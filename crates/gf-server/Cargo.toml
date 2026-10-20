@@ -1,0 +1,42 @@
+[package]
+name = "gf-server"
+description = "generalforecast's server: Arrow Flight API, write-ahead log, and Python workers"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "gf-server"
+path = "src/main.rs"
+
+[dependencies]
+arrow-array = "60"
+arrow-cast = "60"
+arrow-flight = "60"
+arrow-schema = "60"
+axum = "0.8"
+bytes = "1"
+chacha20poly1305 = "0.10"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+getrandom = "0.3"
+gf-assign = { path = "../gf-assign" }
+gf-core = { path = "../gf-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+toml = "1"
+tonic = { version = "0.14", features = ["tls-ring"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+zeroize = "1"
+
+[dev-dependencies]
+# Paused clocks, so tests of leases and failover need not wait.
+tokio = { version = "1", features = ["full", "test-util"] }
+
+[lints]
+workspace = true
