@@ -1,0 +1,127 @@
+[project]
+name = "generalforecast"
+version = "0.1.0"
+description = "gf: tabular foundation models, inference and deployment clients"
+requires-python = ">=3.12"
+dependencies = [
+    "cryptography>=46",
+    "httpx==0.28.1",
+    "huggingface-hub>=2.2.0",
+    "jax>=0.11.0",
+    "jaxtyping>=0.2.38",
+    "numpy>=2.5.3",
+    "pyarrow>=24",
+    "pyyaml>=6.0.2",
+    "safetensors>=0.8.0",
+]
+
+[project.scripts]
+gf = "generalforecast.cli:main"
+
+[project.optional-dependencies]
+sklearn = ["scikit-learn>=1.9.1"]
+dataframes = ["pandas>=2.2", "polars>=1.30,<2"]
+# NVIDIA GPUs: JAX's CUDA 13 plugin, with CUDA and cuDNN from pip, the CUDA
+# PyTorch's default build uses, so both can share one environment.
+cuda = ["jax[cuda13]>=0.11.0"]
+
+[dependency-groups]
+dev = [
+    "pandas>=2.2",
+    "polars>=1.30,<2",
+    "pytest>=8.3",
+    "ruff==0.16.10",
+    "scikit-learn>=1.9.1",
+    "ty==0.0.84",
+]
+reference = [
+    "autogluon-tabular==1.6.3",
+    "chronos-forecasting==2.3.2",
+    "einops==0.8.2",
+    "einx==0.4.3",
+    "limix",
+    "loguru==0.7.3",
+    "structured-data-models",
+    "tabicl==2.2.0",
+    "tabpfn==9.1.0",
+    "timesfm",
+    "timestral",
+    "torch==2.14.1",
+]
+
+[tool.uv]
+# Rebuild the extension when the Rust sources change, not only pyproject.toml.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "Cargo.toml" },
+    { file = "crates/**/Cargo.toml" },
+    { file = "crates/**/*.rs" },
+]
+# generalforecast is developed and run on macOS on Apple silicon, Linux on x86_64 (CI,
+# cloud GPUs and TPU hosts), and Linux on arm64 (images built on Apple silicon).
+environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+]
+
+# AutoGluon caps pyarrow and pandas below generalforecast's (Mitra doesn't use these).
+override-dependencies = ["pyarrow>=24", "pandas>=2"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+# The reference runs on CPU; the default Linux wheel would pull in CUDA.
+torch = { index = "pytorch-cpu" }
+structured-data-models = { git = "https://github.com/NVIDIA/structured-data-models", rev = "64ff257140ca4fed5d710860935c2bfe377b2bde" }
+limix = { git = "https://github.com/limix-ldm-ai/LimiX", rev = "516bf396333feb3198cf7aff8a6c10421f218e24" }
+timestral = { git = "https://github.com/mistralai/timestral", rev = "a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff" }
+timesfm = { git = "https://github.com/google-research/timesfm", rev = "e51928e27119cb17bebc005be2696b75e0a9e688" }
+
+[build-system]
+requires = ["maturin>=1.15,<2"]
+build-backend = "maturin"
+
+[tool.maturin]
+# The Rust control plane builds as generalforecast._core inside the Python package.
+manifest-path = "crates/gf-py/Cargo.toml"
+module-name = "generalforecast._core"
+python-source = "src"
+python-packages = ["generalforecast"]
+features = ["pyo3/extension-module"]
+# A release stages only gf-native into wheel-data/scripts beside Python.
+# Native workers use the extension and Python modules, not server/router binaries.
+# data = "wheel-data"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = ["--import-mode=importlib"]
+# Server and router tests build the binaries and start processes; skip them
+# locally with `-m "not server"` or `-m "not server and not router"`.
+markers = [
+    "server: starts gf-server processes",
+    "router: starts gf-router and gf-server processes",
+    "slow: compiles models or starts servers; CI leaves these out",
+]
+
+[tool.ruff.lint]
+extend-select = ["B", "D", "I", "RUF", "UP"]
+# F722: jaxtyping shape strings. D100, D104: module and package docstrings.
+ignore = ["F722", "D100", "D104"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+
+[tool.ty.src]
+# The reference tests need the reference dependency group, which CI does not
+# install, and the example notebooks install their own libraries, such as
+# pandas and LightGBM, in Colab.
+exclude = ["tests/models/reference", "examples"]
