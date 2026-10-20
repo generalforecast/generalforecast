@@ -1,0 +1,13 @@
+[package]
+name = "gf-core"
+description = "generalforecast's control plane: what to compute, where state lives, and when"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+roaring = "0.11"
