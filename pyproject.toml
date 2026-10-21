@@ -113,8 +113,8 @@ module-name = "generalforecast._core"
 python-source = "src"
 python-packages = ["generalforecast"]
 features = ["pyo3/extension-module"]
-# A release stages only gf-native into wheel-data/scripts beside Python.
-# Native workers use the extension and Python modules, not server/router binaries.
+# A release stages gf-native and gf-server, which `gf serve` runs, into
+# wheel-data/scripts beside Python.
 # data = "wheel-data"
 
 [tool.pytest.ini_options]

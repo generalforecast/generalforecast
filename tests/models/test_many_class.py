@@ -12,8 +12,8 @@ import generalforecast
 from generalforecast.models import registry
 from generalforecast.models.many_class import ManyClass, codebook, many_class_functions
 from generalforecast.models.tabicl.model import tabicl_functions
-from generalforecast.predict import predict
 from tests.models.tabicl.tiny import CLASS_SLOTS, tiny_tabicl
+from tests.utils.predict import predict
 
 
 def test_codes_tell_every_pair_of_classes_apart() -> None:

@@ -14,7 +14,9 @@ path = "src/main.rs"
 arrow-array = "60"
 arrow-cast = "60"
 arrow-flight = "60"
+arrow-ipc = "60"
 arrow-schema = "60"
+arrow-select = "60"
 axum = "0.8"
 bytes = "1"
 chacha20poly1305 = "0.10"
@@ -23,11 +25,12 @@ futures = "0.3"
 getrandom = "0.3"
 gf-assign = { path = "../gf-assign" }
 gf-core = { path = "../gf-core" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["full"] }
-tokio-stream = "0.1"
+tokio-stream = { version = "0.1", features = ["net"] }
 toml = "1"
 tonic = { version = "0.14", features = ["tls-ring"] }
 tracing = "0.1"
@@ -35,6 +38,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 zeroize = "1"
 
 [dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
 # Paused clocks, so tests of leases and failover need not wait.
 tokio = { version = "1", features = ["full", "test-util"] }
 

@@ -17,7 +17,7 @@
 //! it sends a frame nothing asked for: waiting requests fail, later ones fail at
 //! once, and `stopped` resolves so the shard can start the worker again.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::config::WorkerConfig;
-use crate::protocol::{Frame, PROTOCOL_VERSION, WorkerReply};
+use crate::protocol::{Frame, PROTOCOL_VERSION, WorkerReply, WorkerRequest};
 
 /// How long a worker may take to load its models and connect.
 const STARTUP: Duration = Duration::from_secs(600);
@@ -115,8 +115,31 @@ pub fn shared_parent() -> PathBuf {
     }
 }
 
+/// Who waits on a frame's reply: its sender, or each of a `Controls` frame's
+/// requests in order.
+enum Answer {
+    One(oneshot::Sender<Reply>),
+    Controls(Vec<oneshot::Sender<Reply>>),
+}
+
+impl Answer {
+    /// Answers every request the frame carried with the same reply.
+    fn send(self, reply: &Reply) {
+        match self {
+            Self::One(sender) => {
+                let _ = sender.send(reply.clone());
+            }
+            Self::Controls(senders) => {
+                for sender in senders {
+                    let _ = sender.send(reply.clone());
+                }
+            }
+        }
+    }
+}
+
 /// A request waiting for its reply, and the shared frame file to remove then.
-type Waiting = (oneshot::Sender<Reply>, Option<PathBuf>);
+type Waiting = (Answer, Option<PathBuf>);
 
 /// Requests waiting for replies, in order, and why the pipeline stopped, if it has.
 #[derive(Default)]
@@ -140,11 +163,11 @@ impl Stopper {
             queue.stopped.get_or_insert_with(|| reason.to_string());
             std::mem::take(&mut queue.waiting)
         };
-        for (sender, shared) in waiting {
+        for (answer, shared) in waiting {
             if let Some(path) = shared {
                 let _ = std::fs::remove_file(path);
             }
-            let _ = sender.send(Err(reason.to_string()));
+            answer.send(&Err(reason.to_string()));
         }
         self.signal.send_replace(true);
     }
@@ -165,6 +188,9 @@ pub struct Pipeline {
     /// container's 64 MiB default; a disk directory, so slower but unbounded.
     fallback: PathBuf,
     frames: u64,
+    /// Controls not sent yet, which go in one frame before the next frame
+    /// or at `flush`.
+    outbox: Vec<(WorkerRequest, oneshot::Sender<Reply>)>,
 }
 
 impl Pipeline {
@@ -225,12 +251,24 @@ impl Pipeline {
                 if let Some(path) = shared {
                     let _ = std::fs::remove_file(path);
                 }
-                let reply = match WorkerReply::of(&frame) {
-                    Ok(WorkerReply::Error { message }) => Err(message),
-                    Ok(_) => Ok(frame),
-                    Err(error) => Err(error.0),
-                };
-                let _ = next.send(reply);
+                match (WorkerReply::of(&frame), next) {
+                    (Ok(WorkerReply::Controlled { failures }), Answer::Controls(senders)) => {
+                        let mut failed: HashMap<usize, String> = failures
+                            .into_iter()
+                            .map(|failure| (failure.index, failure.message))
+                            .collect();
+                        let done = Frame::header(WorkerReply::Ok.frame().header);
+                        for (index, sender) in senders.into_iter().enumerate() {
+                            let _ = sender
+                                .send(failed.remove(&index).map_or_else(|| Ok(done.clone()), Err));
+                        }
+                    }
+                    (reply, next) => next.send(&match reply {
+                        Ok(WorkerReply::Error { message }) => Err(message),
+                        Ok(_) => Ok(frame),
+                        Err(error) => Err(error.0),
+                    }),
+                }
             }
         });
         Self {
@@ -242,7 +280,57 @@ impl Pipeline {
             shared: None,
             fallback,
             frames: 0,
+            outbox: Vec::new(),
         }
+    }
+
+    /// Queues a control, a table added or removed or tiers' copies and
+    /// drops, for the next frame of controls; its reply arrives on the
+    /// returned receiver once the worker carried it out.
+    pub fn control(&mut self, request: WorkerRequest) -> oneshot::Receiver<Reply> {
+        let (sender, receiver) = oneshot::channel();
+        self.outbox.push((request, sender));
+        receiver
+    }
+
+    /// Sends the controls queued since the last frame, in one frame.
+    ///
+    /// # Errors
+    ///
+    /// If the pipeline has stopped, which fails the controls' replies.
+    pub fn flush(&mut self) -> Result<(), String> {
+        if self.outbox.is_empty() {
+            return Ok(());
+        }
+        let (requests, senders): (Vec<_>, Vec<_>) =
+            std::mem::take(&mut self.outbox).into_iter().unzip();
+        let frame = WorkerRequest::Controls { requests }.frame();
+        self.write(&frame, Answer::Controls(senders), None)
+    }
+
+    /// Queues a frame's reply and hands its bytes to the writing task.
+    fn write(&self, frame: &Frame, answer: Answer, shared: Option<PathBuf>) -> Result<(), String> {
+        let bytes = frame.to_bytes();
+        // Queued before writing, so the reply always finds its request.
+        let mut queue = self
+            .stopper
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(reason) = &queue.stopped {
+            if let Some(path) = shared {
+                let _ = std::fs::remove_file(path);
+            }
+            let reason = reason.clone();
+            drop(queue);
+            answer.send(&Err(reason.clone()));
+            return Err(reason);
+        }
+        queue.waiting.push_back((answer, shared));
+        // The writing task ends only once the pipeline has stopped, which
+        // fails this frame's reply.
+        let _ = self.frames_out.send(bytes);
+        Ok(())
     }
 
     /// A fresh path for a shared frame, in a directory only this user can open.
@@ -318,6 +406,8 @@ impl Pipeline {
     ///
     /// If the pipeline has stopped, or a shared frame cannot be written.
     pub async fn send(&mut self, frame: &Frame) -> Result<oneshot::Receiver<Reply>, String> {
+        // Controls queued before a frame are carried out before it.
+        self.flush()?;
         let (sender, receiver) = oneshot::channel();
         let size: usize = frame.buffers.iter().map(Vec::len).sum();
         let (frame, shared) = if size >= SHARED_BYTES {
@@ -326,23 +416,7 @@ impl Pipeline {
         } else {
             (std::borrow::Cow::Borrowed(frame), None)
         };
-        let bytes = frame.to_bytes();
-        // Queued before writing, so the reply always finds its request.
-        let mut queue = self
-            .stopper
-            .queue
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(reason) = &queue.stopped {
-            if let Some(path) = shared {
-                let _ = std::fs::remove_file(path);
-            }
-            return Err(reason.clone());
-        }
-        queue.waiting.push_back((sender, shared));
-        // The writing task ends only once the pipeline has stopped, which
-        // fails this frame's reply.
-        let _ = self.frames_out.send(bytes);
+        self.write(&frame, Answer::One(sender), shared)?;
         Ok(receiver)
     }
 
@@ -378,6 +452,8 @@ pub struct Launch {
     pub slot_bytes: u64,
     /// The one GPU the worker sees, if it has its own.
     pub gpu: Option<String>,
+    /// The cores the worker is pinned to, if it has its own.
+    pub cpus: Option<Vec<usize>>,
     /// A file for the worker's disk tier, if the node has one.
     pub disk: Option<PathBuf>,
     /// Environment variables the worker never sees, such as the log key.
@@ -407,6 +483,46 @@ pub struct WorkerConnection {
     pub device_bytes: u64,
     pub host_bytes: u64,
     pub row_memory_bytes: u64,
+}
+
+/// The cores this process may run on, as its affinity names them in
+/// `/proc/self/status`; None where it cannot be read.
+#[must_use]
+pub fn allowed_cpus() -> Option<Vec<usize>> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    let list = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?;
+    let mut cpus = Vec::new();
+    for range in list.trim().split(',').filter(|range| !range.is_empty()) {
+        let (first, last) = range.split_once('-').unwrap_or((range, range));
+        cpus.extend(first.trim().parse::<usize>().ok()?..=last.trim().parse::<usize>().ok()?);
+    }
+    (!cpus.is_empty()).then_some(cpus)
+}
+
+/// The cores a CPU worker has to itself when its configuration gives no
+/// `cpu_threads`. On 8 cores, workers of four served new 256-row tabicl
+/// contexts faster than workers of two at 1 and 8 callers, and kept repeated
+/// contexts within 6 to 15% of before, where workers of two lost 23 to 38%.
+pub const CPU_WORKER_CORES: usize = 4;
+
+/// Each worker's cores: the allowed cores in runs of `threads`, one run per
+/// worker, at least one worker; the last run takes any cores left over.
+#[must_use]
+pub fn cpu_groups(cpus: &[usize], threads: usize) -> Vec<Vec<usize>> {
+    let threads = threads.max(1);
+    let workers = (cpus.len() / threads).max(1);
+    (0..workers)
+        .map(|worker| {
+            let end = if worker + 1 == workers {
+                cpus.len()
+            } else {
+                (worker + 1) * threads
+            };
+            cpus[worker * threads..end].to_vec()
+        })
+        .collect()
 }
 
 /// The NVIDIA GPUs this process may use: `CUDA_VISIBLE_DEVICES` if set, else
@@ -457,6 +573,7 @@ impl WorkerConnection {
             bucket_minimum,
             slot_bytes,
             gpu,
+            cpus,
             disk,
             secrets,
             shared_fallback,
@@ -492,6 +609,10 @@ impl WorkerConnection {
         }
         if let Some(gpu) = gpu {
             command.env("CUDA_VISIBLE_DEVICES", gpu);
+        }
+        if let Some(cpus) = cpus {
+            let cpus: Vec<String> = cpus.iter().map(ToString::to_string).collect();
+            command.arg("--cpus").arg(cpus.join(","));
         }
         if let Some(disk) = disk {
             command.arg("--disk-path").arg(disk);
@@ -589,11 +710,13 @@ impl WorkerConnection {
                 config: WorkerConfig {
                     command: Vec::new(),
                     per_gpu: false,
+                    cpu_threads: None,
                     models: std::collections::BTreeMap::new(),
                 },
                 bucket_minimum: 8,
                 slot_bytes: 1 << 20,
                 gpu: None,
+                cpus: None,
                 disk: None,
                 secrets: Vec::new(),
                 shared_fallback: std::env::temp_dir(),
@@ -636,6 +759,46 @@ impl WorkerConnection {
         self.kill().await;
         Err(format!(
             "the worker took over {} seconds to answer a {:?} message",
+            timeout.as_secs_f64(),
+            frame.kind()
+        ))
+    }
+
+    /// Sends a frame and waits for its reply while the worker reports
+    /// progress at least every `timeout`, as it does for each program it
+    /// compiles. A worker silent for longer is killed, as `request_within`
+    /// kills it.
+    ///
+    /// # Errors
+    ///
+    /// If the connection fails, the worker replies with an error, or it
+    /// goes `timeout` without progress.
+    pub async fn request_progressing(&mut self, frame: &Frame, timeout: Duration) -> Reply {
+        let progressed = Arc::clone(&self.pipeline.progressed);
+        let sent = Instant::now();
+        let last = move || {
+            progressed
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .map_or(sent, |at| at.max(sent))
+        };
+        let outcome = {
+            let request = self.pipeline.request(frame);
+            tokio::pin!(request);
+            loop {
+                match tokio::time::timeout_at(last() + timeout, &mut request).await {
+                    Ok(reply) => break Some(reply),
+                    Err(_) if last() + timeout > Instant::now() => {}
+                    Err(_) => break None,
+                }
+            }
+        };
+        if let Some(reply) = outcome {
+            return reply;
+        }
+        self.kill().await;
+        Err(format!(
+            "the worker went over {} seconds without progress on a {:?} message",
             timeout.as_secs_f64(),
             frame.kind()
         ))

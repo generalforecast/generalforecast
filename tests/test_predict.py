@@ -5,8 +5,8 @@ import numpy as np
 import pytest
 
 from generalforecast.models.tabicl.model import tabicl_functions
-from generalforecast.predict import predict
 from tests.models.tabicl.tiny import QUANTILES, tiny_tabicl
+from tests.utils.predict import predict
 
 
 def _table() -> tuple[jnp.ndarray, jnp.ndarray]:

@@ -36,6 +36,16 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             item.add_marker(pytest.mark.slow)
 
 
+@pytest.fixture(scope="session")
+def gf_server() -> str:
+    """Builds gf-server and puts it on PATH, where a runtime finds its front."""
+    from tests.utils.server import build
+
+    directory = str(build().parent)
+    os.environ["PATH"] = directory + os.pathsep + os.environ["PATH"]
+    return directory
+
+
 @pytest.fixture
 def float64() -> Iterator[None]:
     """Enable float64 for tests of code that computes in double precision."""

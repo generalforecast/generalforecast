@@ -13,7 +13,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import generalforecast
 from generalforecast import protocol
 from generalforecast._core import CacheKey
 from generalforecast.models.conformance import Table, check, predict, table
@@ -21,7 +20,6 @@ from generalforecast.models.conformance import close as _close
 from generalforecast.models.conformance import padded as _padded
 from generalforecast.models.contract import TabularFunctions
 from generalforecast.nn.attention import AttentionKernel
-from generalforecast.predict import predict as gf_predict
 from generalforecast.runtime.device import (
     DeviceSettings,
     configure,
@@ -33,6 +31,8 @@ from generalforecast.runtime.memory import fit_profile, memory_profile, tree_byt
 from generalforecast.runtime.paging import cache_layout, pack, read_context
 from generalforecast.worker import Worker
 from tests.models.conformance.cases import CASES, FEATURES, Case
+from tests.utils import node_harness
+from tests.utils.predict import predict as gf_predict
 
 FLOAT32, FLOAT16, BFLOAT16, INT8 = (
     jnp.dtype(name) for name in ("float32", "float16", "bfloat16", "int8")
@@ -245,7 +245,7 @@ def test_a_fit_past_the_call_budget_predicts_as_one_pass(
     budget = int(profile.fused.bytes(padded))
     assert profile.state_rows(budget) >= padded
     monkeypatch.setattr(Worker, "_call_bytes", property(lambda _: budget))
-    client = generalforecast.local(settings=REFERENCE, compile_cache=False)
+    client = node_harness.local(settings=REFERENCE, compile_cache=False)
     columns = {"code": "categorical"} | {
         f"f{index}": "numeric" for index in range(1, FEATURES)
     }
@@ -387,3 +387,25 @@ def test_a_unit_that_summarizes_its_own_rows_predicts_as_those_rows_alone(
     _close(predicted("encode"), expected)
     _close(predicted("reuse"), expected)
     _close(predicted("transient"), expected)
+
+
+def test_a_fused_unit_predicts_as_its_rows_fit_and_encoded_apart(
+    case: Case, functions: TabularFunctions, model: Any
+) -> None:
+    data = table(case.regression, rows=48, queries=6)
+    worker = Worker(REFERENCE, slot_bytes=4096, compile_cache=False)
+    worker.add_model(0, functions, model)
+    worker.allocate(256, 0, 0)
+    worker.add_table(0, 0, data.num_classes, FEATURES)
+    rows = np.arange(48, dtype=np.uint32)
+    features = np.asarray(data.features)
+    targets = np.asarray(data.targets)
+    key = CacheKey(0, 0, 0, "context", 1)
+    unit = protocol.Unit(0, key, rows, "fuse", [], features, targets)
+    queries = np.asarray(data.queries)
+    batch = protocol.QueryBatch(0, 0, 0, queries, [0] * len(queries))
+    predicted = worker.run(protocol.Step([], [], [], [unit], [batch]))[0]
+    expected = gf_predict(
+        functions, model, jnp.asarray(features), jnp.asarray(targets), data.queries
+    )
+    _close(predicted, expected)

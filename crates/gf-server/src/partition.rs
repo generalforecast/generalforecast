@@ -20,7 +20,7 @@ use arrow_schema::{ArrowError, DataType, Field, Schema};
 use gf_core::node::Targets;
 use serde::{Deserialize, Serialize};
 
-use crate::columns::{self, Column, ColumnKind, Strings};
+use gf_core::columns::{self, Column, ColumnKind, Strings};
 
 /// Rows as model features, with categorical features' words apart.
 #[derive(Clone, Debug, Default, PartialEq)]
