@@ -27,16 +27,9 @@ pub struct Config {
     /// latency percentiles. None by default.
     #[serde(default)]
     pub timing_log: Option<PathBuf>,
-    /// The directory `profile_workers` writes profiles under, each in the
-    /// subdirectory the action names; the action is refused without it.
+    /// Present, it also turns on timers for the server's life.
     #[serde(default)]
-    pub profiles_directory: Option<PathBuf>,
-    /// Times each part of a worker step, of planning a step and of a
-    /// request, for the `gf_worker_part_*`, `gf_plan_part_*` and
-    /// `gf_request_*_seconds` metrics; off by default. The server and its
-    /// workers read it at startup, so turning it on or off takes a restart.
-    #[serde(default)]
-    pub timers: bool,
+    pub profiling: Option<ProfilingConfig>,
     /// A certificate and key, in PEM, to serve Flight over TLS.
     #[serde(default)]
     pub tls: Option<TlsConfig>,
@@ -208,6 +201,14 @@ impl Default for PlacementConfig {
     }
 }
 
+/// For generalforecast's developers.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfilingConfig {
+    /// The root `profile_workers` writes under.
+    pub directory: PathBuf,
+}
+
 /// The server's TLS identity.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -307,6 +308,11 @@ fn drain_seconds() -> f64 {
 }
 
 impl Config {
+    #[must_use]
+    pub fn timers(&self) -> bool {
+        self.profiling.is_some()
+    }
+
     /// The environment variables that hold log keys, current and previous,
     /// which workers must never see.
     #[must_use]

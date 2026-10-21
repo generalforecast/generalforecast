@@ -19,12 +19,15 @@ from generalforecast.deployments.boundary import (
 )
 from generalforecast.packages.validation import bytes_digest
 from generalforecast.tabular import table_digest
+from generalforecast.transport import PLATFORM_PROBE
 
 
 @pytest.fixture
 def wire():
     expected = deque()
-    state = SimpleNamespace(expected=expected, requests=[], errors=[], corrupt=False)
+    state = SimpleNamespace(
+        expected=expected, requests=[], errors=[], corrupt=False, probes=0
+    )
 
     def expect(method, path, result=None, *, payload=None, status=200):
         expected.append(
@@ -44,6 +47,17 @@ def wire():
             self.reply()
 
         def reply(self):
+            if self.path == PLATFORM_PROBE:
+                state.probes += 1
+                data = json.dumps(
+                    {"error": {"code": "Unauthenticated", "message": "fixture"}}
+                ).encode()
+                self.send_response(401)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
             try:
                 method, path, payload, result, status = expected.popleft()
                 assert self.command == method and self.path == path

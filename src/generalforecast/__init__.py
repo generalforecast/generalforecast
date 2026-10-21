@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from generalforecast.packages import PackageLock as PackageLock
     from generalforecast.packages import PackageSpec as PackageSpec
     from generalforecast.packages import PythonLock as PythonLock
+    from generalforecast.transport import HostedOnlyError as HostedOnlyError
     from generalforecast.transport import Profile as Profile
 
 try:
@@ -75,6 +76,7 @@ __all__ = [
     "Environment",
     "Forecaster",
     "GroupStrategy",
+    "HostedOnlyError",
     "ImportReceipt",
     "Job",
     "JobSpec",
@@ -144,6 +146,7 @@ _EXPORTS = {
     "PatchRequest": "generalforecast.contracts",
     "PredictionResult": "generalforecast.contracts",
     "Profile": "generalforecast.transport",
+    "HostedOnlyError": "generalforecast.transport",
     "PromoteRequest": "generalforecast.contracts",
     "PythonLock": "generalforecast.packages",
     "Revision": "generalforecast.contracts",

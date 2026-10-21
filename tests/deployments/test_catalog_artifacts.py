@@ -68,7 +68,22 @@ def test_preload_verifies_every_remote_qualified_model(monkeypatch):
     preload()
     assert loaded == [
         (name, {"surface": "remote", "allow_downloads": True})
-        for name in ("tabicl-v2-classifier", "tabicl-v2-regressor", "chronos-2")
+        for name in (
+            "tabicl-v2-classifier",
+            "tabicl-v2-regressor",
+            *(
+                f"kumo-tabular-{size}-{task}"
+                for size in ("small", "medium", "large")
+                for task in ("classifier", "regressor")
+            ),
+            "mitra-2-classifier",
+            "mitra-2-regressor",
+            "chronos-2",
+            "timestral-209m",
+            "timestral-209m-unmirrored",
+            "timestral-28m",
+            "timestral-28m-unmirrored",
+        )
     ]
 
 

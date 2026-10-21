@@ -22,6 +22,8 @@ from tests.models.chronos2.tiny import tiny_chronos2
 from tests.models.timesfm3.tiny import tiny_timesfm
 from tests.models.timestral.tiny import tiny_timestral
 
+pytestmark = pytest.mark.slow
+
 STEP = 10
 A, B = 1, 2
 

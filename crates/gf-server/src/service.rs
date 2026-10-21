@@ -695,17 +695,11 @@ impl Service {
         self
     }
 
-    /// Lets `profile_workers` write under `directory`; without one it is refused.
+    /// Without a directory, requests aren't timed and `profile_workers` is refused.
     #[must_use]
-    pub fn with_profiles_directory(mut self, directory: Option<PathBuf>) -> Self {
+    pub fn with_profiling(mut self, directory: Option<PathBuf>) -> Self {
+        self.timers = directory.is_some();
         self.profiles = directory;
-        self
-    }
-
-    /// Times each part of a request if `timers`; off by default.
-    #[must_use]
-    pub fn with_timers(mut self, timers: bool) -> Self {
-        self.timers = timers;
         self
     }
 
@@ -2470,7 +2464,7 @@ impl Service {
             } => {
                 let Some(root) = &self.profiles else {
                     return Err(Status::failed_precondition(
-                        "profile_workers needs profiles_directory in the server's configuration",
+                        "profile_workers needs [profiling] in the server's configuration",
                     ));
                 };
                 let directory = profile_directory(root, &directory)?;
