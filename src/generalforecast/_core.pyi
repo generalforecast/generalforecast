@@ -333,8 +333,10 @@ class Node:
         step: int,
         patch: int,
         context: int,
+        output_patch: int,
         group: GroupStrategy,
         bytes_per_row: int,
+        pass_limit: int | None = None,
         patch_bytes: int = 0,
         known: list[int] = [],
         max_rows: int | None = None,
@@ -347,10 +349,10 @@ class Node:
 
         Its rows are observations keyed by series and time, with `features`
         covariate columns, of which `known` are known over the horizon; the
-        grid's `step` is in the table's time unit, and `patch`, `context`,
-        `max_rows`, `reusable` and `extendable` come from the model's
-        properties. A group's cache takes `bytes_per_row` per padded row and
-        `patch_bytes` beside them, per patch.
+        grid's `step` is in the table's time unit. `patch`, `output_patch`,
+        `context`, `pass_limit`, `max_rows`, `reusable` and `extendable` come
+        from the model's properties. A group's cache takes `bytes_per_row`
+        per padded row and `patch_bytes` beside them, per patch.
         """
     def submit_forecast(
         self,

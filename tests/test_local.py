@@ -2138,6 +2138,43 @@ def test_series_tables_forecast_as_the_model_does_on_the_group() -> None:
     assert not np.allclose(moved, latest)
 
 
+def test_native_series_forecast_continues_past_one_output_patch() -> None:
+    from generalforecast.models.timesfm3.model import timesfm_functions
+    from tests.models.timesfm3.tiny import tiny_timesfm
+
+    model = tiny_timesfm()
+    properties = timesfm_functions.properties(model)
+    client = generalforecast.local()
+    series = client.create_series_table(
+        "multi-pass",
+        model=(timesfm_functions, model),
+        series="item",
+        time="t",
+        target="units",
+        step=10,
+    )
+    try:
+        series.insert(
+            {
+                "item": ["shoes"] * 8,
+                "t": list(range(100, 180, 10)),
+                "units": list(range(8)),
+            }
+        )
+        continued = series.forecast(["shoes"], horizon=properties.output_patch + 1)
+        assert continued.shape == (
+            1,
+            properties.output_patch + 1,
+            len(properties.quantiles),
+        )
+
+        limit = 64 * (properties.pass_limit or properties.output_patch)
+        with pytest.raises(ValueError, match=f"past the {limit}"):
+            series.forecast(["shoes"], horizon=limit + 1)
+    finally:
+        client.drop_table("multi-pass")
+
+
 def test_series_tables_forecast_the_groups_given_them() -> None:
     from generalforecast.models.timestral.model import timestral_functions
     from tests.models.timestral.tiny import tiny_timestral

@@ -1,3 +1,4 @@
+import threading
 import time
 from collections.abc import Callable, Hashable
 from dataclasses import dataclass
@@ -210,6 +211,7 @@ class Chunks:
         self._backoff: dict[Hashable, int] = {}
         # Parts of one item a call takes, once a single item ran out of memory.
         self._parts: dict[Hashable, int] = {}
+        self._lock = threading.Lock()
 
     def size(self, key: Hashable, budget: int, estimate: Callable[[], int]) -> int:
         """Items of a kind one call of at most `budget` bytes takes.
@@ -222,9 +224,10 @@ class Chunks:
         Returns:
             A power of two, at least 1.
         """
-        if key not in self._item_bytes:
-            self._item_bytes[key] = estimate()
-        bytes = self._item_bytes[key] * self._backoff.get(key, 1)
+        with self._lock:
+            if key not in self._item_bytes:
+                self._item_bytes[key] = estimate()
+            bytes = self._item_bytes[key] * self._backoff.get(key, 1)
         size = max(1, budget // max(1, bytes))
         return 1 << (size.bit_length() - 1)
 
@@ -267,10 +270,12 @@ class Chunks:
                 started = time.perf_counter()
                 measured = measured_bytes(call)
                 measuring += time.perf_counter() - started
-                if measured > self._item_bytes[key]:
-                    self._item_bytes[key] = measured
-                    if self.size(key, budget, estimate) < stop - first:
-                        continue
+                with self._lock:
+                    larger = measured > self._item_bytes[key]
+                    if larger:
+                        self._item_bytes[key] = measured
+                if larger and self.size(key, budget, estimate) < stop - first:
+                    continue
             started = time.perf_counter()
             traces = _traces(call.function)
             try:
@@ -282,7 +287,8 @@ class Chunks:
                     raise
                 # XLA's measure fell short of what the call needed: halve the
                 # call, from here on.
-                self._backoff[key] = 2 * self._backoff.get(key, 1)
+                with self._lock:
+                    self._backoff[key] = 2 * self._backoff.get(key, 1)
                 continue
             finished = time.perf_counter()
             self._counted(stage, measuring + finished - started)
@@ -308,5 +314,6 @@ class Chunks:
 
     def relax(self) -> None:
         """Forgets what calls that ran out of memory taught, as when the pool is sized again."""
-        self._backoff.clear()
-        self._parts.clear()
+        with self._lock:
+            self._backoff.clear()
+            self._parts.clear()

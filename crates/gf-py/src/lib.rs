@@ -985,14 +985,14 @@ impl Node {
     ///
     /// Its rows are observations keyed by series and time, with `features`
     /// covariate columns, of which `known` are known over the horizon; the
-    /// grid's `step` is in the table's time unit, and `patch`, `context`,
-    /// `max_rows`, `reusable` and `extendable` come from the model's
-    /// properties. A group's cache takes `bytes_per_row` per padded row and
-    /// `patch_bytes` beside them, per patch.
+    /// grid's `step` is in the table's time unit. `patch`, `output_patch`,
+    /// `context`, `pass_limit`, `max_rows`, `reusable` and `extendable` come
+    /// from the model's properties. A group's cache takes `bytes_per_row`
+    /// per padded row and `patch_bytes` beside them, per patch.
     #[pyo3(signature = (
-        model, features, step, patch, context, group, bytes_per_row, patch_bytes = 0,
-        known = Vec::new(), max_rows = None, neighbors = "targets", reusable = true,
-        bucket_minimum = 1, extendable = false,
+        model, features, step, patch, context, output_patch, group, bytes_per_row,
+        pass_limit = None, patch_bytes = 0, known = Vec::new(), max_rows = None,
+        neighbors = "targets", reusable = true, bucket_minimum = 1, extendable = false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn create_series_table(
@@ -1002,8 +1002,10 @@ impl Node {
         step: i64,
         patch: i64,
         context: i64,
+        output_patch: i64,
         group: &GroupStrategy,
         bytes_per_row: i64,
+        pass_limit: Option<i64>,
         patch_bytes: i64,
         known: Vec<i64>,
         max_rows: Option<i64>,
@@ -1026,6 +1028,12 @@ impl Node {
                 .ok_or_else(|| invalid("step must be positive"))?,
             patch: positive(patch, "patch")?,
             context: positive(context, "context")?,
+            max_horizon: forecasting::horizon_limit(
+                positive(output_patch, "output_patch")?,
+                pass_limit
+                    .map(|limit| positive(limit, "pass_limit"))
+                    .transpose()?,
+            ),
             max_rows: max_rows
                 .map(|rows| positive(rows, "max_rows"))
                 .transpose()?,
