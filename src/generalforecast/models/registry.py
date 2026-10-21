@@ -101,9 +101,11 @@ def _native(entry: ModelEntry, surface: Surface, allow_downloads: bool) -> Model
     )
     parameters = _attribute(loader)(directory, **dict(entry.options))
     if surface != "local":
+        import jax
+
         from generalforecast.runtime.device import configure, device_settings
 
-        parameters = configure(parameters, device_settings("cpu"))
+        parameters = configure(parameters, device_settings(jax.default_backend()))
     return _trained(
         entry.name, _traced(entry.name, (_attribute(functions), parameters))
     )
@@ -175,7 +177,7 @@ def load_ref(
         functions, parameters = getattr(importlib.import_module(module), function)()
     else:
         entry = ref.entry
-        if not entry.gates.allows(surface, variant=ref.variant):
+        if not entry.allows(surface, variant=ref.variant):
             raise ModelRefError(
                 "UnsupportedModel",
                 f"{ref} is not qualified for {surface} use: {entry.gates.evidence}",

@@ -28,7 +28,7 @@ from typing import Literal, overload
 from generalforecast.serialization import content_digest
 
 Task = Literal["classification", "regression", "forecast"]
-Surface = Literal["local", "package", "remote"]
+Surface = Literal["local", "package", "remote", "self-hosted"]
 
 # The Hugging Face organization that holds the pinned converted checkpoints.
 ORGANIZATION = "general-forecast"
@@ -48,6 +48,11 @@ SERIES_TYPES = ("int64", "float64")
 LICENSE_FILES = ("LICENSE", "NOTICE", "README.md")
 # The derived manifest a converted checkpoint directory records itself in.
 DERIVED_MANIFEST = "gf-manifest.json"
+# Licenses whose terms permit General Forecast to serve the weights to others.
+# Timestral's modified MIT caps free use at a monthly revenue; the owner accepted it.
+HOSTED_LICENSES = frozenset(
+    {"Apache-2.0", "BSD-3-Clause", "MIT", "OpenMDW-1.1", "LicenseRef-timestral-license"}
+)
 
 
 @dataclass(frozen=True)
@@ -223,6 +228,24 @@ class ModelEntry:
     checkpoint: str = ""
     aliases: tuple[str, ...] = ()
     options: tuple[tuple[str, object], ...] = ()
+
+    @property
+    def hostable(self) -> bool:
+        """Whether its license permits serving it on General Forecast infrastructure."""
+        return self.artifact.license in HOSTED_LICENSES
+
+    def allows(self, surface: Surface, *, variant: bool = False) -> bool:
+        """Whether a surface may run the model, or one of its variants.
+
+        A self-hosted server runs on its operator's infrastructure, under the
+        operator's own license: it takes the remote gates for hostable models,
+        and any pinned base model whose license forbids hosting.
+        """
+        if surface != "self-hosted":
+            return self.gates.allows(surface, variant=variant)
+        if self.hostable:
+            return self.gates.allows("remote", variant=variant)
+        return not variant and bool(self.artifact.files)
 
     @property
     def repository_id(self) -> str:
@@ -538,6 +561,7 @@ def _tabular(
     revision: str,
     *,
     trained: tuple[int | None, int | None, int | None] = (None, None, None),
+    class_slots: int = 10,
     license: str | None = None,
     source: str | None = "LICENSE",
     gates: Gates = _LOCAL_GATES,
@@ -552,7 +576,7 @@ def _tabular(
         artifact or _pinned(name, revision, license, source if license else None),
         Capability(
             task,
-            class_slots=10 if task == "classification" else None,
+            class_slots=class_slots if task == "classification" else None,
             context_rows=rows,
             context_features=features,
             context_classes=classes if task == "classification" else None,
@@ -574,6 +598,11 @@ def _upstream(
     return Artifact(repository, revision, _files(name), license, source, convert)
 
 
+_HOSTED = (
+    "pinned config, weights and license files; real-weight Models API "
+    "classification/regression and @K/*N tests"
+)
+_HOSTED_GATES = Gates(remote=True, variants=frozenset({"remote"}), evidence=_HOSTED)
 _TABICL_GATES = Gates(
     package=True,
     remote=True,
@@ -655,6 +684,7 @@ _ALL: tuple[ModelEntry, ...] = (
             revision,
             trained=(60_000, 100, 10),
             license="OpenMDW-1.1",
+            gates=_HOSTED_GATES,
         )
         for size, revision in _KUMO.items()
     ),
@@ -663,6 +693,7 @@ _ALL: tuple[ModelEntry, ...] = (
             name,
             "tabpfn",
             _TABPFN_3[1],
+            class_slots=160,
             trained=(1_000_000, 2_000, None),
             artifact=_upstream(
                 name,
@@ -679,6 +710,7 @@ _ALL: tuple[ModelEntry, ...] = (
             name,
             "tabpfn",
             _TABPFN_3_5[1],
+            class_slots=160,
             trained=(1_000_000, 6_000, 160),
             artifact=_upstream(
                 name,
@@ -716,6 +748,7 @@ _ALL: tuple[ModelEntry, ...] = (
             revision,
             trained=(5_120, 50, None),
             license="Apache-2.0",
+            gates=_HOSTED_GATES,
             aliases=(upstream,),
         )
         for name, (upstream, revision) in _MITRA_2.items()
@@ -749,8 +782,9 @@ _ALL: tuple[ModelEntry, ...] = (
             name + suffix,
             "timestral",
             # The LICENSE files are pinned; the upstream cards say only "other".
-            _pinned(name, revision, None, "LICENSE"),
+            _pinned(name, revision, "LicenseRef-timestral-license", "LICENSE"),
             Capability("forecast"),
+            gates=_HOSTED_GATES,
             checkpoint=name,
             options=(("symmetric", not suffix),),
             aliases=() if suffix else (upstream,),
@@ -774,6 +808,8 @@ _ALL: tuple[ModelEntry, ...] = (
         Capability("forecast"),
     ),
 )
+if unlicensed := [i.name for i in _ALL if i.gates.remote and not i.hostable]:
+    raise AssertionError(f"remote gates need a hosted license: {unlicensed}")
 ENTRIES: MappingProxyType = MappingProxyType({item.name: item for item in _ALL})
 _NAMES: dict[str, str] = {
     alias: item.name

@@ -72,6 +72,26 @@ def json_object(value: Any) -> JsonObject:
     return json.loads(encoded)
 
 
+def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """Rejects ambiguous JSON instead of silently accepting the final key."""
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        require(key not in result, "duplicate JSON field")
+        result[key] = value
+    return result
+
+
+def parse_body(body: bytes) -> dict[str, Any]:
+    """Parses bounded unambiguous JSON without retaining caller bytes."""
+    require(0 < len(body) <= MAX_BYTES, "bounded JSON body required")
+    try:
+        value = json.loads(body, object_pairs_hook=unique_object)
+        require(type(value) is dict, "expected JSON object")
+        return value
+    except (ValueError, UnicodeError, RecursionError):
+        raise ServiceError("ValidationError", "invalid JSON body", 422) from None
+
+
 @dataclass(frozen=True)
 class Scope:
     """Request correlation and project selection, never an authorization proof."""

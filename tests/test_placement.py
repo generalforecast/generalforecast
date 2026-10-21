@@ -14,7 +14,7 @@ flight = pytest.importorskip("pyarrow.flight")
 
 from tests.utils.server import COLUMNS, NEAR_A, Server, build
 
-pytestmark = pytest.mark.server
+pytestmark = [pytest.mark.server, pytest.mark.slow]
 
 LOAD = """
 [placement]

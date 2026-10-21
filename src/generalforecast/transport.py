@@ -54,7 +54,7 @@ class Profile:
     project: str = "local"
     environment: str = "production"
     runtime: str | None = None
-    key_env: str = DEFAULT_KEY_ENV
+    key_env: str | None = DEFAULT_KEY_ENV
 
     def __post_init__(self) -> None:
         """Validates defaults without network access."""
@@ -64,7 +64,11 @@ class Profile:
         if self.runtime is not None:
             name(self.runtime)
         require(
-            type(self.key_env) is str and _KEY_ENV.fullmatch(self.key_env) is not None,
+            self.key_env is None
+            or (
+                type(self.key_env) is str
+                and _KEY_ENV.fullmatch(self.key_env) is not None
+            ),
             "invalid key environment reference",
         )
 
@@ -203,12 +207,16 @@ def credential_from_env(
 
 @dataclass(frozen=True)
 class ConnectionSettings:
-    """One resolved endpoint, project, profile and GF credential."""
+    """One resolved endpoint, project, profile and optional GF credential.
+
+    A profile whose key_env is None, or an explicit base_url, is keyless: no
+    Authorization header is sent unless a key is passed for that endpoint.
+    """
 
     profile_name: str | None
     profile: Profile
     credential_env: str | None
-    token: str = field(repr=False)
+    token: str | None = field(repr=False)
 
     @classmethod
     def resolve(
@@ -223,10 +231,31 @@ class ConnectionSettings:
         key_env: str | None = None,
         new_profile: bool = False,
         environ: Mapping[str, str] | None = None,
+        base_url: str | None = None,
     ) -> "ConnectionSettings":
-        """Explicit arguments, then GF_* overrides, then the profile, then defaults."""
+        """Explicit arguments, then GF_* overrides, then the profile, then defaults.
+
+        base_url names one endpoint, such as a local `gf serve`, and ignores
+        profiles and ambient GF_* settings so hosted keys never reach it. Only
+        api_key/token, or the variable named by key_env, authenticates it.
+        """
         env = os.environ if environ is None else environ
         require(token is None or api_key is None, "use either token or api_key")
+        explicit = api_key if api_key is not None else token
+        if base_url is not None:
+            require(
+                url is None and profile is None and not new_profile,
+                "base_url cannot be combined with url or profile",
+            )
+            variable = None
+            if explicit is None and key_env is not None:
+                explicit, variable = env.get(key_env, ""), key_env
+            local = Profile(
+                base_url, "local" if project is None else project, key_env=key_env
+            )
+            if explicit is None:
+                return cls(None, local, None, None)
+            return cls(None, local, variable, credential(explicit, "API key"))
         if isinstance(profile, Profile):
             selected, base = None, profile
         else:
@@ -241,22 +270,65 @@ class ConnectionSettings:
             base.runtime,
             base.key_env if key_env is None else key_env,
         )
-        explicit = api_key if api_key is not None else token
-        if explicit is None:
-            value, variable = credential_from_env(resolved.key_env, env)
-        else:
+        if explicit is not None:
             value, variable = explicit, None
+        elif resolved.key_env is None:
+            return cls(selected, resolved, None, None)
+        else:
+            value, variable = credential_from_env(resolved.key_env, env)
         return cls(selected, resolved, variable, credential(value, "GF API key"))
 
 
 def connection(
-    url, project, token, api_key, profile, config_path
-) -> tuple[Profile, str]:
+    url, project, token, api_key, profile, config_path, base_url=None
+) -> tuple[Profile, str | None]:
     """Resolves explicit arguments above environment and non-secret profile."""
     settings = ConnectionSettings.resolve(
-        url, project, token, api_key, profile, config_path
+        url, project, token, api_key, profile, config_path, base_url=base_url
     )
     return settings.profile, settings.token
+
+
+PLATFORM_PROBE = "/v1alpha1/auth/status"
+_PORTABLE_ROUTES = (
+    ("GET", re.compile(r"/v1alpha1/projects/[^/]+/models(/[^/]+)?")),
+    ("POST", re.compile(r"/v1alpha1/projects/[^/]+/models/[^/]+/infer")),
+    ("POST", re.compile(r"/v1alpha1/projects/[^/]+/predictions")),
+)
+
+
+class HostedOnlyError(ServiceError):
+    """A hosted platform operation sent to a standalone model server."""
+
+    def __init__(self, method: str, path: str) -> None:
+        """Names the route without query parameters or request content."""
+        super().__init__(
+            "UnsupportedOperation",
+            f"{method} {path.split('?', 1)[0]} requires the hosted platform; "
+            "this endpoint is a standalone model server that only serves "
+            "model listing and inference",
+            501,
+        )
+        self.method, self.path = method, path.split("?", 1)[0]
+
+
+def hosted_only(method: str, path: str) -> bool:
+    """True for versioned routes a standalone `gf serve` model server lacks."""
+    route = path.split("?", 1)[0]
+    return route.startswith("/v1alpha1/") and not any(
+        method == verb and pattern.fullmatch(route)
+        for verb, pattern in _PORTABLE_ROUTES
+    )
+
+
+def route_missing(error: ServiceError) -> bool:
+    """A 404 for the route itself, with or without the standard error envelope."""
+    return error.status == 404 and error.code in ("NotFound", "ProtocolError")
+
+
+def platform_from_probe(error: ServiceError | None) -> bool:
+    """Any probe answer other than a missing route identifies the hosted platform."""
+    return error is None or not route_missing(error)
 
 
 def retryable(method: str, body: Any) -> bool:
@@ -267,8 +339,11 @@ def retryable(method: str, body: Any) -> bool:
     )
 
 
-def response_value(status: int, raw: bytes) -> dict[str, Any]:
-    """Decodes bounded JSON, refusing credential forwarding and unsafe errors."""
+def response_value(status: int, raw: bytes, *, relay: bool = False) -> dict[str, Any]:
+    """Decodes bounded JSON, refusing credential forwarding and unsafe errors.
+
+    `relay` keeps a trusted service's own short error message.
+    """
     if 300 <= status < 400:
         raise ServiceError("RedirectRefused", "credential forwarding is disabled", 502)
     try:
@@ -284,8 +359,9 @@ def response_value(status: int, raw: bytes) -> dict[str, Any]:
             or any(type(v) is not str for v in detail.values())
         ):
             raise ServiceError("ProtocolError", "invalid service error", status)
+        message = detail["message"] if relay and len(detail["message"]) <= 512 else ""
         raise ServiceError(
-            public_code(detail["code"]), "service rejected request", status
+            public_code(detail["code"]), message or "service rejected request", status
         )
     return value
 
@@ -354,6 +430,8 @@ class _NoRedirect(HTTPRedirectHandler):
 class Transport:
     """No cookies, automatic retries, redirects, or credential-bearing repr."""
 
+    relay = False
+
     def __init__(
         self,
         url: str,
@@ -384,22 +462,27 @@ class Transport:
             auth_mode in ("bearer", "azure-easyauth-and-api-key"),
             "unsupported auth_mode",
         )
-        token = credential(
-            credential_from_env()[0] if token is None else token, "GF token"
-        )
+        self.platform: bool | None = None
+        if token is not None:
+            token = credential(token, "GF token")
         self._headers = {
             "Content-Type": "application/json",
             "Accept": "application/json",
             "Accept-Encoding": "identity",
         }
         if auth_mode == "azure-easyauth-and-api-key":
+            if token is None:
+                raise ServiceError(
+                    "ValidationError", "Azure auth_mode requires a GF key", 422
+                )
             self._headers["Authorization"] = "Bearer " + credential(
                 platform_token or "", "Azure platform token"
             )
             self._headers["X-GF-API-Key"] = token
         else:
             require(platform_token is None, "platform_token requires Azure auth_mode")
-            self._headers["Authorization"] = "Bearer " + token
+            if token is not None:
+                self._headers["Authorization"] = "Bearer " + token
         require(
             (modal_key is None) == (modal_secret is None),
             "Modal requires both proxy credentials",
@@ -423,6 +506,39 @@ class Transport:
         )
 
     def send(
+        self,
+        method: str,
+        path: str,
+        body: Any,
+        headers: dict[str, str],
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        """Raises HostedOnlyError for platform routes on a standalone model server.
+
+        The first missing hosted-only route triggers one probe of PLATFORM_PROBE;
+        the answer is remembered for this transport.
+        """
+        platform_route = hosted_only(method, path)
+        if platform_route and self.platform is False:
+            raise HostedOnlyError(method, path)
+        try:
+            value = self._exchange(method, path, body, headers, deadline=deadline)
+        except ServiceError as error:
+            if platform_route and self.platform is None and route_missing(error):
+                try:
+                    self._exchange("GET", PLATFORM_PROBE, None, {}, deadline=deadline)
+                    self.platform = True
+                except ServiceError as probe:
+                    self.platform = platform_from_probe(probe)
+                if not self.platform:
+                    raise HostedOnlyError(method, path) from None
+            raise
+        if platform_route:
+            self.platform = True
+        return value
+
+    def _exchange(
         self,
         method: str,
         path: str,
@@ -538,7 +654,7 @@ class Transport:
                 ) from None
         if time.monotonic() > deadline:
             raise ServiceError("Timeout", "request deadline exceeded", 504)
-        return response_value(status, bytes(raw))
+        return response_value(status, bytes(raw), relay=self.relay)
 
 
 class AsyncTransport:
@@ -556,6 +672,7 @@ class AsyncTransport:
         self.url, self.timeout = settings.url, settings.timeout
         self.retries, self.retry_delay = settings.retries, settings.retry_delay
         self._headers = settings._headers
+        self.platform: bool | None = None
         self._http = httpx.AsyncClient(
             verify=options.get("tls_context") or True,
             timeout=self.timeout,
@@ -569,6 +686,37 @@ class AsyncTransport:
         await self._http.aclose()
 
     async def send(
+        self,
+        method: str,
+        path: str,
+        body: Any,
+        headers: dict[str, str],
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
+        """Matches Transport.send hosted-only classification with one async probe."""
+        platform_route = hosted_only(method, path)
+        if platform_route and self.platform is False:
+            raise HostedOnlyError(method, path)
+        try:
+            value = await self._exchange(method, path, body, headers, deadline=deadline)
+        except ServiceError as error:
+            if platform_route and self.platform is None and route_missing(error):
+                try:
+                    await self._exchange(
+                        "GET", PLATFORM_PROBE, None, {}, deadline=deadline
+                    )
+                    self.platform = True
+                except ServiceError as probe:
+                    self.platform = platform_from_probe(probe)
+                if not self.platform:
+                    raise HostedOnlyError(method, path) from None
+            raise
+        if platform_route:
+            self.platform = True
+        return value
+
+    async def _exchange(
         self,
         method: str,
         path: str,

@@ -19,6 +19,7 @@ from generalforecast.commands import (
 from generalforecast.deployments.contracts import ServiceError
 from generalforecast.package_commands import PackageCommands
 from generalforecast.packages import Package, PackageError, PackageSpec
+from generalforecast.serve.listener import add_arguments as add_serve_arguments
 
 
 class _Parser(argparse.ArgumentParser):
@@ -35,7 +36,7 @@ class _Parser(argparse.ArgumentParser):
 def parser() -> argparse.ArgumentParser:
     """Builds one parser shared by the Python and compiled entry points."""
     common = _Parser(add_help=False)
-    for flag in ("url", "project", "profile", "output"):
+    for flag in ("url", "base-url", "key-env", "project", "profile", "output"):
         common.add_argument("--" + flag, default=argparse.SUPPRESS)
     common.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     common.add_argument("--timeout", type=float, default=argparse.SUPPRESS)
@@ -50,10 +51,7 @@ def parser() -> argparse.ArgumentParser:
     def command(title, help):
         return sub.add_parser(title, parents=[common], help=help)
 
-    login = command(
-        "login", "Verify a configured API key and save non-secret profile metadata"
-    )
-    login.add_argument("--key-env", default=argparse.SUPPRESS)
+    command("login", "Verify a configured API key and save non-secret profile metadata")
     init = command("init", "Create a package directory without downloading models")
     init.add_argument("directory")
     init.add_argument("--name")
@@ -107,18 +105,20 @@ def parser() -> argparse.ArgumentParser:
             p.add_argument("--expected-generation", type=int)
         if title == "delete":
             p.add_argument("--yes", action="store_true", required=True)
-    predict = command(
-        "predict", "Predict through the same authenticated local or remote API"
-    )
+    predict = command("predict", "Predict through a hosted environment or dev session")
     predict.add_argument("name", nargs="?")
     predict.add_argument("--path", default=".")
     predict.add_argument("--env", default="production")
     predict.add_argument("--session")
-    predict.add_argument("--local", action="store_true")
     predict.add_argument("--input", required=True)
     predict.add_argument("--context")
     predict.add_argument("--target")
     predict.add_argument("--features", nargs="+")
+    serve = sub.add_parser(
+        "serve",
+        help="Serve a package or catalog model over the Models API on this machine",
+    )
+    add_serve_arguments(serve)
     datasets = command("datasets", "Logical dataset imports and transactional writes")
     datasets.add_argument(
         "action", choices=["create", "import", "append", "label", "refresh", "status"]
@@ -181,6 +181,10 @@ def run(argv: list[str] | None = None) -> dict:
         root.mkdir(mode=0o700)
         (root / "gf.yaml").write_text(yaml.safe_dump(spec, sort_keys=False))
         return {"name": spec["name"], "created": True}
+    if args.group == "serve":
+        from generalforecast.serve import run as serve
+
+        return serve(args)
     if args.group == "check":
         require(not (args.online and args.offline), "choose offline or online")
         package = Package.load(args.path)

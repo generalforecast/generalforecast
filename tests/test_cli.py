@@ -22,6 +22,7 @@ def binary() -> Path:
     return build()
 
 
+@pytest.mark.slow
 def test_serve_keeps_its_configuration_in_the_data_and_its_key_apart(
     binary: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -70,6 +71,7 @@ def server(binary: Path, tmp_path: Path) -> Iterator[object]:
     running.stop()
 
 
+@pytest.mark.slow
 def test_bench_measures_a_server_and_leaves_no_table(
     server, capsys: pytest.CaptureFixture[str]
 ) -> None:

@@ -13,6 +13,8 @@ from generalforecast.ingest import Columns, apply, follow
 from generalforecast.models.tabicl.model import tabicl_functions
 from tests.models.tabicl.tiny import tiny_tabicl
 
+pytestmark = pytest.mark.slow
+
 COLUMNS = Columns(key="id", features=("a", "b"), target="label")
 
 

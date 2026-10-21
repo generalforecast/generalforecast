@@ -141,10 +141,13 @@ def test_verified_catalog_loader_path_executes_real_engine(monkeypatch, tmp_path
 @pytest.mark.parametrize("shared", [False, True])
 def test_catalog_forecaster_uses_shared_covariate_rows(monkeypatch, tmp_path, shared):
     from generalforecast.deployments import catalog_forecast
+    from generalforecast.models import catalog
     from tests.models.chronos2 import tiny
 
     monkeypatch.setattr(tiny, "PATCH", 16)
-    monkeypatch.setattr(tiny, "QUANTILES", catalog_forecast.QUANTILES)
+    monkeypatch.setattr(
+        tiny, "QUANTILES", catalog.ENTRIES["chronos-2"].capability.quantiles
+    )
     model = tiny.tiny_chronos2()
     monkeypatch.setattr(catalog_forecast, "_model", lambda **kwargs: model)
     context = pa.table(

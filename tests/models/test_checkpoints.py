@@ -270,3 +270,33 @@ def test_built_in_models_say_the_contexts_they_were_trained_on() -> None:
 
     assert limits == [(512, 16), (5_120, 50), (1_000_000, 2_000)]
     assert registry._trained("custom", model) is model
+
+
+def test_built_in_classifiers_say_their_native_class_slots() -> None:
+    assert {
+        name: entry.capability.class_slots
+        for name, entry in catalog.ENTRIES.items()
+        if entry.capability.task == "classification"
+    } == {
+        "tabicl-v2-classifier": 10,
+        "kumo-tabular-small-classifier": 10,
+        "kumo-tabular-medium-classifier": 10,
+        "kumo-tabular-large-classifier": 10,
+        "tabpfn-3-classifier": 160,
+        "tabpfn-3.5-classifier": 160,
+        "limix-2-classifier": 10,
+        "mitra-classifier": 10,
+        "mitra-2-classifier": 10,
+    }
+    assert (
+        catalog.ENTRIES["tabpfn-3-classifier"].capacity(
+            catalog.parse("tabpfn-3-classifier")
+        )
+        == 160
+    )
+    assert (
+        catalog.ENTRIES["tabpfn-3-classifier"].capacity(
+            catalog.parse("tabpfn-3-classifier@2")
+        )
+        == catalog.MAX_CLASSES
+    )

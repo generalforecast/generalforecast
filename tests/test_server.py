@@ -585,7 +585,7 @@ def test_tls_serves_encrypted_clients_and_refuses_plaintext(
 
 
 def test_metrics_count_rows_steps_and_encodes(binary: Path, tmp_path: Path) -> None:
-    server = Server(binary, tmp_path, timing_log=True, timers=True).start()
+    server = Server(binary, tmp_path, timing_log=True, profiles=True).start()
     try:
         _check_metrics(server)
     finally:
@@ -723,7 +723,7 @@ def test_a_page_written_once_embeds_the_written_row_and_copies_the_rest(
     assert metrics['gf_table_rows_copied_total{table="plain"}'] == "0"
 
 
-def test_worker_profiles_need_a_profiles_directory_and_stay_under_it(
+def test_worker_profiles_need_profiling_and_stay_under_its_directory(
     binary: Path, tmp_path: Path
 ) -> None:
     body = {"directory": "run-1", "seconds": 0.2}
@@ -731,7 +731,7 @@ def test_worker_profiles_need_a_profiles_directory_and_stay_under_it(
         (tmp_path / name).mkdir()
     without = Server(binary, tmp_path / "without").start()
     try:
-        with pytest.raises(pa.ArrowException, match="profiles_directory"):
+        with pytest.raises(pa.ArrowException, match=r"\[profiling\]"):
             without.action("profile_workers", body)
     finally:
         without.stop()

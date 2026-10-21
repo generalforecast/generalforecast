@@ -33,6 +33,8 @@ from generalforecast.worker import Worker
 from tests.models.conformance.cases import CASES
 from tests.models.tabicl.tiny import tiny_tabicl
 
+pytestmark = pytest.mark.slow
+
 CHECKPOINTS = Path(__file__).resolve().parents[2] / "checkpoints"
 TASKS = pytest.mark.parametrize("regression", [False, True], ids=["classes", "values"])
 FEATURES = 5

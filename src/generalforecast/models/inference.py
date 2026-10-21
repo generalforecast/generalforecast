@@ -43,8 +43,7 @@ def fit(model: tuple[TabularFunctions, Any], x: Any, y: Any, classes: int) -> An
         classes: The class count, or 0 for a regressor.
     """
     functions, parameters = model
-    with jax.default_device(jax.devices("cpu")[0]):
-        return jax.block_until_ready(_tabular(functions)[0](parameters, x, y, classes))
+    return jax.block_until_ready(_tabular(functions)[0](parameters, x, y, classes))
 
 
 def predict(
@@ -58,8 +57,7 @@ def predict(
     """
     functions, parameters = model
     state, cache = fitted
-    with jax.default_device(jax.devices("cpu")[0]):
-        result = np.asarray(_tabular(functions)[1](parameters, state, cache, x))
+    result = np.asarray(_tabular(functions)[1](parameters, state, cache, x))
     width = classes or functions.properties(parameters).num_outputs
     valid = result.shape == (x.shape[0], width) and np.isfinite(result).all()
     if valid and classes:
@@ -91,8 +89,7 @@ def forecast(
     """
     functions, parameters = model
     levels = functions.properties(parameters).quantiles
-    with jax.default_device(jax.devices("cpu")[0]):
-        result = np.asarray(_forecast(functions)(parameters, group, horizon))
+    result = np.asarray(_forecast(functions)(parameters, group, horizon))
     if (
         result.shape != (group.values.shape[0], horizon, len(levels))
         or not np.isfinite(result).all()
