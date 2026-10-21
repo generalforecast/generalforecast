@@ -13,7 +13,9 @@ jobs:
   ci:
     uses: ./.github/workflows/ci.yml
     permissions:
+      actions: read
       contents: read
+      pull-requests: read
 
   wheels:
     needs: ci
@@ -59,6 +61,7 @@ jobs:
           uv pip install --python smoke/bin/python dist/*.whl
           smoke/bin/gf --help
           smoke/bin/gf-native --help
+          smoke/bin/gf serve --help
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheel-${{ matrix.target }}

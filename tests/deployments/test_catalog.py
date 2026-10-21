@@ -1,10 +1,10 @@
 import copy
 import hashlib
 import json
+from typing import Any, cast
 
 import pytest
 
-from generalforecast.deployments import catalog_forecast
 from generalforecast.deployments.boundary import Scope, json_object
 from generalforecast.deployments.catalog import CatalogService, create_catalog
 from generalforecast.deployments.contracts import ServiceError
@@ -62,12 +62,31 @@ def test_catalog_is_pure_and_returns_copies(monkeypatch):
     assert [model["name"] for model in models] == [
         "tabicl-v2-classifier",
         "tabicl-v2-regressor",
+        *(
+            f"kumo-tabular-{size}-{task}"
+            for size in ("small", "medium", "large")
+            for task in ("classifier", "regressor")
+        ),
+        "mitra-2-classifier",
+        "mitra-2-regressor",
         "chronos-2",
+        "timestral-209m",
+        "timestral-209m-unmirrored",
+        "timestral-28m",
+        "timestral-28m-unmirrored",
     ]
+    assert {model["runtime"] for model in models} == {"cpu"}
+    assert {
+        model["runtime"] for model in CatalogService(runtime="gpu").list(SCOPE)
+    } == {"gpu"}
     assert service.list(Scope("other-project", "list")) == models
-    assert models[2]["artifact"]["revision"] == catalog_forecast.REVISION
+    chronos = next(model for model in models if model["name"] == "chronos-2")
+    assert (
+        chronos["artifact"]["revision"]
+        == catalog.ENTRIES["chronos-2"].artifact.revision
+    )
     assert all(
-        capability["state"] == "supported" for capability in models[2]["capabilities"]
+        capability["state"] == "supported" for capability in chronos["capabilities"]
     )
     models[0]["artifact"]["files"].clear()
     actual = service.get(SCOPE, "general-forecast/tabicl-v2-classifier")
@@ -261,7 +280,9 @@ def test_many_class_codes_serve_more_classes_than_slots(request_data, monkeypatc
         ("tabicl-classifier@4*8", "CapacityExceeded", 422),
         ("tabicl-regressor@2", "UnsupportedCapability", 422),
         ("chronos-2*2", "UnsupportedCapability", 422),
-        ("kumo-tabular-small-classifier", "ModelNotFound", 404),
+        ("tabpfn-3-classifier", "UnsupportedModel", 422),
+        ("timesfm-3", "UnsupportedModel", 422),
+        ("limix-2-classifier", "UnsupportedModel", 422),
         ("tabicl-classifier*2@4", "ModelNotFound", 404),
         ("tabicl-classifier@0", "ModelNotFound", 404),
         ("os:system", "ModelNotFound", 404),
@@ -270,4 +291,46 @@ def test_many_class_codes_serve_more_classes_than_slots(request_data, monkeypatc
 def test_variants_respect_gates_and_serving_policy(model, code, status):
     with pytest.raises(ServiceError) as caught:
         CatalogService().get(SCOPE, model)
+    assert (caught.value.code, caught.value.status) == (code, status)
+
+
+def test_self_hosted_serves_pinned_local_only_tabular_models():
+    hosted = CatalogService()
+    own = CatalogService(surface="self-hosted")
+    for model in ("tabpfn-3-classifier", "tabpfn-3-regressor"):
+        with pytest.raises(ServiceError) as caught:
+            hosted.get(SCOPE, model)
+        assert caught.value.code == "UnsupportedModel"
+        described = own.get(SCOPE, model)
+        assert described["license"] == catalog.ENTRIES[model].artifact.license
+    assert own.get(SCOPE, "tabicl-classifier") == hosted.get(SCOPE, "tabicl-classifier")
+    assert own.get(SCOPE, "timesfm-3")["task"] == "forecast"
+    assert [m["name"] for m in own.list(SCOPE)] == [
+        m["name"] for m in hosted.list(SCOPE)
+    ]
+    entry = catalog.ENTRIES["tabpfn-3-classifier"]
+    assert entry.allows("self-hosted") and not entry.allows("self-hosted", variant=True)
+    assert not entry.allows("remote") and not entry.gates.remote
+    assert not catalog.ENTRIES["limix-2-classifier"].allows("self-hosted")
+    kumo = catalog.ENTRIES["kumo-tabular-small-classifier"]
+    assert kumo.allows("self-hosted", variant=True) == kumo.allows(
+        "remote", variant=True
+    )
+    with pytest.raises(ServiceError):
+        CatalogService(surface=cast(Any, "local"))
+
+
+@pytest.mark.parametrize(
+    "model,code,status",
+    [
+        ("tabpfn-3-classifier@4", "UnsupportedCapability", 422),
+        ("limix-2-classifier", "UnsupportedModel", 422),
+        ("tabicl-classifier@9", "CapacityExceeded", 422),
+        ("unknown-model", "ModelNotFound", 404),
+        ("os:system", "ModelNotFound", 404),
+    ],
+)
+def test_self_hosted_refusals(model, code, status):
+    with pytest.raises(ServiceError) as caught:
+        CatalogService(surface="self-hosted").get(SCOPE, model)
     assert (caught.value.code, caught.value.status) == (code, status)

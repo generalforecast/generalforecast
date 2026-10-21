@@ -75,6 +75,7 @@ PUBLIC_ERROR_CODES = frozenset(
         "JobStorageUnavailable",
         "JobTerminal",
         "LastAdministrator",
+        "LinkConfirmationRequired",
         "LockMismatch",
         "LockOutdated",
         "LockRequired",

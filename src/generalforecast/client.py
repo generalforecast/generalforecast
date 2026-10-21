@@ -152,11 +152,16 @@ class Client:
         api_key: str | None = None,
         profile: str | Profile | None = None,
         config_path: str | Path | None = None,
+        base_url: str | None = None,
         **transport_options: Any,
     ) -> None:
-        """Resolves scoped GF_API_KEY/profile auth without persisting credentials."""
+        """Resolves scoped GF_API_KEY/profile auth without persisting credentials.
+
+        base_url targets one endpoint, such as a local `gf serve`, with no
+        credential unless api_key is given; profiles and GF_* are not read.
+        """
         self.profile, key = connection(
-            url, project, token, api_key, profile, config_path
+            url, project, token, api_key, profile, config_path, base_url
         )
         self.project = self.profile.project
         self._transport = Transport(self.profile.url, token=key, **transport_options)

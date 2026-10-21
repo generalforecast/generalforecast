@@ -111,7 +111,7 @@ def checkpoint(
             or differ from their pins.
     """
     strict = surface != "local"
-    if not entry.gates.allows(surface):
+    if not entry.allows(surface):
         raise ArtifactError(
             "UnsupportedModel", f"{entry.name} is not qualified for {surface} use"
         )

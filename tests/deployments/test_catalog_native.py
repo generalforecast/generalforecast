@@ -16,11 +16,23 @@ SCOPE = Scope("native-catalog-project", "test-catalog")
 @pytest.mark.parametrize(
     "task,model",
     [
-        ("classification", "tabicl-v2-classifier"),
-        ("regression", "tabicl-v2-regressor"),
+        (task, f"{name}-{kind}{variant if kind == 'classifier' else ''}")
+        for name in (
+            "tabicl-v2",
+            "kumo-tabular-small",
+            "kumo-tabular-medium",
+            "kumo-tabular-large",
+            "mitra-2",
+        )
+        for task, kind in (
+            ("classification", "classifier"),
+            ("regression", "regressor"),
+        )
+        for variant in ("", "@2*2")
+        if not (variant and kind == "regressor")
     ],
 )
-def test_real_pinned_tabicl_request_context(task, model, tmp_path, monkeypatch):
+def test_real_pinned_hosted_tabular_request_context(task, model, tmp_path, monkeypatch):
     request: InferenceRequest = {
         "model": model,
         "task": task,

@@ -224,7 +224,7 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
             disk,
             secrets: config.key_envs(),
             shared_fallback: cache.clone(),
-            timers: config.timers,
+            timers: config.timers(),
         })
         .await?;
         let memory = ShardSettings {
@@ -249,7 +249,7 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
             step_timeout: Duration::from_secs_f64(config.step_timeout_seconds),
             queue_bytes: config.predict_queue_bytes,
             snapshot_bytes: 1 << 30,
-            timers: config.timers,
+            timers: config.timers(),
         };
         tracing::info!(
             worker = index,
@@ -406,8 +406,12 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
     let mut service = Service::new(shards.clone(), placement, metrics)
         .with_request_budget(config.request_bytes_in_flight)
         .with_max_tables(config.max_tables)
-        .with_profiles_directory(config.profiles_directory.clone())
-        .with_timers(config.timers)
+        .with_profiling(
+            config
+                .profiling
+                .as_ref()
+                .map(|profiling| profiling.directory.clone()),
+        )
         .with_placement(&config.placement, tables.clone(), keys.clone());
     if config.require_lease {
         service = service.requiring_leases();

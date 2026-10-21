@@ -2,7 +2,7 @@
 
 from collections.abc import Sequence
 from dataclasses import asdict
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from generalforecast.deployments.boundary import (
     Capability,
@@ -40,8 +40,15 @@ MAX_QUERIES = V1_POLICY.query_rows
 MAX_FEATURES = V1_POLICY.features
 
 
-def _ref(model: str) -> ModelRef:
-    """A remote-qualified model reference, never code or an unqualified model."""
+ServingSurface = Literal["remote", "self-hosted"]
+
+
+def _ref(model: str, surface: ServingSurface = "remote") -> ModelRef:
+    """A model reference the surface may serve, never code or an unqualified model.
+
+    Hosted serving takes remote-qualified models. A self-hosted server also
+    takes a pinned model whose license only its operator can grant.
+    """
     text(model, "model")
     try:
         ref = parse(model)
@@ -52,14 +59,32 @@ def _ref(model: str) -> ModelRef:
             ) from None
         raise ServiceError(error.code, str(error), 422) from None
     gates = ref.entry.gates
-    if not gates.allows("remote"):
-        raise ServiceError(
-            "ModelNotFound", "model is not qualified for remote serving", 404
-        )
-    if not gates.allows("remote", variant=ref.variant):
-        raise ServiceError(
-            "UnsupportedCapability", f"{ref} variants are not qualified remotely", 422
-        )
+    if surface == "self-hosted" and not ref.entry.hostable:
+        if ref.variant:
+            raise ServiceError(
+                "UnsupportedCapability", f"{ref} variants are not qualified", 422
+            )
+        if not ref.entry.allows("self-hosted"):
+            raise ServiceError(
+                "UnsupportedModel", f"{ref.entry.name} has no pinned files", 422
+            )
+    else:
+        if not ref.entry.hostable:
+            raise ServiceError(
+                "UnsupportedModel",
+                f"{ref.entry.name} is local-only: its license does not permit hosted serving",
+                422,
+            )
+        if not gates.allows("remote"):
+            raise ServiceError(
+                "ModelNotFound", "model is not qualified for remote serving", 404
+            )
+        if not gates.allows("remote", variant=ref.variant):
+            raise ServiceError(
+                "UnsupportedCapability",
+                f"{ref} variants are not qualified remotely",
+                422,
+            )
     if (refused := V1_POLICY.admits(ref)) is not None:
         raise ServiceError("CapacityExceeded", f"serving policy allows {refused}", 422)
     return ref
@@ -95,10 +120,23 @@ def _capabilities(task: str) -> list[JsonObject]:
 class CatalogService:
     """Stateless curated models port; authorization belongs to the route boundary."""
 
-    def __init__(self, *, allow_downloads: bool = False):
-        """Uses cached checkpoints unless an operator explicitly enables downloads."""
+    def __init__(
+        self,
+        *,
+        allow_downloads: bool = False,
+        runtime: Literal["cpu", "gpu"] = "cpu",
+        surface: ServingSurface = "remote",
+    ):
+        """Uses cached checkpoints unless an operator explicitly enables downloads.
+
+        `runtime` is what model metadata reports: where inference executes.
+        `surface` is "self-hosted" only for a server its operator runs.
+        """
         require(type(allow_downloads) is bool, "allow_downloads must be boolean")
-        self.allow_downloads = allow_downloads
+        require(runtime in ("cpu", "gpu"), "runtime must be cpu or gpu")
+        require(surface in ("remote", "self-hosted"), "invalid serving surface")
+        self.allow_downloads, self.runtime = allow_downloads, runtime
+        self.surface: ServingSurface = surface
 
     def list(self, scope: Scope) -> list[JsonObject]:
         """Lists immutable model metadata without downloads or context retention."""
@@ -112,7 +150,7 @@ class CatalogService:
     def get(self, scope: Scope, model: str) -> JsonObject:
         """Describes support and provenance, not serving readiness or tenancy."""
         require(isinstance(scope, Scope), "expected validated scope")
-        ref = _ref(model)
+        ref = _ref(model, self.surface)
         entry = ref.entry
         bounds = {
             "context_rows": MAX_CONTEXT,
@@ -127,7 +165,7 @@ class CatalogService:
             "task": entry.capability.task,
             "artifact": _artifact(entry),
             "artifact_verification": "required-before-load",
-            "runtime": "cpu",
+            "runtime": self.runtime,
         }
         if not entry.capability.tabular:
             return {
@@ -170,6 +208,22 @@ class CatalogService:
 
     def infer(self, scope: Scope, request: InferenceRequest) -> InferenceResult:
         """Validates before model access and never writes context, query or scores."""
+        value, model = self.check(scope, request)
+        if value["task"] == "forecast":
+            from generalforecast.deployments.catalog_forecast import infer
+
+            return infer(
+                cast(JsonObject, value),
+                ref=_ref(value["model"], self.surface),
+                surface=self.surface,
+                allow_downloads=self.allow_downloads,
+            )
+        return self._tabular(value, model)
+
+    def check(
+        self, scope: Scope, request: InferenceRequest
+    ) -> tuple[InferenceRequest, JsonObject]:
+        """The request's shape and bounds, and its model's metadata, before any load."""
         require(isinstance(scope, Scope), "expected validated scope")
         value = json_object(request)
         fields(
@@ -204,11 +258,7 @@ class CatalogService:
             set(),
             {"series"} if value["task"] == "forecast" else {"quantiles"},
         )
-        if value["task"] == "forecast":
-            from generalforecast.deployments.catalog_forecast import infer
-
-            return infer(value, allow_downloads=self.allow_downloads)
-        return self._tabular(cast(InferenceRequest, value), model)
+        return cast(InferenceRequest, value), model
 
     def _tabular(self, request: InferenceRequest, model: JsonObject) -> InferenceResult:
         features = request["features"]
@@ -255,7 +305,7 @@ class CatalogService:
                     quantile_index(level)
             except ValueError as error:
                 raise ServiceError("ValidationError", str(error), 422) from None
-        ref = _ref(request["model"])
+        ref = _ref(request["model"], self.surface)
         predictions = self._predict(
             ref,
             [[row["features"][feature] for feature in features] for row in labeled],
@@ -309,7 +359,7 @@ class CatalogService:
             loaded = cast(
                 "registry.TabularModel",
                 registry.load_ref(
-                    ref, surface="remote", allow_downloads=self.allow_downloads
+                    ref, surface=self.surface, allow_downloads=self.allow_downloads
                 ),
             )
         except ArtifactError as error:

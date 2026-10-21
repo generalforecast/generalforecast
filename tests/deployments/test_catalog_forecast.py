@@ -8,12 +8,14 @@ from generalforecast.deployments import catalog_forecast
 from generalforecast.deployments.boundary import Scope, json_object
 from generalforecast.deployments.catalog import CatalogService
 from generalforecast.deployments.contracts import ServiceError
+from generalforecast.models import catalog
 from generalforecast.models.series import KNOWN, PAST, TARGET
 
 SCOPE = Scope("forecast-project", "test-catalog")
 
 
 MODEL = catalog_forecast.model
+QUANTILES = catalog.ENTRIES["chronos-2"].capability.quantiles
 
 
 @pytest.fixture
@@ -57,7 +59,7 @@ def forecast():
 
 @pytest.fixture(autouse=True)
 def no_native(monkeypatch):
-    def refuse(**_kwargs):
+    def refuse(*_args, **_kwargs):
         pytest.fail("invalid forecast must not load native weights")
 
     monkeypatch.setattr(catalog_forecast, "model", refuse)
@@ -166,9 +168,9 @@ def test_forecast_alignment_roles_and_no_request_persistence(
     before = copy.deepcopy(forecast)
     calls = []
     parameters = object()
-    properties = SimpleNamespace(quantiles=catalog_forecast.QUANTILES, patch=16)
+    properties = SimpleNamespace(quantiles=QUANTILES, patch=16)
     model = (SimpleNamespace(properties=lambda _: properties), parameters)
-    monkeypatch.setattr(catalog_forecast, "model", lambda **_: model)
+    monkeypatch.setattr(catalog_forecast, "model", lambda *_, **__: model)
 
     def run(actual_model, group, horizon):
         assert actual_model is parameters
@@ -183,7 +185,8 @@ def test_forecast_alignment_roles_and_no_request_persistence(
     result = service.infer(SCOPE, forecast)
     assert (
         forecast == before
-        and vars(service) == {"allow_downloads": False}
+        and vars(service)
+        == {"allow_downloads": False, "runtime": "cpu", "surface": "remote"}
         and list(tmp_path.iterdir()) == []
     )
     assert len(calls) == 2
@@ -211,10 +214,12 @@ def test_forecast_alignment_roles_and_no_request_persistence(
 
 @pytest.mark.parametrize("kind", ["shape", "finite", "capability", "exception"])
 def test_forecast_native_output_validation(forecast, monkeypatch, kind):
-    quantiles = (0.5,) if kind == "capability" else catalog_forecast.QUANTILES
+    quantiles = (0.5,) if kind == "capability" else QUANTILES
     properties = SimpleNamespace(quantiles=quantiles, patch=16)
     model = (SimpleNamespace(properties=lambda _: properties), None)
-    monkeypatch.setattr("generalforecast.models.registry.load", lambda *_, **__: model)
+    monkeypatch.setattr(
+        "generalforecast.models.registry.load_ref", lambda *_, **__: model
+    )
     monkeypatch.setattr(catalog_forecast, "model", MODEL)
 
     def run(*_):
@@ -233,3 +238,67 @@ def test_forecast_native_output_validation(forecast, monkeypatch, kind):
         "exception": "InferenceFailed",
     }.get(kind, "ModelOutputError")
     assert "private-request-token" not in str(caught.value)
+
+
+def fake_forecaster(monkeypatch, levels=(0.1, 0.5, 0.9), max_rows=None):
+    loads = []
+    properties = SimpleNamespace(quantiles=levels, patch=16, max_rows=max_rows)
+
+    def load_ref(ref, *, surface, allow_downloads):
+        loads.append((ref.name, surface))
+        return (SimpleNamespace(properties=lambda _: properties), object())
+
+    def run(_, group, horizon):
+        rows = group.values.shape[0]
+        return np.arange(rows * horizon * len(levels), dtype=float).reshape(
+            rows, horizon, len(levels)
+        )
+
+    monkeypatch.setattr(catalog_forecast, "model", MODEL)
+    monkeypatch.setattr("generalforecast.models.registry.load_ref", load_ref)
+    monkeypatch.setattr("generalforecast.models.inference._forecast", lambda _: run)
+    return loads
+
+
+@pytest.mark.parametrize(
+    "name", ["chronos-2", "timestral-28m", "timestral-209m", "timestral-28m-unmirrored"]
+)
+def test_each_forecaster_loads_and_reports_its_own_weights(forecast, monkeypatch, name):
+    levels = QUANTILES if name == "chronos-2" else (0.1, 0.5, 0.9)
+    loads = fake_forecaster(monkeypatch, levels)
+    forecast["model"] = name
+    result = CatalogService().infer(SCOPE, forecast)
+    entry = catalog.ENTRIES[name]
+    assert loads == [(name, "remote")]
+    assert result["artifact"]["repository"] == entry.artifact.repository
+    assert result["artifact"]["revision"] == entry.artifact.revision
+    assert result["artifact"]["license"] == entry.artifact.license
+    assert result["artifact"]["verified"] is True
+    assert list(result["outputs"][0]["quantiles"]) == ["0.1", "0.5", "0.9"]
+    json_object(dict(result))
+
+
+def test_quantiles_and_row_limit_come_from_the_loaded_model(forecast, monkeypatch):
+    forecast["model"] = "timestral-28m"
+    loads = fake_forecaster(monkeypatch, (0.2, 0.5, 0.8))
+    with pytest.raises(ServiceError) as caught:
+        CatalogService().infer(SCOPE, forecast)
+    assert caught.value.code == "UnsupportedQuantiles"
+    assert loads == [("timestral-28m", "remote")]
+    fake_forecaster(monkeypatch, max_rows=3)
+    with pytest.raises(ServiceError) as caught:
+        CatalogService().infer(SCOPE, forecast)
+    assert caught.value.code == "CapacityExceeded"
+
+
+def test_timesfm_forecasts_only_on_a_self_hosted_server(forecast, monkeypatch):
+    forecast["model"] = "timesfm-3"
+    loads = fake_forecaster(monkeypatch)
+    with pytest.raises(ServiceError) as caught:
+        CatalogService().infer(SCOPE, forecast)
+    assert caught.value.code == "UnsupportedModel" and loads == []
+    result = CatalogService(surface="self-hosted").infer(SCOPE, forecast)
+    assert loads == [("timesfm-3", "self-hosted")]
+    entry = catalog.ENTRIES["timesfm-3"]
+    assert result["artifact"]["repository"] == entry.artifact.repository
+    assert result["artifact"]["license"] == entry.artifact.license
