@@ -14,6 +14,10 @@ pub enum Action {
     Reuse,
     /// Compute it for this step only: there was no room to keep it.
     Transient,
+    /// Fit the table's state on the unit's rows, then encode them and decode
+    /// the queries that read them in the same call, keeping only the state:
+    /// a context one request brought, which may never be read again.
+    Fuse,
     /// Grow a cached series encoding by whole patches of new steps, from
     /// the slots that hold the shorter one, and keep the result.
     Extend,
@@ -27,6 +31,7 @@ impl Action {
             Self::Encode => "encode",
             Self::Reuse => "reuse",
             Self::Transient => "transient",
+            Self::Fuse => "fuse",
             Self::Extend => "extend",
         }
     }
@@ -41,6 +46,8 @@ pub enum Placed {
     Reuse(Vec<SlotId>),
     /// Computed for this step only, in no slots.
     Transient,
+    /// Fit, encoded and decoded in one call for this step only, in no slots.
+    Fuse,
     /// Grown from the encoding in `source` by whole patches of new steps,
     /// and kept in `slots`.
     Extend {
@@ -57,6 +64,7 @@ impl Placed {
             Self::Encode(_) => Action::Encode,
             Self::Reuse(_) => Action::Reuse,
             Self::Transient => Action::Transient,
+            Self::Fuse => Action::Fuse,
             Self::Extend { .. } => Action::Extend,
         }
     }
@@ -66,7 +74,7 @@ impl Placed {
     pub fn slots(&self) -> &[SlotId] {
         match self {
             Self::Encode(slots) | Self::Reuse(slots) | Self::Extend { slots, .. } => slots,
-            Self::Transient => &[],
+            Self::Transient | Self::Fuse => &[],
         }
     }
 

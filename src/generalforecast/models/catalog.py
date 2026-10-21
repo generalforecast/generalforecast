@@ -432,6 +432,30 @@ class ModelRef:
         )
 
 
+def admit(ref: ModelRef, surface: Surface) -> None:
+    """Refuses a reference `surface` may not run, before any of its code loads.
+
+    Raises:
+        ModelRefError: If it names code to import beyond local use, a model
+            not qualified for the surface, or a variant past the serving
+            policy's bounds.
+    """
+    if ref.trusted:
+        if surface != "local":
+            raise ModelRefError(
+                "UntrustedModel", "module:function models run only locally"
+            )
+        return
+    entry = ref.entry
+    if not entry.allows(surface, variant=ref.variant):
+        raise ModelRefError(
+            "UnsupportedModel",
+            f"{ref} is not qualified for {surface} use: {entry.gates.evidence}",
+        )
+    if surface != "local" and (refused := V1_POLICY.admits(ref)):
+        raise ModelRefError("CapacityExceeded", f"serving policy allows {refused}")
+
+
 def parse(spec: str, *, trusted: bool = False) -> ModelRef:
     """Parses a model reference, resolving aliases and repository ids.
 
@@ -531,6 +555,53 @@ def entry(spec: str) -> ModelEntry:
 def entries() -> tuple[ModelEntry, ...]:
     """Every built-in model, in catalog order."""
     return tuple(ENTRIES.values())
+
+
+def manifest() -> dict:
+    """The catalog as the native request validator reads it, as portable JSON.
+
+    `gf_core::catalog` compiles in the copy checked in at
+    `crates/gf-core/catalog.json`, which `python -m generalforecast.models.catalog`
+    prints and a test keeps equal to this. It carries what a request is
+    checked against before any weights load: every spelling that resolves to
+    a model, each model's task, content digest, license and pin state, the
+    classes and quantiles it serves, its gates, and the v1 serving policy.
+    """
+    return {
+        "max_classes": MAX_CLASSES,
+        "policy": {
+            "context_rows": V1_POLICY.context_rows,
+            "query_rows": V1_POLICY.query_rows,
+            "features": V1_POLICY.features,
+            "horizon": V1_POLICY.horizon,
+            "group_series": V1_POLICY.group_series,
+            "covariates": V1_POLICY.covariates,
+            "max_codes": V1_POLICY.max_codes,
+            "max_estimators": V1_POLICY.max_estimators,
+            "max_members": V1_POLICY.max_members,
+        },
+        "names": dict(sorted(_NAMES.items())),
+        "entries": [
+            {
+                "name": item.name,
+                "task": item.capability.task,
+                "digest": item.artifact.digest,
+                "pinned": bool(item.artifact.files),
+                "hostable": item.hostable,
+                "bounds": {
+                    "classes": item.capability.class_slots,
+                    "quantiles": list(item.capability.quantiles),
+                    "quantile_step": item.capability.quantile_step,
+                },
+                "gates": {
+                    "package": item.gates.package,
+                    "remote": item.gates.remote,
+                    "variants": sorted(item.gates.variants),
+                },
+            }
+            for item in _ALL
+        ],
+    }
 
 
 def _files(name: str) -> MappingProxyType:
@@ -816,3 +887,9 @@ _NAMES: dict[str, str] = {
     for item in _ALL
     for alias in (item.name, item.repository_id, *item.aliases)
 }
+
+
+if __name__ == "__main__":
+    import json
+
+    print(json.dumps(manifest(), indent=2))

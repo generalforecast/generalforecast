@@ -8,6 +8,7 @@ import pytest
 from generalforecast.deployments.boundary import Scope, json_object
 from generalforecast.deployments.catalog import create_catalog
 from generalforecast.deployments.interfaces import InferenceRequest
+from tests.utils.engine import tabular_request
 
 pytestmark = pytest.mark.slow
 SCOPE = Scope("native-catalog-project", "test-catalog")
@@ -81,24 +82,18 @@ def test_real_pinned_hosted_tabular_request_context(task, model, tmp_path, monke
     ],
 )
 def test_real_pinned_local_kumo_and_mitra_weights(model):
-    import jax.numpy as jnp
-
-    from generalforecast.models import inference, registry
+    from generalforecast import engine
+    from generalforecast.models.catalog import parse
 
     classifier = model.endswith("-classifier")
-    classes = 2 if classifier else 0
-    loaded = registry.load_tabular(model)
-    context = jnp.array(
-        [[-1, 0], [-0.5, 0.25], [0.1, 0.4], [0.4, 0.5], [0.9, 1.1], [1.2, 1]],
-        dtype=jnp.float32,
-    )
-    targets = jnp.array(
-        [0, 0, 0, 1, 1, 1] if classifier else [-1, -0.5, 0.1, 0.4, 0.9, 1.2],
-        dtype=jnp.int32 if classifier else jnp.float32,
-    )
-    fitted = inference.fit(loaded, context, targets, classes)
-    outputs = inference.predict(
-        loaded, fitted, jnp.array([[0.2, 0.3], [0.8, 0.9]], dtype=jnp.float32), classes
+    outputs = engine.local(allow_downloads=True).tabular(
+        parse(model),
+        tabular_request(
+            model,
+            [[-1, 0], [-0.5, 0.25], [0.1, 0.4], [0.4, 0.5], [0.9, 1.1], [1.2, 1]],
+            [0, 0, 0, 1, 1, 1] if classifier else [-1, -0.5, 0.1, 0.4, 0.9, 1.2],
+            [[0.2, 0.3], [0.8, 0.9]],
+        ),
     )
     assert outputs.shape == (2, 2 if classifier else 999)
     assert np.isfinite(outputs).all()
@@ -154,7 +149,7 @@ def test_real_pinned_chronos_grouped_known_future_forecast(tmp_path, monkeypatch
     assert result["artifact"]["verified"] is True
     assert (
         result["artifact"]["digest"]
-        == "sha256:11b8442ad8a70e4cae0f95fba1a4dac767ed6e60bbdc9870a4fccf5e4ff38c88"
+        == "sha256:f29896cb84d2c1b74cec30fe21c2f811bf50af92e381bf41f4093057a1bcd3a4"
     )
     assert result["context_provenance"]["usable_observations"] == 30
     assert result["context_provenance"]["persisted"] is False
@@ -175,5 +170,5 @@ def test_real_pinned_chronos_grouped_known_future_forecast(tmp_path, monkeypatch
     request["queries"][0]["group"] = ["a"]
     ungrouped = service.infer(SCOPE, request)["outputs"][0]["quantiles"]["0.5"]
     assert not np.array_equal(original, ungrouped)
-    assert list(tmp_path.iterdir()) == [] and vars(service) == {"allow_downloads": True}
+    assert list(tmp_path.iterdir()) == [] and vars(service) == vars(create_catalog())
     json_object(dict(result))

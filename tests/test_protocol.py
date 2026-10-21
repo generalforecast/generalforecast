@@ -124,3 +124,35 @@ def test_series_frames_read_and_write_as_the_server_does() -> None:
         1, 2, True, 0, 9, None, 0, False, series=True, patch=16
     )
     assert protocol.reply(forecaster)["patch"] == 16
+
+
+def test_controls_carry_tables_and_tiers_changes_in_one_frame() -> None:
+    header = {
+        "kind": "controls",
+        "requests": [
+            {
+                "kind": "add_table",
+                "table": 3,
+                "model": "tiny",
+                "classes": 2,
+                "features": 4,
+                "categorical": [1],
+                "page_size": 64,
+                "summary": "table",
+                "series": False,
+            },
+            {"kind": "remove_table", "table": 2},
+        ],
+    }
+    controls = protocol.request(header, [])
+    assert isinstance(controls, protocol.Controls)
+    added, removed = controls.requests
+    assert isinstance(added, protocol.AddTable) and added.categorical == (1,)
+    assert removed == protocol.RemoveTable(2)
+    failed = protocol.Controlled([protocol.ControlFailure(1, "KeyError: 2")])
+    assert protocol.reply(failed) == {
+        "kind": "controlled",
+        "failures": [{"index": 1, "message": "KeyError: 2"}],
+    }
+    with pytest.raises(ValueError, match="must be controls"):
+        protocol.request({"kind": "controls", "requests": [{"kind": "record"}]}, [])

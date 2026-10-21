@@ -809,16 +809,29 @@ dependencies = [
 name = "gf-core"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-cast",
+ "arrow-schema",
+ "arrow-select",
  "roaring",
+ "serde",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
 name = "gf-py"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-select",
  "gf-core",
+ "gf-server",
  "numpy",
  "pyo3",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -850,7 +863,9 @@ dependencies = [
  "arrow-array",
  "arrow-cast",
  "arrow-flight",
+ "arrow-ipc",
  "arrow-schema",
+ "arrow-select",
  "axum",
  "bytes",
  "chacha20poly1305",
@@ -859,6 +874,7 @@ dependencies = [
  "getrandom 0.3.4",
  "gf-assign",
  "gf-core",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",
@@ -866,6 +882,7 @@ dependencies = [
  "tokio-stream",
  "toml",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "zeroize",
@@ -1833,12 +1850,14 @@ dependencies = [
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "wasm-streams",
  "web-sys",
  "webpki-roots",
 ]
@@ -2674,6 +2693,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23f0c9c52aa7cd7d77769a4cfe2a9adb1b331f489a41d912ce14513d5ab995c6"
 dependencies = [
  "unicode-ident",
+]
+
+[[package]]
+name = "wasm-streams"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
+dependencies = [
+ "futures-util",
+ "js-sys",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

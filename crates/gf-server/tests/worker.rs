@@ -107,3 +107,53 @@ async fn a_worker_that_stops_reading_never_blocks_sends() {
         "sending waited on a worker that reads nothing"
     );
 }
+
+#[test]
+fn cpu_workers_each_take_a_run_of_cores() {
+    use gf_server::worker::cpu_groups;
+    let cpus: Vec<usize> = (0..8).collect();
+    assert_eq!(
+        cpu_groups(&cpus, 2),
+        vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]]
+    );
+    // Cores left over go to the last worker; a machine short of a run still gets one.
+    assert_eq!(
+        cpu_groups(&cpus[..7], 3),
+        vec![vec![0, 1, 2], vec![3, 4, 5, 6]]
+    );
+    assert_eq!(cpu_groups(&cpus[..1], 2), vec![vec![0]]);
+    assert_eq!(cpu_groups(&[4, 6], 0), vec![vec![4], vec![6]]);
+}
+
+#[test]
+fn cpu_workers_take_the_default_run_of_cores_when_none_is_given() {
+    use gf_server::config::WorkerConfig;
+    use gf_server::worker::{CPU_WORKER_CORES, allowed_cpus, cpu_groups, visible_gpus};
+    if !visible_gpus().is_empty() {
+        return;
+    }
+    let cpus = allowed_cpus().expect("Linux lists the allowed cores");
+    let worker = |cpu_threads| WorkerConfig {
+        command: Vec::new(),
+        per_gpu: true,
+        cpu_threads,
+        models: std::collections::BTreeMap::new(),
+    };
+    let cores = |cpu_threads| {
+        gf_server::runtime::seats(&[worker(cpu_threads)])
+            .into_iter()
+            .map(|seat| seat.cpus.expect("a CPU seat is pinned"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(cores(None), cpu_groups(&cpus, CPU_WORKER_CORES));
+    assert_eq!(cores(Some(1)), cpu_groups(&cpus, 1));
+}
+
+#[test]
+fn the_allowed_cores_are_read_from_the_process_affinity() {
+    let cpus = gf_server::worker::allowed_cpus().expect("Linux lists the allowed cores");
+    assert_eq!(
+        cpus.len(),
+        std::thread::available_parallelism().unwrap().get()
+    );
+}

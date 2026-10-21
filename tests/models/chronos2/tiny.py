@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import Any
 
 import jax.numpy as jnp
@@ -21,11 +22,15 @@ MAX_OUTPUT_PATCHES = 4
 QUANTILES = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 
 
-def tiny_checkpoint(seed: int = 0) -> tuple[dict[str, Any], dict[str, Any]]:
+def tiny_checkpoint(
+    seed: int = 0, patch: int = PATCH, quantiles: Sequence[float] = QUANTILES
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """A small random checkpoint, as Amazon publishes them.
 
     Args:
         seed: Seed for the weights.
+        patch: Input and output patch length.
+        quantiles: Quantile levels it forecasts.
 
     Returns:
         The state dict and settings.
@@ -49,7 +54,7 @@ def tiny_checkpoint(seed: int = 0) -> tuple[dict[str, Any], dict[str, Any]]:
         linear(f"{prefix}.residual_layer", outputs, inputs)
 
     arrays["shared.weight"] = rng.normal(size=(2, EMBED))
-    residual_block("input_patch_embedding", 3 * PATCH, EMBED)
+    residual_block("input_patch_embedding", 3 * patch, EMBED)
     for index in range(LAYERS):
         prefix = f"encoder.block.{index}.layer"
         for step in (0, 1):
@@ -60,7 +65,7 @@ def tiny_checkpoint(seed: int = 0) -> tuple[dict[str, Any], dict[str, Any]]:
         linear(f"{prefix}.2.mlp.wi", FF, EMBED, False)
         linear(f"{prefix}.2.mlp.wo", EMBED, FF, False)
     norm("encoder.final_layer_norm")
-    residual_block("output_patch_embedding", EMBED, len(QUANTILES) * PATCH)
+    residual_block("output_patch_embedding", EMBED, len(quantiles) * patch)
     state = {key: jnp.asarray(value, jnp.float32) for key, value in arrays.items()}
     settings = {
         "model_type": "t5",
@@ -77,11 +82,11 @@ def tiny_checkpoint(seed: int = 0) -> tuple[dict[str, Any], dict[str, Any]]:
         "dropout_rate": 0.1,
         "chronos_config": {
             "context_length": CONTEXT,
-            "input_patch_size": PATCH,
-            "input_patch_stride": PATCH,
-            "output_patch_size": PATCH,
+            "input_patch_size": patch,
+            "input_patch_stride": patch,
+            "output_patch_size": patch,
             "max_output_patches": MAX_OUTPUT_PATCHES,
-            "quantiles": list(QUANTILES),
+            "quantiles": list(quantiles),
             "time_encoding_scale": CONTEXT,
             "use_reg_token": True,
             "use_arcsinh": True,
@@ -100,3 +105,25 @@ def tiny_chronos2(seed: int = 0) -> Chronos2:
         The model.
     """
     return chronos2_from_state(*tiny_checkpoint(seed))
+
+
+def forecaster() -> tuple[Any, Chronos2]:
+    """A tiny Chronos-2 as a model spec target: `tests.models.chronos2.tiny:forecaster`."""
+    from generalforecast.models.chronos2.model import chronos2_functions
+
+    return chronos2_functions, tiny_chronos2()
+
+
+def catalog_forecaster() -> tuple[Any, Chronos2]:
+    """A tiny Chronos-2 shaped as the catalog's: its patch and quantile levels.
+
+    The model spec target `tests.models.chronos2.tiny:catalog_forecaster`
+    stands in for `chronos-2`, whose published capabilities it matches.
+    """
+    from generalforecast.models import catalog
+    from generalforecast.models.chronos2.model import chronos2_functions
+
+    quantiles = catalog.ENTRIES["chronos-2"].capability.quantiles
+    return chronos2_functions, chronos2_from_state(
+        *tiny_checkpoint(patch=16, quantiles=quantiles)
+    )

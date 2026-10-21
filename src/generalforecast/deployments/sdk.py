@@ -444,7 +444,11 @@ def prediction_payload(
     features: Sequence[str] | None = None,
     options: JsonObject | None = None,
 ) -> JsonObject:
-    """Keeps queries and context separate; never writes prediction inputs."""
+    """Keeps queries and context separate; never writes prediction inputs.
+
+    An empty context list or tuple is no context rows, as a snapshot package's
+    request context is, since a table of no columns has none to normalize.
+    """
     if features is not None:
         require(
             not isinstance(features, str)
@@ -454,7 +458,11 @@ def prediction_payload(
         )
     payload: JsonObject = {"queries": records(queries, columns=features)}
     if context is not None:
-        payload["context"] = records(context, columns=context_columns)
+        payload["context"] = (
+            []
+            if isinstance(context, (list, tuple)) and not context
+            else records(context, columns=context_columns)
+        )
     if target is not None:
         payload["target"] = target
     if features is not None:
