@@ -72,6 +72,7 @@ use crate::protocol::{
     Frame, ModelProfile, Outcome, Predictions, WorkerReply, WorkerRequest, movements_json,
     outcome_from, step_frame,
 };
+use crate::service::Charge;
 use crate::wal::{
     self, Compacted, Compactor, CreationId, EncryptionKey, Log, LogEntry, LogError, PastWrite,
     Record, Replay, RowSealer, Rows, TableDefinition, Terms, decode,
@@ -373,11 +374,13 @@ pub struct LogLength {
     pub created: Option<CreationId>,
 }
 
-/// A client write waiting to be committed with the others that arrived with it.
+/// A client write waiting to be committed with the others that arrived with
+/// it, holding its share of the request budget until it is answered.
 struct Queued {
     table: TableName,
     write: Write,
     fence: Fence,
+    charge: Charge,
     reply: Reply<Written>,
 }
 
@@ -387,6 +390,7 @@ struct Staged {
     id: TableId,
     record: Record,
     log_length: u64,
+    charge: Charge,
     reply: Reply<Written>,
 }
 
@@ -575,6 +579,9 @@ pub enum Command {
         table: TableName,
         write: Write,
         fence: Fence,
+        /// What the write holds of the server's request budget, given back
+        /// once the shard has answered it.
+        charge: Charge,
         reply: Reply<Written>,
     },
     Refit {
@@ -1123,6 +1130,7 @@ impl Shard {
                 table,
                 write,
                 fence,
+                charge,
                 reply,
             } => self.queue(
                 batch,
@@ -1130,6 +1138,7 @@ impl Shard {
                     table,
                     write,
                     fence,
+                    charge,
                     reply,
                 },
             ),
@@ -1143,6 +1152,7 @@ impl Shard {
                     table,
                     write: Write::Refit,
                     fence,
+                    charge: Charge::default(),
                     reply,
                 },
             ),
@@ -2713,6 +2723,7 @@ impl Shard {
                 table,
                 write,
                 fence,
+                charge,
                 reply,
             } = next;
             let prepared = self.prepare(&table, write);
@@ -2760,6 +2771,7 @@ impl Shard {
                         id,
                         record,
                         log_length,
+                        charge,
                         reply,
                     });
                 }
@@ -2795,17 +2807,20 @@ impl Shard {
             id,
             record,
             log_length,
+            charge,
             reply,
         } in staged
         {
             if let Err(error) = &synced[&table] {
                 self.metrics.requests_failed.add(1);
+                drop(charge);
                 let _ = reply.send(Err(error.clone()));
                 continue;
             }
             // Records after one the rows could not take wait for the replay.
             if let Err(error) = self.usable(&table) {
                 self.metrics.requests_failed.add(1);
+                drop(charge);
                 let _ = reply.send(Err(error));
                 continue;
             }
@@ -2821,6 +2836,7 @@ impl Shard {
                     Err(error)
                 }
             };
+            drop(charge);
             let _ = reply.send(written);
             applied.push((table, id));
         }
