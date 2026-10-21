@@ -130,7 +130,8 @@ impl RequestBudget {
     }
 }
 
-/// What one call holds of the budget; given back when dropped.
+/// What one call holds of the budget; given back when dropped. The default
+/// holds nothing, of a budget of its own.
 #[derive(Debug)]
 pub struct Charge {
     held: Arc<AtomicU64>,
@@ -166,6 +167,12 @@ impl Charge {
             limit: self.limit,
             bytes: 0,
         }
+    }
+}
+
+impl Default for Charge {
+    fn default() -> Self {
+        RequestBudget::new(u64::MAX).charge()
     }
 }
 
@@ -1191,7 +1198,9 @@ async fn descriptor(stream: &mut Peekable<Streaming<FlightData>>) -> Option<Flig
     }
 }
 
-/// The record batches in a Flight stream, charged to `charge` as they arrive.
+/// The record batches in a Flight stream, charged to `charge` as they
+/// arrive, and the charge, which the call holds until the shard has answered
+/// what the batches became.
 ///
 /// `DoExchange` clients may open with a message that holds only the descriptor,
 /// so messages without an Arrow header are skipped. A stream past
@@ -1199,11 +1208,14 @@ async fn descriptor(stream: &mut Peekable<Streaming<FlightData>>) -> Option<Flig
 /// is refused as it arrives.
 async fn batches(
     stream: Peekable<Streaming<FlightData>>,
-    mut charge: Charge,
-) -> Result<Vec<RecordBatch>, Status> {
+    charge: Charge,
+) -> Result<(Vec<RecordBatch>, Charge), Status> {
     let mut received = 0;
     let mut decoded = 0;
-    let mut decoded_charge = charge.split();
+    // Shared by the wire and the decoder, whose streams outlive no call.
+    let charge = Arc::new(std::sync::Mutex::new(charge));
+    let wire_charge = Arc::clone(&charge);
+    let decoded_charge = Arc::clone(&charge);
     let messages = stream
         .try_filter(|message| futures::future::ready(!message.data_header.is_empty()))
         .and_then(move |message| {
@@ -1214,12 +1226,15 @@ async fn batches(
                     REQUEST_BYTES >> 20
                 )))
             } else {
-                charge.grow(message.data_body.len() as u64)
+                wire_charge
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .grow(message.data_body.len() as u64)
             };
             futures::future::ready(taken.map(|()| message))
         })
         .map_err(|status| FlightError::Tonic(Box::new(status)));
-    FlightRecordBatchStream::new_from_flight_data(messages)
+    let batches: Vec<RecordBatch> = FlightRecordBatchStream::new_from_flight_data(messages)
         .and_then(move |batch| {
             // The wire bounds nothing once decoded: a column of Arrow's null
             // type takes no bytes however many rows its header claims.
@@ -1231,7 +1246,10 @@ async fn batches(
                     REQUEST_BYTES >> 20
                 )))
             } else {
-                decoded_charge.grow(bytes as u64)
+                decoded_charge
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .grow(bytes as u64)
             };
             futures::future::ready(
                 taken
@@ -1244,7 +1262,12 @@ async fn batches(
         .map_err(|error| match error {
             FlightError::Tonic(status) => *status,
             error => invalid(format!("bad Arrow data: {error}")),
-        })
+        })?;
+    let charge = Arc::into_inner(charge)
+        .expect("the streams that shared the charge are done")
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+    Ok((batches, charge))
 }
 
 /// Bytes a batch takes once decoded for the shard, beyond the Arrow data it
@@ -2004,7 +2027,7 @@ impl Service {
         let mut laps = self.laps(Instant::now);
         let placement = self.placement(&table).await?;
         let mut route = laps.lap();
-        let batches = batches(stream, self.budget.charge()).await?;
+        let (batches, charge) = batches(stream, self.budget.charge()).await?;
         let write = match command {
             PutCommand::Insert => Write::Insert(changes(&batches, &placement, id, false)?),
             PutCommand::Update => Write::Update(changes(&batches, &placement, id, false)?),
@@ -2029,6 +2052,7 @@ impl Service {
                 table,
                 write,
                 fence,
+                charge,
                 reply,
             })
             .await
@@ -2091,7 +2115,7 @@ impl Service {
         }
         let mut laps = self.laps(|| started);
         let mut route = laps.lap();
-        let batches = batches(stream, self.budget.charge()).await?;
+        let (batches, _charge) = batches(stream, self.budget.charge()).await?;
         let (features, strings, rows) = features(&batches, &placement.columns)?;
         if rows == 0 {
             return Err(invalid("no query rows"));
@@ -2157,7 +2181,7 @@ impl Service {
             })?;
         let mut laps = self.laps(|| started);
         let mut route = laps.lap();
-        let batches = batches(stream, self.budget.charge()).await?;
+        let (batches, _charge) = batches(stream, self.budget.charge()).await?;
         let keys = series_column(&batches)?;
         if keys.is_empty() {
             return Err(invalid("no series to forecast"));
@@ -2205,7 +2229,7 @@ impl Service {
         stream: Peekable<Streaming<FlightData>>,
     ) -> Result<Response<Boxed<FlightData>>, Status> {
         let placement = self.placement(table).await?;
-        let batches = batches(stream, self.budget.charge()).await?;
+        let (batches, _charge) = batches(stream, self.budget.charge()).await?;
         let (features, strings, rows) = features(&batches, &placement.columns)?;
         if rows == 0 {
             return Err(invalid("no query rows"));
@@ -2246,7 +2270,7 @@ impl Service {
         stream: Peekable<Streaming<FlightData>>,
     ) -> Result<Response<Boxed<FlightData>>, Status> {
         let placement = self.placement(table).await?;
-        let batches = batches(stream, self.budget.charge()).await?;
+        let (batches, _charge) = batches(stream, self.budget.charge()).await?;
         let (features, strings, rows) = features(&batches, &placement.columns)?;
         if rows == 0 {
             return Err(invalid("no query rows"));
@@ -2290,7 +2314,7 @@ impl Service {
             serde_json::from_slice(body).map_err(|error| invalid(error.to_string()))?
         };
         let placement = self.placement(table).await?;
-        let batches = batches(stream, self.budget.charge()).await?;
+        let (batches, _charge) = batches(stream, self.budget.charge()).await?;
         let (features, strings, rows) = features(&batches, &placement.columns)?;
         if rows == 0 {
             return Err(invalid("no query rows"));
@@ -2346,7 +2370,7 @@ impl Service {
         }
         let mut laps = self.laps(|| started);
         let mut route = laps.lap();
-        let batches = batches(stream, self.budget.charge()).await?;
+        let (batches, _charge) = batches(stream, self.budget.charge()).await?;
         let rows = partition::read_rows(&batches, &placement.columns).map_err(invalid)?;
         let decode = laps.lap();
         let counts = self.metrics.table(table);
@@ -2534,6 +2558,7 @@ impl Service {
                             id: write_id,
                         },
                         fence,
+                        charge: Charge::default(),
                         reply,
                     })
                     .await?;
@@ -2596,6 +2621,7 @@ impl Service {
                         table,
                         write: Write::Truncate,
                         fence,
+                        charge: Charge::default(),
                         reply,
                     })
                     .await?;

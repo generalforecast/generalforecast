@@ -16,7 +16,8 @@
 //!
 //! Up to `FLAT_REGIONS` regions are one level of k-means: k-means++ seeding,
 //! then Lloyd rounds over a sample of at least `SAMPLE_PER_REGION` rows a
-//! region. Past that, regions are the leaves of two levels: about sqrt(k)
+//! region, but no more than `MOST_SAMPLE` rows unless there are more regions,
+//! when each region has one. Past that, regions are the leaves of two levels: about sqrt(k)
 //! top centers, then each top cluster's share of k within it, so a row or
 //! query goes to its nearest top center and then its nearest leaf there.
 
@@ -37,6 +38,9 @@ const REGION_SEED: u64 = 0x7265_6769_6f6e_7321;
 
 /// Sample rows each region is drawn from, at least where the table has them.
 const SAMPLE_PER_REGION: u64 = 32;
+
+/// Sample rows regions are drawn from at most, unless there are more regions.
+const MOST_SAMPLE: u64 = 1 << 18;
 
 /// Lloyd rounds after seeding, at each level.
 const LLOYD_ROUNDS: usize = 6;
@@ -209,7 +213,8 @@ pub(crate) struct Regions {
 
 impl Regions {
     /// Regions of about `per_region` of the `live` rows each, drawn from a
-    /// sample of at least `SAMPLE_PER_REGION` rows a region, seeded by keys.
+    /// sample of `SAMPLE_PER_REGION` rows a region, seeded by keys, but of
+    /// at most `MOST_SAMPLE` rows or one a region.
     ///
     /// # Errors
     ///
@@ -237,7 +242,10 @@ impl Regions {
                 rows: per_region,
             });
         }
-        let wanted = usize::try_from(count.saturating_mul(SAMPLE_PER_REGION)).unwrap_or(usize::MAX);
+        let wanted = count
+            .saturating_mul(SAMPLE_PER_REGION)
+            .min(MOST_SAMPLE.max(count));
+        let wanted = usize::try_from(wanted).unwrap_or(usize::MAX);
         let sample = smallest(REGION_SEED, live, wanted, keys);
         let mut ranked: Vec<(u64, Vec<f32>)> = Vec::with_capacity(sample.len() as usize);
         for row in sample.iter() {
@@ -443,10 +451,13 @@ fn k_means(points: &[Vec<f32>], count: usize, seed: u64, dimensions: usize) -> V
         return vec![vec![0.0; dimensions]];
     };
     let mut centers = vec![first.clone()];
-    let mut nearest_distance: Vec<f64> =
+    let mut nearest_distance: Vec<f32> =
         points.iter().map(|point| distance(point, first)).collect();
     while centers.len() < count.min(points.len()) {
-        let total: f64 = nearest_distance.iter().sum();
+        let total: f64 = nearest_distance
+            .iter()
+            .map(|&distance| f64::from(distance))
+            .sum();
         if total <= 0.0 {
             break;
         }
@@ -456,7 +467,7 @@ fn k_means(points: &[Vec<f32>], count: usize, seed: u64, dimensions: usize) -> V
         let chosen = nearest_distance
             .iter()
             .position(|&distance| {
-                reached += distance;
+                reached += f64::from(distance);
                 reached > draw
             })
             .unwrap_or(points.len() - 1);
@@ -491,7 +502,7 @@ fn k_means(points: &[Vec<f32>], count: usize, seed: u64, dimensions: usize) -> V
 
 /// The index of the center nearest `vector`, ties to the lower.
 fn nearest(centers: &[Vec<f32>], vector: &[f32]) -> usize {
-    let mut best = (f64::INFINITY, 0);
+    let mut best = (f32::INFINITY, 0);
     for (index, center) in centers.iter().enumerate() {
         let distance = distance(center, vector);
         if distance < best.0 {
@@ -502,9 +513,56 @@ fn nearest(centers: &[Vec<f32>], vector: &[f32]) -> usize {
 }
 
 /// The squared distance between two vectors.
-fn distance(left: &[f32], right: &[f32]) -> f64 {
+fn distance(left: &[f32], right: &[f32]) -> f32 {
     left.iter()
         .zip(right)
-        .map(|(&left, &right)| (f64::from(left) - f64::from(right)).powi(2))
+        .map(|(&left, &right)| (left - right) * (left - right))
         .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::{MOST_SAMPLE, Regions};
+    use crate::cache::Epoch;
+    use crate::context::Context;
+    use crate::pages::Vectors;
+    use crate::rows::RowsError;
+    use crate::table::{Keys, RowId};
+
+    /// One vector for every row, so k-means has nothing to seed past its
+    /// first center, counting how many are read.
+    struct Counted(Cell<u64>);
+
+    impl Vectors for Counted {
+        fn vector(&self, _: RowId) -> Result<Vec<f32>, RowsError> {
+            self.0.set(self.0.get() + 1);
+            Ok(vec![1.0, 2.0])
+        }
+    }
+
+    struct Ids;
+
+    impl Keys for Ids {
+        fn key(&self, row: RowId) -> u128 {
+            u128::from(row.0)
+        }
+    }
+
+    /// Vectors read to draw regions of `per_region` of `rows` live rows.
+    fn read(rows: u32, per_region: u64) -> u64 {
+        let live: Context = (0..rows).map(RowId).collect();
+        let vectors = Counted(Cell::new(0));
+        Regions::draw((Epoch(0), 0, 0), &live, per_region, 2, &vectors, &Ids).unwrap();
+        vectors.0.get()
+    }
+
+    #[test]
+    fn regions_are_drawn_from_a_sample_of_at_most_its_cap_or_one_row_a_region() {
+        assert_eq!(read(1_000, 4), 1_000);
+        assert_eq!(read(300_000, 1_024), 293 * 32);
+        assert_eq!(read(300_000, 16), MOST_SAMPLE);
+        assert_eq!(read(300_000, 1), 300_000);
+    }
 }
