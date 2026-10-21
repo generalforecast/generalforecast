@@ -98,6 +98,10 @@ tokens = [{token:?}]
 # metrics_listen = "127.0.0.1:9090"   # /metrics, /healthz, /readyz
 # timing_log = "/var/log/generalforecast/timings.jsonl"   # a JSON line per prediction request
 
+# For generalforecast's developers: turns on timers and allows profile_workers captures.
+# [profiling]
+# directory = "/var/lib/generalforecast/profiles"
+
 [[workers]]
 command = [{python:?}, "-m", "generalforecast.worker_process"]
 per_gpu = true                      # one worker per visible NVIDIA GPU, else one
@@ -456,14 +460,21 @@ mod tests {
     }
 
     #[test]
-    fn timers_are_off_unless_set() {
+    fn timers_run_only_where_the_server_profiles() {
         let directory = tempdir();
         let path = directory.join("generalforecast.toml");
         let base = starter_config(&starter(&directory));
         std::fs::write(&path, &base).unwrap();
-        assert!(!Config::load(&path).unwrap().timers);
-        std::fs::write(&path, format!("timers = true\n{base}")).unwrap();
-        assert!(Config::load(&path).unwrap().timers);
+        let plain = Config::load(&path).unwrap();
+        assert!(!plain.timers() && plain.profiling.is_none());
+        std::fs::write(&path, format!("{base}\n[profiling]\ndirectory = \"p\"\n")).unwrap();
+        let profiled = Config::load(&path).unwrap();
+        assert!(profiled.timers());
+        assert_eq!(profiled.profiling.unwrap().directory, Path::new("p"));
+        for removed in ["timers = true", "profiles_directory = \"p\""] {
+            std::fs::write(&path, format!("{removed}\n{base}")).unwrap();
+            assert!(Config::load(&path).is_err(), "{removed}");
+        }
     }
 
     #[test]

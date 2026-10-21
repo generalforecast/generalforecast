@@ -292,13 +292,6 @@ class PackageCommands:
         """Reads JSON requests or local tabular queries and preserves result metadata."""
         args = self.args
         deployment = name(args.name or Package.load(args.path).spec.name)
-        if args.local:
-            require(
-                self.client._transport.url.startswith(
-                    ("http://127.0.0.1:", "http://localhost:", "http://[::1]:")
-                ),
-                "--local requires a loopback endpoint",
-            )
         input_path = (
             Path(args.input)
             if Path(args.input).is_absolute()

@@ -1,8 +1,13 @@
-"""Pinned Chronos-2 Models API adapter: request validation over shared aligned groups."""
+"""Models API forecasting for every catalog forecaster, over shared aligned groups.
+
+The requested reference picks the model; its quantiles, patch and row limit
+come from the loaded weights, and provenance names the model that ran.
+"""
 
 import math
+from collections.abc import Sequence
 from itertools import pairwise
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from generalforecast.deployments.boundary import JsonObject
 from generalforecast.deployments.catalog import quantile_levels
@@ -15,30 +20,48 @@ from generalforecast.deployments.contracts import (
     text,
 )
 from generalforecast.deployments.interfaces import InferenceResult
-from generalforecast.models import catalog, inference
-from generalforecast.models.catalog import V1_POLICY
+from generalforecast.models import inference
+from generalforecast.models.catalog import (
+    V1_POLICY,
+    ModelEntry,
+    ModelRef,
+    ModelRefError,
+)
 from generalforecast.models.grouping import AlignmentError, aligned_group
 from generalforecast.models.outputs import quantile_index
 
-ENTRY = catalog.ENTRIES["chronos-2"]
-REPOSITORY = ENTRY.artifact.repository
-REVISION = ENTRY.artifact.revision
-FILES = dict(ENTRY.artifact.files)
-QUANTILES = ENTRY.capability.quantiles
+Surface = Literal["remote", "self-hosted"]
 
 
-def provenance() -> JsonObject:
-    """Identifies raw upstream bytes and the pinned model-card license declaration."""
+def provenance(entry: ModelEntry) -> JsonObject:
+    """Identifies the forecaster's pinned upstream bytes and license declaration."""
     return {
-        **artifact(REPOSITORY, REVISION, str(ENTRY.artifact.license), FILES),
-        "license_source": ENTRY.artifact.license_source,
+        **artifact(
+            entry.artifact.repository,
+            entry.artifact.revision,
+            str(entry.artifact.license),
+            dict(entry.artifact.files),
+        ),
+        "license_source": entry.artifact.license_source,
     }
 
 
+def _unsupported(levels: Sequence[float], available: Sequence[float]) -> None:
+    if not set(levels) <= set(available):
+        raise ServiceError(
+            "UnsupportedQuantiles",
+            "the model only returns its own published quantile levels",
+            422,
+        )
+
+
 def validate(
-    request: JsonObject,
+    request: JsonObject, quantiles: Sequence[float] = ()
 ) -> tuple[JsonObject, dict[str, dict[int | float, JsonObject]]]:
-    """Rejects leakage, mixed time axes and invalid known-future shapes."""
+    """Rejects leakage, mixed time axes and invalid known-future shapes.
+
+    `quantiles` are the model's levels when they are known before loading it.
+    """
     require(
         not request["features"], "forecast uses series covariates, not tabular features"
     )
@@ -55,12 +78,8 @@ def validate(
         f"horizon must be 1..{V1_POLICY.horizon}",
     )
     levels = quantile_levels(spec["quantiles"])
-    if not set(levels) <= set(QUANTILES):
-        raise ServiceError(
-            "UnsupportedQuantiles",
-            "Chronos-2 only returns its published quantile levels",
-            422,
-        )
+    if quantiles:
+        _unsupported(levels, quantiles)
     known = spec["known_covariates"]
     require(
         type(known) is list and len(known) <= V1_POLICY.covariates,
@@ -183,28 +202,41 @@ def validate(
     return spec, series
 
 
-def model(*, allow_downloads: bool = False) -> Any:
-    """Chronos-2, verified against its pins and qualified for remote serving."""
+def model(
+    ref: ModelRef, *, surface: Surface = "remote", allow_downloads: bool = False
+) -> Any:
+    """The requested forecaster, verified against its pins for the surface."""
     from generalforecast.models import registry
     from generalforecast.models.artifacts import ArtifactError
 
     try:
-        loaded = registry.load(
-            "chronos-2", surface="remote", allow_downloads=allow_downloads
+        loaded = registry.load_ref(
+            ref, surface=surface, allow_downloads=allow_downloads
         )
     except ArtifactError as error:
         raise ServiceError(error.code, str(error), 503) from None
+    except ModelRefError as error:
+        raise ServiceError(error.code, str(error), 422) from None
     functions, parameters = loaded
-    if tuple(cast(Any, functions.properties(parameters)).quantiles) != QUANTILES:
+    declared = ref.entry.capability.quantiles
+    if declared and tuple(cast(Any, functions.properties(parameters)).quantiles) != (
+        declared
+    ):
         raise ServiceError(
-            "UnsupportedModel", "Chronos-2 checkpoint capabilities changed", 503
+            "UnsupportedModel", f"{ref.entry.name} checkpoint capabilities changed", 503
         )
     return loaded
 
 
-def infer(request: JsonObject, *, allow_downloads: bool = False) -> InferenceResult:
-    """Forecasts related targets and shared past/known-future covariates on CPU."""
-    spec, series = validate(request)
+def infer(
+    request: JsonObject,
+    *,
+    ref: ModelRef,
+    surface: Surface = "remote",
+    allow_downloads: bool = False,
+) -> InferenceResult:
+    """Forecasts related targets and shared past/known-future covariates."""
+    spec, series = validate(request, ref.entry.capability.quantiles)
 
     def groups_for(patch: int) -> list:
         return [
@@ -227,8 +259,16 @@ def infer(request: JsonObject, *, allow_downloads: bool = False) -> InferenceRes
     except AlignmentError as error:
         raise ServiceError(error.code, str(error), 422) from None
     try:
-        loaded = model(allow_downloads=allow_downloads)
-        groups = groups_for(loaded[0].properties(loaded[1]).patch)
+        loaded = model(ref, surface=surface, allow_downloads=allow_downloads)
+        properties = loaded[0].properties(loaded[1])
+        levels = tuple(properties.quantiles)
+        _unsupported(spec["quantiles"], levels)
+        groups = groups_for(properties.patch)
+        limit = getattr(properties, "max_rows", None)
+        if limit is not None and any(g.values.shape[0] > limit for g in groups):
+            raise ServiceError(
+                "CapacityExceeded", f"{ref.entry.name} reads at most {limit} rows", 422
+            )
         outputs = []
         for query, group in zip(request["queries"], groups, strict=True):
             try:
@@ -236,7 +276,7 @@ def infer(request: JsonObject, *, allow_downloads: bool = False) -> InferenceRes
             except ValueError:
                 raise ServiceError(
                     "ModelOutputError",
-                    "native Chronos-2 returned invalid forecasts",
+                    "native forecaster returned invalid forecasts",
                     503,
                 ) from None
             target = result[query["group"].index(query["series"])]
@@ -250,7 +290,7 @@ def infer(request: JsonObject, *, allow_downloads: bool = False) -> InferenceRes
                         for index in range(spec["horizon"])
                     ],
                     "quantiles": {
-                        str(level): target[:, quantile_index(level, QUANTILES)].tolist()
+                        str(level): target[:, quantile_index(level, levels)].tolist()
                         for level in spec["quantiles"]
                     },
                 }
@@ -259,12 +299,12 @@ def infer(request: JsonObject, *, allow_downloads: bool = False) -> InferenceRes
         raise
     except Exception:  # noqa: BLE001
         raise ServiceError(
-            "InferenceFailed", "native Chronos-2 inference failed", 503
+            "InferenceFailed", "native forecast inference failed", 503
         ) from None
     return {
         "task": "forecast",
         "outputs": outputs,
-        "artifact": {**provenance(), "verified": True},
+        "artifact": {**provenance(ref.entry), "verified": True},
         "context_provenance": {
             "source": "request",
             "supplied_rows": len(request["context"]),

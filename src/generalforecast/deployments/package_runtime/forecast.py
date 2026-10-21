@@ -114,7 +114,7 @@ class ForecastContext:
                 }
             },
         }
-        settings, series = native.validate(request)
+        settings, series = native.validate(request, _levels(model))
         try:
             group = aligned_group(
                 series,

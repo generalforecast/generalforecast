@@ -91,6 +91,7 @@ def connection_for(args: argparse.Namespace) -> ConnectionSettings:
         profile=getattr(args, "profile", None),
         key_env=getattr(args, "key_env", None),
         new_profile=getattr(args, "group", None) == "login",
+        base_url=getattr(args, "base_url", None),
     )
 
 
@@ -100,13 +101,24 @@ def client_for(
     """Uses named environment references; never persists credential values."""
     settings = connection_for(args) if settings is None else settings
     token = settings.token
+    # Hosted provider credentials stay with profile endpoints, never --base-url.
+    provider = (
+        {}
+        if getattr(args, "base_url", None) is not None
+        else {
+            "auth_mode": os.environ.get("GF_AUTH_MODE", "bearer"),
+            "platform_token": os.environ.get("GF_PLATFORM_TOKEN"),
+            "modal_key": os.environ.get("GF_MODAL_KEY"),
+            "modal_secret": os.environ.get("GF_MODAL_SECRET"),
+        }
+    )
     _CREDENTIAL_VALUES.update(
         value
         for value in (
             token,
-            os.environ.get("GF_PLATFORM_TOKEN"),
-            os.environ.get("GF_MODAL_KEY"),
-            os.environ.get("GF_MODAL_SECRET"),
+            provider.get("platform_token"),
+            provider.get("modal_key"),
+            provider.get("modal_secret"),
         )
         if value
     )
@@ -125,11 +137,8 @@ def client_for(
         profile=settings.profile,
         token=token,
         timeout=getattr(args, "timeout", 40),
-        auth_mode=os.environ.get("GF_AUTH_MODE", "bearer"),
-        platform_token=os.environ.get("GF_PLATFORM_TOKEN"),
-        modal_key=os.environ.get("GF_MODAL_KEY"),
-        modal_secret=os.environ.get("GF_MODAL_SECRET"),
         tls_context=context,
+        **provider,
     )
 
 
@@ -187,14 +196,12 @@ def execute(args: argparse.Namespace) -> dict:
         client.identity.manage("auth.status")
         profile = settings.profile_name or "default"
         stored = Profile.load_all(missing_ok=True).get(profile, {})
-        Profile(
-            **stored
-            | {
-                "url": client._transport.url,
-                "project": client.project,
-                "key_env": settings.credential_env or settings.profile.key_env,
-            }
-        ).save(profile)
+        fields: dict[str, Any] = stored | {
+            "url": client._transport.url,
+            "project": client.project,
+            "key_env": settings.credential_env or settings.profile.key_env,
+        }
+        Profile(**fields).save(profile)
         return {
             "authenticated": True,
             "profile": profile,

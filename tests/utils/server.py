@@ -64,7 +64,6 @@ class Server:
         workers: int = 1,
         placement: str = "",
         profiles: bool = False,
-        timers: bool = False,
     ) -> None:
         self.name = name
         self.tables = directory / "data" / "tables"
@@ -73,9 +72,11 @@ class Server:
         # With `timing_log`, the server logs each request's timings here.
         self.timings = directory / "timings.jsonl"
         timings = f'timing_log = "{self.timings}"' if timing_log else ""
-        # With `profiles`, `profile_workers` may write under this directory.
+        # `profiles` also turns on the server's timers.
         self.profiles = directory / "profiles"
-        profiles_line = f'profiles_directory = "{self.profiles}"' if profiles else ""
+        profiling = (
+            f'\n[profiling]\ndirectory = "{self.profiles}"\n' if profiles else ""
+        )
         worker = f"""
 [[workers]]
 command = ["{sys.executable}", "-m", "generalforecast.worker_process"]
@@ -91,8 +92,6 @@ models = {{ tiny = "tests.models.tabicl.tiny:classifier", tiny-regressor = "test
 listen = "127.0.0.1:{self.port}"
 metrics_listen = "127.0.0.1:{self.metrics_port}"
 {timings}
-{profiles_line}
-timers = {str(timers).lower()}
 data ="{directory / "data"}"
 tokens = ["secret", {{ token = "clinic", tables = ["clinic-*"] }}]
 replication_tokens = ["replicator", {{ token = "clinic-router", tables = ["clinic-*"] }}]
@@ -102,7 +101,7 @@ encryption_key_env = "GF_TEST_KEY"
 device_bytes = {64 << 20}
 host_bytes = {256 << 20}
 {worker * workers}{placement}
-{tls_section}"""
+{tls_section}{profiling}"""
         )
         self.binary = binary
         self.tls = tls

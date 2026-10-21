@@ -97,7 +97,7 @@ fn a_worker_profile_names_its_directory_and_lasts_ten_seconds_unless_told() {
 }
 
 #[test]
-fn a_worker_profile_needs_every_table_and_stays_under_the_profiles_directory() {
+fn a_worker_profile_needs_every_table_and_stays_under_the_profiling_directory() {
     let profile =
         FlightAction::parse(&action("profile_workers", json!({"directory": "p"}))).unwrap();
     assert!(profile.check_scope(&Scope::All).is_ok());

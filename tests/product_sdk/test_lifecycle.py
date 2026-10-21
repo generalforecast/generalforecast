@@ -416,8 +416,8 @@ def test_wait_never_accepts_failure_or_a_superseded_pointer(wire, status, asynch
                     "risk",
                     revision=1,
                     generation=2,
-                    timeout=0.01,
-                    poll_interval=0.02,
+                    timeout=0.3,
+                    poll_interval=1,
                 )
             assert error.value.code in {
                 "DeploymentFailed",

@@ -33,6 +33,7 @@ def forecast(
 ) -> np.ndarray:
     """Uses the admitted native grouped kernel with one shared row per covariate."""
     from generalforecast.deployments.catalog_forecast import infer
+    from generalforecast.models.catalog import parse
 
     def instant(value):
         if isinstance(value, datetime.datetime):
@@ -72,7 +73,7 @@ def forecast(
         for key, indices in groups.items()
     ]
     request = {
-        "model": "chronos-2",
+        "model": spec.model,
         "task": "forecast",
         "target": spec.target,
         "features": [],
@@ -96,7 +97,7 @@ def forecast(
             }
         },
     }
-    result = infer(request, allow_downloads=allow_downloads)
+    result = infer(request, ref=parse(spec.model), allow_downloads=allow_downloads)
     output = np.empty((len(rows), len(spec.quantiles)), dtype=float)
     forecasts: Any = result["outputs"]
     for item in forecasts:
