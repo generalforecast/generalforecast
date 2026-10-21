@@ -1,13 +1,15 @@
 """What `gf serve` serves: one catalog model or one locked prediction package."""
 
 import threading
+import time
 from pathlib import Path
 from typing import Any, Protocol, cast
 
 import pyarrow as pa
 
+from generalforecast.contracts import ContextVersion, PredictionResult
 from generalforecast.deployments.boundary import JsonObject, Scope
-from generalforecast.deployments.catalog import CatalogService
+from generalforecast.deployments.catalog import CatalogService, quantile_levels
 from generalforecast.deployments.contracts import ServiceError, fields, require
 from generalforecast.deployments.interfaces import InferenceRequest
 from generalforecast.deployments.package_runtime import (
@@ -25,8 +27,10 @@ from generalforecast.deployments.package_runtime.validation import (
     admit,
 )
 from generalforecast.models.catalog import ModelRef, ModelRefError, parse
+from generalforecast.models.outputs import DEFAULT_QUANTILES, class_key
 from generalforecast.packages import Package, PackageLock, PythonLock
 from generalforecast.packages.files import parse_yaml
+from generalforecast.packages.models import describe
 from generalforecast.packages.validation import PackageError, ensure
 
 MAX_CONTEXT_ROWS = 100_000
@@ -115,11 +119,13 @@ class CatalogModel:
         """The hosted one-shot `/predictions`, limited to the served reference."""
         self._admitted(payload.get("model"))
         if not self.ref.entry.gates.allows("package", variant=self.ref.variant):
-            raise ServiceError(
-                "UnsupportedCapability",
-                f"packages cannot lock {self.name}; POST models/{self.name}/infer",
-                422,
-            )
+            if not self.ref.entry.capability.tabular:
+                raise ServiceError(
+                    "UnsupportedCapability",
+                    f"packages cannot lock {self.name}; POST models/{self.name}/infer",
+                    422,
+                )
+            return self._predict_raw(scope, payload)
         lock, context = one_shot_lock(payload)
         pin = lock.model
         if (pin.name, pin.codes, pin.estimators) != (
@@ -134,6 +140,106 @@ class CatalogModel:
             context=context,
         )
         return prediction(table, lock, context.num_rows)
+
+    def _predict_raw(self, scope: Scope, payload: JsonObject) -> JsonObject:
+        """`/predictions` for a model packages cannot lock, through raw inference.
+
+        Only this operator's server reaches here; hosted `/predictions` keeps
+        compiling a package lock and so keeps refusing local-only models.
+        """
+        fields(
+            payload,
+            {"model", "task", "target", "features", "context", "queries", "options"},
+        )
+        options = fields(payload["options"], set(), {"id", "quantiles", "outputs"})
+        task, target, features = payload["task"], payload["target"], payload["features"]
+        rows, queries = payload["context"], payload["queries"]
+        require(type(rows) is list and type(queries) is list, "rows must be lists")
+        require(
+            all(type(row) is dict for row in [*rows, *queries]),
+            "rows must be objects",
+        )
+        require(type(features) is list, "features must be a list")
+        pin = describe(str(self.ref))
+        outputs = options.get("outputs") or (
+            ["label", "probabilities"] if task == "classification" else ["value"]
+        )
+        require(
+            type(outputs) is list
+            and len(set(outputs)) == len(outputs)
+            and set(outputs) <= set(pin.outputs),
+            "model does not support requested outputs",
+        )
+        levels = options.get("quantiles")
+        require(
+            levels is None or "quantiles" in outputs,
+            "quantiles require the quantiles output",
+        )
+        request: JsonObject = {
+            "model": payload["model"],
+            "task": task,
+            "target": target,
+            "features": features,
+            "context": [
+                {
+                    "key": str(index),
+                    "features": {feature: row.get(feature) for feature in features},
+                    "label": row[target],
+                }
+                for index, row in enumerate(rows)
+                if row.get(target) is not None
+            ],
+            "queries": [
+                {
+                    "key": str(index),
+                    "features": {feature: row.get(feature) for feature in features},
+                }
+                for index, row in enumerate(queries)
+            ],
+            "options": {},
+        }
+        selected = quantile_levels(
+            list(DEFAULT_QUANTILES) if levels is None else levels
+        )
+        if task == "regression":
+            request["options"] = {"quantiles": sorted({*selected, 0.5})}
+        result = self.catalog.infer(scope, cast(InferenceRequest, request))
+        scored = {output["key"]: output for output in result["outputs"]}
+        scored = [scored[str(index)] for index in range(len(queries))]
+        columns: dict[str, list] = {}
+        if "id" in options and all(options["id"] in row for row in queries):
+            columns[options["id"]] = [row[options["id"]] for row in queries]
+        if task == "classification":
+            classes = result["context_provenance"]["classes"]
+            values = {
+                "label": [
+                    max(
+                        classes,
+                        key=lambda label, p=output["probabilities"]: p[
+                            class_key(label)
+                        ],
+                    )
+                    for output in scored
+                ],
+                "probabilities": [output["probabilities"] for output in scored],
+            }
+        else:
+            values = {
+                "value": [output["quantiles"]["0.5"] for output in scored],
+                "quantiles": [
+                    {str(level): output["quantiles"][str(level)] for level in selected}
+                    for output in scored
+                ],
+            }
+        for output in outputs:
+            columns[output] = values[output]
+        used = result["context_provenance"]["usable_labeled_rows"]
+        return PredictionResult(
+            pa.table(columns),
+            pin.resolved,
+            task,
+            ContextVersion("request", None, rows=used, as_of=time.time()),
+        ).to_dict()
 
 
 class PackageModel:
