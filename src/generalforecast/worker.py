@@ -36,7 +36,13 @@ from generalforecast import _core, protocol
 from generalforecast._core import CacheKey, bucket_size
 from generalforecast.models.contract import TabularFunctions, TabularProperties
 from generalforecast.models.series import SeriesFunctions, SeriesGroup, SeriesProperties
-from generalforecast.runtime.budget import Call, Chunks, MemoryBudget, out_of_memory
+from generalforecast.runtime.budget import (
+    Call,
+    Chunks,
+    MemoryBudget,
+    _shapes,
+    out_of_memory,
+)
 from generalforecast.runtime.decoding import (
     PROGRAMS,
     Context,
@@ -91,6 +97,7 @@ from generalforecast.runtime.paging import (
     unpack_states,
 )
 from generalforecast.runtime.programs import (
+    FUSED_STACKS,
     WARMED_PAGES,
     WARMED_QUERIES,
     Kind,
@@ -418,6 +425,18 @@ class Worker:
         self._stacks = jax.default_backend() != "cpu"
         self._side_by_side = 1 if self._stacks else max(1, len(os.sched_getaffinity(0)))
         self._alongside: ThreadPoolExecutor | None = None
+        # Takes the keys of programs readied beside steps for deferred
+        # tables; without it, no table's part waits for a program.
+        self.announce: Callable[[list[str]], None] | None = None
+        # The tables the running step defers, by the program they wait for.
+        self.deferred: dict[int, str] = {}
+        # Programs being readied beside steps, and those that failed to be,
+        # which the steps that need them compile and report.
+        self._preparing: set[str] = set()
+        self._unpreparable: set[str] = set()
+        # On an accelerator a program compiles for tens of seconds, so a
+        # stacked count not yet compiled compiles on the side; see `Chunks.run`.
+        self._on_side = self._stacks and compile_ahead
         if compile_cache:
             use_compile_cache()
         # Where measured fits are kept for later processes, beside compiled programs.
@@ -581,7 +600,8 @@ class Worker:
                 program = (kind.program[0], model, *kind.program[2:])
                 try:
                     function = cast(jax.stages.Wrapped, self._program(program))
-                    for count in counts_up_to(counts):
+                    stacks = self._buckets(kind.program[0])
+                    for count in stacks or counts_up_to(counts):
                         items = abstract(kind.item, count)
                         shared = self._shared(program, kind, items)
                         function.lower(parameters, *shared, *items).compile()
@@ -1026,6 +1046,7 @@ class Worker:
         Returns:
             Predictions per request id, and an error message per failed table.
         """
+        self.deferred = {}
         with self.stats.timed("move"):
             for movement in step.movements:
                 self.apply(movement)
@@ -1204,7 +1225,12 @@ class Worker:
             indices,
             consume,
             program=(stage, model, num_classes, len(items[0])),
+            buckets=self._buckets(stage),
         )
+
+    def _buckets(self, stage: str) -> tuple[int, ...] | None:
+        """The only stacked counts a stage's calls take, or None for every power of two."""
+        return FUSED_STACKS if self._stacks and stage == "fit_decode" else None
 
     def _run_items(
         self,
@@ -1217,11 +1243,14 @@ class Worker:
         indices: Sequence[Any],
         consume: Callable[[Any, Any], None],
         program: tuple | None = None,
+        buckets: tuple[int, ...] | None = None,
     ) -> None:
         """Runs alike items through a compiled call in as few calls as fit the budget.
 
         `consume` takes each item's outputs with its entry in `indices`, and
         `program`, if given, is the `Programs` key `compiled` is kept under.
+        Calls take only `buckets`' stacked counts if given, and on an
+        accelerator one not yet compiled compiles on the side.
         """
 
         def prepare(first: int, stop: int, padded: int) -> Call:
@@ -1236,8 +1265,20 @@ class Worker:
                 consume(indices[first + position], item)
 
         self._chunks.run(
-            stage, key, len(items), self._call_bytes, estimate, prepare, taken
+            stage,
+            key,
+            len(items),
+            self._call_bytes,
+            estimate,
+            prepare,
+            taken,
+            self._compile_on_side if self._on_side and buckets is not None else None,
+            buckets,
         )
+
+    def _compile_on_side(self, call: Call, done: Callable[[bool], None]) -> None:
+        """Compiles a call's program for its shapes beside steps, then calls `done`."""
+        self.programs.compile_soon(call.function, (*call.shared, *call.items), done)
 
     def _estimate(
         self, stage: str, model: int, num_classes: int, arguments: tuple
@@ -1862,22 +1903,27 @@ class Worker:
             return {}
         joined, parts = merged(batches)
         jobs = []
-        for batch in joined:
+        kept = []
+        for batch, owned in zip(joined, parts, strict=True):
             unit = units[batch.units[0]]
             if any(units[index] is not unit for index in batch.units):
                 raise RuntimeError(
                     f"queries of table {batch.table} read more than its fused unit"
                 )
-            self._fits_device(unit)
             with self.stats.timed("pad"):
                 queries = _host_padded(batch.features, self._size(len(batch.units)))
-            jobs.append((batch.table, (*self._own_arguments(unit), queries)))
+            arguments = (*self._own_arguments(unit), queries)
+            if self._defers(unit, arguments):
+                continue
+            self._fits_device(unit)
+            jobs.append((batch.table, arguments))
+            kept.append((batch, owned))
         predictions: dict[int, np.ndarray] = {}
         if self._stacks:
             outputs = self._call("fit_decode", jobs)
         else:
             outputs = self._alone("fit_decode", jobs)
-        for batch, owned, (state, values) in zip(joined, parts, outputs, strict=True):
+        for (batch, owned), (state, values) in zip(kept, outputs, strict=True):
             unit = units[batch.units[0]]
             self._tables[batch.table].state = state
             self._warn_crowded(batch.table, state)
@@ -1889,6 +1935,55 @@ class Worker:
             for request, start, stop in owned:
                 predictions[request] = values[start:stop]
         return predictions
+
+    def _defers(self, unit: Unit, arguments: tuple) -> bool:
+        """Whether a fused unit waits for its program, readied beside steps.
+
+        On an accelerator a new shape's program compiles for tens of
+        seconds, and its first unit's measures take as long again, which
+        every other table's steps would wait for. Such a unit's table is
+        deferred instead, under its program's key, which `announce` names
+        once the program is ready, for the server to plan it again.
+        """
+        if not self._on_side or self.announce is None:
+            return False
+        table = self._tables[unit.table]
+        key = ("fit_decode", table.model, table.num_classes, _signature(arguments))
+        if self._chunks.ran(key):
+            return False
+        digest = hashlib.sha256(repr(key).encode()).hexdigest()[:16]
+        name = f"{self.programs.drops}:{digest}"
+        if name in self._unpreparable:
+            return False
+        self.deferred[unit.table] = name
+        if name not in self._preparing:
+            self._preparing.add(name)
+            self.programs.soon(lambda: self._prepare(unit, key, arguments, name))
+        return True
+
+    def _prepare(self, unit: Unit, key: tuple, arguments: tuple, name: str) -> None:
+        """Measures a deferred unit and compiles its program for one, from shapes, then announces its key."""
+        stage, model, num_classes, _ = key
+        program = (stage, model, num_classes, len(arguments))
+        try:
+            self._fits_device(unit)
+            compiled = self._compiled_stage(*program)
+            shared = (self._models[model].parameters,)
+            items = _shapes(_stacked([arguments]))
+            cast(jax.stages.Wrapped, compiled).lower(*shared, *items).compile()
+            self._chunks.mark(key, 1)
+            self._seen(Call(compiled, shared, items, 1, program))
+        except Exception as error:  # noqa: BLE001
+            logger.warning(
+                "could not ready a program beside steps (%s); the step that "
+                "next needs it compiles it",
+                error,
+            )
+            self._unpreparable.add(name)
+        finally:
+            self._preparing.discard(name)
+            if self.announce is not None:
+                self.announce([name])
 
     def _alone(self, stage: str, jobs: Sequence[tuple[int, tuple]]) -> list[Any]:
         """Runs each job in a call of its own, up to a core's worth side by side.

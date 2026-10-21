@@ -4,7 +4,7 @@
 //! A shard driven with a fake worker: table checks, quarantine, hung workers
 //! and the query queue.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -42,13 +42,49 @@ const HANG: u8 = 2;
 const FAIL_FIRST: u8 = 3;
 /// Reports progress every 100 ms for 600 ms, as compiles would, then answers.
 const COMPILE: u8 = 4;
+/// Defers each table's first part, as a worker compiling a new shape beside
+/// its steps does, then reports its program compiled after the reply.
+const DEFER: u8 = 5;
+/// As `DEFER`, but reports the program compiled before the reply.
+const DEFER_EARLY: u8 = 6;
 
 /// Answers every frame the shard sends, in order; steps as `behaviour` says.
 fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notify>) {
     tokio::spawn(async move {
+        let mut deferred_once: HashSet<u64> = HashSet::new();
         while let Ok(frame) = Frame::read_from(&mut stream).await {
             let reply = if frame.kind() == "step" {
                 match behaviour.load(Ordering::Relaxed) {
+                    mode @ (DEFER | DEFER_EARLY) => {
+                        let tables: Vec<u64> = frame.header["queries"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|batch| batch["table"].as_u64())
+                            .filter(|table| deferred_once.insert(*table))
+                            .collect();
+                        if tables.is_empty() {
+                            predictions(&frame.header, None)
+                        } else {
+                            let keys = tables.iter().map(|table| format!("k{table}")).collect();
+                            let compiled = WorkerReply::Compiled { keys }.frame();
+                            if mode == DEFER_EARLY && compiled.write_to(&mut stream).await.is_err()
+                            {
+                                return;
+                            }
+                            if deferring(&frame.header, &tables)
+                                .write_to(&mut stream)
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                            if mode == DEFER && compiled.write_to(&mut stream).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
+                    }
                     FAIL => WorkerReply::Error {
                         message: "out of memory".to_string(),
                     }
@@ -145,6 +181,39 @@ fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notif
 
 /// Zero probabilities over three classes for every query of a step, except
 /// those of the `failing` table, which the reply reports as failed.
+/// A step's predictions with the parts of `tables` deferred, by key `k<table>`.
+fn deferring(header: &Value, tables: &[u64]) -> Frame {
+    let mut frame = predictions(header, None);
+    let tables_of: HashMap<u64, u64> = header["queries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|batch| Some((batch["request"].as_u64()?, batch["table"].as_u64()?)))
+        .collect();
+    let results = frame.header["results"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    frame.header["results"] = Value::Array(
+        results
+            .into_iter()
+            .filter(|result| {
+                let request = result["request"].as_u64().unwrap_or(0);
+                tables_of
+                    .get(&request)
+                    .is_none_or(|table| !tables.contains(table))
+            })
+            .collect(),
+    );
+    frame.header["deferred"] = Value::Array(
+        tables
+            .iter()
+            .map(|table| serde_json::json!({"table": table, "key": format!("k{table}")}))
+            .collect(),
+    );
+    frame
+}
+
 fn predictions(header: &Value, failing: Option<u32>) -> Frame {
     let mut frame = Frame::header(Value::Null);
     let results: Vec<PredictionsHeader> = header["queries"]
@@ -211,6 +280,7 @@ fn predictions(header: &Value, failing: Option<u32>) -> Frame {
     frame.header = WorkerReply::Predictions {
         results,
         failures,
+        deferred: Vec::new(),
         seconds: 0.004,
         stages,
         parts: BTreeMap::from([(
@@ -1690,4 +1760,23 @@ async fn only_ephemeral_definitions_take_request_contexts() {
     let mut durable = context("a", 4);
     durable.definition.durability = Durability::Durable;
     assert_eq!(shard.infer(durable).await, Err(Code::InvalidArgument));
+}
+
+#[tokio::test]
+async fn a_deferred_request_context_is_planned_again_once_its_program_compiled() {
+    for behaviour in [DEFER, DEFER_EARLY] {
+        let shard = shard(settings()).await;
+        shard.behaviour.store(behaviour, Ordering::Relaxed);
+        let answer = shard.infer(context("a", 4)).await.unwrap();
+        assert_eq!(
+            (answer.predictions.rows, answer.predictions.columns),
+            (2, 3)
+        );
+        // The deferred step, then the one that answered.
+        assert_eq!(shard.metrics.steps.get(), 2);
+        assert_eq!(shard.metrics.requests_failed.get(), 0);
+        // Another context waits for its own program the same way.
+        shard.infer(context("b", 4)).await.unwrap();
+        assert_eq!(shard.metrics.steps.get(), 4);
+    }
 }

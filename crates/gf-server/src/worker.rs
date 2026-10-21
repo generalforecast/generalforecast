@@ -30,7 +30,7 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::Command;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -183,6 +183,9 @@ pub struct Pipeline {
     stopper: Stopper,
     /// When the worker last reported progress on a step.
     progressed: Arc<Mutex<Option<Instant>>>,
+    /// Keys of programs compiled beside steps, not yet taken, and a wake
+    /// for each report of them.
+    compiled: Arc<(Mutex<Vec<String>>, Notify)>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
     /// Where shared frames go, made at the first one.
@@ -226,6 +229,8 @@ impl Pipeline {
         let reading = stopper.clone();
         let progressed = Arc::new(Mutex::new(None));
         let progressing = Arc::clone(&progressed);
+        let compiled: Arc<(Mutex<Vec<String>>, Notify)> = Arc::default();
+        let compiling = Arc::clone(&compiled);
         let reader = tokio::spawn(async move {
             loop {
                 let frame = match Frame::read_from(&mut reader).await {
@@ -238,6 +243,15 @@ impl Pipeline {
                 if matches!(WorkerReply::of(&frame), Ok(WorkerReply::Progress)) {
                     *progressing.lock().unwrap_or_else(PoisonError::into_inner) =
                         Some(Instant::now());
+                    continue;
+                }
+                if let Ok(WorkerReply::Compiled { keys }) = WorkerReply::of(&frame) {
+                    let (keys_out, wake) = &*compiling;
+                    keys_out
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .extend(keys);
+                    wake.notify_one();
                     continue;
                 }
                 let next = reading
@@ -278,6 +292,7 @@ impl Pipeline {
             frames_out,
             stopper,
             progressed,
+            compiled,
             reader,
             writer,
             shared: None,
@@ -387,6 +402,22 @@ impl Pipeline {
 
     /// When the worker last reported progress on a step, if it has.
     #[must_use]
+    /// Waits for the worker to report programs compiled beside its steps.
+    pub async fn compiled(&self) {
+        self.compiled.1.notified().await;
+    }
+
+    /// The keys of programs the worker reported compiled since last asked.
+    pub fn take_compiled(&self) -> Vec<String> {
+        std::mem::take(
+            &mut *self
+                .compiled
+                .0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+    }
+
     pub fn progressed(&self) -> Option<Instant> {
         *self
             .progressed

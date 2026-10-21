@@ -795,6 +795,11 @@ pub enum WorkerReply {
     /// program, so a long compile is not taken for a hung worker; it
     /// answers no request.
     Progress,
+    /// Sent when programs a step deferred tables for are compiled, by the
+    /// keys the step's reply named; it answers no request.
+    Compiled {
+        keys: Vec<String>,
+    },
     /// A step's predictions, whose values are the frame's buffers, the
     /// tables whose part of the step failed, the seconds the step took the
     /// worker, its compiled calls and their seconds by stage, and its parts
@@ -803,6 +808,8 @@ pub enum WorkerReply {
         results: Vec<PredictionsHeader>,
         #[serde(default)]
         failures: Vec<Failure>,
+        #[serde(default)]
+        deferred: Vec<Deferral>,
         #[serde(default)]
         seconds: f64,
         #[serde(default)]
@@ -920,6 +927,15 @@ pub struct Failure {
     pub message: String,
 }
 
+/// A table whose part of a step waits for a program the worker compiles
+/// beside its steps, named by `key` until a `Compiled` reply names it too.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Deferral {
+    pub table: u32,
+    pub key: String,
+}
+
 /// One stage's compiled calls in a step, and the seconds they took.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -952,6 +968,8 @@ pub struct Predictions {
 pub struct Outcome {
     pub predictions: Vec<(u64, Predictions)>,
     pub failed: Vec<(TableId, String)>,
+    /// Tables whose part waits for a program, by its key; see `Deferral`.
+    pub deferred: Vec<(TableId, String)>,
     pub seconds: f64,
     pub stages: BTreeMap<String, StageTime>,
     /// The step's parts, which split its seconds: how often each ran and
@@ -968,6 +986,7 @@ pub fn outcome_from(frame: &Frame) -> Result<Outcome, FrameError> {
     let WorkerReply::Predictions {
         results,
         failures,
+        deferred,
         seconds,
         stages,
         parts,
@@ -1012,6 +1031,10 @@ pub fn outcome_from(frame: &Frame) -> Result<Outcome, FrameError> {
         failed: failures
             .into_iter()
             .map(|failure| (TableId(failure.table), failure.message))
+            .collect(),
+        deferred: deferred
+            .into_iter()
+            .map(|deferral| (TableId(deferral.table), deferral.key))
             .collect(),
         seconds,
         stages,

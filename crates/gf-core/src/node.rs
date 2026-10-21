@@ -1512,6 +1512,12 @@ struct TableState {
     /// Whether the table holds a context one request brought; see
     /// `Node::set_single_use`.
     single_use: bool,
+    /// A single-use table's requests in the step in flight, which queue
+    /// again if the worker defers its part; see `Node::complete_deferring`.
+    scheduled: Vec<(RequestId, Vec<f32>, Option<Vec<i64>>)>,
+    /// The program the worker compiles for the table's part of a step,
+    /// which steps leave it out until.
+    compiling: Option<String>,
 }
 
 /// Dead row ids past which, and past the live rows, a table is renumbered
@@ -2582,6 +2588,8 @@ pub struct Node {
     /// would read them wait for it: if it fails, the worker never holds them.
     encoding: HashSet<CacheKey>,
     fitting: HashSet<TableId>,
+    /// Programs the worker reported compiled beside its steps, by key.
+    compiled: HashSet<String>,
     /// Where the last `schedule` spent its time.
     parts: PlanParts,
 }
@@ -2614,6 +2622,7 @@ impl Node {
             moving: HashSet::new(),
             encoding: HashSet::new(),
             fitting: HashSet::new(),
+            compiled: HashSet::new(),
             parts: PlanParts::default(),
         })
     }
@@ -2836,10 +2845,11 @@ impl Node {
     pub fn only_new_contexts_wait(&self) -> bool {
         let mut waiting = false;
         for state in self.tables.values() {
-            if state.pending.is_empty()
+            if (state.pending.is_empty()
                 && state.later.is_empty()
                 && state.givens.is_empty()
-                && state.deferred.is_none()
+                && state.deferred.is_none())
+                || state.compiling.is_some()
             {
                 continue;
             }
@@ -3026,6 +3036,8 @@ impl Node {
                 aged_at: None,
                 rebuild_waited: 0,
                 single_use: false,
+                scheduled: Vec::new(),
+                compiling: None,
             },
         );
         Ok(id)
@@ -4466,6 +4478,7 @@ impl Node {
             .filter(|(_, state)| {
                 (!state.pending.is_empty() || !state.forecasts.is_empty())
                     && state.restoring.is_none()
+                    && state.compiling.is_none()
             })
             .map(|(&id, _)| id)
             .collect();
@@ -4530,7 +4543,11 @@ impl Node {
         for &id in &scheduled {
             if let Some(state) = self.tables.get_mut(&id) {
                 state.gave = state.given.is_some();
-                state.pending.clear();
+                if state.single_use {
+                    state.scheduled = std::mem::take(&mut state.pending);
+                } else {
+                    state.pending.clear();
+                }
                 state.forecasts.clear();
                 state.promote();
                 state.generation += 1;
@@ -5209,7 +5226,10 @@ impl Node {
             state.fitted = None;
             state.recent.clear();
             state.writing.clear();
+            state.scheduled.clear();
+            state.compiling = None;
         }
+        self.compiled.clear();
         self.doomed.clear();
         self.drops.clear();
         self.moving.clear();
@@ -5232,6 +5252,56 @@ impl Node {
         }
         self.unfit(step, |table| failed.contains(&table));
         self.release(step, &Failed::Tables(failed))
+    }
+
+    /// Completes a step as `complete_except` does, except that the tables
+    /// `deferred` names wait for a program the worker compiles beside its
+    /// steps, by its key. Their parts are undone as a failed part's, but
+    /// their requests queue again, and steps leave them out until `compiled`
+    /// names the key, unless it already did.
+    pub fn complete_deferring(
+        &mut self,
+        step: &Step,
+        failed: &HashSet<TableId>,
+        deferred: &[(TableId, String)],
+    ) -> Vec<Movement> {
+        let mut undone = failed.clone();
+        undone.extend(deferred.iter().map(|(table, _)| *table));
+        let dropped = self.complete_except(step, &undone);
+        for (table, key) in deferred {
+            let compiled = self.compiled.contains(key);
+            if let Some(state) = self.tables.get_mut(table) {
+                let mut queued = std::mem::take(&mut state.scheduled);
+                queued.append(&mut state.pending);
+                state.pending = queued;
+                state.generation += 1;
+                if !compiled {
+                    state.compiling = Some(key.clone());
+                }
+            }
+        }
+        for batch in &step.queries {
+            if let Some(state) = self.tables.get_mut(&batch.table)
+                && !deferred.iter().any(|(table, _)| *table == batch.table)
+            {
+                state.scheduled.clear();
+            }
+        }
+        dropped
+    }
+
+    /// Lets steps take again the tables waiting for the programs `keys` name.
+    pub fn compiled(&mut self, keys: Vec<String>) {
+        for state in self.tables.values_mut() {
+            if state
+                .compiling
+                .as_ref()
+                .is_some_and(|key| keys.contains(key))
+            {
+                state.compiling = None;
+            }
+        }
+        self.compiled.extend(keys);
     }
 
     /// Undoes a step the worker failed to run. The entries it was to encode,

@@ -671,6 +671,13 @@ class Progress:
 
 
 @dataclass(frozen=True)
+class Compiled:
+    """Sent once programs that steps deferred tables for are ready, by key; answers no request."""
+
+    keys: list[str]
+
+
+@dataclass(frozen=True)
 class Invalid:
     """A check the model refuses, and why."""
 
@@ -706,6 +713,7 @@ Reply = (
     | Done
     | Warmed
     | Progress
+    | Compiled
     | Invalid
     | Failed
     | Controlled
@@ -718,6 +726,7 @@ _REPLIES: dict[type, str] = {
     Done: "ok",
     Warmed: "warmed",
     Progress: "progress",
+    Compiled: "compiled",
     Invalid: "invalid",
     Failed: "error",
     Controlled: "controlled",
@@ -758,6 +767,7 @@ def predictions(
     seconds: float = 0.0,
     stages: dict[str, tuple[int, float]] | None = None,
     parts: dict[str, tuple[int, float]] | None = None,
+    deferred: dict[int, str] | None = None,
 ) -> tuple[dict[str, Any], list[bytes]]:
     """A frame of float32 predictions per request, and the tables that failed.
 
@@ -769,6 +779,7 @@ def predictions(
     Args:
         results: Each request's predictions.
         failed: Each failed table's error.
+        deferred: Each table whose part waits for a program, by its key.
         seconds: The time the step took the worker.
         stages: The step's compiled calls and their seconds, by stage.
         parts: The step's parts, each run and their seconds; see
@@ -798,6 +809,9 @@ def predictions(
         "kind": "predictions",
         "results": entries,
         "failures": failures,
+        "deferred": [
+            {"table": table, "key": key} for table, key in (deferred or {}).items()
+        ],
         **timing(seconds, stages, parts),
     }
     return header, buffers

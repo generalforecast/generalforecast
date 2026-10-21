@@ -2537,6 +2537,55 @@ def test_a_worker_compiles_the_fused_calls_an_earlier_one_recorded_before_its_st
     np.testing.assert_allclose(predicted, expected, atol=1e-6)
 
 
+def test_an_accelerator_worker_compiles_every_fused_stack_of_a_recorded_kind_at_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from generalforecast._core import CacheKey
+    from generalforecast.models.conformance import table as conformance_table
+    from generalforecast.runtime.programs import FUSED_STACKS
+    from tests.models.conformance.cases import FEATURES
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    jax.config.update("jax_enable_compilation_cache", False)
+    data = conformance_table(False, rows=48, queries=6)
+    model = tiny_tabicl(regression=False)
+
+    def started() -> Worker:
+        worker = Worker(slot_bytes=4096, compile_ahead=False)
+        worker.add_model(0, tabicl_functions, model)
+        worker._specs[0] = "tiny-tabicl"
+        worker.allocate(256, 0, 0)
+        worker.add_table(0, 0, data.num_classes, FEATURES)
+        return worker
+
+    compiled: list[int] = []
+
+    def compile_event(event: str, duration_secs: float, **details: Any) -> None:
+        if event == "/jax/core/compile/backend_compile_duration" and "fit_decode" in (
+            details.get("fun_name", "")
+        ):
+            compiled.append(1)
+
+    first = started()
+    rows = np.arange(48, dtype=np.uint32)
+    key = CacheKey(0, 0, 0, "context", 1)
+    features, targets = np.asarray(data.features), np.asarray(data.targets)
+    unit = protocol.Unit(0, key, rows, "fuse", [], features, targets)
+    queries = np.asarray(data.queries)
+    batch = protocol.QueryBatch(0, 0, 0, queries, [0] * len(queries))
+    first.run(protocol.Step([], [], [], [unit], [batch]))
+    later = started()
+    # As on an accelerator, where fused units stack into one call.
+    later._stacks = True
+    jax.monitoring.register_event_duration_secs_listener(compile_event)
+    try:
+        later.warm_start()
+    finally:
+        jax.monitoring.unregister_event_duration_listener(compile_event)
+        jax.config.update("jax_enable_compilation_cache", True)
+    assert len(compiled) == len(FUSED_STACKS)
+
+
 def test_fused_units_side_by_side_answer_in_order_and_fail_apart(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2587,6 +2636,147 @@ def test_fused_units_side_by_side_answer_in_order_and_fail_apart(
     assert failed == {1: "RuntimeError: table 1 failed"}
     assert sorted(predictions) == [0, 2]
     np.testing.assert_allclose(predictions[2], alone[2], atol=1e-6)
+
+
+def test_a_new_fused_shape_defers_its_table_until_its_program_is_ready() -> None:
+    from generalforecast._core import CacheKey
+    from generalforecast.models.conformance import table as conformance_table
+    from tests.models.conformance.cases import FEATURES
+
+    data = conformance_table(False, rows=48, queries=6)
+    model = tiny_tabicl(regression=False)
+    worker = Worker(slot_bytes=4096)
+    worker.add_model(0, tabicl_functions, model)
+    worker.allocate(256, 0, 0)
+    # As on an accelerator, under a server that plans deferred tables again.
+    worker._stacks = worker._on_side = True
+    announced: list[list[str]] = []
+    worker.announce = announced.append
+    worker.add_table(0, 0, data.num_classes, FEATURES)
+    key = CacheKey(0, 0, 0, "context", 1)
+    rows = np.arange(48, dtype=np.uint32)
+    features, targets = np.asarray(data.features), np.asarray(data.targets)
+    unit = protocol.Unit(0, key, rows, "fuse", [], features, targets)
+    queries = np.asarray(data.queries)
+    batch = protocol.QueryBatch(0, 0, 0, queries, [0] * len(queries))
+    step = protocol.Step([], [], [], [unit], [batch])
+
+    predictions, failed = worker.run_apart(step)
+    assert predictions == {} and failed == {}
+    deferred = worker.deferred[0]
+    worker.wait_warm()
+    assert announced == [[deferred]]
+    predictions, failed = worker.run_apart(step)
+    assert worker.deferred == {} and failed == {} and list(predictions) == [0]
+
+
+def test_a_fused_shape_that_cannot_be_readied_beside_steps_compiles_in_its_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast._core import CacheKey
+    from generalforecast.models.conformance import table as conformance_table
+    from tests.models.conformance.cases import FEATURES
+
+    data = conformance_table(False, rows=48, queries=6)
+    model = tiny_tabicl(regression=False)
+    worker = Worker(slot_bytes=4096)
+    worker.add_model(0, tabicl_functions, model)
+    worker.allocate(256, 0, 0)
+    worker._stacks = worker._on_side = True
+    announced: list[list[str]] = []
+    worker.announce = announced.append
+    worker.add_table(0, 0, data.num_classes, FEATURES)
+    fits = worker._fits_device
+
+    def failing_beside(unit: Any) -> None:
+        if threading.current_thread().name.startswith("gf-soon"):
+            raise RuntimeError("no memory measure")
+        fits(unit)
+
+    monkeypatch.setattr(worker, "_fits_device", failing_beside)
+    key = CacheKey(0, 0, 0, "context", 1)
+    rows = np.arange(48, dtype=np.uint32)
+    features, targets = np.asarray(data.features), np.asarray(data.targets)
+    unit = protocol.Unit(0, key, rows, "fuse", [], features, targets)
+    queries = np.asarray(data.queries)
+    batch = protocol.QueryBatch(0, 0, 0, queries, [0] * len(queries))
+    step = protocol.Step([], [], [], [unit], [batch])
+
+    predictions, failed = worker.run_apart(step)
+    assert predictions == {} and failed == {}
+    deferred = worker.deferred[0]
+    worker.wait_warm()
+    # Announced all the same, so the server plans the table again, and the
+    # step that takes it compiles its program itself.
+    assert announced == [[deferred]]
+    predictions, failed = worker.run_apart(step)
+    assert worker.deferred == {} and failed == {} and list(predictions) == [0]
+
+
+def test_stacked_fused_units_compile_a_new_count_on_the_side() -> None:
+    from generalforecast._core import CacheKey
+    from generalforecast.models.conformance import table as conformance_table
+    from generalforecast.runtime.programs import FUSED_STACKS
+    from tests.models.conformance.cases import FEATURES
+
+    data = conformance_table(False, rows=48, queries=6)
+    model = tiny_tabicl(regression=False)
+    worker = Worker(slot_bytes=4096)
+    worker.add_model(0, tabicl_functions, model)
+    worker.allocate(256, 0, 0)
+    # As on an accelerator, where fused units stack into one call.
+    worker._stacks = worker._on_side = True
+    for index in range(3):
+        worker.add_table(index, 0, data.num_classes, FEATURES)
+
+    def step(indices: list[int]) -> protocol.Step:
+        units, batches = [], []
+        for at, index in enumerate(indices):
+            key = CacheKey(index, 0, 0, "context", 1)
+            rows = np.arange(48, dtype=np.uint32)
+            features = np.asarray(data.features) + np.float32(index)
+            targets = np.asarray(data.targets)
+            units.append(protocol.Unit(index, key, rows, "fuse", [], features, targets))
+            queries = np.asarray(data.queries)
+            batches.append(
+                protocol.QueryBatch(index, index, index, queries, [at] * len(queries))
+            )
+        return protocol.Step([], [], [], units, batches)
+
+    compiled: list[str] = []
+
+    def compile_event(event: str, duration_secs: float, **details: Any) -> None:
+        name = details.get("fun_name", "")
+        if (
+            event == "/jax/core/compile/backend_compile_duration"
+            and "fit_decode" in name
+            and not threading.current_thread().name.startswith("gf-")
+        ):
+            compiled.append(name)
+
+    def counts() -> set[int]:
+        return next(
+            set(found)
+            for key, found in worker._chunks._counts.items()
+            if cast(tuple, key)[0] == "fit_decode"
+        )
+
+    jax.monitoring.register_event_duration_secs_listener(compile_event)
+    try:
+        alone = {index: worker.run(step([index]))[index] for index in range(3)}
+        # The first call compiles stacks of one in the step, and the other
+        # buckets on the side.
+        assert len(compiled) == 1 and 1 in counts()
+        worker.wait_warm()
+        assert counts() == set(FUSED_STACKS)
+        together = worker.run(step([0, 1, 2]))
+        again = worker.run(step([0, 1, 2]))
+    finally:
+        jax.monitoring.unregister_event_duration_listener(compile_event)
+    assert len(compiled) == 1
+    for index in range(3):
+        np.testing.assert_allclose(together[index], alone[index], atol=1e-5)
+        np.testing.assert_allclose(again[index], alone[index], atol=1e-5)
 
 
 def test_a_steps_parts_add_up_to_its_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
