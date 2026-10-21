@@ -177,7 +177,7 @@ def test_a_large_fit_keeps_every_call_in_the_call_budget(
     ran: list[tuple[Call, int]] = []
     run = Chunks.run
 
-    def recorded(chunks, stage, key, count, budget, estimate, prepare, consume):
+    def recorded(chunks, stage, key, count, budget, estimate, prepare, consume, *rest):
         prepared: dict[tuple[int, int], Call] = {}
 
         def preparing(first: int, stop: int, padded: int) -> Call:
@@ -188,7 +188,7 @@ def test_a_large_fit_keeps_every_call_in_the_call_budget(
             ran.append((prepared[first, stop], budget))
             consume(first, stop, outputs)
 
-        run(chunks, stage, key, count, budget, estimate, preparing, consuming)
+        run(chunks, stage, key, count, budget, estimate, preparing, consuming, *rest)
 
     monkeypatch.setattr(Chunks, "run", recorded)
     generator = np.random.default_rng(0)

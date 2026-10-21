@@ -186,3 +186,125 @@ def test_a_calls_handing_to_the_device_is_compile_for_a_new_shape_and_dispatch_a
     assert timed == ["compile", "wait"]
     _run(chunks, doubled, items, 8 * items[0].nbytes)
     assert timed == ["compile", "wait", "dispatch", "wait"]
+
+
+def test_a_count_not_yet_compiled_compiles_on_the_side_while_compiled_counts_run() -> (
+    None
+):
+    doubled = jax.jit(lambda rows: rows * 2)
+    items = np.arange(7, dtype=np.float32).reshape(7, 1)
+    chunks = Chunks(lambda *_: None)
+    padded_counts: list[int] = []
+    outputs: list[np.ndarray] = []
+    aside: list[tuple[int, Any]] = []
+
+    def prepare(first: int, stop: int, padded: int) -> Call:
+        padded_counts.append(padded)
+        rows = items[first:stop]
+        stacked = np.concatenate([rows, np.repeat(rows[-1:], padded - len(rows), 0)])
+        return Call(doubled, (), (stacked,), padded)
+
+    def consume(first: int, stop: int, found: Any) -> None:
+        outputs.extend(np.asarray(found)[: stop - first])
+
+    def ahead(call: Call, done: Any) -> None:
+        aside.append((call.padded, done))
+
+    def run(count: int) -> list[int]:
+        padded_counts.clear()
+        outputs.clear()
+        chunks.run(
+            "fit", "key", count, 8 << 20, lambda: 1 << 20, prepare, consume, ahead
+        )
+        np.testing.assert_array_equal(np.stack(outputs), items[:count] * 2)
+        return padded_counts
+
+    # A kind's first call compiles for its own count, in the call.
+    assert run(2) == [2] and aside == []
+    # Five items would pad to eight: that compiles on the side, once, while
+    # they run two at a time, the most a compiled count takes.
+    assert run(5) == [8, 2, 2, 2]
+    assert [padded for padded, _ in aside] == [8]
+    assert run(5) == [2, 2, 2]
+    assert len(aside) == 1
+    # One item pads up to two rather than compile for one.
+    assert run(1)[-1] == 2
+    aside[0][1](True)
+    # Once it compiled, eight takes them in one call, and fewer pad up to it.
+    assert run(5) == [8]
+    assert run(7) == [8]
+
+
+def test_calls_with_buckets_pad_to_the_least_that_takes_them_or_split_across_the_most() -> (
+    None
+):
+    doubled = jax.jit(lambda rows: rows * 2)
+    items = np.arange(80, dtype=np.float32).reshape(80, 1)
+    padded_counts: list[int] = []
+    outputs: list[np.ndarray] = []
+
+    def prepare(first: int, stop: int, padded: int) -> Call:
+        padded_counts.append(padded)
+        rows = items[first:stop]
+        stacked = np.concatenate([rows, np.repeat(rows[-1:], padded - len(rows), 0)])
+        return Call(doubled, (), (stacked,), padded)
+
+    def consume(first: int, stop: int, found: Any) -> None:
+        outputs.extend(np.asarray(found)[: stop - first])
+
+    def run(count: int, budget: int = 128 << 20) -> list[int]:
+        padded_counts.clear()
+        outputs.clear()
+        chunks = Chunks(lambda *_: None)
+        chunks.run(
+            "fit",
+            "key",
+            count,
+            budget,
+            lambda: 1 << 20,
+            prepare,
+            consume,
+            buckets=(1, 4, 16, 64),
+        )
+        np.testing.assert_array_equal(np.stack(outputs), items[:count] * 2)
+        return padded_counts
+
+    assert run(1) == [1]
+    assert run(3) == [4]
+    assert run(5) == [16]
+    assert run(64) == [64]
+    assert run(70) == [64, 16]
+    # Within a chunk of eight items, the most bucket that fits is four.
+    assert run(7, 8 << 20) == [4, 4]
+
+
+def test_a_count_that_fails_to_compile_on_the_side_starts_again_later() -> None:
+    doubled = jax.jit(lambda rows: rows * 2)
+    items = np.arange(5, dtype=np.float32).reshape(5, 1)
+    chunks = Chunks(lambda *_: None)
+    aside: list[tuple[int, Any]] = []
+
+    def prepare(first: int, stop: int, padded: int) -> Call:
+        rows = items[first:stop]
+        stacked = np.concatenate([rows, np.repeat(rows[-1:], padded - len(rows), 0)])
+        return Call(doubled, (), (stacked,), padded)
+
+    def run(count: int) -> None:
+        chunks.run(
+            "fit",
+            "key",
+            count,
+            8 << 20,
+            lambda: 1 << 20,
+            prepare,
+            lambda *_: None,
+            lambda call, done: aside.append((call.padded, done)),
+        )
+
+    run(2)
+    run(5)
+    assert [padded for padded, _ in aside] == [8]
+    # The side holds the call's shapes, not its items.
+    aside[0][1](False)
+    run(5)
+    assert [padded for padded, _ in aside] == [8, 8]

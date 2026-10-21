@@ -132,6 +132,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
     def progressed() -> None:
         replies.put(lambda: (progress, []))
 
+    def announced(keys: list[str]) -> None:
+        frame = protocol.reply(protocol.Compiled(keys))
+        replies.put(lambda: (frame, []))
+
+    worker.announce = announced
+
     while (frame := frames.get()) is not None:
         replies.put(_answer(worker, names, progressed, *frame))
         if worker.lost:
@@ -181,7 +187,9 @@ def _handled(
                 # its reply's conversion, so its parts add up to them.
                 predictions, failed = worker.run_apart(step)
                 with worker.stats.timed("reply"):
-                    frame = protocol.predictions(predictions, failed)
+                    frame = protocol.predictions(
+                        predictions, failed, deferred=worker.deferred
+                    )
                 frame[0].update(
                     protocol.timing(
                         time.perf_counter() - started,

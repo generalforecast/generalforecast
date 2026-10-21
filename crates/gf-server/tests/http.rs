@@ -54,6 +54,7 @@ fn fake_worker(mut stream: UnixStream) {
                 reply.header = WorkerReply::Predictions {
                     results,
                     failures: Vec::new(),
+                    deferred: Vec::new(),
                     seconds: 0.001,
                     stages: BTreeMap::new(),
                     parts: BTreeMap::new(),

@@ -3,7 +3,7 @@
 
 import threading
 import time
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -177,6 +177,22 @@ def measured_bytes(call: Call) -> int:
     return total // max(1, call.padded)
 
 
+def _shapes(tree: Any) -> Any:
+    """A tree's leaves as their shapes and dtypes alone."""
+    return jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(
+            leaf.shape, leaf.dtype, weak_type=getattr(leaf, "weak_type", False)
+        ),
+        tree,
+    )
+
+
+def _bucket_of(buckets: Sequence[int], items: int, size: int) -> int:
+    """The least of `buckets` within `size` that takes `items`, or else the most within it."""
+    within = [bucket for bucket in buckets if bucket <= size] or [1]
+    return min((bucket for bucket in within if bucket >= items), default=max(within))
+
+
 class Chunks:
     """Runs many items of one kind of call in as few calls as fit a call budget.
 
@@ -221,6 +237,9 @@ class Chunks:
         self._backoff: dict[Hashable, int] = {}
         # Parts of one item a call takes, once a single item ran out of memory.
         self._parts: dict[Hashable, int] = {}
+        # Padded counts each kind has run at, and those compiling ahead.
+        self._counts: dict[Hashable, set[int]] = {}
+        self._compiling: set[tuple[Hashable, int]] = set()
         self._lock = threading.Lock()
 
     def size(self, key: Hashable, budget: int, estimate: Callable[[], int]) -> int:
@@ -250,8 +269,14 @@ class Chunks:
         estimate: Callable[[], int],
         prepare: Callable[[int, int, int], Call],
         consume: Callable[[int, int, Any], None],
+        ahead: Callable[[Call, Callable[[bool], None]], None] | None = None,
+        buckets: Sequence[int] | None = None,
     ) -> None:
         """Runs `count` items of a kind of call, as many to a call as fit `budget`.
+
+        With `ahead`, a kind that has run before runs only at padded counts it
+        has run at, and a count it has not compiles on the side: see
+        `_compiled_count`.
 
         Args:
             stage: The stage each call counts under.
@@ -262,6 +287,11 @@ class Chunks:
             prepare: Makes the call for items `first` to `stop`, exclusive,
                 padded to the third argument's count.
             consume: Takes each call's first and last item, exclusive, and its outputs.
+            ahead: Compiles a call without running it, then calls its second
+                argument, on a thread of its own.
+            buckets: The only padded counts calls take, with 1 among them, in
+                place of every power of two: each pads to the least that
+                takes the items left, or else takes the most within the chunk.
 
         Raises:
             JaxRuntimeError: If a call fails other than for want of memory, or
@@ -273,8 +303,16 @@ class Chunks:
         measuring = 0.0
         while first < count:
             size = self.size(key, budget, estimate)
-            stop = min(count, first + size)
-            call = prepare(first, stop, size if count > size else bucket_size(count, 1))
+            if buckets is None:
+                padded = size if count > size else bucket_size(count, 1)
+            else:
+                padded = _bucket_of(buckets, count - first, size)
+            if ahead is not None:
+                padded = self._compiled_count(
+                    key, padded, size, count, first, prepare, ahead
+                )
+            stop = min(count, first + padded)
+            call = prepare(first, stop, padded)
             if key not in self._measured:
                 self._measured.add(key)
                 started = time.perf_counter()
@@ -307,6 +345,13 @@ class Chunks:
                 self.timed("compile" if compiled else "dispatch", dispatched - started)
                 self.timed("wait", finished - dispatched)
             measuring = 0.0
+            self._ran(key, padded)
+            if ahead is not None and buckets is not None:
+                # The first of a kind's calls compiles in it; its other
+                # buckets compile on the side from then on, before steps ask.
+                for bucket in buckets:
+                    if bucket <= size:
+                        self._start(key, bucket, count, first, prepare, ahead)
             if self._compiled is not None and compiled:
                 self._compiled(stage)
             if self._seen is not None and compiled:
@@ -315,6 +360,81 @@ class Chunks:
             # Freed before the next call, so the device never holds two calls' outputs.
             del outputs
             first = stop
+
+    def _compiled_count(
+        self,
+        key: Hashable,
+        padded: int,
+        size: int,
+        count: int,
+        first: int,
+        prepare: Callable[[int, int, int], Call],
+        ahead: Callable[[Call, Callable[[bool], None]], None],
+    ) -> int:
+        """The padded count to run items from `first` at, of a kind that compiles on the side.
+
+        A kind's first call compiles for `padded` in the call. After it, a
+        count the kind has not run at compiles on the side, through `ahead`,
+        while the items run at the least count it has run at that takes them
+        all, or else in calls of the most, within `size`. On an accelerator
+        a program takes many seconds to compile, and padding a few items
+        more takes far less than every call behind waiting for it.
+        """
+        with self._lock:
+            counts = [known for known in self._counts.get(key, ()) if known <= size]
+            if not counts or padded in counts:
+                return padded
+        self._start(key, padded, count, first, prepare, ahead)
+        left = count - first
+        return min((known for known in counts if known >= left), default=max(counts))
+
+    def _start(
+        self,
+        key: Hashable,
+        padded: int,
+        count: int,
+        first: int,
+        prepare: Callable[[int, int, int], Call],
+        ahead: Callable[[Call, Callable[[bool], None]], None],
+    ) -> None:
+        """Compiles a kind for a padded count on the side, unless it has it or is compiling it."""
+        with self._lock:
+            if (key, padded) in self._compiling or padded in self._counts.get(key, ()):
+                return
+            self._compiling.add((key, padded))
+        made = prepare(first, min(count, first + padded), padded)
+        # Compiled from shapes, so the side holds no items' memory.
+        call = Call(
+            made.function, made.shared, _shapes(made.items), padded, made.program
+        )
+        del made
+
+        def done(compiled: bool) -> None:
+            if not compiled:
+                # A later call starts it again.
+                with self._lock:
+                    self._compiling.discard((key, padded))
+                return
+            self._ran(key, padded)
+            if self._seen is not None:
+                self._seen(call)
+
+        ahead(call, done)
+
+    def ran(self, key: Hashable) -> bool:
+        """Whether a kind has a program for any padded count."""
+        with self._lock:
+            return bool(self._counts.get(key))
+
+    def mark(self, key: Hashable, padded: int) -> None:
+        """Counts a padded count a kind was compiled for elsewhere."""
+        self._ran(key, padded)
+
+    def _ran(self, key: Hashable, padded: int) -> None:
+        """Counts a padded count a kind has a program for."""
+        with self._lock:
+            self._counts.setdefault(key, set()).add(padded)
+            self._compiling.discard((key, padded))
 
     def parts(self, key: Hashable) -> int | None:
         """The most parts of one item a call of `key` takes, or None while any number fit."""

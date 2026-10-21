@@ -4935,3 +4935,39 @@ fn only_new_single_use_contexts_waiting_is_told_apart_from_other_work() {
     node.submit(fresh, &B).unwrap();
     assert!(!node.only_new_contexts_wait());
 }
+
+#[test]
+fn a_deferred_single_use_table_waits_for_its_program_then_serves_its_requests() {
+    let mut node = node(64);
+    let fresh = table(&mut node, Strategy::Exact, 32);
+    node.set_single_use(fresh).unwrap();
+    let other = table(&mut node, Strategy::Exact, 32);
+    let request = node.submit(fresh, &A).unwrap();
+    let step = node.schedule().unwrap().expect("a step");
+    assert!(step.queries().iter().any(|batch| batch.request == request));
+    node.complete_deferring(
+        &step,
+        &std::collections::HashSet::new(),
+        &[(fresh, "k".to_string())],
+    );
+
+    // Left out while its program compiles, as other tables are planned.
+    node.submit(other, &A).unwrap();
+    let step = node.schedule().unwrap().expect("a step");
+    assert!(step.queries().iter().all(|batch| batch.table != fresh));
+    node.complete(&step);
+    assert!(node.schedule().unwrap().is_none());
+    assert!(!node.only_new_contexts_wait());
+
+    node.compiled(vec!["k".to_string()]);
+    let step = node.schedule().unwrap().expect("a step");
+    assert!(step.queries().iter().any(|batch| batch.request == request));
+    // A key already reported compiled holds nothing back.
+    node.complete_deferring(
+        &step,
+        &std::collections::HashSet::new(),
+        &[(fresh, "k".to_string())],
+    );
+    let step = node.schedule().unwrap().expect("a step");
+    assert!(step.queries().iter().any(|batch| batch.request == request));
+}

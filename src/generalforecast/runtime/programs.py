@@ -34,6 +34,10 @@ WARMED_PAGES = 4
 # decoded, this many buckets above the smallest: steps merging many callers'
 # requests reach them.
 WARMED_QUERIES = 5
+# The stacked counts an accelerator's fused calls take, each its own program
+# that compiles for tens of seconds: a step's new contexts pad up to one, or
+# split across the most, rather than compile for every power of two.
+FUSED_STACKS = (1, 4, 16, 64)
 # Seconds a worker goes without a step before compiling ahead. A caller sending
 # steps back to back would otherwise meet a compile in each of its next steps.
 WARM_QUIET = 0.5
@@ -223,6 +227,7 @@ class Programs:
         self._shapes: set[Hashable] = set()
         self._done: set[Hashable] = set()
         self._thread = ThreadPoolExecutor(1, thread_name_prefix="gf-warm")
+        self._soon = ThreadPoolExecutor(1, thread_name_prefix="gf-soon")
         self._pending: list[Future] = []
         self._lock = threading.Lock()
         # Whether a step runs, and when the last ended; compiles ahead wait on them.
@@ -330,6 +335,35 @@ class Programs:
         self.later(
             lambda: cast(jax.stages.Wrapped, function).lower(*arguments).compile()
         )
+
+    def compile_soon(
+        self,
+        function: Callable[..., Any],
+        arguments: tuple,
+        done: Callable[[bool], None],
+    ) -> None:
+        """Compiles a function for these arguments beside steps, then tells `done` whether it compiled.
+
+        For a program steps already wait on, so unlike `later` it does not
+        wait for a quiet gap. A compile that fails is logged.
+        """
+
+        def compile_it() -> None:
+            try:
+                cast(jax.stages.Wrapped, function).lower(*arguments).compile()
+            except Exception as error:  # noqa: BLE001
+                logger.warning("a compile beside steps failed: %s", error)
+                done(False)
+                return
+            done(True)
+
+        self.soon(compile_it)
+
+    def soon(self, task: Callable[[], Any]) -> None:
+        """Runs a task on a thread of its own beside steps, without waiting for a quiet gap."""
+        with self._lock:
+            self._pending = [future for future in self._pending if not future.done()]
+            self._pending.append(self._soon.submit(task))
 
     def later(self, task: Callable[[], Any]) -> None:
         """Runs a task that only saves time, such as compiling ahead, in a quiet gap.

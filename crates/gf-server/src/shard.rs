@@ -872,6 +872,8 @@ pub struct ShardSettings {
 /// worker stopping, the oldest step passing its deadline, or a stopped worker
 /// due another start or done starting.
 enum Event {
+    /// The worker compiled programs that steps deferred tables for.
+    Compiled,
     Command(Option<Box<Command>>),
     /// A log rewritten in the background, ready to install.
     Compacted(Box<Finished>),
@@ -1110,6 +1112,7 @@ impl Shard {
             let next = self.in_flight.front_mut().map(|step| &mut step.reply);
             let up = self.down.is_none();
             let stopped = self.worker.pipeline.stopped();
+            let compiled = self.worker.pipeline.compiled();
             let retry = self
                 .down
                 .as_ref()
@@ -1125,6 +1128,7 @@ impl Shard {
                     Event::Reply(reply.unwrap_or_else(|_| Err("the worker stopped".to_string())))
                 }
                 () = stopped, if up => Event::Stopped,
+                () = compiled, if up => Event::Compiled,
                 () = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)),
                     if deadline.is_some() => Event::Hung,
                 command = commands.recv() => Event::Command(command.map(Box::new)),
@@ -1164,6 +1168,10 @@ impl Shard {
                 Event::Started(started) => self.started(*started).await,
                 Event::Idle => self.save_idle_heads(),
                 Event::Expired => self.sweep_ephemeral().await,
+                Event::Compiled => {
+                    let keys = self.worker.pipeline.take_compiled();
+                    self.node.compiled(keys);
+                }
             }
             self.flush_controls();
         }
@@ -3939,7 +3947,8 @@ impl Shard {
             Ok(outcome) => {
                 let failed: HashSet<TableId> =
                     outcome.failed.iter().map(|(table, _)| *table).collect();
-                self.node.complete_except(&step, &failed)
+                self.node
+                    .complete_deferring(&step, &failed, &outcome.deferred)
             }
             Err(_) => self.node.fail(&step),
         };
@@ -3949,12 +3958,13 @@ impl Shard {
                 let Outcome {
                     predictions,
                     failed,
+                    deferred,
                     ..
                 } = outcome;
                 for (table, reason) in &failed {
                     self.fail_requests(&step, Some(*table), &ServerError::Internal(reason.clone()));
                 }
-                self.answer(&step, predictions, &shares, times);
+                self.answer(&step, predictions, &shares, times, &deferred);
                 let tables = step
                     .fits()
                     .iter()
@@ -4200,6 +4210,7 @@ impl Shard {
         predictions: Vec<(u64, Predictions)>,
         shares: &HashMap<RequestId, Share>,
         times: StepTimes,
+        deferred: &[(TableId, String)],
     ) {
         for (request, mut predictions) in predictions {
             self.metrics.predictions.add(predictions.rows as u64);
@@ -4242,14 +4253,26 @@ impl Shard {
             });
             let _ = pending.reply.send(Ok(predictions));
         }
-        // A request the reply leaves out would otherwise wait forever.
-        self.fail_requests(
-            step,
-            None,
-            &ServerError::Internal(
-                "the worker returned no predictions for this request".to_string(),
-            ),
+        // A request the reply leaves out would otherwise wait forever,
+        // unless its table's part waits for a program and queued again.
+        let unanswered = ServerError::Internal(
+            "the worker returned no predictions for this request".to_string(),
         );
+        for batch in step.queries() {
+            if deferred.iter().any(|(table, _)| *table == batch.table) {
+                continue;
+            }
+            if let Some(pending) = self.take(batch.request) {
+                self.metrics.requests_failed.add(1);
+                let _ = pending.reply.send(Err(unanswered.clone()));
+            }
+        }
+        for forecast in step.forecasts() {
+            if let Some(pending) = self.take(forecast.request) {
+                self.metrics.requests_failed.add(1);
+                let _ = pending.reply.send(Err(unanswered.clone()));
+            }
+        }
     }
 
     /// Fails a step's requests that are still waiting, for one table or all.
