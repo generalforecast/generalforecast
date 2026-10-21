@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Forecasting: groups of series planned as units, laid onto grids.
 //!
 //! A series table's forecast request names series and the cutoff each is

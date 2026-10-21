@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! `gf-router init`: a starter configuration for a router over a few nodes.
 
 /// A router over `nodes` servers on this machine, as `init` writes it.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Feature columns: their kinds, the numbers typed Arrow columns become, and
 //! the vocabularies that give categories their codes.
 //!

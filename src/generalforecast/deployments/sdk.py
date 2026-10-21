@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Compatibility aliases to the canonical versioned SDK, with no alpha transport."""
 
 import datetime

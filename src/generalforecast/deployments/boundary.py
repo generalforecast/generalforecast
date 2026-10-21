@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Additive local-suite envelope, shared by HTTP and in-process adapters.
 
 Parsing is not authorization or domain admission. Existing alpha contracts stay

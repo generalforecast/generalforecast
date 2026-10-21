@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Row vectors for tests that build a page index alone, which keeps none.
 
 use std::cell::RefCell;

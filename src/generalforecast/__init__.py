@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """gf SDK: versioned HTTP clients and the existing native notebook engine."""
 
 import importlib

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The router's configuration file (TOML).
 
 use std::path::{Path, PathBuf};

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The `generalforecast` command: a server on this machine, and a benchmark of one.
 
 `generalforecast serve` starts a gf-server on this machine with the built-in models,

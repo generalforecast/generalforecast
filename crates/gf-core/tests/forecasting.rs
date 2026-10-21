@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Series grouped into units before a cutoff, and laid onto grids.
 
 use std::collections::HashSet;

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Every built-in model once: artifact identity, intrinsic capability and qualification.
 
 This module is metadata only, standard library alone, so offline tools such as

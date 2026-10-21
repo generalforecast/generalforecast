@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! How a table's slices are balanced.
 
 use serde::{Deserialize, Serialize};

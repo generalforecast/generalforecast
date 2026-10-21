@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """TimesFM 3: a causal patch transformer that decodes a horizon in one pass.
 
 Each row is normalized by the running moments of its observed values up to

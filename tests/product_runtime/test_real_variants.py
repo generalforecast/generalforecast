@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Real pinned CPU weights: @K, *N and grouped forecasts agree across surfaces.
 
 The Models API (`CatalogService`, which `LocalModels` and HTTP routes share), a

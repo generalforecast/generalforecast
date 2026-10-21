@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Chronos-2: an encoder over patches with attention along time and across rows.
 
 Every row of a group is standardized on its own and turned into patches of

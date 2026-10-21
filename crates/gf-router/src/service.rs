@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The router's Flight service: each call goes to the nodes that hold its table.
 //!
 //! Arrow streams pass through without being decoded. A table keeps `replicas`

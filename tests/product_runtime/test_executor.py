@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Package execution contract tests. Injected numeric kernels are not model evidence."""
 
 from concurrent.futures import ThreadPoolExecutor

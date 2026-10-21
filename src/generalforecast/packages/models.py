@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Immutable catalog metadata and explicit online qualification, never weight loading."""
 
 import re

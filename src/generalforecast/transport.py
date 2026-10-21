@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Bounded HTTPS transport with explicit, independent credential layers."""
 
 import asyncio

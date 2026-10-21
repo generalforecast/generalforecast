@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """TimesFM 3 checkpoints: converted from Google's repository, then loaded.
 
 The published files are the model's config, with the residual block's and

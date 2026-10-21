@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Source-test-only Flight client for internal engine/server/router regression tests."""
 
 import asyncio

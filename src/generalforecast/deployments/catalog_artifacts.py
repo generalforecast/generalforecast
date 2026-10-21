@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Content verification shared by curated Models API adapters."""
 
 from dataclasses import asdict

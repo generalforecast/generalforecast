@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Frames: a JSON header plus raw little-endian arrays.
 //!
 //! The server and its workers exchange frames over a Unix socket, and log

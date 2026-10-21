@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """An example of a local table whose rows change between predictions.
 
 We insert, update and delete rows, predicting after each change. Only the cached

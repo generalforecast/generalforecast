@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Tables split into partitions, each an ordinary table on the nodes.
 //!
 //! A table made with `partitions` is that many tables,

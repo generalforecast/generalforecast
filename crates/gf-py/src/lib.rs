@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! `generalforecast._core`: thin Python bindings over `gf-core`.
 //!
 //! Bindings convert arguments, arrays and errors and nothing else, so behavior

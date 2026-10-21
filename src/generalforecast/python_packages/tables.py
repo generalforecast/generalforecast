@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Canonical SDK/runtime data adapters without extra prediction or HTTP clients."""
 
 from typing import Any

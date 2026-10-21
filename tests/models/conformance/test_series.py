@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Contract checks every forecaster must pass, run on small random instances."""
 
 from __future__ import annotations

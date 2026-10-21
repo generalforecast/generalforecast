@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """`gf serve`, the standalone Models API server. Injected kernels are not model evidence."""
 
 import asyncio

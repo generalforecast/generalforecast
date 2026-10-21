@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """One capability admission for compiled, registered and executed packages.
 
 `Package.check`, revision registration and the package runtime all call

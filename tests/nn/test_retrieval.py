@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The retrieval decoder against a direct computation, with padding and int8 caches."""
 
 from __future__ import annotations

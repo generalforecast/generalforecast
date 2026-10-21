@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Canonical model catalog: one entry per family and frozen v1 pin identities."""
 
 import dataclasses

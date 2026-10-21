@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """What `gf serve` serves: one catalog model or one locked prediction package."""
 
 import threading

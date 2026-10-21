@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Contexts as sets of rows, and their fingerprints.
 
 use gf_core::context::{Context, Fingerprint};

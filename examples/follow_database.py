@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """An example keeping a table in step with a database through Debezium events.
 
 We apply hand-written events here, so the example runs without Kafka; in

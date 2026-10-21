@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Bounded request-context Models API; no management or ingestion dependency."""
 
 from collections.abc import Sequence

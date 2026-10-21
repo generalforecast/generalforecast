@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Quantiles of a distribution over buckets, as bucket regression heads predict."""
 
 import math

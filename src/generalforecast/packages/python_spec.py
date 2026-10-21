@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Strict Python serving intent, independent of catalog capabilities and execution."""
 
 from dataclasses import dataclass

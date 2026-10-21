@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Change data capture: keeps a table in step with a source database.
 
 Debezium turns a database's log (Postgres logical replication, the MySQL binlog

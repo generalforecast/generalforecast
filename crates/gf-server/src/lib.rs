@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! generalforecast's server: an Arrow Flight API over nodes, with a write-ahead log and Python workers.
 
 pub mod action;

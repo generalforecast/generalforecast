@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Context caches in fixed-size slots of bytes, so device and host memory are pools.
 
 A layout says where each part of a model's context cache goes. Leaves with a

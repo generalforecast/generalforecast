@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Chronos-2 from Amazon's package, and generalforecast's port, on the same weights."""
 
 from __future__ import annotations

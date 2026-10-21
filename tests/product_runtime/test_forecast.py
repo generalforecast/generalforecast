@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Forecast alignment contract tests with explicitly substituted numeric kernels."""
 
 from dataclasses import replace

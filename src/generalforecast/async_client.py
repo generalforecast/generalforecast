@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Native asynchronous SDK with the same scoped resources and immutable values."""
 
 from __future__ import annotations

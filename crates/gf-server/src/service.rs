@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The Arrow Flight API.
 //!
 //! - Actions: `create_table`, `describe`, `delete`, `refit`, `compact`, `drop_table`,

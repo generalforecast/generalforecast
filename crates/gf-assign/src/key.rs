@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Key functions: where a row or query sits in a table's key space.
 
 /// A point in a table's key space.
