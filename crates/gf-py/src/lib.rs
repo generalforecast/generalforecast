@@ -1303,12 +1303,14 @@ impl Node {
         queries: PyReadonlyArray2<'_, f32>,
         before: Option<PyReadonlyArray1<'_, i64>>,
     ) -> PyResult<Vec<Py<PyArray2<u64>>>> {
+        // Copied out, so planning, which may draw regions, runs without the GIL.
         let before = before
             .as_ref()
-            .map(PyReadonlyArray1::as_slice)
+            .map(|before| before.as_slice().map(<[i64]>::to_vec))
             .transpose()?;
-        self.0
-            .contexts(TableId(table), queries.as_slice()?, before)
+        let queries = queries.as_slice()?.to_vec();
+        let node = &mut self.0;
+        py.detach(|| node.contexts(TableId(table), &queries, before.as_deref()))
             .map_err(raised)?
             .iter()
             .map(|keys| key_matrix(py, keys))
