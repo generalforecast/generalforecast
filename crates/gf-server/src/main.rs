@@ -20,12 +20,16 @@ use axum::routing::get;
 use clap::Parser;
 use gf_core::node::Task;
 use gf_server::auth::Tokens;
-use gf_server::config::{Config, WorkerConfig};
+use gf_server::config::{Config, HttpConfig, KeysConfig};
+use gf_server::http::{Front, Introspect, KeyStore, Principal, ServedModel, Static};
 use gf_server::metrics::Metrics;
-use gf_server::service::{Placement, SeriesPlacement, Service};
+use gf_server::revisions::{Limits as RevisionLimits, Revisions};
+use gf_server::runtime;
+use gf_server::service::{Placement, RequestBudget, SeriesPlacement, Service};
 use gf_server::setup;
-use gf_server::shard::{Command, Shard, ShardSettings};
-use gf_server::worker::{Launch, Private, WorkerConnection, shared_parent, visible_gpus};
+use gf_server::shard::Command;
+use gf_server::upstream::{Cidr, Upstream};
+use gf_server::worker::{Private, shared_parent};
 use tokio::sync::{oneshot, watch};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
@@ -185,6 +189,16 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
         tracing::warn!("{warning}");
     }
     let keys = setup::keys(&config)?;
+    // One signal starts the drain for every listener; calls still open after
+    // the drain deadline are cut off, since every write is already on disk.
+    let (stop, stopped) = watch::channel(false);
+    let draining = Arc::new(AtomicBool::new(false));
+    // The Models API listens before the workers load, so liveness answers
+    // and readiness says when inference starts.
+    let front = match &config.http {
+        Some(http) => Some(listen_http(http, &config, draining.clone(), stopped.clone()).await?),
+        None => None,
+    };
     let key = keys.current.clone();
     let tables = config.data.join("tables");
     std::fs::create_dir_all(&tables)?;
@@ -200,78 +214,10 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
         None => Metrics::default(),
     });
 
-    let gpus = visible_gpus();
-    let launches: Vec<(&WorkerConfig, Option<&str>)> = config
-        .workers
-        .iter()
-        .flat_map(|worker| {
-            if worker.per_gpu && !gpus.is_empty() {
-                gpus.iter()
-                    .map(|gpu| (worker, Some(gpu.as_str())))
-                    .collect()
-            } else {
-                vec![(worker, None)]
-            }
-        })
-        .collect();
-    let mut shards = Vec::new();
-    for (index, (worker, gpu)) in launches.iter().enumerate() {
-        let disk = (config.disk_bytes > 0).then(|| cache.join(format!("worker-{index}.slots")));
-        let connection = WorkerConnection::spawn(Launch {
-            index,
-            workers: launches.len(),
-            config: (*worker).clone(),
-            bucket_minimum: config.bucket_minimum,
-            slot_bytes: config.slot_bytes,
-            gpu: gpu.map(str::to_string),
-            disk,
-            secrets: config.key_envs(),
-            shared_fallback: cache.clone(),
-            timers: config.timers(),
-        })
-        .await?;
-        let memory = ShardSettings {
-            device_bytes: config
-                .device_bytes
-                .or_else(|| {
-                    config
-                        .device_fraction
-                        .map(|fraction| (connection.device_memory as f64 * fraction) as u64)
-                })
-                .unwrap_or(connection.device_bytes),
-            host_bytes: config.host_bytes.unwrap_or(connection.host_bytes),
-            disk_bytes: config.disk_bytes,
-            row_memory_bytes: config
-                .row_memory_bytes
-                .unwrap_or(connection.row_memory_bytes),
-            slot_bytes: config.slot_bytes,
-            bucket_minimum: config.bucket_minimum,
-            step_bytes: config.step_bytes,
-            scheduling: config.scheduling,
-            eviction: config.eviction,
-            step_timeout: Duration::from_secs_f64(config.step_timeout_seconds),
-            queue_bytes: config.predict_queue_bytes,
-            snapshot_bytes: 1 << 30,
-            timers: config.timers(),
-        };
-        tracing::info!(
-            worker = index,
-            gpu,
-            models = ?connection.models,
-            device_bytes = memory.device_bytes,
-            host_bytes = memory.host_bytes,
-            "worker ready"
-        );
-        let mut shard = Shard::new(
-            connection,
-            memory,
-            key.clone(),
-            tables.clone(),
-            metrics.clone(),
-        )?;
-        shard.allocate().await?;
-        shards.push(shard.spawn()?);
-    }
+    let seats = runtime::seats(&config.workers);
+    let (shards, routes) = runtime::start(&config, &seats, &key, &tables, &cache, &metrics)
+        .await
+        .map_err(|error| -> Box<dyn Error> { error })?;
 
     let mut placement = HashMap::new();
     for (index, path) in setup::table_logs(&tables)?.iter().enumerate() {
@@ -325,10 +271,6 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
         placement.insert(name, placed);
     }
 
-    // One signal starts the drain for both servers; calls still open after
-    // the drain deadline are cut off, since every write is already on disk.
-    let (stop, stopped) = watch::channel(false);
-    let draining = Arc::new(AtomicBool::new(false));
     let drain = Duration::from_secs_f64(config.drain_seconds);
     tokio::spawn({
         let draining = draining.clone();
@@ -406,6 +348,10 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
         tracing::warn!("serving without TLS beyond this machine, as allow_plaintext says");
     }
     tracing::info!(%address, tls = config.tls.is_some(), "serving");
+    if let Some((front, url, _)) = &front {
+        front.start(shards.clone(), routes.clone()).await?;
+        event(&serde_json::json!({"event": "ready", "url": url}));
+    }
     let mut service = Service::new(shards.clone(), placement, metrics)
         .with_request_budget(config.request_bytes_in_flight)
         .with_max_tables(config.max_tables)
@@ -440,8 +386,138 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
             let _ = answer.await;
         }
     }
+    if let Some((_, url, served)) = front {
+        let _ = served.await;
+        event(&serde_json::json!({"event": "stopped", "url": url}));
+    }
     tracing::info!("drained");
     Ok(())
+}
+
+/// Writes one NDJSON event on stdout, as `gf serve` reports its progress.
+fn event(value: &serde_json::Value) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    let _ = writeln!(stdout, "{value}");
+    let _ = stdout.flush();
+}
+
+/// Binds the Models API, says it is serving, and answers on its own task
+/// until the drain; the front starts inference once the shards are up.
+async fn listen_http(
+    http: &HttpConfig,
+    config: &Config,
+    draining: Arc<AtomicBool>,
+    mut stopped: watch::Receiver<bool>,
+) -> Result<(Arc<Front>, String, tokio::task::JoinHandle<()>), Box<dyn Error>> {
+    let text = std::fs::read_to_string(&http.models)
+        .map_err(|error| format!("{}: {error}", http.models.display()))?;
+    let models: Vec<ServedModel> = serde_json::from_str(&text)
+        .map_err(|error| format!("{}: {error}", http.models.display()))?;
+    let listener = tokio::net::TcpListener::bind(&http.listen)
+        .await
+        .map_err(|error| format!("cannot listen on {}: {error}", http.listen))?;
+    let address = listener.local_addr()?;
+    let keys: Box<dyn KeyStore> = match &http.keys {
+        KeysConfig::Static {
+            env,
+            project,
+            permissions,
+        } => {
+            let key = std::env::var(env).ok().filter(|key| !key.is_empty());
+            if key.is_none() && !address.ip().is_loopback() {
+                eprintln!(
+                    "gf serve: warning: listening on {}:{} without an API key; anyone who can \
+                     reach this address can run inference. Set {env} to require a bearer key.",
+                    address.ip(),
+                    address.port()
+                );
+            }
+            Box::new(Static::scoped(
+                key.as_deref(),
+                Principal {
+                    project: project.clone(),
+                    permissions: permissions.clone(),
+                },
+            ))
+        }
+        KeysConfig::Introspect { url, token_env } => {
+            let token = std::env::var(token_env)
+                .map_err(|_| format!("set {token_env} to the control plane's service token"))?;
+            Box::new(Introspect::new(url, token)?)
+        }
+    };
+    let mut front = Front::new(
+        models,
+        keys,
+        http.surface,
+        address.ip().is_loopback(),
+        RequestBudget::new(config.request_bytes_in_flight),
+        Duration::from_secs_f64(http.request_timeout_seconds),
+        draining,
+    );
+    if let Some(url) = &http.upstream {
+        let trusted = http
+            .trusted_proxies
+            .iter()
+            .map(|range| range.parse::<Cidr>())
+            .collect::<Result<Vec<_>, _>>()?;
+        let timeout = Duration::try_from_secs_f64(http.upstream_timeout_seconds)
+            .map_err(|_| "upstream_timeout_seconds must be a positive number of seconds")?;
+        front = front.with_upstream(Upstream::new(
+            url,
+            timeout,
+            http.upstream_body_bytes,
+            trusted,
+        )?);
+    }
+    if let Some(revisions) = &http.revisions {
+        let token = std::env::var(&revisions.token_env).map_err(|_| {
+            format!(
+                "set {} to the control plane's service token",
+                revisions.token_env
+            )
+        })?;
+        let seconds = |value: f64, field: &str| {
+            Duration::try_from_secs_f64(value)
+                .ok()
+                .filter(|duration| !duration.is_zero())
+                .ok_or_else(|| format!("revisions.{field} must be a positive number of seconds"))
+        };
+        front = front.with_revisions(Revisions::new(
+            &revisions.url,
+            token,
+            RevisionLimits {
+                bytes: usize::try_from(revisions.cache_bytes)
+                    .map_err(|_| "revisions.cache_bytes is too large")?,
+                idle: seconds(revisions.idle_seconds, "idle_seconds")?,
+                resolve: seconds(revisions.resolve_seconds, "resolve_seconds")?,
+                timeout: seconds(revisions.timeout_seconds, "timeout_seconds")?,
+            },
+        )?);
+    }
+    let front = Arc::new(front.with_hosts(http.hosts.clone()));
+    let url = format!("http://{address}");
+    event(&serde_json::json!({
+        "event": "serving",
+        "url": url,
+        "models": front.names(),
+        "auth": front.auth(),
+    }));
+    let router = gf_server::http::router(front.clone());
+    let served = tokio::spawn(async move {
+        let shutdown = async move {
+            let _ = stopped.wait_for(|stop| *stop).await;
+        };
+        let router = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
+        if let Err(error) = axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown)
+            .await
+        {
+            tracing::error!("the Models API: {error}");
+        }
+    });
+    Ok((front, url, served))
 }
 
 /// Resolves on Ctrl-C or SIGTERM.

@@ -67,20 +67,22 @@ use gf_core::node::{Action, Step, StepUnit, Targets, UNLABELED};
 use gf_core::regions::RegionStats;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::columns::{self, Strings, Vocabulary, Words};
+use crate::ephemeral::{Ephemeral, EphemeralTables};
 use crate::metrics::{Metrics, TableMetrics, Timing};
 use crate::name::TableName;
 use crate::partition::{self, Given, ModelRows, Offer};
 use crate::protocol::{
-    Frame, ModelProfile, Outcome, Predictions, WorkerReply, WorkerRequest, movements_json,
-    outcome_from, step_frame,
+    ModelProfile, Outcome, Predictions, WorkerReply, WorkerRequest, movements_json, outcome_from,
+    step_frame,
 };
+use crate::routes::Routes;
 use crate::service::Charge;
 use crate::wal::{
-    self, Compacted, Compactor, CreationId, EncryptionKey, Log, LogEntry, LogError, PastWrite,
-    Record, Replay, RowSealer, Rows, TableDefinition, Terms, decode,
+    self, Compacted, Compactor, CreationId, Durability, EncryptionKey, Log, LogEntry, LogError,
+    PastWrite, Record, Replay, RowSealer, Rows, TableDefinition, Terms, decode,
 };
 use crate::worker::{self, WorkerConnection};
+use gf_core::columns::{self, Strings, Vocabulary, Words};
 
 fn profile_steps(steps: u64, what: &str) -> Result<NonZeroUsize, ServerError> {
     usize::try_from(steps)
@@ -89,8 +91,8 @@ fn profile_steps(steps: u64, what: &str) -> Result<NonZeroUsize, ServerError> {
         .ok_or_else(|| ServerError::Internal(format!("the forecaster's profile has no {what}")))
 }
 
-/// The frame that has a worker serve a table.
-fn add_table(id: TableId, definition: &TableDefinition) -> Frame {
+/// The request that has a worker serve a table.
+fn add_table(id: TableId, definition: &TableDefinition) -> WorkerRequest {
     WorkerRequest::AddTable {
         table: id.0,
         model: definition.model.clone(),
@@ -101,7 +103,6 @@ fn add_table(id: TableId, definition: &TableDefinition) -> Frame {
         summary: definition.summary,
         series: definition.series.is_some(),
     }
-    .frame()
 }
 
 /// Checks a forecaster's quantile levels: one per output column, increasing,
@@ -194,6 +195,14 @@ struct InFlight {
     planned: Instant,
     sent: Instant,
     reply: oneshot::Receiver<worker::Reply>,
+}
+
+/// A table the worker was told to serve or stop serving without the shard
+/// waiting: the worker answers frames in turn, so a step sent after it finds
+/// the table added, and its reply comes before that step's.
+enum Control {
+    Add(TableId),
+    Remove(TableId),
 }
 
 /// When a step was planned, sent, started once the step before it finished,
@@ -710,8 +719,24 @@ pub enum Command {
         trace: String,
         reply: Reply<Predictions>,
     },
+    /// Predicts queries against a request's context: from the ephemeral
+    /// table its definition names if the shard holds it, else from one made
+    /// now with the context's rows. The table stays pinned until the answer.
+    Infer {
+        context: Box<RequestContext>,
+        asked: Asked,
+        trace: String,
+        reply: Reply<Inferred>,
+    },
     /// The models the worker serves, by name.
     Models { reply: Reply<Vec<String>> },
+    /// Has the worker load a model under `name` from `spec`, unless it
+    /// serves one by that name already; a restarted worker loads it too.
+    AddModel {
+        name: String,
+        spec: String,
+        reply: Reply<()>,
+    },
     /// Saves every log's head, as a server does before it exits.
     SaveHeads { reply: Reply<()> },
     /// Has the worker sample its own threads for `seconds`, their stacks
@@ -760,6 +785,60 @@ struct Scratch {
 /// Idle scratch tables a shard keeps for requests over the same rows.
 const SCRATCH_KEPT: usize = 4;
 
+/// The metrics every ephemeral table reports under: one series for them
+/// all, named as no table may be, since each request context is a table.
+const EPHEMERAL_METRICS: &str = "ctx-*";
+
+/// How many ephemeral tables a shard keeps, in count and bytes of rows, and
+/// how long one may go unused; past either bound the least recently used
+/// unpinned tables go first. A table is pinned while a request reads it.
+#[derive(Clone, Copy, Debug)]
+pub struct EphemeralLimits {
+    pub tables: usize,
+    pub bytes: u64,
+    pub idle: Duration,
+}
+
+/// A request's context, as the shard makes its ephemeral table from it.
+#[derive(Clone, Debug)]
+pub struct RequestContext {
+    /// What names the context, and routes it to its shard.
+    pub fingerprint: [u8; 32],
+    /// The table's definition: `durability = ephemeral`, named for the
+    /// context's fingerprint.
+    pub definition: TableDefinition,
+    pub keys: Vec<u128>,
+    /// Row-major features, `definition.features()` per row.
+    pub features: Vec<f32>,
+    pub targets: Targets,
+    /// Each row's time, for a context of series.
+    pub times: Option<Vec<Option<i64>>>,
+}
+
+/// What a request asks of its context: predictions of query rows, or
+/// forecasts of some of its series.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Asked {
+    /// Row-major query features, `definition.features()` per row.
+    Rows(Vec<f32>),
+    /// Forecasts of `series` from before each cutoff, over `horizon` steps,
+    /// each with the members `groups` names.
+    Forecast {
+        series: Vec<u64>,
+        before: Option<Vec<i64>>,
+        horizon: NonZeroUsize,
+        groups: Option<Vec<Vec<u64>>>,
+    },
+}
+
+/// Predictions against a request's context, with the quantile level of each
+/// column for a table predicting values.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Inferred {
+    pub predictions: Predictions,
+    pub levels: Option<Vec<f64>>,
+}
+
 /// Memory, padding and timing settings for a shard.
 #[derive(Clone, Copy, Debug)]
 pub struct ShardSettings {
@@ -785,6 +864,8 @@ pub struct ShardSettings {
     pub snapshot_bytes: u64,
     /// Times each part of planning a step, for the `gf_plan_part_*` metrics.
     pub timers: bool,
+    /// The ephemeral tables of request contexts the shard keeps.
+    pub ephemeral: EphemeralLimits,
 }
 
 /// What wakes a shard: a command, the worker's reply to the oldest step, the
@@ -800,6 +881,8 @@ enum Event {
     Retry,
     Started(Box<Result<WorkerConnection, String>>),
     Idle,
+    /// The least recently used ephemeral table has gone unused too long.
+    Expired,
 }
 
 /// A compaction under way: the writes it holds back, the callers waiting for
@@ -836,6 +919,11 @@ pub struct Shard {
     scratch: HashMap<TableId, Scratch>,
     /// Counts uses of scratch tables, so the least recent go first.
     scratch_uses: u64,
+    /// Request contexts' tables, by name, held in memory alone.
+    ephemeral: EphemeralTables,
+    /// The routes to the shards, and this shard's place in them, told
+    /// which contexts' tables it holds.
+    routes: Option<(Arc<Routes>, usize)>,
     /// Each served table's name, by its id in the node.
     names: HashMap<TableId, TableName>,
     profiles: HashMap<(String, usize), ModelProfile>,
@@ -854,6 +942,8 @@ pub struct Shard {
     /// Bytes of queries in `pending`.
     queued_bytes: u64,
     in_flight: VecDeque<InFlight>,
+    /// Tables added to or removed from the worker whose replies are still due.
+    controls: VecDeque<(Control, oneshot::Receiver<worker::Reply>)>,
     /// When the worker last finished a step, to time steps that queued behind it.
     finished: Instant,
     /// Failed steps in a row, by table, and the tables quarantined for them.
@@ -934,8 +1024,11 @@ impl Shard {
             pending: HashMap::new(),
             scratch: HashMap::new(),
             scratch_uses: 0,
+            ephemeral: EphemeralTables::new(memory.ephemeral),
+            routes: None,
             queued_bytes: 0,
             in_flight: VecDeque::new(),
+            controls: VecDeque::new(),
             finished: Instant::now(),
             failures: HashMap::new(),
             quarantined: HashMap::new(),
@@ -952,6 +1045,14 @@ impl Shard {
         })
     }
 
+    /// Tells `routes`, as shard `shard` of them, which contexts' tables it
+    /// holds and drops.
+    #[must_use]
+    pub fn with_routes(mut self, routes: Arc<Routes>, shard: usize) -> Self {
+        self.routes = Some((routes, shard));
+        self
+    }
+
     /// Sizes the worker's pools as the node's tiers.
     ///
     /// # Errors
@@ -964,10 +1065,19 @@ impl Shard {
             disk_slots: self.tiers[2].slots,
         }
         .frame();
-        self.worker
-            .request_within(&frame, self.step_timeout)
-            .await
-            .map(drop)
+        // The worker compiles the programs earlier workers recorded before
+        // it answers, reporting progress after each, so the shard takes no
+        // step until they are ready.
+        let reply = self
+            .worker
+            .request_progressing(&frame, self.step_timeout)
+            .await?;
+        if let Ok(WorkerReply::Warmed { compiles, seconds }) = WorkerReply::of(&reply) {
+            tracing::info!(compiles, seconds, "worker compiled its recorded programs");
+            self.metrics.warm_compiles.add(compiles);
+            self.metrics.warm_seconds.add(seconds);
+        }
+        Ok(())
     }
 
     /// Runs the shard on a thread of its own, so planning never holds up the
@@ -990,8 +1100,13 @@ impl Shard {
     async fn run(mut self, mut commands: mpsc::Receiver<Command>) {
         loop {
             self.cancel_abandoned();
-            while self.in_flight.len() < PIPELINE_DEPTH && self.dispatch().await {}
+            self.settle_controls().await;
+            while self.in_flight.len() < PIPELINE_DEPTH
+                && !self.holds_new_contexts()
+                && self.dispatch().await
+            {}
             let deadline = self.deadline();
+            let expiry = self.ephemeral.expiry();
             let next = self.in_flight.front_mut().map(|step| &mut step.reply);
             let up = self.down.is_none();
             let stopped = self.worker.pipeline.stopped();
@@ -1022,6 +1137,8 @@ impl Shard {
                     ))
                 }
                 () = std::future::ready(()), if heads_behind => Event::Idle,
+                () = tokio::time::sleep_until(expiry.unwrap_or_else(Instant::now)),
+                    if expiry.is_some() => Event::Expired,
             };
             match event {
                 Event::Command(Some(command)) => {
@@ -1046,7 +1163,9 @@ impl Shard {
                 }
                 Event::Started(started) => self.started(*started).await,
                 Event::Idle => self.save_idle_heads(),
+                Event::Expired => self.sweep_ephemeral().await,
             }
+            self.flush_controls();
         }
         self.drain().await;
         self.save_heads();
@@ -1246,6 +1365,9 @@ impl Shard {
             Command::Models { reply } => {
                 let _ = reply.send(Ok(self.worker.models.clone()));
             }
+            Command::AddModel { name, spec, reply } => {
+                let _ = reply.send(self.add_model(name, spec).await);
+            }
             Command::ReadLog {
                 table,
                 from,
@@ -1362,6 +1484,31 @@ impl Shard {
             } => {
                 let _ = reply.send(self.offer(&table, features, &strings, share, before));
             }
+            Command::Infer {
+                context,
+                asked,
+                trace,
+                reply,
+            } => match self.infer(*context, asked).await {
+                Ok((request, pending, levels)) => {
+                    let (answered, answer) = oneshot::channel();
+                    self.queue_pending(
+                        request,
+                        Pending {
+                            reply: answered,
+                            trace,
+                            ..pending
+                        },
+                    );
+                    // A caller that goes away closes the queued reply, so the
+                    // abandoned query leaves the queue as a prediction's does.
+                    tokio::spawn(relay(answer, reply, levels));
+                    self.sweep_ephemeral().await;
+                }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            },
             Command::PredictGiven {
                 table,
                 rows,
@@ -1371,8 +1518,7 @@ impl Shard {
             } => {
                 let _ = match self.submit_given(&table, rows, given).await {
                     Ok((request, pending)) => {
-                        self.queued_bytes += pending.bytes;
-                        self.pending.insert(
+                        self.queue_pending(
                             request,
                             Pending {
                                 reply,
@@ -1394,10 +1540,12 @@ impl Shard {
                 trace,
                 reply,
             } => {
-                let _ = match self.submit_forecast(&table, series, before, horizon, groups) {
+                let submitted = self.usable(&table).and_then(|id| {
+                    self.submit_forecast(id, &table, series, before, horizon, groups)
+                });
+                let _ = match submitted {
                     Ok((request, pending)) => {
-                        self.queued_bytes += pending.bytes;
-                        self.pending.insert(
+                        self.queue_pending(
                             request,
                             Pending {
                                 reply,
@@ -1424,8 +1572,7 @@ impl Shard {
                     resolved.and_then(|()| self.submit(&table, features, before, given));
                 let _ = match submitted {
                     Ok((request, pending)) => {
-                        self.queued_bytes += pending.bytes;
-                        self.pending.insert(
+                        self.queue_pending(
                             request,
                             Pending {
                                 reply,
@@ -1647,6 +1794,108 @@ impl Shard {
         ))
     }
 
+    /// Queues queries against a request context's ephemeral table, making
+    /// the table from the context's rows unless the shard holds it already.
+    async fn infer(
+        &mut self,
+        context: RequestContext,
+        asked: Asked,
+    ) -> Result<(RequestId, Pending, Option<Vec<f64>>), ServerError> {
+        let RequestContext {
+            fingerprint,
+            definition,
+            keys,
+            features,
+            targets,
+            times,
+        } = context;
+        if definition.durability != Durability::Ephemeral {
+            return Err(ServerError::Invalid(
+                "a request's context takes an ephemeral table".to_string(),
+            ));
+        }
+        let name = definition.name.clone();
+        let id = match self.ephemeral.named(&name) {
+            Some(table) if table.definition == definition => table.id,
+            Some(_) => {
+                return Err(ServerError::Internal(format!(
+                    "table {name:?} holds another context"
+                )));
+            }
+            None => {
+                self.make_ephemeral(
+                    fingerprint,
+                    definition,
+                    &keys,
+                    &features,
+                    targets,
+                    times.as_deref(),
+                )
+                .await?
+            }
+        };
+        if let Some((routes, shard)) = &self.routes {
+            routes.holds(&fingerprint, *shard);
+        }
+        let levels = self
+            .ephemeral
+            .get(id)
+            .and_then(|table| table.levels.clone());
+        let (request, pending) = match asked {
+            Asked::Rows(queries) => self.enqueue(id, name.as_str(), queries, None, None)?,
+            Asked::Forecast {
+                series,
+                before,
+                horizon,
+                groups,
+            } => self.submit_forecast(id, name.as_str(), series, before, horizon, groups)?,
+        };
+        Ok((request, pending, levels))
+    }
+
+    /// Serves an ephemeral table in memory, without a log, and adds its rows.
+    async fn make_ephemeral(
+        &mut self,
+        fingerprint: [u8; 32],
+        definition: TableDefinition,
+        keys: &[u128],
+        features: &[f32],
+        targets: Targets,
+        times: Option<&[Option<i64>]>,
+    ) -> Result<TableId, ServerError> {
+        let (spec, _, levels) = self.spec(&definition, false).await?;
+        let id = self.node.create_table(spec)?;
+        self.node.set_single_use(id)?;
+        self.send_to_worker(id, &definition);
+        let rows = targets.len() as u64;
+        if let Err(error) = self.node.insert_at(id, keys, features, targets, times) {
+            self.unserve(id).await;
+            return Err(error.into());
+        }
+        let bytes = keys.len() as u64 * 16 + features.len() as u64 * 4 + rows * 4;
+        self.ephemeral.insert(Ephemeral::new(
+            id,
+            fingerprint,
+            definition,
+            levels,
+            bytes,
+            self.metrics.table(EPHEMERAL_METRICS),
+        ));
+        self.metrics.ephemeral_tables.add(1);
+        Ok(id)
+    }
+
+    /// Drops ephemeral tables, least recently used first, while more are
+    /// kept than the limits allow or they went unused past the idle limit;
+    /// tables a request reads are pinned.
+    async fn sweep_ephemeral(&mut self) {
+        for table in self.ephemeral.evict(Instant::now()) {
+            self.metrics.ephemeral_tables.sub(1);
+            self.dropped(&table);
+            self.unserve(table.id).await;
+        }
+    }
+
     /// Drops the scratch tables no request needs, past the `SCRATCH_KEPT`
     /// most recently used.
     async fn sweep_scratch(&mut self) {
@@ -1814,6 +2063,18 @@ impl Shard {
         given: Option<Vec<Vec<u128>>>,
     ) -> Result<(RequestId, Pending), ServerError> {
         let id = self.usable(table)?;
+        self.enqueue(id, table, features, before, given)
+    }
+
+    /// Queues queries of a table the node holds, within the queue's budget.
+    fn enqueue(
+        &mut self,
+        id: TableId,
+        table: &str,
+        features: Vec<f32>,
+        before: Option<Vec<i64>>,
+        given: Option<Vec<Vec<u128>>>,
+    ) -> Result<(RequestId, Pending), ServerError> {
         if let Some(reason) = self.quarantined.get(&id) {
             return Err(ServerError::Invalid(format!(
                 "table {table:?} takes no queries: it failed {FAILURES} steps running \
@@ -1852,26 +2113,33 @@ impl Shard {
     }
 
     /// Queues a forecast of series, as `submit` queues queries.
+    /// The definition of a table the shard serves, durable or ephemeral.
+    fn definition(&self, id: TableId, table: &str) -> Option<&TableDefinition> {
+        self.ephemeral
+            .get(id)
+            .map(|ephemeral| &ephemeral.definition)
+            .or_else(|| self.tables.get(table).map(|entry| &entry.definition))
+    }
+
     fn submit_forecast(
         &mut self,
+        id: TableId,
         table: &str,
         series: Vec<u64>,
         before: Option<Vec<i64>>,
         horizon: NonZeroUsize,
         groups: Option<Vec<Vec<u64>>>,
     ) -> Result<(RequestId, Pending), ServerError> {
-        let id = self.usable(table)?;
         if let Some(reason) = self.quarantined.get(&id) {
             return Err(ServerError::Invalid(format!(
                 "table {table:?} takes no forecasts: it failed {FAILURES} steps running \
                  ({reason}); a write lets it try again"
             )));
         }
-        let entry = &self.tables[table];
-        let key = (
-            entry.definition.model.clone(),
-            entry.definition.model_features(),
-        );
+        let definition = self
+            .definition(id, table)
+            .ok_or_else(|| ServerError::Internal(format!("table {table:?} has no definition")))?;
+        let key = (definition.model.clone(), definition.model_features());
         if let Some(profile) = self.profiles.get(&key) {
             let limit = horizon_limit(
                 profile_steps(profile.output_patch, "output patch")?,
@@ -1885,7 +2153,7 @@ impl Shard {
                 return Err(ServerError::Invalid(format!(
                     "a horizon of {horizon} steps is past the {limit} the model {:?} forecasts \
                      in {HORIZON_PASSES} passes",
-                    entry.definition.model
+                    definition.model
                 )));
             }
         }
@@ -1961,7 +2229,15 @@ impl Shard {
     fn take(&mut self, request: RequestId) -> Option<Pending> {
         let pending = self.pending.remove(&request)?;
         self.queued_bytes -= pending.bytes;
+        self.ephemeral.unpin(pending.table, Instant::now());
         Some(pending)
+    }
+
+    /// Queues a request for its answer, pinning the ephemeral table it reads.
+    fn queue_pending(&mut self, request: RequestId, pending: Pending) {
+        self.queued_bytes += pending.bytes;
+        self.ephemeral.pin(pending.table);
+        self.pending.insert(request, pending);
     }
 
     /// Kills the worker and starts it again in the background: requests in
@@ -1984,9 +2260,21 @@ impl Shard {
                 .unwrap_or_else(|_| Err("the worker stopped".to_string()));
             self.finish(reply).await;
         }
+        // The worker forgets every table, so answers still due mean nothing.
+        self.controls.clear();
         // The worker starts again with only the shard's own tables, so the
-        // scratch tables go, and requests waiting on them fail.
-        for (id, _) in std::mem::take(&mut self.scratch) {
+        // scratch and ephemeral tables go, and requests waiting on them fail.
+        let ephemeral = self.ephemeral.drain();
+        self.metrics.ephemeral_tables.sub(ephemeral.len() as u64);
+        for table in &ephemeral {
+            self.dropped(table);
+        }
+        let ephemeral = ephemeral.into_iter().map(|table| table.id);
+        let dropped: Vec<TableId> = std::mem::take(&mut self.scratch)
+            .into_keys()
+            .chain(ephemeral)
+            .collect();
+        for id in dropped {
             let waiting: Vec<RequestId> = self
                 .pending
                 .iter()
@@ -2041,7 +2329,10 @@ impl Shard {
         self.allocate().await?;
         for entry in self.tables.values() {
             self.worker
-                .request_within(&add_table(entry.id, &entry.definition), self.step_timeout)
+                .request_within(
+                    &add_table(entry.id, &entry.definition).frame(),
+                    self.step_timeout,
+                )
                 .await?;
         }
         Ok(())
@@ -2167,6 +2458,38 @@ impl Shard {
         !tables.is_empty()
     }
 
+    /// Has the worker load a model it does not serve yet, and starts later
+    /// workers with it.
+    async fn add_model(&mut self, name: String, spec: String) -> Result<(), ServerError> {
+        if self.worker.models.contains(&name) {
+            return Ok(());
+        }
+        let request = WorkerRequest::Controls {
+            requests: vec![WorkerRequest::AddModel {
+                name: name.clone(),
+                spec: spec.clone(),
+            }],
+        };
+        match self.ask_worker(&request).await? {
+            WorkerReply::Ok => {
+                self.worker.models.push(name.clone());
+                self.worker.launch.config.models.insert(name, spec);
+                Ok(())
+            }
+            WorkerReply::Controlled { failures } => Err(ServerError::Invalid(format!(
+                "model {name:?} could not load: {}",
+                failures
+                    .iter()
+                    .map(|failure| failure.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))),
+            reply => Err(ServerError::Internal(format!(
+                "the worker answered adding a model with {reply:?}"
+            ))),
+        }
+    }
+
     /// Sends the worker a request and reads its reply.
     async fn ask_worker(&mut self, request: &WorkerRequest) -> Result<WorkerReply, ServerError> {
         let frame = self
@@ -2184,6 +2507,16 @@ impl Shard {
             model: definition.model.clone(),
             classes: definition.classes,
             features: definition.model_features(),
+            series: definition
+                .series
+                .as_ref()
+                .map_or(1, |series| match series.group {
+                    crate::wal::GroupSpec::Alone => 1,
+                    crate::wal::GroupSpec::Random { size, .. }
+                    | crate::wal::GroupSpec::Given { size } => {
+                        usize::try_from(size).unwrap_or(usize::MAX)
+                    }
+                }),
         };
         match self.ask_worker(&request).await? {
             WorkerReply::Ok => Ok(()),
@@ -2240,13 +2573,88 @@ impl Shard {
     ) -> Result<(), ServerError> {
         if let Err(error) = self
             .worker
-            .request_within(&add_table(id, definition), self.step_timeout)
+            .request_within(&add_table(id, definition).frame(), self.step_timeout)
             .await
         {
             let _ = self.node.remove_table(id);
             return Err(ServerError::Internal(error));
         }
         Ok(())
+    }
+
+    /// Has the worker serve a table the node serves without waiting for its
+    /// answer, so tables made while steps are in flight do not queue behind
+    /// them, and tables made in one tick go to the worker in one frame;
+    /// `settle_controls` reads the answer.
+    fn send_to_worker(&mut self, id: TableId, definition: &TableDefinition) {
+        let reply = self.worker.pipeline.control(add_table(id, definition));
+        self.controls.push_back((Control::Add(id), reply));
+    }
+
+    /// Sends the worker the controls this tick queued, in one frame; if the
+    /// worker stopped, their replies fail and the restart serves the tables
+    /// again.
+    fn flush_controls(&mut self) {
+        if let Err(error) = self.worker.pipeline.flush() {
+            tracing::error!("sending tables and tiers' changes to the worker: {error}");
+        }
+    }
+
+    /// Reads the worker's answers to tables added and removed, in the order
+    /// sent, as far as they came. A table the worker refused to add leaves
+    /// the shard, failing the requests that wait on it.
+    async fn settle_controls(&mut self) {
+        while let Some((_, reply)) = self.controls.front_mut() {
+            let answer = match reply.try_recv() {
+                Ok(answer) => answer,
+                Err(oneshot::error::TryRecvError::Empty) => break,
+                Err(oneshot::error::TryRecvError::Closed) => Err("the worker stopped".to_string()),
+            };
+            let (control, _) = self.controls.pop_front().expect("found above");
+            let Err(error) = answer else {
+                continue;
+            };
+            match control {
+                Control::Add(id) => {
+                    tracing::error!(table = id.0, "adding a table to the worker: {error}");
+                    self.drop_unserved(id, &ServerError::Internal(error)).await;
+                }
+                Control::Remove(id) => {
+                    tracing::error!(table = id.0, "removing a table from the worker: {error}");
+                }
+            }
+        }
+    }
+
+    /// Tells the routes a context's table left this shard.
+    fn dropped(&self, table: &Ephemeral) {
+        if let Some((routes, shard)) = &self.routes {
+            routes.dropped(&table.fingerprint, *shard);
+        }
+    }
+
+    /// Takes an ephemeral table the worker could not serve off the shard,
+    /// failing the requests that wait on it.
+    async fn drop_unserved(&mut self, id: TableId, error: &ServerError) {
+        if let Some(table) = self.ephemeral.remove(id) {
+            self.metrics.ephemeral_tables.sub(1);
+            self.dropped(&table);
+        }
+        let waiting: Vec<RequestId> = self
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.table == id)
+            .map(|(&request, _)| request)
+            .collect();
+        for request in waiting {
+            self.node.cancel(request);
+            if let Some(pending) = self.take(request) {
+                let _ = pending.reply.send(Err(error.clone()));
+            }
+        }
+        if let Ok(dropped) = self.node.remove_table(id) {
+            self.send_drops(&dropped).await;
+        }
     }
 
     /// A table's spec on the node, checked against its model, with its
@@ -2339,7 +2747,9 @@ impl Shard {
             }
             (Task::Classes(1), false) => {
                 return Err(ServerError::Invalid(
-                    "a classifier tells at least 2 classes apart, not 1 class".to_string(),
+                    "a classifier tells at least 2 classes apart, not 1 class; a regressor's \
+                     table takes none"
+                        .to_string(),
                 ));
             }
             (Task::Classes(classes), false) if u64::from(classes) > class_slots => {
@@ -2469,14 +2879,11 @@ impl Shard {
             // The worker starts again with only the tables the shard still serves.
             return;
         }
-        let removal = WorkerRequest::RemoveTable { table: id.0 }.frame();
-        if let Err(error) = self
+        let reply = self
             .worker
-            .request_within(&removal, self.step_timeout)
-            .await
-        {
-            tracing::error!(table = id.0, "removing a table from the worker: {error}");
-        }
+            .pipeline
+            .control(WorkerRequest::RemoveTable { table: id.0 });
+        self.controls.push_back((Control::Remove(id), reply));
     }
 
     /// Serves a new table with a new log under these terms; returns its
@@ -2583,18 +2990,28 @@ impl Shard {
         );
     }
 
-    /// A served table's name, or a scratch table's partition's.
+    /// A served table's name, a scratch table's partition's, or an
+    /// ephemeral table's.
     fn name_of(&self, id: TableId) -> Option<&TableName> {
         self.names
             .get(&id)
             .or_else(|| self.scratch.get(&id).map(|scratch| &scratch.content.0))
+            .or_else(|| self.ephemeral_of(id).map(|table| &table.definition.name))
+    }
+
+    fn ephemeral_of(&self, id: TableId) -> Option<&Ephemeral> {
+        self.ephemeral.get(id)
     }
 
     /// A table's metrics by its id in the node; a scratch table's are its partition's.
     fn table_metrics(&self, id: TableId) -> Option<&TableMetrics> {
         match self.names.get(&id) {
             Some(name) => self.tables.get(name).map(|entry| &*entry.metrics),
-            None => self.scratch.get(&id).map(|scratch| &*scratch.metrics),
+            None => self
+                .scratch
+                .get(&id)
+                .map(|scratch| &*scratch.metrics)
+                .or_else(|| self.ephemeral_of(id).map(|table| &*table.metrics)),
         }
     }
 
@@ -3343,6 +3760,13 @@ impl Shard {
         Ok(())
     }
 
+    /// Whether the next step waits for the one in flight: new contexts
+    /// that arrive while it runs go together in the step after it, side by
+    /// side, rather than each in a step of its own behind it.
+    fn holds_new_contexts(&self) -> bool {
+        !self.in_flight.is_empty() && self.node.only_new_contexts_wait()
+    }
+
     /// Plans pending predictions into a step and sends it to the worker.
     ///
     /// Returns whether a step was sent.
@@ -3438,6 +3862,7 @@ impl Shard {
 
     /// Completes the oldest step in flight with the worker's reply.
     async fn finish(&mut self, reply: worker::Reply) {
+        self.settle_controls().await;
         let InFlight {
             step,
             planned,
@@ -3465,6 +3890,8 @@ impl Shard {
         tracing::debug!(
             traces = ?traces,
             units = step.units().len(),
+            fits = step.fits().len(),
+            queries = step.queries().len(),
             milliseconds = took.as_secs_f64() * 1e3,
             "ran a step"
         );
@@ -3479,7 +3906,7 @@ impl Shard {
                 gf_core::node::Action::Reuse => {
                     (&self.metrics.units_reused, &self.metrics.rows_reused)
                 }
-                gf_core::node::Action::Transient => {
+                gf_core::node::Action::Transient | gf_core::node::Action::Fuse => {
                     (&self.metrics.units_transient, &self.metrics.rows_encoded)
                 }
                 // Tabular units are never extended; counted as encoded if one were.
@@ -3701,7 +4128,9 @@ impl Shard {
                         let unit = step.unit(index);
                         let encoded = match unit.placed.action() {
                             Action::Reuse => 0,
-                            Action::Encode | Action::Transient | Action::Extend => unit.rows.len(),
+                            Action::Encode | Action::Transient | Action::Fuse | Action::Extend => {
+                                unit.rows.len()
+                            }
                         };
                         encoded as f64 / readers[&index] as f64
                     })
@@ -3724,7 +4153,7 @@ impl Shard {
             // An extension encodes its new steps and reuses the rest.
             let steps = match unit.placed.action() {
                 Action::Reuse => 0,
-                Action::Encode | Action::Transient => unit.grid.steps,
+                Action::Encode | Action::Transient | Action::Fuse => unit.grid.steps,
                 Action::Extend => unit.grown,
             };
             let entry = forecasts
@@ -3845,34 +4274,49 @@ impl Shard {
         }
     }
 
-    /// Sends drops to the worker without waiting: the pipeline orders them, and a
-    /// failure is only logged, since nothing reads those entries again.
+    /// Sends drops to the worker without waiting: the pipeline orders them
+    /// with the tick's other controls, and a failure is only logged, since
+    /// nothing reads those entries again.
     async fn send_drops(&mut self, movements: &[Movement]) {
         // A worker starting again starts empty, so it has nothing to drop.
         if movements.is_empty() || self.down.is_some() {
             return;
         }
-        let frame = WorkerRequest::Apply {
+        let reply = self.worker.pipeline.control(WorkerRequest::Apply {
             movements: movements_json(movements),
-        }
-        .frame();
-        match self.worker.pipeline.send(&frame).await {
-            Ok(reply) => {
-                tokio::spawn(async move {
-                    if let Ok(Err(error)) = reply.await {
-                        tracing::error!("applying drops after a step: {error}");
-                    }
-                });
+        });
+        tokio::spawn(async move {
+            if let Ok(Err(error)) = reply.await {
+                tracing::error!("applying drops after a step: {error}");
             }
-            Err(error) => tracing::error!("sending drops after a step: {error}"),
-        }
+        });
     }
 
     fn fail_all(&mut self, error: &ServerError) {
         self.queued_bytes = 0;
+        let now = Instant::now();
         for (_, pending) in self.pending.drain() {
+            self.ephemeral.unpin(pending.table, now);
             let _ = pending.reply.send(Err(error.clone()));
         }
+    }
+}
+
+/// Passes a request context's predictions on with its table's levels, or
+/// stops waiting once the caller goes away, which closes the queued reply.
+async fn relay(
+    answer: oneshot::Receiver<Result<Predictions, ServerError>>,
+    reply: Reply<Inferred>,
+    levels: Option<Vec<f64>>,
+) {
+    let mut reply = reply;
+    tokio::select! {
+        answered = answer => {
+            let answered = answered
+                .unwrap_or_else(|_| Err(ServerError::Unavailable("the shard has stopped".to_string())));
+            let _ = reply.send(answered.map(|predictions| Inferred { predictions, levels }));
+        }
+        () = reply.closed() => {}
     }
 }
 

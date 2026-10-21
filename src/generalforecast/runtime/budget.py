@@ -138,12 +138,15 @@ class Call:
         shared: Arguments every item shares, such as parameters and the pool.
         items: Arguments stacked over the chunk's items.
         padded: Items the call takes, the chunk padded as `Chunks.run` asks.
+        program: The `Programs` key `function` is compiled under, for a
+            kind of call a later process can compile again; None otherwise.
     """
 
     function: Callable[..., Any]
     shared: tuple
     items: tuple
     padded: int
+    program: tuple | None = None
 
 
 def _traces(function: Callable[..., Any]) -> int:
@@ -192,6 +195,7 @@ class Chunks:
         counted: Callable[[str, float], None],
         compiled: Callable[[str], None] | None = None,
         timed: Callable[[str, float], None] | None = None,
+        seen: Callable[[Call], None] | None = None,
     ) -> None:
         """Sets up with nothing measured.
 
@@ -203,10 +207,13 @@ class Chunks:
                 device, as `compile` for a shape its program had not seen
                 and `dispatch` otherwise, and its `wait` seconds, until the
                 device finishes it. Without it, no call is split so.
+            seen: Takes each call whose shape its program had not seen, once
+                it ran.
         """
         self._counted = counted
         self._compiled = compiled
         self.timed = timed
+        self._seen = seen
         # Bytes per item of each kind, as estimated or measured, whichever is more.
         self._item_bytes: dict[Hashable, int] = {}
         self._measured: set[Hashable] = set()
@@ -302,6 +309,8 @@ class Chunks:
             measuring = 0.0
             if self._compiled is not None and compiled:
                 self._compiled(stage)
+            if self._seen is not None and compiled:
+                self._seen(call)
             consume(first, stop, outputs)
             # Freed before the next call, so the device never holds two calls' outputs.
             del outputs

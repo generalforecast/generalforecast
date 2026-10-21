@@ -6,12 +6,15 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use gf_core::cache::Eviction;
+use gf_core::catalog::Surface;
 use gf_core::node::Scheduling;
 use serde::{Deserialize, Deserializer};
 
 use crate::auth::TokenConfig;
+use crate::shard::EphemeralLimits;
 
 /// Everything a server needs to start.
 #[derive(Clone, Debug, Deserialize)]
@@ -135,16 +138,157 @@ pub struct Config {
     /// How long to wait for open calls to finish on shutdown before exiting anyway.
     #[serde(default = "drain_seconds")]
     pub drain_seconds: f64,
+    /// The most ephemeral tables, one per request context, each worker keeps
+    /// in memory; past it the least recently used unpinned ones go.
+    #[serde(default = "ephemeral_tables")]
+    pub ephemeral_tables: usize,
+    /// Bytes of request contexts' rows each worker keeps in ephemeral
+    /// tables; past it the least recently used unpinned ones go.
+    #[serde(default = "ephemeral_bytes")]
+    pub ephemeral_bytes: u64,
+    /// How long an ephemeral table may go unused before it goes.
+    #[serde(default = "ephemeral_idle_seconds")]
+    pub ephemeral_idle_seconds: f64,
     /// The most tables the server holds; creations past it are refused. Each
     /// table keeps its log open, so the server's open-file limit must allow
     /// as many files.
     #[serde(default = "max_tables")]
     pub max_tables: usize,
+    /// The Models API over HTTP, if the server answers it.
+    #[serde(default)]
+    pub http: Option<HttpConfig>,
     /// One worker per accelerator.
     pub workers: Vec<WorkerConfig>,
     /// How tables are placed on and moved between workers.
     #[serde(default)]
     pub placement: PlacementConfig,
+}
+
+/// The Models API over HTTP: where it listens, the models it serves and
+/// whose keys it takes.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpConfig {
+    /// The address to serve the Models API on, such as `127.0.0.1:8000`.
+    pub listen: String,
+    /// A JSON file listing the served models, as `gf serve` and the hosted
+    /// runtime write it from the catalog.
+    pub models: PathBuf,
+    /// Whose bearer keys requests must present.
+    pub keys: KeysConfig,
+    /// Where the server runs, which decides the models it may serve:
+    /// `self-hosted` by an operator, or `remote` on General Forecast's hosts.
+    #[serde(deserialize_with = "surface")]
+    pub surface: Surface,
+    /// How long one inference request may take, queued and run.
+    #[serde(default = "inference_timeout_seconds")]
+    pub request_timeout_seconds: f64,
+    /// The origin every route the front does not own streams to, such as
+    /// the control plane on `http://127.0.0.1:8001`. Unset, those routes
+    /// are not found.
+    #[serde(default)]
+    pub upstream: Option<String>,
+    /// How long the upstream may take to connect, to answer, and between
+    /// the chunks of its answer.
+    #[serde(default = "upstream_timeout_seconds")]
+    pub upstream_timeout_seconds: f64,
+    /// The largest request body streamed upstream.
+    #[serde(default = "upstream_body_bytes")]
+    pub upstream_body_bytes: u64,
+    /// Peers, as address ranges, whose `X-Forwarded-*` headers are kept.
+    #[serde(default)]
+    pub trusted_proxies: Vec<String>,
+    /// The exact `Host` names requests must carry, as a deployment behind
+    /// one endpoint answers only for it; requests from browsers, which send
+    /// `Origin`, are then refused. Empty takes any host.
+    #[serde(default)]
+    pub hosts: Vec<String>,
+    /// Where deployed revisions are published, if this front predicts from
+    /// them.
+    #[serde(default)]
+    pub revisions: Option<RevisionsConfig>,
+}
+
+/// The control plane a front loads deployed revisions from.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RevisionsConfig {
+    /// The control plane's origin, e.g. `http://127.0.0.1:8001`.
+    pub url: String,
+    /// The environment variable holding the control plane's service token.
+    pub token_env: String,
+    /// Bytes of published packages held at once.
+    #[serde(default = "revision_cache_bytes")]
+    pub cache_bytes: u64,
+    /// How long a package nobody predicted from is held.
+    #[serde(default = "revision_idle_seconds")]
+    pub idle_seconds: f64,
+    /// How long an environment's revision is trusted before it is asked
+    /// again, which bounds how late a promote or rollback is seen.
+    #[serde(default = "revision_resolve_seconds")]
+    pub resolve_seconds: f64,
+    /// How long one control-plane call may take.
+    #[serde(default = "revision_timeout_seconds")]
+    pub timeout_seconds: f64,
+}
+
+fn revision_cache_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+fn revision_idle_seconds() -> f64 {
+    600.0
+}
+
+fn revision_resolve_seconds() -> f64 {
+    5.0
+}
+
+fn revision_timeout_seconds() -> f64 {
+    30.0
+}
+
+/// Whose bearer keys the Models API takes.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum KeysConfig {
+    /// One key, from the environment variable `env` if it is set; without
+    /// it, every request is served, and a server listening beyond this
+    /// machine warns that anyone who reaches it can run inference. A key
+    /// reaches only `project` and holds only `permissions`, when given.
+    Static {
+        env: String,
+        #[serde(default)]
+        project: Option<String>,
+        #[serde(default)]
+        permissions: Option<Vec<String>>,
+    },
+    /// The control plane's keys, checked at `url` under the service token
+    /// in the environment variable `token_env`.
+    Introspect { url: String, token_env: String },
+}
+
+fn surface<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Surface, D::Error> {
+    match String::deserialize(deserializer)?.as_str() {
+        "self-hosted" => Ok(Surface::SelfHosted),
+        "remote" => Ok(Surface::Remote),
+        other => Err(serde::de::Error::custom(format!(
+            "surface is self-hosted or remote, not {other:?}"
+        ))),
+    }
+}
+
+fn inference_timeout_seconds() -> f64 {
+    60.0
+}
+
+fn upstream_timeout_seconds() -> f64 {
+    300.0
+}
+
+/// The control plane's own request body cap, so the front refuses what it would.
+fn upstream_body_bytes() -> u64 {
+    32 * 1024 * 1024
 }
 
 /// How a server places its tables on its workers.
@@ -233,6 +377,11 @@ pub struct WorkerConfig {
     /// Start one copy per visible NVIDIA GPU, each seeing only its own.
     #[serde(default)]
     pub per_gpu: bool,
+    /// Without GPUs, start one copy per this many of the cores the server
+    /// may use, each pinned to its own, so each copy's XLA threads run on
+    /// its cores alone; `worker::CPU_WORKER_CORES` if unset.
+    #[serde(default)]
+    pub cpu_threads: Option<usize>,
     /// Model name to spec: a built-in model's repository id, or `module:function`.
     pub models: BTreeMap<String, String>,
 }
@@ -291,6 +440,18 @@ fn connection_concurrency() -> usize {
     64
 }
 
+fn ephemeral_tables() -> usize {
+    1024
+}
+
+fn ephemeral_bytes() -> u64 {
+    1 << 30
+}
+
+fn ephemeral_idle_seconds() -> f64 {
+    300.0
+}
+
 fn max_tables() -> usize {
     100_000
 }
@@ -311,6 +472,16 @@ fn drain_seconds() -> f64 {
 }
 
 impl Config {
+    /// The ephemeral tables each shard keeps.
+    #[must_use]
+    pub fn ephemeral(&self) -> EphemeralLimits {
+        EphemeralLimits {
+            tables: self.ephemeral_tables,
+            bytes: self.ephemeral_bytes,
+            idle: Duration::from_secs_f64(self.ephemeral_idle_seconds),
+        }
+    }
+
     #[must_use]
     pub fn timers(&self) -> bool {
         self.profiling.is_some()
@@ -372,8 +543,20 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("{}: {error}", path.display()))?;
-        let config: Self =
-            toml::from_str(&text).map_err(|error| toml_error(path, &text, &error))?;
+        let config = Self::parse(path, &text)?;
+        config.listening()?;
+        Ok(config)
+    }
+
+    /// A configuration's text, checked for what its shards run on; `load`
+    /// checks what serving Flight beyond it takes as well, and an
+    /// in-process engine needs no more than this.
+    ///
+    /// # Errors
+    ///
+    /// If the text is not a valid configuration.
+    pub fn parse(path: &Path, text: &str) -> Result<Self, String> {
+        let config: Self = toml::from_str(text).map_err(|error| toml_error(path, text, &error))?;
         if config.workers.is_empty() {
             return Err("the configuration has no workers".to_string());
         }
@@ -383,30 +566,18 @@ impl Config {
         {
             return Err("device_fraction must be in (0, 1]".to_string());
         }
-        if config.tokens.is_empty() && config.replication_tokens.is_empty() {
-            return Err("the configuration has no tokens".to_string());
-        }
-        let tokens = config.tokens.iter().chain(&config.replication_tokens);
-        if tokens.clone().any(|token| token.token().is_empty()) {
-            return Err("a token is empty".to_string());
-        }
-        if config.encryption_key_env.is_some() == config.encryption_key_file.is_some() {
-            return Err(
-                "give the log encryption key as encryption_key_env or encryption_key_file"
-                    .to_string(),
-            );
-        }
-        if config.tls.is_none() && !config.allow_plaintext && !loopback(&config.listen) {
-            return Err(format!(
-                "listening on {} without TLS sends tokens and rows in the clear; add [tls], \
-                 or set allow_plaintext = true on a network you trust",
-                config.listen
-            ));
-        }
         let positive = [
             ("step_timeout_seconds", config.step_timeout_seconds),
             ("request_timeout_seconds", config.request_timeout_seconds),
             ("drain_seconds", config.drain_seconds),
+            ("ephemeral_idle_seconds", config.ephemeral_idle_seconds),
+            (
+                "http.request_timeout_seconds",
+                config
+                    .http
+                    .as_ref()
+                    .map_or(1.0, |http| http.request_timeout_seconds),
+            ),
         ];
         if let Some((name, _)) = positive
             .iter()
@@ -435,11 +606,39 @@ impl Config {
             ("predict_queue_bytes", config.predict_queue_bytes),
             ("step_bytes", config.step_bytes.unwrap_or(1)),
             ("max_tables", config.max_tables as u64),
+            ("ephemeral_tables", config.ephemeral_tables as u64),
+            ("ephemeral_bytes", config.ephemeral_bytes),
         ];
         if let Some((name, _)) = nonzero.iter().find(|(_, value)| *value == 0) {
             return Err(format!("{name} must be positive"));
         }
         Ok(config)
+    }
+
+    /// Whether Flight may listen as configured: with tokens, a log key, and
+    /// TLS beyond this machine.
+    fn listening(&self) -> Result<(), String> {
+        if self.tokens.is_empty() && self.replication_tokens.is_empty() {
+            return Err("the configuration has no tokens".to_string());
+        }
+        let tokens = self.tokens.iter().chain(&self.replication_tokens);
+        if tokens.clone().any(|token| token.token().is_empty()) {
+            return Err("a token is empty".to_string());
+        }
+        if self.encryption_key_env.is_some() == self.encryption_key_file.is_some() {
+            return Err(
+                "give the log encryption key as encryption_key_env or encryption_key_file"
+                    .to_string(),
+            );
+        }
+        if self.tls.is_none() && !self.allow_plaintext && !loopback(&self.listen) {
+            return Err(format!(
+                "listening on {} without TLS sends tokens and rows in the clear; add [tls], \
+                 or set allow_plaintext = true on a network you trust",
+                self.listen
+            ));
+        }
+        Ok(())
     }
 }
 

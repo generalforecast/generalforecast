@@ -45,6 +45,15 @@ RESOURCE_KINDS = frozenset(ResourceKind.__args__)
 
 def json_object(value: Any) -> JsonObject:
     """Copies bounded portable JSON, rejecting lossy/coercible Python values."""
+    return json.loads(json_bytes(value))
+
+
+def json_bytes(value: Any) -> bytes:
+    """Encodes bounded portable JSON, rejecting lossy/coercible Python values.
+
+    The bytes are what `json_object` measures, so native validation of them
+    holds a payload to the same bounds.
+    """
     count = 0
 
     def visit(item: Any, depth: int) -> None:
@@ -68,11 +77,11 @@ def json_object(value: Any) -> JsonObject:
     require(type(value) is dict, "expected JSON object")
     visit(value, 0)
     try:
-        encoded = json.dumps(value, allow_nan=False, ensure_ascii=False)
-        require(len(encoded.encode("utf-8")) <= MAX_BYTES, "JSON body too large")
+        encoded = json.dumps(value, allow_nan=False, ensure_ascii=False).encode("utf-8")
     except (ValueError, UnicodeError) as error:
         raise ServiceError("ValidationError", "invalid JSON encoding", 422) from error
-    return json.loads(encoded)
+    require(len(encoded) <= MAX_BYTES, "JSON body too large")
+    return encoded
 
 
 def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:

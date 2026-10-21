@@ -22,6 +22,173 @@ DEFAULT_FIT_ROWS: int
 def bucket_size(rows: int, minimum: int = 8) -> int:
     """The padded size for `rows` rows: `minimum` doubled until it fits."""
 
+type Surface = Literal["local", "remote", "self-hosted"]
+type Label = str | bool | int
+
+class RequestError(ValueError):
+    """A refused inference request: `args` are its code, message and HTTP status."""
+
+def resolve_model(spec: object, surface: Surface) -> str:
+    """The canonical reference a model spec names, if the surface may serve it.
+
+    `surface` is `remote` (the hosted Models API), `self-hosted` (a server its
+    operator runs) or `local` (a caller that admitted the model already).
+    Raises `RequestError` as the Models API refuses the reference.
+    """
+
+def quantile_levels(payload: bytes) -> list[float]:
+    """Requested quantile levels, from their JSON list: strictly increasing, in (0, 1).
+
+    Raises `RequestError` for levels a request may not select.
+    """
+
+class TabularRequest:
+    """A classification or regression request, validated before any weights load."""
+
+    model: str
+    """The canonical reference of the model it resolved to."""
+    task: Literal["classification", "regression"]
+    target: str
+    features: list[str]
+    context: Features
+    """The labeled context rows' features, `(rows, features)`."""
+    targets: Targets
+    """Per labeled row, its class code into `classes` (int32) or its value (float32)."""
+    classes: list[Label]
+    """The classes in output order; empty for a regression."""
+    queries: Features
+    """The queries' features, `(queries, features)`."""
+    query_keys: list[str]
+    levels: list[float]
+    """The quantile levels a regression returns; empty for a classification."""
+    supplied_rows: int
+    """Context rows supplied, labeled or not."""
+    fingerprint: str
+    """SHA-256 of the model and its context, as hex: same context, same table."""
+
+class AlignedGroup:
+    """Related series aligned on one time axis, unpadded: the last step is the origin.
+
+    Rows are the group's targets in query order, then its covariates sorted
+    by name; execution left-pads time to the model's patch.
+    """
+
+    values: Features
+    """`(rows, steps)`, zero where unobserved."""
+    observed: npt.NDArray[np.bool_]
+    roles: npt.NDArray[np.int32]
+    """Per row, `TARGET`, `PAST` or `KNOWN`."""
+    future: Features
+    """Known covariates' values over the horizon, `(rows, horizon)`."""
+    future_observed: npt.NDArray[np.bool_]
+
+class ForecastQuery:
+    """One forecast query: a series forecast with its group from an origin."""
+
+    key: str
+    series: str
+    origin: int | float
+    """An integer period or floating UTC seconds."""
+    members: list[str]
+    """The group's target series, in row order."""
+    member: int
+    """The row of `series` among `members`."""
+    times: list[int | float]
+    """The forecast's times, one step after another past the origin."""
+    group: AlignedGroup
+    fingerprint: str
+    """SHA-256 of the context fingerprint and this group, as hex: its members,
+    origin, horizon and known-future covariates.
+    """
+
+class ForecastRequest:
+    """A forecast request, validated and aligned before any weights load."""
+
+    model: str
+    """The canonical reference of the model it resolved to."""
+    target: str
+    step: int | float
+    """An integer number of periods or floating seconds."""
+    horizon: int
+    levels: list[float]
+    known_covariates: list[str]
+    queries: list[ForecastQuery]
+    time_axis: Literal["integer-periods", "utc-seconds"]
+    """`integer-periods` or `utc-seconds`."""
+    supplied_rows: int
+    """Context rows supplied, observed or not."""
+    usable_observations: int
+    """Context rows with an observed value."""
+    fingerprint: str
+    """SHA-256 of the model and its context, as hex: same context, same table."""
+
+class PackageContext:
+    """A tabular package's context, bound once.
+
+    Its labeled rows encoded as the engine reads them, and the vocabularies
+    its queries are encoded against.
+    """
+
+    @property
+    def features(self) -> Features:
+        """The labeled rows' features, `(rows, width)`."""
+    @property
+    def targets(self) -> Targets:
+        """Per labeled row, its class code into `classes` (int32) or its value (float32)."""
+    @property
+    def classes(self) -> list[Label]:
+        """The classes in output order; empty for a regression."""
+    @property
+    def rows(self) -> int:
+        """Labeled context rows."""
+    @property
+    def vocabularies(self) -> list[list[str]]:
+        """Each input column's words in code order; empty but for categorical columns."""
+    def encode(self, queries: bytes) -> Features:
+        """Query rows from an Arrow IPC stream, encoded as `(rows, width)`.
+
+        Words are coded with the context's vocabularies; a word the context
+        never held is NaN. Raises `RequestError` for a missing column or values of another kind.
+        """
+
+def bind_package(
+    schema: bytes,
+    task: Literal["classification", "regression"],
+    target: str,
+    context: bytes,
+) -> PackageContext:
+    """Binds a tabular package's context from its lock's schema and its rows.
+
+    `schema` is the lock's `TableSchema.to_dict()` as JSON, `task` is
+    `classification` or `regression`, and `context` is the rows as an Arrow
+    IPC stream. Only labeled rows are kept. Raises `RequestError`:
+    `EmptyContext` for no labeled rows, `InvalidPackage` for fewer than two
+    classes or columns that hold values of another kind.
+    """
+
+def parse_inference(
+    payload: bytes,
+    surface: Surface,
+    *,
+    limits: Literal["request", "package"] = "request",
+    levels: list[float] | None = None,
+    admission: Literal["catalog", "trusted"] = "catalog",
+    digest: str | None = None,
+) -> TabularRequest | ForecastRequest:
+    """Parses and validates an inference request's JSON payload, without the GIL.
+
+    `surface` decides the gates its model passes, as for `resolve_model`.
+    `limits` is `request` for one Models API request's bounds or `package`
+    for a package's bound context, which its lock bounds instead. `levels`
+    are the quantile levels a forecaster outputs, when its weights are
+    loaded; the catalog's declared levels otherwise. `admission` is
+    `catalog` for built-in models alone, or `trusted` for a local caller
+    that also forecasts with its own `module:function` model, at the
+    `levels` it gives; `digest` names that model's code, which the context's
+    fingerprint covers. Raises `RequestError` with the code, message and
+    status the Models API answers.
+    """
+
 class Strategy:
     """How each query's context is chosen.
 
@@ -419,4 +586,82 @@ class Node:
         """Refits a table's state and retrieval scaling.
 
         Returns drops of old entries nothing reads.
+        """
+
+class BoundTable:
+    """A context bound as a durable table, which lives until `Engine.unbind`."""
+
+    @property
+    def name(self) -> str:
+        """The table's name."""
+    @property
+    def levels(self) -> list[float] | None:
+        """The quantile levels a regression's outputs are; None for a classification."""
+
+class Engine:
+    """gf-server's shards in this process, sized as `gf serve` sizes them.
+
+    One worker per GPU, or on CPU one per run of the configuration's
+    `cpu_threads` cores, pinned to them.
+
+    Calls release the GIL while they wait, so concurrent callers' queries
+    share the shards' steps.
+    """
+
+    def __init__(self, config: str) -> None:
+        """Initialize self.  See help(type(self)) for accurate signature."""
+    @property
+    def shards(self) -> int:
+        """How many shards, and so worker processes, the engine runs."""
+    def serve(self) -> tuple[str, str]:
+        """Serves gf-server's Flight `Service` on these shards to this process alone.
+
+        Returns `(location, token)`: a Unix socket in an owner-only directory
+        under the data directory, or a loopback port where there are none, and
+        the random token it accepts. The first call starts it; `close` stops it.
+        """
+    def add_model(self, name: str, spec: str) -> None:
+        """Has every worker load a model under `name` from `spec`.
+
+        `spec` is a built-in model's repository id or a `module:function`
+        spec; a worker serving that name already keeps it.
+        """
+    def tabular(
+        self, model: str, request: TabularRequest
+    ) -> tuple[npt.NDArray[np.float32], list[float] | None]:
+        """Scores a validated request's queries against its context.
+
+        The context is the ephemeral table its fingerprint names. Returns
+        `(queries, outputs)` and the quantile levels of a regression's outputs.
+        """
+    def forecast(
+        self, model: str, request: ForecastRequest
+    ) -> tuple[npt.NDArray[np.float32], list[float] | None]:
+        """Forecasts every query of a validated request.
+
+        Each aligned group reads the ephemeral table its fingerprint names.
+        Returns `(queries, horizon, levels)` and the model's quantile levels.
+        """
+    def bind(
+        self,
+        model: str,
+        features: npt.NDArray[np.float32],
+        targets: npt.NDArray[np.int32] | npt.NDArray[np.float32],
+        classes: int,
+    ) -> BoundTable:
+        """Binds labeled rows once as a durable table.
+
+        `features` is `(rows, columns)`; `targets` holds class codes (int32)
+        when `classes` is positive, else values (float32).
+        """
+    def predict(
+        self, bound: BoundTable, features: npt.NDArray[np.float32]
+    ) -> tuple[npt.NDArray[np.float32], list[float] | None]:
+        """Scores query features `(queries, columns)` against a bound table."""
+    def unbind(self, bound: BoundTable) -> None:
+        """Drops a bound table and its log."""
+    def close(self) -> None:
+        """Stops the shards and their workers once calls in progress return.
+
+        Later calls raise.
         """

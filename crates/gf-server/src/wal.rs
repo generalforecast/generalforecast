@@ -74,13 +74,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use zeroize::Zeroize;
 
-use crate::columns::{Column, Words};
 use crate::name::TableName;
 use crate::protocol::{
     Frame, FrameError, StrategySpec, SummarySpec, f32_bytes, f32_values, f64_bytes, f64_values,
     i64_bytes, i64_values, key_bytes, key_values, target_bytes, targets_from, u32_bytes,
     u32_values, u64_bytes, u64_values,
 };
+use gf_core::columns::{Column, Words};
 
 const NONCE: usize = 24;
 /// Numbers each staged compaction file, unique in the process, so a dropped
@@ -162,6 +162,31 @@ pub struct TableDefinition {
     /// as any table.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route_by: Option<RouteBy>,
+    /// Whether the table's rows outlive the server: `durable` tables keep a
+    /// log and replicate, `ephemeral` ones hold a request's context in memory
+    /// alone, under the name `ctx-<fingerprint>`, until the shard evicts them.
+    #[serde(default, skip_serializing_if = "Durability::is_durable")]
+    pub durability: Durability,
+}
+
+/// Whether a table's rows are logged, or held in memory for requests alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Durability {
+    /// Every change is logged before it applies, and replicas copy the log.
+    #[default]
+    Durable,
+    /// Rows live in memory only: never logged, never replicated, and gone
+    /// once the shard evicts the table or the server stops.
+    Ephemeral,
+}
+
+impl Durability {
+    /// Whether this is the default, which definitions leave unwritten.
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        *self == Self::Durable
+    }
 }
 
 /// The id a server gives a table when it creates it: 16 hex digits, the
@@ -260,10 +285,10 @@ impl TableDefinition {
                     .into(),
             );
         }
-        if crate::columns::retrieval(&self.columns) > 0 {
+        if gf_core::columns::retrieval(&self.columns) > 0 {
             return Err("a table of series takes no retrieval columns".into());
         }
-        let starts = crate::columns::offsets(&self.columns);
+        let starts = gf_core::columns::offsets(&self.columns);
         let mut known = Vec::new();
         for name in &series.known {
             let index = self
@@ -298,13 +323,13 @@ impl TableDefinition {
     /// more for a datetime column.
     #[must_use]
     pub fn features(&self) -> usize {
-        crate::columns::width(&self.columns)
+        gf_core::columns::width(&self.columns)
     }
 
     /// Number of those values the model reads: all but the retrieval values.
     #[must_use]
     pub fn model_features(&self) -> usize {
-        self.features() - crate::columns::retrieval(&self.columns)
+        self.features() - gf_core::columns::retrieval(&self.columns)
     }
 
     /// The definition's settings, checked once, as the node serves the table.
@@ -440,7 +465,7 @@ impl RouteBy {
             .iter()
             .find(|column| column.name == self.column)
             .ok_or_else(|| format!("route_by column {:?} is not a column", self.column))?;
-        if column.kind != crate::columns::ColumnKind::Numeric {
+        if column.kind != gf_core::columns::ColumnKind::Numeric {
             return Err(format!("route_by column {:?} must be numeric", self.column));
         }
         match self.kind {
@@ -2769,8 +2794,8 @@ fn record_from(frame: &Frame) -> Result<Record, LogError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::columns::ColumnKind;
     use crate::setup;
+    use gf_core::columns::ColumnKind;
 
     /// Writes a log whose table names `strategy`, as an earlier server could.
     fn log_with_strategy(path: &Path, key: &EncryptionKey, strategy: Value) {
@@ -2798,6 +2823,7 @@ mod tests {
             created: CreationId::parse("0123456789abcdef"),
             times: TimeKind::Integer,
             route_by: None,
+            durability: Default::default(),
         };
         let log = Log::create(path, key, &definition, Terms::default()).unwrap();
         let mut header = serde_json::to_value(&definition).unwrap();

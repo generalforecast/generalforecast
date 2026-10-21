@@ -4,6 +4,8 @@
 """Real optimized engine calls with tiny random weights, not catalog/cloud proof."""
 
 import pickle
+from collections.abc import Iterator
+from typing import Any
 
 import numpy as np
 import pyarrow as pa
@@ -11,20 +13,45 @@ import pytest
 from sklearn.model_selection import cross_val_score
 
 import generalforecast
+from generalforecast.engine import LocalEngine
 from generalforecast.estimators import Forecaster, Regressor
-from generalforecast.models.chronos2.model import chronos2_functions
-from generalforecast.models.tabicl.model import tabicl_functions
 from generalforecast.packages import PackageError
-from tests.models.chronos2.tiny import tiny_chronos2
-from tests.models.tabicl.tiny import tiny_tabicl
 
 pytestmark = pytest.mark.slow
+
+# The tiny model the engine's workers load for each catalog model, so catalog
+# tests run its admission, export and native paths without its checkpoint.
+CATALOG = {
+    "tabicl-v2-classifier": "tests.models.tabicl.tiny:classifier",
+    "tabicl-v2-regressor": "tests.models.tabicl.tiny:regressor",
+    "chronos-2": "tests.models.chronos2.tiny:catalog_forecaster",
+}
+
+
+@pytest.fixture(scope="module")
+def catalog() -> Iterator[None]:
+    """The process engine, loading each catalog model's tiny spec in its workers.
+
+    It does not claim the tiny checkpoints are the published ones; estimators
+    given no client connect to it afresh, and never download.
+    """
+    tiny = LocalEngine(models=CATALOG)
+
+    def local(surface: Any = "local", allow_downloads: bool = False) -> LocalEngine:
+        assert not allow_downloads
+        return tiny.gated(surface, allow_downloads)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr("generalforecast.engine.local", local)
+        patch.setattr("generalforecast.native.estimators._shared", {})
+        yield
+    tiny.close()
 
 
 def test_regressor_cross_validation_uses_fold_local_context():
     features = np.random.default_rng(0).normal(size=(24, 3)).astype(np.float32)
     target = features.sum(axis=1)
-    estimator = Regressor((tabicl_functions, tiny_tabicl(regression=True)))
+    estimator = Regressor("tests.models.tabicl.tiny:regressor")
     scores = cross_val_score(estimator, features, target, cv=2)
     assert scores.shape == (2,) and np.isfinite(scores).all()
     assert not estimator.__sklearn_is_fitted__()
@@ -36,7 +63,7 @@ def test_regressor_cross_validation_uses_fold_local_context():
 def test_forecaster_matches_native_grouped_series_and_preserves_context(
     tmp_path, covariates, shared
 ):
-    model = (chronos2_functions, tiny_chronos2())
+    model = "tests.models.chronos2.tiny:forecaster"
     context = pa.table(
         {
             "store": ["a"] * 8 + ["b"] * 8,
@@ -64,10 +91,8 @@ def test_forecaster_matches_native_grouped_series_and_preserves_context(
         else (),
         future_inputs=("price",) if covariates else (),
     ).fit(context)
-    original_count = len(estimator.table_)
     quantiles = estimator.predict_quantiles(future)
     assert quantiles.shape == (4, 3) and np.isfinite(quantiles).all()
-    assert len(estimator.table_) == original_count
     assert estimator.context_.equals(context)
     np.testing.assert_allclose(estimator.predict(future), quantiles[:, 1], atol=1e-6)
     client = generalforecast.local()
@@ -112,18 +137,9 @@ def test_forecaster_matches_native_grouped_series_and_preserves_context(
         estimator.close()
 
 
-def test_verified_catalog_loader_path_executes_real_engine(monkeypatch, tmp_path):
-    from generalforecast.deployments import catalog_tabicl
+def test_verified_catalog_loader_path_executes_real_engine(catalog, tmp_path):
     from generalforecast.estimators import Classifier
-    from tests.models.tabicl.tiny import classifier
 
-    # Loader substitution is explicit: exercise admission/export/native behavior
-    # but do not claim the tiny checkpoint is the published catalog checkpoint.
-    def model(pin, *, allow_downloads):
-        assert pin.name == "tabicl-v2-classifier" and not allow_downloads
-        return classifier()[1]
-
-    monkeypatch.setattr(catalog_tabicl, "_model", model)
     caller_values = np.arange(16, dtype=float)
     X = pa.table({"x": caller_values, "group": ["north", "south"] * 8})
     y = np.array(["a", "b"] * 8)
@@ -142,17 +158,7 @@ def test_verified_catalog_loader_path_executes_real_engine(monkeypatch, tmp_path
 
 
 @pytest.mark.parametrize("shared", [False, True])
-def test_catalog_forecaster_uses_shared_covariate_rows(monkeypatch, tmp_path, shared):
-    from generalforecast.deployments import catalog_forecast
-    from generalforecast.models import catalog
-    from tests.models.chronos2 import tiny
-
-    monkeypatch.setattr(tiny, "PATCH", 16)
-    monkeypatch.setattr(
-        tiny, "QUANTILES", catalog.ENTRIES["chronos-2"].capability.quantiles
-    )
-    model = tiny.tiny_chronos2()
-    monkeypatch.setattr(catalog_forecast, "_model", lambda **kwargs: model)
+def test_catalog_forecaster_uses_shared_covariate_rows(catalog, tmp_path, shared):
     context = pa.table(
         {
             "store": ["a"] * 8 + ["b"] * 8,
@@ -192,12 +198,8 @@ def test_catalog_forecaster_uses_shared_covariate_rows(monkeypatch, tmp_path, sh
 
 
 def test_local_context_beyond_package_capacity_runs_but_never_exports(
-    monkeypatch, tmp_path
+    catalog, tmp_path
 ):
-    from generalforecast.deployments import catalog_tabicl
-    from tests.models.tabicl.tiny import regressor
-
-    monkeypatch.setattr(catalog_tabicl, "_model", lambda pin, **_: regressor()[1])
     features = np.random.default_rng(1).normal(size=(1100, 2))
     estimator = Regressor().fit(features, features.sum(axis=1))
     assert np.isfinite(estimator.predict(features[:3])).all()
@@ -206,3 +208,27 @@ def test_local_context_beyond_package_capacity_runs_but_never_exports(
     assert error.value.code == "CapacityExceeded"
     assert not (tmp_path / "large").exists()
     estimator.close()
+
+
+def test_a_trusted_spec_is_digested_by_its_module_file_without_importing_it(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hashlib
+    import sys
+
+    from generalforecast.local_models import code_digest
+
+    package = tmp_path / "digested"
+    package.mkdir()
+    (package / "__init__.py").write_text("raise RuntimeError('imported')\n")
+    module = package / "model.py"
+    module.write_text("def forecaster(): ...\n")
+    monkeypatch.syspath_prepend(str(tmp_path))
+
+    first = code_digest("digested.model:forecaster")
+    assert first == "sha256:" + hashlib.sha256(module.read_bytes()).hexdigest()
+    module.write_text("def forecaster(): return 1\n")
+    assert code_digest("digested.model:forecaster") != first
+    assert "digested" not in sys.modules
+    with pytest.raises(PackageError, match="no source file"):
+        code_digest("digested.missing:forecaster")

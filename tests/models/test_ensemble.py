@@ -14,10 +14,10 @@ from generalforecast.models.contract import TabularFunctions
 from generalforecast.models.ensemble import Ensemble, ensemble_functions
 from generalforecast.models.tabicl.model import class_probabilities, tabicl_functions
 from generalforecast.models.tabpfn.model import tabpfn_functions
-from generalforecast.predict import predict
 from tests.models.conformance.cases import table
 from tests.models.tabicl.tiny import tiny_tabicl
 from tests.models.tabpfn.tiny import tiny_tabpfn
+from tests.utils.predict import predict
 
 
 def test_estimators_see_their_own_view_and_average_back() -> None:

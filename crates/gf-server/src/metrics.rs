@@ -180,6 +180,8 @@ pub struct Metrics {
     /// Tables out of service until the server restarts: their log refuses
     /// writes, or holds a record their rows could not take.
     pub tables_broken: Gauge,
+    /// Request contexts' tables held in memory, across shards.
+    pub ephemeral_tables: Gauge,
     pub step_seconds: Histogram,
     /// Time to plan a step, from the queue to the step sent to the worker.
     pub plan_seconds: Histogram,
@@ -187,6 +189,10 @@ pub struct Metrics {
     pub queue_seconds: Histogram,
     /// Time workers spent running steps, as they measure it.
     pub worker_seconds: Seconds,
+    /// Programs workers compiled as they started, before taking steps, from
+    /// the kinds of call earlier workers recorded, and the time it took.
+    pub warm_compiles: Counter,
+    pub warm_seconds: Seconds,
     /// Where a prediction or write request's time goes in the service, beside
     /// the shard's queue and plan: decoding its Arrow body, finding its
     /// table's placement and route, waiting for the shard's answer, and
@@ -405,6 +411,11 @@ impl Metrics {
         );
         let _ = write!(
             text,
+            "# HELP gf_ephemeral_tables Request contexts' tables held in memory.\n# TYPE gf_ephemeral_tables gauge\ngf_ephemeral_tables {}\n",
+            self.ephemeral_tables.get()
+        );
+        let _ = write!(
+            text,
             "# HELP gf_step_seconds Time a worker takes to run a step.\n# TYPE gf_step_seconds histogram\n"
         );
         histogram(&mut text, "gf_step_seconds", "", &self.step_seconds);
@@ -422,6 +433,17 @@ impl Metrics {
             text,
             "# HELP gf_worker_seconds_total Time workers spent running steps, as they measure it.\n# TYPE gf_worker_seconds_total counter\ngf_worker_seconds_total {}\n",
             self.worker_seconds.get()
+        );
+        counter(
+            &mut text,
+            "gf_worker_warm_compiles_total",
+            "Programs workers compiled as they started, before taking steps.",
+            self.warm_compiles.get(),
+        );
+        let _ = write!(
+            text,
+            "# HELP gf_worker_warm_seconds_total Time workers spent compiling as they started.\n# TYPE gf_worker_warm_seconds_total counter\ngf_worker_warm_seconds_total {}\n",
+            self.warm_seconds.get()
         );
         let requests = [
             (

@@ -667,11 +667,20 @@ pub enum WorkerRequest {
         model: String,
         features: usize,
     },
+    /// Loads a model the worker did not start with, under `name`, from a
+    /// built-in model's repository id or a `module:function` spec: a control,
+    /// sent in a `Controls` frame ahead of the first table naming the model.
+    AddModel {
+        name: String,
+        spec: String,
+    },
     /// Whether a model can fit a table of this task and width.
     Check {
         model: String,
         classes: u32,
         features: usize,
+        /// Series a forecast's group holds at most; tabular tables send 1.
+        series: usize,
     },
     AddTable {
         table: u32,
@@ -694,6 +703,12 @@ pub enum WorkerRequest {
     /// Copies and drops between tiers, as `movements_json` writes them.
     Apply {
         movements: Value,
+    },
+    /// Models loaded, tables added and removed and tiers' copies and drops, carried out in
+    /// order: what a shard tick asks of the worker besides its steps, in one
+    /// frame. The worker answers `Ok`, or `Controlled` with those that failed.
+    Controls {
+        requests: Vec<WorkerRequest>,
     },
     /// Samples the worker's threads for `seconds`, their stacks written
     /// collapsed to `path`; the worker answers once the sampling starts,
@@ -723,6 +738,14 @@ impl WorkerRequest {
         serde_json::from_value(frame.header.clone())
             .map_err(|error| FrameError(format!("not a worker request: {error}")))
     }
+}
+
+/// A request of a `Controls` frame that failed: its index there, and why.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ControlFailure {
+    pub index: usize,
+    pub message: String,
 }
 
 /// A worker's reply.
@@ -757,6 +780,16 @@ pub enum WorkerReply {
     /// A request that failed.
     Error {
         message: String,
+    },
+    /// The requests of a `Controls` frame that failed; the rest were carried out.
+    Controlled {
+        failures: Vec<ControlFailure>,
+    },
+    /// An allocation carried out, after compiling the programs earlier
+    /// workers recorded for its models, and the seconds they took.
+    Warmed {
+        compiles: u64,
+        seconds: f64,
     },
     /// Sent while a step runs, each time the worker finishes compiling a
     /// program, so a long compile is not taken for a hung worker; it

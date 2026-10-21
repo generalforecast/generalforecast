@@ -24,19 +24,24 @@ from generalforecast.columns import MAX_WORDS, Column, datetime_parts
 from generalforecast.models import registry
 from generalforecast.models.kumo.model import kumo_functions
 from generalforecast.models.tabicl.model import tabicl_functions
-from generalforecast.predict import predict
 from generalforecast.runtime.device import device_settings
 from generalforecast.runtime.memory import NoMemoryAnalysis, memory_profile
 from generalforecast.runtime.paging import DevicePool, read_context
 from generalforecast.worker import Worker
 from tests.models.conformance.cases import CASES, Case, table
 from tests.models.kumo.tiny import tiny_kumo
-from tests.models.tabicl.tiny import classifier, tiny_tabicl
+from tests.models.tabicl.tiny import tiny_tabicl
 from tests.models.timestral.tiny import tiny_timestral
+from tests.utils import node_harness
+from tests.utils.predict import predict
 
 PAGE = 8
 NEAR_A = np.zeros((2, 5), dtype=np.float32)
 NEAR_B = np.full((2, 5), 10.0, dtype=np.float32)
+TABICL = "tests.models.tabicl.tiny:classifier"
+TABICL_REGRESSOR = "tests.models.tabicl.tiny:regressor"
+KUMO = "tests.models.kumo.tiny:classifier"
+LIMIX = "tests.models.limix.tiny:classifier"
 
 
 def _clusters(rows: int = 32) -> tuple[np.ndarray, np.ndarray]:
@@ -48,11 +53,14 @@ def _clusters(rows: int = 32) -> tuple[np.ndarray, np.ndarray]:
 
 
 def _table(
-    client: generalforecast.LocalClient, name: str = "t", strategy=None, model=None
+    client: generalforecast.LocalClient | node_harness.LocalClient,
+    name: str = "t",
+    strategy=None,
+    model=None,
 ) -> generalforecast.Table:
     return client.create_table(
         name,
-        model=model or (tabicl_functions, tiny_tabicl(regression=False)),
+        model=model or TABICL,
         features=5,
         classes=3,
         strategy=strategy or generalforecast.Strategy.exact(),
@@ -67,7 +75,7 @@ def test_local_predictions_match_predict(case: Case) -> None:
     client = generalforecast.local()
     rows = client.create_table(
         "rows",
-        model=(functions, model),
+        model=f"tests.models.conformance.cases:{case.name.replace('-', '_').replace('.', '_')}",
         features=5,
         classes=data.num_classes or None,
         page_size=PAGE,
@@ -81,7 +89,7 @@ def test_local_predictions_match_predict(case: Case) -> None:
 
 
 def test_repeated_queries_reuse_the_encoded_context() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client)
     rows.insert(np.arange(32), *_clusters())
 
@@ -97,7 +105,7 @@ def test_repeated_queries_reuse_the_encoded_context() -> None:
 
 
 def test_queries_near_one_cluster_share_an_encode() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client, strategy=generalforecast.Strategy.neighbors(16))
     rows.insert(np.arange(32), *_clusters())
 
@@ -110,13 +118,13 @@ def test_queries_near_one_cluster_share_an_encode() -> None:
 def test_evicted_contexts_come_back_without_reencoding() -> None:
     model = tiny_tabicl(regression=False)
     unit = memory_profile(tabicl_functions, model, 5).context_bytes(16)
-    client = generalforecast.local(
+    client = node_harness.local(
         device_bytes=unit, host_bytes=4 * unit, slot_bytes=unit // 2
     )
     rows = _table(
         client,
         strategy=generalforecast.Strategy.neighbors(16),
-        model=(tabicl_functions, model),
+        model=TABICL,
     )
     rows.insert(np.arange(32), *_clusters())
 
@@ -176,7 +184,7 @@ def test_contexts_spilled_to_disk_come_back_without_reencoding(tmp_path: Path) -
     unit = memory_profile(tabicl_functions, model, 5).context_bytes(16)
     slot = unit // 4
     # One context on the device; one context and the tables' pages on the host.
-    client = generalforecast.local(
+    client = node_harness.local(
         device_bytes=unit,
         host_bytes=unit + 6 * slot,
         slot_bytes=slot,
@@ -186,7 +194,7 @@ def test_contexts_spilled_to_disk_come_back_without_reencoding(tmp_path: Path) -
     tables = []
     for index in range(3):
         features, targets = _clusters(16)
-        table = _table(client, name=f"t{index}", model=(tabicl_functions, model))
+        table = _table(client, name=f"t{index}", model=TABICL)
         table.insert(np.arange(16), features + index, targets)
         tables.append(table)
 
@@ -201,7 +209,7 @@ def test_contexts_spilled_to_disk_come_back_without_reencoding(tmp_path: Path) -
 
 
 def test_updates_reencode_only_the_contexts_holding_the_row() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client, strategy=generalforecast.Strategy.neighbors(16))
     features, targets = _clusters()
     rows.insert(np.arange(32), features, targets)
@@ -230,8 +238,8 @@ def test_rows_wider_than_a_slot_span_slots(strategy: str) -> None:
     predictions = []
     # Odd slot sizes, so the bytes of a padding block land misaligned.
     for slot_bytes in (1 << 20, row // 3 + 1, 257):
-        client = generalforecast.local(slot_bytes=slot_bytes)
-        rows = _table(client, strategy=chosen, model=(tabicl_functions, model))
+        client = node_harness.local(slot_bytes=slot_bytes)
+        rows = _table(client, strategy=chosen, model=TABICL)
         rows.insert(np.arange(64), features, targets)
         predictions.append(rows.predict(queries))
         np.testing.assert_allclose(rows.predict(queries), predictions[-1])
@@ -242,7 +250,7 @@ def test_rows_wider_than_a_slot_span_slots(strategy: str) -> None:
 
 
 def test_pools_never_pass_the_nodes_slots() -> None:
-    client = generalforecast.local(
+    client = node_harness.local(
         device_bytes=64 << 10, host_bytes=256 << 10, slot_bytes=4096
     )
     features, targets = _clusters()
@@ -265,7 +273,7 @@ def test_contexts_past_the_models_length_warn_once_or_are_clamped() -> None:
             tabicl_functions.properties(parameters), context_rows=8
         )
     )
-    client = generalforecast.local()
+    client = node_harness.local()
     tables = {
         past_cap: client.create_table(
             past_cap,
@@ -295,15 +303,15 @@ def test_contexts_past_the_models_length_warn_once_or_are_clamped() -> None:
 
 def test_contexts_whose_calls_would_not_fit_the_device_are_refused() -> None:
     model = tiny_tabicl(regression=False)
-    client = generalforecast.local()
+    client = node_harness.local()
     worker = client._worker
     features, targets = _clusters(256)
-    whole = _table(client, name="whole", model=(tabicl_functions, model))
+    whole = _table(client, name="whole", model=TABICL)
     whole.insert(np.arange(256), features, targets)
     nearest = _table(
         client,
         name="nearest",
-        model=(tabicl_functions, model),
+        model=TABICL,
         strategy=generalforecast.Strategy.neighbors(16),
     )
     nearest.insert(np.arange(256), features, targets)
@@ -330,7 +338,7 @@ def test_contexts_whose_calls_would_not_fit_the_device_are_refused() -> None:
 
 
 def test_representations_are_reused_until_their_page_changes() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client, strategy=generalforecast.Strategy.neighbors(16))
     features, targets = _clusters()
     rows.insert(np.arange(32), features, targets)
@@ -355,7 +363,7 @@ def test_writes_after_a_fit_reembed_pages_without_compiling() -> None:
 
     jax.monitoring.register_event_duration_secs_listener(compile_event)
     try:
-        client = generalforecast.local()
+        client = node_harness.local()
         rows = _table(client)
         features, targets = _clusters()
         rows.insert(np.arange(24), features[:24], targets[:24])
@@ -376,7 +384,7 @@ def test_writes_after_a_fit_reembed_pages_without_compiling() -> None:
 
 
 def test_appends_that_change_a_querys_neighbors_need_no_new_decode() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client, strategy=generalforecast.Strategy.neighbors(32))
     features, targets = _clusters(96)
     rows.insert(np.arange(48), features[:48], targets[:48])
@@ -410,7 +418,7 @@ def test_steps_of_more_queries_after_a_decode_compile_no_decode() -> None:
 
     jax.monitoring.register_event_duration_secs_listener(compile_event)
     try:
-        client = generalforecast.local()
+        client = node_harness.local()
         rows = _table(client)
         features, targets = _clusters()
         rows.insert(np.arange(32), features, targets)
@@ -437,7 +445,7 @@ def test_a_new_number_of_queries_in_a_bucket_compiles_nothing() -> None:
 
     jax.monitoring.register_event_duration_secs_listener(compile_event)
     try:
-        client = generalforecast.local()
+        client = node_harness.local()
         rows = _table(client)
         features, targets = _clusters()
         rows.insert(np.arange(32), features, targets)
@@ -463,8 +471,8 @@ def test_a_new_number_of_tables_in_a_step_compiles_nothing_per_state_leaf() -> N
 
     jax.monitoring.register_event_duration_secs_listener(compile_event)
     try:
-        client = generalforecast.local()
-        model = (tabicl_functions, tiny_tabicl(regression=False))
+        client = node_harness.local()
+        model = TABICL
         tables = [_table(client, name, model=model) for name in "abc"]
         features, targets = _clusters()
         for rows in tables:
@@ -512,7 +520,7 @@ def test_a_retrieved_context_of_every_row_predicts_as_the_exact_one(
 
 
 def test_contexts_are_the_rows_predictions_read_and_encode_nothing() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     table = _table(client, strategy=generalforecast.Strategy.neighbors(4))
     features, targets = _clusters()
     table.insert(np.arange(32), features, targets)
@@ -532,7 +540,7 @@ def test_retrieval_columns_place_rows_and_the_model_never_reads_them() -> None:
     tables = [
         client.create_table(
             name,
-            model=(tabicl_functions, tiny_tabicl(regression=False)),
+            model=TABICL,
             columns={**columns, "r": "retrieval"},
             classes=3,
             strategy=strategy,
@@ -562,7 +570,7 @@ def test_retrieval_columns_place_rows_and_the_model_never_reads_them() -> None:
     with pytest.raises(ValueError, match="after every other column"):
         client.create_table(
             "first",
-            model=(tabicl_functions, tiny_tabicl(regression=False)),
+            model=TABICL,
             columns={"r": "retrieval", **columns},
             classes=3,
         )
@@ -578,7 +586,7 @@ def test_target_encoding_places_categories_by_their_rows_targets() -> None:
     for encoding in ("codes", "target"):
         table = client.create_table(
             encoding,
-            model=(tabicl_functions, tiny_tabicl(regression=False)),
+            model=TABICL,
             columns={"f": "numeric", "c": "categorical"},
             classes=3,
             strategy=generalforecast.Strategy.neighbors(7),
@@ -639,14 +647,12 @@ def test_rows_wait_out_of_contexts_until_labeled(
 
 
 def test_a_model_with_a_target_mask_reads_unlabeled_rows() -> None:
-    from generalforecast.models.limix.model import limix_functions
-    from tests.models.limix.tiny import tiny_limix
 
     client = generalforecast.local()
     features, targets = _clusters(40)
     table = client.create_table(
         "masked",
-        model=(limix_functions, tiny_limix(regression=False)),
+        model=LIMIX,
         features=5,
         classes=3,
         strategy=generalforecast.Strategy.neighbors(24),
@@ -673,7 +679,7 @@ def test_rows_without_labels_are_refused_and_take_nulls() -> None:
     with pytest.raises(ValueError, match="NaN for rows not labeled yet"):
         client.create_table(
             "values",
-            model=(tabicl_functions, tiny_tabicl(regression=True)),
+            model=TABICL_REGRESSOR,
             features=5,
         ).insert([0], features[:1], [np.inf])
 
@@ -681,7 +687,7 @@ def test_rows_without_labels_are_refused_and_take_nulls() -> None:
 def test_given_rows_predict_as_a_table_of_those_rows() -> None:
     client = generalforecast.local()
     features, targets = _clusters()
-    model = (tabicl_functions, tiny_tabicl(regression=False))
+    model = TABICL
     tables = {
         summary: client.create_table(
             summary, model=model, features=5, classes=3, summary=summary
@@ -716,10 +722,10 @@ def test_given_rows_predict_as_a_table_of_those_rows() -> None:
 
 
 def test_a_regions_queries_share_a_context_rebuilt_once_they_are_answered() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     table = client.create_table(
         "t",
-        model=(tabicl_functions, tiny_tabicl(regression=False)),
+        model=TABICL,
         features=5,
         classes=3,
         strategy=generalforecast.Strategy.neighbors(8),
@@ -736,11 +742,12 @@ def test_a_regions_queries_share_a_context_rebuilt_once_they_are_answered() -> N
     churn = table.region_churn(np.concatenate([NEAR_A, NEAR_B]))
 
     stale = table.predict(NEAR_A)
-    rebuilt = client.stats.encoded - encoded
     fresh = table.predict(NEAR_A)
+    rebuilt = client.stats.encoded - encoded
 
     # Four queries shared one context; the stale one answered, then the
-    # rebuild ran in a step of its own, and later queries read it.
+    # rebuild ran in a step of its own, which the driver runs once the stale
+    # query's step is answered, and the later query read it.
     assert encoded == 1 and rebuilt == 1
     assert not np.allclose(stale, fresh)
     stats = table.describe().region_stats
@@ -755,7 +762,7 @@ def test_a_regions_queries_share_a_context_rebuilt_once_they_are_answered() -> N
 
 @pytest.mark.parametrize("nearest", [False, True], ids=["exact", "neighbors"])
 def test_requests_to_one_table_in_a_step_decode_together(nearest: bool) -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     strategy = generalforecast.Strategy.neighbors(8) if nearest else None
     rows = _table(client, strategy=strategy)
     features, targets = _clusters()
@@ -782,7 +789,7 @@ def test_requests_to_one_table_in_a_step_decode_together(nearest: bool) -> None:
 
 @pytest.mark.parametrize("tight", [False, True], ids=["roomy", "tight"])
 def test_queries_with_contexts_of_their_own_decode_apart(tight: bool) -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client, strategy=generalforecast.Strategy.neighbors(8))
     features, targets = _clusters(64)
     rows.insert(np.arange(64), features, targets)
@@ -803,7 +810,7 @@ def test_queries_with_contexts_of_their_own_decode_apart(tight: bool) -> None:
 
 
 def test_decodings_pad_only_to_their_own_size() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client, strategy=generalforecast.Strategy.neighbors(8))
     features, targets = _clusters(64)
     rows.insert(np.arange(64), features, targets)
@@ -826,7 +833,7 @@ def test_a_step_stores_each_context_as_it_is_encoded(
 ) -> None:
     profile = memory_profile(tabicl_functions, tiny_tabicl(regression=False), 5)
     unit = profile.context_bytes(PAGE)
-    client = generalforecast.local(device_bytes=16 * unit, slot_bytes=unit)
+    client = node_harness.local(device_bytes=16 * unit, slot_bytes=unit)
     rows = _table(client, strategy=generalforecast.Strategy.neighbors(8))
     features, targets = _clusters(128)
     rows.insert(np.arange(128), features, targets)
@@ -894,7 +901,7 @@ def test_contexts_whose_encode_cannot_be_measured_are_checked_by_their_decode(
 def test_contexts_whose_encode_cannot_be_compiled_are_refused(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     table = _table(client)
     features, targets = _clusters(64)
     table.insert(np.arange(64), features, targets)
@@ -913,7 +920,7 @@ def test_contexts_whose_encode_cannot_be_compiled_are_refused(
 def test_a_worker_drops_its_programs_past_its_table_shapes_when_memory_is_short(
     short: bool,
 ) -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     worker = client._worker
     worker.programs.limit = 2
     # Memory is short when less than a quarter of the host's is free.
@@ -922,7 +929,7 @@ def test_a_worker_drops_its_programs_past_its_table_shapes_when_memory_is_short(
     tables = []
     for width in (3, 4, 5):
         table = client.create_table(
-            f"w{width}", model=classifier(), features=width, classes=3
+            f"w{width}", model=TABICL, features=width, classes=3
         )
         features, targets = _clusters()
         table.insert(np.arange(32), features[:, :width], targets)
@@ -940,8 +947,8 @@ def test_a_worker_drops_its_programs_past_its_table_shapes_when_memory_is_short(
 def test_evicting_representations_changes_no_prediction() -> None:
     model = tiny_tabicl(regression=False)
     page = memory_profile(tabicl_functions, model, 5).row_bytes * PAGE
-    ample = generalforecast.local()
-    tight = generalforecast.local(host_bytes=2 * page, slot_bytes=page)
+    ample = node_harness.local()
+    tight = node_harness.local(host_bytes=2 * page, slot_bytes=page)
     features, targets = _clusters(64)
     queries = np.concatenate([NEAR_A, NEAR_B])
     predictions = []
@@ -949,7 +956,7 @@ def test_evicting_representations_changes_no_prediction() -> None:
         rows = _table(
             client,
             strategy=generalforecast.Strategy.neighbors(16),
-            model=(tabicl_functions, model),
+            model=TABICL,
         )
         rows.insert(np.arange(64), features, targets)
         rows.predict(queries)
@@ -962,7 +969,7 @@ def test_evicting_representations_changes_no_prediction() -> None:
 
 
 def test_deleted_rows_leave_the_cache_at_once() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client, strategy=generalforecast.Strategy.neighbors(16))
     rows.insert(np.arange(32), *_clusters())
     rows.predict(np.concatenate([NEAR_A, NEAR_B]))
@@ -974,7 +981,7 @@ def test_deleted_rows_leave_the_cache_at_once() -> None:
 
 
 def test_changes_then_a_refit_match_a_fresh_table() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client)
     features, targets = _clusters()
     rows.insert(np.arange(32), features, targets)
@@ -997,7 +1004,7 @@ def test_changes_then_a_refit_match_a_fresh_table() -> None:
 
 def test_a_drifted_table_refits_on_its_own() -> None:
     client = generalforecast.local()
-    model = (tabicl_functions, tiny_tabicl(regression=False))
+    model = TABICL
     rows = client.create_table(
         "rows", model=model, features=5, classes=3, page_size=PAGE, refit_shift=1.0
     )
@@ -1023,7 +1030,7 @@ def test_categorical_columns_reach_the_model() -> None:
     data = table(regression=False, rows=32)
     coded = client.create_table(
         "coded",
-        model=(kumo_functions, model),
+        model=KUMO,
         columns={
             "a": "categorical",
             "b": "numeric",
@@ -1055,7 +1062,7 @@ def test_categorical_columns_reach_the_model() -> None:
     # A table without categorical columns keeps a different state, yet decodes
     # in the same step.
     plain = client.create_table(
-        "plain", model=(kumo_functions, model), features=5, classes=data.num_classes
+        "plain", model=KUMO, features=5, classes=data.num_classes
     )
     plain.insert(np.arange(32), features, np.asarray(data.targets))
     together = client.predict({"coded": queries, "plain": queries})
@@ -1063,20 +1070,16 @@ def test_categorical_columns_reach_the_model() -> None:
     with pytest.raises(ValueError, match="codes"):
         coded.insert([99], np.array([[0.5, 0, 0, 0, 0]], np.float32), [0])
     with pytest.raises(ValueError, match="kind"):
-        client.create_table(
-            "bad", model=(kumo_functions, model), columns={"a": "text"}, classes=3
-        )
+        client.create_table("bad", model=KUMO, columns={"a": "text"}, classes=3)
     with pytest.raises(ValueError, match="kinds are"):
         Column("a", "text")  # ty: ignore[invalid-argument-type]
     with pytest.raises(ValueError, match="fixed column"):
-        client.create_table(
-            "bad", model=(kumo_functions, model), columns={"key": "numeric"}, classes=3
-        )
+        client.create_table("bad", model=KUMO, columns={"key": "numeric"}, classes=3)
 
 
 def test_column_kinds_encode_frames_as_the_model_reads_them() -> None:
     client = generalforecast.local()
-    model = (tabicl_functions, tiny_tabicl(regression=False))
+    model = TABICL
     kinds = {
         "store": "categorical",
         "amount": "numeric",
@@ -1168,7 +1171,7 @@ def test_times_split_into_the_features_the_server_gives_them() -> None:
 
 
 def test_datetime_columns_take_dates_and_rows_keep_their_kinds() -> None:
-    model = (tabicl_functions, tiny_tabicl(regression=False))
+    model = TABICL
     kinds = {"paid_at": "datetime", "store": "categorical", "amount": "numeric"}
     table = generalforecast.local().create_table(
         "dated", model=model, columns=kinds, classes=3
@@ -1193,7 +1196,7 @@ def test_datetime_columns_take_dates_and_rows_keep_their_kinds() -> None:
 
 
 def test_tables_take_times_of_the_kind_they_declare() -> None:
-    model = classifier()
+    model = TABICL
     features, targets = _clusters(2)
     client = generalforecast.local()
     counted = client.create_table("counted", model=model, features=5, classes=3)
@@ -1252,7 +1255,7 @@ def test_small_tables_run_together_in_one_compiled_call() -> None:
     functions = tabicl_functions._replace(
         embed=traced("embed"), decode=traced("decode")
     )
-    client = generalforecast.local()
+    client = node_harness.local()
     model = (functions, tiny_tabicl(regression=False))
     tables = {}
     for index in range(6):
@@ -1282,7 +1285,7 @@ def test_a_decode_that_runs_out_of_memory_splits_its_queries(
 ) -> None:
     features, targets = _clusters()
     queries = np.random.default_rng(1).normal(size=(40, 5)).astype(np.float32)
-    plain = _table(generalforecast.local())
+    plain = _table(node_harness.local())
     plain.insert(np.arange(32), features, targets)
     expected = plain.predict(queries)
 
@@ -1290,9 +1293,9 @@ def test_a_decode_that_runs_out_of_memory_splits_its_queries(
         model = tiny_tabicl(regression=False)
         unit = memory_profile(tabicl_functions, model, 5).context_bytes(32)
         # No room on the device: the context is transient, decoded from a dense array.
-        client = generalforecast.local(device_bytes=unit // 2, slot_bytes=unit // 2)
+        client = node_harness.local(device_bytes=unit // 2, slot_bytes=unit // 2)
     else:
-        client = generalforecast.local()
+        client = node_harness.local()
     worker = client._worker
     sizes: list[int] = []
 
@@ -1362,11 +1365,11 @@ def _as_frame(step: Any) -> protocol.Step:
 def test_a_failing_table_fails_only_its_own_part_of_a_step(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model = (tabicl_functions, tiny_tabicl(regression=False))
+    model = TABICL
     features, targets = _clusters()
-    alone = _table(generalforecast.local(), name="good", model=model)
+    alone = _table(node_harness.local(), name="good", model=model)
     alone.insert(np.arange(len(features)), features, targets)
-    client = generalforecast.local()
+    client = node_harness.local()
     tables = {name: _table(client, name=name, model=model) for name in ("bad", "good")}
     for handle in tables.values():
         handle.insert(np.arange(len(features)), features, targets)
@@ -1402,7 +1405,7 @@ def test_a_failing_table_fails_only_its_own_part_of_a_step(
 
 
 def test_units_must_read_rows_of_the_steps_pages() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client)
     rows.insert(np.arange(32), *_clusters())
     rows.delete([5])
@@ -1418,8 +1421,8 @@ def test_units_must_read_rows_of_the_steps_pages() -> None:
 
 
 def test_contexts_of_different_sizes_decode_in_one_call() -> None:
-    client = generalforecast.local()
-    model = (tabicl_functions, tiny_tabicl(regression=False))
+    client = node_harness.local()
+    model = TABICL
     tables = {}
     for name, rows in (("small", 20), ("large", 70)):
         features, targets = _clusters(rows)
@@ -1437,7 +1440,7 @@ def test_contexts_of_different_sizes_decode_in_one_call() -> None:
 
 
 def test_a_decode_holds_its_context_once_however_large_its_slots() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client, strategy=generalforecast.Strategy.neighbors(16))
     features, targets = _clusters(64)
     rows.insert(np.arange(64), features, targets)
@@ -1471,9 +1474,9 @@ def test_a_decode_holds_its_context_once_however_large_its_slots() -> None:
 def test_decoding_from_slots_matches_decoding_dense_caches() -> None:
     model = tiny_tabicl(regression=False)
     unit = memory_profile(tabicl_functions, model, 5).context_bytes(16)
-    paged = generalforecast.local()
+    paged = node_harness.local()
     # No room on the device: every context is transient, decoded from dense arrays.
-    dense = generalforecast.local(device_bytes=unit // 2, slot_bytes=unit // 2)
+    dense = node_harness.local(device_bytes=unit // 2, slot_bytes=unit // 2)
     features, targets = _clusters(64)
     queries = np.concatenate([NEAR_A, NEAR_B, NEAR_A + 0.5])
     predictions = []
@@ -1481,7 +1484,7 @@ def test_decoding_from_slots_matches_decoding_dense_caches() -> None:
         rows = _table(
             client,
             strategy=generalforecast.Strategy.neighbors(16),
-            model=(tabicl_functions, model),
+            model=TABICL,
         )
         rows.insert(np.arange(64), features, targets)
         predictions.append(rows.predict(queries))
@@ -1496,11 +1499,11 @@ def test_contexts_with_no_room_are_encoded_only_as_their_decode_needs_them(
     model = tiny_tabicl(regression=False)
     unit = memory_profile(tabicl_functions, model, 5).context_bytes(16)
     # No room on the device: every context is transient.
-    client = generalforecast.local(device_bytes=unit // 2, slot_bytes=unit // 2)
+    client = node_harness.local(device_bytes=unit // 2, slot_bytes=unit // 2)
     rows = _table(
         client,
         strategy=generalforecast.Strategy.neighbors(16),
-        model=(tabicl_functions, model),
+        model=TABICL,
     )
     features, targets = _clusters(128)
     rows.insert(np.arange(128), features, targets)
@@ -1540,8 +1543,8 @@ def test_dense_contexts_are_encoded_a_call_budget_at_a_time(
 ) -> None:
     model = tiny_tabicl(regression=False)
     unit = memory_profile(tabicl_functions, model, 5).context_bytes(16)
-    paged = generalforecast.local()
-    dense = generalforecast.local(device_bytes=unit // 2, slot_bytes=unit // 2)
+    paged = node_harness.local()
+    dense = node_harness.local(device_bytes=unit // 2, slot_bytes=unit // 2)
     worker = dense._worker
     # Less than two contexts, so each is decoded before the next is encoded:
     # a call takes at most an eighth of a device with room for a context, its
@@ -1563,7 +1566,7 @@ def test_dense_contexts_are_encoded_a_call_budget_at_a_time(
         rows = _table(
             client,
             strategy=generalforecast.Strategy.neighbors(16),
-            model=(tabicl_functions, model),
+            model=TABICL,
         )
         rows.insert(np.arange(64), features, targets)
         predictions.append(rows.predict(queries))
@@ -1580,15 +1583,15 @@ def test_requests_past_a_steps_budget_run_in_later_steps(budget: str) -> None:
     # Room for one table's context, on the device or in a step, so a step
     # takes one table.
     if budget == "device":
-        client = generalforecast.local(device_bytes=unit, slot_bytes=unit)
+        client = node_harness.local(device_bytes=unit, slot_bytes=unit)
     else:
-        client = generalforecast.local(slot_bytes=unit, step_bytes=unit)
-    alone = generalforecast.local()
+        client = node_harness.local(slot_bytes=unit, step_bytes=unit)
+    alone = node_harness.local()
     names = ["first", "second", "third"]
     for target in (client, alone):
         for index, name in enumerate(names):
             features, targets = _clusters(20 + index)
-            table = _table(target, name=name, model=(tabicl_functions, model))
+            table = _table(target, name=name, model=TABICL)
             table.insert(np.arange(len(features)), features, targets)
 
     together = client.predict({name: NEAR_A for name in names})
@@ -1601,10 +1604,10 @@ def test_requests_past_a_steps_budget_run_in_later_steps(budget: str) -> None:
 
 
 def test_a_table_past_its_fit_rows_fits_on_a_sample_and_embeds_pages_it_reads() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     table = client.create_table(
         "t",
-        model=(tabicl_functions, tiny_tabicl(regression=False)),
+        model=TABICL,
         features=5,
         classes=3,
         strategy=generalforecast.Strategy.neighbors(8),
@@ -1623,13 +1626,11 @@ def test_a_table_past_its_fit_rows_fits_on_a_sample_and_embeds_pages_it_reads() 
 
 
 def test_a_table_that_summarizes_each_context_fits_units_and_reuses_them() -> None:
-    from generalforecast.models.limix.model import limix_functions
-    from tests.models.limix.tiny import tiny_limix
 
-    client = generalforecast.local()
+    client = node_harness.local()
     table = client.create_table(
         "t",
-        model=(kumo_functions, tiny_kumo(regression=False)),
+        model=KUMO,
         features=5,
         classes=3,
         strategy=generalforecast.Strategy.neighbors(8),
@@ -1650,7 +1651,7 @@ def test_a_table_that_summarizes_each_context_fits_units_and_reuses_them() -> No
     with pytest.raises(ValueError, match="no column summary"):
         client.create_table(
             "limix",
-            model=(limix_functions, tiny_limix(regression=False)),
+            model=LIMIX,
             features=5,
             classes=3,
             summary="context",
@@ -1661,7 +1662,7 @@ def test_cutoffs_limit_contexts_and_states_to_earlier_rows() -> None:
     model = tiny_tabicl(regression=False)
     client = generalforecast.local()
     features, targets = _clusters()
-    table = _table(client, model=(tabicl_functions, model))
+    table = _table(client, model=TABICL)
     table.insert(np.arange(32), features, targets, times=np.arange(32))
     rows, labels = jnp.asarray(features), jnp.asarray(targets)
 
@@ -1689,7 +1690,7 @@ def test_cutoffs_limit_contexts_and_states_to_earlier_rows() -> None:
 
 def test_a_failed_step_leaves_nothing_behind(monkeypatch) -> None:
     features, targets = _clusters()
-    tables = [_table(generalforecast.local()) for _ in range(2)]
+    tables = [_table(node_harness.local()) for _ in range(2)]
     for each in tables:
         each.insert(np.arange(32), features, targets)
     store = Worker._store
@@ -1709,7 +1710,7 @@ def test_a_write_that_loses_the_device_pool_forgets_every_context(monkeypatch) -
     from generalforecast.runtime import paging
 
     features, targets = _clusters()
-    client = generalforecast.local()
+    client = node_harness.local()
     # An accelerator's pool, which a donated write can take with it.
     client._worker._device._on_host = False
     tables = [_table(client, name) for name in ("first", "second")]
@@ -1737,7 +1738,7 @@ def test_a_write_that_loses_the_device_pool_forgets_every_context(monkeypatch) -
 def test_regressors_pick_quantiles_between_the_models_own() -> None:
     features, _ = _clusters()
     table = generalforecast.local().create_table(
-        "values", model=(tabicl_functions, tiny_tabicl(regression=True)), features=5
+        "values", model=TABICL_REGRESSOR, features=5
     )
     table.insert(np.arange(32), features, features.sum(axis=1))
     every = table.predict(NEAR_A)
@@ -1752,7 +1753,7 @@ def test_regressors_pick_quantiles_between_the_models_own() -> None:
     np.testing.assert_allclose(picked[:, 1], (every[:, 0] + every[:, 1]) / 2, rtol=1e-6)
     np.testing.assert_array_equal(picked[:, 2], every[:, 0])
     assert table.predict(NEAR_A[:0], quantiles=[0.5]).shape == (0, 1)
-    assert table.describe().model is None
+    assert table.describe().model == TABICL_REGRESSOR
     with pytest.raises(ValueError, match="predicts classes"):
         _table(generalforecast.local()).predict(NEAR_A, quantiles=[0.5])
     for strategy in (
@@ -1762,14 +1763,8 @@ def test_regressors_pick_quantiles_between_the_models_own() -> None:
         generalforecast.Strategy.retrieved(4, core=4, span=3600),
     ):
         assert eval(repr(strategy), {"Strategy": generalforecast.Strategy}) == strategy
-    assert (
-        generalforecast.Classifier().get_params()["model"]
-        == "general-forecast/tabicl-v2-classifier"
-    )
-    assert (
-        generalforecast.Regressor().get_params()["model"]
-        == "general-forecast/tabicl-v2-regressor"
-    )
+    assert generalforecast.Classifier().get_params()["model"] == "tabicl-classifier"
+    assert generalforecast.Regressor().get_params()["model"] == "tabicl-regressor"
 
 
 def test_string_labels_code_in_order_and_stay_apart_from_codes() -> None:
@@ -1788,15 +1783,15 @@ def test_string_labels_code_in_order_and_stay_apart_from_codes() -> None:
         labelled.insert([99], features[:1], [0])
     with pytest.raises(ValueError, match="codes"):
         coded.insert([99], features[:1], ["cat"])
-    with pytest.raises(ValueError, match="'eel' would be another"):
+    with pytest.raises(ValueError, match="its labels would be"):
         labelled.upsert([1, 99], features[:2], ["cat", "eel"])
     assert len(labelled) == 32
 
 
-def _int8(client_bytes: int = 1 << 30) -> generalforecast.LocalClient:
+def _int8(client_bytes: int = 1 << 30) -> node_harness.LocalClient:
     """A local client storing caches as int8, as GF_CACHE_DTYPE=int8 does."""
     exact = device_settings("cpu", exact=True)
-    return generalforecast.local(
+    return node_harness.local(
         settings=dataclasses.replace(exact, cache_dtype=jnp.dtype("int8")),
         device_bytes=client_bytes,
     )
@@ -1812,7 +1807,7 @@ def test_models_that_read_caches_as_encoded_get_them_back_in_float32() -> None:
     spec.loader.exec_module(example)
     features, targets = _clusters()
     predictions = []
-    for client in (generalforecast.local(), _int8()):
+    for client in (node_harness.local(), _int8()):
         table = client.create_table(
             "kernel", model=example.kernel(), features=5, classes=3
         )
@@ -1827,10 +1822,10 @@ def test_time_buckets_keep_later_rows_off_earlier_pages() -> None:
     features, targets = _clusters(64)
     embedded, copied = {}, {}
     for time_bucket in (None, 8):
-        client = generalforecast.local()
+        client = node_harness.local()
         table = client.create_table(
             "rows",
-            model=(tabicl_functions, tiny_tabicl(regression=False)),
+            model=TABICL,
             features=5,
             classes=3,
             page_size=PAGE,
@@ -1858,7 +1853,7 @@ def test_tables_naming_a_model_share_its_weights(monkeypatch) -> None:
     loads = []
     load = registry.load
     monkeypatch.setattr(registry, "load", lambda spec: loads.append(spec) or load(spec))
-    client = generalforecast.local()
+    client = node_harness.local()
 
     for name in ("first", "second"):
         client.create_table(
@@ -1869,7 +1864,7 @@ def test_tables_naming_a_model_share_its_weights(monkeypatch) -> None:
 
 
 def test_a_failed_predict_leaves_nothing_for_the_next() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     features, targets = _clusters()
     for name in ("first", "second"):
         _table(client, name).insert(np.arange(32), features, targets, np.arange(32))
@@ -1919,9 +1914,9 @@ def test_keys_labels_and_rows_are_checked_rather_than_converted() -> None:
         table.delete([7])
     with pytest.raises(KeyError, match="key 7"):
         table.update([7], features[:1], targets[:1])
-    with pytest.raises(ValueError, match="table 't': the table has no rows"):
+    with pytest.raises(ValueError, match="the table has no rows"):
         generalforecast.local().create_table(
-            "t", model=classifier(), features=5, classes=3
+            "t", model=TABICL, features=5, classes=3
         ).predict(features)
 
 
@@ -1929,13 +1924,13 @@ def test_tables_and_strategies_are_checked_when_created() -> None:
     client = generalforecast.local()
 
     with pytest.raises(ValueError, match="feature"):
-        client.create_table("flat", model=classifier(), features=0, classes=3)
+        client.create_table("flat", model=TABICL, features=0, classes=3)
     with pytest.raises(ValueError, match="2 classes"):
-        client.create_table("one", model=classifier(), features=3, classes=1)
+        client.create_table("one", model=TABICL, features=3, classes=1)
     # The model says what a table predicts: classes only for a classifier.
-    with pytest.raises(ValueError, match="give the table its classes"):
-        client.create_table("none", model=classifier(), features=3)
-    regressor = (tabicl_functions, tiny_tabicl(regression=True))
+    with pytest.raises(ValueError, match="give the table its number of classes"):
+        client.create_table("none", model=TABICL, features=3)
+    regressor = TABICL_REGRESSOR
     with pytest.raises(ValueError, match="without classes"):
         client.create_table("values", model=regressor, features=3, classes=2)
     assert client.create_table("values", model=regressor, features=3).classes is None
@@ -1949,8 +1944,8 @@ def test_tables_and_strategies_are_checked_when_created() -> None:
 
 def test_clients_take_generators_predict_nothing_and_close() -> None:
     features, targets = _clusters()
-    with generalforecast.local(disk_bytes=1 << 20, slot_bytes=1 << 16) as client:
-        table = _table(client, model=classifier())
+    with node_harness.local(disk_bytes=1 << 20, slot_bytes=1 << 16) as client:
+        table = _table(client, model=TABICL)
         table.insert((key for key in range(32)), features, targets)
         temporary = client._temporary
 
@@ -1978,7 +1973,7 @@ def test_tables_are_looked_up_by_name_and_names_are_unique() -> None:
 
 
 def test_dropped_tables_free_their_name_and_caches() -> None:
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client)
     features, targets = _clusters()
     rows.insert(np.arange(32), features, targets)
@@ -2022,7 +2017,7 @@ def test_a_client_sizes_its_tiers_from_its_device(
         "generalforecast.runtime.budget.device_memory", lambda: 64 << 20
     )
 
-    client = generalforecast.local(slot_bytes=1 << 20)
+    client = node_harness.local(slot_bytes=1 << 20)
 
     # A quarter of the device's memory, and as much again on the host.
     assert client._worker._slots[:2] == (16, 16)
@@ -2084,7 +2079,7 @@ def test_series_tables_forecast_as_the_model_does_on_the_group() -> None:
     client = generalforecast.local()
     sales = client.create_series_table(
         "sales",
-        model=(timestral_functions, model),
+        model="tests.models.timestral.tiny:forecaster",
         series="item",
         time="t",
         target="units",
@@ -2150,7 +2145,7 @@ def test_native_series_forecast_continues_past_one_output_patch() -> None:
     client = generalforecast.local()
     series = client.create_series_table(
         "multi-pass",
-        model=(timesfm_functions, model),
+        model="tests.models.timesfm3.tiny:forecaster",
         series="item",
         time="t",
         target="units",
@@ -2179,10 +2174,8 @@ def test_native_series_forecast_continues_past_one_output_patch() -> None:
 
 
 def test_series_tables_forecast_the_groups_given_them() -> None:
-    from generalforecast.models.timestral.model import timestral_functions
-    from tests.models.timestral.tiny import tiny_timestral
 
-    model = (timestral_functions, tiny_timestral())
+    model = "tests.models.timestral.tiny:forecaster"
     client = generalforecast.local()
 
     def table(name: str, group: generalforecast.GroupStrategy, items: list[str]) -> Any:
@@ -2239,8 +2232,6 @@ def test_series_tables_forecast_the_groups_given_them() -> None:
 
 
 def test_series_tables_refuse_groups_past_the_models_rows() -> None:
-    from generalforecast.models.timesfm3.model import timesfm_functions
-    from tests.models.timesfm3.tiny import tiny_timesfm
 
     # The tiny TimesFM reads 32 rows per group: with one covariate, 16 series
     # of two rows each fit, 32 do not, and the table says so at creation
@@ -2248,7 +2239,7 @@ def test_series_tables_refuse_groups_past_the_models_rows() -> None:
     client = generalforecast.local()
     client.create_series_table(
         "fits",
-        model=(timesfm_functions, tiny_timesfm()),
+        model="tests.models.timesfm3.tiny:forecaster",
         series="item",
         time="t",
         target="units",
@@ -2262,7 +2253,7 @@ def test_series_tables_refuse_groups_past_the_models_rows() -> None:
     wide = {f"c{index}": "numeric" for index in range(16)}
     client.create_series_table(
         "alone",
-        model=(timesfm_functions, tiny_timesfm()),
+        model="tests.models.timesfm3.tiny:forecaster",
         series="item",
         time="t",
         target="units",
@@ -2272,7 +2263,7 @@ def test_series_tables_refuse_groups_past_the_models_rows() -> None:
     with pytest.raises(ValueError, match="per group"):
         client.create_series_table(
             "pair",
-            model=(timesfm_functions, tiny_timesfm()),
+            model="tests.models.timesfm3.tiny:forecaster",
             series="item",
             time="t",
             target="units",
@@ -2283,7 +2274,7 @@ def test_series_tables_refuse_groups_past_the_models_rows() -> None:
     with pytest.raises(ValueError, match="past what the model serves per group"):
         client.create_series_table(
             "wide",
-            model=(timesfm_functions, tiny_timesfm()),
+            model="tests.models.timesfm3.tiny:forecaster",
             series="item",
             time="t",
             target="units",
@@ -2295,14 +2286,13 @@ def test_series_tables_refuse_groups_past_the_models_rows() -> None:
 
 
 def test_series_tables_refuse_what_they_cannot_hold() -> None:
-    from generalforecast.models.timestral.model import timestral_functions
 
-    forecaster: Any = (timestral_functions, tiny_timestral())
-    tabular: Any = (tabicl_functions, tiny_tabicl(regression=True))
+    forecaster: Any = "tests.models.timestral.tiny:forecaster"
+    tabular: Any = TABICL_REGRESSOR
     client = generalforecast.local()
-    with pytest.raises(TypeError, match="forecaster"):
+    with pytest.raises(ValueError, match="is a forecaster"):
         client.create_table("rows", model=forecaster, features=2)
-    with pytest.raises(TypeError, match="not a forecaster"):
+    with pytest.raises(ValueError, match="not a forecaster"):
         client.create_series_table(
             "rows",
             model=tabular,
@@ -2321,7 +2311,7 @@ def test_series_tables_refuse_what_they_cannot_hold() -> None:
             step=1,
             times="datetime",
         )
-    with pytest.raises(ValueError, match="known columns"):
+    with pytest.raises(ValueError, match="known column"):
         client.create_series_table(
             "sales",
             model=forecaster,
@@ -2378,8 +2368,8 @@ def test_series_tables_refuse_what_they_cannot_hold() -> None:
 
 
 def test_a_page_written_once_embeds_the_written_row_and_copies_the_rest() -> None:
-    written, plain = generalforecast.local(), generalforecast.local()
-    model = (tabicl_functions, tiny_tabicl(regression=False))
+    written, plain = node_harness.local(), node_harness.local()
+    model = TABICL
     tables = {
         client: client.create_table(
             "rows", model=model, features=5, classes=3, page_size=32
@@ -2415,10 +2405,10 @@ def test_a_page_written_once_embeds_its_row_with_a_warmed_program() -> None:
 
     jax.monitoring.register_event_duration_secs_listener(compile_event)
     try:
-        client = generalforecast.local()
+        client = node_harness.local()
         rows = client.create_table(
             "rows",
-            model=(tabicl_functions, tiny_tabicl(regression=False)),
+            model=TABICL,
             features=5,
             classes=3,
             page_size=32,
@@ -2440,10 +2430,169 @@ def test_a_page_written_once_embeds_its_row_with_a_warmed_program() -> None:
     assert "jit(embed)" not in compiled
 
 
+def test_a_worker_compiles_the_programs_an_earlier_one_recorded_before_its_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    jax.config.update("jax_enable_compilation_cache", False)
+    compiled: list[str] = []
+
+    def compile_event(event: str, duration_secs: float, **details: Any) -> None:
+        # Compiles ahead run on their own thread; only a step's own count.
+        if (
+            event == "/jax/core/compile/backend_compile_duration"
+            and threading.current_thread().name != "gf-warm_0"
+        ):
+            compiled.append(details.get("fun_name", ""))
+
+    def served(client: Any) -> Any:
+        rows = client.create_table(
+            "rows",
+            model=(tabicl_functions, tiny_tabicl(regression=False)),
+            features=5,
+            classes=3,
+        )
+        # As `worker_process` loads models: by spec, so their calls are recorded.
+        client._worker._specs[0] = "tiny-tabicl"
+        return rows
+
+    features, targets = _clusters()
+    jax.monitoring.register_event_duration_secs_listener(compile_event)
+    try:
+        earlier = node_harness.local()
+        rows = served(earlier)
+        rows.insert(np.arange(32), features, targets)
+        expected = rows.predict(NEAR_A)
+        assert any("fit" in name or "lambda" in name for name in compiled)
+
+        later = node_harness.local()
+        rows = served(later)
+        later._worker.warm_start()
+        assert later._worker.programs.warmed > 0
+        compiled.clear()
+        rows.insert(np.arange(32), features, targets)
+        predicted = rows.predict(NEAR_A)
+    finally:
+        jax.monitoring.unregister_event_duration_listener(compile_event)
+        jax.config.update("jax_enable_compilation_cache", True)
+
+    stages = ("fit", "embed", "encode", "decode", "lambda")
+    assert [name for name in compiled if any(s in name for s in stages)] == []
+    np.testing.assert_allclose(predicted, expected, atol=1e-6)
+
+
+def test_a_worker_compiles_the_fused_calls_an_earlier_one_recorded_before_its_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from generalforecast._core import CacheKey
+    from generalforecast.models.conformance import table as conformance_table
+    from tests.models.conformance.cases import FEATURES
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    jax.config.update("jax_enable_compilation_cache", False)
+    compiled: list[str] = []
+
+    def compile_event(event: str, duration_secs: float, **details: Any) -> None:
+        if (
+            event == "/jax/core/compile/backend_compile_duration"
+            and threading.current_thread().name != "gf-warm_0"
+        ):
+            compiled.append(details.get("fun_name", ""))
+
+    data = conformance_table(False, rows=48, queries=6)
+    model = tiny_tabicl(regression=False)
+
+    def started() -> Worker:
+        worker = Worker(slot_bytes=4096, compile_ahead=False)
+        worker.add_model(0, tabicl_functions, model)
+        # As `worker_process` loads models: by spec, so their calls are recorded.
+        worker._specs[0] = "tiny-tabicl"
+        worker.allocate(256, 0, 0)
+        worker.add_table(0, 0, data.num_classes, FEATURES)
+        return worker
+
+    def fused(worker: Worker) -> np.ndarray:
+        rows = np.arange(48, dtype=np.uint32)
+        key = CacheKey(0, 0, 0, "context", 1)
+        features, targets = np.asarray(data.features), np.asarray(data.targets)
+        unit = protocol.Unit(0, key, rows, "fuse", [], features, targets)
+        queries = np.asarray(data.queries)
+        batch = protocol.QueryBatch(0, 0, 0, queries, [0] * len(queries))
+        return worker.run(protocol.Step([], [], [], [unit], [batch]))[0]
+
+    jax.monitoring.register_event_duration_secs_listener(compile_event)
+    try:
+        expected = fused(started())
+        assert any("fit_decode" in name for name in compiled)
+        later = started()
+        later.warm_start()
+        assert later.programs.warmed > 0
+        compiled.clear()
+        predicted = fused(later)
+    finally:
+        jax.monitoring.unregister_event_duration_listener(compile_event)
+        jax.config.update("jax_enable_compilation_cache", True)
+
+    assert [name for name in compiled if "fit_decode" in name] == []
+    np.testing.assert_allclose(predicted, expected, atol=1e-6)
+
+
+def test_fused_units_side_by_side_answer_in_order_and_fail_apart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast._core import CacheKey
+    from generalforecast.models.conformance import table as conformance_table
+    from tests.models.conformance.cases import FEATURES
+
+    model = tiny_tabicl(regression=False)
+    tables = [
+        conformance_table(False, rows=48, queries=6, seed=seed) for seed in range(3)
+    ]
+    worker = Worker(slot_bytes=4096, compile_ahead=False)
+    worker.add_model(0, tabicl_functions, model)
+    worker.allocate(256, 0, 0)
+    worker._side_by_side = 3
+    for index, data in enumerate(tables):
+        worker.add_table(index, 0, data.num_classes, FEATURES)
+
+    def step(indices: list[int]) -> protocol.Step:
+        units, batches = [], []
+        for at, index in enumerate(indices):
+            data = tables[index]
+            key = CacheKey(index, 0, 0, "context", 1)
+            rows = np.arange(48, dtype=np.uint32)
+            features, targets = np.asarray(data.features), np.asarray(data.targets)
+            units.append(protocol.Unit(index, key, rows, "fuse", [], features, targets))
+            queries = np.asarray(data.queries)
+            batches.append(
+                protocol.QueryBatch(index, index, index, queries, [at] * len(queries))
+            )
+        return protocol.Step([], [], [], units, batches)
+
+    alone = {index: worker.run(step([index]))[index] for index in range(3)}
+    together = worker.run(step([0, 1, 2]))
+    assert list(together) == [0, 1, 2]
+    for index in range(3):
+        np.testing.assert_allclose(together[index], alone[index], atol=1e-6)
+
+    called = worker._call
+
+    def failing(stage: str, jobs: Any, consume: Any = None) -> list[Any]:
+        if stage == "fit_decode" and jobs[0][0] == 1:
+            raise RuntimeError("table 1 failed")
+        return called(stage, jobs, consume)
+
+    monkeypatch.setattr(worker, "_call", failing)
+    predictions, failed = worker.run_apart(step([0, 1, 2]))
+    assert failed == {1: "RuntimeError: table 1 failed"}
+    assert sorted(predictions) == [0, 2]
+    np.testing.assert_allclose(predictions[2], alone[2], atol=1e-6)
+
+
 def test_a_steps_parts_add_up_to_its_seconds(monkeypatch: pytest.MonkeyPatch) -> None:
     from generalforecast import worker_process
 
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client)
     rows.insert(np.arange(32), *_clusters())
     node, worker = client._node, client._worker
@@ -2453,7 +2602,9 @@ def test_a_steps_parts_add_up_to_its_seconds(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(protocol, "request", lambda header, buffers: step)
     before = worker.stats.snapshot()
 
-    header, buffers = worker_process._answer(worker, {}, {"kind": "step"}, [])()
+    header, buffers = worker_process._answer(
+        worker, {}, lambda: None, {"kind": "step"}, []
+    )()
 
     parts = {name: spent["seconds"] for name, spent in header["parts"].items()}
     stages = sum(spent["seconds"] for spent in header["stages"].values())
@@ -2490,7 +2641,7 @@ def test_a_steps_parts_add_up_to_its_seconds(monkeypatch: pytest.MonkeyPatch) ->
 def test_a_failed_steps_time_counts_as_other(monkeypatch: pytest.MonkeyPatch) -> None:
     from generalforecast import worker_process
 
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client)
     rows.insert(np.arange(32), *_clusters())
     node, worker = client._node, client._worker
@@ -2510,7 +2661,7 @@ def test_a_failed_steps_time_counts_as_other(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(worker, "_compute", failing)
     before = worker.stats.snapshot()
 
-    header, _ = worker_process._answer(worker, {}, {"kind": "step"}, [])()
+    header, _ = worker_process._answer(worker, {}, lambda: None, {"kind": "step"}, [])()
 
     # The attempt's parts went with its counts, and its time is `other`.
     assert header["failures"] and not header["results"]
@@ -2532,7 +2683,7 @@ def test_an_untimed_step_reports_no_parts_and_predicts_as_a_timed_one(
 ) -> None:
     from generalforecast import worker_process
 
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client)
     rows.insert(np.arange(32), *_clusters())
     node, worker = client._node, client._worker
@@ -2542,10 +2693,12 @@ def test_an_untimed_step_reports_no_parts_and_predicts_as_a_timed_one(
     assert not worker.timers
 
     untimed, untimed_buffers = worker_process._answer(
-        worker, {}, {"kind": "step"}, []
+        worker, {}, lambda: None, {"kind": "step"}, []
     )()
     worker.timers = True
-    timed, timed_buffers = worker_process._answer(worker, {}, {"kind": "step"}, [])()
+    timed, timed_buffers = worker_process._answer(
+        worker, {}, lambda: None, {"kind": "step"}, []
+    )()
 
     # The reply keeps its parts field, empty, and its stages and seconds.
     assert untimed["parts"] == {} and timed["parts"]
@@ -2572,7 +2725,7 @@ def test_a_record_request_samples_the_steps_stacks(
 ) -> None:
     from generalforecast import worker_process
 
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client)
     rows.insert(np.arange(32), *_clusters())
     node, worker = client._node, client._worker
@@ -2590,18 +2743,18 @@ def test_a_record_request_samples_the_steps_stacks(
     path = tmp_path / "profile" / "stacks.txt"
     header = {"kind": "record", "seconds": 0.5, "path": str(path)}
     for _ in range(3):
-        worker_process._answer(worker, {}, {"kind": "step"}, [])()
+        worker_process._answer(worker, {}, lambda: None, {"kind": "step"}, [])()
 
-    answered, _ = worker_process._answer(worker, {}, header, [])()
+    answered, _ = worker_process._answer(worker, {}, lambda: None, header, [])()
     assert answered == {"kind": "ok"}
     assert path.parent.is_dir()
     # One record at a time.
-    answered, _ = worker_process._answer(worker, {}, header, [])()
+    answered, _ = worker_process._answer(worker, {}, lambda: None, header, [])()
     assert answered["kind"] == "error" and "already" in answered["message"]
     # Steps run on this thread while the sampler runs beside them.
     deadline = clock.perf_counter() + 10
     while not path.exists() and clock.perf_counter() < deadline:
-        worker_process._answer(worker, {}, {"kind": "step"}, [])()
+        worker_process._answer(worker, {}, lambda: None, {"kind": "step"}, [])()
 
     stacks = _stacks(path)
     this = threading.current_thread().name
@@ -2627,7 +2780,7 @@ def test_a_record_request_with_a_trace_writes_the_trace_and_its_steps(
     from generalforecast import worker_process
     from generalforecast.profiling import trace
 
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client)
     rows.insert(np.arange(32), *_clusters())
     node, worker = client._node, client._worker
@@ -2649,14 +2802,18 @@ def test_a_record_request_with_a_trace_writes_the_trace_and_its_steps(
         "path": str(directory / "stacks.txt"),
         "trace": str(directory),
     }
-    worker_process._answer(worker, {}, {"kind": "step"}, [])()
-    answered, _ = worker_process._answer(worker, {}, header, [])()
+    worker_process._answer(worker, {}, lambda: None, {"kind": "step"}, [])()
+    answered, _ = worker_process._answer(worker, {}, lambda: None, header, [])()
     assert answered == {"kind": "ok"}
     # One record at a time, with or without a trace.
-    answered, _ = worker_process._answer(worker, {}, header, [])()
+    answered, _ = worker_process._answer(worker, {}, lambda: None, header, [])()
     assert answered["kind"] == "error"
     answered, _ = worker_process._answer(
-        worker, {}, {"kind": "record", "seconds": 0.1, "path": str(tmp_path / "x")}, []
+        worker,
+        {},
+        lambda: None,
+        {"kind": "record", "seconds": 0.1, "path": str(tmp_path / "x")},
+        [],
     )()
     assert answered["kind"] == "error"
 
@@ -2664,7 +2821,7 @@ def test_a_record_request_with_a_trace_writes_the_trace_and_its_steps(
     deadline = clock.perf_counter() + 10
     while not (directory / trace.STEPS_FILE).exists():
         assert clock.perf_counter() < deadline
-        worker_process._answer(worker, {}, {"kind": "step"}, [])()
+        worker_process._answer(worker, {}, lambda: None, {"kind": "step"}, [])()
         ran += 1
     assert (directory / "stacks.txt").exists()
     assert list(directory.glob(trace.TRACE_GLOB))
@@ -2688,7 +2845,7 @@ def test_a_record_request_with_a_trace_writes_the_trace_and_its_steps(
     assert programs["jit_decode"]["runs"] >= len(steps)
     assert summary.kernels.num_rows > 0
     # Steps run past the window as they did before it, and a new record may follow.
-    worker_process._answer(worker, {}, {"kind": "step"}, [])()
+    worker_process._answer(worker, {}, lambda: None, {"kind": "step"}, [])()
     assert worker_process._tracing is None
     assert not worker_process._recording
 
@@ -2701,7 +2858,7 @@ def test_sampling_costs_a_step_loop_a_few_percent_at_most(
     # enough for a shared machine.
     from generalforecast import worker_process
 
-    client = generalforecast.local()
+    client = node_harness.local()
     rows = _table(client)
     rows.insert(np.arange(32), *_clusters())
     node, worker = client._node, client._worker
@@ -2713,7 +2870,7 @@ def test_sampling_costs_a_step_loop_a_few_percent_at_most(
         deadline = clock.perf_counter() + seconds
         count = 0
         while clock.perf_counter() < deadline:
-            worker_process._answer(worker, {}, {"kind": "step"}, [])()
+            worker_process._answer(worker, {}, lambda: None, {"kind": "step"}, [])()
             count += 1
         return count
 

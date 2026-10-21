@@ -171,22 +171,12 @@ def load_ref(
     ref: ModelRef, *, surface: Surface = "local", allow_downloads: bool = True
 ) -> Model:
     """Loads a parsed model reference, as `load` does a spec."""
+    catalog.admit(ref, surface)
     if ref.trusted:
-        if surface != "local":
-            raise ModelRefError(
-                "UntrustedModel", "module:function models run only locally"
-            )
         module, function = ref.name.split(":", 1)
         functions, parameters = getattr(importlib.import_module(module), function)()
     else:
         entry = ref.entry
-        if not entry.allows(surface, variant=ref.variant):
-            raise ModelRefError(
-                "UnsupportedModel",
-                f"{ref} is not qualified for {surface} use: {entry.gates.evidence}",
-            )
-        if surface != "local" and (refused := catalog.V1_POLICY.admits(ref)):
-            raise ModelRefError("CapacityExceeded", f"serving policy allows {refused}")
         if surface != "local":
             return _variant(
                 entry.name, surface, allow_downloads, ref.codes, ref.estimators

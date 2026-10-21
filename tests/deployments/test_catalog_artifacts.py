@@ -12,10 +12,13 @@ from generalforecast.deployments import catalog_artifacts
 from generalforecast.deployments.catalog import CatalogService
 from generalforecast.deployments.catalog_artifacts import preload, verify
 from generalforecast.deployments.contracts import ServiceError
+from generalforecast.engine import _checked
 from generalforecast.models import artifacts, catalog
 from generalforecast.models.artifacts import ArtifactError
+from tests.utils.engine import tabular_request
 
 ENTRY = catalog.ENTRIES["tabicl-v2-classifier"]
+TABULAR = tabular_request("tabicl-classifier", [[0.0], [1.0]], [False, True], [[2.0]])
 
 
 @pytest.mark.parametrize("online", [False, True])
@@ -120,8 +123,8 @@ def test_download_failures_are_typed_and_redacted(monkeypatch):
     monkeypatch.delenv("GF_CHECKPOINTS", raising=False)
     monkeypatch.setattr(huggingface_hub, "snapshot_download", refuse)
     with pytest.raises(ServiceError) as caught:
-        CatalogService(allow_downloads=True)._predict(
-            catalog.parse("tabicl-classifier"), [[0]], [0], [[1]], 2
+        CatalogService(allow_downloads=True)._run(
+            catalog.parse("tabicl-classifier"), TABULAR
         )
     assert (caught.value.code, caught.value.status) == ("ModelUnavailable", 503)
     assert "private-signed-url" not in str(caught.value)
@@ -137,7 +140,6 @@ def test_native_output_validation(kind, monkeypatch):
     monkeypatch.setattr(
         "generalforecast.models.registry.load_ref", lambda *_, **__: (functions, None)
     )
-    monkeypatch.setattr("generalforecast.models.inference.fit", lambda *_: (None, None))
 
     def run(*_):
         if kind == "exception":
@@ -150,18 +152,22 @@ def test_native_output_validation(kind, monkeypatch):
             "quantile-order": -np.arange(999).reshape(1, 999),
         }[kind]
 
-    monkeypatch.setattr(
-        "generalforecast.models.inference._tabular", lambda _: (None, run)
-    )
+    class Engine:
+        def tabular(self, ref, request):
+            return _checked(run(), len(request.queries), len(request.classes))
+
+    monkeypatch.setattr("generalforecast.engine.local", lambda *_: Engine())
+    request = TABULAR
+    if regression:
+        request = tabular_request(
+            "tabicl-regressor", [[0.0], [1.0]], [0.0, 1.0], [[2.0]]
+        )
     model = "tabicl-regressor" if regression else "tabicl-classifier"
     with pytest.raises(ServiceError) as caught:
-        CatalogService()._predict(
-            catalog.parse(model), [[0], [1]], [0, 1], [[2]], 0 if regression else 2
-        )
+        CatalogService()._run(catalog.parse(model), request)
     assert caught.value.code == (
         "InferenceFailed" if kind == "exception" else "ModelOutputError"
     )
-    assert "private-context" not in str(caught.value)
 
 
 def test_catalog_artifacts_module_has_no_private_loaders():

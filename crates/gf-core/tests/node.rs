@@ -2379,7 +2379,7 @@ fn a_region_built_never_again_is_read_until_its_entry_goes() {
 
 #[test]
 fn a_changed_region_built_each_period_falls_due_when_its_period_ends() {
-    let period = std::time::Duration::from_millis(100);
+    let period = std::time::Duration::from_secs(2);
     let mut node = node(64);
     let (table, more, middle) = regioned_table(&mut node, Rebuild::Every(period));
     planned_rows(&mut node, table, &A);
@@ -4915,4 +4915,23 @@ fn admitting_a_page_under_host_pressure_never_evicts_a_pinned_source() {
     let again = node.schedule().unwrap().unwrap();
     assert_eq!(copied_and_embedded(&again), [(7, 1)]);
     assert_eq!(embedded(&again)[0].copies[0].0, transient[0]);
+}
+
+#[test]
+fn only_new_single_use_contexts_waiting_is_told_apart_from_other_work() {
+    let mut node = node(64);
+    let durable = table(&mut node, Strategy::Exact, 32);
+    let fresh = table(&mut node, Strategy::Exact, 32);
+    node.set_single_use(fresh).unwrap();
+    assert!(!node.only_new_contexts_wait());
+
+    node.submit(fresh, &A).unwrap();
+    assert!(node.only_new_contexts_wait());
+    node.submit(durable, &A).unwrap();
+    assert!(!node.only_new_contexts_wait());
+
+    run(&mut node);
+    assert!(!node.only_new_contexts_wait());
+    node.submit(fresh, &B).unwrap();
+    assert!(!node.only_new_contexts_wait());
 }

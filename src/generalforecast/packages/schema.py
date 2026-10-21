@@ -136,6 +136,16 @@ def _compatible(actual: str, declared: str) -> bool:
     )
 
 
+def declared_seconds(frequency: str | float | None) -> float | None:
+    """A spec's declared frequency in time units: periods, or seconds for "7d"."""
+    if isinstance(frequency, str):
+        return (
+            int(frequency[:-1])
+            * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[frequency[-1]]
+        )
+    return frequency
+
+
 def _frequency(spec: PackageSpec, table: pa.Table) -> float:
     buckets: dict[tuple, list] = {}
     for row in table.select([*spec.series, spec.time]).to_pylist():
@@ -169,12 +179,7 @@ def _frequency(spec: PackageSpec, table: pa.Table) -> float:
     )
     observed = steps.pop()
     if spec.frequency is not None:
-        declared = spec.frequency
-        if type(declared) is str:
-            declared = (
-                int(declared[:-1])
-                * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[declared[-1]]
-            )
+        declared = declared_seconds(spec.frequency)
         ensure(observed == declared, "declared frequency differs from observed times")
     return observed
 

@@ -1,400 +1,53 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""What `gf serve` serves: one catalog model or one locked prediction package."""
+"""What `gf serve` serves: a catalog model or a locked tabular package, described as gf-server reads it."""
 
-import threading
-import time
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any
 
-import pyarrow as pa
-
-from generalforecast.contracts import ContextVersion, PredictionResult
-from generalforecast.deployments.boundary import JsonObject, Scope
-from generalforecast.deployments.catalog import CatalogService, quantile_levels
-from generalforecast.deployments.contracts import ServiceError, fields, require
-from generalforecast.deployments.interfaces import InferenceRequest
-from generalforecast.deployments.package_runtime import (
-    PackageExecutor,
-    PreparedPackage,
-)
-from generalforecast.deployments.package_runtime.requests import (
-    bind_request,
-    one_shot_lock,
-    prediction,
-    request_table,
-)
-from generalforecast.deployments.package_runtime.validation import (
-    MAX_QUERY_ROWS,
-    admit,
-)
+from generalforecast.deployments.boundary import Scope
+from generalforecast.deployments.catalog import CatalogService, ServingSurface
+from generalforecast.deployments.contracts import ServiceError, require
+from generalforecast.deployments.package_runtime.validation import admit
+from generalforecast.models.artifacts import ArtifactError, checkpoint
 from generalforecast.models.catalog import ModelRef, ModelRefError, parse
-from generalforecast.models.outputs import DEFAULT_QUANTILES, class_key
+from generalforecast.models.outputs import DEFAULT_QUANTILES
 from generalforecast.packages import Package, PackageLock, PythonLock
 from generalforecast.packages.files import parse_yaml
 from generalforecast.packages.models import describe
+from generalforecast.packages.schema import declared_seconds
 from generalforecast.packages.validation import PackageError, ensure
+from generalforecast.tabular import arrow_bytes
 
-MAX_CONTEXT_ROWS = 100_000
-
-
-class Served(Protocol):
-    """One loaded model behind the Models API routes."""
-
-    name: str
-
-    def warm(self) -> None:
-        """Loads verified weights and bound context once, before readiness."""
-        ...
-
-    def describe(self, scope: Scope) -> JsonObject:
-        """The `GET models/{name}` result."""
-        ...
-
-    def infer(self, scope: Scope, payload: JsonObject) -> JsonObject:
-        """The `POST models/{name}/infer` result."""
-        ...
-
-    def predict(self, scope: Scope, payload: JsonObject) -> JsonObject:
-        """The `POST predictions` result."""
-        ...
+LOCK_BYTES = 1_048_576
 
 
-def _not_served() -> ServiceError:
-    return ServiceError("ModelNotFound", "model is not served here", 404)
+def served(
+    target: str, directory: Path, *, allow_downloads: bool = True
+) -> dict[str, Any]:
+    """The served model's entry in gf-server's models file, with its weights verified.
 
+    The target is a package directory, a `gf.lock` file or a catalog model
+    reference. A snapshot package's context rows go to `directory`, where
+    gf-server binds them once into a durable table; a request-context
+    package binds each request's rows into an ephemeral table.
 
-class CatalogModel:
-    """A curated catalog reference, served by the hosted Models API's own port.
-
-    The operator runs it, so it also serves pinned models whose license
-    forbids hosting them on General Forecast infrastructure.
-    """
-
-    def __init__(self, ref: ModelRef, *, allow_downloads: bool) -> None:
-        """Rejects references a self-hosted Models API would not serve."""
-        self.ref = ref
-        self.name = ref.entry.name
-        self.catalog = CatalogService(
-            allow_downloads=allow_downloads, surface="self-hosted"
-        )
-        self.executor = PackageExecutor(allow_downloads=allow_downloads)
-        self.allow_downloads = allow_downloads
-        self.catalog.get(Scope("local", "load"), str(ref))
-
-    def _admitted(self, model: object) -> None:
-        try:
-            ref = parse(model) if type(model) is str else None
-        except ModelRefError:
-            ref = None
-        if ref != self.ref:
-            raise _not_served()
-
-    def warm(self) -> None:
-        """Loads the pinned weights the request paths use, through their caches."""
-        from generalforecast.deployments import catalog_forecast
-        from generalforecast.models import registry
-        from generalforecast.models.artifacts import ArtifactError
-
-        if not self.ref.entry.capability.tabular:
-            catalog_forecast.model(
-                self.ref, surface="self-hosted", allow_downloads=self.allow_downloads
-            )
-            return
-        try:
-            registry.load_ref(
-                self.ref, surface="self-hosted", allow_downloads=self.allow_downloads
-            )
-        except ArtifactError as error:
-            raise ServiceError(error.code, str(error), 503) from None
-
-    def describe(self, scope: Scope) -> JsonObject:
-        """The hosted catalog description of exactly this reference."""
-        return self.catalog.get(scope, str(self.ref))
-
-    def infer(self, scope: Scope, payload: JsonObject) -> JsonObject:
-        """The hosted `CatalogService.infer`, limited to the served reference."""
-        self._admitted(payload.get("model"))
-        return dict(self.catalog.infer(scope, cast(InferenceRequest, payload)))
-
-    def predict(self, scope: Scope, payload: JsonObject) -> JsonObject:
-        """The hosted one-shot `/predictions`, limited to the served reference."""
-        self._admitted(payload.get("model"))
-        if not self.ref.entry.gates.allows("package", variant=self.ref.variant):
-            if not self.ref.entry.capability.tabular:
-                raise ServiceError(
-                    "UnsupportedCapability",
-                    f"packages cannot lock {self.name}; POST models/{self.name}/infer",
-                    422,
-                )
-            return self._predict_raw(scope, payload)
-        lock, context = one_shot_lock(payload)
-        pin = lock.model
-        if (pin.name, pin.codes, pin.estimators) != (
-            self.ref.name,
-            self.ref.codes,
-            self.ref.estimators,
-        ):
-            raise _not_served()
-        prepared = self.executor.prepare(lock, None)
-        table = prepared.predict(
-            request_table(payload["queries"], lock, max_rows=MAX_QUERY_ROWS),
-            context=context,
-        )
-        return prediction(table, lock, context.num_rows)
-
-    def _predict_raw(self, scope: Scope, payload: JsonObject) -> JsonObject:
-        """`/predictions` for a model packages cannot lock, through raw inference.
-
-        Only this operator's server reaches here; hosted `/predictions` keeps
-        compiling a package lock and so keeps refusing local-only models.
-        """
-        fields(
-            payload,
-            {"model", "task", "target", "features", "context", "queries", "options"},
-        )
-        options = fields(payload["options"], set(), {"id", "quantiles", "outputs"})
-        task, target, features = payload["task"], payload["target"], payload["features"]
-        rows, queries = payload["context"], payload["queries"]
-        require(type(rows) is list and type(queries) is list, "rows must be lists")
-        require(
-            all(type(row) is dict for row in [*rows, *queries]),
-            "rows must be objects",
-        )
-        require(type(features) is list, "features must be a list")
-        pin = describe(str(self.ref))
-        outputs = options.get("outputs") or (
-            ["label", "probabilities"] if task == "classification" else ["value"]
-        )
-        require(
-            type(outputs) is list
-            and len(set(outputs)) == len(outputs)
-            and set(outputs) <= set(pin.outputs),
-            "model does not support requested outputs",
-        )
-        levels = options.get("quantiles")
-        require(
-            levels is None or "quantiles" in outputs,
-            "quantiles require the quantiles output",
-        )
-        request: JsonObject = {
-            "model": payload["model"],
-            "task": task,
-            "target": target,
-            "features": features,
-            "context": [
-                {
-                    "key": str(index),
-                    "features": {feature: row.get(feature) for feature in features},
-                    "label": row[target],
-                }
-                for index, row in enumerate(rows)
-                if row.get(target) is not None
-            ],
-            "queries": [
-                {
-                    "key": str(index),
-                    "features": {feature: row.get(feature) for feature in features},
-                }
-                for index, row in enumerate(queries)
-            ],
-            "options": {},
-        }
-        selected = quantile_levels(
-            list(DEFAULT_QUANTILES) if levels is None else levels
-        )
-        if task == "regression":
-            request["options"] = {"quantiles": sorted({*selected, 0.5})}
-        result = self.catalog.infer(scope, cast(InferenceRequest, request))
-        scored = {output["key"]: output for output in result["outputs"]}
-        scored = [scored[str(index)] for index in range(len(queries))]
-        columns: dict[str, list] = {}
-        if "id" in options and all(options["id"] in row for row in queries):
-            columns[options["id"]] = [row[options["id"]] for row in queries]
-        if task == "classification":
-            classes = result["context_provenance"]["classes"]
-            values = {
-                "label": [
-                    max(
-                        classes,
-                        key=lambda label, p=output["probabilities"]: p[
-                            class_key(label)
-                        ],
-                    )
-                    for output in scored
-                ],
-                "probabilities": [output["probabilities"] for output in scored],
-            }
-        else:
-            values = {
-                "value": [output["quantiles"]["0.5"] for output in scored],
-                "quantiles": [
-                    {str(level): output["quantiles"][str(level)] for level in selected}
-                    for output in scored
-                ],
-            }
-        for output in outputs:
-            columns[output] = values[output]
-        used = result["context_provenance"]["usable_labeled_rows"]
-        return PredictionResult(
-            pa.table(columns),
-            pin.resolved,
-            task,
-            ContextVersion("request", None, rows=used, as_of=time.time()),
-        ).to_dict()
-
-
-class PackageModel:
-    """A locked catalog package; its context is bound once and shared read-only."""
-
-    def __init__(
-        self, lock: PackageLock, context: pa.Table | None, *, allow_downloads: bool
-    ) -> None:
-        """Admits the lock now; weights and context load in `warm`."""
-        self.lock = admit(lock)
-        mode = self.lock.spec.context.mode
-        ensure(
-            mode != "dataset",
-            "dataset context needs the hosted data plane; lock a snapshot or "
-            "request-context package to serve it",
-            "UnsupportedCapability",
-        )
-        ensure(
-            (context is None) == (mode == "request"),
-            "snapshot packages are served from their package directory",
-            "ContextRequired",
-        )
-        self.name = self.lock.spec.name
-        self.context = context
-        self.executor = PackageExecutor(allow_downloads=allow_downloads)
-        self.prepared: PreparedPackage | None = None
-        self.schema_free = mode == "request" and not self.lock.schema.columns
-        self._warming = threading.Lock()
-
-    def warm(self) -> None:
-        """Loads weights and warms bound context exactly once."""
-        with self._warming:
-            if self.prepared is None:
-                self.prepared = self.executor.prepare(self.lock, self.context)
-
-    def describe(self, scope: Scope) -> JsonObject:
-        """Locked identity, roles and outputs, without context or weights."""
-        lock = self.lock
-        return {
-            "name": self.name,
-            "kind": "package",
-            "model": lock.model.resolved,
-            "task": lock.task,
-            "target": lock.spec.target,
-            "features": list(lock.schema.features),
-            "outputs": list(lock.outputs),
-            "context": lock.spec.context.mode,
-            "context_rows": None
-            if self.prepared is None
-            else self.prepared.context_rows,
-            "package_digest": lock.package_digest,
-        }
-
-    def infer(self, scope: Scope, payload: JsonObject) -> JsonObject:
-        """Packages answer `/predictions`, which keeps their locked outputs."""
-        raise ServiceError(
-            "UnsupportedCapability",
-            "packages serve POST predictions with the package name as model",
-            422,
-        )
-
-    def predict(self, scope: Scope, payload: JsonObject) -> JsonObject:
-        """The `/predictions` body, checked against the lock instead of compiled."""
-        fields(
-            payload,
-            {"model", "task", "target", "features", "context", "queries", "options"},
-        )
-        if payload["model"] != self.name:
-            raise _not_served()
-        lock = self.lock
-        if payload["task"] != lock.task:
-            raise ServiceError(
-                "UnsupportedTask", "package does not serve this task", 422
-            )
-        require(payload["options"] == {}, "package options are compiled into its lock")
-        require(type(payload["features"]) is list, "features must be a list")
-        require(
-            type(payload["queries"]) is list
-            and 0 < len(payload["queries"]) <= MAX_QUERY_ROWS,
-            "queries must contain 1..10000 rows",
-        )
-        if not self.schema_free:
-            require(payload["target"] == lock.spec.target, "target differs from lock")
-            require(
-                payload["features"] == list(lock.schema.features),
-                "features differ from lock",
-            )
-        prepared = self.prepared
-        if prepared is None:
-            raise ServiceError("NotReady", "model is loading", 503)
-        if lock.spec.context.mode != "request":
-            require(payload["context"] == [], "bound context cannot be overridden")
-            table = prepared.predict(
-                request_table(payload["queries"], lock, max_rows=MAX_QUERY_ROWS)
-            )
-            return prediction(
-                table,
-                lock,
-                prepared.context_rows or 0,
-                source="snapshot",
-                version=lock.data_digest,
-            )
-        context = request_table(payload["context"], lock, max_rows=MAX_CONTEXT_ROWS)
-        if self.schema_free:
-            bound = bind_request(lock, payload, context)
-            prepared = self.executor.prepare(bound, None)
-            lock = bound
-        table = prepared.predict(
-            request_table(payload["queries"], lock, max_rows=MAX_QUERY_ROWS),
-            context=context,
-        )
-        return prediction(table, lock, context.num_rows)
-
-
-def load(target: str, *, allow_downloads: bool = True) -> Served:
-    """Resolves a package directory, a `gf.lock` file or a catalog model reference.
+    The operator runs the server, so it also serves pinned models whose
+    license forbids hosting them on General Forecast infrastructure. A
+    catalog model's description is the hosted catalog's, so
+    `GET models/{name}` answers the same on both.
 
     Raises:
-        PackageError: If the target is not a servable package or model.
+        PackageError: If the target is not a package or catalog model this
+            server may serve, or its weights are missing or differ from
+            their pins.
     """
     require(type(target) is str and bool(target), "serve target is required")
     path = Path(target)
     try:
-        if path.is_dir():
-            package = Package.load(path)
-            ensure(
-                package.lock is not None,
-                "gf.lock is required; run gf check first",
-                "LockRequired",
-            )
-            lock = package.compile(frozen=True)
-            _catalog_lock(lock)
-            assert isinstance(lock, PackageLock)
-            context = None
-            if lock.spec.context.mode == "snapshot":
-                context = package.snapshot_table()
-            return PackageModel(lock, context, allow_downloads=allow_downloads)
-        if path.is_file():
-            if (path.parent / "gf.yaml").is_file():
-                return load(str(path.parent), allow_downloads=allow_downloads)
-            raw = path.read_bytes()
-            ensure(len(raw) <= 1_048_576, "lock file is too large")
-            lock = PackageLock.from_dict(parse_yaml(raw))
-            _catalog_lock(lock)
-            assert isinstance(lock, PackageLock)
-            ensure(
-                lock.spec.context.mode == "request",
-                "a lone lock file serves only request-context packages; "
-                "serve the package directory instead",
-                "ContextRequired",
-            )
-            return PackageModel(lock, None, allow_downloads=allow_downloads)
+        if path.is_dir() or path.is_file():
+            return _package(path, directory, allow_downloads=allow_downloads)
         try:
             ref = parse(target)
         except ModelRefError as error:
@@ -402,11 +55,157 @@ def load(target: str, *, allow_downloads: bool = True) -> Served:
                 "ModelNotFound",
                 f"{target!r} is not a package directory, lock file or catalog model",
             ) from error
-        return CatalogModel(ref, allow_downloads=allow_downloads)
     except ServiceError as error:
         raise PackageError(error.code, error.message) from None
     except OSError as error:
         raise PackageError("MissingFile", f"cannot read {target!r}") from error
+    return catalog_model(ref, surface="self-hosted", allow_downloads=allow_downloads)
+
+
+def catalog_model(
+    ref: ModelRef, *, surface: ServingSurface, allow_downloads: bool
+) -> dict[str, Any]:
+    """A catalog model's entry in gf-server's models file, its weights verified.
+
+    `gf serve` passes the `self-hosted` surface, where the operator may serve
+    pinned models whose license forbids hosting them on General Forecast
+    infrastructure; the hosted pool passes `remote`, which keeps those out.
+
+    Raises:
+        PackageError: If the surface may not serve the model, or its weights
+            are missing or differ from their pins.
+    """
+    try:
+        description = CatalogService(surface=surface).get(
+            Scope("local", "load"), str(ref)
+        )
+    except ServiceError as error:
+        raise PackageError(error.code, error.message) from None
+    _verified(ref, surface=surface, allow_downloads=allow_downloads)
+    pin = describe(str(ref))
+    return {
+        "name": ref.entry.name,
+        "reference": str(ref),
+        "worker": ref.entry.name,
+        "resolved": pin.resolved,
+        "outputs": list(pin.outputs),
+        "description": description,
+        "license_source": ref.entry.artifact.license_source,
+    }
+
+
+def _verified(
+    ref: ModelRef, *, surface: ServingSurface = "self-hosted", allow_downloads: bool
+) -> None:
+    try:
+        checkpoint(ref.entry, surface=surface, allow_downloads=allow_downloads)
+    except ArtifactError as error:
+        raise PackageError(error.code, str(error)) from None
+
+
+def _package(path: Path, directory: Path, *, allow_downloads: bool) -> dict[str, Any]:
+    """A locked package's entry, with a snapshot's selected rows written out.
+
+    The entry holds the package's identity and its lock's schema, which
+    gf-server binds rows with through `gf_core::package`.
+    """
+    context = None
+    if path.is_dir():
+        package = Package.load(path)
+        ensure(
+            package.lock is not None,
+            "gf.lock is required; run gf check first",
+            "LockRequired",
+        )
+        lock = package.compile(frozen=True)
+        _catalog_lock(lock)
+        assert isinstance(lock, PackageLock)
+        if lock.spec.context.mode == "snapshot":
+            context = package.context_table()
+    elif (path.parent / "gf.yaml").is_file():
+        return _package(path.parent, directory, allow_downloads=allow_downloads)
+    else:
+        raw = path.read_bytes()
+        ensure(len(raw) <= LOCK_BYTES, "lock file is too large")
+        lock = PackageLock.from_dict(parse_yaml(raw))
+        _catalog_lock(lock)
+        assert isinstance(lock, PackageLock)
+        ensure(
+            lock.spec.context.mode == "request",
+            "a lone lock file serves only request-context packages; "
+            "serve the package directory instead",
+            "ContextRequired",
+        )
+    lock = admit(lock)
+    mode = lock.spec.context.mode
+    ensure(
+        mode != "dataset",
+        "dataset context needs the hosted data plane; lock a snapshot or "
+        "request-context package to serve it",
+        "UnsupportedCapability",
+    )
+    ref = parse(lock.model.resolved)
+    _verified(ref, allow_downloads=allow_downloads)
+    snapshot = None
+    if context is not None:
+        snapshot = directory / "context.arrow"
+        snapshot.write_bytes(arrow_bytes(context))
+    return served_entry(lock, snapshot)
+
+
+def served_entry(lock: PackageLock, snapshot: Path | None = None) -> dict[str, Any]:
+    """A locked package as gf-server serves it, from `gf serve` or a deployment.
+
+    `snapshot` names the file a snapshot's rows were written to, if any were.
+    """
+    ref = parse(lock.model.resolved)
+    mode = lock.spec.context.mode
+    regression = lock.task in ("regression", "forecast")
+    return {
+        "name": lock.spec.name,
+        "reference": str(ref),
+        "worker": ref.entry.name,
+        "resolved": lock.model.resolved,
+        "outputs": list(lock.outputs),
+        "license_source": ref.entry.artifact.license_source,
+        "description": {
+            "name": lock.spec.name,
+            "kind": "package",
+            "model": lock.model.resolved,
+            "task": lock.task,
+            "target": lock.spec.target,
+            "features": list(lock.schema.features),
+            "outputs": list(lock.outputs),
+            "context": mode,
+            "context_rows": lock.context_rows if mode == "snapshot" else None,
+            "package_digest": lock.package_digest,
+        },
+        "package": {
+            "schema": lock.schema.to_dict(),
+            "task": lock.task,
+            "target": lock.spec.target,
+            "features": list(lock.schema.features),
+            "id": lock.spec.id,
+            "context": mode,
+            "quantiles": list(lock.spec.quantiles or DEFAULT_QUANTILES)
+            if regression
+            else [],
+            "data_digest": lock.data_digest,
+            "package_digest": lock.package_digest,
+            "snapshot": None if snapshot is None else str(snapshot),
+            "forecast": None
+            if lock.task != "forecast"
+            else {
+                "series": list(lock.spec.series),
+                "time": lock.spec.time,
+                "horizon": lock.spec.horizon,
+                "past_inputs": list(lock.spec.past_inputs),
+                "future_inputs": list(lock.spec.future_inputs),
+                "frequency": lock.schema.frequency,
+                "declared": declared_seconds(lock.spec.frequency),
+            },
+        },
+    }
 
 
 def _catalog_lock(lock: Any) -> None:

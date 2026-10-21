@@ -4,7 +4,6 @@
 """Verified in-process package execution, without HTTP, persistence or identity."""
 
 from dataclasses import dataclass
-from typing import Any, cast
 
 import pyarrow as pa
 
@@ -17,40 +16,33 @@ from generalforecast.deployments.package_runtime.validation import (
     context_table,
     query_table,
 )
+from generalforecast.engine import LocalEngine
+from generalforecast.models.catalog import ModelRef
 from generalforecast.packages import PackageLock
 from generalforecast.packages.python_lock import PythonLock
 from generalforecast.packages.schema import TableSchema
 from generalforecast.packages.validation import PackageError, ensure
 
 
-def _load(lock: PackageLock, allow_downloads: bool) -> Any:
-    """The locked model and variant, verified against its pins, for packages."""
-    from generalforecast.models import registry
+def _load(lock: PackageLock, allow_downloads: bool) -> tuple[LocalEngine, ModelRef]:
+    """The process engine and the locked model, verified against its pins, for packages."""
+    from generalforecast import engine as engines
     from generalforecast.models.artifacts import ArtifactError
-    from generalforecast.models.catalog import ModelRef, ModelRefError
+    from generalforecast.models.catalog import ModelRefError
 
     pin = lock.model
     ref = ModelRef(pin.name, pin.codes, pin.estimators, pin.digest)
+    engine = engines.local("package", allow_downloads)
     try:
-        model = registry.load_ref(
-            ref, surface="package", allow_downloads=allow_downloads
-        )
+        engine.load(ref)
     except ArtifactError as error:
         raise ServiceError(error.code, str(error), 503) from None
     except ModelRefError as error:
         raise PackageError(error.code, str(error)) from None
-    if lock.task == "forecast":
-        functions, parameters = model
-        ensure(
-            tuple(cast(Any, functions.properties(parameters)).quantiles)
-            == ref.entry.capability.quantiles,
-            "pinned model capabilities changed",
-            "ModelMismatch",
-        )
-    return model
+    return engine, ref
 
 
-def _bind(lock: PackageLock, model: Any, context: pa.Table):
+def _bind(lock: PackageLock, model: tuple[LocalEngine, ModelRef], context: pa.Table):
     table, schema = context_table(lock, context)
     engine = ForecastContext if lock.task == "forecast" else TabularContext
     rows = table.num_rows
@@ -73,7 +65,7 @@ class PreparedPackage(ResourceFree):
     """
 
     lock: PackageLock
-    _model: Any
+    _model: tuple[LocalEngine, ModelRef]
     _context: TabularContext | ForecastContext | None
     _schema: TableSchema
     context_rows: int | None

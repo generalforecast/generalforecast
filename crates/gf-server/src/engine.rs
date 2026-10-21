@@ -1,0 +1,491 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
+//! The engine: a server's shards, and how a validated request reaches one.
+//!
+//! A request's context becomes an ephemeral table named for its
+//! fingerprint, on the shard the fingerprint routes to, so a repeated
+//! context finds its table and cache; a snapshot package's rows bind once
+//! into a durable table. The Models API and the in-process `_core` engine
+//! both answer through it.
+
+use std::collections::HashMap;
+use std::num::NonZeroUsize;
+use std::sync::Arc;
+use std::time::Duration;
+
+use gf_core::columns;
+use gf_core::forecasting::{KNOWN, TARGET};
+use gf_core::node::Targets;
+use gf_core::package::{self, Encoder};
+use gf_core::request::{self, AlignedGroup, Forecast, Label, Tabular};
+use gf_core::route;
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::http::ApiError;
+use crate::name::TableName;
+use crate::packages::ServedPackage;
+use crate::routes::{Busy, Routes};
+use crate::service::{Charge, RequestBudget};
+use crate::shard::{Asked, Command, Fence, Incoming, Inferred, RequestContext, ServerError, Write};
+use crate::wal::{Rows, TableDefinition, Terms};
+
+/// A snapshot package's rows, bound once into their durable table.
+pub struct Bound {
+    pub table: TableName,
+    /// What names the table's shard.
+    pub fingerprint: [u8; 32],
+    /// The binding's encoder, which codes queries' words as the rows' were.
+    pub encoder: Encoder,
+    pub classes: Vec<Label>,
+    pub rows: usize,
+    pub levels: Option<Vec<f64>>,
+}
+
+/// The shards, once their workers are up, and the bounds a call answers within.
+pub struct Engine {
+    shards: Vec<mpsc::Sender<Command>>,
+    routes: Arc<Routes>,
+    budget: RequestBudget,
+    timeout: Duration,
+}
+
+impl Engine {
+    /// # Panics
+    ///
+    /// If `routes` routes over another count of shards.
+    #[must_use]
+    pub fn new(
+        shards: Vec<mpsc::Sender<Command>>,
+        routes: Arc<Routes>,
+        budget: RequestBudget,
+        timeout: Duration,
+    ) -> Self {
+        assert_eq!(routes.shards(), shards.len(), "routes over the shards");
+        Self {
+            shards,
+            routes,
+            budget,
+            timeout,
+        }
+    }
+
+    /// Predicts a validated tabular request from its context's ephemeral
+    /// table, on the shard its fingerprint names.
+    pub async fn tabular(
+        &self,
+        model: &str,
+        request: &Tabular,
+        charge: Charge,
+    ) -> Result<Inferred, ApiError> {
+        let context = rows_context(
+            model,
+            &request.fingerprint,
+            request.features.len(),
+            request.classes.len(),
+            request.context.clone(),
+            request.targets.clone(),
+            request.usable_rows(),
+        )?;
+        let answered = self
+            .ask(
+                context,
+                Asked::Rows(request.queries.clone()),
+                &request.fingerprint,
+            )
+            .await;
+        drop(charge);
+        // A context the model cannot fit is refused by its class count, as
+        // the catalog's engine refuses it.
+        answered.map_err(|error| {
+            if error.code == "InvalidContext" {
+                ApiError::new("UnsupportedClassCount", error.message, 422)
+            } else {
+                error
+            }
+        })
+    }
+
+    /// Forecasts the members of one aligned group from its ephemeral table,
+    /// named for the group's fingerprint and laid out as the local engine
+    /// lays it: each target row a series on periods from zero, every other
+    /// row a covariate column, and known covariates' future after the origin.
+    pub async fn forecast(
+        &self,
+        model: &str,
+        group: &AlignedGroup,
+        fingerprint: &[u8; 32],
+        members: &[usize],
+        horizon: usize,
+    ) -> Result<Inferred, ApiError> {
+        let failed = || ApiError::new("InternalError", "request failed safely", 500);
+        let horizon = NonZeroUsize::new(horizon).ok_or_else(failed)?;
+        let targets: Vec<usize> = (0..group.rows)
+            .filter(|&row| group.roles[row] == TARGET)
+            .collect();
+        let covariates: Vec<usize> = (0..group.rows)
+            .filter(|&row| group.roles[row] != TARGET)
+            .collect();
+        let names: Vec<String> = (0..covariates.len())
+            .map(|index| format!("c{index}"))
+            .collect();
+        let known: Vec<&String> = names
+            .iter()
+            .zip(&covariates)
+            .filter(|&(_, &row)| group.roles[row] == KNOWN)
+            .map(|(name, _)| name)
+            .collect();
+        let span = group.steps + if known.is_empty() { 0 } else { group.horizon };
+        // Unobserved values are NaN; past the origin only known covariates have any.
+        let value = |row: usize, time: usize| -> f32 {
+            if time < group.steps {
+                let at = row * group.steps + time;
+                if group.observed[at] {
+                    group.values[at]
+                } else {
+                    f32::NAN
+                }
+            } else if group.roles[row] == KNOWN {
+                group.future[row * group.horizon + time - group.steps]
+            } else {
+                f32::NAN
+            }
+        };
+        let definition: TableDefinition = serde_json::from_value(json!({
+            "name": format!("ctx-{}", request::hex(fingerprint)),
+            "model": model,
+            "columns": names
+                .iter()
+                .map(|name| json!({"name": name, "kind": "numeric"}))
+                .collect::<Vec<_>>(),
+            "classes": 0,
+            "durability": "ephemeral",
+            "series": {
+                "series": "series",
+                "time": "time",
+                "target": "target",
+                "step": 1,
+                "known": known,
+                "group": {"kind": "given", "size": targets.len()},
+                "horizon": horizon.get(),
+            },
+            "times": "integer",
+        }))
+        .map_err(|_| failed())?;
+        let rows = targets.len() * span;
+        let mut context = RequestContext {
+            fingerprint: *fingerprint,
+            definition,
+            keys: Vec::with_capacity(rows),
+            features: Vec::with_capacity(rows * covariates.len()),
+            targets: Targets::Values(Vec::with_capacity(rows)),
+            times: Some(Vec::with_capacity(rows)),
+        };
+        let mut values = Vec::with_capacity(rows);
+        for (series, &target) in targets.iter().enumerate() {
+            for time in 0..span {
+                // A series row key holds the series in its high half and the time in its low.
+                context.keys.push(((series as u128) << 64) | time as u128);
+                context
+                    .features
+                    .extend(covariates.iter().map(|&row| value(row, time)));
+                values.push(value(target, time));
+                if let Some(times) = context.times.as_mut() {
+                    times.push(Some(time as i64));
+                }
+            }
+        }
+        context.targets = Targets::Values(values);
+        let count = members.len();
+        let asked = Asked::Forecast {
+            series: members.iter().map(|&member| member as u64).collect(),
+            before: Some(vec![group.steps as i64; count]),
+            horizon,
+            groups: Some(vec![(0..targets.len() as u64).collect(); count]),
+        };
+        self.ask(context, asked, fingerprint).await
+    }
+
+    /// Asks the shard `Routes` gives a context for an answer against it.
+    pub async fn ask(
+        &self,
+        context: RequestContext,
+        asked: Asked,
+        fingerprint: &[u8; 32],
+    ) -> Result<Inferred, ApiError> {
+        let shard = self.routes.context(fingerprint);
+        let (reply, answer) = oneshot::channel();
+        let command = Command::Infer {
+            context: Box::new(context),
+            asked,
+            trace: String::new(),
+            reply,
+        };
+        self.wait(shard, command, answer).await
+    }
+
+    /// Predicts encoded queries from a snapshot package's durable table.
+    pub async fn predicted(&self, bound: &Bound, features: Vec<f32>) -> Result<Inferred, ApiError> {
+        self.predict_bound(
+            &bound.table,
+            &bound.fingerprint,
+            features,
+            bound.levels.clone(),
+        )
+        .await
+    }
+
+    /// Predicts encoded queries from a durable table `bind` wrote, on the
+    /// shard its fingerprint names.
+    pub async fn predict_bound(
+        &self,
+        table: &TableName,
+        fingerprint: &[u8; 32],
+        features: Vec<f32>,
+        levels: Option<Vec<f64>>,
+    ) -> Result<Inferred, ApiError> {
+        let shard = self.durable(fingerprint);
+        let (reply, answer) = oneshot::channel();
+        let command = Command::Predict {
+            table: table.clone(),
+            features,
+            strings: Vec::new(),
+            before: None,
+            given: None,
+            trace: String::new(),
+            reply,
+        };
+        let predictions = self.wait(self.routes.shard(shard), command, answer).await?;
+        Ok(Inferred {
+            predictions,
+            levels,
+        })
+    }
+
+    /// Binds a snapshot package's rows through `gf_core::package` and
+    /// writes them, once, into a durable table named for the package's
+    /// digest, which every query of the package then reads.
+    pub async fn bind_snapshot(
+        &self,
+        model: &str,
+        package: &ServedPackage,
+    ) -> Result<Bound, ApiError> {
+        let failed = || ApiError::new("InternalError", "request failed safely", 500);
+        let rows = crate::http::snapshot_rows(package)?;
+        let target = package.target.as_deref().ok_or_else(|| {
+            ApiError::new("InvalidPackage", "a snapshot package names its target", 422)
+        })?;
+        let context = package::bind(&package.schema, package.task()?, target, &rows)?;
+        let fingerprint: [u8; 32] = Sha256::digest(package.package_digest.as_bytes()).into();
+        let table =
+            TableName::new(format!("pkg-{}", request::hex(&fingerprint))).map_err(|_| failed())?;
+        let levels = self
+            .bind(
+                model,
+                &table,
+                &fingerprint,
+                context.encoder.width(),
+                context.classes.len(),
+                context.features,
+                context.targets,
+                context.rows,
+            )
+            .await?;
+        Ok(Bound {
+            table,
+            fingerprint,
+            encoder: context.encoder,
+            classes: context.classes,
+            rows: context.rows,
+            levels,
+        })
+    }
+
+    /// Writes labeled rows, once, into a durable table on the shard their
+    /// fingerprint names; answers the table's quantile levels, if it
+    /// predicts values.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn bind(
+        &self,
+        model: &str,
+        table: &TableName,
+        fingerprint: &[u8; 32],
+        width: usize,
+        classes: usize,
+        features: Vec<f32>,
+        targets: Targets,
+        rows: usize,
+    ) -> Result<Option<Vec<f64>>, ApiError> {
+        let failed = || ApiError::new("InternalError", "request failed safely", 500);
+        let definition: TableDefinition = serde_json::from_value(json!({
+            "name": table.as_str(),
+            "model": model,
+            "columns": columns::numeric(width),
+            "classes": classes,
+        }))
+        .map_err(|_| failed())?;
+        let shard = self.durable(fingerprint);
+        let (reply, answer) = oneshot::channel();
+        let create = Command::Create {
+            definition,
+            terms: Terms::default(),
+            reply,
+        };
+        let levels = self.wait(self.routes.shard(shard), create, answer).await?;
+        let written = Rows {
+            keys: (0..rows as u128).collect(),
+            features,
+            targets,
+            times: None,
+            id: None,
+            words: Vec::new(),
+            writes: Vec::new(),
+            layout: None,
+            table: None,
+        };
+        let (reply, answer) = oneshot::channel();
+        let write = Command::Write {
+            table: table.clone(),
+            write: Write::Insert(Incoming::from(written)),
+            fence: Fence {
+                lease: None,
+                term: None,
+            },
+            charge: self.budget.charge(),
+            reply,
+        };
+        self.wait(self.routes.shard(shard), write, answer).await?;
+        Ok(levels)
+    }
+
+    /// Forecasts every query of a request: each aligned group from the
+    /// ephemeral table its fingerprint names, the groups at once; answers
+    /// each group's query indices and forecasts.
+    pub async fn forecast_request(
+        &self,
+        model: &str,
+        request: &Forecast,
+    ) -> Result<Vec<(Vec<usize>, Inferred)>, ApiError> {
+        let mut groups: Vec<(&[u8; 32], Vec<usize>)> = Vec::new();
+        let mut held: HashMap<&[u8; 32], usize> = HashMap::new();
+        for (index, query) in request.queries.iter().enumerate() {
+            let at = *held.entry(&query.fingerprint).or_insert_with(|| {
+                groups.push((&query.fingerprint, Vec::new()));
+                groups.len() - 1
+            });
+            groups[at].1.push(index);
+        }
+        let answers = futures::future::try_join_all(groups.iter().map(|(fingerprint, indices)| {
+            let members: Vec<usize> = indices
+                .iter()
+                .map(|&index| request.queries[index].member)
+                .collect();
+            let group = &request.queries[indices[0]].group;
+            async move {
+                self.forecast(model, group, fingerprint, &members, request.horizon)
+                    .await
+            }
+        }))
+        .await?;
+        Ok(groups
+            .into_iter()
+            .map(|(_, indices)| indices)
+            .zip(answers)
+            .collect())
+    }
+
+    /// Drops a durable table `bind` wrote.
+    pub async fn unbind(&self, table: &TableName, fingerprint: &[u8; 32]) -> Result<(), ApiError> {
+        let (reply, answer) = oneshot::channel();
+        let release = Command::Release {
+            table: table.clone(),
+            keep: false,
+            reply,
+        };
+        let shard = self.routes.shard(self.durable(fingerprint));
+        self.wait(shard, release, answer).await
+    }
+
+    /// Has every shard's worker load a model under `name` from `spec`, as a
+    /// worker started with it in `[workers.models]` would; a name already
+    /// served is left as it is.
+    pub async fn add_model(&self, name: &str, spec: &str) -> Result<(), ApiError> {
+        futures::future::try_join_all((0..self.shards.len()).map(|shard| async move {
+            let (reply, answer) = oneshot::channel();
+            let command = Command::AddModel {
+                name: name.to_string(),
+                spec: spec.to_string(),
+                reply,
+            };
+            self.wait(self.routes.shard(shard), command, answer).await
+        }))
+        .await?;
+        Ok(())
+    }
+
+    /// A share of the request budget, held while a call's buffers are.
+    #[must_use]
+    pub fn charge(&self) -> Charge {
+        self.budget.charge()
+    }
+
+    /// The shard a durable table's fingerprint names, by `route::shard_of`:
+    /// its table stays there, however busy.
+    fn durable(&self, fingerprint: &[u8; 32]) -> usize {
+        route::shard_of(fingerprint, self.shards.len())
+    }
+
+    /// Sends a shard a command and waits, within the request timeout, for
+    /// its answer, counted in the shard's load until then.
+    async fn wait<T>(
+        &self,
+        busy: Busy<'_>,
+        command: Command,
+        answer: oneshot::Receiver<Result<T, ServerError>>,
+    ) -> Result<T, ApiError> {
+        let stopped = || {
+            ApiError::new(
+                "ModelUnavailable",
+                "the model is restarting; retry shortly",
+                503,
+            )
+        };
+        let shard = &self.shards[busy.shard];
+        shard.send(command).await.map_err(|_| stopped())?;
+        let answered = tokio::time::timeout(self.timeout, answer)
+            .await
+            .map_err(|_| ApiError::new("RequestTimeout", "inference timed out", 504))?
+            .map_err(|_| stopped())?;
+        Ok(answered?)
+    }
+}
+
+/// A tabular context in the ephemeral table its fingerprint names.
+pub fn rows_context(
+    model: &str,
+    fingerprint: &[u8; 32],
+    width: usize,
+    classes: usize,
+    features: Vec<f32>,
+    targets: Targets,
+    rows: usize,
+) -> Result<RequestContext, ApiError> {
+    let definition: TableDefinition = serde_json::from_value(json!({
+        "name": format!("ctx-{}", request::hex(fingerprint)),
+        "model": model,
+        "columns": columns::numeric(width),
+        "classes": classes,
+        "durability": "ephemeral",
+    }))
+    .map_err(|_| ApiError::new("InternalError", "request failed safely", 500))?;
+    Ok(RequestContext {
+        fingerprint: *fingerprint,
+        definition,
+        keys: (0..rows as u128).collect(),
+        features,
+        targets,
+        times: None,
+    })
+}
