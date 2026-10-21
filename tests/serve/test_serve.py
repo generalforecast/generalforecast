@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """`gf serve`, which runs gf-server's Models API over a catalog model or a locked package."""
 
 import json

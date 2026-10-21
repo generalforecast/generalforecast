@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Chronos-2 checkpoints: converted from Amazon's repository, mirrored, then loaded.
 
 The published files are a transformers config, whose `chronos_config` holds

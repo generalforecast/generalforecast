@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """A small random Kumo Tabular, so model tests run without checkpoints."""
 
 from __future__ import annotations

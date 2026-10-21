@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Ensembles of any model: estimators that each see the table another way.
 
 Estimator 0 sees the table as it is. Each later one sees its columns in a fixed

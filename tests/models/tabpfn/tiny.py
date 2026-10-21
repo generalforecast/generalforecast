@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Small random TabPFN-3 and TabPFN-3.5 models, so tests run without checkpoints."""
 
 from __future__ import annotations

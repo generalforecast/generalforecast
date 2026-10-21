@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 import numpy as np
 
 # Where TabPFN's borders sit, as (bucket, border) for 5000 buckets; the rest

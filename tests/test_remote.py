@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The remote client against a running server: the same tables as local mode."""
 
 from __future__ import annotations

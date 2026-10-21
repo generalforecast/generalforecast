@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The Flight client, under the names server, router and CLI tests use."""
 
 from generalforecast import Column, GroupStrategy, RebuildWait, Strategy, Table, local

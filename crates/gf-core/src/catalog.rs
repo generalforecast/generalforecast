@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The model catalog as request validation reads it, and model references.
 //!
 //! `generalforecast.models.catalog` is the single source: it emits the

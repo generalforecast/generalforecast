@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Pages: groups of similar rows, the unit of retrieval, caching and invalidation.
 //!
 //! Rows are grouped per bucket (a time window, for example), so rows from

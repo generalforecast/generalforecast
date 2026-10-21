@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Predictions per second of `LocalClient` at N concurrent callers on one table.
 
 tabicl-classifier on a table of 256 labeled rows of 8 features; every call

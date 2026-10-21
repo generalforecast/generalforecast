@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The front door's upstream: every route the front does not own streams,
 //! unchanged, to the control plane listening behind it on loopback.
 //!

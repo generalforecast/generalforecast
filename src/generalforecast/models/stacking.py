@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Several estimators of one model, stored as one model's rows and caches.
 
 Row representations and outputs put estimators side by side. Caches fold the

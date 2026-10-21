@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Tables placed on a server's workers by load, and moved between them."""
 
 from __future__ import annotations

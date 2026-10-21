@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rows by timestamp, for time cutoffs and windows.
 
 use std::collections::{BTreeMap, HashMap, btree_map};

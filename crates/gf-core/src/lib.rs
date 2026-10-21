@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! generalforecast's control plane: catalog, contexts, cache directory and scheduler.
 //!
 //! This crate is plain Rust with no Python types, so it builds and tests with

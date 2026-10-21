@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Owner-private local files: no-follow reads, atomic 0600 writes and locks.
 
 Importing this module is portable. Calls fail with a typed UnsupportedOperation

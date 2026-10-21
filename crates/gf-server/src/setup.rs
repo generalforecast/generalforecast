@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! `gf-server init` and `gf-server check`: a starter configuration for one
 //! machine, and a look at everything a server needs before it starts.
 

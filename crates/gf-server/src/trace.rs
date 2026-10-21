@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! W3C trace context and logging, so one request's logs join up across the
 //! router, the node and the step its queries ran in.
 

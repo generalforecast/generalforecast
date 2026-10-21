@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """A worker process for `gf-server`: `python -m generalforecast.worker_process --socket PATH --model NAME=SPEC`.
 
 The server starts one per accelerator. The worker loads its models, connects

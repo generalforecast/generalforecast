@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The front door: every route the front does not own streams to the
 //! upstream, and none of its own ever does.
 

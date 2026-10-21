@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rows by id in blocks, in memory and spilled to disk.
 
 use std::path::PathBuf;

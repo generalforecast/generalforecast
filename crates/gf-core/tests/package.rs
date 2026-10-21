@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The package binder: a lock's schema and rows as the numbers the engine reads.
 
 use std::sync::Arc;

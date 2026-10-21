@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The `gf serve` command line: writes gf-server's configuration, then runs it.
 
 gf-server answers the Models API itself, batching concurrent requests'

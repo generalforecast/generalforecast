@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """How every surface orders classes, spells their keys and reads quantiles.
 
 The local SDK, packages and the Models API all present a model's outputs the

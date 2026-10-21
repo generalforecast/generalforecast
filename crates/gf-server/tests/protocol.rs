@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Frames between the server and its workers, and strategy specs.
 
 use gf_core::planner::{Core, CoreKind, Recency, Strategy};

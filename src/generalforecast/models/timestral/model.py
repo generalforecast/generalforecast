@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Timestral: a causal patch transformer that decodes blocks of query tokens.
 
 Each row is normalized causally per patch and embedded from its values and

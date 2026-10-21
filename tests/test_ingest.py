@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Change data capture from Debezium events on Kafka."""
 
 from __future__ import annotations

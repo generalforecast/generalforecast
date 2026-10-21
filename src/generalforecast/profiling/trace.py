@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Summarises a worker's device trace per step: `python -m generalforecast.profiling.trace DIRECTORY`.
 
 A `profile_workers` action with `trace` set has each worker write JAX's

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! generalforecast's router: places tables on nodes by rendezvous hashing, keeps their replicas, and forwards clients to them.
 
 pub mod config;

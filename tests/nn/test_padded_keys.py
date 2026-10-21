@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Attention, QASSMax and induced attention over keys padded past a true length."""
 
 from __future__ import annotations

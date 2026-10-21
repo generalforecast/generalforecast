@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Flight actions and write commands, parsed once from what a client or
 //! router sent, and the answers routers read back, for servers and routers
 //! alike.

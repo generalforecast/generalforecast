@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Which shard a request's context goes to, by one rule for gf-server's
 //! front and the in-process engine: a context a shard holds goes back to
 //! that shard, so a repeat finds its table and cache, and a new one goes to

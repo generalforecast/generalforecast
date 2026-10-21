@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Error-correcting output codes, for more classes than a classifier has slots."""
 
 from __future__ import annotations

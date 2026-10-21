@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Local mode: the node, the worker and the client API in one process."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Classification and regression with generalforecast's scikit-learn estimators.
 
 Since a tabular foundation model learns from the rows it is shown when it

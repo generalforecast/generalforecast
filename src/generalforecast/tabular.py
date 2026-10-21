@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Bounded local tabular conversion without semantic guesses or remote I/O."""
 
 import io

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The write-ahead log: every pushed change, encrypted and synced before it applies.
 //!
 //! Each table has its own log, `<table>.log`: a plain header naming the format

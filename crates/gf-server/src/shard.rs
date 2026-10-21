@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! A shard: one worker, its node, and the logs of the tables placed on it.
 //!
 //! A shard runs as one task. It takes every queued command, logging each

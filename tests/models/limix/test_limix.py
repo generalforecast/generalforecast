@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """LimiX's preprocessing, loader checks and properties."""
 
 from __future__ import annotations

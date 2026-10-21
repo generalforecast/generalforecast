@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Physical schema inspection and explicit target, feature and time contracts."""
 
 import datetime

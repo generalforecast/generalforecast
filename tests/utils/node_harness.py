@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The Python Node and Worker table client, kept to test the worker's scheduling white-box."""
 
 import datetime

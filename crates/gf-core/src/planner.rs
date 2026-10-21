@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Context strategies: which row sets to encode, and what each query decodes against.
 //!
 //! A plan lists units, each a set of rows encoded together once and cached

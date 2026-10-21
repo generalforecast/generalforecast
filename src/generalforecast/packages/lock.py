@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Versioned immutable compiler output with independently verifiable digests."""
 
 from dataclasses import dataclass, replace

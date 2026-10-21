@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """TabPFN's preprocessing, bucket quantiles and loader checks."""
 
 from __future__ import annotations

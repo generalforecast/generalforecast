@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """TabICL's preprocessing, as its own inference pipeline runs it without a normalizer.
 
 Upstream imputes missing values with column means, standardizes with a small

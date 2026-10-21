@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """`gf` against a standalone model server: --base-url, --key-env, typed errors."""
 
 import json

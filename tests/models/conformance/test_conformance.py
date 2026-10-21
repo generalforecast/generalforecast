@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Contract checks every model must pass, run on small random instances.
 
 These are the guarantees the engine relies on: what each call depends on, that

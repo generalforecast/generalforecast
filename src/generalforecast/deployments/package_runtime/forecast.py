@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Aligned grouped forecast contexts, with explicit complete future query rows."""
 
 from dataclasses import dataclass

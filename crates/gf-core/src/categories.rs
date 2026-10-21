@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! How a table's categorical features place rows for retrieval.
 //!
 //! By default a category's code is standardized like any number, so codes

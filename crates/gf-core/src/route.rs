@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Which shard serves a context: the rules gf-server's front and the
 //! local engine both route by, so a context's table lives on one shard.
 

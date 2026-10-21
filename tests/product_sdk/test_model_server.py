@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Standalone `gf serve` endpoints through fake sync and async transports."""
 
 import asyncio

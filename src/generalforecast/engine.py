@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The engine port: every surface's model calls, over gf-server's shards.
 
 The Models API, `gf serve`, package predictions and the native estimators

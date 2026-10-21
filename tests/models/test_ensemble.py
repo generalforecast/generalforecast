@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Ensembles: estimators on reordered, label-shifted tables, averaged as upstream."""
 
 from __future__ import annotations

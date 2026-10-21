@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! A shard's ephemeral tables: request contexts kept in memory alone, found
 //! by name or id, with the unpinned ones in order of last use, so eviction
 //! and expiry take the least recently used without scanning the others.

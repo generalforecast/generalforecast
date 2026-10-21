@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! A node: many tables, one request queue, one cache.
 //!
 //! The node owns each table's rows, so it is the single writer for them. A

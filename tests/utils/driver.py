@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The thread that runs a local node's steps, so concurrent callers share them.
 
 A `LocalClient` and the `generalforecast.engine.LocalEngine` over it submit

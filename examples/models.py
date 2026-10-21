@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Models beyond the default TabICL.
 
 We fit Kumo Tabular with a column of store names, an ensemble of four estimators

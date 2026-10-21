@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Row masks, masked statistics and column orders every model's preprocessing shares."""
 
 from typing import NamedTuple

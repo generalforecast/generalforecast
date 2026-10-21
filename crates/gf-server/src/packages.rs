@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Locked tabular packages on the Models API: what `gf serve` says of one,
 //! and its JSON rows as the Arrow columns `gf_core::package`, the one
 //! binder, encodes.

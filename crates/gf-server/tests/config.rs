@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Configuration files as deployments write them.
 
 use gf_server::config::{Config, KeysConfig};

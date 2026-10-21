@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The models the conformance suite runs on, each a small random instance."""
 
 from __future__ import annotations

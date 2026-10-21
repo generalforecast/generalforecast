@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Requests per second of `_core.Engine` at N concurrent callers, on distinct contexts.
 
 The workload the engine port is gated on: tabicl-classifier, 256 labeled

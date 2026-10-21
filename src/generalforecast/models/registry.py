@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Models by name: built-in checkpoints, or trusted `module:function` specs.
 
 A built-in model goes by its canonical name, such as `tabicl-v2-classifier`,

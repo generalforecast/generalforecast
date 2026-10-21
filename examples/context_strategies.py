@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """A comparison of the strategies that decide which rows each query reads.
 
 At the 4,000 rows here, `exact`, where every query reads every row, is both the

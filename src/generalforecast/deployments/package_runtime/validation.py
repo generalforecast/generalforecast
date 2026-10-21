@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Admission and bounded Arrow validation for the in-process package executor."""
 
 from pathlib import Path

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """generalforecast/_core.pyi against the extension, so editors show the Rust docstrings."""
 
 import ast

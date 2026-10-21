@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The router in front of nodes: placement, forwarding, quotas, mutual TLS and replicas."""
 
 from __future__ import annotations

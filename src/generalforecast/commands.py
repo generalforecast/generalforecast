@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Scoped API operations, local input adapters and non-secret CLI profiles."""
 
 import argparse

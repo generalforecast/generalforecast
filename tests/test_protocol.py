@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The frames a server and its workers exchange, read on the worker's side."""
 
 from __future__ import annotations

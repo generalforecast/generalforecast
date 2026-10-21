@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Thin launcher for the wheel's single canonical gf implementation.
 
 use std::process::{Command, ExitCode};

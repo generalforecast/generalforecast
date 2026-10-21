@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! A worker process, spawned by the server and reached over a Unix socket.
 //!
 //! Frames are pipelined: the server sends a frame without waiting for the

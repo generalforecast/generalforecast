@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Immutable package publication and isolated, bounded remote patch sessions."""
 
 import argparse

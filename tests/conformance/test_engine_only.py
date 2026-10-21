@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Only the worker executes models, and only gf-server serves inference over HTTP.
 
 The worker is `generalforecast.worker`, the process that hosts it

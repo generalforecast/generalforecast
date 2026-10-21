@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The Models API over HTTP: the routes, envelopes, headers and errors the
 //! hosted API and `gf serve` answer, in front of the server's shards.
 //!

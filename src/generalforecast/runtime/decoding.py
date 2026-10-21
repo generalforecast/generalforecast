@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 import dataclasses
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
