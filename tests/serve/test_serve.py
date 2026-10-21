@@ -1,119 +1,242 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""`gf serve`, the standalone Models API server. Injected kernels are not model evidence."""
+"""`gf serve`, which runs gf-server's Models API over a catalog model or a locked package."""
 
-import asyncio
-import http.client
 import json
 import os
-import shutil
+import random
 import signal
+import socket
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from types import SimpleNamespace
 
-import numpy as np
 import pyarrow as pa
 import pytest
 import yaml
 
-from generalforecast.cli import parser as cli_parser
 from generalforecast.client import Client
-from generalforecast.deployments.boundary import MAX_BYTES, Scope
+from generalforecast.deployments.boundary import Scope
 from generalforecast.deployments.catalog import CatalogService
-from generalforecast.deployments.contracts import ServiceError
 from generalforecast.packages import Package
 from generalforecast.packages.validation import PackageError
-from generalforecast.serve import Application, Server, load
-from generalforecast.serve.listener import public_warning
+from generalforecast.serve.models import served
 from generalforecast.tabular import arrow_bytes
 
 ROOT = Path(__file__).resolve().parents[2]
 KEY = "gf-serve-test-key"
-KERNELS = """
-import os, time
-from types import SimpleNamespace
-import numpy as np
-import generalforecast.deployments.package_runtime as package_runtime
-import generalforecast.models.inference as inference
-import generalforecast.models.registry as registry
-
-package_runtime._load = lambda *args: (SimpleNamespace(), None)
-registry.load_ref = lambda *args, **kwargs: SimpleNamespace()
-
-def fit(model, x, y, count):
-    return count, float(np.mean(np.asarray(y)))
-
-def predict(model, fitted, x, classes):
-    time.sleep(float(os.environ.get("GF_TEST_DELAY", "0")))
-    count, cache = fitted
-    if count:
-        return np.tile([0.25, 0.75], (len(x), 1))
-    return np.tile(np.arange(999, dtype=float) + cache, (len(x), 1))
-
-inference.fit, inference.predict = fit, predict
-"""
-FORBIDDEN = (
-    "generalforecast.server",
-    "generalforecast.deployments.identity",
-    "generalforecast.deployments.workspace_",
-    "generalforecast.deployments.security",
-    "generalforecast.deployments.store",
-    "generalforecast.deployments.postgres",
-    "generalforecast.deployments.routes",
-    "generalforecast.deployments.revision_api",
-    "generalforecast.deployments.jobs",
-    "generalforecast.deployments.sources",
-    "generalforecast.deployments.packages",
-    "generalforecast.deployments.python_runtime",
-    "generalforecast.deployments.settings",
-    "generalforecast.deployments.providers",
-    "generalforecast.deployments.web",
-    "generalforecast.deployments.runtime",
-    "generalforecast.deployments.handoff",
-    "generalforecast.deployments.data",
-    "generalforecast.deployments.blobs",
-    "generalforecast.deployments.operators",
-    "generalforecast.deployments.sql",
-    "psycopg",
-    "google.cloud",
+CLEAN = (
+    "GF_MICROSOFT_CLIENT_SECRET",
+    "GF_MICROSOFT_CLIENT_ID",
+    "GF_GITHUB_CLIENT_ID",
+    "GF_GITHUB_CLIENT_SECRET",
 )
 
 
-@pytest.fixture
-def kernels(monkeypatch):
-    fits = []
-    monkeypatch.setattr(
-        "generalforecast.deployments.package_runtime._load",
-        lambda *args: (SimpleNamespace(), None),
+def _port() -> int:
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def envelope(resource, payload, *, project="local", request_id="r-test"):
+    return {
+        "api_version": "gf/v1alpha1",
+        "project": project,
+        "request_id": request_id,
+        "resource": {"kind": "model", "name": resource},
+        "payload": payload,
+    }
+
+
+def call(url, path, body=None, *, key=None, headers=None):
+    data = None if body is None else json.dumps(body).encode()
+    sent = {"Content-Type": "application/json"} if body is not None else {}
+    if key is not None:
+        sent["Authorization"] = "Bearer " + key
+    sent |= headers or {}
+    request = urllib.request.Request(url + path, data=data, headers=sent)
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            return response.status, json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        return error.code, json.loads(error.read())
+
+
+def infer_payload(**changes):
+    return {
+        "model": "tabicl-classifier",
+        "task": "classification",
+        "target": "y",
+        "features": ["x"],
+        "context": [
+            {"key": "c1", "features": {"x": 0.0}, "label": False},
+            {"key": "c2", "features": {"x": 3.0}, "label": True},
+        ],
+        "queries": [{"key": "q", "features": {"x": 1.5}}],
+        "options": {},
+    } | changes
+
+
+def _start(arguments, *, env=None):
+    from tests.utils.server import build
+
+    binary = build()
+    environment = {k: v for k, v in os.environ.items() if k not in CLEAN}
+    environment["PATH"] = f"{binary.parent}{os.pathsep}{environment['PATH']}"
+    environment |= env or {}
+    return subprocess.Popen(
+        [sys.executable, "-m", "generalforecast.serve", *arguments],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=environment,
+        cwd=ROOT,
     )
-    monkeypatch.setattr(
-        "generalforecast.models.registry.load_ref",
-        lambda *args, **kwargs: SimpleNamespace(),
+
+
+def _event(process, expected):
+    deadline = time.monotonic() + 600
+    while time.monotonic() < deadline:
+        line = process.stdout.readline()
+        if not line:
+            raise AssertionError(process.stderr.read())
+        event = json.loads(line)
+        if event.get("event") == expected:
+            return event
+    raise AssertionError(f"no {expected} event")
+
+
+@pytest.fixture(scope="module")
+def server():
+    port = _port()
+    process = _start(
+        ["tabicl-classifier", "--port", str(port)], env={"GF_API_KEY": KEY}
     )
-    delay = {"seconds": 0.0}
+    serving = _event(process, "serving")
+    assert serving == {
+        "event": "serving",
+        "url": f"http://127.0.0.1:{port}",
+        "models": ["tabicl-v2-classifier"],
+        "auth": "bearer",
+    }
+    _event(process, "ready")
+    yield serving["url"], process
+    process.send_signal(signal.SIGTERM)
+    assert _event(process, "stopped")["url"] == serving["url"]
+    assert process.wait(60) == 0
 
-    def fit(model, x, y, count):
-        fits.append(np.asarray(x).copy())
-        return count, float(np.mean(np.asarray(y)))
 
-    def predict(model, fitted, x, classes):
-        time.sleep(delay["seconds"])
-        count, cache = fitted
-        if count:
-            return np.tile([0.25, 0.75], (len(x), 1))
-        return np.tile(np.arange(999, dtype=float) + cache, (len(x), 1))
+@pytest.mark.slow
+def test_serve_answers_the_hosted_models_api(server):
+    url, _ = server
+    hosted = CatalogService(allow_downloads=True)
+    scope = Scope("local", "r-test")
+    assert call(url, "/livez") == (200, {"live": True})
+    assert call(url, "/readyz") == (200, {"ready": True})
+    status, body = call(url, "/v1alpha1/projects/local/models", key=KEY)
+    assert status == 200
+    assert body["result"] == {"models": [hosted.get(scope, "tabicl-classifier")]}
+    path = "/v1alpha1/projects/local/models/tabicl-v2-classifier/infer"
+    status, body = call(
+        url, path, envelope("tabicl-v2-classifier", infer_payload()), key=KEY
+    )
+    assert status == 200, body
+    expected = hosted.infer(scope, infer_payload())
+    got = body["result"]
+    assert {k: v for k, v in got.items() if k != "outputs"} == {
+        k: v for k, v in expected.items() if k != "outputs"
+    }
+    [output] = got["outputs"]
+    [reference] = expected["outputs"]
+    assert output["key"] == "q"
+    for label, probability in reference["probabilities"].items():
+        assert output["probabilities"][label] == pytest.approx(probability, abs=1e-3)
 
-    monkeypatch.setattr("generalforecast.models.inference.fit", fit)
-    monkeypatch.setattr("generalforecast.models.inference.predict", predict)
-    return SimpleNamespace(fits=fits, delay=delay)
+
+@pytest.mark.slow
+def test_serve_requires_its_key_and_keeps_the_api_errors(server):
+    url, _ = server
+    status, body = call(url, "/v1alpha1/projects/local/models")
+    assert (status, body["error"]["message"]) == (401, "application bearer required")
+    status, body = call(url, "/v1alpha1/projects/local/models/other", key=KEY)
+    assert (status, body["error"]["code"]) == (404, "ModelNotFound")
+    path = "/v1alpha1/projects/local/models/tabicl-v2-classifier/infer"
+    payload = infer_payload(task="regression")
+    status, body = call(url, path, envelope("tabicl-v2-classifier", payload), key=KEY)
+    assert (status, body["error"]["code"]) == (422, "UnsupportedTask")
+    assert body["request_id"] == "r-test"
+
+
+@pytest.mark.slow
+def test_sdk_client_and_predictions_work_against_gf_serve(server):
+    url, _ = server
+    client = Client(base_url=url, api_key=KEY)
+    [described] = client.models.list()
+    assert described["name"] == "tabicl-v2-classifier"
+    payload = {
+        "model": "tabicl-classifier",
+        "task": "classification",
+        "target": "y",
+        "features": ["x"],
+        "context": [{"x": 0.0, "y": False}, {"x": 3.0, "y": True}],
+        "queries": [{"id": "a", "x": 1.5}],
+        "options": {"id": "id"},
+    }
+    status, body = call(
+        url,
+        "/v1alpha1/projects/local/predictions",
+        envelope("predictions", payload),
+        key=KEY,
+    )
+    assert status == 200, body
+    [row] = body["result"]["predictions"]
+    assert row["id"] == "a" and type(row["label"]) is bool
+    assert set(row["probabilities"]) == {"false", "true"}
+    assert body["result"]["context"]["rows"] == 2
+
+
+@pytest.mark.slow
+def test_public_bind_without_a_key_warns():
+    port = _port()
+    process = _start(["tabicl-classifier", "--host", "0.0.0.0", "--port", str(port)])
+    try:
+        _event(process, "serving")
+        warning = process.stderr.readline()
+        while "warning" not in warning:
+            warning = process.stderr.readline()
+        assert warning.strip().endswith(
+            "anyone who can reach this address can run inference. "
+            "Set GF_API_KEY to require a bearer key."
+        )
+        assert warning.startswith(
+            f"gf serve: warning: listening on 0.0.0.0:{port} without an API key"
+        )
+    finally:
+        process.kill()
+        process.wait(30)
+
+
+def test_unservable_targets_fail_before_listening(tmp_path):
+    result = subprocess.run(
+        [sys.executable, "-m", "generalforecast.serve", str(tmp_path / "missing")],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=ROOT,
+        env={k: v for k, v in os.environ.items() if k not in CLEAN},
+        timeout=300,
+    )
+    assert result.returncode == 1
+    assert (
+        json.loads(result.stderr.strip().splitlines()[-1])["error"]["code"]
+        == "ModelNotFound"
+    )
 
 
 def history():
@@ -157,53 +280,8 @@ def lone_lock(tmp_path):
     Package.load(root).check(data=history().drop(["id"]))
     lone = tmp_path / "elsewhere"
     lone.mkdir()
-    shutil.copy(root / "gf.lock", lone / "gf.lock")
+    (lone / "gf.lock").write_bytes((root / "gf.lock").read_bytes())
     return lone / "gf.lock"
-
-
-@pytest.fixture
-def serve(kernels):
-    servers = []
-
-    def start(target, **options):
-        application = Application([load(str(target))], **options)
-        server = Server(application, "127.0.0.1", 0).start()
-        assert server.wait_ready(30)
-        servers.append(server)
-        return server
-
-    yield start
-    for server in servers:
-        server.stop()
-
-
-def envelope(resource, payload, *, project="local", request_id="r-test"):
-    return {
-        "api_version": "gf/v1alpha1",
-        "project": project,
-        "request_id": request_id,
-        "resource": {"kind": "model", "name": resource},
-        "payload": payload,
-    }
-
-
-def call(url, path, body=None, *, key=None, headers=None, method=None):
-    data = None if body is None else json.dumps(body).encode()
-    sent = {"Content-Type": "application/json"} if body is not None else {}
-    if key is not None:
-        sent["Authorization"] = "Bearer " + key
-    sent |= headers or {}
-    request = urllib.request.Request(
-        url + path,
-        data=data,
-        method=method or ("POST" if body is not None else "GET"),
-        headers=sent,
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return response.status, json.loads(response.read())
-    except urllib.error.HTTPError as error:
-        return error.code, json.loads(error.read())
 
 
 def predictions_payload(**changes):
@@ -218,609 +296,182 @@ def predictions_payload(**changes):
     } | changes
 
 
-def infer_payload(**changes):
-    return {
-        "model": "tabicl-classifier",
-        "task": "classification",
-        "target": "y",
-        "features": ["x"],
-        "context": [
-            {"key": "c1", "features": {"x": 0.0}, "label": False},
-            {"key": "c2", "features": {"x": 3.0}, "label": True},
-        ],
-        "queries": [{"key": "q", "features": {"x": 1.5}}],
-        "options": {},
-    } | changes
+def _serving(target):
+    port = _port()
+    process = _start([str(target), "--port", str(port)], env={"GF_API_KEY": KEY})
+    url = _event(process, "serving")["url"]
+    _event(process, "ready")
+    return url, process
 
 
-def test_health_and_package_routes_over_http(serve, package, kernels):
-    server = serve(package)
-    url = server.url
-    assert call(url, "/livez") == (200, {"live": True})
-    assert call(url, "/readyz") == (200, {"ready": True})
-    status, body = call(url, "/v1alpha1/projects/local/models")
-    assert status == 200
-    assert body["api_version"] == "gf/v1alpha1"
-    assert body["project"] == "local"
-    assert body["resource"] == {"kind": "model", "name": "models"}
-    [described] = body["result"]["models"]
-    assert described["name"] == "churn" and described["kind"] == "package"
-    assert described["features"] == ["x"] and described["context_rows"] == 4
-    status, body = call(url, "/v1alpha1/projects/team-a/models/churn")
-    assert status == 200 and body["project"] == "team-a"
-    assert body["result"] == described
-    status, body = call(
-        url,
-        "/v1alpha1/projects/local/predictions",
-        envelope("predictions", predictions_payload()),
-        headers={"X-GF-Request-ID": "r-test", "X-GF-Project": "local"},
-    )
-    assert status == 200, body
-    assert body["request_id"] == "r-test"
-    result = body["result"]
-    assert result["predictions"] == [
-        {"id": "q", "label": True, "probabilities": {"false": 0.25, "true": 0.75}}
-    ]
-    assert result["task"] == "classification"
-    assert result["context"]["source"] == "snapshot"
-    assert result["context"]["rows"] == 4
-    assert len(kernels.fits) == 1
-    status, body = call(
-        url,
-        "/v1alpha1/projects/local/models/churn/infer",
-        envelope("churn", predictions_payload()),
-    )
-    assert status == 422 and body["error"]["code"] == "UnsupportedCapability"
-    assert body["request_id"] == "r-test"
+def _stop(process):
+    process.send_signal(signal.SIGTERM)
+    _event(process, "stopped")
+    assert process.wait(60) == 0
 
 
-def test_catalog_model_matches_the_hosted_models_api(serve, kernels):
-    server = serve("tabicl-classifier")
-    url = server.url
-    hosted = CatalogService(allow_downloads=True)
-    scope = Scope("local", "r-test")
-    status, body = call(url, "/v1alpha1/projects/local/models/tabicl-v2-classifier")
-    assert status == 200
-    assert body["result"] == hosted.get(scope, "tabicl-classifier")
-    status, body = call(url, "/v1alpha1/projects/local/models")
-    assert body["result"] == {"models": [hosted.get(scope, "tabicl-classifier")]}
-    payload = infer_payload()
-    status, body = call(
-        url,
-        "/v1alpha1/projects/local/models/tabicl-v2-classifier/infer",
-        envelope("tabicl-v2-classifier", payload),
-    )
-    assert status == 200, body
-    assert body["result"] == hosted.infer(scope, payload)
-    assert [row["key"] for row in body["result"]["outputs"]] == ["q"]
-    status, body = call(
-        url,
-        "/v1alpha1/projects/local/predictions",
-        envelope(
-            "predictions",
-            predictions_payload(
-                model="tabicl-classifier",
-                context=[{"x": 0.0, "y": False}, {"x": 3.0, "y": True}],
-                queries=[{"x": 1.5}],
-            ),
-        ),
-    )
-    assert status == 200, body
-    assert body["result"]["predictions"][0]["label"] is True
-    assert body["result"]["context"]["source"] == "request"
-
-
-def test_unserved_models_and_unknown_routes_are_not_found(serve, package):
-    url = serve(package).url
-    for path in (
-        "/v1alpha1/auth/status",
-        "/v1alpha1/projects/local/deployments",
-        "/v1alpha1/projects/local/keys",
-        "/v1alpha1/workspaces",
-        "/",
-    ):
-        status, body = call(url, path)
-        assert status == 404, path
-        assert body == {"error": {"code": "NotFound", "message": "route not found"}}
-    status, body = call(url, "/v1alpha1/projects/local/models/other")
-    assert status == 404 and body["error"]["code"] == "ModelNotFound"
-    status, body = call(
-        url,
-        "/v1alpha1/projects/local/predictions",
-        envelope("predictions", predictions_payload(model="other")),
-    )
-    assert status == 404 and body["error"]["code"] == "ModelNotFound"
-    assert body["resource"] == {"kind": "model", "name": "predictions"}
-    status, body = call(url, "/v1alpha1/projects/local/models", method="DELETE")
-    assert status == 405 and body["error"]["code"] == "MethodNotAllowed"
-
-
-@pytest.mark.parametrize(
-    ("change", "code"),
-    [
-        ({"target": "z"}, "ValidationError"),
-        ({"features": ["x", "w"]}, "ValidationError"),
-        ({"task": "regression"}, "UnsupportedTask"),
-        ({"options": {"quantiles": [0.5]}}, "ValidationError"),
-        ({"context": [{"x": 1.0, "y": True}]}, "ValidationError"),
-        ({"queries": []}, "ValidationError"),
-    ],
-)
-def test_package_requests_must_match_the_lock(serve, package, change, code):
-    url = serve(package).url
-    status, body = call(
-        url,
-        "/v1alpha1/projects/local/predictions",
-        envelope("predictions", predictions_payload(**change)),
-    )
-    assert status == 422 and body["error"]["code"] == code
-
-
-def test_envelope_mismatches_are_rejected(serve, package):
-    url = serve(package).url
-    path = "/v1alpha1/projects/local/predictions"
-    for body, headers in (
-        (envelope("predictions", predictions_payload(), project="other"), {}),
-        (envelope("churn", predictions_payload()), {}),
-        (envelope("predictions", predictions_payload()), {"X-GF-Project": "x"}),
-        (envelope("predictions", predictions_payload()), {"X-GF-Request-ID": "r-2"}),
-        ({"payload": {}}, {}),
-    ):
-        status, error = call(url, path, body, headers=headers)
-        assert status == 422 and error["error"]["code"] == "ValidationError"
-    status, _ = call(
-        url, path, envelope("predictions", {}), headers={"Content-Type": "text/plain"}
-    )
-    assert status == 422
-
-
-def test_serve_rejects_api_key_cli_argument():
-    with pytest.raises(SystemExit) as error:
-        cli_parser().parse_args(["serve", "--api-key", "x"])
-    assert error.value.code == 2
-
-
-def test_api_key_is_required_when_configured(serve, package):
-    url = serve(package, api_key=KEY).url
-    assert call(url, "/livez") == (200, {"live": True})
-    assert call(url, "/readyz") == (200, {"ready": True})
-    path = "/v1alpha1/projects/local/predictions"
-    body = envelope("predictions", predictions_payload())
-    for key, headers in (
-        (None, {}),
-        ("wrong-key", {}),
-        (KEY[:-1], {}),
-        (None, {"Authorization": KEY}),
-        (None, {"Authorization": "Basic " + KEY}),
-        (None, {"X-GF-API-Key": KEY}),
-    ):
-        status, error = call(url, path, body, key=key, headers=headers)
-        assert status == 401, (key, headers)
-        assert error["error"]["code"] == "Unauthorized"
-        assert error["request_id"] == "r-test"
-        status, error = call(
-            url, "/v1alpha1/projects/local/models", key=key, headers=headers
-        )
-        assert status == 401 and error["error"]["code"] == "Unauthorized"
-    status, result = call(url, path, body, key=KEY)
-    assert status == 200 and result["result"]["predictions"][0]["label"] is True
-
-
-def test_sdk_client_works_against_the_standalone_server(serve):
-    url = serve("tabicl-classifier", api_key=KEY).url
-    with Client(url, project="local", api_key=KEY) as client:
-        [model] = client.models.list()
-        assert model["name"] == "tabicl-v2-classifier"
-        assert client.models.get("tabicl-v2-classifier")["task"] == "classification"
-        result = client.models.infer(infer_payload())  # type: ignore[arg-type]
-        assert result["outputs"][0]["key"] == "q"
-        prediction = client.predict(
-            model="tabicl-classifier",
-            target="y",
-            context=pa.table({"x": [0.0, 3.0], "y": [False, True]}),
-            queries=pa.table({"x": [1.5]}),
-        )
-        assert prediction.table.column("label").to_pylist() == [True]
-
-
-def test_lone_lock_file_serves_request_context(serve, lone_lock, kernels):
-    url = serve(lone_lock).url
-    status, body = call(
-        url,
-        "/v1alpha1/projects/local/predictions",
-        envelope(
-            "predictions",
-            predictions_payload(
-                model="scorer",
-                context=[
-                    {"x": 0.0, "y": False},
-                    {"x": 1.0, "y": False},
-                    {"x": 3.0, "y": True},
-                ],
-                queries=[{"x": 2.5}],
-            ),
-        ),
-    )
-    assert status == 200, body
-    assert body["result"]["context"] == {
-        **body["result"]["context"],
-        "source": "request",
-        "rows": 3,
-    }
-    status, body = call(
-        url,
-        "/v1alpha1/projects/local/predictions",
-        envelope("predictions", predictions_payload(model="scorer")),
-    )
-    assert status == 422
-
-
-def test_local_only_models_serve_on_the_operators_own_server(serve):
-    url = serve("tabpfn-3-classifier").url
-    own = CatalogService(allow_downloads=True, surface="self-hosted")
-    scope = Scope("local", "r-test")
-    with pytest.raises(ServiceError) as caught:
-        CatalogService().get(scope, "tabpfn-3-classifier")
-    assert caught.value.code == "UnsupportedModel"
-    status, body = call(url, "/v1alpha1/projects/local/models/tabpfn-3-classifier")
-    assert status == 200
-    assert body["result"] == own.get(scope, "tabpfn-3-classifier")
-    assert body["result"]["license"] == "LicenseRef-tabpfn-3-license-v1.0"
-    payload = infer_payload(model="tabpfn-3-classifier")
-    status, body = call(
-        url,
-        "/v1alpha1/projects/local/models/tabpfn-3-classifier/infer",
-        envelope("tabpfn-3-classifier", payload),
-    )
-    assert status == 200, body
-    assert body["result"] == own.infer(scope, payload)
-    status, body = call(
-        url,
-        "/v1alpha1/projects/local/predictions",
-        envelope(
-            "predictions",
-            predictions_payload(
-                model="tabpfn-3-classifier",
-                context=[{"x": 0.0, "y": False}, {"x": 3.0, "y": True}],
-                options={"id": "id"},
-            ),
-        ),
-    )
-    assert status == 200, body
-    result = body["result"]
-    assert result["model"].startswith("catalog/tabpfn-3-classifier@")
-    assert result["task"] == "classification"
-    assert result["context"]["source"] == "request" and result["context"]["rows"] == 2
-    assert result["predictions"] == [
-        {"id": "q", "label": True, "probabilities": {"false": 0.25, "true": 0.75}}
-    ]
-
-
-@pytest.mark.parametrize("asynchronous", [False, True])
-def test_sdk_predict_works_against_a_local_only_model(serve, asynchronous):
-    from generalforecast.async_client import AsyncClient
-
-    context = pa.table({"x": [0.0, 1.0, 3.0], "y": [False, None, True]})
-    queries = pa.table({"x": [1.5, 2.5]})
-    url = serve("tabpfn-3-classifier").url
-    if asynchronous:
-
-        async def run():
-            async with AsyncClient(base_url=url) as client:
-                return await client.predict(
-                    model="tabpfn-3-classifier",
-                    target="y",
-                    context=context,
-                    queries=queries,
-                )
-
-        prediction = asyncio.run(run())
-    else:
-        with Client(base_url=url) as client:
-            prediction = client.predict(
-                model="tabpfn-3-classifier",
-                target="y",
-                context=context,
-                queries=queries,
-            )
-    assert prediction.task == "classification"
-    assert prediction.model.startswith("catalog/tabpfn-3-classifier@")
-    assert prediction.context is not None and prediction.context.rows == 2
-    assert prediction.table.column("label").to_pylist() == [True, True]
-    assert prediction.table.column("probabilities").to_pylist()[0] == {
-        "false": 0.25,
-        "true": 0.75,
-    }
-
-
-def test_local_only_regressor_predictions_select_quantiles(serve):
-    url = serve("tabpfn-3-regressor").url
-    with Client(base_url=url) as client:
-        prediction = client.predict(
-            model="tabpfn-3-regressor",
-            target="y",
-            context=pa.table({"x": [0.0, 1.0], "y": [1.0, 3.0]}),
-            queries=pa.table({"x": [2.0]}),
-            options={"quantiles": [0.1, 0.9]},
-            outputs=["value", "quantiles"],
-        )
-    [row] = prediction.table.to_pylist()
-    assert row["value"] == pytest.approx(0.5 * 999 + 2.0, rel=1e-3)
-    assert set(row["quantiles"]) == {"0.1", "0.9"}
-    status, body = call(
-        url,
-        "/v1alpha1/projects/local/predictions",
-        envelope(
-            "predictions",
-            predictions_payload(
-                model="tabpfn-3-regressor",
-                task="regression",
-                context=[{"x": 0.0, "y": 1.0}],
-                options={"quantiles": [0.1]},
-            ),
-        ),
-    )
-    assert status == 422 and body["error"]["code"] == "ValidationError"
-
-
-def test_local_only_forecasters_still_refuse_predictions():
-    from generalforecast.models.catalog import parse
-    from generalforecast.serve.models import CatalogModel
-
-    model = CatalogModel(parse("timesfm-3"), allow_downloads=False)
-    with pytest.raises(ServiceError) as caught:
-        model.predict(
-            Scope("local", "r-test"),
-            predictions_payload(model="timesfm-3", task="forecast"),
-        )
-    assert caught.value.code == "UnsupportedCapability"
-
-
-def test_unservable_targets_fail_before_listening(tmp_path, package):
-    with pytest.raises(PackageError) as caught:
-        load(str(tmp_path / "missing-model"))
-    assert caught.value.code == "ModelNotFound"
-    assert load("timesfm-3").name == "timesfm-3"
-    for model, code in (
-        ("tabpfn-3-classifier@4", "UnsupportedCapability"),
-        ("limix-2-classifier", "UnsupportedModel"),
-    ):
-        with pytest.raises(PackageError) as caught:
-            load(model)
-        assert caught.value.code == code, model
-    (tmp_path / "unlocked").mkdir()
-    (tmp_path / "unlocked" / "gf.yaml").write_text(
-        yaml.safe_dump({"name": "u", "model": "tabicl-classifier", "target": "y"})
-    )
-    with pytest.raises(PackageError) as caught:
-        load(str(tmp_path / "unlocked"))
-    assert caught.value.code == "LockRequired"
-    lone = tmp_path / "lone"
-    lone.mkdir()
-    shutil.copy(package / "gf.lock", lone / "gf.lock")
-    with pytest.raises(PackageError) as caught:
-        load(str(lone / "gf.lock"))
-    assert caught.value.code == "ContextRequired"
-    (package / "history.arrow").write_bytes(arrow_bytes(history().slice(0, 3)))
-    with pytest.raises(PackageError):
-        load(str(package))
-
-
-def test_bounded_body_and_loopback_origin(serve, package):
-    server = serve(package)
-    connection = http.client.HTTPConnection("127.0.0.1", server.port, timeout=10)
-    connection.putrequest("POST", "/v1alpha1/projects/local/predictions")
-    connection.putheader("Content-Type", "application/json")
-    connection.putheader("Content-Length", str(MAX_BYTES + 1))
-    connection.endheaders()
-    response = connection.getresponse()
-    assert response.status == 413
-    assert json.loads(response.read())["error"]["code"] == "CapacityExceeded"
-    connection.close()
-    for headers in (
-        {"Origin": "http://evil.example"},
-        {"Host": "evil.example"},
-    ):
+@pytest.mark.slow
+def test_snapshot_package_binds_once_and_answers_predictions(package):
+    url, process = _serving(package)
+    try:
+        status, body = call(url, "/v1alpha1/projects/local/models", key=KEY)
+        assert status == 200
+        [described] = body["result"]["models"]
+        assert described["name"] == "churn" and described["kind"] == "package"
+        assert described["features"] == ["x"] and described["context_rows"] == 4
+        assert described["context"] == "snapshot"
+        status, body = call(url, "/v1alpha1/projects/team-a/models/churn", key=KEY)
+        assert status == 200 and body["result"] == described
         status, body = call(
-            server.url, "/v1alpha1/projects/local/models", headers=headers
-        )
-        assert status == 422 and body["error"]["code"] == "ValidationError"
-
-
-def test_inference_deadline_returns_timeout(serve, package, kernels):
-    url = serve(package, timeout=0.2).url
-    kernels.delay["seconds"] = 1.0
-    status, body = call(
-        url,
-        "/v1alpha1/projects/local/predictions",
-        envelope("predictions", predictions_payload()),
-    )
-    assert status == 504 and body["error"]["code"] == "RequestTimeout"
-
-
-def test_concurrent_requests_share_one_loaded_package(serve, package, kernels):
-    url = serve(package, concurrency=4).url
-    kernels.delay["seconds"] = 0.05
-
-    def one(index):
-        return call(
             url,
             "/v1alpha1/projects/local/predictions",
             envelope(
                 "predictions",
-                predictions_payload(queries=[{"id": f"q{index}", "x": 1.5}]),
-                request_id=f"r-{index}",
+                predictions_payload(
+                    queries=[{"id": "q", "x": 2.9}, {"id": "r", "x": 0.1}]
+                ),
             ),
+            key=KEY,
         )
-
-    with ThreadPoolExecutor(16) as pool:
-        results = list(pool.map(one, range(32)))
-    assert all(status == 200 for status, _ in results)
-    assert [body["request_id"] for _, body in results] == [
-        f"r-{index}" for index in range(32)
-    ]
-    assert [body["result"]["predictions"][0]["id"] for _, body in results] == [
-        f"q{index}" for index in range(32)
-    ]
-    assert len(kernels.fits) == 1
-
-
-class Gated:
-    name = "gated"
-
-    def __init__(self):
-        self.release = threading.Event()
-
-    def warm(self):
-        assert self.release.wait(30)
-
-    def describe(self, scope):
-        return {"name": self.name}
-
-    def infer(self, scope, payload):
-        return {}
-
-    def predict(self, scope, payload):
-        return {}
-
-
-def test_readiness_waits_for_loading_and_drains_on_stop():
-    model = Gated()
-    server = Server(Application([model]), "127.0.0.1", 0).start()
-    try:
-        assert call(server.url, "/livez") == (200, {"live": True})
-        assert call(server.url, "/readyz") == (503, {"ready": False})
-        status, body = call(server.url, "/v1alpha1/projects/local/models")
-        assert status == 503 and body["error"]["code"] == "NotReady"
-        model.release.set()
-        assert server.wait_ready(10)
-        assert call(server.url, "/readyz") == (200, {"ready": True})
-        assert call(server.url, "/v1alpha1/projects/local/models")[0] == 200
-    finally:
-        server.stop()
-    with pytest.raises(OSError):
-        call(server.url, "/livez")
-
-
-def _start(arguments, *, env=None, entry="serve"):
-    launcher = (
-        "from generalforecast.serve import main; main(sys.argv[1:])"
-        if entry == "serve"
-        else "from generalforecast.cli import main; sys.argv = ['gf', *sys.argv[1:]]; main()"
-    )
-    return subprocess.Popen(
-        [sys.executable, "-c", "import sys\n" + KERNELS + "\n" + launcher, *arguments],
-        cwd=ROOT,
-        env={k: v for k, v in os.environ.items() if k != "GF_API_KEY"} | (env or {}),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-
-def _event(process, expected):
-    assert process.stdout is not None
-    while True:
-        line = process.stdout.readline()
-        assert line, process.stderr.read() if process.stderr else ""
-        value = json.loads(line)
-        if value.get("event") == expected:
-            return value
-
-
-@pytest.mark.parametrize("entry", ["serve", "cli"])
-def test_public_bind_warns_and_sigterm_drains_in_flight(package, entry):
-    process = _start(
-        ([] if entry == "serve" else ["serve"])
-        + [str(package), "--host", "0.0.0.0", "--port", "0"],
-        env={"GF_TEST_DELAY": "1"},
-        entry=entry,
-    )
-    try:
-        serving = _event(process, "serving")
-        assert serving["auth"] == "none" and serving["models"] == ["churn"]
-        port = int(serving["url"].rsplit(":", 1)[1])
-        url = f"http://127.0.0.1:{port}"
-        _event(process, "ready")
-        with ThreadPoolExecutor(1) as pool:
-            pending = pool.submit(
-                call,
+        assert status == 200, body
+        result = body["result"]
+        assert [row["id"] for row in result["predictions"]] == ["q", "r"]
+        assert [row["label"] for row in result["predictions"]] == [True, False]
+        assert set(result["predictions"][0]["probabilities"]) == {"false", "true"}
+        assert result["task"] == "classification"
+        assert result["context"]["source"] == "snapshot"
+        assert result["context"]["rows"] == 4
+        lock = Package.load(package).lock
+        assert lock is not None
+        assert result["context"]["version"] == lock.data_digest
+        status, body = call(
+            url,
+            "/v1alpha1/projects/local/models/churn/infer",
+            envelope("churn", predictions_payload()),
+            key=KEY,
+        )
+        assert status == 422 and body["error"]["code"] == "UnsupportedCapability"
+        for change, code in [
+            ({"target": "z"}, "ValidationError"),
+            ({"features": ["x", "w"]}, "ValidationError"),
+            ({"task": "regression"}, "UnsupportedTask"),
+            ({"options": {"quantiles": [0.5]}}, "ValidationError"),
+            ({"context": [{"x": 1.0, "y": True}]}, "ValidationError"),
+            ({"queries": []}, "ValidationError"),
+            ({"queries": [{"id": "q", "x": "high"}]}, "ValidationError"),
+        ]:
+            status, body = call(
                 url,
                 "/v1alpha1/projects/local/predictions",
-                envelope("predictions", predictions_payload()),
+                envelope("predictions", predictions_payload(**change)),
+                key=KEY,
             )
-            time.sleep(0.4)
-            process.send_signal(signal.SIGTERM)
-            status, body = pending.result(timeout=30)
-        assert status == 200, body
-        assert process.wait(timeout=30) == 0
-        assert _event(process, "stopped")["url"] == serving["url"]
-        assert process.stderr is not None
-        assert public_warning("0.0.0.0", port) in process.stderr.read()
+            assert (status, body["error"]["code"]) == (422, code), change
     finally:
-        if process.poll() is None:
-            process.kill()
+        _stop(process)
 
 
-def test_api_key_from_environment_silences_the_warning(package):
-    process = _start(
-        [str(package), "--host", "0.0.0.0", "--port", "0"], env={"GF_API_KEY": KEY}
-    )
+@pytest.mark.slow
+def test_lone_lock_file_serves_request_context(lone_lock):
+    url, process = _serving(lone_lock)
     try:
-        serving = _event(process, "serving")
-        assert serving["auth"] == "bearer"
-        port = int(serving["url"].rsplit(":", 1)[1])
-        _event(process, "ready")
-        url = f"http://127.0.0.1:{port}"
-        assert call(url, "/v1alpha1/projects/local/models")[0] == 401
-        assert call(url, "/v1alpha1/projects/local/models", key=KEY)[0] == 200
-        process.send_signal(signal.SIGINT)
-        assert process.wait(timeout=30) == 0
-        assert process.stderr is not None
-        stderr = process.stderr.read()
-        assert "warning" not in stderr and KEY not in stderr
+        context = [
+            {"x": 0.0, "y": False},
+            {"x": 1.0, "y": False},
+            {"x": 3.0, "y": True},
+        ]
+        status, body = call(
+            url,
+            "/v1alpha1/projects/local/predictions",
+            envelope(
+                "predictions",
+                predictions_payload(
+                    model="scorer", context=context, queries=[{"x": 2.9}, {"x": 0.1}]
+                ),
+            ),
+            key=KEY,
+        )
+        assert status == 200, body
+        assert body["result"]["context"]["source"] == "request"
+        assert body["result"]["context"]["rows"] == 3
+        labels = [row["label"] for row in body["result"]["predictions"]]
+        assert labels == [True, False]
+        status, body = call(
+            url,
+            "/v1alpha1/projects/local/predictions",
+            envelope("predictions", predictions_payload(model="scorer")),
+            key=KEY,
+        )
+        assert status == 422
     finally:
-        if process.poll() is None:
-            process.kill()
+        _stop(process)
 
 
-def test_server_imports_nothing_from_the_private_control_plane(package):
-    code = (
-        "import json, sys\n"
-        + KERNELS
-        + """
-import generalforecast.serve
-from generalforecast.serve import Application, Server, load
-import generalforecast.serve.__main__
-import generalforecast.deployments.catalog_forecast
-application = Application([load(sys.argv[1]), load("tabicl-classifier")])
-application.warm()
-body = json.dumps({
-    "api_version": "gf/v1alpha1", "project": "local", "request_id": "r-1",
-    "resource": {"kind": "model", "name": "predictions"},
-    "payload": {"model": "churn", "task": "classification", "target": "y",
-                "features": ["x"], "context": [], "queries": [{"x": 1.5}],
-                "options": {}},
-}).encode()
-response = application.handle(
-    "POST", "/v1alpha1/projects/local/predictions",
-    [("Host", "127.0.0.1"), ("Content-Type", "application/json")], body,
-)
-assert response.status == 200, response.body
-application.close()
-print(json.dumps(sorted(sys.modules)))
-"""
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", code, str(package)],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,
-    )
-    assert result.returncode == 0, result.stderr
-    modules = json.loads(result.stdout.splitlines()[-1])
-    assert "generalforecast.serve.app" in modules
-    leaked = [m for m in modules if m.startswith(FORBIDDEN)]
-    assert not leaked
+def test_package_targets_are_checked_before_serving(tmp_path, package, lone_lock):
+    entry = served(str(package), tmp_path, allow_downloads=True)
+    assert entry["name"] == "churn" and entry["worker"] == "tabicl-v2-classifier"
+    assert entry["package"]["context"] == "snapshot"
+    snapshot = Path(entry["package"]["snapshot"])
+    assert snapshot.parent == tmp_path and snapshot.read_bytes()
+    entry = served(str(lone_lock), tmp_path, allow_downloads=True)
+    assert entry["package"]["context"] == "request"
+    assert entry["package"]["snapshot"] is None
+    unlocked = tmp_path / "unlocked"
+    unlocked.mkdir()
+    (unlocked / "gf.yaml").write_text((package / "gf.yaml").read_text())
+    (unlocked / "history.arrow").write_bytes(arrow_bytes(history()))
+    with pytest.raises(PackageError) as caught:
+        served(str(unlocked), tmp_path)
+    assert caught.value.code == "LockRequired"
+    lone_snapshot = tmp_path / "lone"
+    lone_snapshot.mkdir()
+    (lone_snapshot / "gf.lock").write_bytes((package / "gf.lock").read_bytes())
+    with pytest.raises(PackageError) as caught:
+        served(str(lone_snapshot / "gf.lock"), tmp_path)
+    assert caught.value.code == "ContextRequired"
+
+
+def _context_load(url, concurrency, requests, seed):
+    """Requests per second for `requests` calls, each with a new 64-row context."""
+
+    def one(index):
+        rng = random.Random(seed + index)
+        payload = infer_payload(
+            features=["a", "b"],
+            context=[
+                {
+                    "key": f"c{row}",
+                    "features": {"a": rng.random(), "b": rng.random()},
+                    "label": row % 2 == 0,
+                }
+                for row in range(64)
+            ],
+            queries=[{"key": "q", "features": {"a": 0.5, "b": 0.5}}],
+        )
+        status, body = call(
+            url,
+            "/v1alpha1/projects/local/models/tabicl-v2-classifier/infer",
+            envelope("tabicl-v2-classifier", payload),
+            key=KEY,
+        )
+        assert status == 200, body
+
+    start = time.perf_counter()
+    with ThreadPoolExecutor(concurrency) as pool:
+        list(pool.map(one, range(requests)))
+    return requests / (time.perf_counter() - start)
+
+
+@pytest.mark.slow
+def test_new_contexts_hold_throughput_past_saturation(server):
+    """Past saturation, a request per new context keeps the throughput it had.
+
+    Every call fits a table of its own; doubling the callers from 256 to 512
+    queues more fits per step, so throughput plateaus rather than falls. The
+    first pass at 512 compiles the step sizes the measured ones reach.
+    """
+    url, _ = server
+    _context_load(url, 512, 1024, seed=0)
+    at_256 = _context_load(url, 256, 1024, seed=1 << 20)
+    at_512 = _context_load(url, 512, 2048, seed=2 << 20)
+    assert at_512 >= 0.8 * at_256, (at_256, at_512)

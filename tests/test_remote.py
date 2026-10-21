@@ -19,7 +19,6 @@ pa = pytest.importorskip("pyarrow")
 
 from pyarrow import flight
 
-from tests.models.tabicl.tiny import classifier, regressor
 from tests.utils import legacy_client as generalforecast
 from tests.utils.server import NEAR_A, Server, build
 
@@ -56,7 +55,7 @@ def test_remote_tables_match_local_tables(server: Server) -> None:
     features, targets = _clusters()
     remote = _connect(server).create_table("rows", model="tiny", features=5, classes=3)
     local = generalforecast.local().create_table(
-        "rows", model=classifier(), features=5, classes=3
+        "rows", model="tests.models.tabicl.tiny:classifier", features=5, classes=3
     )
 
     for table in (remote, local):
@@ -77,7 +76,7 @@ def test_string_and_uuid_keys_work_alike_locally_and_on_a_server(
     keys = ["acct-1", "acct-2", uuid.UUID(int=7), -5]
     remote = _connect(server).create_table("rows", model="tiny", features=5, classes=3)
     local = generalforecast.local().create_table(
-        "rows", model=classifier(), features=5, classes=3
+        "rows", model="tests.models.tabicl.tiny:classifier", features=5, classes=3
     )
 
     for table in (remote, local):
@@ -97,7 +96,7 @@ def test_remote_cutoffs_match_local_ones(server: Server) -> None:
     times = np.arange(32) * 10
     remote = _connect(server).create_table("rows", model="tiny", features=5, classes=3)
     local = generalforecast.local().create_table(
-        "rows", model=classifier(), features=5, classes=3
+        "rows", model="tests.models.tabicl.tiny:classifier", features=5, classes=3
     )
     for table in (remote, local):
         table.insert(np.arange(32), features, targets, times=times)
@@ -118,7 +117,11 @@ def test_dated_tables_reopen_dated_and_truncate_like_local_ones(server: Server) 
         "dated", model="tiny", features=5, classes=3, times="datetime"
     )
     local = generalforecast.local().create_table(
-        "dated", model=classifier(), features=5, classes=3, times="datetime"
+        "dated",
+        model="tests.models.tabicl.tiny:classifier",
+        features=5,
+        classes=3,
+        times="datetime",
     )
     for table in (remote, local):
         table.insert(np.arange(32), features, targets, times=stamps)
@@ -143,7 +146,7 @@ def test_string_labels_are_coded_on_the_server_and_survive_restarts(
     names = np.array(["cat", "dog", "fish"])[targets]
     remote = _connect(server).create_table("pets", model="tiny", features=5, classes=3)
     local = generalforecast.local().create_table(
-        "pets", model=classifier(), features=5, classes=3
+        "pets", model="tests.models.tabicl.tiny:classifier", features=5, classes=3
     )
     for table in (remote, local):
         table.insert(np.arange(32), features, names)
@@ -169,7 +172,11 @@ def test_retrieval_columns_place_rows_as_a_local_tables_do(server: Server) -> No
     columns = {**{f"f{index}": "numeric" for index in range(5)}, "r": "retrieval"}
     strategy = generalforecast.Strategy.neighbors(4)
     local = generalforecast.local().create_table(
-        "placed", model=classifier(), columns=columns, classes=3, strategy=strategy
+        "placed",
+        model="tests.models.tabicl.tiny:classifier",
+        columns=columns,
+        classes=3,
+        strategy=strategy,
     )
     remote = _connect(server).create_table(
         "placed", model="tiny", columns=columns, classes=3, strategy=strategy
@@ -207,7 +214,7 @@ def test_target_encodings_survive_a_restart_as_a_local_tables_place_rows(
         "retrieval_categoricals": "target",
     }
     local = generalforecast.local().create_table(
-        "encoded", model=classifier(), **settings
+        "encoded", model="tests.models.tabicl.tiny:classifier", **settings
     )
     remote = _connect(server).create_table("encoded", model="tiny", **settings)
     for table in (local, remote):
@@ -228,7 +235,11 @@ def test_labels_reach_a_servers_rows_and_survive_a_restart(server: Server) -> No
     unlabeled = np.concatenate([targets[:32], np.full(8, -1, np.int32)])
     strategy = generalforecast.Strategy.neighbors(24)
     local = generalforecast.local().create_table(
-        "late", model=classifier(), features=5, classes=3, strategy=strategy
+        "late",
+        model="tests.models.tabicl.tiny:classifier",
+        features=5,
+        classes=3,
+        strategy=strategy,
     )
     remote = _connect(server).create_table(
         "late", model="tiny", features=5, classes=3, strategy=strategy
@@ -254,7 +265,7 @@ def test_a_server_predicts_against_given_rows_as_a_local_table_does(
 ) -> None:
     features, targets = _clusters()
     local = generalforecast.local().create_table(
-        "chosen", model=classifier(), features=5, classes=3
+        "chosen", model="tests.models.tabicl.tiny:classifier", features=5, classes=3
     )
     remote = _connect(server).create_table(
         "chosen", model="tiny", features=5, classes=3
@@ -277,7 +288,11 @@ def test_contexts_hold_the_keys_a_prediction_reads(server: Server) -> None:
     strategy = generalforecast.Strategy.retrieved(4, core=4, kind="stratified")
     tables = [
         client.create_table(
-            "rows", model=classifier(), features=5, classes=3, strategy=strategy
+            "rows",
+            model="tests.models.tabicl.tiny:classifier",
+            features=5,
+            classes=3,
+            strategy=strategy,
         )
         if client is not None
         else _connect(server).create_table(
@@ -312,7 +327,7 @@ def test_a_table_that_summarizes_each_context_predicts_as_a_local_one(
     )
     local = generalforecast.local().create_table(
         "contexts",
-        model=regressor(),
+        model="tests.models.tabicl.tiny:regressor",
         features=5,
         strategy=strategy,
         page_size=8,
@@ -349,7 +364,7 @@ def test_tables_describe_what_they_are_and_pick_quantiles_on_the_server(
     )
     local = generalforecast.local().create_table(
         "values",
-        model=regressor(),
+        model="tests.models.tabicl.tiny:regressor",
         features=5,
         strategy=strategy,
         page_size=8,
@@ -550,7 +565,7 @@ def test_strings_booleans_and_times_are_coded_on_the_server(server: Server) -> N
     }
     remote = client.create_table("typed", model="tiny", columns=kinds, classes=3)
     local = generalforecast.local().create_table(
-        "typed", model=classifier(), columns=kinds, classes=3
+        "typed", model="tests.models.tabicl.tiny:classifier", columns=kinds, classes=3
     )
     features, targets = _clusters()
     frame = pa.table(
@@ -613,7 +628,6 @@ def test_strings_booleans_and_times_are_coded_on_the_server(server: Server) -> N
 
 
 def test_series_tables_forecast_on_a_server_as_locally(server: Server) -> None:
-    from tests.models.timestral.tiny import forecaster
 
     settings: dict[str, Any] = {
         "series": "item",
@@ -627,7 +641,7 @@ def test_series_tables_forecast_on_a_server_as_locally(server: Server) -> None:
     client = _connect(server)
     remote = client.create_series_table("sales", model="tiny-forecaster", **settings)
     local = generalforecast.local().create_series_table(
-        "sales", model=forecaster(), **settings
+        "sales", model="tests.models.timestral.tiny:forecaster", **settings
     )
     # A table of targets alone, as a local one may be.
     plain = client.create_series_table(
@@ -674,7 +688,7 @@ def test_series_tables_forecast_on_a_server_as_locally(server: Server) -> None:
     }
     given_remote = client.create_series_table("given", model="tiny-forecaster", **given)
     given_local = generalforecast.local().create_series_table(
-        "given", model=forecaster(), **given
+        "given", model="tests.models.timestral.tiny:forecaster", **given
     )
     for table in (given_remote, given_local):
         table.insert(frame)

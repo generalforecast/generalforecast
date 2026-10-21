@@ -49,7 +49,15 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--timers", action="store_true", help="time each part of a step"
     )
+    parser.add_argument(
+        "--cpus",
+        help="the cores to run on, comma-separated, if this worker has its own",
+    )
     options = parser.parse_args(arguments)
+    if options.cpus and sys.platform == "linux":
+        # Before JAX starts its backend, which sizes XLA's thread pools from
+        # the cores the process may run on.
+        os.sched_setaffinity(0, [int(cpu) for cpu in options.cpus.split(",")])
 
     # Before `default_settings` starts JAX's backend, which reads XLA's flags.
     without_command_buffers()
@@ -66,7 +74,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     for entry in options.model or []:
         name, spec = entry.split("=", 1)
         names[name] = len(names)
-        worker.add_model(names[name], *registry.load(spec))
+        worker.add_model(names[name], *registry.load(spec), spec=spec)
 
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     connection.connect(options.socket)
@@ -120,8 +128,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
     threading.Thread(target=read, daemon=True).start()
     writer = threading.Thread(target=write, daemon=True)
     writer.start()
+
+    def progressed() -> None:
+        replies.put(lambda: (progress, []))
+
     while (frame := frames.get()) is not None:
-        replies.put(_answer(worker, names, *frame))
+        replies.put(_answer(worker, names, progressed, *frame))
         if worker.lost:
             # The server starts the worker again, forgetting every cached context.
             failed.set()
@@ -134,20 +146,25 @@ def main(arguments: Sequence[str] | None = None) -> int:
 def _answer(
     worker: Worker,
     names: dict[str, int],
+    progressed: Callable[[], None],
     header: dict[str, Any],
     buffers: list[memoryview],
 ) -> Callable[[], Frame]:
-    """Handles one frame; returns what formats its reply, for the writer to call."""
+    """Handles one frame; returns what formats its reply, for the writer to call.
+
+    `progressed` tells the server a long answer is moving, before its reply.
+    """
     tracing = _tracing
     if tracing is None or header.get("kind") != "step":
-        return _handled(worker, names, header, buffers)
+        return _handled(worker, names, progressed, header, buffers)
     with tracing.step(worker):
-        return _handled(worker, names, header, buffers)
+        return _handled(worker, names, progressed, header, buffers)
 
 
 def _handled(
     worker: Worker,
     names: dict[str, int],
+    progressed: Callable[[], None],
     header: dict[str, Any],
     buffers: list[memoryview],
 ) -> Callable[[], Frame]:
@@ -180,10 +197,12 @@ def _handled(
             case protocol.FitLimits(model=model, features=features):
                 state_rows, fused_rows = worker.fit_rows(names[model], features)
                 answer = protocol.Limited(_limit(state_rows), _limit(fused_rows))
-            case protocol.Check(model=model, classes=classes, features=features):
+            case protocol.Check(
+                model=model, classes=classes, features=features, series=series
+            ):
                 try:
                     if worker.forecaster(names[model]):
-                        worker.check_series(names[model], features)
+                        worker.check_series(names[model], features, rows=series)
                     else:
                         worker.check(names[model], classes, features)
                     answer = protocol.Done()
@@ -191,32 +210,67 @@ def _handled(
                     answer = protocol.Invalid(str(error))
             case protocol.Allocate(device_slots, host_slots, disk_slots):
                 worker.allocate(device_slots, host_slots, disk_slots)
-                answer = protocol.Done()
-            case protocol.AddTable(
-                table, model, classes, features, categorical, page_size, summary, series
-            ):
-                worker.add_table(
-                    table,
-                    names[model],
-                    classes,
-                    features,
-                    categorical,
-                    page_size,
-                    summary,
-                    series,
+                # The server takes steps only after this reply, so the
+                # programs earlier workers compiled are ready before them.
+                before = worker.programs.warmed, worker.programs.warm_seconds
+                worker.warm_start(progressed)
+                answer = protocol.Warmed(
+                    worker.programs.warmed - before[0],
+                    worker.programs.warm_seconds - before[1],
                 )
-                answer = protocol.Done()
-            case protocol.RemoveTable(table):
-                worker.remove_table(table)
-                answer = protocol.Done()
-            case protocol.Apply(movements):
-                for movement in movements:
-                    worker.apply(movement)
+            case protocol.Controls(requests):
+                failures = []
+                for index, control in enumerate(requests):
+                    try:
+                        _control(worker, names, control)
+                    except Exception as error:  # noqa: BLE001
+                        message = f"{type(error).__name__}: {error}"
+                        failures.append(protocol.ControlFailure(index, message))
+                answer = protocol.Controlled(failures) if failures else protocol.Done()
+            case protocol.AddTable() | protocol.RemoveTable() | protocol.Apply():
+                _control(worker, names, request)
                 answer = protocol.Done()
     except Exception as error:  # noqa: BLE001
         answer = protocol.Failed(f"{type(error).__name__}: {error}")
     header = protocol.reply(answer)
     return lambda: (header, [])
+
+
+def _control(
+    worker: Worker,
+    names: dict[str, int],
+    control: protocol.AddModel
+    | protocol.AddTable
+    | protocol.RemoveTable
+    | protocol.Apply,
+) -> None:
+    """Loads a model, adds or removes a table, or applies tiers' copies and drops.
+
+    A model loads under its name unless the worker serves one by it, as at launch.
+    """
+    match control:
+        case protocol.AddModel(name, spec):
+            if name not in names:
+                worker.add_model(len(names), *registry.load(spec))
+                names[name] = len(names)
+        case protocol.AddTable(
+            table, model, classes, features, categorical, page_size, summary, series
+        ):
+            worker.add_table(
+                table,
+                names[model],
+                classes,
+                features,
+                categorical,
+                page_size,
+                summary,
+                series,
+            )
+        case protocol.RemoveTable(table):
+            worker.remove_table(table)
+        case protocol.Apply(movements):
+            for movement in movements:
+                worker.apply(movement)
 
 
 def _profiled(worker: Worker, model: int, features: int) -> protocol.Profiled:
@@ -244,6 +298,9 @@ def _profiled(worker: Worker, model: int, features: int) -> protocol.Profiled:
             max_rows=properties.max_rows,
             extendable=worker.series_extendable(model),
         )
+    # A table of series may have no columns; its shard refuses a tabular
+    # model from this profile, which needs a column to size.
+    features = max(features, 1)
     profile = worker.profile(model, features)
     properties = worker.properties(model)
     return protocol.Profiled(

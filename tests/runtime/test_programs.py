@@ -10,7 +10,16 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from generalforecast.runtime.programs import Programs, ladder
+from generalforecast.runtime.programs import (
+    RECORDED_KINDS,
+    Kind,
+    Manifest,
+    Programs,
+    abstract,
+    counts_up_to,
+    ladder,
+    signature,
+)
 
 
 class _Program:
@@ -104,3 +113,62 @@ def test_programs_drop_past_their_shapes_only_when_memory_is_short() -> None:
 def test_ladders_double_from_a_padded_size() -> None:
     assert ladder(1, 4) == [1, 2, 4, 8]
     assert ladder(16, 5) == [16, 32, 64, 128, 256]
+
+
+def test_start_compiles_each_power_of_two_up_to_the_most_items_taken() -> None:
+    assert counts_up_to([]) == []
+    assert counts_up_to([1]) == [1]
+    assert counts_up_to([8, 2]) == [1, 2, 4, 8]
+
+
+def test_signatures_drop_the_stacked_axis_and_stack_again() -> None:
+    tree = {"rows": jnp.zeros((4, 3, 2)), "count": jnp.zeros((4,), jnp.int32)}
+    recorded = signature(tree, stacked=True)
+    shapes = abstract(recorded, 16)
+
+    assert shapes["rows"].shape == (16, 3, 2)
+    assert shapes["count"].shape == (16,)
+    assert shapes["count"].dtype == jnp.int32
+
+
+def test_manifests_keep_kinds_and_widths_for_later_processes(tmp_path) -> None:
+    first = Programs(None, lambda: False, ahead=False, manifests=tmp_path)
+    kind = Kind(("embed", None, 2, 2), signature(()), signature((jnp.zeros((1, 8)),)))
+    first.remember("model", kind, 4)
+    first.remember("model", kind, 1)
+    first.remember_measure("model", ("width", 8))
+    # Another worker on the machine adds to the same file.
+    other = Kind(("fit", None, 2, 4), signature(()), signature((jnp.zeros((1, 3)),)))
+    Programs(None, lambda: False, ahead=False, manifests=tmp_path).remember(
+        "model", other, 2
+    )
+
+    recorded = Programs(None, lambda: False, manifests=tmp_path).recorded("model")
+
+    assert recorded.kinds == {kind: {1, 4}, other: {2}}
+    assert list(recorded.measures) == [("width", 8)]
+    assert (
+        Programs(None, lambda: False, manifests=tmp_path).recorded("other").kinds == {}
+    )
+
+
+def test_manifests_keep_only_the_latest_kinds(tmp_path) -> None:
+    manifest = Manifest(tmp_path / "model.pickle")
+    kinds = [
+        Kind(("embed", None, 2, index), signature(()), signature(()))
+        for index in range(RECORDED_KINDS + 1)
+    ]
+    for kind in kinds:
+        manifest.add(kind, 1)
+    manifest.add(kinds[1], 2)
+
+    recorded = manifest.read().kinds
+    assert len(recorded) == RECORDED_KINDS
+    assert kinds[0] not in recorded
+    assert list(recorded)[-1] == kinds[1]
+
+
+def test_an_unreadable_manifest_reads_as_empty(tmp_path) -> None:
+    (tmp_path / "model.pickle").write_bytes(b"not a manifest")
+
+    assert Manifest(tmp_path / "model.pickle").read().kinds == {}

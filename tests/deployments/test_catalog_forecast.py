@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -11,13 +10,16 @@ from generalforecast.deployments import catalog_forecast
 from generalforecast.deployments.boundary import Scope, json_object
 from generalforecast.deployments.catalog import CatalogService
 from generalforecast.deployments.contracts import ServiceError
+from generalforecast.engine import Forecasts, ModelOutputError
 from generalforecast.models import catalog
+from generalforecast.models.outputs import quantile_index
 from generalforecast.models.series import KNOWN, PAST, TARGET
+from tests.utils.engine import FakeEngine
 
 SCOPE = Scope("forecast-project", "test-catalog")
 
 
-MODEL = catalog_forecast.model
+RUN = catalog_forecast.run
 QUANTILES = catalog.ENTRIES["chronos-2"].capability.quantiles
 
 
@@ -65,7 +67,7 @@ def no_native(monkeypatch):
     def refuse(*_args, **_kwargs):
         pytest.fail("invalid forecast must not load native weights")
 
-    monkeypatch.setattr(catalog_forecast, "model", refuse)
+    monkeypatch.setattr(catalog_forecast, "run", refuse)
 
 
 @pytest.mark.parametrize(
@@ -169,20 +171,8 @@ def test_forecast_alignment_roles_and_no_request_persistence(
     forecast["context"][1]["value"] = None
     forecast["context"].pop(6)
     before = copy.deepcopy(forecast)
-    calls = []
-    parameters = object()
-    properties = SimpleNamespace(quantiles=QUANTILES, patch=16)
-    model = (SimpleNamespace(properties=lambda _: properties), parameters)
-    monkeypatch.setattr(catalog_forecast, "model", lambda *_, **__: model)
-
-    def run(actual_model, group, horizon):
-        assert actual_model is parameters
-        calls.append(group)
-        return np.arange(group.values.shape[0] * horizon * 21).reshape(
-            group.values.shape[0], horizon, 21
-        )
-
-    monkeypatch.setattr("generalforecast.models.inference._forecast", lambda _: run)
+    fake = FakeEngine(QUANTILES).install(monkeypatch)
+    monkeypatch.setattr(catalog_forecast, "run", RUN)
     monkeypatch.chdir(tmp_path)
     service = CatalogService()
     result = service.infer(SCOPE, forecast)
@@ -192,19 +182,26 @@ def test_forecast_alignment_roles_and_no_request_persistence(
         == {"allow_downloads": False, "runtime": "cpu", "surface": "remote"}
         and list(tmp_path.iterdir()) == []
     )
-    assert len(calls) == 2
-    first = calls[0]
-    assert first.values.shape == (4, 16)
-    np.testing.assert_array_equal(first.roles, [TARGET, TARGET, PAST, KNOWN])
-    np.testing.assert_array_equal(first.observed[0, -4:], [True, False, True, True])
-    np.testing.assert_array_equal(first.observed[1, -4:], [True, True, False, True])
-    assert not np.asarray(first.observed[:, :-4]).any()
-    np.testing.assert_array_equal(
-        first.future_observed[:, 0], [False, False, False, True]
-    )
-    np.testing.assert_array_equal(first.future[-1], [0, 1, 0])
-    assert result["outputs"][0]["quantiles"]["0.1"] == [2, 23, 44]
-    assert result["outputs"][1]["quantiles"]["0.5"] == [73, 94, 115]
+    # One validated request, every query with its aligned group.
+    [request] = fake.forecasts
+    assert request.known_covariates == ["promo"]
+    assert [(q.series, q.members, q.member) for q in request.queries] == [
+        ("a", ["a", "b"], 0),
+        ("b", ["a", "b"], 1),
+    ]
+    group = request.queries[0].group
+    np.testing.assert_array_equal(group.roles, [TARGET, TARGET, PAST, KNOWN])
+    np.testing.assert_array_equal(group.values[:2], [[10, 0, 12, 13], [30, 31, 0, 33]])
+    np.testing.assert_array_equal(group.observed[:2], [[1, 0, 1, 1], [1, 1, 0, 1]])
+    np.testing.assert_array_equal(group.future[3], [0, 1, 0])
+    low, median = quantile_index(0.1, QUANTILES), quantile_index(0.5, QUANTILES)
+    width = len(QUANTILES)
+    assert result["outputs"][0]["quantiles"]["0.1"] == [
+        period * width + low for period in range(3)
+    ]
+    assert result["outputs"][1]["quantiles"]["0.5"] == [
+        (3 + period) * width + median for period in range(3)
+    ]
     assert result["outputs"][0]["times"] == (
         [1_700_000_240.0, 1_700_000_300.0, 1_700_000_360.0]
         if floating_axis
@@ -218,22 +215,17 @@ def test_forecast_alignment_roles_and_no_request_persistence(
 @pytest.mark.parametrize("kind", ["shape", "finite", "capability", "exception"])
 def test_forecast_native_output_validation(forecast, monkeypatch, kind):
     quantiles = (0.5,) if kind == "capability" else QUANTILES
-    properties = SimpleNamespace(quantiles=quantiles, patch=16)
-    model = (SimpleNamespace(properties=lambda _: properties), None)
-    monkeypatch.setattr(
-        "generalforecast.models.registry.load_ref", lambda *_, **__: model
-    )
-    monkeypatch.setattr(catalog_forecast, "model", MODEL)
+    monkeypatch.setattr(catalog_forecast, "run", RUN)
 
-    def run(*_):
-        if kind == "exception":
-            raise RuntimeError("private-request-token")
-        return np.full(
-            (4, 3, 1 if kind == "shape" else 21),
-            float("nan") if kind == "finite" else 1,
-        )
+    class Engine:
+        def forecast(self, ref, request):
+            if kind == "exception":
+                raise RuntimeError("private-request-token")
+            if kind in ("shape", "finite"):
+                raise ModelOutputError("the forecaster returned invalid forecasts")
+            return Forecasts(np.ones((2, 3, len(quantiles))), quantiles)
 
-    monkeypatch.setattr("generalforecast.models.inference._forecast", lambda _: run)
+    monkeypatch.setattr("generalforecast.engine.local", lambda *_: Engine())
     with pytest.raises(ServiceError) as caught:
         CatalogService().infer(SCOPE, forecast)
     assert caught.value.code == {
@@ -244,23 +236,8 @@ def test_forecast_native_output_validation(forecast, monkeypatch, kind):
 
 
 def fake_forecaster(monkeypatch, levels=(0.1, 0.5, 0.9), max_rows=None):
-    loads = []
-    properties = SimpleNamespace(quantiles=levels, patch=16, max_rows=max_rows)
-
-    def load_ref(ref, *, surface, allow_downloads):
-        loads.append((ref.name, surface))
-        return (SimpleNamespace(properties=lambda _: properties), object())
-
-    def run(_, group, horizon):
-        rows = group.values.shape[0]
-        return np.arange(rows * horizon * len(levels), dtype=float).reshape(
-            rows, horizon, len(levels)
-        )
-
-    monkeypatch.setattr(catalog_forecast, "model", MODEL)
-    monkeypatch.setattr("generalforecast.models.registry.load_ref", load_ref)
-    monkeypatch.setattr("generalforecast.models.inference._forecast", lambda _: run)
-    return loads
+    monkeypatch.setattr(catalog_forecast, "run", RUN)
+    return FakeEngine(levels, max_rows).install(monkeypatch).loads
 
 
 @pytest.mark.parametrize(

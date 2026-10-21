@@ -23,7 +23,7 @@ import numpy as np
 from generalforecast._core import CacheKey
 
 # What a worker does with a unit or page, and the tiers entries move between.
-Action = Literal["encode", "reuse", "transient", "extend"]
+Action = Literal["encode", "reuse", "transient", "fuse", "extend"]
 Tier = Literal["device", "host", "disk"]
 
 # The most bytes one frame may claim, as in `protocol.rs`, so a damaged length
@@ -68,7 +68,11 @@ class Page:
 
 @dataclass(frozen=True)
 class Unit:
-    """One unit of a step: rows to encode or reuse; `features` and `targets` are set to fit them."""
+    """One unit of a step: rows to encode or reuse; `features` and `targets` are set to fit them.
+
+    A `fuse` unit fits its table's state on its rows, then encodes them and
+    decodes the queries that read it in the same call, in no slots.
+    """
 
     table: int
     key: CacheKey
@@ -424,12 +428,26 @@ class FitLimits:
 
 
 @dataclass(frozen=True)
+class AddModel:
+    """Loads a model the worker did not start with, under `name`, from `spec`.
+
+    A control: a shard sends it in a `Controls` frame, ahead of the first
+    table that names the model.
+    """
+
+    name: str
+    spec: str
+
+
+@dataclass(frozen=True)
 class Check:
     """Asks whether a model can fit a table of this task and width."""
 
     model: str
     classes: int
     features: int
+    # Series a forecast's group holds at most; tabular tables send 1.
+    series: int
 
 
 @dataclass(frozen=True)
@@ -466,6 +484,17 @@ class Apply:
     movements: list[Movement]
 
 
+@dataclass(frozen=True)
+class Controls:
+    """Models loaded, tables added and removed and tiers' copies and drops, in order.
+
+    A shard sends what one tick asks besides its steps in one frame; the
+    worker answers `Done`, or `Controlled` with the requests that failed.
+    """
+
+    requests: list[AddModel | AddTable | RemoveTable | Apply]
+
+
 # The trace event a worker records around each step, with the step's number
 # as `step_num`.
 STEP_EVENT = "gf step"
@@ -492,10 +521,12 @@ Request = (
     Allocate
     | Profile
     | FitLimits
+    | AddModel
     | Check
     | AddTable
     | RemoveTable
     | Apply
+    | Controls
     | Record
     | Step
 )
@@ -517,6 +548,16 @@ def request(header: dict[str, Any], buffers: list[memoryview]) -> Request:
         fields["movements"] = movements(fields.get("movements", []))
     if kind == "add_table":
         fields["categorical"] = tuple(fields.get("categorical", ()))
+    if kind == "controls":
+        requests = fields.get("requests")
+        if type(requests) is not list or not all(
+            type(control) is dict and control.get("kind") in _CONTROLS
+            for control in requests
+        ):
+            raise ValueError(
+                "a malformed controls request: its requests must be controls"
+            )
+        fields["requests"] = [request(control, []) for control in requests]
     try:
         return _REQUESTS[kind](**fields)
     except TypeError as error:
@@ -527,12 +568,16 @@ _REQUESTS: dict[str, Any] = {
     "allocate": Allocate,
     "profile": Profile,
     "fit_limits": FitLimits,
+    "add_model": AddModel,
     "check": Check,
     "add_table": AddTable,
     "remove_table": RemoveTable,
     "apply": Apply,
+    "controls": Controls,
     "record": Record,
 }
+# The requests a `Controls` frame carries.
+_CONTROLS = frozenset({"add_model", "add_table", "remove_table", "apply"})
 
 
 @dataclass(frozen=True)
@@ -608,6 +653,19 @@ class Done:
 
 
 @dataclass(frozen=True)
+class Warmed:
+    """An allocation carried out, after compiling the programs earlier workers recorded.
+
+    Attributes:
+        compiles: Programs compiled before replying.
+        seconds: Seconds they took.
+    """
+
+    compiles: int
+    seconds: float
+
+
+@dataclass(frozen=True)
 class Progress:
     """Sent while a step runs, once per compile finished; answers no request."""
 
@@ -626,16 +684,43 @@ class Failed:
     message: str
 
 
-Reply = Ready | Profiled | Limited | Done | Progress | Invalid | Failed
+@dataclass(frozen=True)
+class ControlFailure:
+    """A request of a `Controls` frame that failed: its index there, and why."""
+
+    index: int
+    message: str
+
+
+@dataclass(frozen=True)
+class Controlled:
+    """The requests of a `Controls` frame that failed; the rest were carried out."""
+
+    failures: list[ControlFailure]
+
+
+Reply = (
+    Ready
+    | Profiled
+    | Limited
+    | Done
+    | Warmed
+    | Progress
+    | Invalid
+    | Failed
+    | Controlled
+)
 
 _REPLIES: dict[type, str] = {
     Ready: "ready",
     Profiled: "profile",
     Limited: "fit_limits",
     Done: "ok",
+    Warmed: "warmed",
     Progress: "progress",
     Invalid: "invalid",
     Failed: "error",
+    Controlled: "controlled",
 }
 
 

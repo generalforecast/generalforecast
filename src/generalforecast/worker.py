@@ -13,11 +13,17 @@ runs as one vectorized call.
 
 import contextlib
 import dataclasses
+import hashlib
+import importlib.metadata
 import logging
+import os
 import sys
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as finished
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, cast
@@ -36,7 +42,6 @@ from generalforecast.runtime.decoding import (
     Context,
     Decoding,
     Group,
-    PagedShape,
     alike,
     decoding_of,
     merged,
@@ -88,8 +93,14 @@ from generalforecast.runtime.paging import (
 from generalforecast.runtime.programs import (
     WARMED_PAGES,
     WARMED_QUERIES,
+    Kind,
     Programs,
+    abstract,
+    counts_up_to,
     ladder,
+)
+from generalforecast.runtime.programs import (
+    signature as kind_signature,
 )
 from generalforecast.runtime.series import (
     SeriesBytes,
@@ -230,8 +241,9 @@ class WorkerStats:
         """Counts one run of a part of a step, and the seconds it took."""
         if not self.timers:
             return
-        self.parts[name] = self.parts.get(name, 0) + 1
-        self.part_seconds[name] = self.part_seconds.get(name, 0.0) + seconds
+        with _COUNTING:
+            self.parts[name] = self.parts.get(name, 0) + 1
+            self.part_seconds[name] = self.part_seconds.get(name, 0.0) + seconds
 
     def timed(self, name: str) -> contextlib.AbstractContextManager[None]:
         """Counts the block's time as one run of a part of a step."""
@@ -264,6 +276,9 @@ class WorkerStats:
         """Each part's runs and their seconds since `before`."""
         return _since(before.parts, before.part_seconds, self.parts, self.part_seconds)
 
+
+# Guards the counts of calls that run side by side; see `Worker._alone`.
+_COUNTING = threading.Lock()
 
 # What `WorkerStats.timed` gives untimed: a block that counts nothing.
 _UNTIMED = contextlib.nullcontext()
@@ -396,13 +411,20 @@ class Worker:
         without_command_buffers()
         self._settings, self._minimum = settings, bucket_minimum
         self._slot_bytes = slot_bytes
+        # On a CPU a stacked fused call takes as long per unit as one alone,
+        # and pads to its bucket and compiles for it, so units run one a
+        # call, side by side on the worker's cores: two to four at once
+        # served 20 to 40% more than one at a time on four cores.
+        self._stacks = jax.default_backend() != "cpu"
+        self._side_by_side = 1 if self._stacks else max(1, len(os.sched_getaffinity(0)))
+        self._alongside: ThreadPoolExecutor | None = None
         if compile_cache:
             use_compile_cache()
         # Where measured fits are kept for later processes, beside compiled programs.
         self._fit_cache = cache_root() / "fit" if compile_cache else None
         # How the worker divides its memory; calls are sized from it as they run.
         self.budget = budget or MemoryBudget.measure()
-        self._chunks = Chunks(self._count, self._compiled, self._part)
+        self._chunks = Chunks(self._count, self._compiled, self._part, self._seen)
         # The worker's compiled programs, and those it compiles ahead.
         self.programs = Programs(
             settings,
@@ -417,8 +439,11 @@ class Worker:
                 *PROGRAMS,
             ),
             ahead=compile_ahead,
+            manifests=_manifests(bucket_minimum, slot_bytes) if compile_cache else None,
         )
         self._models: dict[int, _Model] = {}
+        # The spec each model was loaded from, under which its kinds of call are recorded.
+        self._specs: dict[int, str] = {}
         self._tables: dict[int, _Table] = {}
         self._layouts: dict[tuple[int, int], CacheLayout] = {}
         self._profiles: dict[tuple[int, int], MemoryProfile] = {}
@@ -491,6 +516,9 @@ class Worker:
 
     def close(self) -> None:
         """Frees the device pool and forgets every cached context and page."""
+        if self._alongside is not None:
+            self._alongside.shutdown()
+            self._alongside = None
         self._contexts.clear()
         self._fixed.clear()
         self._pages.clear()
@@ -511,11 +539,105 @@ class Worker:
         model: int,
         functions: TabularFunctions | SeriesFunctions,
         parameters: Any,
+        spec: str | None = None,
     ) -> None:
-        """Loads a model's parameters under the node's model id."""
+        """Loads a model's parameters under the node's model id.
+
+        With `spec`, what the model was loaded from, the kinds of call it
+        compiles for are recorded under it, and `warm_start` compiles them.
+        """
         if self._settings is not None:
             parameters = configure(parameters, self._settings)
         self._models[model] = _Model[Any](functions, parameters)
+        if spec is not None:
+            self._specs[model] = spec
+
+    def warm_start(self, progress: Callable[[], None] | None = None) -> None:
+        """Compiles the kinds of call earlier processes recorded for the loaded models, before any step.
+
+        Each kind compiles for every power of two of items up to the most a
+        call of it took, and for each count it took, from shapes alone, so
+        the device stays free. Programs JAX's compile cache holds load from
+        it; tracing them is what remains, which steps would otherwise do.
+        A kind that no longer compiles, as after the model's code changed,
+        is skipped. Call it after `allocate`: paged decodes read the pool.
+
+        Args:
+            progress: Called after each program compiles.
+        """
+        started = time.perf_counter()
+        for model, spec in self._specs.items():
+            parameters = self._models[model].parameters
+            recorded = self.programs.recorded(spec)
+            if not self.forecaster(model) and recorded.kinds:
+                # What a step measures by compiling, once per model and width,
+                # before it decides where a context goes.
+                self.decode_profile(model)
+                for measure in recorded.measures:
+                    self._measure(model, measure)
+                    if progress is not None:
+                        progress()
+            for kind, counts in recorded.kinds.items():
+                program = (kind.program[0], model, *kind.program[2:])
+                try:
+                    function = cast(jax.stages.Wrapped, self._program(program))
+                    for count in counts_up_to(counts):
+                        items = abstract(kind.item, count)
+                        shared = self._shared(program, kind, items)
+                        function.lower(parameters, *shared, *items).compile()
+                        self.programs.warmed += 1
+                        if progress is not None:
+                            progress()
+                except Exception as error:  # noqa: BLE001
+                    logger.warning(
+                        "not compiling a recorded %s call: %s", kind.program[0], error
+                    )
+        self.programs.warm_seconds += time.perf_counter() - started
+
+    def _remember(self, model: int, measure: tuple) -> None:
+        """Records a measure a model took by compiling, for `warm_start` to take again."""
+        if model in self._specs:
+            self.programs.remember_measure(self._specs[model], measure)
+
+    def _measure(self, model: int, measure: tuple) -> None:
+        """Takes a recorded measure again: a width's sizes and layout, or an encode's bytes."""
+        try:
+            match measure:
+                case ("width", int(features)):
+                    self.profile(model, features)
+                    self.layout(model, features)
+                case ("encode", int(features), int(rows), bool(fit)):
+                    self.encode_bytes(model, features, rows, fit)
+        except Exception as error:  # noqa: BLE001
+            logger.warning("not measuring a recorded %s: %s", measure[0], error)
+
+    def _shared(self, program: tuple, kind: Kind, items: tuple) -> tuple:
+        """A recorded kind's shared arguments for `items`: a paged decode reads this pool."""
+        if program[0] != "paged":
+            return abstract(kind.shared)
+        blocks = items[2]
+        pool = self._device.data
+        if isinstance(pool, np.ndarray):
+            # A CPU's decode reads a copy of its slots; see `DevicePool.source`.
+            rows = bucket_size(int(np.prod(blocks.shape)), 1)
+            source = jax.ShapeDtypeStruct((rows, pool.shape[1]), np.uint8)
+        else:
+            source = jax.ShapeDtypeStruct(pool.shape, pool.dtype)
+        return (source,)
+
+    def _seen(self, call: Call) -> None:
+        """Records a call that compiled, if it is a kind a later process can compile again."""
+        if call.program is None or call.program[1] not in self._specs:
+            return
+        # What a paged decode reads its slots from follows from its items and
+        # the pool; see `_shared`.
+        shared = () if call.program[0] == "paged" else call.shared[1:]
+        kind = Kind(
+            (call.program[0], None, *call.program[2:]),
+            kind_signature(shared),
+            kind_signature(call.items, stacked=True),
+        )
+        self.programs.remember(self._specs[call.program[1]], kind, call.padded)
 
     def forecaster(self, model: int) -> bool:
         """Whether a loaded model is a forecaster."""
@@ -687,6 +809,7 @@ class Worker:
                 return profile.working_bytes(per_row, rows)
         key = (model, fit, features, rows)
         if key not in self._encode_bytes:
+            self._remember(model, ("encode", features, rows, fit))
             entry = self._tabular(model)
             try:
                 measured = encode_bytes(
@@ -848,6 +971,7 @@ class Worker:
             raise ValueError(f"categorical columns must be in 0 .. {features - 1}")
         check_summary(self.properties(model), summary)
         self.programs.add_shape((model, num_classes, features))
+        self._remember(model, ("width", features))
         self.layout(model, features)
         mask = None
         if categorical:
@@ -873,8 +997,6 @@ class Worker:
     def remove_table(self, table: int) -> None:
         """Forgets a table's state; the node drops its cache entries separately."""
         del self._tables[table]
-        self.programs.forget(("embeds", table))
-        self.programs.forget(("queries", table))
 
     def run(self, step: Step) -> dict[int, np.ndarray]:
         """Runs a step: copies, fits, page embeds, encodes and decodes, in that order.
@@ -960,7 +1082,13 @@ class Worker:
         self.stats.steps += 1
         self.stats.queries += sum(len(batch.units) for batch in step.queries)
         self.stats.queries += len(step.forecasts)
-        predictions = self._decode(step.queries, step.units, transient)
+        fused = {
+            index for index, unit in enumerate(step.units) if unit.action == "fuse"
+        }
+        reads = [batch for batch in step.queries if fused.isdisjoint(batch.units)]
+        alone = [batch for batch in step.queries if not fused.isdisjoint(batch.units)]
+        predictions = self._decode(reads, step.units, transient)
+        predictions.update(self._decode_fused(alone, step.units))
         predictions.update(self._forecast(step.series_units, step.forecasts))
         return predictions
 
@@ -1067,7 +1195,15 @@ class Worker:
         compiled = self._compiled_stage(stage, model, num_classes, len(items[0]))
         estimate = self._estimate(stage, model, num_classes, items[0])
         self._run_items(
-            stage, key, compiled, (parameters,), items, estimate, indices, consume
+            stage,
+            key,
+            compiled,
+            (parameters,),
+            items,
+            estimate,
+            indices,
+            consume,
+            program=(stage, model, num_classes, len(items[0])),
         )
 
     def _run_items(
@@ -1080,16 +1216,18 @@ class Worker:
         estimate: Callable[[], int],
         indices: Sequence[Any],
         consume: Callable[[Any, Any], None],
+        program: tuple | None = None,
     ) -> None:
         """Runs alike items through a compiled call in as few calls as fit the budget.
 
-        `consume` takes each item's outputs with its entry in `indices`.
+        `consume` takes each item's outputs with its entry in `indices`, and
+        `program`, if given, is the `Programs` key `compiled` is kept under.
         """
 
         def prepare(first: int, stop: int, padded: int) -> Call:
             with self.stats.timed("stack"):
                 stacked = _stacked(padded_items(items[first:stop], padded))
-            return Call(compiled, shared, stacked, padded)
+            return Call(compiled, shared, stacked, padded, program)
 
         def taken(first: int, stop: int, outputs: Any) -> None:
             for position in range(stop - first):
@@ -1126,15 +1264,21 @@ class Worker:
         meets it would otherwise wait for.
         """
         spec = self._tables[fit.table]
-        if len(fit.features) == 0 or not self.programs.first(("embeds", fit.table)):
+        if len(fit.features) == 0:
             return
         features, targets, _ = self._padded(
             fit.features[:1], fit.targets[:1], spec.page_size
         )
         arguments = (spec.state, features, targets)
-        self.programs.later(lambda: self._compile_embeds(fit.table, arguments))
+        # Tables of one model, task and padded shapes share their programs,
+        # so only the first of them compiles; many request contexts are.
+        marker = ("embeds", spec.model, spec.num_classes, _signature(arguments))
+        if self.programs.first(marker):
+            self.programs.later(
+                lambda: self._compile_embeds(spec.model, spec.num_classes, arguments)
+            )
 
-    def _compile_embeds(self, table: int, arguments: tuple) -> None:
+    def _compile_embeds(self, model: int, num_classes: int, arguments: tuple) -> None:
         """Compiles page embeds for each row bucket up to the page size and the first `WARMED_PAGES` page counts, without running one.
 
         A page with sources embeds only its own rows, padded to their bucket,
@@ -1142,13 +1286,10 @@ class Worker:
         shapes alone leaves the device to the step thread, so a warm never
         runs beside a step.
         """
-        spec = self._tables[table]
-        key = ("embed", spec.model, spec.num_classes, _signature(arguments))
-        estimate = self._estimate("embed", spec.model, spec.num_classes, arguments)
+        key = ("embed", model, num_classes, _signature(arguments))
+        estimate = self._estimate("embed", model, num_classes, arguments)
         size = self._chunks.size(key, self._call_bytes, estimate)
-        compiled = self._compiled_stage(
-            "embed", spec.model, spec.num_classes, len(arguments)
-        )
+        compiled = self._compiled_stage("embed", model, num_classes, len(arguments))
         state, features, targets = arguments
         page = len(features)
         below = [
@@ -1162,19 +1303,27 @@ class Worker:
                     lambda value, count=count: _stacked_shape(value, count), sliced
                 )
                 jitted = cast(jax.stages.Wrapped, compiled)
-                jitted.lower(self._models[spec.model].parameters, *stacked).compile()
+                jitted.lower(self._models[model].parameters, *stacked).compile()
 
     def _warmed_queries(self) -> list[int]:
         """Padded query counts compiled ahead: `WARMED_QUERIES` buckets above the smallest."""
         return ladder(self._size(self._minimum + 1), WARMED_QUERIES)
 
     def _warm_query_embeds(self, batch: QueryBatch) -> None:
-        """Compiles a table's query embed for each of `_warmed_queries` ahead, once."""
+        """Compiles a query embed for each of `_warmed_queries` ahead, once per model, task and shapes."""
         spec = self._tables[batch.table]
-        if spec.state is None or not self.programs.first(("queries", batch.table)):
+        if spec.state is None:
+            return
+        features = np.asarray(batch.features)
+        marker = (
+            "queries",
+            spec.model,
+            spec.num_classes,
+            _signature((spec.state, features[:0])),
+        )
+        if not self.programs.first(marker):
             return
         compiled = self._compiled_stage("embed", spec.model, spec.num_classes, 2)
-        features = np.asarray(batch.features)
         for more in self._warmed_queries():
             shape = jax.ShapeDtypeStruct((1, more, *features.shape[1:]), features.dtype)
             self.programs.compile_later(
@@ -1192,12 +1341,14 @@ class Worker:
         """Counts a compiled call of a stage, and the seconds it took."""
         # A fit of the state alone counts as a fit.
         stage = "fit" if stage == "state" else stage
-        self.stats.calls[stage] = self.stats.calls.get(stage, 0) + 1
-        self.stats.seconds[stage] = self.stats.seconds.get(stage, 0.0) + seconds
+        with _COUNTING:
+            self.stats.calls[stage] = self.stats.calls.get(stage, 0) + 1
+            self.stats.seconds[stage] = self.stats.seconds.get(stage, 0.0) + seconds
 
     def _compiled(self, stage: str) -> None:
         """Counts a call of a stage whose shape its program had not seen."""
-        self.stats.compiles[stage] = self.stats.compiles.get(stage, 0) + 1
+        with _COUNTING:
+            self.stats.compiles[stage] = self.stats.compiles.get(stage, 0) + 1
 
     def _part(self, part: str, seconds: float) -> None:
         """Counts one run of a part of a step; see `WorkerStats.parts`."""
@@ -1211,6 +1362,7 @@ class Worker:
         # that reads them only as its `encode` returned them.
         stored = functions.properties(entry.parameters).stored_cache
         read = (lambda cache: cache) if stored else load_cache
+        settings = self._settings
 
         def fit(parameters, features, targets, rows, categorical):
             return functions.fit(
@@ -1256,7 +1408,14 @@ class Worker:
             rows = functions.embed(parameters, state, features)
             return stages["decode"](parameters, state, cache, rows)
 
+        def fit_decode(parameters, features, targets, rows, categorical, queries):
+            state, cache = fit_encode(parameters, features, targets, rows, categorical)
+            if settings is not None:
+                cache = store_cache(cache, settings)
+            return state, embed_decode(parameters, state, cache, queries)
+
         stages["fit_encode"], stages["embed_decode"] = fit_encode, embed_decode
+        stages["fit_decode"] = fit_decode
         return stages[stage]
 
     def _compiled_stage(
@@ -1491,8 +1650,12 @@ class Worker:
         it, so a step never holds every such context at once.
         """
         transient: Transient = {}
-        waiting = [index for index, unit in enumerate(units) if unit.action != "reuse"]
-        self.stats.reused += len(units) - len(waiting)
+        waiting = [
+            index
+            for index, unit in enumerate(units)
+            if unit.action not in ("reuse", "fuse")
+        ]
+        self.stats.reused += sum(unit.action == "reuse" for unit in units)
         self.stats.rows_reused += sum(
             len(unit.rows) for unit in units if unit.action == "reuse"
         )
@@ -1684,6 +1847,68 @@ class Worker:
             if index in predictions
             for request, start, stop in owned
         }
+
+    def _decode_fused(
+        self, batches: Sequence[QueryBatch], units: Sequence[Unit]
+    ) -> dict[int, np.ndarray]:
+        """Fits, encodes and decodes each fused unit and its queries in one call.
+
+        A fused unit is a context one request brought: no page or slot keeps
+        it, and its table keeps only the state, so a later step that reads the
+        context again encodes it from pages. Units of one model, task and
+        padded shapes share their calls.
+        """
+        if not batches:
+            return {}
+        joined, parts = merged(batches)
+        jobs = []
+        for batch in joined:
+            unit = units[batch.units[0]]
+            if any(units[index] is not unit for index in batch.units):
+                raise RuntimeError(
+                    f"queries of table {batch.table} read more than its fused unit"
+                )
+            self._fits_device(unit)
+            with self.stats.timed("pad"):
+                queries = _host_padded(batch.features, self._size(len(batch.units)))
+            jobs.append((batch.table, (*self._own_arguments(unit), queries)))
+        predictions: dict[int, np.ndarray] = {}
+        if self._stacks:
+            outputs = self._call("fit_decode", jobs)
+        else:
+            outputs = self._alone("fit_decode", jobs)
+        for batch, owned, (state, values) in zip(joined, parts, outputs, strict=True):
+            unit = units[batch.units[0]]
+            self._tables[batch.table].state = state
+            self._warn_crowded(batch.table, state)
+            self.stats.encoded += 1
+            self.stats.transient += 1
+            self.stats.rows_encoded += len(unit.rows)
+            with self.stats.timed("fetch"):
+                values = np.asarray(values)[: len(batch.units)]
+            for request, start, stop in owned:
+                predictions[request] = values[start:stop]
+        return predictions
+
+    def _alone(self, stage: str, jobs: Sequence[tuple[int, tuple]]) -> list[Any]:
+        """Runs each job in a call of its own, up to a core's worth side by side.
+
+        Outputs come back in the jobs' order. Every call ends before this
+        returns, and a failure raises the first failed job's error, as when
+        they run in turn, so `run_apart` still fails only its table.
+        """
+        if len(jobs) < 2 or self._side_by_side < 2:
+            return [self._call(stage, [job])[0] for job in jobs]
+        if self._alongside is None:
+            self._alongside = ThreadPoolExecutor(
+                self._side_by_side, thread_name_prefix="gf-alone"
+            )
+        calls: list[Future[Any]] = [
+            self._alongside.submit(lambda job=job: self._call(stage, [job])[0])
+            for job in jobs
+        ]
+        finished(calls)
+        return [call.result() for call in calls]
 
     def _decode_batches(
         self,
@@ -1918,9 +2143,10 @@ class Worker:
             decodings = [part for d in decodings for part in split(d, limit)]
         shape = paged_shape(decodings, layout, self._size)
         signature = (key, shape)
-        compiled = self._compiled_paged(
-            model, num_classes, layout, shape, own is not None
+        program = self._paged_key(
+            model, num_classes, layout, shape.masked, shape.in_order, own is not None
         )
+        compiled = self._program(program)
         parameters = self._models[model].parameters
         results: list[tuple[tuple[QueryBatch, list[int]], np.ndarray]] = []
         # The latest call alone, so earlier chunks' arguments are freed.
@@ -1946,7 +2172,9 @@ class Worker:
             # holds neither the slots' bytes whole nor a copy of the pool.
             source, blocks = self._device.source(blocks)
             arguments = (states, index, blocks, *rest)
-            latest[:] = [Call(compiled, (parameters, source), arguments, len(index))]
+            latest[:] = [
+                Call(compiled, (parameters, source), arguments, len(index), program)
+            ]
             return latest[0]
 
         def taken(first: int, stop: int, values: Any) -> None:
@@ -2035,12 +2263,25 @@ class Worker:
                     *[one(read, more) for read in reads],
                 )
 
+    @staticmethod
+    def _paged_key(
+        model: int,
+        num_classes: int,
+        layout: CacheLayout,
+        masked: bool,
+        in_order: bool,
+        own: bool,
+    ) -> tuple:
+        """The `Programs` key of a model and task's paged decodes for a layout and way of reading."""
+        return ("paged", model, num_classes, layout, masked, in_order, own)
+
     def _compiled_paged(
         self,
         model: int,
         num_classes: int,
         layout: CacheLayout,
-        shape: PagedShape,
+        masked: bool,
+        in_order: bool,
         own: bool,
     ) -> Callable[..., Any]:
         """Paged decodes of a model and task, compiled once per layout and way of reading."""
@@ -2049,12 +2290,17 @@ class Worker:
             entry = self._tabular(model)
             functions = entry.functions
             stored = functions.properties(entry.parameters).stored_cache
-            return paged_decode(
-                functions, stored, layout, shape.masked, shape.in_order, own
-            )
+            return paged_decode(functions, stored, layout, masked, in_order, own)
 
-        key = ("paged", model, num_classes, layout, shape.masked, shape.in_order, own)
+        key = self._paged_key(model, num_classes, layout, masked, in_order, own)
         return self.programs.compiled(key, build)
+
+    def _program(self, key: tuple) -> Callable[..., Any]:
+        """The compiled function a `Call.program` key names: a stage or a paged decode."""
+        if key[0] == "paged":
+            return self._compiled_paged(*key[1:])
+        stage, model, num_classes, arity = key
+        return self._compiled_stage(stage, model, num_classes, arity)
 
     def _forecast(
         self, units: Sequence[SeriesUnit], forecasts: Sequence[Forecast]
@@ -2532,6 +2778,35 @@ def _stack_columns(columns: list[tuple]) -> list[jax.Array]:
 def _item(outputs: Any, at: jax.Array) -> Any:
     """One item of a call's stacked outputs, in one dispatch rather than one per leaf."""
     return jax.tree.map(lambda value: value[at], outputs)
+
+
+def _manifests(bucket_minimum: int, slot_bytes: int) -> Path:
+    """Where workers record the kinds of call their models compile for, beside JAX's compile cache.
+
+    One directory per version of this package and JAX, device and padding,
+    since programs recorded under another may not compile, or compile alike.
+    """
+    device = jax.devices()[0]
+    identity = "|".join(
+        [
+            _version(),
+            jax.__version__,
+            device.platform,
+            device.device_kind,
+            str(bucket_minimum),
+            str(slot_bytes),
+        ]
+    )
+    digest = hashlib.sha256(identity.encode()).hexdigest()[:16]
+    return cache_root() / "programs" / digest
+
+
+def _version() -> str:
+    """This package's version, or `unknown` from a source tree that is not installed."""
+    try:
+        return importlib.metadata.version("generalforecast")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
 
 
 def _message(error: Exception) -> str:

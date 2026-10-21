@@ -330,7 +330,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_array::{ArrayRef, Int32Array, Int64Array};
-    use gf_server::columns::numeric;
+    use gf_core::columns::numeric;
     use gf_server::partition::{ModelRows, Offer, rows_batch};
     use gf_server::wal::RouteKind;
 

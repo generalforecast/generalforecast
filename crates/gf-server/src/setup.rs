@@ -107,7 +107,8 @@ tokens = [{token:?}]
 
 [[workers]]
 command = [{python:?}, "-m", "generalforecast.worker_process"]
-per_gpu = true                      # one worker per visible NVIDIA GPU, else one
+per_gpu = true                      # one worker per visible NVIDIA GPU, else one per
+# cpu_threads = 4                   # this many cores (gf-server picks if unset), pinned to them
 
 [workers.models]
 {models}

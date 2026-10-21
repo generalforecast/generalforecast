@@ -9,13 +9,18 @@
 #![forbid(unsafe_code)]
 
 pub mod cache;
+pub mod catalog;
 pub mod categories;
+pub mod columns;
 pub mod context;
 pub mod forecasting;
 pub mod node;
+pub mod package;
 pub mod pages;
 pub mod planner;
 pub mod regions;
+pub mod request;
+pub mod route;
 pub mod rows;
 pub mod series;
 pub mod shapes;

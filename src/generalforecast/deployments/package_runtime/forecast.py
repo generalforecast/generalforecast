@@ -9,44 +9,40 @@ from typing import Any
 import numpy as np
 import pyarrow as pa
 
-from generalforecast.deployments import catalog_forecast as native
+from generalforecast.deployments.catalog import forecast_request
 from generalforecast.deployments.contracts import ServiceError
-from generalforecast.models import inference
-from generalforecast.models.catalog import V1_POLICY
-from generalforecast.models.grouping import AlignmentError, aligned_group, instant
+from generalforecast.engine import LocalEngine, ModelOutputError
+from generalforecast.models.catalog import V1_POLICY, ModelRef
+from generalforecast.models.grouping import instant
 from generalforecast.models.outputs import DEFAULT_QUANTILES, quantile_index, quantiles
 from generalforecast.packages import PackageLock
 from generalforecast.packages.schema import TableSchema
 from generalforecast.packages.validation import ensure
 
 
-def _run(model: Any, group: Any, horizon: int) -> np.ndarray:
-    try:
-        return inference.forecast(model, group, horizon)
-    except ValueError:
-        raise ServiceError(
-            "ModelOutputError", "native forecaster returned invalid forecasts", 503
-        ) from None
-
-
-def _levels(model: Any) -> tuple[float, ...]:
-    functions, parameters = model
-    return tuple(functions.properties(parameters).quantiles)
-
-
 @dataclass(frozen=True)
 class ForecastContext:
-    """Independent aligned series tensors and a warmed native forecast."""
+    """A related group's series, aligned once into the request its forecasts repeat.
+
+    Each forecast is that request with the queries' future inputs, so the
+    engine reads the group's context table by its fingerprint: made once,
+    and once per set of known future values.
+    """
 
     identities: tuple[tuple, ...]
     origin: int | float
     step: int | float
-    group: Any
-    warmed: np.ndarray
+    request: dict[str, Any]
 
     @classmethod
-    def build(cls, lock: PackageLock, model: Any, table: pa.Table, schema: TableSchema):
-        """Validates and warms a related group without inventing a reusable encoder."""
+    def build(
+        cls,
+        lock: PackageLock,
+        model: tuple[LocalEngine, ModelRef],
+        table: pa.Table,
+        schema: TableSchema,
+    ):
+        """Validates and aligns a related group, binding it as a table."""
         spec = lock.spec
         assert (
             spec.time is not None
@@ -117,29 +113,14 @@ class ForecastContext:
                 }
             },
         }
-        settings, series = native.validate(request, _levels(model))
-        try:
-            group = aligned_group(
-                series,
-                query["group"],
-                settings["known_covariates"],
-                origin,
-                step,
-                spec.horizon,
-                query["future_covariates"],
-                model[0].properties(model[1]).patch,
-            )
-        except AlignmentError as error:
-            raise ServiceError(error.code, str(error), 422) from None
-        # A forecaster may have no separable context encoder. Warm the complete native kernel
-        # and retain its immutable aligned context tensors instead of inventing a KV cache.
-        warmed = _run(model, group, spec.horizon)
-        return cls(identities, origin, step, group, warmed)
+        engine, ref = model
+        engine.forecast(ref, forecast_request(request, ref.entry.capability.quantiles))
+        return cls(identities, origin, step, request)
 
-    def predict(self, lock: PackageLock, model: Any, table: pa.Table) -> dict[str, Any]:
-        """Aligns future rows and reruns only when known future values affect outputs."""
-        import jax.numpy as jnp
-
+    def predict(
+        self, lock: PackageLock, model: tuple[LocalEngine, ModelRef], table: pa.Table
+    ) -> dict[str, Any]:
+        """Aligns future rows and forecasts the queried series of the bound group."""
         spec = lock.spec
         assert spec.horizon is not None and spec.time is not None
         positions: list[tuple[int, int]] = []
@@ -180,22 +161,42 @@ class ForecastContext:
             all(len(times) == spec.horizon for times in seen.values()),
             "queries must include the complete horizon for each requested series",
         )
-        result = self.warmed
-        if spec.future_inputs:
-            covariates = sorted(set(spec.past_inputs) | set(spec.future_inputs))
-            values = np.zeros(self.group.future.shape, np.float32)
-            for name in spec.future_inputs:
-                values[len(self.identities) + covariates.index(name)] = [
-                    future[(name, i)] for i in range(spec.horizon)
-                ]
-            result = _run(
-                model, self.group._replace(future=jnp.asarray(values)), spec.horizon
-            )
+        members = tuple(sorted(seen))
+        template = self.request["queries"][0]
+        queries = [
+            {
+                **template,
+                "key": f"q{member}",
+                "series": f"gfseries:{member}",
+                "future_covariates": {
+                    name: [future[(name, i)] for i in range(spec.horizon)]
+                    for name in spec.future_inputs
+                },
+            }
+            for member in members
+        ]
+        engine, ref = model
+        declared = ref.entry.capability.quantiles
+        parsed = forecast_request({**self.request, "queries": queries}, declared)
+        try:
+            result, grid = engine.forecast(ref, parsed)
+        except ModelOutputError:
+            raise ServiceError(
+                "ModelOutputError", "native forecaster returned invalid forecasts", 503
+            ) from None
+        ensure(
+            grid == tuple(declared),
+            "pinned model capabilities changed",
+            "ModelMismatch",
+        )
+        rows = {member: index for index, member in enumerate(members)}
         levels = spec.quantiles or DEFAULT_QUANTILES
-        grid = _levels(model)
         return {
             "value": [
-                float(result[s, p, quantile_index(0.5, grid)]) for s, p in positions
+                float(result[rows[s], p, quantile_index(0.5, grid)])
+                for s, p in positions
             ],
-            "quantiles": [quantiles(result[s, p], levels, grid) for s, p in positions],
+            "quantiles": [
+                quantiles(result[rows[s], p], levels, grid) for s, p in positions
+            ],
         }

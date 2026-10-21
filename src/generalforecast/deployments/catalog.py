@@ -3,24 +3,21 @@
 
 """Bounded request-context Models API; no management or ingestion dependency."""
 
+import json
 from collections.abc import Sequence
 from dataclasses import asdict
 from typing import Any, Literal, cast
 
+from generalforecast import _core
+from generalforecast._core import ForecastRequest, TabularRequest
 from generalforecast.deployments.boundary import (
     Capability,
     JsonObject,
     Scope,
-    json_object,
+    json_bytes,
 )
 from generalforecast.deployments.catalog_artifacts import artifact
-from generalforecast.deployments.contracts import (
-    ServiceError,
-    fields,
-    number,
-    require,
-    text,
-)
+from generalforecast.deployments.contracts import ServiceError, require
 from generalforecast.deployments.interfaces import InferenceRequest, InferenceResult
 from generalforecast.models.catalog import (
     V1_POLICY,
@@ -30,13 +27,7 @@ from generalforecast.models.catalog import (
     entries,
     parse,
 )
-from generalforecast.models.outputs import (
-    DEFAULT_QUANTILES,
-    class_order,
-    probabilities,
-    quantile_index,
-    quantiles,
-)
+from generalforecast.models.outputs import probabilities, quantiles
 
 MAX_CONTEXT = V1_POLICY.context_rows
 MAX_QUERIES = V1_POLICY.query_rows
@@ -46,51 +37,71 @@ MAX_FEATURES = V1_POLICY.features
 ServingSurface = Literal["remote", "self-hosted"]
 
 
+def _refused(error: _core.RequestError) -> ServiceError:
+    code, message, status = error.args
+    return ServiceError(code, message, status)
+
+
 def _ref(model: str, surface: ServingSurface = "remote") -> ModelRef:
     """A model reference the surface may serve, never code or an unqualified model.
 
     Hosted serving takes remote-qualified models. A self-hosted server also
-    takes a pinned model whose license only its operator can grant.
+    takes a pinned model whose license only its operator can grant. The gates
+    are `gf_core::catalog::resolve`'s, which every surface shares.
     """
-    text(model, "model")
     try:
-        ref = parse(model)
-    except ModelRefError as error:
-        if error.code in ("UnknownModel", "UntrustedModel", "InvalidModel"):
-            raise ServiceError(
-                "ModelNotFound", "model is not in the curated catalog", 404
-            ) from None
-        raise ServiceError(error.code, str(error), 422) from None
-    gates = ref.entry.gates
-    if surface == "self-hosted" and not ref.entry.hostable:
-        if ref.variant:
-            raise ServiceError(
-                "UnsupportedCapability", f"{ref} variants are not qualified", 422
-            )
-        if not ref.entry.allows("self-hosted"):
-            raise ServiceError(
-                "UnsupportedModel", f"{ref.entry.name} has no pinned files", 422
-            )
-    else:
-        if not ref.entry.hostable:
-            raise ServiceError(
-                "UnsupportedModel",
-                f"{ref.entry.name} is local-only: its license does not permit hosted serving",
-                422,
-            )
-        if not gates.allows("remote"):
-            raise ServiceError(
-                "ModelNotFound", "model is not qualified for remote serving", 404
-            )
-        if not gates.allows("remote", variant=ref.variant):
-            raise ServiceError(
-                "UnsupportedCapability",
-                f"{ref} variants are not qualified remotely",
-                422,
-            )
-    if (refused := V1_POLICY.admits(ref)) is not None:
-        raise ServiceError("CapacityExceeded", f"serving policy allows {refused}", 422)
-    return ref
+        return parse(_core.resolve_model(model, surface))
+    except _core.RequestError as error:
+        raise _refused(error) from None
+
+
+def inference_request(
+    request: object, surface: ServingSurface
+) -> TabularRequest | ForecastRequest:
+    """A Models API request, validated by `gf_core::request` before any load.
+
+    The single validator every surface shares: shape, bounds, the model's
+    gates and capability, class order, quantile levels and aligned forecast
+    groups, with the Models API's error codes, messages and statuses.
+    """
+    payload = json_bytes(request)
+    try:
+        return _core.parse_inference(payload, surface)
+    except _core.RequestError as error:
+        raise _refused(error) from None
+
+
+def forecast_request(
+    request: JsonObject,
+    levels: Sequence[float],
+    admission: Literal["catalog", "trusted"] = "catalog",
+    digest: str | None = None,
+) -> ForecastRequest:
+    """A package's or estimator's bound forecast context, validated as a request is.
+
+    The package's lock admitted its model and bounds its context, so neither
+    the serving gates nor a request's size bounds apply; `levels` are those
+    the loaded forecaster outputs. A `trusted` admission also takes the
+    caller's own `module:function` forecaster, at `levels`, whose code
+    `digest` names.
+    """
+    try:
+        payload = json.dumps(request, allow_nan=False, ensure_ascii=False)
+    except (TypeError, ValueError):
+        raise ServiceError("ValidationError", "expected JSON value", 422) from None
+    try:
+        parsed = _core.parse_inference(
+            payload.encode("utf-8"),
+            "local",
+            limits="package",
+            levels=list(levels),
+            admission=admission,
+            digest=digest,
+        )
+    except _core.RequestError as error:
+        raise _refused(error) from None
+    require(isinstance(parsed, ForecastRequest), "expected a forecast request")
+    return cast(ForecastRequest, parsed)
 
 
 def _artifact(entry: ModelEntry) -> JsonObject:
@@ -211,185 +222,81 @@ class CatalogService:
 
     def infer(self, scope: Scope, request: InferenceRequest) -> InferenceResult:
         """Validates before model access and never writes context, query or scores."""
-        value, model = self.check(scope, request)
-        if value["task"] == "forecast":
+        require(isinstance(scope, Scope), "expected validated scope")
+        parsed = inference_request(request, self.surface)
+        model = self.get(scope, parsed.model)
+        if isinstance(parsed, ForecastRequest):
             from generalforecast.deployments.catalog_forecast import infer
 
             return infer(
-                cast(JsonObject, value),
-                ref=_ref(value["model"], self.surface),
+                parsed,
+                ref=parse(parsed.model),
                 surface=self.surface,
                 allow_downloads=self.allow_downloads,
             )
-        return self._tabular(value, model)
+        return self._tabular(parsed, model)
 
     def check(
         self, scope: Scope, request: InferenceRequest
     ) -> tuple[InferenceRequest, JsonObject]:
         """The request's shape and bounds, and its model's metadata, before any load."""
         require(isinstance(scope, Scope), "expected validated scope")
-        value = json_object(request)
-        fields(
-            value,
-            {"model", "task", "target", "features", "context", "queries", "options"},
+        parsed = inference_request(request, self.surface)
+        return (
+            cast(InferenceRequest, json.loads(json_bytes(request))),
+            self.get(scope, parsed.model),
         )
-        model = self.get(scope, value["model"])
-        require(
-            value["task"] in ("classification", "regression", "forecast"),
-            "invalid task",
-        )
-        if value["task"] != model["task"]:
-            raise ServiceError(
-                "UnsupportedTask", "selected model does not support this task", 422
-            )
-        text(value["target"], "target")
-        features = value["features"]
-        require(
-            type(features) is list and len(features) <= MAX_FEATURES,
-            "invalid feature list",
-        )
-        for feature in features:
-            text(feature, "feature")
-        require(len(set(features)) == len(features), "features must be unique")
-        require(value["target"] not in features, "target cannot be a feature")
-        require(type(value["context"]) is list, "context must be a list")
-        require(len(value["context"]) <= MAX_CONTEXT, "context capacity exceeded")
-        require(type(value["queries"]) is list, "queries must be a list")
-        require(0 < len(value["queries"]) <= MAX_QUERIES, "query capacity exceeded")
-        fields(
-            value["options"],
-            set(),
-            {"series"} if value["task"] == "forecast" else {"quantiles"},
-        )
-        return cast(InferenceRequest, value), model
 
-    def _tabular(self, request: InferenceRequest, model: JsonObject) -> InferenceResult:
-        features = request["features"]
-        require(bool(features), "tabular inference requires features")
-        context = _rows(request["context"], features, scoring=False)
-        queries = _rows(request["queries"], features, scoring=True)
-        labeled = [row for row in context if "label" in row]
-        if not labeled:
-            raise ServiceError("EmptyContext", "no usable labeled rows; no score", 503)
-        labels = [row["label"] for row in labeled]
-        classes: tuple = ()
-        if request["task"] == "classification":
-            require(not request["options"], "classification has no quantile options")
-            kind = type(labels[0])
-            require(
-                kind in (str, bool, int),
-                "classification labels must be strings, booleans or integers",
-            )
-            require(
-                all(type(label) is kind for label in labels),
-                "class labels must have one type",
-            )
-            if kind is str:
-                for label in labels:
-                    text(label, "label")
-            classes = class_order(labels)
-            capacity = model["bounds"]["classes"]
-            if len(classes) > capacity:
-                raise ServiceError(
-                    "UnsupportedClassCount",
-                    f"this model serves at most {capacity} classes; "
-                    "@K error-correcting codes serve more",
-                    422,
-                )
-            targets: list = [classes.index(label) for label in labels]
-            levels: list[float] = []
-        else:
-            targets = [number(label, -1e12, 1e12, "label") for label in labels]
-            levels = quantile_levels(
-                request["options"].get("quantiles", list(DEFAULT_QUANTILES))
-            )
-            try:
-                for level in levels:
-                    quantile_index(level)
-            except ValueError as error:
-                raise ServiceError("ValidationError", str(error), 422) from None
-        ref = _ref(request["model"], self.surface)
-        predictions = self._predict(
-            ref,
-            [[row["features"][feature] for feature in features] for row in labeled],
-            targets,
-            [[row["features"][feature] for feature in features] for row in queries],
-            len(classes),
-        )
+    def _tabular(self, request: TabularRequest, model: JsonObject) -> InferenceResult:
+        """Scores a validated request's queries against its labeled context."""
+        classes = request.classes
+        predictions = self._run(parse(request.model), request)
         outputs = []
-        for row, prediction in zip(queries, predictions, strict=True):
-            if classes:
+        for key, prediction in zip(request.query_keys, predictions, strict=True):
+            if request.task == "classification":
                 outputs.append(
-                    {
-                        "key": row["key"],
-                        "probabilities": probabilities(classes, prediction),
-                    }
+                    {"key": key, "probabilities": probabilities(classes, prediction)}
                 )
             else:
                 outputs.append(
-                    {"key": row["key"], "quantiles": quantiles(prediction, levels)}
+                    {"key": key, "quantiles": quantiles(prediction, request.levels)}
                 )
         return {
-            "task": request["task"],
+            "task": request.task,
             "outputs": outputs,
             "artifact": {**model["artifact"], "verified": True},
             "context_provenance": {
                 "source": "request",
-                "supplied_rows": len(context),
-                "usable_labeled_rows": len(labeled),
-                "features": list(features),
-                "target": request["target"],
+                "supplied_rows": request.supplied_rows,
+                "usable_labeled_rows": len(request.context),
+                "features": list(request.features),
+                "target": request.target,
                 "persisted": False,
                 "classes": list(classes),
             },
         }
 
-    def _predict(
-        self,
-        ref: ModelRef,
-        features: Sequence[Sequence[float]],
-        targets: Sequence[Any],
-        queries: Sequence[Sequence[float]],
-        classes: int,
-    ) -> Any:
-        """Fits and decodes genuine supplied context, retaining only model parameters."""
-        import jax.numpy as jnp
-
-        from generalforecast.models import inference, registry
+    def _run(self, ref: ModelRef, request: TabularRequest) -> Any:
+        """The model's checked outputs for a validated request, from the process engine."""
+        from generalforecast import _core, engine
         from generalforecast.models.artifacts import ArtifactError
 
         try:
-            loaded = cast(
-                "registry.TabularModel",
-                registry.load_ref(
-                    ref, surface=self.surface, allow_downloads=self.allow_downloads
-                ),
+            return engine.local(self.surface, self.allow_downloads).tabular(
+                ref, request
             )
         except ArtifactError as error:
             raise ServiceError(error.code, str(error), 503) from None
         except ModelRefError as error:
             raise ServiceError(error.code, str(error), 422) from None
-        try:
-            fitted = inference.fit(
-                loaded,
-                jnp.asarray(features, dtype=jnp.float32),
-                jnp.asarray(targets, dtype=jnp.int32 if classes else jnp.float32),
-                classes,
-            )
-        except ValueError as error:
-            raise ServiceError("UnsupportedClassCount", str(error), 422) from None
-        except Exception:  # noqa: BLE001
-            raise ServiceError(
-                "InferenceFailed", "native inference failed", 503
-            ) from None
-        try:
-            return inference.predict(
-                loaded, fitted, jnp.asarray(queries, dtype=jnp.float32), classes
-            ).tolist()
-        except ValueError:
+        except engine.ModelOutputError:
             raise ServiceError(
                 "ModelOutputError", "native model returned invalid outputs", 503
             ) from None
+        except _core.RequestError as error:
+            raise ServiceError(*error.args) from None
+        except ValueError as error:
+            raise ServiceError("UnsupportedClassCount", str(error), 422) from None
         except Exception:  # noqa: BLE001
             raise ServiceError(
                 "InferenceFailed", "native inference failed", 503
@@ -403,25 +310,11 @@ def create_catalog() -> CatalogService:
 
 def quantile_levels(value: object) -> list[float]:
     """Validates requested quantile levels: strictly increasing, inside (0, 1)."""
-    require(type(value) is list and 0 < len(value) <= 99, "invalid quantile levels")
-    levels = [number(level, 0, 1, "quantile") for level in cast(list, value)]
-    require(all(0 < level < 1 for level in levels), "quantiles must be within (0,1)")
-    require(levels == sorted(set(levels)), "quantiles must strictly increase")
-    return levels
-
-
-def _rows(
-    rows: list[JsonObject], features: list[str], *, scoring: bool
-) -> list[JsonObject]:
-    keys = set()
-    for row in rows:
-        fields(row, {"key", "features"}, set() if scoring else {"label", "event_at"})
-        key = text(row["key"], "key")
-        require(key not in keys, "duplicate row key")
-        keys.add(key)
-        fields(row["features"], set(features))
-        for value in row["features"].values():
-            number(value, -1e12, 1e12, "feature")
-        if "event_at" in row:
-            number(row["event_at"], -1e12, 1e12, "event_at")
-    return rows
+    try:
+        payload = json.dumps(value, allow_nan=False).encode("utf-8")
+    except (TypeError, ValueError):
+        raise ServiceError("ValidationError", "invalid quantile levels", 422) from None
+    try:
+        return _core.quantile_levels(payload)
+    except _core.RequestError as error:
+        raise _refused(error) from None

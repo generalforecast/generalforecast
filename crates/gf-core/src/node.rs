@@ -1509,6 +1509,9 @@ struct TableState {
     /// Request steps taken since a region context fell due, without a
     /// rebuild step.
     rebuild_waited: u32,
+    /// Whether the table holds a context one request brought; see
+    /// `Node::set_single_use`.
+    single_use: bool,
 }
 
 /// Dead row ids past which, and past the live rows, a table is renumbered
@@ -2826,6 +2829,46 @@ impl Node {
         self.step_bytes = Some(bytes);
     }
 
+    /// Whether every table with requests waiting is a single-use context
+    /// not yet fitted, whose requests a step would fit, encode and decode
+    /// in one call.
+    #[must_use]
+    pub fn only_new_contexts_wait(&self) -> bool {
+        let mut waiting = false;
+        for state in self.tables.values() {
+            if state.pending.is_empty()
+                && state.later.is_empty()
+                && state.givens.is_empty()
+                && state.deferred.is_none()
+            {
+                continue;
+            }
+            if !state.single_use || state.fitted == Some(state.epoch) || state.restoring.is_some() {
+                return false;
+            }
+            waiting = true;
+        }
+        waiting && self.drops.is_empty() && self.rebuilding.is_empty()
+    }
+
+    /// Marks a table as holding a context one request brought, which may
+    /// never be read again. Its first step, when the queries waiting read one
+    /// context of every row, fits its state, encodes the context and decodes
+    /// them in one call, writing no pages and keeping no context; a later
+    /// step that reads it again caches it as any table's.
+    ///
+    /// # Errors
+    ///
+    /// If the table does not exist.
+    pub fn set_single_use(&mut self, table: TableId) -> Result<(), NodeError> {
+        let state = self
+            .tables
+            .get_mut(&table)
+            .ok_or(NodeError::UnknownTable(table))?;
+        state.single_use = true;
+        Ok(())
+    }
+
     /// The node with tables' rows in `memory`, which bounds what tables with
     /// files keep in memory; set before any table is made.
     #[must_use]
@@ -2982,6 +3025,7 @@ impl Node {
                 planned_counts: RegionStats::default(),
                 aged_at: None,
                 rebuild_waited: 0,
+                single_use: false,
             },
         );
         Ok(id)
@@ -4499,7 +4543,7 @@ impl Node {
                 .map(|movement| movement.key),
         );
         self.encoding.extend(encoded(&step));
-        self.fitting.extend(step.fits.iter().map(|fit| fit.table));
+        self.fitting.extend(fitted_tables(&step));
         self.turn = TableId(first.0 + 1);
         for (id, _) in &due {
             if let Some(state) = self.tables.get_mut(id) {
@@ -4660,6 +4704,7 @@ impl Node {
                 planned.units,
                 keys,
                 &BTreeMap::new(),
+                false,
                 &mut step,
                 &mut self.parts,
             );
@@ -5202,9 +5247,15 @@ impl Node {
 
     /// Plans again the fits a step held for the tables `failed` names.
     fn unfit(&mut self, step: &Step, failed: impl Fn(TableId) -> bool) {
-        for fit in step.fits.iter().filter(|fit| failed(fit.table)) {
-            if let Some(state) = self.tables.get_mut(&fit.table)
-                && state.fitted == Some(fit.epoch)
+        let fits = step.fits.iter().map(|fit| (fit.table, fit.epoch));
+        let fused = step
+            .units
+            .iter()
+            .filter(|unit| unit.placed == Placed::Fuse)
+            .map(|unit| (unit.table, unit.key.epoch));
+        for (table, epoch) in fits.chain(fused).filter(|(table, _)| failed(*table)) {
+            if let Some(state) = self.tables.get_mut(&table)
+                && state.fitted == Some(epoch)
             {
                 state.fitted = None;
             }
@@ -5221,8 +5272,8 @@ impl Node {
         for key in encoded(step) {
             self.encoding.remove(&key);
         }
-        for fit in &step.fits {
-            self.fitting.remove(&fit.table);
+        for table in fitted_tables(step) {
+            self.fitting.remove(&table);
         }
         let kept = step
             .units
@@ -5300,7 +5351,7 @@ impl Node {
             }
         }
         for (table, key, action) in kept {
-            if action == Action::Transient {
+            if matches!(action, Action::Transient | Action::Fuse) {
                 continue;
             }
             let _ = self.cache.unpin(&key);
@@ -5383,6 +5434,16 @@ struct Rebuilding {
     due: Instant,
 }
 
+/// The tables a step fits a state for: by a fit, or by a fused unit.
+fn fitted_tables(step: &Step) -> impl Iterator<Item = TableId> + '_ {
+    let fused = step
+        .units
+        .iter()
+        .filter(|unit| unit.placed == Placed::Fuse)
+        .map(|unit| unit.table);
+    step.fits.iter().map(|fit| fit.table).chain(fused)
+}
+
 /// The entries a step encodes and keeps: its contexts and its pages.
 fn encoded(step: &Step) -> impl Iterator<Item = CacheKey> + '_ {
     let units = step.units.iter().map(|unit| (unit.key, &unit.placed));
@@ -5459,12 +5520,21 @@ fn schedule_table(
     // A table that summarizes each context fits each unit on its own rows
     // instead: the worker gets no fit and no pages.
     let own = state.spec.summary == SummaryScope::Context;
+    let fuse = !own && wanted.is_none() && fuses(state, snapshot, &planned);
     let fits = step.fits.len();
     if state.fitted != Some(state.epoch) {
         state.horizon = wanted;
     }
     if own {
         state.fitted = Some(state.epoch);
+    } else if fuse {
+        // The unit fits the state on its rows, every row by key, in the call
+        // that encodes and decodes it, so the step has no fit and no pages.
+        let rows: Vec<RowId> = snapshot.rows().iter().collect();
+        let rows = by_key(&state.table, &rows);
+        let (features, _) = state.inputs(&rows)?;
+        fitted_on(state, &rows, &features);
+        state.fitted_latest = rows.iter().filter_map(|&row| state.times.time(row)).max();
     } else if let Some(horizon) = wanted.filter(|_| state.fitted != Some(state.epoch)) {
         // Fit only on rows before the cutoffs, so no query's state saw a later row.
         let before = &state.times.before(horizon) & &snapshot.rows();
@@ -5503,17 +5573,7 @@ fn schedule_table(
             .flat_map(|&index| step.page(index).rows.clone())
             .collect();
         let (features, targets) = state.inputs(&rows)?;
-        let width = state.spec.model_features();
-        let labeled = state.labeled_values(&rows, &features);
-        let (means, deviations) = moments(&labeled, width);
-        state.columns = Columns::of(&labeled, width);
-        let hidden = state.hidden();
-        state.fitted_columns = Some(Fitted {
-            rows: rows.iter().filter(|row| !hidden.contains(row.0)).count() as u64,
-            means,
-            deviations,
-        });
-        state.changed = 0;
+        fitted_on(state, &rows, &features);
         step.fits.push(Fit {
             table: id,
             epoch: state.epoch,
@@ -5522,7 +5582,6 @@ fn schedule_table(
             rows,
             pages: indices,
         });
-        state.fitted = Some(state.epoch);
     }
     if let Some(fit) = step.fits.get(fits) {
         state.fitted_latest = fit
@@ -5544,6 +5603,7 @@ fn schedule_table(
         planned.units,
         keys,
         &placed,
+        fuse,
         step,
         parts,
     )?;
@@ -5581,6 +5641,7 @@ fn place_units(
     units: Vec<crate::planner::Unit>,
     keys: Vec<CacheKey>,
     placed: &BTreeMap<PageId, StepPage>,
+    fuse: bool,
     step: &mut Step,
     parts: &mut PlanParts,
 ) -> Result<(), NodeError> {
@@ -5591,7 +5652,11 @@ fn place_units(
         let mut rows: Vec<RowId> = unit.rows.iter().collect();
         let bytes = state.spec.sizes.bytes(rows.len(), cache.slot_bytes());
         let held = unit.rows.clone();
-        let placement = place(cache, busy, key, bytes, unit.rows, &mut step.movements)?;
+        let placement = if fuse {
+            Placed::Fuse
+        } else {
+            place(cache, busy, key, bytes, unit.rows, &mut step.movements)?
+        };
         // A unit fit on its own rows carries the values the model reads of
         // them, and reads no pages.
         let mut fit = None;
@@ -5599,7 +5664,7 @@ fn place_units(
             // The model reads a context's rows by key, so their order does
             // not depend on the order they were written in.
             rows = by_key(&state.table, &rows);
-            if state.spec.summary == SummaryScope::Context {
+            if fuse || state.spec.summary == SummaryScope::Context {
                 fit = Some(state.inputs(&rows)?);
             } else {
                 encoding |= &held;
@@ -5624,6 +5689,45 @@ fn place_units(
     let pages = place_pages(cache, busy, id, state, snapshot, &missing, false, step);
     parts.add("pages", since);
     pages
+}
+
+/// Whether a table's step fuses its one unit: the table holds a single-use
+/// context not fit this epoch, its plan reads one context of every row, and
+/// the context and the queries waiting stay within the rows a fit embeds
+/// with its state.
+fn fuses(state: &TableState, snapshot: &Snapshot, planned: &Plan) -> bool {
+    let most = state
+        .spec
+        .effective_fit_rows()
+        .min(state.spec.sizes.fused_rows) as u64;
+    let width = state.spec.features.max(1);
+    let queries: usize = state
+        .pending
+        .iter()
+        .map(|(_, features, _)| features.len() / width)
+        .sum();
+    state.single_use
+        && state.fitted != Some(state.epoch)
+        && queries as u64 <= most
+        && matches!(planned.units.as_slice(), [unit]
+            if unit.rows.len() <= most && unit.rows == snapshot.rows())
+}
+
+/// Records a fit of a table's state on `rows`, every live row, whose model
+/// values are `features`: their column summary and moments.
+fn fitted_on(state: &mut TableState, rows: &[RowId], features: &[f32]) {
+    let width = state.spec.model_features();
+    let labeled = state.labeled_values(rows, features);
+    let (means, deviations) = moments(&labeled, width);
+    state.columns = Columns::of(&labeled, width);
+    let hidden = state.hidden();
+    state.fitted_columns = Some(Fitted {
+        rows: rows.iter().filter(|row| !hidden.contains(row.0)).count() as u64,
+        means,
+        deviations,
+    });
+    state.changed = 0;
+    state.fitted = Some(state.epoch);
 }
 
 /// Fits a table's state alone on a seeded sample of at most the effective

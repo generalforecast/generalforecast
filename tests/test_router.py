@@ -1099,7 +1099,6 @@ def test_a_routed_table_of_one_partition_is_one_table(
 def test_a_series_tables_given_groups_pass_through_the_router(
     cluster: tuple[Router, list[Server]],
 ) -> None:
-    from tests.models.timestral.tiny import forecaster
 
     settings: dict[str, Any] = {
         "series": "item",
@@ -1114,7 +1113,7 @@ def test_a_series_tables_given_groups_pass_through_the_router(
         "given", model="tiny-forecaster", **settings
     )
     local = generalforecast.local().create_series_table(
-        "given", model=forecaster(), **settings
+        "given", model="tests.models.timestral.tiny:forecaster", **settings
     )
     generator = np.random.default_rng(0)
     times = list(range(100, 200, 10))

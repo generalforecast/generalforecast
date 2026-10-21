@@ -223,3 +223,17 @@ def tiny_limix(*, regression: bool, seed: int = 0) -> LimiX:
     """
     state, settings = tiny_checkpoint(seed)
     return limix_from_state(one_task(state, regression), settings)
+
+
+def classifier() -> tuple[Any, LimiX]:
+    """A tiny classifier as a model spec target: `tests.models.limix.tiny:classifier`."""
+    from generalforecast.models.limix.model import limix_functions
+
+    return limix_functions, tiny_limix(regression=False)
+
+
+def regressor() -> tuple[Any, LimiX]:
+    """A tiny regressor as a model spec target: `tests.models.limix.tiny:regressor`."""
+    from generalforecast.models.limix.model import limix_functions
+
+    return limix_functions, tiny_limix(regression=True)

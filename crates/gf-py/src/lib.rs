@@ -9,22 +9,29 @@
 //! so other Python threads run meanwhile.
 
 use std::num::{NonZeroU64, NonZeroUsize};
+use std::sync::Arc;
 use std::time::Duration;
 
 use gf_core::cache::{Eviction, Kind, ModelId, TierConfig};
+use gf_core::catalog::{self, Admission, Surface};
 use gf_core::categories::CategoryEncoding;
 use gf_core::forecasting::{self, SeriesSpec};
 use gf_core::node::{
     self, CutoffRefit, DEFAULT_FIT_ROWS, EntrySizes, ErrorKind, NodeError, PastCap, RefitPolicy,
     RequestId, StepRows, SummaryScope, TableId, TableSpec, Targets, Task,
 };
+use gf_core::package;
 use gf_core::planner;
 use gf_core::regions::{Rebuild, RebuildWait, RegionSpec};
+use gf_core::request::{self, Inference, Label, Limits, Num, Options};
 use gf_core::table::RowId;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
+use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+
+mod engine;
 
 fn invalid(error: impl std::fmt::Display) -> PyErr {
     PyValueError::new_err(error.to_string())
@@ -1462,9 +1469,409 @@ impl Node {
     }
 }
 
+pyo3::create_exception!(
+    _core,
+    RequestError,
+    PyValueError,
+    "A refused inference request: `args` are its code, message and HTTP status."
+);
+
+fn refused(error: request::RequestError) -> PyErr {
+    RequestError::new_err((error.code, error.message, error.status))
+}
+
+fn surface(name: &str) -> PyResult<Surface> {
+    name.parse().map_err(invalid)
+}
+
+fn number(py: Python<'_>, value: Num) -> PyResult<Py<PyAny>> {
+    match value {
+        Num::Int(value) => value.into_py_any(py),
+        Num::Float(value) => value.into_py_any(py),
+    }
+}
+
+fn label(py: Python<'_>, value: &Label) -> PyResult<Py<PyAny>> {
+    match value {
+        Label::Bool(value) => value.into_py_any(py),
+        Label::Int(value) => value.into_py_any(py),
+        Label::Text(value) => value.into_py_any(py),
+    }
+}
+
+/// The canonical reference a model spec names, if the surface may serve it.
+///
+/// `surface` is `remote` (the hosted Models API), `self-hosted` (a server its
+/// operator runs) or `local` (a caller that admitted the model already).
+/// Raises `RequestError` as the Models API refuses the reference.
+#[pyfunction]
+fn resolve_model(spec: &Bound<'_, PyAny>, surface: &str) -> PyResult<String> {
+    let spec = spec.extract::<String>().ok();
+    catalog::resolve(spec.as_deref(), self::surface(surface)?)
+        .map(|model| model.to_string())
+        .map_err(refused)
+}
+
+/// Requested quantile levels, from their JSON list: strictly increasing, in (0, 1).
+///
+/// Raises `RequestError` for levels a request may not select.
+#[pyfunction]
+fn quantile_levels(payload: &[u8]) -> PyResult<Vec<f64>> {
+    request::quantile_levels(payload).map_err(refused)
+}
+
+/// A classification or regression request, validated before any weights load.
+#[pyclass(frozen)]
+struct TabularRequest {
+    /// The canonical reference of the model it resolved to.
+    #[pyo3(get)]
+    model: String,
+    #[pyo3(get)]
+    task: &'static str,
+    #[pyo3(get)]
+    target: String,
+    #[pyo3(get)]
+    features: Vec<String>,
+    /// The labeled context rows' features, `(rows, features)`.
+    #[pyo3(get)]
+    context: Py<PyArray2<f32>>,
+    /// Per labeled row, its class code into `classes` (int32) or its value (float32).
+    #[pyo3(get)]
+    targets: Py<PyAny>,
+    /// The classes in output order; empty for a regression.
+    #[pyo3(get)]
+    classes: Vec<Py<PyAny>>,
+    /// The queries' features, `(queries, features)`.
+    #[pyo3(get)]
+    queries: Py<PyArray2<f32>>,
+    #[pyo3(get)]
+    query_keys: Vec<String>,
+    /// The quantile levels a regression returns; empty for a classification.
+    #[pyo3(get)]
+    levels: Vec<f64>,
+    /// Context rows supplied, labeled or not.
+    #[pyo3(get)]
+    supplied_rows: usize,
+    /// SHA-256 of the model and its context, as hex: same context, same table.
+    #[pyo3(get)]
+    fingerprint: String,
+    /// The request as parsed, which the engine runs.
+    parsed: Arc<request::Tabular>,
+}
+
+/// Related series aligned on one time axis, unpadded: the last step is the origin.
+///
+/// Rows are the group's targets in query order, then its covariates sorted
+/// by name; execution left-pads time to the model's patch.
+#[pyclass(frozen, get_all)]
+struct AlignedGroup {
+    /// `(rows, steps)`, zero where unobserved.
+    values: Py<PyArray2<f32>>,
+    observed: Py<PyArray2<bool>>,
+    /// Per row, `TARGET`, `PAST` or `KNOWN`.
+    roles: Py<PyArray1<i32>>,
+    /// Known covariates' values over the horizon, `(rows, horizon)`.
+    future: Py<PyArray2<f32>>,
+    future_observed: Py<PyArray2<bool>>,
+}
+
+/// One forecast query: a series forecast with its group from an origin.
+#[pyclass(frozen, get_all)]
+struct ForecastQuery {
+    key: String,
+    series: String,
+    /// An integer period or floating UTC seconds.
+    origin: Py<PyAny>,
+    /// The group's target series, in row order.
+    members: Vec<String>,
+    /// The row of `series` among `members`.
+    member: usize,
+    /// The forecast's times, one step after another past the origin.
+    times: Vec<Py<PyAny>>,
+    group: Py<AlignedGroup>,
+    /// SHA-256 of the context fingerprint and this group, as hex: its members,
+    /// origin, horizon and known-future covariates.
+    fingerprint: String,
+}
+
+/// A forecast request, validated and aligned before any weights load.
+#[pyclass(frozen)]
+struct ForecastRequest {
+    /// The canonical reference of the model it resolved to.
+    #[pyo3(get)]
+    model: String,
+    #[pyo3(get)]
+    target: String,
+    /// An integer number of periods or floating seconds.
+    #[pyo3(get)]
+    step: Py<PyAny>,
+    #[pyo3(get)]
+    horizon: usize,
+    #[pyo3(get)]
+    levels: Vec<f64>,
+    #[pyo3(get)]
+    known_covariates: Vec<String>,
+    #[pyo3(get)]
+    queries: Vec<Py<ForecastQuery>>,
+    /// `integer-periods` or `utc-seconds`.
+    #[pyo3(get)]
+    time_axis: &'static str,
+    /// Context rows supplied, observed or not.
+    #[pyo3(get)]
+    supplied_rows: usize,
+    /// Context rows with an observed value.
+    #[pyo3(get)]
+    usable_observations: usize,
+    /// SHA-256 of the model and its context, as hex: same context, same table.
+    #[pyo3(get)]
+    fingerprint: String,
+    /// The request as parsed, which the engine runs.
+    parsed: Arc<request::Forecast>,
+}
+
+fn boolean_matrix(py: Python<'_>, values: Vec<bool>, rows: usize) -> PyResult<Py<PyArray2<bool>>> {
+    let width = values.len().checked_div(rows).unwrap_or(0);
+    Ok(PyArray1::from_vec(py, values)
+        .reshape([rows, width])?
+        .unbind())
+}
+
+fn tabular_request(py: Python<'_>, parsed: request::Tabular) -> PyResult<TabularRequest> {
+    let kept = Arc::new(parsed.clone());
+    let rows = parsed.usable_rows();
+    let queries = parsed.query_keys.len();
+    Ok(TabularRequest {
+        parsed: kept,
+        model: parsed.model.to_string(),
+        task: parsed.task.as_str(),
+        target: parsed.target,
+        features: parsed.features,
+        context: matrix(py, parsed.context, rows)?,
+        targets: target_array(py, parsed.targets),
+        classes: parsed
+            .classes
+            .iter()
+            .map(|class| label(py, class))
+            .collect::<PyResult<_>>()?,
+        queries: matrix(py, parsed.queries, queries)?,
+        query_keys: parsed.query_keys,
+        levels: parsed.levels,
+        supplied_rows: parsed.supplied_rows,
+        fingerprint: request::hex(&parsed.fingerprint),
+    })
+}
+
+fn forecast_request(py: Python<'_>, parsed: request::Forecast) -> PyResult<ForecastRequest> {
+    let kept = Arc::new(parsed.clone());
+    let queries = parsed
+        .queries
+        .into_iter()
+        .map(|query| {
+            let group = query.group;
+            let group = AlignedGroup {
+                values: matrix(py, group.values, group.rows)?,
+                observed: boolean_matrix(py, group.observed, group.rows)?,
+                roles: PyArray1::from_vec(py, group.roles).unbind(),
+                future: matrix(py, group.future, group.rows)?,
+                future_observed: boolean_matrix(py, group.future_observed, group.rows)?,
+            };
+            Py::new(
+                py,
+                ForecastQuery {
+                    key: query.key,
+                    series: query.series,
+                    origin: number(py, query.origin)?,
+                    members: query.members,
+                    member: query.member,
+                    times: query
+                        .times
+                        .into_iter()
+                        .map(|time| number(py, time))
+                        .collect::<PyResult<_>>()?,
+                    group: Py::new(py, group)?,
+                    fingerprint: request::hex(&query.fingerprint),
+                },
+            )
+        })
+        .collect::<PyResult<_>>()?;
+    Ok(ForecastRequest {
+        parsed: kept,
+        model: parsed.model.to_string(),
+        target: parsed.target,
+        step: number(py, parsed.step)?,
+        horizon: parsed.horizon,
+        levels: parsed.levels,
+        known_covariates: parsed.known,
+        queries,
+        time_axis: parsed.clock.as_str(),
+        supplied_rows: parsed.supplied_rows,
+        usable_observations: parsed.usable_observations,
+        fingerprint: request::hex(&parsed.fingerprint),
+    })
+}
+
+/// Parses and validates an inference request's JSON payload, without the GIL.
+///
+/// `surface` decides the gates its model passes, as for `resolve_model`.
+/// `limits` is `request` for one Models API request's bounds or `package`
+/// for a package's bound context, which its lock bounds instead. `levels`
+/// are the quantile levels a forecaster outputs, when its weights are
+/// loaded; the catalog's declared levels otherwise. `admission` is
+/// `catalog` for built-in models alone, or `trusted` for a local caller
+/// that also forecasts with its own `module:function` model, at the
+/// `levels` it gives; `digest` names that model's code, which the context's
+/// fingerprint covers. Raises `RequestError` with the code, message and
+/// status the Models API answers.
+#[pyfunction]
+#[pyo3(signature = (payload, surface, *, limits = "request", levels = None, admission = "catalog", digest = None))]
+fn parse_inference(
+    py: Python<'_>,
+    payload: &[u8],
+    surface: &str,
+    limits: &str,
+    levels: Option<Vec<f64>>,
+    admission: &str,
+    digest: Option<String>,
+) -> PyResult<Py<PyAny>> {
+    let admission = match (admission, digest.as_deref()) {
+        ("catalog", None) => Admission::Catalog,
+        ("trusted", Some(digest)) => Admission::Trusted { digest },
+        ("catalog" | "trusted", _) => {
+            return Err(invalid("only a trusted admission names its code's digest"));
+        }
+        _ => return Err(invalid(format!("unknown model admission {admission:?}"))),
+    };
+    let limits = match limits {
+        "request" => Limits::Request,
+        "package" => Limits::Package,
+        _ => return Err(invalid(format!("unknown request limits {limits:?}"))),
+    };
+    let options = Options {
+        surface: self::surface(surface)?,
+        limits,
+        levels: levels.as_deref(),
+        admission,
+    };
+    match py
+        .detach(|| request::parse(payload, &options))
+        .map_err(refused)?
+    {
+        Inference::Tabular(parsed) => Py::new(py, tabular_request(py, parsed)?)?.into_py_any(py),
+        Inference::Forecast(parsed) => Py::new(py, forecast_request(py, parsed)?)?.into_py_any(py),
+    }
+}
+
+/// Rows from an Arrow IPC stream, as one batch.
+fn record_batch(payload: &[u8]) -> PyResult<arrow_array::RecordBatch> {
+    let reader = arrow_ipc::reader::StreamReader::try_new(payload, None).map_err(invalid)?;
+    let schema = reader.schema();
+    let batches = reader.collect::<Result<Vec<_>, _>>().map_err(invalid)?;
+    arrow_select::concat::concat_batches(&schema, &batches).map_err(invalid)
+}
+
+/// A tabular package's context, bound once.
+///
+/// Its labeled rows encoded as the engine reads them, and the vocabularies
+/// its queries are encoded against.
+#[pyclass(frozen)]
+struct PackageContext(package::Context);
+
+#[pymethods]
+impl PackageContext {
+    /// The labeled rows' features, `(rows, width)`.
+    #[getter]
+    fn features(&self, py: Python<'_>) -> PyResult<Py<PyArray2<f32>>> {
+        matrix(py, self.0.features.clone(), self.0.rows)
+    }
+
+    /// Per labeled row, its class code into `classes` (int32) or its value (float32).
+    #[getter]
+    fn targets(&self, py: Python<'_>) -> Py<PyAny> {
+        target_array(py, self.0.targets.clone())
+    }
+
+    /// The classes in output order; empty for a regression.
+    #[getter]
+    fn classes(&self, py: Python<'_>) -> PyResult<Vec<Py<PyAny>>> {
+        self.0
+            .classes
+            .iter()
+            .map(|class| label(py, class))
+            .collect()
+    }
+
+    /// Labeled context rows.
+    #[getter]
+    fn rows(&self) -> usize {
+        self.0.rows
+    }
+
+    /// Each input column's words in code order; empty but for categorical columns.
+    #[getter]
+    fn vocabularies(&self) -> Vec<Vec<String>> {
+        self.0
+            .encoder
+            .vocabularies()
+            .map(<[String]>::to_vec)
+            .collect()
+    }
+
+    /// Query rows from an Arrow IPC stream, encoded as `(rows, width)`.
+    ///
+    /// Words are coded with the context's vocabularies; a word the context
+    /// never held is NaN. Raises `RequestError` for a missing column or values of another kind.
+    fn encode(&self, py: Python<'_>, queries: &[u8]) -> PyResult<Py<PyArray2<f32>>> {
+        let rows = record_batch(queries)?;
+        let count = rows.num_rows();
+        let encoded = py
+            .detach(|| self.0.encoder.encode(&rows))
+            .map_err(refused)?;
+        matrix(py, encoded, count)
+    }
+}
+
+/// Binds a tabular package's context from its lock's schema and its rows.
+///
+/// `schema` is the lock's `TableSchema.to_dict()` as JSON, `task` is
+/// `classification` or `regression`, and `context` is the rows as an Arrow
+/// IPC stream. Only labeled rows are kept. Raises `RequestError`:
+/// `EmptyContext` for no labeled rows, `InvalidPackage` for fewer than two
+/// classes or columns that hold values of another kind.
+#[pyfunction]
+fn bind_package(
+    py: Python<'_>,
+    schema: &[u8],
+    task: &str,
+    target: &str,
+    context: &[u8],
+) -> PyResult<PackageContext> {
+    let schema: package::Schema = serde_json::from_slice(schema).map_err(invalid)?;
+    let task = match task {
+        "classification" => catalog::Task::Classification,
+        "regression" => catalog::Task::Regression,
+        _ => return Err(invalid(format!("a tabular package has no task {task:?}"))),
+    };
+    let rows = record_batch(context)?;
+    py.detach(|| package::bind(&schema, task, target, &rows))
+        .map(PackageContext)
+        .map_err(refused)
+}
+
 #[pymodule]
 fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(bucket_size, module)?)?;
+    module.add_function(wrap_pyfunction!(resolve_model, module)?)?;
+    module.add_function(wrap_pyfunction!(parse_inference, module)?)?;
+    module.add_function(wrap_pyfunction!(quantile_levels, module)?)?;
+    module.add_function(wrap_pyfunction!(bind_package, module)?)?;
+    module.add_class::<PackageContext>()?;
+    module.add_class::<engine::Engine>()?;
+    module.add_class::<engine::BoundTable>()?;
+    module.add("RequestError", module.py().get_type::<RequestError>())?;
+    module.add_class::<TabularRequest>()?;
+    module.add_class::<ForecastRequest>()?;
+    module.add_class::<ForecastQuery>()?;
+    module.add_class::<AlignedGroup>()?;
     module.add("DEFAULT_FIT_ROWS", DEFAULT_FIT_ROWS)?;
     module.add_class::<Strategy>()?;
     module.add_class::<GroupStrategy>()?;

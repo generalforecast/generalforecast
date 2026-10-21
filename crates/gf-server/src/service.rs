@@ -75,7 +75,6 @@ use crate::action::{
 use crate::auth::{
     CREATED, MISSING_OK, QUANTILES, SHIPMENT, Scope, TERM, TERMS, Tokens, WRITE_ID, bearer,
 };
-use crate::columns::{self, Cells, Column, ColumnKind, Strings};
 use crate::config::{Assign, PlacementConfig};
 use crate::metrics::{Histogram, Metrics};
 use crate::name::TableName;
@@ -85,7 +84,8 @@ use crate::shard::{
     Command, Description, Fence, Incoming, Lease, Lineage, LogLength, ServerError, Write,
 };
 use crate::trace::{Trace, traced};
-use crate::wal::{CreationId, LogEntry, Rows, TableDefinition, Terms, decode};
+use crate::wal::{CreationId, Durability, LogEntry, Rows, TableDefinition, Terms, decode};
+use gf_core::columns::{self, Cells, Column, ColumnKind, Strings};
 
 type Boxed<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
@@ -810,6 +810,11 @@ impl Service {
     }
 
     async fn create(&self, definition: TableDefinition, terms: Terms) -> Result<(), Status> {
+        if definition.durability != Durability::Durable {
+            return Err(invalid(
+                "ephemeral tables hold request contexts, which inference requests make",
+            ));
+        }
         let (name, task, columns, creation) = (
             definition.name.clone(),
             Task::of_classes(definition.classes),
@@ -1623,39 +1628,53 @@ fn quantile_levels<T>(request: &Request<T>) -> Result<Option<Vec<f64>>, Status> 
     Ok(Some(levels))
 }
 
-/// The quantile columns of predictions at `levels`, each linearly between
-/// the two of the table's `known` levels around it; one beyond the outermost
+/// Predictions at `levels`, a column per level, each linearly between the
+/// two of the table's `known` levels around it; one beyond the outermost
 /// known level takes that level. Clients compute the same. `values` are
-/// row-major with `known.len()` columns.
+/// row-major with `known.len()` columns; None if they are not.
+#[must_use]
+pub fn quantile_values(values: &[f32], known: &[f64], levels: &[f64]) -> Option<Vec<Vec<f32>>> {
+    let columns = known.len();
+    if columns == 0 || !values.len().is_multiple_of(columns) {
+        return None;
+    }
+    let rows = values.len() / columns;
+    Some(
+        levels
+            .iter()
+            .map(|&level| {
+                let upper = known.partition_point(|&at| at < level).min(columns - 1);
+                let lower = upper.saturating_sub(1);
+                let span = known[upper] - known[lower];
+                let weight = if span > 0.0 {
+                    ((level - known[lower]) / span).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                (0..rows)
+                    .map(|row| {
+                        let at = |column: usize| f64::from(values[row * columns + column]);
+                        (at(lower) * (1.0 - weight) + at(upper) * weight) as f32
+                    })
+                    .collect()
+            })
+            .collect(),
+    )
+}
+
+/// The quantile columns of predictions at `levels`, as `quantile_values`
+/// computes them, named `q<level>`.
 fn quantile_columns(
     values: &[f32],
     known: &[f64],
     levels: &[f64],
 ) -> Result<Vec<(Field, ArrayRef)>, Status> {
-    let columns = known.len();
-    if columns == 0 || !values.len().is_multiple_of(columns) {
-        return Err(Status::internal(
-            "a regressor's predictions have no columns",
-        ));
-    }
-    let rows = values.len() / columns;
+    let picked = quantile_values(values, known, levels)
+        .ok_or_else(|| Status::internal("a regressor's predictions have no columns"))?;
     Ok(levels
         .iter()
-        .map(|&level| {
-            let upper = known.partition_point(|&at| at < level).min(columns - 1);
-            let lower = upper.saturating_sub(1);
-            let span = known[upper] - known[lower];
-            let weight = if span > 0.0 {
-                ((level - known[lower]) / span).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let picked: Vec<f32> = (0..rows)
-                .map(|row| {
-                    let at = |column: usize| f64::from(values[row * columns + column]);
-                    (at(lower) * (1.0 - weight) + at(upper) * weight) as f32
-                })
-                .collect();
+        .zip(picked)
+        .map(|(&level, picked)| {
             (
                 Field::new(format!("q{level}"), DataType::Float32, false),
                 Arc::new(Float32Array::from(picked)) as ArrayRef,
