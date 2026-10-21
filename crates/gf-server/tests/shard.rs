@@ -15,6 +15,7 @@ use gf_server::protocol::{
     Failure, Frame, ModelProfile, PredictionsHeader, StageTime, WorkerReply, WorkerRequest,
     f32_bytes,
 };
+use gf_server::service::{Charge, RequestBudget};
 use gf_server::shard::{Command, Fence, Incoming, Lease, Shard, ShardSettings, Write};
 use gf_server::wal::{
     CreationId, EncryptionKey, Keys, Log, LogEntry, LogError, Record, Rows, TableDefinition, Terms,
@@ -373,6 +374,7 @@ impl Harness {
             table: name(table),
             write: Write::Insert(Incoming { rows, strings }),
             fence: Fence::default(),
+            charge: Charge::default(),
             reply,
         };
         self.commands.send(command).await.unwrap();
@@ -398,6 +400,7 @@ impl Harness {
                 id: id.map(str::to_string),
             },
             fence: Fence::default(),
+            charge: Charge::default(),
             reply,
         };
         self.commands.send(command).await.unwrap();
@@ -992,6 +995,7 @@ async fn a_node_that_needs_leases_takes_writes_only_under_a_term() {
                 lease: Some(lease.clone()),
                 term,
             },
+            charge: Charge::default(),
             reply,
         };
         (command, answer)
@@ -1021,6 +1025,7 @@ async fn a_truncate_empties_the_table_and_later_writes_in_its_batch_follow_it() 
         table: name("rows"),
         write: Write::Truncate,
         fence: Fence::default(),
+        charge: Charge::default(),
         reply,
     };
     let (reply, inserted) = oneshot::channel();
@@ -1041,6 +1046,7 @@ async fn a_truncate_empties_the_table_and_later_writes_in_its_batch_follow_it() 
             .into(),
         ),
         fence: Fence::default(),
+        charge: Charge::default(),
         reply,
     };
     shard.commands.send(truncate).await.unwrap();
@@ -1100,20 +1106,29 @@ async fn acknowledged_writes_are_headed_once_the_shard_goes_idle() {
     let head = shard.directory.join("rows.head");
     let initial_head = std::fs::read(&head).unwrap();
 
-    shard.insert(&[1, 2, 3]).await;
-    shard.insert(&[4]).await;
-
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        if std::fs::read(&head).unwrap() != initial_head {
-            break;
+    // The shard goes idle after each write, so each moves the head on in
+    // turn; waiting on the first alone could catch the head between them.
+    let headed = |before: Vec<u8>| {
+        let head = head.clone();
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let now = std::fs::read(&head).unwrap();
+                if now != before {
+                    return now;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the log head did not catch up while the shard was idle"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the log head did not catch up while the shard was idle"
-        );
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    };
+    shard.insert(&[1, 2, 3]).await;
+    let first_head = headed(initial_head).await;
+    shard.insert(&[4]).await;
+    headed(first_head).await;
 
     let copy = shard.directory.with_extension("copy");
     std::fs::create_dir(&copy).unwrap();
@@ -1298,6 +1313,7 @@ impl Harness {
                 strings: Vec::new(),
             }),
             fence: Fence::default(),
+            charge: Charge::default(),
             reply,
         };
         self.commands.send(command).await.unwrap();
@@ -1428,4 +1444,58 @@ async fn a_series_table_compacted_and_restarted_forecasts_as_before() {
         shard.forecast_over("rows", &[1], None, 257).await,
         Err(Code::InvalidArgument)
     );
+}
+
+#[tokio::test]
+async fn a_queued_write_keeps_its_budget_until_it_is_answered() {
+    let test = async {
+        let shard = shard(settings()).await;
+        shard.create(3).await.unwrap();
+        // A held check blocks the shard, so the write waits in its queue.
+        let (reply, created) = oneshot::channel();
+        let command = Command::Create {
+            definition: definition("held", 6),
+            terms: Terms::default(),
+            reply,
+        };
+        shard.commands.send(command).await.unwrap();
+
+        let budget = RequestBudget::new(1_000);
+        let mut charge = budget.charge();
+        charge.grow(1_000).unwrap();
+        let (reply, mut written) = oneshot::channel();
+        let command = Command::Write {
+            table: name("rows"),
+            write: Write::Insert(
+                Rows {
+                    keys: vec![1],
+                    features: vec![1.0, 0.0],
+                    targets: Targets::Classes(vec![1]),
+                    times: None,
+                    id: None,
+                    words: Vec::new(),
+                    writes: Vec::new(),
+                    layout: None,
+                    table: None,
+                }
+                .into(),
+            ),
+            fence: Fence::default(),
+            charge,
+            reply,
+        };
+        shard.commands.send(command).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The queued write holds the budget, so the next call's rows are refused.
+        assert!(written.try_recv().is_err());
+        assert!(budget.charge().grow(1).is_err());
+
+        shard.held.notify_one();
+        assert!(created.await.unwrap().is_ok());
+        assert_eq!(written.await.unwrap().map(|written| written.rows), Ok(1));
+        assert!(budget.charge().grow(1_000).is_ok());
+    };
+    tokio::time::timeout(Duration::from_secs(30), test)
+        .await
+        .expect("the write was answered in time");
 }
