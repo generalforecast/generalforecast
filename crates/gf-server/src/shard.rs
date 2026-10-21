@@ -26,8 +26,8 @@
 //! other log work go on, and predictions wait for it.
 //!
 //! A prediction whose caller has gone, such as one that timed out, leaves the
-//! queue before the next step is planned. Each log's head is saved with every
-//! sync, and again when the shard stops.
+//! queue before the next step is planned. Each log's head is saved when its
+//! writes go idle, and again when the shard stops.
 //!
 //! The worker reports which tables' parts of a step failed, so one table's
 //! error fails only its own requests. A table that fails three steps running
@@ -787,6 +787,7 @@ enum Event {
     Hung,
     Retry,
     Started(Box<Result<WorkerConnection, String>>),
+    Idle,
 }
 
 /// A compaction under way: the writes it holds back, the callers waiting for
@@ -859,9 +860,10 @@ pub struct Shard {
     rows_reported: u64,
     /// Tables whose logs are being rewritten off the shard, and where their results come.
     compacting: HashMap<TableName, Compacting>,
+    /// Tables whose logs synced since their heads were last saved.
+    unsaved_heads: HashSet<TableName>,
     compactions: mpsc::UnboundedReceiver<Finished>,
     compacted: mpsc::UnboundedSender<Finished>,
-    next_compaction: u64,
 }
 
 impl Shard {
@@ -932,9 +934,9 @@ impl Shard {
             cache_reported: [0; 3],
             rows_reported: 0,
             compacting: HashMap::new(),
+            unsaved_heads: HashSet::new(),
             compactions,
             compacted,
-            next_compaction: 0,
         })
     }
 
@@ -987,6 +989,7 @@ impl Shard {
                 .filter(|down| down.starting.is_none())
                 .map(|down| down.retry);
             let starting = self.down.as_mut().and_then(|down| down.starting.as_mut());
+            let heads_behind = !self.unsaved_heads.is_empty();
             // Biased, so a reply that came in while the shard was busy, such
             // as compacting a log, wins over the deadline it would have met.
             let event = tokio::select! {
@@ -1006,6 +1009,7 @@ impl Shard {
                         started.unwrap_or_else(|error| Err(error.to_string())),
                     ))
                 }
+                () = std::future::ready(()), if heads_behind => Event::Idle,
             };
             match event {
                 Event::Command(Some(command)) => {
@@ -1029,6 +1033,7 @@ impl Shard {
                     down.starting = Some(tokio::spawn(WorkerConnection::spawn(launch)));
                 }
                 Event::Started(started) => self.started(*started).await,
+                Event::Idle => self.save_idle_heads(),
             }
         }
         self.drain().await;
@@ -1067,6 +1072,18 @@ impl Shard {
     fn save_heads(&mut self) {
         for (table, entry) in &mut self.tables {
             if let Err(error) = entry.log.save_head() {
+                tracing::error!(table = table.as_str(), "saving the log's head: {error}");
+            }
+        }
+        self.unsaved_heads.clear();
+    }
+
+    fn save_idle_heads(&mut self) {
+        let tables: Vec<TableName> = self.unsaved_heads.drain().collect();
+        for table in tables {
+            if let Some(entry) = self.tables.get_mut(&table)
+                && let Err(error) = entry.log.save_head()
+            {
                 tracing::error!(table = table.as_str(), "saving the log's head: {error}");
             }
         }
@@ -2491,6 +2508,7 @@ impl Shard {
         }
         match replayed.and_then(|()| replay.finish()) {
             Ok(log) => {
+                self.unsaved_heads.insert(definition.name.clone());
                 self.add_entry(
                     &definition,
                     id,
@@ -2759,6 +2777,7 @@ impl Shard {
         // One sync per log, all at once, then every staged write applies in order.
         let logs: HashSet<&str> = staged.iter().map(|item| item.table.as_str()).collect();
         let synced = sync_logs(&mut self.tables, &logs);
+        self.unsaved_heads.extend(synced.keys().cloned());
         for table in synced.keys() {
             self.check_poisoned(table);
         }
@@ -2956,6 +2975,7 @@ impl Shard {
         let appended = log.append(&record);
         self.check_poisoned(table);
         appended?;
+        self.unsaved_heads.insert(self.names[&id].clone());
         let log_length = self.tables[table].log.length();
         let (written, dropped) = self
             .apply_record(id, record, log_length)
@@ -3042,6 +3062,7 @@ impl Shard {
                         sequence,
                         std::slice::from_ref(&snapshot),
                     )?;
+                    self.unsaved_heads.insert(self.names[&id].clone());
                     let Record::Snapshot(rows) = snapshot else {
                         unreachable!("matched a snapshot above");
                     };
@@ -3087,6 +3108,7 @@ impl Shard {
         let synced = self.tables.get_mut(&name).expect("found above").log.sync();
         self.check_poisoned(&name);
         synced?;
+        self.unsaved_heads.insert(name);
         for (record, log_length) in staged {
             let (_, dropped) = self
                 .apply_record(id, record, log_length)
@@ -3120,6 +3142,7 @@ impl Shard {
         let compactor = entry
             .log
             .begin_compaction(&entry.definition, entry.log.length())?;
+        let number = compactor.number();
         let row_bytes = (entry.definition.features() * 4 + 48) as u64;
         let per_record = usize::try_from(self.snapshot_bytes / row_bytes)
             .unwrap_or(usize::MAX)
@@ -3149,8 +3172,6 @@ impl Shard {
                 .collect()
         });
         let name = name.clone();
-        let number = self.next_compaction;
-        self.next_compaction += 1;
         let sender = self.compacted.clone();
         let table = name.clone();
         tokio::task::spawn_blocking(move || {
@@ -3201,6 +3222,9 @@ impl Shard {
                 entry.log.install_compaction(compacted)?;
                 Ok(entry.log.length())
             });
+        if self.tables.contains_key(&table) {
+            self.unsaved_heads.insert(table.clone());
+        }
         match &installed {
             Ok(length) => {
                 let entry = self
@@ -3256,6 +3280,7 @@ impl Shard {
         };
         removed.map_err(|error| ServerError::Internal(format!("removing the log: {error}")))?;
         self.tables.remove(table);
+        self.unsaved_heads.remove(table);
         self.names.remove(&id);
         self.unserve(id).await;
         Ok(())
@@ -3281,7 +3306,11 @@ impl Shard {
         }
         let id = self.entry(table)?;
         self.settle().await;
-        self.tables.remove(table);
+        let entry = self.tables.remove(table).expect("found above");
+        if let Err(error) = entry.log.close() {
+            tracing::error!(table = table.as_str(), "closing the log's head: {error}");
+        }
+        self.unsaved_heads.remove(table);
         self.names.remove(&id);
         self.unserve(id).await;
         Ok(())
