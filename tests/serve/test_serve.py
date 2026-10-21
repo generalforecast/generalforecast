@@ -1,5 +1,6 @@
 """`gf serve`, the standalone Models API server. Injected kernels are not model evidence."""
 
+import asyncio
 import http.client
 import json
 import os
@@ -466,9 +467,103 @@ def test_local_only_models_serve_on_the_operators_own_server(serve):
     status, body = call(
         url,
         "/v1alpha1/projects/local/predictions",
-        envelope("predictions", predictions_payload(model="tabpfn-3-classifier")),
+        envelope(
+            "predictions",
+            predictions_payload(
+                model="tabpfn-3-classifier",
+                context=[{"x": 0.0, "y": False}, {"x": 3.0, "y": True}],
+                options={"id": "id"},
+            ),
+        ),
     )
-    assert status == 422 and body["error"]["code"] == "UnsupportedCapability"
+    assert status == 200, body
+    result = body["result"]
+    assert result["model"].startswith("catalog/tabpfn-3-classifier@")
+    assert result["task"] == "classification"
+    assert result["context"]["source"] == "request" and result["context"]["rows"] == 2
+    assert result["predictions"] == [
+        {"id": "q", "label": True, "probabilities": {"false": 0.25, "true": 0.75}}
+    ]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_sdk_predict_works_against_a_local_only_model(serve, asynchronous):
+    from generalforecast.async_client import AsyncClient
+
+    context = pa.table({"x": [0.0, 1.0, 3.0], "y": [False, None, True]})
+    queries = pa.table({"x": [1.5, 2.5]})
+    url = serve("tabpfn-3-classifier").url
+    if asynchronous:
+
+        async def run():
+            async with AsyncClient(base_url=url) as client:
+                return await client.predict(
+                    model="tabpfn-3-classifier",
+                    target="y",
+                    context=context,
+                    queries=queries,
+                )
+
+        prediction = asyncio.run(run())
+    else:
+        with Client(base_url=url) as client:
+            prediction = client.predict(
+                model="tabpfn-3-classifier",
+                target="y",
+                context=context,
+                queries=queries,
+            )
+    assert prediction.task == "classification"
+    assert prediction.model.startswith("catalog/tabpfn-3-classifier@")
+    assert prediction.context is not None and prediction.context.rows == 2
+    assert prediction.table.column("label").to_pylist() == [True, True]
+    assert prediction.table.column("probabilities").to_pylist()[0] == {
+        "false": 0.25,
+        "true": 0.75,
+    }
+
+
+def test_local_only_regressor_predictions_select_quantiles(serve):
+    url = serve("tabpfn-3-regressor").url
+    with Client(base_url=url) as client:
+        prediction = client.predict(
+            model="tabpfn-3-regressor",
+            target="y",
+            context=pa.table({"x": [0.0, 1.0], "y": [1.0, 3.0]}),
+            queries=pa.table({"x": [2.0]}),
+            options={"quantiles": [0.1, 0.9]},
+            outputs=["value", "quantiles"],
+        )
+    [row] = prediction.table.to_pylist()
+    assert row["value"] == pytest.approx(0.5 * 999 + 2.0, rel=1e-3)
+    assert set(row["quantiles"]) == {"0.1", "0.9"}
+    status, body = call(
+        url,
+        "/v1alpha1/projects/local/predictions",
+        envelope(
+            "predictions",
+            predictions_payload(
+                model="tabpfn-3-regressor",
+                task="regression",
+                context=[{"x": 0.0, "y": 1.0}],
+                options={"quantiles": [0.1]},
+            ),
+        ),
+    )
+    assert status == 422 and body["error"]["code"] == "ValidationError"
+
+
+def test_local_only_forecasters_still_refuse_predictions():
+    from generalforecast.models.catalog import parse
+    from generalforecast.serve.models import CatalogModel
+
+    model = CatalogModel(parse("timesfm-3"), allow_downloads=False)
+    with pytest.raises(ServiceError) as caught:
+        model.predict(
+            Scope("local", "r-test"),
+            predictions_payload(model="timesfm-3", task="forecast"),
+        )
+    assert caught.value.code == "UnsupportedCapability"
 
 
 def test_unservable_targets_fail_before_listening(tmp_path, package):

@@ -25,7 +25,8 @@ from generalforecast.deployments.boundary import (
     json_object,
 )
 from generalforecast.deployments.contracts import VERSION, ServiceError, name, require
-from generalforecast.packages import CatalogResolver, Package, PackageLock, PythonLock
+from generalforecast.packages import Package, PackageLock, PythonLock
+from generalforecast.packages.models import describe
 from generalforecast.packages.validation import bytes_digest
 from generalforecast.python_packages.compiler import MAX_ARCHIVE
 from generalforecast.tabular import file_format, read_table, to_arrow
@@ -485,7 +486,7 @@ def one_shot_payload(
         )
         semantic["outputs"] = list(outputs)
     if task is None:
-        tasks = CatalogResolver().resolve(model, offline=True).tasks
+        tasks = describe(model).tasks
         require(len(tasks) == 1, "provide an explicit model task")
         task = tasks[0]
     query_table = table(queries, columns=features)
