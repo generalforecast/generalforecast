@@ -21,6 +21,7 @@ import pyarrow as pa
 import pytest
 import yaml
 
+from generalforecast.cli import parser as cli_parser
 from generalforecast.client import Client
 from generalforecast.deployments.boundary import MAX_BYTES, Scope
 from generalforecast.deployments.catalog import CatalogService
@@ -368,6 +369,12 @@ def test_envelope_mismatches_are_rejected(serve, package):
         url, path, envelope("predictions", {}), headers={"Content-Type": "text/plain"}
     )
     assert status == 422
+
+
+def test_serve_rejects_api_key_cli_argument():
+    with pytest.raises(SystemExit) as error:
+        cli_parser().parse_args(["serve", "--api-key", "x"])
+    assert error.value.code == 2
 
 
 def test_api_key_is_required_when_configured(serve, package):
