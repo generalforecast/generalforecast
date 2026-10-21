@@ -8,18 +8,16 @@ Requires the pinned TabICL and Chronos-2 artifacts, downloaded if missing.
 
 from typing import Literal
 
-import jax.numpy as jnp
 import numpy as np
 import pyarrow as pa
 import pytest
 
+import generalforecast
 from generalforecast.deployments.boundary import Scope
 from generalforecast.deployments.catalog import CatalogService
 from generalforecast.deployments.interfaces import InferenceRequest
 from generalforecast.deployments.package_runtime import PackageExecutor
 from generalforecast.local_models import LocalModels
-from generalforecast.models import inference, registry
-from generalforecast.models.contract import TabularFunctions
 from generalforecast.models.outputs import class_key
 from tests.product_runtime.test_executor import checked
 
@@ -65,21 +63,23 @@ def _request(
 
 
 def _local(model: str, task: str) -> np.ndarray:
+    """The model's outputs from a table of its own on a local client, apart from the engine."""
     rows, labels = _context(task == "classification")
-    functions, parameters = registry.load(model)
-    assert isinstance(functions, TabularFunctions)
-    loaded = (functions, parameters)
     classes = sorted(set(labels)) if task == "classification" else []
     targets = [classes.index(label) for label in labels] if classes else labels
-    fitted = inference.fit(
-        loaded,
-        jnp.asarray(rows, jnp.float32),
-        jnp.asarray(targets, jnp.int32 if classes else jnp.float32),
-        len(classes),
+    client = generalforecast.local()
+    table = client.create_table(
+        "t",
+        model=model,
+        features=len(rows[0]),
+        classes=len(classes) or None,
     )
-    return inference.predict(
-        loaded, fitted, jnp.asarray(rows[:5], jnp.float32), len(classes)
+    table.insert(
+        np.arange(len(rows)),
+        np.asarray(rows, np.float32),
+        np.asarray(targets, np.int32 if classes else np.float32),
     )
+    return np.asarray(table.predict(np.asarray(rows[:5], np.float32)))
 
 
 @pytest.mark.parametrize("model", ["tabicl-classifier@4", "tabicl-classifier@4*2"])

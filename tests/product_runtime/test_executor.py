@@ -2,9 +2,7 @@
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
-from types import SimpleNamespace
 
-import numpy as np
 import pyarrow as pa
 import pytest
 import yaml
@@ -12,9 +10,11 @@ import yaml
 from generalforecast.deployments.contracts import ServiceError
 from generalforecast.deployments.interfaces import PreparedExecution
 from generalforecast.deployments.package_runtime import PackageExecutor
+from generalforecast.engine import ModelOutputError
 from generalforecast.packages import ModelPin, Package, PackageLock
 from generalforecast.packages.validation import digest
 from generalforecast.tabular import arrow_bytes
+from tests.utils.engine import FakeEngine
 
 
 def checked(root, data, **changes):
@@ -45,25 +45,7 @@ def data():
 
 @pytest.fixture
 def kernels(monkeypatch):
-    calls = []
-    monkeypatch.setattr(
-        "generalforecast.deployments.package_runtime._load",
-        lambda *args: (SimpleNamespace(), None),
-    )
-
-    def fit(model, x, y, count):
-        calls.append(np.asarray(x).copy())
-        return count, float(np.mean(np.asarray(y)))
-
-    def predict(model, fitted, x, classes):
-        count, cache = fitted
-        if count:
-            return np.tile([0.25, 0.75], (len(x), 1))
-        return np.tile(np.arange(999, dtype=float) + cache, (len(x), 1))
-
-    monkeypatch.setattr("generalforecast.models.inference.fit", fit)
-    monkeypatch.setattr("generalforecast.models.inference.predict", predict)
-    return calls
+    return FakeEngine().install(monkeypatch).contexts
 
 
 def test_prepare_warms_once_preserves_ids_outputs_and_immutable_state(
@@ -279,10 +261,13 @@ def test_bad_native_output_and_private_error_are_typed(
     package = checked(tmp_path, data, id="id")
     prepared = PackageExecutor().prepare(package.lock, data)
     monkeypatch.undo()
-    monkeypatch.setattr(
-        "generalforecast.models.inference._tabular",
-        lambda _: (None, lambda *args: np.array([[np.nan, 1.0]])),
-    )
+
+    def invalid(*_args):
+        raise ModelOutputError("the model returned invalid outputs")
+
+    engine, _ = prepared._model
+    monkeypatch.setattr(engine, "predict", invalid)
+    monkeypatch.setattr(engine, "tabular", invalid)
     with pytest.raises(ServiceError) as error:
         prepared.predict(pa.table({"x": [1.0]}))
     assert error.value.code == "ModelOutputError"

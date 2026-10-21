@@ -6,10 +6,10 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
 
+use gf_core::columns::{Column, ColumnKind, Words};
 use gf_core::node::{FittedColumns, RowLayout, Scaling, TableLayout, Targets};
 use gf_core::pages::{Bucket, CellLayout, IndexLayout, PageId, PageLayout};
 use gf_core::table::RowId;
-use gf_server::columns::{Column, ColumnKind, Words};
 use gf_server::name::TableName;
 use gf_server::protocol::{RecencySpec, StrategySpec};
 use gf_server::setup;
@@ -72,6 +72,7 @@ fn definition() -> TableDefinition {
         created: CreationId::parse("0123456789abcdef"),
         times: TimeKind::Integer,
         route_by: None,
+        durability: Default::default(),
     }
 }
 

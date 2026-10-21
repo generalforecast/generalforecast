@@ -7,19 +7,23 @@ use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use gf_core::cache::Eviction;
+use gf_core::columns::{Column, ColumnKind};
 use gf_core::node::{Scheduling, Targets};
-use gf_server::columns::{Column, ColumnKind};
 use gf_server::metrics::Metrics;
 use gf_server::name::TableName;
 use gf_server::protocol::{
     Failure, Frame, ModelProfile, PredictionsHeader, StageTime, WorkerReply, WorkerRequest,
     f32_bytes,
 };
+use gf_server::routes::Routes;
 use gf_server::service::{Charge, RequestBudget};
-use gf_server::shard::{Command, Fence, Incoming, Lease, Shard, ShardSettings, Write};
+use gf_server::shard::{
+    Asked, Command, EphemeralLimits, Fence, Incoming, Inferred, Lease, RequestContext, Shard,
+    ShardSettings, Write,
+};
 use gf_server::wal::{
-    CreationId, EncryptionKey, Keys, Log, LogEntry, LogError, Record, Rows, TableDefinition, Terms,
-    TimeKind, decode,
+    CreationId, Durability, EncryptionKey, Keys, Log, LogEntry, LogError, Record, Rows,
+    TableDefinition, Terms, TimeKind, decode,
 };
 use gf_server::worker::WorkerConnection;
 use serde_json::Value;
@@ -107,6 +111,25 @@ fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notif
                         message: "ValueError: seven classes".to_string(),
                     }
                     .frame(),
+                    // The fake worker compiles three recorded programs as it
+                    // starts, reporting progress after each.
+                    WorkerRequest::Allocate { .. } => {
+                        for _ in 0..3 {
+                            if WorkerReply::Progress
+                                .frame()
+                                .write_to(&mut stream)
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        WorkerReply::Warmed {
+                            compiles: 3,
+                            seconds: 0.5,
+                        }
+                        .frame()
+                    }
                     _ => WorkerReply::Ok.frame(),
                 }
             };
@@ -230,6 +253,16 @@ async fn shard(settings: ShardSettings) -> Harness {
 
 /// A shard over a directory, which may hold the logs of an earlier one.
 async fn shard_in(settings: ShardSettings, directory: std::path::PathBuf) -> Harness {
+    shard_routed(settings, directory, None).await
+}
+
+/// A shard over a directory, telling `routes`, if given, as their shard 0
+/// which contexts it holds.
+async fn shard_routed(
+    settings: ShardSettings,
+    directory: std::path::PathBuf,
+    routes: Option<Arc<Routes>>,
+) -> Harness {
     let (ours, theirs) = UnixStream::pair().unwrap();
     let behaviour = Arc::new(AtomicU8::new(OK));
     let held = Arc::new(Notify::new());
@@ -248,6 +281,9 @@ async fn shard_in(settings: ShardSettings, directory: std::path::PathBuf) -> Har
         metrics.clone(),
     )
     .unwrap();
+    if let Some(routes) = routes {
+        shard = shard.with_routes(routes, 0);
+    }
     shard.allocate().await.unwrap();
     Harness {
         commands: shard.spawn().unwrap(),
@@ -273,6 +309,11 @@ fn settings() -> ShardSettings {
         queue_bytes: 1 << 20,
         snapshot_bytes: 1 << 30,
         timers: false,
+        ephemeral: EphemeralLimits {
+            tables: 4,
+            bytes: 1 << 20,
+            idle: Duration::from_secs(300),
+        },
     }
 }
 
@@ -307,6 +348,7 @@ fn definition(name: &str, classes: u32) -> TableDefinition {
         created: CreationId::parse("0123456789abcdef"),
         times: TimeKind::Integer,
         route_by: None,
+        durability: Default::default(),
     }
 }
 
@@ -536,6 +578,22 @@ fn status(error: &gf_server::shard::ServerError) -> Code {
         ServerError::Unavailable(_) => Code::Unavailable,
         ServerError::Internal(_) => Code::Internal,
     }
+}
+
+#[tokio::test]
+async fn a_workers_compiles_at_start_count_before_its_shard_takes_steps() {
+    let shard = tokio::time::timeout(Duration::from_secs(10), shard(settings()))
+        .await
+        .unwrap();
+
+    assert_eq!(shard.metrics.warm_compiles.get(), 3);
+    assert!((shard.metrics.warm_seconds.get() - 0.5).abs() < 1e-9);
+    assert!(
+        shard
+            .metrics
+            .render()
+            .contains("gf_worker_warm_compiles_total 3")
+    );
 }
 
 #[tokio::test]
@@ -1498,4 +1556,135 @@ async fn a_queued_write_keeps_its_budget_until_it_is_answered() {
     tokio::time::timeout(Duration::from_secs(30), test)
         .await
         .expect("the write was answered in time");
+}
+
+/// The fingerprint a test names a context by: its name's bytes.
+fn fingerprint_of(name: &str) -> [u8; 32] {
+    let mut fingerprint = [0u8; 32];
+    fingerprint[..name.len()].copy_from_slice(name.as_bytes());
+    fingerprint
+}
+
+/// A request context of `rows` rows over the two columns, as the HTTP front
+/// makes it, named `ctx-<fingerprint>`.
+fn context(fingerprint: &str, rows: u128) -> RequestContext {
+    RequestContext {
+        fingerprint: fingerprint_of(fingerprint),
+        definition: TableDefinition {
+            durability: Durability::Ephemeral,
+            ..definition(&format!("ctx-{fingerprint}"), 3)
+        },
+        keys: (0..rows).collect(),
+        features: (0..rows).flat_map(|row| [row as f32, 0.0]).collect(),
+        targets: Targets::Classes((0..rows).map(|row| (row % 3) as i32).collect()),
+        times: None,
+    }
+}
+
+impl Harness {
+    async fn infer(&self, context: RequestContext) -> Result<Inferred, Code> {
+        let (reply, answer) = oneshot::channel();
+        let command = Command::Infer {
+            context: Box::new(context),
+            asked: Asked::Rows(vec![0.5, 0.0, 1.5, 0.0]),
+            trace: String::new(),
+            reply,
+        };
+        self.commands.send(command).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(30), answer)
+            .await
+            .expect("answered in time")
+            .unwrap()
+            .map_err(|error| status(&error))
+    }
+}
+
+#[tokio::test]
+async fn a_request_context_is_kept_in_memory_and_read_again_by_its_fingerprint() {
+    let shard = shard(settings()).await;
+    let first = shard.infer(context("a", 4)).await.unwrap();
+    assert_eq!((first.predictions.rows, first.predictions.columns), (2, 3));
+    assert_eq!(first.levels, None);
+    shard.infer(context("a", 4)).await.unwrap();
+    assert_eq!(shard.metrics.ephemeral_tables.get(), 1);
+    assert_eq!(shard.metrics.tables.get(), 0);
+    // Nothing of it reaches the disk: no log, no rows file.
+    let written: Vec<_> = std::fs::read_dir(&shard.directory)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(written.is_empty(), "{written:?}");
+}
+
+#[tokio::test]
+async fn ephemeral_tables_past_the_count_go_least_recently_used_first() {
+    let shard = shard(settings()).await;
+    for fingerprint in ["a", "b", "c", "d"] {
+        shard.infer(context(fingerprint, 4)).await.unwrap();
+    }
+    assert_eq!(shard.metrics.ephemeral_tables.get(), 4);
+    // Reading `a` again makes `b` the least recently used, which goes.
+    shard.infer(context("a", 4)).await.unwrap();
+    shard.infer(context("e", 4)).await.unwrap();
+    assert_eq!(shard.metrics.ephemeral_tables.get(), 4);
+    shard.infer(context("b", 4)).await.unwrap();
+    assert_eq!(shard.metrics.ephemeral_tables.get(), 4);
+}
+
+#[tokio::test]
+async fn the_routes_forget_a_context_as_its_table_leaves_the_shard() {
+    let routes = Arc::new(Routes::new(1, 16));
+    let directory = std::env::temp_dir().join(format!("gf-shard-routes-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut settings = settings();
+    settings.ephemeral.tables = 1;
+    let shard = shard_routed(settings, directory, Some(routes.clone())).await;
+    shard.infer(context("a", 4)).await.unwrap();
+    assert_eq!(routes.owner(&fingerprint_of("a")), Some(0));
+    shard.infer(context("b", 4)).await.unwrap();
+    assert_eq!(routes.owner(&fingerprint_of("a")), None);
+    assert_eq!(routes.owner(&fingerprint_of("b")), Some(0));
+    assert_eq!(routes.len(), 1);
+}
+
+#[tokio::test]
+async fn ephemeral_tables_past_the_bytes_go_but_a_pinned_one_stays() {
+    let mut settings = settings();
+    // One context of 4,096 rows: 16 + 8 + 4 bytes a row.
+    settings.ephemeral.bytes = 4096 * 28;
+    let shard = shard(settings).await;
+    shard.infer(context("a", 4096)).await.unwrap();
+    assert_eq!(shard.metrics.ephemeral_tables.get(), 1);
+    shard.infer(context("b", 4096)).await.unwrap();
+    assert_eq!(shard.metrics.ephemeral_tables.get(), 1);
+    // A context larger than the budget is answered while it is pinned, then goes.
+    shard.infer(context("c", 8192)).await.unwrap();
+    shard.infer(context("d", 4)).await.unwrap();
+    assert_eq!(shard.metrics.ephemeral_tables.get(), 1);
+}
+
+#[tokio::test]
+async fn ephemeral_tables_go_once_idle() {
+    let mut settings = settings();
+    settings.ephemeral.idle = Duration::from_millis(200);
+    let shard = shard(settings).await;
+    shard.infer(context("a", 4)).await.unwrap();
+    assert_eq!(shard.metrics.ephemeral_tables.get(), 1);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while shard.metrics.ephemeral_tables.get() > 0 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the idle table went");
+}
+
+#[tokio::test]
+async fn only_ephemeral_definitions_take_request_contexts() {
+    let shard = shard(settings()).await;
+    let mut durable = context("a", 4);
+    durable.definition.durability = Durability::Durable;
+    assert_eq!(shard.infer(durable).await, Err(Code::InvalidArgument));
 }

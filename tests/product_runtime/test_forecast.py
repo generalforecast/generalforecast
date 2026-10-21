@@ -1,7 +1,6 @@
 """Forecast alignment contract tests with explicitly substituted numeric kernels."""
 
 from dataclasses import replace
-from types import SimpleNamespace
 
 import numpy as np
 import pyarrow as pa
@@ -9,8 +8,10 @@ import pytest
 
 from generalforecast.deployments.contracts import ServiceError
 from generalforecast.deployments.package_runtime import PackageExecutor
+from generalforecast.engine import Forecasts
 from generalforecast.models.catalog import CHRONOS2_QUANTILES
 from tests.product_runtime.test_executor import checked
+from tests.utils.engine import FakeEngine
 
 
 @pytest.fixture
@@ -31,22 +32,16 @@ def context():
 
 @pytest.fixture
 def engine(tmp_path, context, monkeypatch):
-    properties = SimpleNamespace(patch=16, quantiles=CHRONOS2_QUANTILES)
-    model = (SimpleNamespace(properties=lambda _: properties), None)
-    monkeypatch.setattr(
-        "generalforecast.deployments.package_runtime._load", lambda *a: model
-    )
+    fake = FakeEngine(CHRONOS2_QUANTILES).install(monkeypatch)
 
-    def run(model, group, horizon):
-        result = np.broadcast_to(
-            np.asarray(group.future).sum() + np.arange(21),
-            (group.values.shape[0], horizon, 21),
+    def forecast(ref, request):
+        future = request.queries[0].group.future.sum()
+        values = np.broadcast_to(
+            future + np.arange(21), (len(request.queries), request.horizon, 21)
         ).copy()
-        return result
+        return Forecasts(values, tuple(CHRONOS2_QUANTILES))
 
-    monkeypatch.setattr(
-        "generalforecast.deployments.package_runtime.forecast._run", run
-    )
+    monkeypatch.setattr(fake, "forecast", forecast)
     package = checked(
         tmp_path,
         context,
@@ -144,11 +139,7 @@ def test_bad_forecast_queries_are_typed(engine, case):
 def test_irregular_context_and_covariate_disagreement_fail_before_ready(
     tmp_path, context, monkeypatch
 ):
-    properties = SimpleNamespace(patch=16, quantiles=CHRONOS2_QUANTILES)
-    model = (SimpleNamespace(properties=lambda _: properties), None)
-    monkeypatch.setattr(
-        "generalforecast.deployments.package_runtime._load", lambda *a: model
-    )
+    FakeEngine(CHRONOS2_QUANTILES).install(monkeypatch)
     package = checked(
         tmp_path,
         context,

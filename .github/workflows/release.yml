@@ -38,9 +38,10 @@ jobs:
       # native extension and Python workers need no server/router executable.
       - if: runner.os == 'macOS'
         run: |
-          cargo build --release --locked -p gf-cli --bin gf
+          cargo build --release --locked -p gf-cli --bin gf -p gf-server --bin gf-server
           mkdir -p wheel-data/scripts
           cp target/release/gf wheel-data/scripts/gf-native
+          cp target/release/gf-server wheel-data/scripts/gf-server
           sed -i '' 's/^# data = "wheel-data"/data = "wheel-data"/' pyproject.toml
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -48,9 +49,10 @@ jobs:
           manylinux: "2_28"
           args: --release --locked --out dist
           before-script-linux: |
-            cargo build --release --locked -p gf-cli --bin gf
+            cargo build --release --locked -p gf-cli --bin gf -p gf-server --bin gf-server
             mkdir -p wheel-data/scripts
             cp target/release/gf wheel-data/scripts/gf-native
+            cp target/release/gf-server wheel-data/scripts/gf-server
             sed -i 's/^# data = "wheel-data"/data = "wheel-data"/' pyproject.toml
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
@@ -61,6 +63,7 @@ jobs:
           uv pip install --python smoke/bin/python dist/*.whl
           smoke/bin/gf --help
           smoke/bin/gf-native --help
+          smoke/bin/gf-server --help
           smoke/bin/gf serve --help
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

@@ -32,8 +32,11 @@ def forecast(
     allow_downloads: bool = False,
 ) -> np.ndarray:
     """Uses the admitted native grouped kernel with one shared row per covariate."""
-    from generalforecast.deployments.catalog_forecast import infer
+    from generalforecast.deployments.catalog import forecast_request
+    from generalforecast.deployments.catalog_forecast import checked
+    from generalforecast.local_models import code_digest, custom_model
     from generalforecast.models.catalog import parse
+    from generalforecast.models.outputs import quantile_index
 
     def instant(value):
         if isinstance(value, datetime.datetime):
@@ -97,12 +100,22 @@ def forecast(
             }
         },
     }
-    result = infer(request, ref=parse(spec.model), allow_downloads=allow_downloads)
+    custom = custom_model(spec.model)
+    ref = parse(spec.model, trusted=custom)
+    parsed = forecast_request(
+        request,
+        spec.quantiles if custom else ref.entry.capability.quantiles,
+        "trusted" if custom else "catalog",
+        code_digest(spec.model) if custom else None,
+    )
+    values, levels = checked(
+        ref, parsed, surface="local", allow_downloads=allow_downloads
+    )
+    columns = [quantile_index(level, levels) for level in spec.quantiles]
     output = np.empty((len(rows), len(spec.quantiles)), dtype=float)
-    forecasts: Any = result["outputs"]
-    for item in forecasts:
-        for offset, index in enumerate(groups[item["series"]]):
-            output[index] = [item["quantiles"][str(q)][offset] for q in spec.quantiles]
+    for query, target in zip(parsed.queries, values, strict=True):
+        for offset, index in enumerate(groups[query.series]):
+            output[index] = target[offset, columns]
     return output
 
 
@@ -131,8 +144,10 @@ def admitted_spec(
     model: Any, task: str, table: pa.Table, *, target: str, **options: Any
 ) -> PackageSpec:
     """Resolves metadata and validates all context rows without executing weights."""
+    from generalforecast.local_models import custom_model
+
     ensure(
-        isinstance(model, str),
+        not custom_model(model),
         "custom native models cannot be exported",
         "UnsupportedCapability",
     )

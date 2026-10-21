@@ -1,105 +1,94 @@
-"""Native tabular context fitting and reusable immutable query state, for any model."""
+"""Package tabular contexts, bound once and scored on the engine, for any model."""
 
+import json
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import pyarrow as pa
 
-from generalforecast.columns import Column, encode, prepare
+from generalforecast import _core
 from generalforecast.deployments.contracts import ServiceError
-from generalforecast.models import inference
+from generalforecast.engine import Bound, Labeled, LocalEngine, ModelOutputError
+from generalforecast.models.catalog import ModelRef
 from generalforecast.models.outputs import (
     DEFAULT_QUANTILES,
-    class_order,
     probabilities,
     quantile_index,
     quantiles,
 )
 from generalforecast.packages import PackageLock
 from generalforecast.packages.schema import TableSchema
-from generalforecast.packages.validation import ensure
+from generalforecast.packages.validation import PackageError
+from generalforecast.tabular import arrow_bytes
 
 
-def _columns(schema: TableSchema) -> tuple[Column, ...]:
-    return tuple(
-        Column(
-            c.name,
-            "categorical"
-            if c.semantic == "category" or c.type == "string"
-            else "datetime"
-            if c.semantic == "datetime" or c.type in ("date", "timestamp")
-            else "numeric",
-        )
-        for c in schema.columns
-        if c.role == "input"
-    )
+def _refused(error: _core.RequestError) -> PackageError:
+    code, message, _ = error.args
+    return PackageError(code, message)
 
 
 @dataclass(frozen=True)
 class TabularContext:
-    """Independent fit statistics, vocabularies and immutable attention cache."""
+    """A context's `gf_core::package` binding and the engine context its queries read.
 
-    columns: tuple[Column, ...]
-    vocabularies: tuple[tuple[tuple[str, int], ...], ...]
-    classes: tuple
-    state: Any
-    cache: Any
+    The labeled rows are bound once as a table, which lives as long as the
+    prepared package: a snapshot's or dataset's for every request, a request
+    context's for that request.
+    """
+
+    context: _core.PackageContext
+    classes: tuple[Any, ...]
+    levels: tuple[float, ...]
+    bound: Bound
 
     @classmethod
-    def build(cls, lock: PackageLock, model: Any, table: pa.Table, schema: TableSchema):
-        """Fits all selected labeled rows and blocks until their cache is ready."""
-        import jax.numpy as jnp
-
+    def build(
+        cls,
+        lock: PackageLock,
+        model: tuple[LocalEngine, ModelRef],
+        table: pa.Table,
+        schema: TableSchema,
+    ):
+        """Binds the labeled rows through `gf_core::package`, then as a table."""
         target = lock.spec.target
         assert target is not None
-        table = table.filter(table[target].is_valid())
-        ensure(table.num_rows > 0, "context has no labeled rows", "EmptyContext")
-        columns = _columns(schema)
-        values, _ = prepare(table, columns)
-        vocabularies: list[dict[str, int]] = [{} for _ in columns]
-        matrix, added = encode(values, columns, vocabularies, True)
-        for index, words in added.items():
-            vocabularies[index].update({word: i for i, word in enumerate(words)})
-        labels = table[target].to_pylist()
-        classes = class_order(labels) if lock.task == "classification" else ()
-        if classes:
-            ensure(len(set(labels)) >= 2, "selected context needs at least two classes")
-            labels = [classes.index(value) for value in labels]
-        state, cache = inference.fit(
-            model,
-            jnp.asarray(matrix),
-            jnp.asarray(labels, dtype=jnp.int32 if classes else jnp.float32),
-            len(classes),
-        )
-        return cls(
-            columns,
-            tuple(tuple(v.items()) for v in vocabularies),
-            classes,
-            state,
-            cache,
-        )
-
-    def predict(self, lock: PackageLock, model: Any, table: pa.Table) -> dict[str, Any]:
-        """Bounds native query intermediates while preserving request row order."""
-        outputs: dict[str, list] = {name: [] for name in lock.outputs}
-        for offset in range(0, table.num_rows, 128):
-            batch = self._batch(lock, model, table.slice(offset, 128))
-            for name, values in outputs.items():
-                values.extend(batch[name])
-        return outputs
-
-    def _batch(self, lock: PackageLock, model: Any, table: pa.Table) -> dict[str, Any]:
-        import jax.numpy as jnp
-
-        values, _ = prepare(table, self.columns)
-        matrix, _ = encode(
-            values, self.columns, [dict(v) for v in self.vocabularies], False
-        )
         try:
-            result = inference.predict(
-                model, (self.state, self.cache), jnp.asarray(matrix), len(self.classes)
+            context = _core.bind_package(
+                json.dumps(schema.to_dict()).encode("utf-8"),
+                "classification" if lock.task == "classification" else "regression",
+                target,
+                arrow_bytes(table),
             )
-        except ValueError:
+        except _core.RequestError as error:
+            raise _refused(error) from None
+        classes = tuple(context.classes)
+        labeled = Labeled(
+            task="classification" if classes else "regression",
+            context=np.asarray(context.features, np.float32),
+            targets=np.asarray(context.targets, np.int32 if classes else np.float32),
+            classes=classes,
+        )
+        engine, ref = model
+        return cls(
+            context,
+            classes,
+            tuple(lock.spec.quantiles or DEFAULT_QUANTILES),
+            engine.bind(ref, labeled),
+        )
+
+    def predict(
+        self, lock: PackageLock, model: tuple[LocalEngine, ModelRef], table: pa.Table
+    ) -> dict[str, Any]:
+        """Scores the query rows in their order, in steps the engine shares."""
+        try:
+            matrix = self.context.encode(arrow_bytes(table))
+        except _core.RequestError as error:
+            raise _refused(error) from None
+        engine, _ = model
+        try:
+            result = engine.predict(self.bound, np.asarray(matrix, np.float32))
+        except ModelOutputError:
             raise ServiceError(
                 "ModelOutputError", "native model returned invalid outputs", 503
             ) from None
@@ -108,9 +97,8 @@ class TabularContext:
                 "label": [self.classes[i] for i in result.argmax(axis=1)],
                 "probabilities": [probabilities(self.classes, row) for row in result],
             }
-        levels = lock.spec.quantiles or DEFAULT_QUANTILES
         median = quantile_index(0.5)
         return {
             "value": result[:, median].tolist(),
-            "quantiles": [quantiles(row, levels) for row in result],
+            "quantiles": [quantiles(row, self.levels) for row in result],
         }

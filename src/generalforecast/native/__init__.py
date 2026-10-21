@@ -12,16 +12,16 @@ if TYPE_CHECKING:
     from generalforecast.native.client import Answer as Answer
     from generalforecast.native.client import Definition as Definition
     from generalforecast.native.client import Described as Described
-    from generalforecast.native.client import LocalClient as LocalClient
-    from generalforecast.native.client import LocalSeriesTable as LocalSeriesTable
-    from generalforecast.native.client import LocalTable as LocalTable
     from generalforecast.native.client import RebuildWait as RebuildWait
     from generalforecast.native.client import SeriesDefinition as SeriesDefinition
     from generalforecast.native.client import SeriesTable as SeriesTable
     from generalforecast.native.client import Table as Table
-    from generalforecast.native.client import local as local
     from generalforecast.native.estimators import Classifier as Classifier
     from generalforecast.native.estimators import Regressor as Regressor
+    from generalforecast.native.local_client import LocalClient as LocalClient
+    from generalforecast.native.local_client import LocalSeriesTable as LocalSeriesTable
+    from generalforecast.native.local_client import LocalTable as LocalTable
+    from generalforecast.native.local_client import local as local
 
 try:
     __version__ = version("generalforecast")
@@ -62,16 +62,16 @@ _EXPORTS = {
             "Answer",
             "Definition",
             "Described",
-            "LocalClient",
-            "LocalSeriesTable",
-            "LocalTable",
             "RebuildWait",
             "SeriesDefinition",
             "SeriesTable",
             "Table",
-            "local",
         ),
         "generalforecast.native.client",
+    ),
+    **dict.fromkeys(
+        ("LocalClient", "LocalSeriesTable", "LocalTable", "local"),
+        "generalforecast.native.local_client",
     ),
 }
 

@@ -126,3 +126,10 @@ def tiny_timesfm(seed: int = 0) -> TimesFM:
         The model.
     """
     return timesfm_from_state(*tiny_checkpoint(seed))
+
+
+def forecaster() -> tuple[Any, TimesFM]:
+    """A tiny TimesFM as a model spec target: `tests.models.timesfm3.tiny:forecaster`."""
+    from generalforecast.models.timesfm3.model import timesfm_functions
+
+    return timesfm_functions, tiny_timesfm()
