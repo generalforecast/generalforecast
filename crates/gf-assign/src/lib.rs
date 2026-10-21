@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Assigns slices of a table's key space to GPUs by measured load.
 //!
 //! Every row and query maps to a 64-bit key (`key`), a slice is a range of

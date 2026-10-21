@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rendezvous hashing: every table ranks every node, and the top node serves it.
 //!
 //! Adding a node moves only the tables it now ranks first, and removing one

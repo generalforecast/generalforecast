@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The CLI never offers human-session workspace commands and explains denials."""
 
 import json

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The single binder of package tables: a lock's schema and Arrow rows as
 //! the numbers the engine reads.
 //!

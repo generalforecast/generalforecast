@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Stage-zero ports, not a second server or a claim of implemented backends.
 
 Owners implement these methods in the modules listed in replacement-contracts.md.

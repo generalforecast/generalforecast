@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """An engine double for surface tests: it records what surfaces run, and models nothing."""
 
 import json

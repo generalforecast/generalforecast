@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Regions: queries near each other sharing one context.
 //!
 //! A table with regions divides its retrieval space by k-means centers, drawn

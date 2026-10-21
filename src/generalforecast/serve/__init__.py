@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """A standalone Models API server for catalog models.
 
 `gf serve` runs gf-server, which answers the hosted Models API routes with

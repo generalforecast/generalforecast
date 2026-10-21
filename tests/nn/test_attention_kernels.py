@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Attention kernels: query and block chunking, the attention dtype, and cuDNN on GPU."""
 
 from __future__ import annotations

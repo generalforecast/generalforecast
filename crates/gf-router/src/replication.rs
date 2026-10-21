@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Where a table's copies should be shipped, released and read, and which may
 //! take over its writes.
 //!

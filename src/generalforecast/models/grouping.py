@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Forecast times as `gf_core::request` takes them, shared by every forecast surface.
 
 `gf_core::request` aligns a query's related series and covariates into its

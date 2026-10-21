@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The single validator of inference requests, before any weights load.
 //!
 //! Every surface that takes an `InferenceRequest` (`model, task, target,

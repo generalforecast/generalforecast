@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The Flight table client, for a `gf-server`, a `gf-router` or this process's engine."""
 
 import asyncio

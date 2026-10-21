@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Every model's outputs against its upstream PyTorch implementation, on real weights.
 
 Both sides get the same prepared table, or the same group of series, and the

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Verified checkpoint directories for built-in models, the one way they are found.
 
 A built-in model's files come from `GF_CHECKPOINTS/<name>` when that is set,

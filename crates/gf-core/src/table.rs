@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! A table's rows: identity, versions, the change log and snapshots.
 //!
 //! The table itself lives outside generalforecast. This is generalforecast's view of it, built from the

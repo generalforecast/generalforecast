@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Verified in-process package execution, without HTTP, persistence or identity."""
 
 from dataclasses import dataclass

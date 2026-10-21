@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Timestral checkpoints: converted from Mistral's repositories, mirrored, then loaded.
 
 The published files are the inference config, flat, and safetensors under

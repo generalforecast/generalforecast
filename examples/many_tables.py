@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """An example serving fifty small tables, one per customer, from one client.
 
 Each keeps its own rows and preprocessing, yet tables sharing a model run in the

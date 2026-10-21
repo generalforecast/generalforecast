@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Immutable declarative packages, with lazy exports to keep table conversion independent."""
 
 from typing import TYPE_CHECKING, Any

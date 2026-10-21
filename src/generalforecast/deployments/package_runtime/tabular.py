@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Package tabular contexts, bound once and scored on the engine, for any model."""
 
 import json

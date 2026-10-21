@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Prometheus metrics: counters, gauges and time histograms, for the server and
 //! for each table, and an optional log of each request's timings.
 

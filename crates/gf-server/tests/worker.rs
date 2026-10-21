@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The worker pipeline: frames are sent without waiting, and each reply reaches its request.
 
 use std::time::Duration;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Planning a step costs the same however many rows a table holds.
 //!
 //! A table shaped like one of the Radar workload's: a classifier over 256

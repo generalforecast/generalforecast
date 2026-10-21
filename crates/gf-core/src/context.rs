@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Contexts: sets of rows a model conditions on, and their fingerprints.
 
 use std::iter::Sum;

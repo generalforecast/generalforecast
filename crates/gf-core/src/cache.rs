@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The cache directory: where each encoded state lives, and what to evict.
 //!
 //! The directory tracks slots, not memory. The Python executor owns the device

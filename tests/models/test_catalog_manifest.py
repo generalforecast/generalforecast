@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The native validator's catalog manifest and reference parsing match the catalog."""
 
 import json

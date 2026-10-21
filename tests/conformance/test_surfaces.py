@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """One table of requests, answered alike by every surface that runs the engine.
 
 Each case runs in process through `CatalogService` and `LocalModels` on a

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! `gf-router run --config router.toml`: forwards clients to the nodes that
 //! serve their tables. `init` writes a starter configuration, and `check`
 //! looks at the configuration and reaches each node.

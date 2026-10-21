@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Attention blocks, static settings and the PyTorch QKV layout, without PyTorch fixtures."""
 
 from __future__ import annotations

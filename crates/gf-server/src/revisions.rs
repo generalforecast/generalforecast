@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Deployed revisions, loaded on demand from the control plane that
 //! publishes them, and the metrics their predictions report back to it.
 //!

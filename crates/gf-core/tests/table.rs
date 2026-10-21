@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rows, versions, the change log and snapshots.
 
 use gf_core::context::Fingerprint;

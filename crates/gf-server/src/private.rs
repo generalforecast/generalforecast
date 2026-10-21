@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! A Flight `Service` over an embedding process's shards, for that process
 //! alone: on a Unix socket in an owner-only directory where there are Unix
 //! sockets, else on a loopback port, behind a random token no configuration

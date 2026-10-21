@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Feature columns: their kinds, and how a frame's values become the numbers models read.
 
 Each of a table's columns has a kind. Numeric columns are read as float32, with

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The local engine: gf-server's shards in this process, models loaded in the workers."""
 
 import gc

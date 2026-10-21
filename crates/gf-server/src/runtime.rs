@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! A server's shards, from its configuration and its hardware: one worker
 //! per GPU, or on CPU one per run of `cpu_threads` cores, each behind its
 //! own shard, which a request's context reaches by `routes::Routes`. The

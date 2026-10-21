@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The engine: a server's shards, and how a validated request reaches one.
 //!
 //! A request's context becomes an ephemeral table named for its

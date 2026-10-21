@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The engine in this process: gf-server's shards, each a node and a worker
 //! subprocess, on a runtime of their own.
 //!

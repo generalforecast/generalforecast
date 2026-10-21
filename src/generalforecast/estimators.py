@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """sklearn adapters over the existing optimized native tabular and series engine."""
 
 import datetime

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """What `gf serve` serves: a catalog model or a locked tabular package, described as gf-server reads it."""
 
 from pathlib import Path

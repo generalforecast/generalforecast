@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The contract for forecasters: models that predict a series' next steps.
 
 A forecaster differs from a tabular model in what it is asked: there is no

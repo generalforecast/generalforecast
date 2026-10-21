@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Python SDK upload/lifecycle contracts; fixture results are not isolated inference."""
 
 import asyncio

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The Models API front: routes, envelopes, headers, errors and keys, with
 //! inference through a shard driven by a fake worker.
 
