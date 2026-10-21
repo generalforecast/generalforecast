@@ -60,8 +60,8 @@ class SeriesProperties:
         output_patch: Steps per output patch; horizons pad to a multiple.
         context_limit: Most context steps the model reads.
         pass_limit: Most horizon steps one pass of the network predicts, or
-            None when one pass covers any horizon the context cap leaves
-            room for; `forecast` and `decode` take longer horizons and loop.
+            None when one pass covers any horizon. `forecast` and `decode`
+            loop to produce a longer horizon when the model imposes a limit.
         quantiles: The levels of the last output axis, increasing.
         reusable: Whether `encode` and `decode` exist: the context encoding
             does not read the horizon when no row is a known covariate, so a

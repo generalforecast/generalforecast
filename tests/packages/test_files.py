@@ -38,8 +38,21 @@ def test_symlinks_directories_manifest_and_data_are_never_followed(tmp_path):
         with pytest.raises(PackageError) as error:
             read(tmp_path, path)
         assert error.value.code == "UnsafePath"
-    with pytest.raises(PackageError):
-        read(tmp_path / "linked", "history.csv")
+
+
+def test_package_root_can_have_a_symlinked_parent(tmp_path):
+    actual = tmp_path / "actual"
+    package = actual / "package"
+    package.mkdir(parents=True)
+    (package / "gf.yaml").write_text(
+        "name: linked-root\nmodel: tabicl-classifier\ntarget: y\n"
+        "context: {source: none}\n"
+    )
+    (tmp_path / "linked").symlink_to(actual, target_is_directory=True)
+
+    loaded = Package.load(tmp_path / "linked" / "package")
+
+    assert loaded.spec.name == "linked-root"
 
 
 def test_lock_atomicity_private_mode_and_failed_replace_cleanup(tmp_path, monkeypatch):

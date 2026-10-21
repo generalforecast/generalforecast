@@ -47,7 +47,7 @@ def relative(value: Any) -> str:
 @contextmanager
 def directory(root: Path):
     """Pins a directory handle without following any symlink component."""
-    root = Path(os.path.abspath(root))
+    root = Path(os.path.realpath(root))
     fd = os.open(root.anchor, os.O_RDONLY | os.O_DIRECTORY)
     try:
         for part in root.parts[1:]:

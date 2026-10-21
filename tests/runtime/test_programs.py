@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import jax
@@ -52,6 +54,25 @@ def test_programs_without_compiles_ahead_compile_only_when_called() -> None:
     programs.wait()
 
     assert events == []
+
+
+def test_concurrent_compiled_calls_store_one_winner() -> None:
+    programs = Programs(None, lambda: False, ahead=False)
+    started = threading.Barrier(2)
+    calls = []
+
+    def build():
+        calls.append(object())
+        started.wait()
+        return lambda value: value
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(programs.compiled, "same", build)
+        second = pool.submit(programs.compiled, "same", build)
+        assert first.result() is second.result()
+
+    assert len(calls) == 2
+    assert len(programs._compiled) == 1
 
 
 def test_programs_drop_past_their_shapes_only_when_memory_is_short() -> None:

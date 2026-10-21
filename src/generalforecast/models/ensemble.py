@@ -92,7 +92,10 @@ def _labels(estimators: int, targets: Array, num_classes: int) -> Array:
     if num_classes == 0:
         return jnp.broadcast_to(targets, (estimators, *targets.shape))
     shifts = jnp.arange(estimators)[:, None]
-    return ((targets[None, :] + shifts) % num_classes).astype(targets.dtype)
+    shifted = (targets[None, :] + shifts) % num_classes
+    return jnp.where(targets[None, :] < 0, targets[None, :], shifted).astype(
+        targets.dtype
+    )
 
 
 def _shifted_back(each: Array, num_classes: int) -> Array:

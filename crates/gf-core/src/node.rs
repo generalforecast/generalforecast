@@ -819,6 +819,8 @@ pub enum NodeError {
     UnknownTable(TableId),
     /// A table was given no feature columns.
     NoFeatures,
+    /// A retrieval vector was requested before its standardizer was fitted.
+    Unscaled,
     Strategy(StrategyError),
     /// Queries were sent to a table with no rows to learn from.
     EmptyTable(TableId),
@@ -871,6 +873,7 @@ impl fmt::Display for NodeError {
         match self {
             Self::UnknownTable(table) => write!(formatter, "table {} does not exist", table.0),
             Self::NoFeatures => write!(formatter, "a table needs at least one feature column"),
+            Self::Unscaled => write!(formatter, "the table has no fitted retrieval space"),
             Self::Strategy(error) => error.fmt(formatter),
             Self::EmptyTable(_) => write!(
                 formatter,
@@ -1822,8 +1825,9 @@ impl TableState {
         let vectors: Vec<Vec<f32>> = self
             .pending
             .iter()
-            .flat_map(|(_, queries, _)| queries.chunks(width).map(|row| self.vector(row)))
-            .collect();
+            .flat_map(|(_, queries, _)| queries.chunks(width))
+            .map(|row| self.vector(row))
+            .collect::<Result<_, _>>()?;
         let (cutoffs, prints, window_of) = self.windows();
         let Some(spec) = self.spec.regions else {
             let planned = self.plan_around(snapshot, &vectors, &cutoffs, &prints, &window_of);
@@ -2046,14 +2050,15 @@ impl TableState {
     }
 
     /// Counts a changed row, with these features, toward its region's rebuild.
-    fn note_change(&mut self, features: &[f32]) {
+    fn note_change(&mut self, features: &[f32]) -> Result<(), NodeError> {
         if let Some(spec) = self.spec.regions
             && self.regions.is_some()
         {
-            let vector = self.vector(features);
+            let vector = self.vector(features)?;
             let regions = self.regions.as_mut().expect("checked above");
             regions.change(&vector, spec.rebuild, Instant::now());
         }
+        Ok(())
     }
 
     /// The rows' strata, by class or by target bin.
@@ -2494,11 +2499,11 @@ impl TableState {
         Ok(())
     }
 
-    fn vector(&self, row: &[f32]) -> Vec<f32> {
+    fn vector(&self, row: &[f32]) -> Result<Vec<f32>, NodeError> {
         self.standardizer
             .as_ref()
-            .expect("set by the first insert")
-            .vector(row)
+            .map(|standardizer| standardizer.vector(row))
+            .ok_or(NodeError::Unscaled)
     }
 }
 
@@ -2730,14 +2735,12 @@ impl Node {
                 && !self.doomed.contains(&key)
                 && !self.encoding.contains(&key)
         };
-        Ok(rows
-            .map(|row| {
-                regions
-                    .built_of(&state.vector(row))
-                    .filter(cached)
-                    .map(Built::churn)
-            })
-            .collect())
+        rows.map(|row| {
+            state
+                .vector(row)
+                .map(|vector| regions.built_of(&vector).filter(cached).map(Built::churn))
+        })
+        .collect::<Result<_, _>>()
     }
 
     /// How a table is served: its strategy as cut to the model's trained
@@ -3091,7 +3094,10 @@ impl Node {
             Some(cutoff) => &state.times.before(cutoff) & &live,
             None => live,
         };
-        let vectors: Vec<Vec<f32>> = queries.chunks(width).map(|row| state.vector(row)).collect();
+        let vectors: Vec<Vec<f32>> = queries
+            .chunks(width)
+            .map(|row| state.vector(row))
+            .collect::<Result<_, _>>()?;
         // Its fields alone, so the table's cores can be drawn meanwhile.
         let scaled = Scaled {
             rows: &state.rows,
@@ -3705,7 +3711,7 @@ impl Node {
             let row = state.table.apply(Change::Insert(RowKey(key)))?;
             let time = times.and_then(|times| times[offset]);
             if paged {
-                placed.push((row, state.spec.bucket(time), state.vector(values)));
+                placed.push((row, state.spec.bucket(time), state.vector(values)?));
             }
             state.times.set(row, time);
             if let (Some(index), Some(time)) = (&mut state.series, time) {
@@ -3865,7 +3871,7 @@ impl Node {
             }
             if moved && paged {
                 let bucket = state.spec.bucket(time);
-                let vector = state.vector(values);
+                let vector = state.vector(values)?;
                 let scaled = Scaled {
                     rows: &state.rows,
                     standardizer: state.standardizer.as_ref(),
@@ -3899,7 +3905,7 @@ impl Node {
             // region's rebuild: a label is when an unlabeled row enters
             // contexts, or one update to it for a model that reads it unlabeled.
             if state.serves(was) || state.serves(is) {
-                state.note_change(values);
+                state.note_change(values)?;
                 changed += 1;
             }
             rows.push(row);
@@ -3990,7 +3996,7 @@ impl Node {
                 state.columns.add(&values, -1.0);
             }
             if state.serves(labeled) {
-                state.note_change(&values);
+                state.note_change(&values)?;
                 changed += 1;
             }
             rows.push(row);
@@ -4077,6 +4083,9 @@ impl Node {
             .tables
             .get_mut(&table)
             .ok_or(NodeError::UnknownTable(table))?;
+        if state.spec.series.is_some() {
+            return Err(ForecastError::OnlyForecasts.into());
+        }
         state.check_queries(queries, cutoffs)?;
         if let Some(error) = state.empty(table, cutoffs) {
             return Err(error);
@@ -4225,8 +4234,18 @@ impl Node {
     ) -> Result<RequestId, NodeError> {
         let request = RequestId(self.next_request);
         let state = self.state(table)?;
-        if state.spec.series.is_none() {
-            return Err(ForecastError::NotSeries.into());
+        let max_horizon = state
+            .spec
+            .series
+            .as_ref()
+            .ok_or(ForecastError::NotSeries)?
+            .max_horizon;
+        if horizon > max_horizon {
+            return Err(ForecastError::HorizonTooLong {
+                horizon: horizon.get(),
+                limit: max_horizon.get(),
+            }
+            .into());
         }
         if series.is_empty() {
             return Err(NodeError::NoQueries);

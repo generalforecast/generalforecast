@@ -50,7 +50,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use gf_core::cache::{Eviction, ModelId, Movement, Tier, TierConfig};
-use gf_core::forecasting::{self, Neighbors, SeriesSpec};
+use gf_core::forecasting::{self, HORIZON_PASSES, Neighbors, SeriesSpec, horizon_limit};
 use gf_core::node::{
     CompactionSource, EntrySizes, ErrorKind, Node, NodeError, RequestId, Scheduling, SummaryScope,
     TableId, TableRows, TableSpec, Task,
@@ -77,6 +77,13 @@ use crate::wal::{
     Record, Replay, RowSealer, Rows, TableDefinition, Terms, decode,
 };
 use crate::worker::{self, WorkerConnection};
+
+fn profile_steps(steps: u64, what: &str) -> Result<NonZeroUsize, ServerError> {
+    usize::try_from(steps)
+        .ok()
+        .and_then(NonZeroUsize::new)
+        .ok_or_else(|| ServerError::Internal(format!("the forecaster's profile has no {what}")))
+}
 
 /// The frame that has a worker serve a table.
 fn add_table(id: TableId, definition: &TableDefinition) -> Frame {
@@ -742,11 +749,6 @@ struct Scratch {
 
 /// Idle scratch tables a shard keeps for requests over the same rows.
 const SCRATCH_KEPT: usize = 4;
-
-/// Most passes of a forecaster's network one forecast runs: the cap on a
-/// horizon, in steps one pass predicts, so one call cannot hold a shard for
-/// minutes.
-const HORIZON_PASSES: u64 = 64;
 
 /// Memory, padding and timing settings for a shard.
 #[derive(Clone, Copy, Debug)]
@@ -1858,8 +1860,15 @@ impl Shard {
             entry.definition.model_features(),
         );
         if let Some(profile) = self.profiles.get(&key) {
-            let limit = HORIZON_PASSES * profile.pass_limit.unwrap_or(profile.output_patch).max(1);
-            if horizon.get() as u64 > limit {
+            let limit = horizon_limit(
+                profile_steps(profile.output_patch, "output patch")?,
+                profile
+                    .pass_limit
+                    .map(|steps| profile_steps(steps, "pass limit"))
+                    .transpose()?,
+            )
+            .get();
+            if horizon.get() > limit {
                 return Err(ServerError::Invalid(format!(
                     "a horizon of {horizon} steps is past the {limit} the model {:?} forecasts \
                      in {HORIZON_PASSES} passes",
@@ -2335,17 +2344,9 @@ impl Shard {
         }
         let series = settings
             .map(|settings| -> Result<SeriesSpec, ServerError> {
-                let patches = |steps: u64, what: &str| {
-                    usize::try_from(steps)
-                        .ok()
-                        .and_then(NonZeroUsize::new)
-                        .ok_or_else(|| {
-                            ServerError::Internal(format!("the forecaster's profile has no {what}"))
-                        })
-                };
                 let max_rows = profile
                     .max_rows
-                    .map(|rows| patches(rows, "positive cap on rows"))
+                    .map(|rows| profile_steps(rows, "positive cap on rows"))
                     .transpose()?;
                 let per_member = 1 + definition.model_features();
                 let size = settings.group.size();
@@ -2361,8 +2362,15 @@ impl Shard {
                 }
                 Ok(SeriesSpec {
                     step: settings.step,
-                    patch: patches(profile.patch, "patch")?,
-                    context: patches(profile.context_limit, "context limit")?,
+                    patch: profile_steps(profile.patch, "patch")?,
+                    context: profile_steps(profile.context_limit, "context limit")?,
+                    max_horizon: horizon_limit(
+                        profile_steps(profile.output_patch, "output patch")?,
+                        profile
+                            .pass_limit
+                            .map(|steps| profile_steps(steps, "pass limit"))
+                            .transpose()?,
+                    ),
                     max_rows,
                     known: settings.known,
                     group: settings.group,

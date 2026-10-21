@@ -58,6 +58,21 @@ def test_estimators_see_their_own_view_and_average_back() -> None:
     assert isinstance(functions, TabularFunctions)
 
 
+def test_unknown_classes_stay_unknown_in_every_estimator() -> None:
+    from generalforecast.models.limix.model import limix_functions
+    from tests.models.limix.tiny import tiny_limix
+
+    functions = ensemble_functions(limix_functions)
+    model = Ensemble(tiny_limix(regression=False), 6)
+    features = jnp.asarray(np.random.default_rng(0).normal(size=(30, 5)), jnp.float32)
+    targets = jnp.asarray(np.arange(30) % 3, jnp.int32).at[4].set(-1)
+
+    state, rows = functions.fit(model, features, targets, 3)
+    query = functions.embed(model, state, features[4:5])
+
+    np.testing.assert_allclose(rows[4], query[0], atol=1e-6)
+
+
 def test_probability_averaging_models_average_each_estimators_probabilities() -> None:
     model, data = tiny_tabpfn(regression=False), table(regression=False)
     order = jnp.asarray(np.random.default_rng(1).permutation(data.features.shape[1]))
