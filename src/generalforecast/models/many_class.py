@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """More classes than a classifier has slots, with error-correcting output codes.
 
 Each of `codes` estimators sees the classes merged into at most as many groups

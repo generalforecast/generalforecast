@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rows that travel between the nodes of a table split into partitions.
 //!
 //! Each partition codes its categorical columns with a vocabulary of its own,

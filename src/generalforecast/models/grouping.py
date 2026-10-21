@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Aligned related series as one `SeriesGroup`, shared by every forecast surface.
 
 A forecast query names its series and the series forecast with it, a time

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """sklearn-style estimators: `fit` creates a table, `predict` queries it.
 
 They follow sklearn's estimator API, so `clone`, pipelines and cross-validation

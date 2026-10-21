@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The generalforecast command: a server on this machine, and a benchmark of one."""
 
 from __future__ import annotations

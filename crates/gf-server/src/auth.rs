@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Bearer tokens, the tables each may reach, and what routers mark node calls with.
 
 use std::collections::HashMap;

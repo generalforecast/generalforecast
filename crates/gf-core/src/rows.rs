@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Rows by id, in small blocks that stay in memory while a budget allows and
 //! spill to a file on disk when it does not.
 //!

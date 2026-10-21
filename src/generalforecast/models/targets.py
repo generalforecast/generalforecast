@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Regression targets standardized for the network, and quantiles mapped back.
 
 Every model's table state keeps a target center and scale, None for

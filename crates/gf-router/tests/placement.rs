@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Placing tables on nodes with rendezvous hashing.
 
 use std::collections::HashMap;

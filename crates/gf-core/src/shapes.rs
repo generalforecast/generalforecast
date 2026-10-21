@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Padded sizes for compiled model calls.
 
 use std::num::NonZeroUsize;

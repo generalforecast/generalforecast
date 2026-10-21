@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Request-scoped native runs of any model's contract calls, shared by servers.
 
 Packages and the Models API fit a request's or a revision's context once, then

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Checkpoint directories, read and written the same way for every model.
 
 A directory holds `config.json`, naming the architecture and its settings, and

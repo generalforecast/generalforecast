@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! A shard driven with a fake worker: table checks, quarantine, hung workers
 //! and the query queue.
 

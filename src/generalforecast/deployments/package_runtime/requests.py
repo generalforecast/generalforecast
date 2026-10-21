@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Request-scoped package inputs shared by the hosted API and `gf serve`."""
 
 import json

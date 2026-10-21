@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Native tabular context fitting and reusable immutable query state, for any model."""
 
 from dataclasses import dataclass

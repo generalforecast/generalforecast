@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Frames between the server and a worker: a JSON header plus raw arrays.
 
 The layout matches `gf-server`'s `protocol.rs`: a u64 length, then the frame,

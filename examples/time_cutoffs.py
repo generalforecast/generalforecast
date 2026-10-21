@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Point-in-time predictions over rows that carry times.
 
 A query with a cutoff reads only rows from before it, which lets us backtest by

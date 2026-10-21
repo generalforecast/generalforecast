@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Independent regressions for canonical payloads, snapshot guards and transports."""
 
 import asyncio

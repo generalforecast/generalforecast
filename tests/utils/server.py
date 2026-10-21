@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """A gf-server process for tests, and a raw Flight client for it."""
 
 from __future__ import annotations

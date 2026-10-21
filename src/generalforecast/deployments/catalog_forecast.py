@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Models API forecasting for every catalog forecaster, over shared aligned groups.
 
 The requested reference picks the model; its quantiles, patch and row limit

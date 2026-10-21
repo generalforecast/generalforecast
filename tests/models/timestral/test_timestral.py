@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Timestral's loader checks and the choices its forecasts make."""
 
 from __future__ import annotations

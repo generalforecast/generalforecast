@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """LimiX-2 from Stable AI's LimiX package, and generalforecast's port, on the same weights."""
 
 from __future__ import annotations

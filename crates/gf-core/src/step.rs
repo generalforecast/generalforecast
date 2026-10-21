@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! What a step asks of the executor: actions, placements and request ids.
 //!
 //! These name a step's parts without the node's planning around them, so the

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """A standalone model server for prediction packages and catalog models.
 
 `gf serve` loads one locked package or catalog model and answers the hosted

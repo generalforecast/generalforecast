@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Types for generalforecast._core, the Rust control plane built from crates/gf-py."""
 
 from typing import Literal, Self

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Row keys: integers, strings, bytes or UUIDs, as the 128 bits tables hold.
 
 An integer key keeps its value, a negative one in two's complement, and a UUID

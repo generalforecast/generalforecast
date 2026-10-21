@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 use gf_core::categories::{CategoryEncoding, Lookup, ONE_HOT_CATEGORIES};
 use gf_core::node::{Targets, Task};
 

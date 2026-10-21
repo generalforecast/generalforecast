@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The `gf serve` HTTP listener, command line and graceful shutdown."""
 
 import argparse

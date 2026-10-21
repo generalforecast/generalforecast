@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Opt-in real pinned CPU checkpoints, including the 478 MB Chronos-2 artifact."""
 
 import copy

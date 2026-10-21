@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Real optimized engine calls with tiny random weights, not catalog/cloud proof."""
 
 import pickle

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The worker: runs the steps a node schedules, on one accelerator.
 
 The node decides what to compute and where state lives. The worker holds

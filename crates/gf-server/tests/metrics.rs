@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Prometheus metrics, rendered in the text exposition format.
 
 use std::time::Duration;

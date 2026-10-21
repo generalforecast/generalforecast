@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Groups of series as the worker runs them: bucketed, laid out, and decoded from slots.
 
 A step's series units arrive as dense grids. Here they pad to buckets, so

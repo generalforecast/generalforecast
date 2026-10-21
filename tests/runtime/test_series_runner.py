@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Forecasts through a node and a worker: groups bucketed, cached and decoded."""
 
 from __future__ import annotations

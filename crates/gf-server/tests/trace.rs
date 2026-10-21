@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! W3C trace context: read from `traceparent`, and sent on by child spans.
 
 use gf_server::trace::Trace;

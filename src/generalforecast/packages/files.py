@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Directory-relative, no-follow inputs and durable atomic lock replacement."""
 
 import os

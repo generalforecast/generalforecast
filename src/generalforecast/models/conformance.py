@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Checks a model against the contract the engine relies on, on random inputs.
 
 A model written against `generalforecast.models.contract` is run by the engine in ways a

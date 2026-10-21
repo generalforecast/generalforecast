@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The page index (similar rows grouped into pages, per bucket), the time
 //! index and the series index.
 

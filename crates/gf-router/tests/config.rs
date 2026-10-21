@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! The router's configuration: what it refuses, and the lease it derives.
 
 use std::time::Duration;

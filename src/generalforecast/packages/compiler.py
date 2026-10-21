@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Functional package load/check/resolve/compile operations shared by all surfaces."""
 
 import os

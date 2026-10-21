@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Opt-in real hash-verified CPU model execution. Requires preloaded HF artifacts."""
 
 import datetime

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! `gf-server run --config generalforecast.toml`: serves tables over Arrow Flight.
 //! `init` writes a starter configuration, and `check` looks at everything a
 //! configuration needs before starting.

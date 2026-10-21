@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Series: each series' rows by time, laid onto regular grids before a cutoff.
 //!
 //! A series table's rows are observations, one per series and time, keyed by

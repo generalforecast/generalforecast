@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Grouped-query attention, QK-norm, query scaling, token axes and a context norm."""
 
 from __future__ import annotations

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Slices of a key space and the GPUs that hold them.
 
 use crate::key::Key;

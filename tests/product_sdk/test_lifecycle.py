@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Real HTTP SDK contract coverage; fixture predictions are not inference evidence."""
 
 import asyncio

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Transport-independent Models API routes, envelopes and bearer-key check."""
 
 import hmac

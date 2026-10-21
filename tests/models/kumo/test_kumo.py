@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """What is specific to Kumo Tabular; the conformance suite covers the contract."""
 
 from __future__ import annotations

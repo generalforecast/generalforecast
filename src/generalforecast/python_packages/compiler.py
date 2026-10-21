@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Deterministic, explicit-file Python revisions; compilation never imports code."""
 
 import ast

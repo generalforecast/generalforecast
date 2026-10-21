@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The server binary end to end, over Arrow Flight, with a Python worker."""
 
 from __future__ import annotations

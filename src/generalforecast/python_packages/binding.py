@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Content-bound extension for the canonical Package/SDK/API, not a new registry."""
 
 from dataclasses import dataclass

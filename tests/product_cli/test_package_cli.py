@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """Installed CLI checks; HTTP fixture below proves contracts, not model inference."""
 
 import json
