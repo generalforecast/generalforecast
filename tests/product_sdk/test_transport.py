@@ -240,7 +240,7 @@ def test_retries_preserve_guarded_write_identity_and_never_retry_unguarded_posts
                     json={
                         "error": {
                             "code": "ServiceUnavailable",
-                            "message": "fixture-key",
+                            "message": "service unavailable",
                         }
                     },
                 )
@@ -353,7 +353,12 @@ def test_async_redirect_revocation_cookie_and_response_bounds(monkeypatch):
             if request.url.path == "/revoked":
                 return httpx.Response(
                     401,
-                    json={"error": {"code": "Unauthorized", "message": "fixture-key"}},
+                    json={
+                        "error": {
+                            "code": "Unauthorized",
+                            "message": "session was revoked",
+                        }
+                    },
                 )
             return httpx.Response(200, json={"data": "a" * 1000})
 

@@ -94,10 +94,10 @@ def test_every_service_raised_code_is_public_vocabulary():
 )
 def test_remote_codes_are_classified_without_echoing_unknowns(code, expected):
     assert public_code(code) == expected
-    raw = json.dumps({"error": {"code": code, "message": "secret detail"}}).encode()
+    message = "safe service detail"
+    raw = json.dumps({"error": {"code": code, "message": message}}).encode()
     with pytest.raises(ServiceError) as error:
         response_value(409, raw)
     assert error.value.code == expected and error.value.status == 409
-    assert "secret detail" not in str(error.value) and (
-        expected != "RemoteError" or code not in str(error.value.code)
-    )
+    assert str(error.value) == message
+    assert expected != "RemoteError" or code not in str(error.value.code)

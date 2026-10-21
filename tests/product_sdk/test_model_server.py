@@ -232,7 +232,7 @@ def test_hosted_missing_resource_stays_not_found(asynchronous):
         client, lambda c: c.deployments.get("gone"), lambda c: c.keys.list()
     )
     for error in (first, second):
-        assert type(error) is gf.ServiceError and error.code == "NotFound"
+        assert isinstance(error, gf.ServiceError) and error.code == "NotFound"
     assert [p for _m, _o, p, _h in server.seen] == [
         "/v1alpha1/projects/local/deployments/gone",
         PLATFORM_PROBE,

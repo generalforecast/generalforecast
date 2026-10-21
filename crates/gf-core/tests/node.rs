@@ -3006,6 +3006,7 @@ mod series {
             step: NonZeroU64::new(10).unwrap(),
             patch: NonZeroUsize::new(4).unwrap(),
             context: NonZeroUsize::new(16).unwrap(),
+            max_horizon: NonZeroUsize::new(32).unwrap(),
             max_rows: None,
             known,
             group,
@@ -3049,6 +3050,53 @@ mod series {
 
     fn horizon(steps: usize) -> NonZeroUsize {
         NonZeroUsize::new(steps).unwrap()
+    }
+
+    #[test]
+    fn forecast_horizon_uses_the_model_pass_limit() {
+        let mut node = node(64);
+        let table = table(&mut node, vec![], GroupStrategy::Alone);
+
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(32), None)
+            .unwrap();
+        assert!(matches!(
+            node.submit_forecast(table, &[A.0], Some(&[160]), horizon(33), None),
+            Err(NodeError::Forecast(ForecastError::HorizonTooLong {
+                horizon: 33,
+                limit: 32
+            }))
+        ));
+        assert_eq!(
+            ForecastError::HorizonTooLong {
+                horizon: 33,
+                limit: 32
+            }
+            .to_string(),
+            "a horizon of 33 steps is past the 32 the model forecasts in 64 passes"
+        );
+        assert!(node.schedule().unwrap().is_some());
+
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(17), None)
+            .unwrap();
+    }
+
+    #[test]
+    fn invalid_series_queries_and_empty_candidates_preserve_forecasts() {
+        let mut node = node(64);
+        let table = table(&mut node, vec![], GroupStrategy::Alone);
+        let empty = node.create_table(spec(Strategy::Exact)).unwrap();
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(2), None)
+            .unwrap();
+
+        assert!(matches!(
+            node.candidates(empty, &[1.0, 2.0], None, None),
+            Err(NodeError::Unscaled)
+        ));
+        assert_eq!(
+            node.contexts(table, &[1.0, 2.0], None),
+            Err(NodeError::Forecast(ForecastError::OnlyForecasts))
+        );
+        assert_eq!(node.schedule().unwrap().unwrap().forecasts().len(), 1);
     }
 
     #[test]

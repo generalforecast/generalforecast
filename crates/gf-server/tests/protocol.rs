@@ -270,6 +270,7 @@ fn a_steps_series_units_and_forecasts_travel_as_grids() {
                 step: NonZeroU64::new(10).unwrap(),
                 patch: NonZeroUsize::new(4).unwrap(),
                 context: NonZeroUsize::new(16).unwrap(),
+                max_horizon: NonZeroUsize::new(256).unwrap(),
                 max_rows: None,
                 known: Vec::new(),
                 group: GroupStrategy::Alone,

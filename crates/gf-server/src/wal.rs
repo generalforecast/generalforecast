@@ -14,13 +14,18 @@
 //! under the current key at startup, entry for entry, keeping every sequence
 //! number, so it stays the same log as its copies elsewhere.
 //!
-//! Beside each log, `<table>.head` holds the log's length when it was last
-//! synced, sealed with the table's name. A log shorter than its head, or
-//! without one, lost whole records from its end and does not open. Every sync
-//! rewrites the head before its records count as written, so a record at or
-//! past the head's length was never acknowledged: one that does not open can
-//! only be an append a crash tore, so opening cuts it off, while one before
-//! the head that does not open is refused.
+//! Beside each log, `<table>.head` holds a length the log was synced through,
+//! sealed with the table's name. A log shorter than its head, or without one,
+//! lost whole records from its end and does not open. A record is
+//! acknowledged once it is synced, so a crash can only tear an append that
+//! was never acknowledged. Writing the head costs three more syncs, so while
+//! a table is busy it trails the synced length by up to `HEAD_LAG` records or
+//! `HEAD_INTERVAL`, and it catches up once the table's writes go idle and
+//! when the log closes. A record before the head's length that does not open
+//! is refused as damage; one at or past it is taken for a torn append, and
+//! opening cuts it off with everything after it. So a crash loses no
+//! acknowledged record, and only damage to one synced within the head's lag
+//! before a crash could be taken for a torn append.
 //! Restoring an older copy of both files together still opens; replicas are
 //! what catch that.
 //!
@@ -44,6 +49,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
@@ -74,6 +80,9 @@ use crate::protocol::{
 };
 
 const NONCE: usize = 24;
+/// Numbers each staged compaction file, unique in the process, so a dropped
+/// table's late compaction never shares a file with its successor's.
+static COMPACTIONS: AtomicU64 = AtomicU64::new(0);
 /// A record's length, then its complement: a torn write leaves the pair short,
 /// while a damaged length breaks the pair instead of hiding later records.
 const PREFIX: usize = 8;
@@ -1028,7 +1037,8 @@ pub struct Log {
 /// behind a sync, before a sync writes the head too. Writing it costs three
 /// more syncs, so a busy table writes it every so often rather than with
 /// every commit; a record past the head that does not open is cut off as a
-/// torn append, rather than refused, until the head catches up.
+/// torn append, rather than refused, until the head catches up, as it does
+/// when the table's writes go idle.
 const HEAD_LAG: u64 = 64;
 /// How long the head may stay behind a sync before a sync writes it too.
 pub const HEAD_INTERVAL: Duration = Duration::from_secs(1);
@@ -1071,6 +1081,7 @@ impl Log {
             .append(true)
             .read(true)
             .open(path)?;
+        remove_staged_compactions(path);
         let cipher = XChaCha20Poly1305::new(&key.0);
         let mut log = Self {
             path: path.to_path_buf(),
@@ -1183,6 +1194,16 @@ impl Log {
             self.head_written(synced);
         }
         Ok(())
+    }
+
+    /// Writes the head through every synced record, so a log closed cleanly
+    /// checks all its acknowledged records.
+    ///
+    /// # Errors
+    ///
+    /// If the head cannot be written.
+    pub fn close(mut self) -> std::io::Result<()> {
+        self.save_head()
     }
 
     /// Notes a head written at `length`.
@@ -1381,7 +1402,7 @@ impl Log {
 
     /// Syncs the staged records to disk; a failure cuts them back off, so
     /// they were never written. The head follows every `HEAD_LAG` records or
-    /// `HEAD_INTERVAL`, and `save_head` writes it on request.
+    /// `HEAD_INTERVAL`, and the shard saves it when its writes go idle.
     ///
     /// # Errors
     ///
@@ -1636,15 +1657,16 @@ impl Log {
                 "a log with records staged cannot be compacted".to_string(),
             ));
         }
-        let staged = self.path.with_extension("compacting");
+        let number = COMPACTIONS.fetch_add(1, Ordering::Relaxed);
+        let staged = self.path.with_extension(format!("compacting.{number}"));
         let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .write(true)
             .open(&staged)?;
         file.write_all(&self.key_header())?;
         let mut compactor = Compactor {
             staged,
+            number,
             file,
             cipher: self.cipher.clone(),
             table: self.table.clone(),
@@ -1782,6 +1804,9 @@ impl Replay {
         entries.log.base = frame.header["base"].as_u64().unwrap_or(1);
         entries.log.created.clone_from(&definition.created);
         entries.log.terms = terms_from(&frame)?;
+        if writable {
+            remove_staged_compactions(path);
+        }
         Ok(Self {
             entries,
             definition,
@@ -1835,7 +1860,7 @@ impl Replay {
             tracing::warn!(
                 log = %log.path.display(),
                 offset,
-                "cutting off a final record that a crash tore, which was never acknowledged"
+                "cutting off a record past the head that does not open, and everything after it: an append a crash tore before it was synced, or damage to a record synced since the head was last written"
             );
             if self.writable {
                 log.file.set_len(offset)?;
@@ -2006,6 +2031,45 @@ fn head_path(log: &Path) -> PathBuf {
     log.with_extension("head")
 }
 
+fn remove_staged_compactions(log: &Path) {
+    let Some(stem) = log.file_stem().and_then(|stem| stem.to_str()) else {
+        return;
+    };
+    let plain = format!("{stem}.compacting");
+    let numbered = format!("{stem}.compacting.");
+    let directory = log.parent().unwrap_or_else(|| Path::new("."));
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            tracing::warn!(directory = %directory.display(), "listing staged compactions: {error}");
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(directory = %directory.display(), "reading staged compaction entry: {error}");
+                continue;
+            }
+        };
+        let matches = entry.file_name().to_str().is_some_and(|name| {
+            name == plain
+                || name.strip_prefix(&numbered).is_some_and(|number| {
+                    !number.is_empty() && number.bytes().all(|byte| byte.is_ascii_digit())
+                })
+        });
+        if !matches {
+            continue;
+        }
+        if let Err(error) = std::fs::remove_file(entry.path())
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(staged = %entry.path().display(), "removing staged compaction: {error}");
+        }
+    }
+}
+
 /// What a head is sealed with besides its bytes.
 fn head_associated(table: &str) -> Vec<u8> {
     let mut data = b"gf log head".to_vec();
@@ -2166,6 +2230,7 @@ fn record_frame(record: &Record) -> Frame {
 /// records sealed in order after the definition into a staged file.
 pub struct Compactor {
     staged: PathBuf,
+    number: u64,
     file: File,
     cipher: XChaCha20Poly1305,
     table: TableName,
@@ -2196,6 +2261,12 @@ impl Compacted {
 }
 
 impl Compactor {
+    /// The process-wide number in this compaction's staged file name.
+    #[must_use]
+    pub fn number(&self) -> u64 {
+        self.number
+    }
+
     /// Seals the compaction's next record into the staged file.
     ///
     /// # Errors
@@ -2213,11 +2284,11 @@ impl Compactor {
     /// # Errors
     ///
     /// If the file cannot be synced.
-    pub fn finish(self) -> Result<Compacted, LogError> {
+    pub fn finish(mut self) -> Result<Compacted, LogError> {
         self.file.sync_all()?;
         Ok(Compacted {
-            staged: self.staged,
-            offsets: self.offsets,
+            staged: std::mem::take(&mut self.staged),
+            offsets: std::mem::take(&mut self.offsets),
             previous: self.previous,
             at: self.at,
             begun: self.begun,
@@ -2242,6 +2313,14 @@ impl Compactor {
         let end = self.offsets.last().copied().unwrap_or_default() + bytes.len() as u64;
         self.offsets.push(end);
         Ok(())
+    }
+}
+
+impl Drop for Compactor {
+    fn drop(&mut self) {
+        if !self.staged.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.staged);
+        }
     }
 }
 

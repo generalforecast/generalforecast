@@ -97,12 +97,16 @@ class Programs:
         Returns:
             The compiled function.
         """
-        if key not in self._compiled:
-            function = build()
-            if self._settings is not None:
-                function = with_precision(function, self._settings.matmul_precision)
-            self._compiled[key] = jax.jit(function)
-        return self._compiled[key]
+        with self._lock:
+            compiled = self._compiled.get(key)
+        if compiled is not None:
+            return compiled
+        function = build()
+        if self._settings is not None:
+            function = with_precision(function, self._settings.matmul_precision)
+        compiled = jax.jit(function)
+        with self._lock:
+            return self._compiled.setdefault(key, compiled)
 
     def add_shape(self, shape: Hashable) -> None:
         """Counts a table shape, dropping every program first if memory is short past `limit`."""

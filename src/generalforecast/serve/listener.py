@@ -38,7 +38,7 @@ def public_warning(host: str, port: int) -> str:
     return (
         f"gf serve: warning: listening on {host}:{port} without an API key; "
         "anyone who can reach this address can run inference. "
-        f"Pass --api-key or set {API_KEY_ENV}."
+        f"Set {API_KEY_ENV} to require a bearer key."
     )
 
 
@@ -240,11 +240,6 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument(
-        "--api-key",
-        default=None,
-        help=f"Require this bearer key (default: ${API_KEY_ENV}, else no key)",
-    )
-    parser.add_argument(
         "--offline",
         action="store_true",
         help="Use only cached model weights; never download",
@@ -263,8 +258,7 @@ def run(
     """Serves until SIGTERM or SIGINT, then drains and returns the final event."""
     require(1 <= len(args.host) <= 255, "invalid host")
     require(type(args.port) is int and 0 <= args.port <= 65535, "invalid port")
-    key = args.api_key if args.api_key is not None else os.environ.get(API_KEY_ENV)
-    key = key or None
+    key = os.environ.get(API_KEY_ENV) or None
     from generalforecast.serve.app import Application
     from generalforecast.serve.models import load
 
