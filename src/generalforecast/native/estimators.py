@@ -25,7 +25,8 @@ from sklearn.utils.validation import validate_data
 
 from generalforecast._core import Strategy
 from generalforecast.columns import infer
-from generalforecast.native.client import LocalClient, Table, local
+from generalforecast.native.client import Table
+from generalforecast.native.local_client import LocalClient
 from generalforecast.native.package import (
     admitted_spec,
     context_table,
@@ -37,8 +38,6 @@ from generalforecast.packages import Package
 from generalforecast.packages.validation import ensure
 from generalforecast.tabular import to_arrow
 
-_shared: LocalClient | None = None
-
 
 class _TableClient(Protocol):
     @property
@@ -47,12 +46,15 @@ class _TableClient(Protocol):
     def drop_table(self, name: str) -> None: ...
 
 
-def _local() -> LocalClient:
-    """The local client of estimators given none, so each model loads once."""
-    global _shared
-    if _shared is None:
-        _shared = local(compile_ahead=False)
-    return _shared
+_shared: dict[bool, LocalClient] = {}
+
+
+def _local(allow_downloads: bool = False) -> LocalClient:
+    """The local client of estimators given none, one per download gate, on the process's engine."""
+    client = _shared.get(allow_downloads)
+    if client is None:
+        client = _shared[allow_downloads] = LocalClient(allow_downloads=allow_downloads)
+    return client
 
 
 def _named(X: Any) -> bool:
@@ -158,7 +160,9 @@ class _Estimator(BaseEstimator):
         self._release()
         features = self.context_.drop([self.target_])
         targets = np.array(targets, copy=True)
-        client = self.client if self.client is not None else _local()
+        client = (
+            self.client if self.client is not None else _local(self.allow_downloads)
+        )
         name = f"estimator-{uuid.uuid4().hex}"
         kinds = getattr(self, "_kinds", None)
         table = client.create_table(
@@ -187,7 +191,7 @@ class _Estimator(BaseEstimator):
         from generalforecast.local_models import native_model
 
         task = "classification" if isinstance(self, Classifier) else "regression"
-        return native_model(self.model, task, allow_downloads=self.allow_downloads)
+        return native_model(self.model, task)
 
     def _release(self) -> None:
         dropper = getattr(self, "_dropper", None)

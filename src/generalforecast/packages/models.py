@@ -291,3 +291,37 @@ class CatalogResolver:
                 "ModelMismatch",
             )
         return ModelPin.from_dict(result.to_dict())
+
+
+def trusted(
+    spec: str,
+    task: str,
+    *,
+    max_context_rows: int,
+    max_features: int,
+    max_horizon: int,
+    quantiles: tuple[float, ...],
+) -> ModelPin:
+    """A trusted `module:function` model, bounded by what its local caller asks.
+
+    It has no catalog files or published bounds: the caller's context, inputs,
+    horizon and levels are its limits, and the workers that import it check
+    the rest.
+    """
+    return ModelPin(
+        name=spec,
+        repository="",
+        revision="",
+        digest="",
+        files=(),
+        tasks=(task,),
+        outputs=("value", "quantiles"),
+        input_types=("int64", "float64"),
+        missing_values=True,
+        max_context_rows=max_context_rows,
+        max_features=max_features,
+        max_horizon=max_horizon,
+        quantiles=quantiles,
+        past_inputs=True,
+        future_inputs=True,
+    )

@@ -245,3 +245,11 @@ SERIES_CASES = [
     SeriesCase("timestral", _timestral_functions, _timestral(True)),
     SeriesCase("timestral-plain", _timestral_functions, _timestral(False)),
 ]
+
+
+def __getattr__(name: str) -> Callable[[], tuple[TabularFunctions, Any]]:
+    """Each case at seed 0 as a model spec target, e.g. `tests.models.conformance.cases:kumo_values`."""
+    for case in CASES:
+        if case.name.replace("-", "_").replace(".", "_") == name:
+            return lambda: (case.functions(), case.build(0))
+    raise AttributeError(name)

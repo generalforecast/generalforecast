@@ -10,8 +10,6 @@ import pytest
 
 import generalforecast
 from generalforecast.ingest import Columns, apply, follow
-from generalforecast.models.tabicl.model import tabicl_functions
-from tests.models.tabicl.tiny import tiny_tabicl
 
 pytestmark = pytest.mark.slow
 
@@ -66,7 +64,7 @@ def _event(op: str, row: dict) -> dict:
 
 
 def _table(client: generalforecast.LocalClient, name: str) -> generalforecast.Table:
-    model = (tabicl_functions, tiny_tabicl(regression=False))
+    model = "tests.models.tabicl.tiny:classifier"
     return client.create_table(name, model=model, features=2, classes=3, page_size=8)
 
 
@@ -183,7 +181,7 @@ def test_a_dropped_table_stops_following_without_committing() -> None:
 
 def test_events_feed_columns_by_their_kinds() -> None:
     client = generalforecast.local()
-    model = (tabicl_functions, tiny_tabicl(regression=False))
+    model = "tests.models.tabicl.tiny:classifier"
     kinds = {"store": "categorical", "when": "datetime"}
     table = client.create_table("typed", model=model, columns=kinds, classes=3)
     schema = {
@@ -244,7 +242,7 @@ def test_string_targets_become_a_classifiers_labels() -> None:
 
 
 def test_truncates_string_keys_and_dated_times_follow_the_source() -> None:
-    model = (tabicl_functions, tiny_tabicl(regression=False))
+    model = "tests.models.tabicl.tiny:classifier"
     table = generalforecast.local().create_table(
         "dated",
         model=model,

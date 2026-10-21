@@ -243,13 +243,16 @@ def use_compile_cache() -> None:
     In `$XDG_CACHE_HOME/generalforecast/jax`, `~/.cache/generalforecast/jax` by default, and every
     program however quick it was to compile. The cache has no size limit: with
     one, JAX's bookkeeping made a cold start about four times slower. A cache
-    JAX already has, such as one `JAX_COMPILATION_CACHE_DIR` names, is left as
-    it is.
+    JAX already has, such as one `JAX_COMPILATION_CACHE_DIR` names, is kept,
+    and keeps every program unless `JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS`
+    says otherwise.
     """
-    if jax.config.jax_compilation_cache_dir:
-        return
-    jax.config.update("jax_compilation_cache_dir", str(cache_root() / "jax"))
-    jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+    if not jax.config.jax_compilation_cache_dir:
+        jax.config.update("jax_compilation_cache_dir", str(cache_root() / "jax"))
+    # Workers compile the programs earlier ones recorded as they start, so a
+    # quick program is worth keeping too; JAX keeps only those over a second.
+    if "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS" not in os.environ:
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
 
 
 def cache_root() -> Path:

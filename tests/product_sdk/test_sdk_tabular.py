@@ -11,6 +11,7 @@ from pyarrow import feather, parquet
 
 import generalforecast as gf
 from generalforecast.deployments.sdk import Dataset, prediction_payload, table
+from generalforecast.packages.validation import PackageError
 
 
 @pytest.mark.parametrize(
@@ -58,6 +59,15 @@ def test_numpy_requires_explicit_feature_and_context_column_order():
     assert payload["queries"] == [{"b": 5, "a": 2}, {"b": 8, "a": 4}]
     assert payload["context"][1] == {"b": 4, "a": 2, "y": 1}
     assert payload["features"] == ["b", "a"]
+
+
+def test_an_empty_context_list_is_no_records_and_queries_stay_required():
+    queries = pa.table({"x": [1.0]})
+    for empty in ([], ()):
+        assert prediction_payload(queries, context=empty)["context"] == []
+    assert prediction_payload(queries, context=queries.slice(0, 0))["context"] == []
+    with pytest.raises(PackageError, match="columns must be nonempty"):
+        prediction_payload([])
 
 
 def test_pandas_polars_lazyframes_and_typed_results():

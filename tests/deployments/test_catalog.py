@@ -3,6 +3,7 @@ import hashlib
 import json
 from typing import Any, cast
 
+import numpy as np
 import pytest
 
 from generalforecast.deployments.boundary import Scope, json_object
@@ -10,6 +11,7 @@ from generalforecast.deployments.catalog import CatalogService, create_catalog
 from generalforecast.deployments.contracts import ServiceError
 from generalforecast.deployments.interfaces import ModelPort
 from generalforecast.models import catalog
+from tests.utils.engine import FakeEngine
 
 SCOPE = Scope("test-project", "test-catalog")
 
@@ -43,7 +45,20 @@ def no_native_inference(monkeypatch):
     def refuse(*_args, **_kwargs):
         pytest.fail("unit validation must not execute a native model")
 
-    monkeypatch.setattr(CatalogService, "_predict", refuse)
+    monkeypatch.setattr("generalforecast.engine.local", refuse)
+
+
+def engine_calls(monkeypatch, answer):
+    """The engine's tabular calls, each answered by `answer` of its request."""
+    fake = FakeEngine().install(monkeypatch)
+    calls = []
+
+    def tabular(ref, request):
+        calls.append((ref, request))
+        return np.asarray(answer(request), float)
+
+    monkeypatch.setattr(fake, "tabular", tabular)
+    return calls
 
 
 def error_code(request, code="ValidationError", status=422):
@@ -184,17 +199,11 @@ def test_tabular_output_and_class_mapping(
         row["label"] = label
     request_data["context"].append({"key": "unlabeled", "features": {"x": 0, "z": 1}})
     before = copy.deepcopy(request_data)
-    calls = []
-
-    def predict(self, ref, features, targets, queries, classes):
-        calls.append((ref.name, features, targets, queries, classes))
-        return [[1 / classes] * classes]
-
-    monkeypatch.setattr(CatalogService, "_predict", predict)
+    calls = engine_calls(monkeypatch, lambda r: [[1 / len(r.classes)] * len(r.classes)])
     result = CatalogService().infer(SCOPE, request_data)
     assert request_data == before
-    assert len(calls) == 1 and calls[0][2] == encoded
-    assert calls[0][3] == [[2, 3]]
+    assert len(calls) == 1 and calls[0][1].targets.tolist() == encoded
+    assert calls[0][1].queries.tolist() == [[2, 3]]
     assert list(result["outputs"][0]["probabilities"]) == names
     assert result["context_provenance"]["usable_labeled_rows"] == len(labels)
     assert result["context_provenance"]["persisted"] is False
@@ -215,13 +224,11 @@ def test_regression_quantile_selection(request_data, monkeypatch):
     for i, row in enumerate(request_data["context"]):
         row["label"] = 10.0 + i
 
-    def predict(self, ref, features, labels, queries, classes):
-        assert ref.name == "tabicl-v2-regressor"
-        assert labels == [10.0, 11.0] and classes == 0
-        return [list(range(999))]
-
-    monkeypatch.setattr(CatalogService, "_predict", predict)
+    calls = engine_calls(monkeypatch, lambda _: [list(range(999))])
     result = CatalogService().infer(SCOPE, request_data)
+    [(ref, request)] = calls
+    assert ref.name == "tabicl-v2-regressor"
+    assert request.targets.tolist() == [10.0, 11.0] and request.classes == []
     assert result["outputs"] == [
         {"key": "q", "quantiles": {"0.001": 0, "0.5": 499, "0.999": 998}}
     ]
@@ -251,18 +258,15 @@ def test_many_class_codes_serve_more_classes_than_slots(request_data, monkeypatc
         {"key": str(i), "features": {"x": i, "z": 0}, "label": f"c{i:02d}"}
         for i in range(25)
     ]
-    calls = []
-
-    def predict(self, ref, features, targets, queries, classes):
-        calls.append((str(ref), classes))
-        return [[1 / classes] * classes]
-
-    monkeypatch.setattr(CatalogService, "_predict", predict)
+    calls = engine_calls(monkeypatch, lambda r: [[1 / len(r.classes)] * len(r.classes)])
     for model in ("tabicl-classifier@4", "general-forecast/tabicl-v2-classifier@4*2"):
         request_data["model"] = model
         result = CatalogService().infer(SCOPE, request_data)
         assert len(result["outputs"][0]["probabilities"]) == 25
-    assert calls == [("tabicl-v2-classifier@4", 25), ("tabicl-v2-classifier@4*2", 25)]
+    assert [(str(ref), len(request.classes)) for ref, request in calls] == [
+        ("tabicl-v2-classifier@4", 25),
+        ("tabicl-v2-classifier@4*2", 25),
+    ]
     described = CatalogService().get(SCOPE, "tabicl-classifier@4*2")
     assert described["variant"] == {"codes": 4, "estimators": 2}
     assert described["bounds"]["classes"] == 1000

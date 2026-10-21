@@ -1,9 +1,6 @@
 """sklearn adapters over the existing optimized native tabular and series engine."""
 
 import datetime
-import uuid
-import weakref
-from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -12,9 +9,8 @@ import pyarrow as pa
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.exceptions import NotFittedError
 
-from generalforecast.columns import infer
-from generalforecast.local_models import native_model
-from generalforecast.native.estimators import Classifier, Regressor, _drop, _local
+from generalforecast.local_models import custom_model, native_model
+from generalforecast.native.estimators import Classifier, Regressor
 from generalforecast.native.package import (
     admitted_spec,
     copy_table,
@@ -25,7 +21,7 @@ from generalforecast.native.package import (
     forecast as native_forecast,
 )
 from generalforecast.packages import Package, PackageSpec
-from generalforecast.packages.models import describe
+from generalforecast.packages.models import describe, trusted
 from generalforecast.packages.schema import infer_schema
 from generalforecast.packages.validation import ensure
 from generalforecast.tabular import physical_type, to_arrow
@@ -115,31 +111,35 @@ class Forecaster(RegressorMixin, BaseEstimator):
             table = to_arrow(table.append_column(self.target, pa.array(values)))
         else:
             features = [column for column in features if column != self.target]
-        pin = describe(self.model if isinstance(self.model, str) else "chronos-2")
+        custom = custom_model(self.model)
+        if custom:
+            ensure(
+                self.backend is None,
+                "remote backend requires an admitted catalog model",
+            )
+        pin = (
+            trusted(
+                self.model,
+                "forecast",
+                max_context_rows=table.num_rows,
+                max_features=len({*self.past_inputs, *self.future_inputs}),
+                max_horizon=self.horizon,
+                quantiles=tuple(self.quantiles),
+            )
+            if custom
+            else describe(self.model)
+        )
         ensure("forecast" in pin.tasks, "model does not support forecasting")
         spec = PackageSpec.from_dict(
             {
                 "name": "estimator",
-                "model": pin.resolved,
+                "model": self.model if custom else pin.resolved,
                 "task": "forecast",
                 "target": self.target,
                 "context": "context.arrow",
                 **self._intent(),
             }
         )
-        if not isinstance(self.model, str):
-            ensure(
-                self.backend is None,
-                "remote backend requires an admitted catalog model",
-            )
-            functions, parameters = self.model
-            properties = functions.properties(parameters)
-            pin = replace(
-                pin,
-                max_context_rows=properties.context_limit,
-                max_horizon=properties.pass_limit or properties.context_limit,
-                quantiles=properties.quantiles,
-            )
         schema = infer_schema(spec, pin, "forecast", table)
         identities = tuple(
             dict.fromkeys(
@@ -201,12 +201,7 @@ class Forecaster(RegressorMixin, BaseEstimator):
         self.context_ = copy_table(table)
         try:
             if self.backend is None:
-                if isinstance(self.model, str):
-                    native_model(
-                        self.model, "forecast", allow_downloads=self.allow_downloads
-                    )
-                else:
-                    self._table()
+                native_model(self.model, "forecast")
         except BaseException:
             self.close()
             raise
@@ -219,69 +214,7 @@ class Forecaster(RegressorMixin, BaseEstimator):
         )
         return f"gfseries:{self._identities.index(identity)}"
 
-    def _engine_rows(self, table: pa.Table) -> pa.Table:
-        rows = table.to_pylist()
-        result = {
-            "series": [self._identity(row) for row in rows],
-            "time": table[self.time],
-            "target": table[self.target],
-        }
-        for index, column in enumerate(self._spec.forecast_inputs):
-            result[f"c{index}"] = table[column]
-        return pa.table(result)
-
-    def _table(self) -> Any:
-        if hasattr(self, "table_"):
-            return self.table_
-        table, dropper = self._make_table(self.context_)
-        self.table_, self._dropper = table, dropper
-        return table
-
-    def _make_table(self, context: pa.Table) -> tuple[Any, Any]:
-        from generalforecast._core import GroupStrategy
-
-        client = _local()
-        name = "estimator-" + uuid.uuid4().hex
-        rows = self._engine_rows(context)
-        covariates = {
-            f"c{i}": infer(self.context_.select([column]))[column]
-            for i, column in enumerate(self._spec.forecast_inputs)
-        }
-        known = [
-            f"c{i}"
-            for i, column in enumerate(self._spec.forecast_inputs)
-            if column in self.future_inputs
-        ]
-        step = (
-            int(self._frequency)
-            if self._clock == "int64"
-            else datetime.timedelta(seconds=self._frequency)
-        )
-        table = client.create_series_table(
-            name,
-            model=native_model(
-                self.model, "forecast", allow_downloads=self.allow_downloads
-            ),
-            series="series",
-            time="time",
-            target="target",
-            step=step,
-            columns=covariates or None,
-            known=known,
-            group=GroupStrategy.given(len(self._identities)),
-            horizon=self.horizon,
-            times="integer" if self._clock == "int64" else "datetime",
-        )
-        dropper = weakref.finalize(self, _drop, client, name)
-        dropper.atexit = False
-        try:
-            table.insert(rows)
-        except BaseException:
-            dropper()
-            raise
-        return table, dropper
-
-    def _future(self, X: Any) -> tuple[pa.Table, dict[str, list[int]]]:
+    def _future(self, X: Any) -> pa.Table:
         self._require_fitted()
         table = to_arrow(X)
         columns = [*self._spec.series, self.time, *self.future_inputs]
@@ -331,11 +264,11 @@ class Forecaster(RegressorMixin, BaseEstimator):
                 == [origin + step * (i + 1) for i in range(self.horizon)],
                 "future times must immediately follow fitted context on its regular grid",
             )
-        return table, groups
+        return table
 
     def predict_quantiles(self, X: Any) -> np.ndarray:
         """Returns one row per supplied future row, in its original order."""
-        queries, groups = self._future(X)
+        queries = self._future(X)
         if self.backend is not None:
             result = remote_result(
                 self.backend,
@@ -366,55 +299,13 @@ class Forecaster(RegressorMixin, BaseEstimator):
                 "ProtocolError",
             )
             return values
-        if isinstance(self.model, str):
-            return native_forecast(
-                self._spec,
-                self.context_,
-                queries,
-                self._frequency,
-                allow_downloads=self.allow_downloads,
-            )
-        table = self._table()
-        temporary = None
-        try:
-            if self.future_inputs:
-                future = pa.table(
-                    {
-                        **{column: queries[column] for column in queries.column_names},
-                        self.target: pa.array(
-                            [None] * len(queries), type=self.context_[self.target].type
-                        ),
-                        **{
-                            column: pa.array(
-                                [None] * len(queries), type=self.context_[column].type
-                            )
-                            for column in self.past_inputs
-                            if column not in self.future_inputs
-                        },
-                    }
-                )
-                future = future.select(self.context_.column_names).cast(
-                    self.context_.schema
-                )
-                table, temporary = self._make_table(
-                    pa.concat_tables([self.context_, future])
-                )
-            forecasts = table.forecast_given(
-                list(groups),
-                [[f"gfseries:{i}" for i in range(len(self._identities))]] * len(groups),
-                horizon=self.horizon,
-                quantiles=self.quantiles,
-                before=[
-                    queries[self.time][indexes[0]].as_py()
-                    for indexes in groups.values()
-                ],
-            )
-        finally:
-            if temporary is not None:
-                temporary()
-        values = np.empty((len(queries), len(self.quantiles)))
-        for forecast, indexes in zip(forecasts, groups.values(), strict=True):
-            values[indexes] = forecast
+        values = native_forecast(
+            self._spec,
+            self.context_,
+            queries,
+            self._frequency,
+            allow_downloads=self.allow_downloads,
+        )
         ensure(
             np.isfinite(values).all(),
             "native forecast returned non-finite values",
@@ -436,12 +327,7 @@ class Forecaster(RegressorMixin, BaseEstimator):
 
     def close(self) -> None:
         """Releases native context; the estimator must be fitted again."""
-        dropper = getattr(self, "_dropper", None)
-        if dropper is not None:
-            dropper()
         for name in (
-            "table_",
-            "_dropper",
             "context_",
             "n_features_in_",
             "feature_names_in_",
@@ -451,10 +337,3 @@ class Forecaster(RegressorMixin, BaseEstimator):
             "_identities",
         ):
             self.__dict__.pop(name, None)
-
-    def __getstate__(self) -> dict[str, Any]:
-        """Keeps copied context but recreates process-local native tables on demand."""
-        state = dict(super().__getstate__())
-        state.pop("table_", None)
-        state.pop("_dropper", None)
-        return state

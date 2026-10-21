@@ -98,7 +98,7 @@ def test_columns_with_more_categories_than_kept_are_flagged_once(
     client = generalforecast.local()
     crowded = client.create_table(
         "crowded",
-        model=(kumo_functions, tiny_kumo(regression=False)),
+        model="tests.models.kumo.tiny:classifier",
         columns={"code": "categorical", "x": "numeric"},
         classes=2,
         summary=summary,
