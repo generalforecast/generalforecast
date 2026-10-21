@@ -20,6 +20,7 @@ from generalforecast.deployments.contracts import ServiceError
 from generalforecast.package_commands import PackageCommands
 from generalforecast.packages import Package, PackageError, PackageSpec
 from generalforecast.serve.listener import add_arguments as add_serve_arguments
+from generalforecast.transport import RelayedError
 
 
 class _Parser(argparse.ArgumentParser):
@@ -279,7 +280,7 @@ def main() -> None:
         )
         message = (
             str(error)
-            if isinstance(error, (PackageError, CLIError))
+            if isinstance(error, (PackageError, CLIError, RelayedError))
             else {
                 "Unauthorized": "authentication failed; configure a valid key and run gf login",
                 "Forbidden": "permission denied",

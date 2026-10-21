@@ -40,6 +40,22 @@ DEFAULT_KEY_ENV = "GF_API_KEY"
 PROFILE_FIELDS = ("url", "project", "environment", "runtime", "key_env")
 _PROFILE_LIMIT = 65536
 _KEY_ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+_ESCAPES = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])|\x9b[0-?]*[ -/]*[@-~]"
+)
+
+
+def printable(message: str) -> str:
+    """Removes terminal escapes and non-printable characters from a message."""
+    return "".join(
+        " " if character in "\t\n\r" else character
+        for character in _ESCAPES.sub("", message)
+        if character in "\t\n\r" or character.isprintable()
+    ).strip()
+
+
+class RelayedError(ServiceError):
+    """A service's own short error message, made printable."""
 
 
 def _invalid_profile() -> ServiceError:
@@ -339,11 +355,8 @@ def retryable(method: str, body: Any) -> bool:
     )
 
 
-def response_value(status: int, raw: bytes, *, relay: bool = False) -> dict[str, Any]:
-    """Decodes bounded JSON, refusing credential forwarding and unsafe errors.
-
-    `relay` keeps a trusted service's own short error message.
-    """
+def response_value(status: int, raw: bytes) -> dict[str, Any]:
+    """Decodes bounded JSON, refusing credential forwarding and unsafe errors."""
     if 300 <= status < 400:
         raise ServiceError("RedirectRefused", "credential forwarding is disabled", 502)
     try:
@@ -359,9 +372,11 @@ def response_value(status: int, raw: bytes, *, relay: bool = False) -> dict[str,
             or any(type(v) is not str for v in detail.values())
         ):
             raise ServiceError("ProtocolError", "invalid service error", status)
-        message = detail["message"] if relay and len(detail["message"]) <= 512 else ""
+        message = printable(detail["message"]) if len(detail["message"]) <= 512 else ""
+        if message:
+            raise RelayedError(public_code(detail["code"]), message, status)
         raise ServiceError(
-            public_code(detail["code"]), message or "service rejected request", status
+            public_code(detail["code"]), "service rejected request", status
         )
     return value
 
@@ -429,8 +444,6 @@ class _NoRedirect(HTTPRedirectHandler):
 
 class Transport:
     """No cookies, automatic retries, redirects, or credential-bearing repr."""
-
-    relay = False
 
     def __init__(
         self,
@@ -654,7 +667,7 @@ class Transport:
                 ) from None
         if time.monotonic() > deadline:
             raise ServiceError("Timeout", "request deadline exceeded", 504)
-        return response_value(status, bytes(raw), relay=self.relay)
+        return response_value(status, bytes(raw))
 
 
 class AsyncTransport:
