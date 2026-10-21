@@ -9,7 +9,12 @@ import pytest
 
 import generalforecast as gf
 from generalforecast.async_client import AsyncClient, AsyncDeployment
-from generalforecast.transport import AsyncTransport, response_value
+from generalforecast.transport import (
+    AsyncTransport,
+    RelayedError,
+    printable,
+    response_value,
+)
 from tests.product_sdk.test_lifecycle import invoke
 
 
@@ -208,10 +213,36 @@ def test_error_code_is_not_an_untrusted_credential_echo():
     ):
         with pytest.raises(gf.ServiceError) as error:
             response_value(
-                401, json.dumps({"error": {"code": code, "message": code}}).encode()
+                401,
+                json.dumps(
+                    {"error": {"code": code, "message": "permission denied"}}
+                ).encode(),
             )
         assert error.value.code == "RemoteError"
+        assert str(error.value) == "permission denied"
         assert code not in repr(error.value.body())
+
+
+@pytest.mark.parametrize(
+    "message,expected",
+    [
+        ("\x1b[31mred\x1b[0m", "red"),
+        ("\x1b]0;title\x07ok", "ok"),
+        ("\x9b2Jx", "x"),
+        ("a\x00\u202eb\nc", "ab c"),
+    ],
+)
+def test_printable_removes_terminal_escapes_and_controls(message, expected):
+    assert printable(message) == expected
+
+
+@pytest.mark.parametrize("message", ["x" * 513, "", "\x00\u202e"])
+def test_response_value_falls_back_for_long_or_empty_printable_messages(message):
+    raw = json.dumps({"error": {"code": "Forbidden", "message": message}}).encode()
+    with pytest.raises(gf.ServiceError) as error:
+        response_value(403, raw)
+    assert not isinstance(error.value, RelayedError)
+    assert str(error.value) == "service rejected request"
 
 
 def test_async_refuses_compressed_bodies_before_consuming_or_decoding():

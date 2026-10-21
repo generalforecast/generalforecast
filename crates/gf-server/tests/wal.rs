@@ -14,7 +14,7 @@ use gf_server::name::TableName;
 use gf_server::protocol::{RecencySpec, StrategySpec};
 use gf_server::setup;
 use gf_server::wal::{
-    CreationId, EncryptionKey, HEAD_INTERVAL, Keys, Log, LogEntry, LogError, PastCapSpec,
+    self, CreationId, EncryptionKey, HEAD_INTERVAL, Keys, Log, LogEntry, LogError, PastCapSpec,
     PastWrite, Record, Rows, TableDefinition, Term, Terms, TimeKind, decode,
 };
 
@@ -600,9 +600,16 @@ fn a_crash_on_either_side_of_compactions_rename_leaves_a_whole_log() {
     // Before the rename: the old log with its head, beside a part-written new one.
     std::fs::write(&path, &old).unwrap();
     std::fs::write(&head, &old_head).unwrap();
+    std::fs::write(
+        directory.join("payments.compacting.7"),
+        &new[..new.len() / 2],
+    )
+    .unwrap();
     std::fs::write(directory.join("payments.compacting"), &new[..new.len() / 2]).unwrap();
     let (_, replayed, mut log) = open(&path, &keys(7)).unwrap();
     assert!(same(&replayed, &records()));
+    assert!(!directory.join("payments.compacting.7").exists());
+    assert!(!directory.join("payments.compacting").exists());
     // The next compaction writes over what the crash left.
     log.compact(&definition(), 5, std::slice::from_ref(&snapshot))
         .unwrap();
@@ -618,6 +625,81 @@ fn a_crash_on_either_side_of_compactions_rename_leaves_a_whole_log() {
     let (_, replayed, log) = open(&path, &keys(7)).unwrap();
     assert!(same(&replayed, &[snapshot]));
     assert_eq!(log.length(), 6);
+}
+
+#[test]
+fn a_late_compaction_of_a_dropped_table_leaves_its_successor_alone() {
+    let directory = tempdir();
+    let path = directory.join("payments.log");
+    let old = written(&path, &records()[..2]);
+    let mut old_compactor = old.begin_compaction(&definition(), old.length()).unwrap();
+    old_compactor.append(&records()[0]).unwrap();
+    let old_staged = directory.join(format!("payments.compacting.{}", old_compactor.number()));
+
+    drop(old);
+    wal::remove(&path).unwrap();
+    let mut new_definition = definition();
+    new_definition.created = Some(CreationId::new(1, [2, 3]));
+    let mut new = Log::create(&path, &key(7), &new_definition, Terms::default()).unwrap();
+    new.append(&records()[2]).unwrap();
+    new.append(&records()[3]).unwrap();
+    assert!(!old_staged.exists());
+
+    let mut new_compactor = new.begin_compaction(&new_definition, new.length()).unwrap();
+    let snapshot = Record::Snapshot(Rows {
+        keys: vec![2],
+        features: vec![3.0, 4.0],
+        targets: Targets::Classes(vec![1]),
+        times: Some(vec![Some(9)]),
+        id: None,
+        words: Vec::new(),
+        writes: Vec::new(),
+        layout: None,
+        table: None,
+    });
+    new_compactor.append(&snapshot).unwrap();
+    let new_staged = directory.join(format!("payments.compacting.{}", new_compactor.number()));
+
+    old_compactor.append(&records()[1]).unwrap();
+    old_compactor.finish().unwrap().discard();
+    new.install_compaction(new_compactor.finish().unwrap())
+        .unwrap();
+    drop(new);
+
+    let (replayed_definition, replayed, log) = open(&path, &keys(7)).unwrap();
+    assert_eq!(replayed_definition, new_definition);
+    assert!(same(&replayed, std::slice::from_ref(&snapshot)));
+    assert_eq!(log.length(), 4);
+    drop(log);
+    assert!(!new_staged.exists());
+    assert!(std::fs::read_dir(&directory).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("payments.compacting")
+    }));
+}
+
+#[test]
+fn a_closed_log_heads_every_acknowledged_record() {
+    let directory = tempdir();
+    let path = directory.join("payments.log");
+    let mut log = Log::create(&path, &key(7), &definition(), Terms::default()).unwrap();
+    for record in &records()[..3] {
+        log.append(record).unwrap();
+    }
+    log.close().unwrap();
+
+    assert!(same(&open(&path, &keys(7)).unwrap().1, &records()[..3]));
+    let mut damaged = std::fs::read(&path).unwrap();
+    let last = damaged.len() - 1;
+    damaged[last] ^= 1;
+    std::fs::write(&path, damaged).unwrap();
+    assert!(matches!(
+        open(&path, &keys(7)),
+        Err(LogError::Decrypt { .. })
+    ));
 }
 
 #[test]

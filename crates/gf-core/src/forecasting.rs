@@ -27,6 +27,18 @@ pub const TARGET: i32 = 0;
 pub const PAST: i32 = 1;
 pub const KNOWN: i32 = 2;
 
+/// Most passes of a forecaster's network one forecast runs: the cap on a
+/// horizon, in steps one pass predicts, so one call cannot hold a shard for
+/// minutes.
+pub const HORIZON_PASSES: usize = 64;
+
+/// The largest horizon, in steps, that one forecast may request.
+#[must_use]
+pub fn horizon_limit(output_patch: NonZeroUsize, pass_limit: Option<NonZeroUsize>) -> NonZeroUsize {
+    NonZeroUsize::new(HORIZON_PASSES.saturating_mul(pass_limit.unwrap_or(output_patch).get()))
+        .expect("a horizon limit is nonzero")
+}
+
 /// Which other series join a series in its group.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GroupStrategy {
@@ -73,6 +85,8 @@ pub struct SeriesSpec {
     pub patch: NonZeroUsize,
     /// Most context steps a grid holds; fewer than a patch holds one patch.
     pub context: NonZeroUsize,
+    /// Most steps one forecast covers: HORIZON_PASSES passes of the model's output.
+    pub max_horizon: NonZeroUsize,
     /// Most rows in a group, from the model, or None for any number.
     pub max_rows: Option<NonZeroUsize>,
     /// Feature columns known over the horizon, read from rows after the cutoff.
@@ -109,6 +123,8 @@ pub enum ForecastError {
     NotSeries,
     /// Query rows sent to a table of series, which takes forecasts.
     OnlyForecasts,
+    /// A forecast horizon longer than the model's maximum.
+    HorizonTooLong { horizon: usize, limit: usize },
     /// A row of a series table without a time.
     Untimed,
     /// Not one cutoff per series.
@@ -158,6 +174,11 @@ impl fmt::Display for ForecastError {
                     "a table of series takes forecasts, not query rows"
                 )
             }
+            Self::HorizonTooLong { horizon, limit } => write!(
+                formatter,
+                "a horizon of {horizon} steps is past the {limit} the model forecasts in \
+                 {HORIZON_PASSES} passes"
+            ),
             Self::Untimed => write!(formatter, "a row of a series table needs a time"),
             Self::Cutoffs { series, cutoffs } => {
                 write!(formatter, "{series} series were given {cutoffs} cutoffs")

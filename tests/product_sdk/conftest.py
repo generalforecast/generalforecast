@@ -129,7 +129,7 @@ def wire():
                     else {
                         "error": {
                             "code": result,
-                            "message": "fixture-key must not be reflected",
+                            "message": "service rejected the request",
                         }
                     }
                 )

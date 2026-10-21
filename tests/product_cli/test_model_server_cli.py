@@ -1,13 +1,16 @@
 """`gf` against a standalone model server: --base-url, --key-env, typed errors."""
 
 import json
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from generalforecast.cli import run
+from generalforecast import Client
+from generalforecast.cli import main, run
 from generalforecast.deployments.boundary import Request, Resource, Scope, success
+from generalforecast.deployments.contracts import ServiceError
 from generalforecast.transport import PLATFORM_PROBE, HostedOnlyError
 
 HOSTED_SECRETS = {
@@ -105,3 +108,56 @@ def test_base_url_rejects_profile_mixing_and_old_local_predict(model_server):
     with pytest.raises(SystemExit):
         run(["predict", "risk", "--local", "--input", "x.json"])
     assert not seen
+
+
+def test_client_and_cli_relay_sanitized_server_errors(monkeypatch, capsys):
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *_args):
+            pass
+
+        def do_GET(self):
+            body = json.dumps(
+                {
+                    "error": {
+                        "code": "Forbidden",
+                        "message": "key lacks deployments:write \x1b[2J",
+                    }
+                }
+            ).encode()
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        with (
+            Client(url, project="local", token="test-only-api-key") as client,
+            pytest.raises(ServiceError) as error,
+        ):
+            client.models.list()
+        assert str(error.value) == "key lacks deployments:write"
+
+        monkeypatch.setenv("GF_API_KEY", "test-only-api-key")
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["gf", "model", "list", "--base-url", url],
+        )
+        with pytest.raises(SystemExit) as exit_error:
+            main()
+        assert exit_error.value.code == 1
+        assert json.loads(capsys.readouterr().err) == {
+            "error": {
+                "code": "Forbidden",
+                "message": "key lacks deployments:write",
+            }
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()

@@ -17,8 +17,8 @@ use gf_server::protocol::{
 };
 use gf_server::shard::{Command, Fence, Incoming, Lease, Shard, ShardSettings, Write};
 use gf_server::wal::{
-    CreationId, EncryptionKey, Keys, Log, LogEntry, Record, Rows, TableDefinition, Terms, TimeKind,
-    decode,
+    CreationId, EncryptionKey, Keys, Log, LogEntry, LogError, Record, Rows, TableDefinition, Terms,
+    TimeKind, decode,
 };
 use gf_server::worker::WorkerConnection;
 use serde_json::Value;
@@ -1059,10 +1059,10 @@ async fn a_compaction_that_cannot_write_its_log_leaves_the_table_as_it_was() {
     shard.insert(&[1, 2, 3, 4]).await;
     let log = shard.directory.join("rows.log");
     let before = std::fs::read(&log).unwrap();
-    // The rewrite goes to a file beside the log; a directory in its place
-    // fails it before anything is written.
-    let blocking = shard.directory.join("rows.compacting");
-    std::fs::create_dir(&blocking).unwrap();
+    // With its directory moved away, the rewrite beside the log fails before
+    // anything is written.
+    let away = shard.directory.with_extension("away");
+    std::fs::rename(&shard.directory, &away).unwrap();
 
     let (reply, answer) = oneshot::channel();
     let command = Command::Compact {
@@ -1072,6 +1072,7 @@ async fn a_compaction_that_cannot_write_its_log_leaves_the_table_as_it_was() {
     };
     shard.commands.send(command).await.unwrap();
     assert!(answer.await.unwrap().is_err());
+    std::fs::rename(&away, &shard.directory).unwrap();
 
     // The log, its rows and its row order are as they were, so a restart
     // reads what the shard serves, and the next compaction goes through.
@@ -1079,11 +1080,66 @@ async fn a_compaction_that_cannot_write_its_log_leaves_the_table_as_it_was() {
     assert_eq!(shard.describe().await.rows, 4);
     shard.insert(&[5]).await;
     assert_eq!(shard.predict().await, Ok(1));
-    std::fs::remove_dir(&blocking).unwrap();
     shard.compact().await;
+    assert!(std::fs::read_dir(&shard.directory).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("rows.compacting")
+    }));
     let again = shard.restart().await;
     assert_eq!(again.describe().await.rows, 5);
     assert_eq!(again.predict().await, Ok(1));
+}
+
+#[tokio::test]
+async fn acknowledged_writes_are_headed_once_the_shard_goes_idle() {
+    let shard = shard(settings()).await;
+    shard.create(3).await.unwrap();
+    let head = shard.directory.join("rows.head");
+    let initial_head = std::fs::read(&head).unwrap();
+
+    shard.insert(&[1, 2, 3]).await;
+    shard.insert(&[4]).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if std::fs::read(&head).unwrap() != initial_head {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the log head did not catch up while the shard was idle"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    let copy = shard.directory.with_extension("copy");
+    std::fs::create_dir(&copy).unwrap();
+    let copy_log = copy.join("rows.log");
+    let copy_head = copy.join("rows.head");
+    std::fs::copy(shard.directory.join("rows.log"), &copy_log).unwrap();
+    std::fs::copy(&head, &copy_head).unwrap();
+    let read = |path: &std::path::Path| -> Result<Vec<Record>, LogError> {
+        let mut replay = Log::open(path, &Keys::only(key()))?;
+        let records = replay.by_ref().collect::<Result<Vec<_>, _>>()?;
+        replay.finish()?;
+        Ok(records)
+    };
+    let records = read(&copy_log).unwrap();
+    assert_eq!(records.len(), 2);
+    assert!(
+        records
+            .iter()
+            .all(|record| matches!(record, Record::Insert(_)))
+    );
+
+    let mut damaged = std::fs::read(&copy_log).unwrap();
+    let last = damaged.len() - 1;
+    damaged[last] ^= 1;
+    std::fs::write(&copy_log, damaged).unwrap();
+    assert!(matches!(read(&copy_log), Err(error) if error.damaged()));
 }
 
 #[tokio::test]
