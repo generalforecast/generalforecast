@@ -23,15 +23,18 @@ from generalforecast.models.conformance import close as _close
 from generalforecast.models.conformance import padded as _padded
 from generalforecast.models.contract import TabularFunctions
 from generalforecast.nn.attention import AttentionKernel
+from generalforecast.runtime import paging
+from generalforecast.runtime.decoding import paged_decode
 from generalforecast.runtime.device import (
     DeviceSettings,
     configure,
     device_settings,
+    load_cache,
     store_cache,
     to_cache_dtype,
 )
 from generalforecast.runtime.memory import fit_profile, memory_profile, tree_bytes
-from generalforecast.runtime.paging import cache_layout, pack, read_context
+from generalforecast.runtime.paging import cache_layout, pack, pack_into, read_context
 from generalforecast.worker import Worker
 from tests.models.conformance.cases import CASES, FEATURES, Case
 from tests.utils import node_harness
@@ -354,6 +357,78 @@ def test_caches_pack_into_slots_and_back(
         )
         for leaf in layout.row_leaves:
             np.testing.assert_array_equal(restored[leaf.index], expected[leaf.index])
+
+
+def test_a_cache_packs_into_the_pool_as_pack_packs_it_in_parts(
+    case: Case, functions: TabularFunctions, model: Any, monkeypatch: Any
+) -> None:
+    data = _padded(
+        table(case.regression, rows=20, queries=6), context_size=32, query_size=8
+    )
+    state, rows = functions.fit(
+        model, data.features, data.targets, data.num_classes, num_rows=20
+    )
+    cache = to_cache_dtype(
+        functions.encode(model, state, rows, data.targets, num_rows=20), FLOAT16
+    )
+    layout = cache_layout(
+        functions, model, FEATURES, slot_bytes=4096, cache_dtype=FLOAT16
+    )
+    count = layout.packed_slots(cache)
+    slots = list(range(count + 3, 3, -1))[:count]
+    expected = (
+        jnp.zeros((count + 5, 4096), jnp.uint8)
+        .at[jnp.array(slots)]
+        .set(pack(layout, cache))
+    )
+    # Three blocks a part: parts of every size, the last padded.
+    monkeypatch.setattr(paging, "PACK_BYTES", 3 * layout.block_bytes)
+
+    pool = pack_into(jnp.zeros((count + 5, 4096), jnp.uint8), slots, layout, cache)
+
+    np.testing.assert_array_equal(pool, expected)
+
+
+def test_a_paged_decode_predicts_as_one_of_the_whole_cache(
+    case: Case, functions: TabularFunctions, model: Any
+) -> None:
+    data = _padded(
+        table(case.regression, rows=20, queries=6), context_size=32, query_size=8
+    )
+    state, rows = functions.fit(
+        model, data.features, data.targets, data.num_classes, num_rows=20
+    )
+    cache = to_cache_dtype(
+        functions.encode(model, state, rows, data.targets, num_rows=20), FLOAT16
+    )
+    layout = cache_layout(
+        functions, model, FEATURES, slot_bytes=4096, cache_dtype=FLOAT16
+    )
+    slots = pack(layout, cache)
+    blocks = jnp.arange(slots.shape[0]).reshape(-1, layout.slots_per_row)
+    queries = functions.embed(model, state, data.queries)
+    stored = functions.properties(model).stored_cache
+
+    decode = paged_decode(functions, stored, layout, masked=False, in_order=True)
+    paged = decode(
+        model,
+        slots,
+        jax.tree.map(lambda values: values[None], state),
+        jnp.zeros(1, jnp.int32),
+        blocks[None],
+        jnp.arange(32)[None],
+        jnp.array([20]),
+        queries[None],
+    )[0]
+
+    whole = read_context(layout, slots, blocks, jnp.arange(32), jnp.array(20))
+    whole = whole if stored else load_cache(whole)
+    np.testing.assert_array_equal(
+        paged,
+        functions.postprocess(
+            model, state, functions.decode(model, state, whole, queries)
+        ),
+    )
 
 
 def test_a_unit_that_summarizes_its_own_rows_predicts_as_those_rows_alone(

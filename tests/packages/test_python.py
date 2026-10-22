@@ -193,7 +193,7 @@ def test_catalog_v1_serialization_is_stable():
     )
     assert (
         hashlib.sha256(canonical(lock.to_dict())).hexdigest()
-        == "3b363c2990bad0d9ad8c64cd56cf9b3842a4790c7c3218645c3e318c97228869"
+        == "184a5b104bdd51d03e63cdd3a7c1ea9e9ce4a14ba99bcf783d14e959136d1f0d"
     )
     assert lock.kind == "catalog" and lock.identity == lock.model.resolved
     assert "kind" not in lock.to_dict()

@@ -333,17 +333,33 @@ def paged_decode(
         The function, which takes the parameters, the pool, the tables' states
         and `paged_inputs`.
     """
+    indices = jax.tree.unflatten(layout.treedef, range(layout.treedef.num_leaves))
 
     def decode(
         parameters, source, states, index, blocks, positions, count, rows, reads=None
     ):
-        cache = read_context(layout, source, blocks, positions, count, reads, in_order)
-        if not stored:
-            cache = load_cache(cache)
+        def read(after: Any, part: Callable[[Any], Any]) -> Any:
+            # Tied to `after`, so XLA gathers each part only once it is needed.
+            _, slots = jax.lax.optimization_barrier((after, source))
+            wanted = frozenset(jax.tree.leaves(part(indices)))
+            cache = read_context(
+                layout, slots, blocks, positions, count, reads, in_order, wanted
+            )
+            chosen = part(cache)
+            return chosen if stored else load_cache(chosen)
+
         state = jax.tree.map(lambda values: values[index], states)
         if embeds:
             rows = functions.embed(parameters, state, rows)
-        outputs = functions.decode(parameters, state, cache, rows)
+        if functions.decode_reading is not None:
+            outputs = functions.decode_reading(parameters, state, read, rows)
+        else:
+            cache = read_context(
+                layout, source, blocks, positions, count, reads, in_order
+            )
+            if not stored:
+                cache = load_cache(cache)
+            outputs = functions.decode(parameters, state, cache, rows)
         return functions.postprocess(parameters, state, outputs)
 
     in_axes = (None, None, None, 0, 0, 0, 0, 0) + ((0,) if masked else ())

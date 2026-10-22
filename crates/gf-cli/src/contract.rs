@@ -69,7 +69,7 @@ pub fn validate(value: Value, dataset: bool) -> Result<Value, String> {
                 .features
                 .iter()
                 .any(|f| !name(f) || f == &config.target)
-            || !(1..=1024).contains(&config.max_rows)
+            || config.max_rows == 0
             || !(1..=10000).contains(&config.max_writes)
         {
             return Err("invalid bounded bootstrap dataset configuration".into());

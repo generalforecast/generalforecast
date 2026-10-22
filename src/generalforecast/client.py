@@ -73,9 +73,23 @@ WORKSPACE_ACTIONS: dict[str, tuple[str, str, str]] = {
     "workspaces.list": ("GET", "/workspaces", "workspaces"),
     "workspaces.create": ("POST", "/workspaces", "new"),
     "workspaces.get": ("GET", "/workspaces/{workspace}", "{workspace}"),
+    "workspaces.update": ("POST", "/workspaces/{workspace}", "{workspace}"),
     "workspaces.join": ("POST", "/workspaces/{workspace}/join", "{workspace}"),
     "workspaces.members": ("GET", "/workspaces/{workspace}/members", "{workspace}"),
+    "members.update": (
+        "POST",
+        "/workspaces/{workspace}/members/role",
+        "{workspace}",
+    ),
+    "members.remove": (
+        "POST",
+        "/workspaces/{workspace}/members/remove",
+        "{workspace}",
+    ),
     "invitations.preview": ("POST", "/invitations/preview", "invitation"),
+    "device.preview": ("POST", "/cli-logins/preview", "cli-login"),
+    "device.approve": ("POST", "/cli-logins/approve", "cli-login"),
+    "device.deny": ("POST", "/cli-logins/deny", "cli-login"),
     "invitations.accept": ("POST", "/invitations/accept", "invitation"),
     "invitations.list": ("GET", "/workspaces/{workspace}/invitations", "{workspace}"),
     "invitations.create": (
@@ -100,15 +114,11 @@ WORKSPACE_ACTIONS: dict[str, tuple[str, str, str]] = {
         "{id}",
     ),
     "requests.cancel": ("POST", "/join-requests/{id}/cancel", "{id}"),
+    "waitlist.join": ("POST", "/waitlist", "waitlist"),
+    "waitlist.get": ("GET", "/waitlist/{id}", "{id}"),
+    "waitlist.approve": ("POST", "/waitlist/{id}/approve", "{id}"),
     "domains.list": ("GET", "/workspaces/{workspace}/domains", "{workspace}"),
-    "domains.create": ("POST", "/workspaces/{workspace}/domains", "{workspace}"),
-    "domains.verify": ("POST", "/workspaces/{workspace}/domains/{id}/verify", "{id}"),
-    "domains.configure": (
-        "POST",
-        "/workspaces/{workspace}/domains/{id}/policy",
-        "{id}",
-    ),
-    "domains.revoke": ("POST", "/workspaces/{workspace}/domains/{id}/revoke", "{id}"),
+    "domains.configure": ("POST", "/workspaces/{workspace}/domains", "{workspace}"),
 }
 
 
@@ -1021,6 +1031,7 @@ class Identity:
         globals_ = {
             "workspace.get": ("workspace", "/workspace", "workspace"),
             "auth.status": ("workspace", "/auth/status", "auth"),
+            "auth.logout": ("workspace", "/auth/logout", "auth"),
             "organizations.list": ("workspace", "/organizations", "organizations"),
             "organizations.create": (
                 "workspace",
@@ -1031,13 +1042,14 @@ class Identity:
             "projects.create": ("project", "/projects", payload.get("name", "new")),
         }
         if action in globals_:
+            post = action.endswith("create") or action == "auth.logout"
             require(
                 action.endswith("create") or not payload,
                 "GET operation requires empty payload",
             )
             kind, path, resource = globals_[action]
             return self.client._call(
-                "POST" if action.endswith("create") else "GET",
+                "POST" if post else "GET",
                 path,
                 cast(ResourceKind, kind),
                 resource,
