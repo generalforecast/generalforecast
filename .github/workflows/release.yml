@@ -41,7 +41,6 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: "2_28"
-          sccache: "true"
           args: --release --locked --out dist
           before-script-linux: |
             cargo build --release --locked -p gf-cli --bin gf -p gf-server --bin gf-server
