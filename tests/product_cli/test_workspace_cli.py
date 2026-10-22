@@ -26,6 +26,7 @@ def test_session_denials_get_safe_console_hints(monkeypatch, capsys, code, messa
         raise ServiceError(code, "server detail gf_inv_" + "C" * 43, 403)
 
     monkeypatch.setattr(cli, "run", run)
+    monkeypatch.setattr("sys.argv", ["gf", "--json"])
     with pytest.raises(SystemExit) as exited:
         cli.main()
     assert exited.value.code == 1

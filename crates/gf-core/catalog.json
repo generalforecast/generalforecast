@@ -1,7 +1,7 @@
 {
   "max_classes": 1000,
   "policy": {
-    "context_rows": 1024,
+    "context_rows": 100000,
     "query_rows": 100,
     "features": 32,
     "horizon": 32,

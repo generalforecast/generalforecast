@@ -14,6 +14,7 @@ from sklearn.exceptions import NotFittedError
 
 from generalforecast.contracts import PredictionResult
 from generalforecast.estimators import Classifier, Forecaster, Regressor
+from generalforecast.models.catalog import V1_POLICY
 from generalforecast.packages import Package, PackageError, PackageLock
 
 
@@ -235,7 +236,8 @@ def test_package_capacity_binds_remote_and_export_not_local_paging(monkeypatch):
         raise RuntimeError("local loader reached")
 
     monkeypatch.setattr("generalforecast.models.artifacts.checkpoint", loading)
-    rows, target = np.ones((1100, 2)), np.arange(1100.0)
+    count = V1_POLICY.context_rows + 1
+    rows, target = np.ones((count, 2)), np.arange(float(count))
     with pytest.raises(RuntimeError, match="loader reached"):
         Regressor().fit(rows, target)
     with pytest.raises(PackageError) as error:

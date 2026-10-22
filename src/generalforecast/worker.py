@@ -13,6 +13,7 @@ runs as one vectorized call.
 
 import contextlib
 import dataclasses
+import functools
 import hashlib
 import importlib.metadata
 import logging
@@ -21,7 +22,7 @@ import sys
 import threading
 import time
 from collections import defaultdict
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Hashable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as finished
 from dataclasses import dataclass, field
@@ -64,6 +65,7 @@ from generalforecast.runtime.device import (
     configure,
     load_cache,
     store_cache,
+    to_cache_dtype,
     use_compile_cache,
     with_summary_chunk,
     without_command_buffers,
@@ -449,13 +451,16 @@ class Worker:
         self._fit_cache = cache_root() / "fit" if compile_cache else None
         # How the worker divides its memory; calls are sized from it as they run.
         self.budget = budget or MemoryBudget.measure()
-        self._chunks = Chunks(self._count, self._compiled, self._part, self._seen)
+        self._chunks = Chunks(
+            self._count, self._compiled, self._part, self._seen, self._noted
+        )
         # The worker's compiled programs, and those it compiles ahead.
         self.programs = Programs(
             settings,
             lambda: self.budget.short_of_memory(),
             (
                 _item,
+                _only_item,
                 _stack_columns,
                 store_cache,
                 pack,
@@ -665,6 +670,19 @@ class Worker:
         )
         self.programs.remember(self._specs[call.program[1]], kind, call.padded)
 
+    def _noted(self, stage: str, key: Hashable, call: Call, seconds: float) -> None:
+        """Logs a call that compiled, with its shapes, while parts are timed."""
+        if self.stats.timers:
+            logger.warning(
+                "compiled %s %s at %d items in %.2f s: items %s, kind %s",
+                stage,
+                call.program,
+                call.padded,
+                seconds,
+                kind_signature(call.items, stacked=True),
+                key,
+            )
+
     def forecaster(self, model: int) -> bool:
         """Whether a loaded model is a forecaster."""
         return isinstance(self._models[model].functions, SeriesFunctions)
@@ -838,8 +856,11 @@ class Worker:
             self._remember(model, ("encode", features, rows, fit))
             entry = self._tabular(model)
             try:
+                cache_dtype = (
+                    None if self._settings is None else self._settings.cache_dtype
+                )
                 measured = encode_bytes(
-                    entry.functions, entry.parameters, features, rows, fit
+                    entry.functions, entry.parameters, features, rows, fit, cache_dtype
                 )
             except NoMemoryAnalysis as error:
                 logger.warning(
@@ -1256,7 +1277,7 @@ class Worker:
         `consume` takes each item's outputs with its entry in `indices`, and
         `program`, if given, is the `Programs` key `compiled` is kept under.
         Calls take only `buckets`' stacked counts if given, and on an
-        accelerator one not yet compiled compiles on the side.
+        accelerator a count not yet compiled compiles on the side.
         """
 
         def prepare(first: int, stop: int, padded: int) -> Call:
@@ -1265,9 +1286,14 @@ class Worker:
             return Call(compiled, shared, stacked, padded, program)
 
         def taken(first: int, stop: int, outputs: Any) -> None:
+            alone = all(leaf.shape[0] == 1 for leaf in jax.tree.leaves(outputs))
             for position in range(stop - first):
                 with self.stats.timed("unstack"):
-                    item = _item(outputs, np.int32(position))
+                    item = (
+                        _only_item(outputs)
+                        if alone
+                        else _item(outputs, np.int32(position))
+                    )
                 consume(indices[first + position], item)
 
         self._chunks.run(
@@ -1278,7 +1304,7 @@ class Worker:
             estimate,
             prepare,
             taken,
-            self._compile_on_side if self._on_side and buckets is not None else None,
+            self._compile_on_side if self._on_side else None,
             buckets,
         )
 
@@ -1411,6 +1437,13 @@ class Worker:
         read = (lambda cache: cache) if stored else load_cache
         settings = self._settings
 
+        def stored_dtype(cache: Any) -> Any:
+            return (
+                cache
+                if settings is None
+                else to_cache_dtype(cache, settings.cache_dtype)
+            )
+
         def fit(parameters, features, targets, rows, categorical):
             return functions.fit(
                 parameters,
@@ -1434,8 +1467,9 @@ class Worker:
             "fit": fit,
             "state": state,
             "embed": functions.embed,
-            "encode": lambda parameters, state, rows, targets, count: functions.encode(
-                parameters, state, rows, targets, num_rows=count
+            # Cast inside the call, so it holds the cache in one dtype only.
+            "encode": lambda parameters, state, rows, targets, count: stored_dtype(
+                functions.encode(parameters, state, rows, targets, num_rows=count)
             ),
             "decode": lambda parameters, state, cache, rows: functions.postprocess(
                 parameters,
@@ -1457,8 +1491,6 @@ class Worker:
 
         def fit_decode(parameters, features, targets, rows, categorical, queries):
             state, cache = fit_encode(parameters, features, targets, rows, categorical)
-            if settings is not None:
-                cache = store_cache(cache, settings)
             return state, embed_decode(parameters, state, cache, queries)
 
         stages["fit_encode"], stages["embed_decode"] = fit_encode, embed_decode
@@ -1732,8 +1764,6 @@ class Worker:
                 state, cache = outputs if stage == "fit_encode" else (None, outputs)
                 if state is not None:
                     self._warn_crowded(unit.table, state)
-                if self._settings is not None:
-                    cache = store_cache(cache, self._settings)
                 self.stats.encoded += 1
                 self.stats.rows_encoded += len(unit.rows)
                 table = self._tables[unit.table]
@@ -1794,8 +1824,8 @@ class Worker:
         """Refuses a unit whose encode, or whose context and decode, would not fit the device.
 
         Beside the pool, the device must hold the context's encode: its inputs,
-        temporaries and cache, then the cache again as the call's item is
-        taken from it. It must also hold the working memory of decoding the
+        temporaries and cache, which the call's lone item is taken from in
+        place. It must also hold the working memory of decoding the
         smallest chunk of queries against the context. A kept context's decode
         reads it, and any own state, from the pool into that working memory; a
         transient context's decode takes a copy of it into its call, beside
@@ -1856,20 +1886,21 @@ class Worker:
         state: Any = None,
     ) -> None:
         """Packs an encoded context of `rows` layout rows, and any own state after it, into the device slots the node assigned it."""
-        data = pack(layout, cache)
         slots = list(slots)
-        written = slots
-        if own is not None:
-            # The node keeps room for the table's state, with or without
-            # categorical columns; the state may take fewer whole slots.
-            data = jnp.concatenate([data, pack_state(own, state)])
-            written = slots[: data.shape[0]]
-        if data.shape[0] != len(written):
+        packed = layout.packed_slots(cache)
+        own_data = None if own is None else pack_state(own, state)
+        used = packed + (0 if own_data is None else own_data.shape[0])
+        # The node keeps room for the table's state, with or without
+        # categorical columns; the state may take fewer whole slots.
+        written = slots if own is None else slots[:used]
+        if used != len(written):
             raise RuntimeError(
-                f"a context packs into {data.shape[0]} slots, but the node gave {len(slots)}"
+                f"a context packs into {used} slots, but the node gave {len(slots)}"
             )
         with self.stats.timed("store"):
-            self._device.write(written, data)
+            self._device.write_cache(slots[:packed], layout, cache)
+            if own_data is not None:
+                self._device.write(slots[packed:used], own_data)
         self._contexts[key] = Context(layout, rows, slots)
 
     def _decode(
@@ -2075,10 +2106,11 @@ class Worker:
         for (batch, queries), values in outputs:
             with self.stats.timed("fetch"):
                 values = np.asarray(values)[: len(queries)]
-            if batch.request not in predictions:
-                shape = (len(batch.units), values.shape[-1])
-                predictions[batch.request] = np.zeros(shape, dtype=values.dtype)
-            predictions[batch.request][queries] = values
+            with self.stats.timed("scatter"):
+                if batch.request not in predictions:
+                    shape = (len(batch.units), values.shape[-1])
+                    predictions[batch.request] = np.zeros(shape, dtype=values.dtype)
+                predictions[batch.request][queries] = values
         return predictions
 
     def _decode_dense(
@@ -2187,8 +2219,6 @@ class Worker:
             state, cache = output if put_off.stage == "fit_encode" else (None, output)
             if state is not None:
                 self._warn_crowded(put_off.table, state)
-            if self._settings is not None:
-                cache = store_cache(cache, self._settings)
             if not put_off.encoded:
                 put_off.encoded = True
                 self.stats.encoded += 1
@@ -2302,6 +2332,7 @@ class Worker:
                 lambda: estimate,
                 prepare,
                 taken,
+                self._compile_on_side if self._on_side else None,
             )
         except jax.errors.JaxRuntimeError as error:
             # One decoding alone ran out of memory: its queries go in halves,
@@ -2879,6 +2910,12 @@ def _stack_columns(columns: list[tuple]) -> list[jax.Array]:
 def _item(outputs: Any, at: jax.Array) -> Any:
     """One item of a call's stacked outputs, in one dispatch rather than one per leaf."""
     return jax.tree.map(lambda value: value[at], outputs)
+
+
+@functools.partial(jax.jit, donate_argnums=0)
+def _only_item(outputs: Any) -> Any:
+    """The item of a call's outputs stacked over one, taking over their buffers."""
+    return jax.tree.map(lambda value: value[0], outputs)
 
 
 def _manifests(bucket_minimum: int, slot_bytes: int) -> Path:

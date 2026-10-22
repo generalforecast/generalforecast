@@ -67,6 +67,11 @@ impl Gauge {
         self.0.fetch_sub(value, Ordering::Relaxed);
     }
 
+    /// Raises the value to `value`, if it is more.
+    pub fn max(&self, value: u64) {
+        self.0.fetch_max(value, Ordering::Relaxed);
+    }
+
     /// The value.
     #[must_use]
     pub fn get(&self) -> u64 {
@@ -215,6 +220,9 @@ pub struct Metrics {
     /// The parts of planning a step, which split `plan_seconds`; see the
     /// node's `PlanParts`.
     plan_parts: Mutex<BTreeMap<String, Arc<Stage>>>,
+    /// The most each kind of memory held in any worker's step; see the
+    /// worker's `generalforecast.profiling.memory`.
+    memory_peaks: Mutex<BTreeMap<String, Arc<Gauge>>>,
     by_table: Mutex<BTreeMap<String, Arc<TableMetrics>>>,
     timings: Option<TimingLog>,
 }
@@ -285,6 +293,18 @@ impl Metrics {
     /// A plan part's metrics, made on first use.
     pub fn plan_part(&self, name: &str) -> Arc<Stage> {
         Self::named(&self.plan_parts, name)
+    }
+
+    /// Counts a step's memory of a kind, in bytes, towards the most any step held.
+    pub fn memory_peak(&self, kind: &str, bytes: u64) {
+        let peak = Arc::clone(
+            self.memory_peaks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(kind.to_string())
+                .or_default(),
+        );
+        peak.max(bytes);
     }
 
     fn named(map: &Mutex<BTreeMap<String, Arc<Stage>>>, name: &str) -> Arc<Stage> {
@@ -545,6 +565,22 @@ impl Metrics {
                 text,
                 "gf_worker_part_seconds_total{{part=\"{name}\"}} {}",
                 part.seconds.get()
+            );
+        }
+        let peaks = self
+            .memory_peaks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let _ = write!(
+            text,
+            "# HELP gf_worker_memory_peak_bytes The most each kind of memory held in any worker's step.\n# TYPE gf_worker_memory_peak_bytes gauge\n"
+        );
+        for (kind, peak) in &peaks {
+            let _ = writeln!(
+                text,
+                "gf_worker_memory_peak_bytes{{kind=\"{kind}\"}} {}",
+                peak.get()
             );
         }
         let plan_parts = self

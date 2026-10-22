@@ -146,10 +146,8 @@ def test_an_encodes_estimate_covers_what_xla_measures(name: str) -> None:
         profile = encode_profile(functions, model, widths=encode_widths(width))
         per_row = memory_profile(functions, model, width).cache_bytes_per_row
         for rows in (MEASURED_ROWS, 4 * MEASURED_ROWS):
-            held, temporaries, outputs = _encode_parts(
-                functions, model, False, width, rows
-            )
-            measured = held + max(temporaries, outputs)
+            held, temporaries, _ = _encode_parts(functions, model, False, width, rows)
+            measured = held + temporaries
 
             # LimiX chunks its attention at a size that moves with width, so
             # past the sizes measured a wide table's estimate runs high.

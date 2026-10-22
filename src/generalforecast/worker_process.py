@@ -26,6 +26,7 @@ import jax
 
 from generalforecast import protocol
 from generalforecast.models import registry
+from generalforecast.profiling import memory
 from generalforecast.runtime.budget import MemoryBudget
 from generalforecast.runtime.device import default_settings, without_command_buffers
 from generalforecast.worker import Worker
@@ -185,6 +186,8 @@ def _handled(
             case protocol.Step() as step:
                 # The step's seconds run from its frame's decode, above, to
                 # its reply's conversion, so its parts add up to them.
+                if worker.timers:
+                    memory.reset()
                 predictions, failed = worker.run_apart(step)
                 with worker.stats.timed("reply"):
                     frame = protocol.predictions(
@@ -195,6 +198,7 @@ def _handled(
                         time.perf_counter() - started,
                         worker.stats.stages_since(before),
                         worker.stats.parts_since(before),
+                        memory.reading() if worker.timers else None,
                     )
                 )
                 return lambda: frame
@@ -370,6 +374,7 @@ class _Tracing:
                         ended - started,
                         worker.stats.stages_since(before),
                         worker.stats.parts_since(before),
+                        memory.reading() if worker.timers else None,
                     ),
                 }
             )
