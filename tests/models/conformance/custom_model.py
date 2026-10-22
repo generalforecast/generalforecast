@@ -8,10 +8,7 @@ practice, one would use a built-in model; this shows the calls the engine runs
 every model through: fit, embed, encode, decode and postprocess, and checks the
 model against what the engine relies on with `generalforecast.models.conformance.check`.
 
-Run with:
-  uv run python examples/custom_model.py
-
-This example requires scikit-learn (uv sync --extra sklearn).
+It requires scikit-learn (uv sync --extra sklearn).
 """
 
 from dataclasses import dataclass, field
