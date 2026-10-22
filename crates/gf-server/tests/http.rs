@@ -58,6 +58,7 @@ fn fake_worker(mut stream: UnixStream) {
                     seconds: 0.001,
                     stages: BTreeMap::new(),
                     parts: BTreeMap::new(),
+                    memory: BTreeMap::new(),
                 }
                 .frame()
                 .header;

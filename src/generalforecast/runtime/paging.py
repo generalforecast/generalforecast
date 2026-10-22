@@ -17,7 +17,7 @@ layout decides how many of its rows fit in one.
 
 import gc
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -30,7 +30,7 @@ import numpy as np
 from generalforecast.models.contract import TabularFunctions
 from generalforecast.nn.attention import AttentionCache
 from generalforecast.runtime.device import to_cache_dtype
-from generalforecast.runtime.shapes import bucket_size, pad_rows
+from generalforecast.runtime.shapes import bucket_size
 
 # Two traced context sizes; the axis that grows between them is the row axis.
 _SMALL, _LARGE = 16, 48
@@ -79,6 +79,12 @@ class CacheLayout:
     def slots(self, rows: int) -> int:
         """Slots a cache of `rows` rows takes."""
         return -(-rows // self.rows_per_slot) * self.slots_per_row
+
+    def packed_slots(self, cache: Any) -> int:
+        """Slots `pack` packs `cache` into: one block for each of its encoded rows' slots."""
+        first = self.row_leaves[0]
+        leaves = self.treedef.flatten_up_to(cache)
+        return self.slots(leaves[first.index].shape[first.axis])
 
 
 def cache_layout(
@@ -196,6 +202,26 @@ def traced_layout(
     )
 
 
+def _packed(layout: CacheLayout, cache: Any, start: jax.Array, count: int) -> jax.Array:
+    """Blocks `start` to `start + count` of a cache's rows as slots; rows past its end pack as zeros."""
+    leaves = layout.treedef.flatten_up_to(cache)
+    rows = start * layout.rows_per_slot + jnp.arange(count * layout.rows_per_slot)
+    blocks = []
+    for leaf in layout.row_leaves:
+        values = jnp.take(
+            leaves[leaf.index], rows, axis=leaf.axis, mode="fill", fill_value=0
+        )
+        values = jnp.moveaxis(values, leaf.axis, 0)
+        # Booleans have no bit pattern to reinterpret; a byte each is exact.
+        if values.dtype == jnp.bool_:
+            values = values.astype(jnp.uint8)
+        data = jax.lax.bitcast_convert_type(values, jnp.uint8)
+        blocks.append(data.reshape(count, layout.rows_per_slot * leaf.row_bytes))
+    data = jnp.concatenate(blocks, axis=1)
+    data = jnp.pad(data, ((0, 0), (0, layout.block_bytes - data.shape[1])))
+    return data.reshape(count * layout.slots_per_row, layout.slot_bytes)
+
+
 @partial(jax.jit, static_argnums=0)
 def pack(layout: CacheLayout, cache: Any) -> jax.Array:
     """Packs a cache's rows into slots.
@@ -207,21 +233,47 @@ def pack(layout: CacheLayout, cache: Any) -> jax.Array:
     Returns:
         The slots' bytes, `(slots, slot_bytes)` uint8.
     """
-    leaves = layout.treedef.flatten_up_to(cache)
-    first = layout.row_leaves[0]
-    count = layout.slots(leaves[first.index].shape[first.axis]) // layout.slots_per_row
-    capacity = count * layout.rows_per_slot
-    blocks = []
-    for leaf in layout.row_leaves:
-        rows = pad_rows(jnp.moveaxis(leaves[leaf.index], leaf.axis, 0), capacity)
-        # Booleans have no bit pattern to reinterpret; a byte each is exact.
-        if rows.dtype == jnp.bool_:
-            rows = rows.astype(jnp.uint8)
-        data = jax.lax.bitcast_convert_type(rows, jnp.uint8)
-        blocks.append(data.reshape(count, layout.rows_per_slot * leaf.row_bytes))
-    data = jnp.concatenate(blocks, axis=1)
-    data = jnp.pad(data, ((0, 0), (0, layout.block_bytes - data.shape[1])))
-    return data.reshape(count * layout.slots_per_row, layout.slot_bytes)
+    count = layout.packed_slots(cache) // layout.slots_per_row
+    return _packed(layout, cache, jnp.int32(0), count)
+
+
+@partial(jax.jit, static_argnums=0, donate_argnums=1)
+def _write_blocks(
+    layout: CacheLayout, pool: jax.Array, cache: Any, start: jax.Array, slots: jax.Array
+) -> jax.Array:
+    """`pool` with the cache's blocks from `start` packed into `slots`; a slot past its end is padding, and dropped."""
+    count = slots.shape[0] // layout.slots_per_row
+    return pool.at[slots].set(_packed(layout, cache, start, count), mode="drop")
+
+
+# Bytes of a cache packed at a time as it is written to the device pool,
+# rounded down to a power of two of blocks.
+PACK_BYTES = 1 << 30
+
+
+def pack_into(
+    pool: jax.Array, slots: Sequence[int], layout: CacheLayout, cache: Any
+) -> jax.Array:
+    """`pool` with `cache` packed into `slots`, a part of `PACK_BYTES` at a time.
+
+    The pool is donated to each part's write, so the device holds one part's
+    bytes beside the cache and the pool. Each part but the last is the same
+    size, and the last pads to a bucket, so a layout compiles a few programs.
+    """
+    most = max(1, PACK_BYTES // layout.block_bytes)
+    most = 1 << (most.bit_length() - 1)
+    total = len(slots) // layout.slots_per_row
+    for start in range(0, total, most):
+        count = min(most, total - start)
+        index = np.full(
+            bucket_size(count, 1) * layout.slots_per_row, pool.shape[0], np.int32
+        )
+        part = slots[
+            start * layout.slots_per_row : (start + count) * layout.slots_per_row
+        ]
+        index[: len(part)] = part
+        pool = _write_blocks(layout, pool, cache, jnp.int32(start), jnp.asarray(index))
+    return pool
 
 
 @dataclass(frozen=True)
@@ -321,6 +373,7 @@ def read_context(
     count: jax.Array,
     reads: jax.Array | None = None,
     in_order: bool = False,
+    parts: frozenset[int] | None = None,
 ) -> Any:
     """A context's cache, gathered row by row from the slots of its entries.
 
@@ -343,6 +396,8 @@ def read_context(
         in_order: Whether the context is one entry, its rows its blocks' rows
             in order, at least as many as `positions` has. Each leaf then comes
             a block at a time, far faster for long contexts than row by row.
+        parts: The flat indices of the row-bearing leaves to read, or None
+            for all; the others are None.
 
     Returns:
         The context cache, its attention lengths set to `count`, and its mask
@@ -355,6 +410,9 @@ def read_context(
     leaves: list[Any] = [None] * layout.treedef.num_leaves
     offset = 0
     for leaf in layout.row_leaves:
+        if parts is not None and leaf.index not in parts:
+            offset += layout.rows_per_slot * leaf.row_bytes
+            continue
         if in_order and layout.slots_per_row == 1:
             width = layout.rows_per_slot * leaf.row_bytes
             starts = jnp.full(blocks.shape[0], offset, jnp.int32)
@@ -563,9 +621,28 @@ class DevicePool:
                 calls.append((index, part))
         else:
             calls = [(jnp.asarray(slots, dtype=jnp.int32), data)]
+        self._update(
+            [
+                lambda pool, index=index, part=part: _write(pool, index, part)
+                for index, part in calls
+            ]
+        )
+
+    def write_cache(self, slots: list[int], layout: CacheLayout, cache: Any) -> None:
+        """Packs `cache` into `slots`, in place; see `pack_into`."""
+        _check(slots, self._shape[0])
+        pool = self.data
+        if isinstance(pool, np.ndarray):
+            pool[slots] = np.asarray(pack(layout, cache))
+            return
+        self._update([lambda pool: pack_into(pool, slots, layout, cache)])
+
+    def _update(self, writes: list[Callable[[jax.Array], jax.Array]]) -> None:
+        """Replaces the device pool by each of `writes` in turn, each donated the last's pool."""
+        pool = self._on_device()
         try:
-            for index, part in calls:
-                pool = _write(pool, index, part)
+            for write in writes:
+                pool = write(pool)
                 self._data = pool
         except Exception as error:
             if not pool.is_deleted():

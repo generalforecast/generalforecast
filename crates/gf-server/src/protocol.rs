@@ -816,6 +816,8 @@ pub enum WorkerReply {
         stages: BTreeMap<String, StageTime>,
         #[serde(default)]
         parts: BTreeMap<String, StageTime>,
+        #[serde(default)]
+        memory: BTreeMap<String, u64>,
     },
 }
 
@@ -975,6 +977,9 @@ pub struct Outcome {
     /// The step's parts, which split its seconds: how often each ran and
     /// its seconds, as the worker's `WorkerStats.parts` names them.
     pub parts: BTreeMap<String, StageTime>,
+    /// What the step held in memory, in bytes by kind, when the worker times
+    /// its parts; see the worker's `generalforecast.profiling.memory`.
+    pub memory: BTreeMap<String, u64>,
 }
 
 /// A worker's reply to a step.
@@ -990,6 +995,7 @@ pub fn outcome_from(frame: &Frame) -> Result<Outcome, FrameError> {
         seconds,
         stages,
         parts,
+        memory,
     } = WorkerReply::of(frame)?
     else {
         return Err(FrameError(format!(
@@ -1039,6 +1045,7 @@ pub fn outcome_from(frame: &Frame) -> Result<Outcome, FrameError> {
         seconds,
         stages,
         parts,
+        memory,
     })
 }
 

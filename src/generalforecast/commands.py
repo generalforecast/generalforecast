@@ -17,6 +17,12 @@ from typing import Any
 import yaml
 
 from generalforecast.client import Client
+from generalforecast.command_specs import (
+    COLLECTIONS,
+    IDENTITY_GROUPS,
+    LEGACY_DEPLOY,
+    OPERATIONS,
+)
 from generalforecast.contracts import DatasetImportRef
 from generalforecast.deployments.boundary import JsonObject, ResourceKind
 from generalforecast.deployments.contracts import ServiceError, name
@@ -30,7 +36,8 @@ class CLIError(ServiceError):
     """Local validation with a constant, safe terminal message."""
 
 
-_CREDENTIAL_VALUES: set[str] = set()
+from generalforecast.credentials import CONNECTION, uses_profiles
+from generalforecast.credentials import SEEN as _CREDENTIAL_VALUES
 
 
 def require(condition: bool, message: str) -> None:
@@ -86,8 +93,72 @@ def records(table) -> list[dict]:
     return json.loads(json.dumps(table.to_pylist(), default=scalar, allow_nan=False))
 
 
+# Server and credential source of the last resolved connection, for diagnostics.
+def _legacy(args: argparse.Namespace) -> bool:
+    """Explicit endpoint flags, GF_PROFILE or a saved profile keep the old resolver."""
+    return uses_profiles(args)
+
+
 def connection_for(args: argparse.Namespace) -> ConnectionSettings:
-    """Resolves CLI flags through the SDK's single profile/credential resolver."""
+    """GF_API_KEY or the `gf login` key for GF_URL (default: the hosted service).
+
+    `--local` targets a `gf serve` on this machine without credentials. Saved
+    profiles and the hidden --url/--profile/--key-env/--base-url flags still
+    resolve through the SDK's profile resolver.
+    """
+    from generalforecast.credentials import ENV_KEY, CredentialStore, server_url
+    from generalforecast.transport import credential
+
+    CONNECTION.clear()
+    if getattr(args, "local", False):
+        from generalforecast.serve.listener import DEFAULT_PORT
+
+        local = os.environ.get("GF_LOCAL_URL", f"http://127.0.0.1:{DEFAULT_PORT}")
+        CONNECTION.update(server=local, source="--local", project_pending="")
+        return ConnectionSettings.resolve(
+            project=getattr(args, "project", None), base_url=local
+        )
+    if not _legacy(args):
+        server = server_url()
+        found = CredentialStore().resolve(server)
+        if found is None:
+            raise CLIError("NotLoggedIn", "not logged in", 401)
+        CONNECTION.update(server=server, source=found.source)
+        project = (
+            getattr(args, "project", None)
+            or os.environ.get("GF_PROJECT")
+            or (found.login.project if found.login else None)
+        )
+        CONNECTION["project_pending"] = "" if project else "1"
+        profile = Profile(
+            server,
+            project or "default",
+            os.environ.get("GF_ENV", "production"),
+            os.environ.get("GF_RUNTIME"),
+            key_env=None,
+        )
+        env = ENV_KEY if found.source == ENV_KEY else None
+        return ConnectionSettings(None, profile, env, credential(found.key, "API key"))
+    settings = _resolve(args)
+    CONNECTION.update(
+        server=settings.profile.url,
+        source=settings.credential_env or "profile",
+        project_pending="",
+    )
+    return settings
+
+
+def _key_project(server: str, key: str) -> str:
+    """The project a bare GF_API_KEY is scoped to, asked of the server once."""
+    client = Client(profile=Profile(server, "local", key_env=None), token=key)
+    scoped = client.identity.manage("auth.status").get("key") or {}
+    project = scoped.get("project")
+    if not isinstance(project, str):
+        raise CLIError("ValidationError", "set GF_PROJECT for this API key", 400)
+    return project
+
+
+def _resolve(args: argparse.Namespace) -> ConnectionSettings:
     return ConnectionSettings.resolve(
         getattr(args, "url", None),
         getattr(args, "project", None),
@@ -107,7 +178,7 @@ def client_for(
     # Hosted provider credentials stay with profile endpoints, never --base-url.
     provider = (
         {}
-        if getattr(args, "base_url", None) is not None
+        if getattr(args, "base_url", None) is not None or getattr(args, "local", False)
         else {
             "auth_mode": os.environ.get("GF_AUTH_MODE", "bearer"),
             "platform_token": os.environ.get("GF_PLATFORM_TOKEN"),
@@ -136,6 +207,15 @@ def client_for(
             raise ServiceError(
                 "ClientError", "cannot load verified TLS configuration", 422
             ) from None
+    if CONNECTION.get("project_pending") and token:
+        return _KeyScopedClient(
+            key=token,
+            profile=settings.profile,
+            token=token,
+            timeout=getattr(args, "timeout", 40),
+            tls_context=context,
+            **provider,
+        )
     return Client(
         profile=settings.profile,
         token=token,
@@ -143,6 +223,28 @@ def client_for(
         tls_context=context,
         **provider,
     )
+
+
+class _KeyScopedClient(Client):
+    """A bare GF_API_KEY learns its project from the server on first use."""
+
+    def __init__(self, *args: Any, key: str, **kwargs: Any) -> None:
+        """Defers the project lookup so building a client never touches the network."""
+        self._key, self._project, self._ready = key, None, False
+        super().__init__(*args, **kwargs)
+        self._ready = True
+
+    @property
+    def project(self) -> str:
+        """The key's project, asked of the server once."""
+        if self._project is None:
+            self._project = _key_project(self.profile.url, self._key)
+        return self._project
+
+    @project.setter
+    def project(self, value: str) -> None:
+        if self._ready:
+            self._project = value
 
 
 def upload_snapshot(client: Client, table) -> dict:
@@ -194,26 +296,35 @@ def upload_python_source(client: Client, deployment: str, package) -> None:
 def execute(args: argparse.Namespace) -> dict:
     """Executes authenticated commands; receipt acceptance never implies readiness."""
     if args.group == "login":
-        settings = connection_for(args)
-        client = client_for(args, settings)
-        client.identity.manage("auth.status")
-        profile = settings.profile_name or "default"
-        stored = Profile.load_all(missing_ok=True).get(profile, {})
-        fields: dict[str, Any] = stored | {
-            "url": client._transport.url,
-            "project": client.project,
-            "key_env": settings.credential_env or settings.profile.key_env,
-        }
-        Profile(**fields).save(profile)
-        return {
-            "authenticated": True,
-            "profile": profile,
-            "project": client.project,
-            "method": "configured-key",
-        }
+        return configured_login(args)
     client = client_for(args)
     if args.group == "datasets":
         return _dataset(client, args)
+    return _scoped(client, args)
+
+
+def configured_login(args: argparse.Namespace) -> dict:
+    """Verifies a key named by --key-env/--profile and saves the profile."""
+    settings = connection_for(args)
+    client = client_for(args, settings)
+    client.identity.manage("auth.status")
+    profile = settings.profile_name or "default"
+    stored = Profile.load_all(missing_ok=True).get(profile, {})
+    fields: dict[str, Any] = stored | {
+        "url": client._transport.url,
+        "project": client.project,
+        "key_env": settings.credential_env or settings.profile.key_env,
+    }
+    Profile(**fields).save(profile)
+    return {
+        "authenticated": True,
+        "profile": profile,
+        "project": client.project,
+        "method": "configured-key",
+    }
+
+
+def _scoped(client: Client, args: argparse.Namespace) -> dict:
     if args.group == "runtimes":
         ident = name(args.name)
         require(args.action != "cleanup" or args.yes, "cleanup requires --yes")
@@ -245,19 +356,6 @@ def execute(args: argparse.Namespace) -> dict:
     if args.group in IDENTITY_GROUPS:
         return _identity(client, args, payload)
     return _collection(client, args, payload)
-
-
-IDENTITY_GROUPS = {
-    "key": "keys",
-    "secret": "secrets",
-    "auth": "auth",
-    "workspace": "workspace",
-    "organization": "organizations",
-    "project": "projects",
-    "membership": "memberships",
-    "sso": "sso",
-    "audit": "audit",
-}
 
 
 def _identity(client: Client, args: argparse.Namespace, payload: JsonObject) -> dict:
@@ -417,66 +515,6 @@ def _dataset(client: Client, args: argparse.Namespace) -> dict:
         "records": observations,
     }
     return dict(client.datasets.mutate(ident, mutation))
-
-
-COLLECTIONS: dict[str, tuple[ResourceKind, str]] = {
-    "dataset": ("dataset", "datasets"),
-    "source": ("source", "sources"),
-    "model": ("model", "models"),
-    "job": ("job", "jobs"),
-    "package": ("package", "packages"),
-    "deploy": ("deployment", "deployments"),
-    "key": ("api-key", "keys"),
-    "secret": ("secret", "secrets"),
-    "operator": ("operator", "operators"),
-    "auth": ("workspace", "auth"),
-    "workspace": ("workspace", "workspace"),
-    "organization": ("workspace", "organizations"),
-    "project": ("project", "projects"),
-    "membership": ("workspace", "memberships"),
-    "sso": ("workspace", "sso"),
-    "audit": ("workspace", "audit"),
-}
-
-
-OPERATIONS: dict[str, set[str]] = {
-    "dataset": {"list", "get", "create", "mutate", "snapshot"},
-    "source": {"list", "pin"},
-    "model": {"list", "get", "infer"},
-    "job": {
-        "list",
-        "get",
-        "submit",
-        "pause",
-        "resume",
-        "cancel",
-        "retry",
-        "results",
-    },
-    "package": {"list", "get", "inspect", "register", "test"},
-    "deploy": {
-        "list",
-        "get",
-        "apply",
-        "wait",
-        "score",
-        "effect-status",
-        "effect-wait",
-    },
-    "key": {"list", "create", "revoke", "rotate"},
-    "secret": {"list", "get", "create", "rotate", "delete"},
-    "operator": {"doctor"},
-    "auth": {"status"},
-    "workspace": {"get"},
-    "organization": {"list", "create"},
-    "project": {"list", "create"},
-    "membership": {"list", "add", "remove"},
-    "sso": {"get", "configure"},
-    "audit": {"list"},
-}
-
-
-LEGACY_DEPLOY = frozenset({"apply", "wait", "score", "effect-status", "effect-wait"})
 
 
 def route(

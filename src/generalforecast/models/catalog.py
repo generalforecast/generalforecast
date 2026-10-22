@@ -193,7 +193,7 @@ class ServingPolicy:
 
 # Bounds v1 pins and locks recorded, frozen so their identities never move.
 V1_POLICY = ServingPolicy(
-    context_rows=1024,
+    context_rows=100_000,
     query_rows=100,
     features=32,
     horizon=32,
