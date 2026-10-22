@@ -1800,7 +1800,7 @@ def _int8(client_bytes: int = 1 << 30) -> node_harness.LocalClient:
 def test_models_that_read_caches_as_encoded_get_them_back_in_float32() -> None:
     import importlib.util
 
-    path = Path(__file__).parents[1] / "examples" / "custom_model.py"
+    path = Path(__file__).parent / "models" / "conformance" / "custom_model.py"
     spec = importlib.util.spec_from_file_location("custom_model", path)
     assert spec is not None and spec.loader is not None
     example = importlib.util.module_from_spec(spec)
