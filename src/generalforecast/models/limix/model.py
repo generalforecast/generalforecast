@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.nn as jnn
@@ -14,6 +15,7 @@ from jaxtyping import Bool, Float, Int
 from generalforecast.models.buckets import QUANTILE_LEVELS, bucket_quantiles
 from generalforecast.models.contract import (
     Averaging,
+    ReadCache,
     TabularFunctions,
     TabularProperties,
 )
@@ -324,6 +326,24 @@ def _within_row(
     return update.reshape(tokens.shape)
 
 
+def _by_rows(
+    function: Callable[[Array], Array],
+    values: Float[Array, " batch rows tokens model"],
+    tokens: int | None,
+) -> Float[Array, " batch rows tokens features"]:
+    """Applies a row-wise `function` to blocks of about `tokens` tokens' rows at a time."""
+    rows = values.shape[1]
+    steps = 1 if tokens is None else -(-rows * values.shape[2] // tokens)
+    if steps <= 1:
+        return function(values)
+    size = -(-rows // steps)
+    # Unrolled, so XLA reuses one block's buffers for the next.
+    return jnp.concatenate(
+        [function(values[:, start : start + size]) for start in range(0, rows, size)],
+        axis=1,
+    )
+
+
 def _layer(
     model: LimiX,
     layer: LimiXLayer,
@@ -348,7 +368,11 @@ def _layer(
     cells, targets = _split(model, rms_norm(norm, tokens))
     fed = _join(
         model,
-        gated_mlp(layer.cell_feed_forward, cells),
+        _by_rows(
+            lambda cells: gated_mlp(layer.cell_feed_forward, cells),
+            cells,
+            layer.cells_within_row.kernel.block_chunk,
+        ),
         gated_mlp(layer.target_feed_forward, targets),
     )
     tokens = tokens + rms_norm(norm, fed)
@@ -420,12 +444,38 @@ def decode(
     Returns:
         Class logits over every class slot, or logits over the regression buckets.
     """
+
+    # Tied to `after`, so XLA lays out each layer's keys only as that layer runs.
+    def read(after: Any, part: Callable[[Any], Any]) -> Any:
+        return part(jax.lax.optimization_barrier((after, cache))[1])
+
+    return decode_reading(model, state, read, rows)
+
+
+def decode_reading(
+    model: LimiX,
+    state: TableState,
+    read: ReadCache,
+    rows: Float[Array, " queries tokens_model"],
+) -> Float[Array, " queries outputs"]:
+    """Decodes query rows as `decode` does, reading each layer's cache as that layer runs.
+
+    Args:
+        model: LimiX parameters.
+        state: State from `fit`.
+        read: Reads a part of the cache from `encode`.
+        rows: Query row representations.
+
+    Returns:
+        Class logits over every class slot, or logits over the regression buckets.
+    """
     groups = kept_groups(state.snapshot)
-    batched = jax.tree.map(lambda values: values[None], cache)
     tokens = _as_tokens(model, rows)
-    for layer, cells_cache, targets_cache in zip(
-        model.layers, batched.cells, batched.targets, strict=True
-    ):
+    for index, layer in enumerate(model.layers):
+        cells_cache, targets_cache = jax.tree.map(
+            lambda values: values[None],
+            read(tokens, lambda cache, at=index: (cache.cells[at], cache.targets[at])),
+        )
         tokens = _layer(model, layer, tokens, cells_cache, targets_cache, groups)
     _, targets = _split(model, rms_norm(model.layer_norm, tokens)[0])
     hidden = rms_norm(model.head_norm, mlp(model.head_adapter, targets))
@@ -500,4 +550,5 @@ limix_functions = TabularFunctions(
     decode=decode,
     postprocess=postprocess,
     properties=properties,
+    decode_reading=decode_reading,
 )

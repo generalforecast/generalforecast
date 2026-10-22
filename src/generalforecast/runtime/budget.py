@@ -212,6 +212,7 @@ class Chunks:
         compiled: Callable[[str], None] | None = None,
         timed: Callable[[str, float], None] | None = None,
         seen: Callable[[Call], None] | None = None,
+        noted: Callable[[str, Hashable, Call, float], None] | None = None,
     ) -> None:
         """Sets up with nothing measured.
 
@@ -225,11 +226,14 @@ class Chunks:
                 device finishes it. Without it, no call is split so.
             seen: Takes each call whose shape its program had not seen, once
                 it ran.
+            noted: Takes the stage, kind, call and seconds of each call whose
+                shape its program had not seen, to say what compiled.
         """
         self._counted = counted
         self._compiled = compiled
         self.timed = timed
         self._seen = seen
+        self._noted = noted
         # Bytes per item of each kind, as estimated or measured, whichever is more.
         self._item_bytes: dict[Hashable, int] = {}
         self._measured: set[Hashable] = set()
@@ -341,6 +345,8 @@ class Chunks:
             finished = time.perf_counter()
             self._counted(stage, measuring + finished - started)
             compiled = _traces(call.function) > traces
+            if compiled and self._noted is not None:
+                self._noted(stage, key, call, finished - started)
             if self.timed is not None:
                 self.timed("compile" if compiled else "dispatch", dispatched - started)
                 self.timed("wait", finished - dispatched)

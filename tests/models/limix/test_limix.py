@@ -16,7 +16,7 @@ from generalforecast.models.limix.checkpoint import (
     limix_from_state,
     one_task,
 )
-from generalforecast.models.limix.model import limix_functions
+from generalforecast.models.limix.model import _by_rows, limix_functions
 from generalforecast.models.limix.prepare import fit_snapshot, prepare_features
 from tests.models.limix.tiny import CLASS_SLOTS, tiny_checkpoint, tiny_limix
 
@@ -157,3 +157,15 @@ def test_an_unlabeled_context_row_embeds_as_a_query(regression: bool) -> None:
         others = np.delete(known, 3)
         assert state.snapshot.target_center == pytest.approx(others.mean())
         assert state.snapshot.target_scale == pytest.approx(others.std(ddof=1))
+
+
+@pytest.mark.parametrize("tokens", [None, 1, 7, 40, 1000])
+def test_rows_in_blocks_match_all_at_once(tokens: int | None) -> None:
+    values = jnp.asarray(
+        np.random.default_rng(0).normal(size=(1, 9, 4, 3)), jnp.float32
+    )
+
+    def function(block: jnp.ndarray) -> jnp.ndarray:
+        return jnp.tanh(block @ jnp.ones((3, 2)))
+
+    np.testing.assert_array_equal(_by_rows(function, values, tokens), function(values))

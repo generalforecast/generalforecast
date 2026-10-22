@@ -22,7 +22,7 @@ GOLDEN = {
         "future_inputs": True,
         "input_types": ["int64", "float64"],
         "max_classes": None,
-        "max_context_rows": 1024,
+        "max_context_rows": 100_000,
         "max_features": 8,
         "max_horizon": 32,
         "memory": "8Gi",
@@ -69,7 +69,7 @@ GOLDEN = {
         "future_inputs": False,
         "input_types": ["boolean", "int64", "float64", "string", "date", "timestamp"],
         "max_classes": 10,
-        "max_context_rows": 1024,
+        "max_context_rows": 100_000,
         "max_features": 32,
         "max_horizon": None,
         "memory": "8Gi",
@@ -94,7 +94,7 @@ GOLDEN = {
         "future_inputs": False,
         "input_types": ["boolean", "int64", "float64", "string", "date", "timestamp"],
         "max_classes": None,
-        "max_context_rows": 1024,
+        "max_context_rows": 100_000,
         "max_features": 32,
         "max_horizon": None,
         "memory": "8Gi",
@@ -162,7 +162,7 @@ class Offline(socket.socket):
 sys.meta_path.insert(0, Native())
 socket.socket = Offline
 socket.create_connection = socket.getaddrinfo = offline
-sys.argv = ["gf", "check"]
+sys.argv = ["gf", "--json", "check"]
 runpy.run_module("generalforecast", run_name="__main__")
 """
 
