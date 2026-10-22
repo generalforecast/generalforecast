@@ -15,12 +15,8 @@ from dataclasses import dataclass, field
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from jax import Array
-from sklearn.datasets import load_wine
 
-import generalforecast
-from generalforecast.models.conformance import check
 from generalforecast.models.contract import TabularFunctions, TabularProperties
 from generalforecast.nn.attention import AttentionCache
 
@@ -114,20 +110,3 @@ kernel_functions = TabularFunctions(fit, embed, encode, decode, postprocess, pro
 def kernel() -> tuple[TabularFunctions, Kernel]:
     """The model as a spec names it: `custom_model:kernel` from this directory."""
     return kernel_functions, Kernel(temperature=jnp.asarray(2.0), width=32)
-
-
-if __name__ == "__main__":
-    # Raises if the model breaks a guarantee the engine relies on.
-    check(*kernel())
-
-    X, y = load_wine(return_X_y=True)
-    X = X.astype(np.float32)
-    order = np.random.default_rng(0).permutation(len(X))
-    train, test = order[:140], order[140:]
-
-    # A server would name it in its configuration as "custom_model:kernel".
-    client = generalforecast.local()
-    table = client.create_table("wine", model=kernel(), features=13, classes=3)
-    table.insert(train, X[train], y[train])
-    predicted = table.predict(X[test]).argmax(axis=1)
-    print("kernel model accuracy:", np.mean(predicted == y[test]))
