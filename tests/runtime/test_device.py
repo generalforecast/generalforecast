@@ -188,6 +188,17 @@ def test_workers_keep_compiled_programs_on_disk() -> None:
     assert jax.config.jax_compilation_cache_dir
 
 
+def test_worker_parallelism_falls_back_without_process_affinity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast import worker
+
+    monkeypatch.delattr(worker.os, "sched_getaffinity", raising=False)
+    monkeypatch.setattr(worker.os, "cpu_count", lambda: 6)
+
+    assert worker._parallel_cpus() == 6
+
+
 def test_command_buffers_are_off_unless_xla_flags_set_them(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
