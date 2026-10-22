@@ -1,0 +1,22 @@
+[package]
+name = "gf-core"
+description = "generalforecast's control plane: what to compute, where state lives, and when"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+arrow-array = "60"
+arrow-cast = "60"
+arrow-schema = "60"
+arrow-select = "60"
+roaring = "0.11"
+serde = { version = "1", features = ["derive"] }
+# Correctly rounded floats, so quantile levels compare as Python's do.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"

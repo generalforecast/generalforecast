@@ -1,0 +1,10 @@
+.DS_Store
+**/__pycache__/
+.venv/
+.pytest_cache/
+checkpoints/
+# Rust build output, and the extension uv builds into the source tree.
+target/
+src/generalforecast/*.so
+# The binaries a release packs into the wheel.
+wheel-data/

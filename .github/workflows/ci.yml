@@ -1,0 +1,133 @@
+name: CI
+
+# Actions minutes are a budget, so CI runs at a few moments rather than on
+# every commit:
+# - a pull request into main when it is opened or marked ready for review;
+#   drafts and stacked PRs based on other branches run nothing;
+# - on request: add the `ci` label to a PR (remove and add it to run again),
+#   or run the workflow by hand on any branch;
+# - pushes to main, unless the merged PR already passed on the same tree.
+# Changes to documentation alone run nothing, and the Rust job runs only when
+# code it checks changes. Tests marked slow run weekly in weekly.yml.
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md"]
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, ready_for_review, labeled]
+    paths-ignore: ["**.md"]
+  workflow_dispatch:
+  # The release workflow runs these checks before it publishes wheels.
+  workflow_call:
+
+# A newer run for the same PR or branch cancels the older one; adding any
+# other label gets a group of its own, so it cannot cancel a real run.
+concurrency:
+  group: >-
+    ${{ github.event.action == 'labeled' && github.event.label.name != 'ci' &&
+    github.run_id || format('ci-{0}', github.event.pull_request.number || github.ref) }}
+  cancel-in-progress: true
+
+jobs:
+  # Decides which jobs run, from the API alone so it needs no checkout.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    if: >-
+      github.event_name != 'pull_request' ||
+      (!github.event.pull_request.draft &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ci'))
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.decide.outputs.rust }}
+      python: ${{ steps.decide.outputs.python }}
+    steps:
+      - id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.sha }}
+        run: |
+          rust=true python=true
+          if [ "$EVENT" = pull_request ]; then
+            files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')
+            grep -qE '^(crates/|Cargo\.|rust-toolchain|tests/product_cli/|\.github/workflows/ci\.yml)|^src/generalforecast/[^/]*$|^src/generalforecast/(deployments|packages)/' <<<"$files" || rust=false
+          elif [ "$EVENT" = push ]; then
+            # A merge whose tree is the PR head's repeats checks that passed.
+            pr=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[0].number // empty')
+            if [ -n "$pr" ]; then
+              head=$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)
+              tree() { gh api "repos/$REPO/git/commits/$1" --jq .tree.sha; }
+              if [ "$(tree "$SHA")" = "$(tree "$head")" ]; then
+                passed=false
+                for run in $(gh api "repos/$REPO/actions/runs?head_sha=$head&event=pull_request" \
+                    --jq '.workflow_runs[] | select(.name == "CI" and .conclusion == "success") | .id'); do
+                  if gh api "repos/$REPO/actions/runs/$run/jobs" \
+                      --jq '.jobs[] | select(.name == "python") | .conclusion' | grep -qx success; then
+                    passed=true
+                  fi
+                done
+                if $passed; then
+                  rust=false python=false
+                  echo "PR #$pr passed on this tree"
+                fi
+              fi
+            fi
+          fi
+          echo "rust=$rust python=$python"
+          echo "rust=$rust" >>"$GITHUB_OUTPUT"
+          echo "python=$python" >>"$GITHUB_OUTPUT"
+
+# The two checks run side by side, so a run takes as long as the slower one.
+  rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Dependencies and build outputs carry over from main's last run; only
+      # main saves them, so pull requests cannot crowd out its cache.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # rustup installs the toolchain pinned in rust-toolchain.toml.
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test -p gf-core -p gf-server -p gf-router -p gf-cli
+      - run: cargo build -p gf-cli --bins
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.8.0"
+      - run: uv sync --locked
+      - run: GF_CLI="$PWD/target/debug/gf" uv run pytest tests/product_cli -m "not slow"
+
+  python:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: python scripts/spdx.py --check
+      # uv sync builds the Rust extension.
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.8.0"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run ty check
+      # Tests that compile models or start servers are marked slow and run
+      # weekly; the rest run on both cores.
+      - run: uv run pytest -m "not slow" -n auto
