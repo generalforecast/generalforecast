@@ -10,15 +10,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  ci:
-    uses: ./.github/workflows/ci.yml
-    permissions:
-      actions: read
-      contents: read
-      pull-requests: read
-
   wheels:
-    needs: ci
     strategy:
       fail-fast: false
       matrix:
@@ -36,6 +28,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # Only the canonical versioned client is an executable wheel asset. The
       # native extension and Python workers need no server/router executable.
+      - if: runner.os == 'macOS'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - if: runner.os == 'macOS'
         run: |
           cargo build --release --locked -p gf-cli --bin gf -p gf-server --bin gf-server
@@ -65,6 +59,11 @@ jobs:
           smoke/bin/gf-native --help
           smoke/bin/gf-server --help
           smoke/bin/gf serve --help
+      # The README's example, end to end on the wheel's own engine.
+      - name: Fit and predict with the wheel
+        run: |
+          uv pip install --python smoke/bin/python "$(ls dist/*.whl)[sklearn]"
+          smoke/bin/python scripts/readme_example.py
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheel-${{ matrix.target }}
