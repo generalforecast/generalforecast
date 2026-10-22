@@ -49,7 +49,7 @@ def parser() -> argparse.ArgumentParser:
         parents=[common],
         description="Immutable prediction packages and operations.",
     )
-    root.add_argument("--version", action="version", version="gf 0.1.0")
+    root.add_argument("--version", action="version", version="gf 0.1.1")
     sub = root.add_subparsers(dest="group", required=True)
 
     def command(title, help):
