@@ -10,7 +10,26 @@ on:
   workflow_dispatch:
 
 jobs:
+  # A commit whose CI already passed, such as main's head, skips running it again.
+  passed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions:
+      actions: read
+    outputs:
+      ci: ${{ steps.check.outputs.ci }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$GITHUB_SHA&status=success" \
+            --jq '[.workflow_runs[] | select(.name == "CI")] | length')
+          echo "ci=$([ "$runs" -gt 0 ] && echo true || echo false)" >>"$GITHUB_OUTPUT"
+
   ci:
+    needs: passed
+    if: needs.passed.outputs.ci != 'true'
     uses: ./.github/workflows/ci.yml
     permissions:
       actions: read
@@ -18,7 +37,10 @@ jobs:
       pull-requests: read
 
   wheels:
-    needs: ci
+    needs: [passed, ci]
+    if: >-
+      always() && needs.passed.result == 'success' &&
+      (needs.ci.result == 'success' || needs.passed.outputs.ci == 'true')
     strategy:
       fail-fast: false
       matrix:
@@ -37,6 +59,8 @@ jobs:
       # Only the canonical versioned client is an executable wheel asset. The
       # native extension and Python workers need no server/router executable.
       - if: runner.os == 'macOS'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - if: runner.os == 'macOS'
         run: |
           cargo build --release --locked -p gf-cli --bin gf -p gf-server --bin gf-server
           mkdir -p wheel-data/scripts
@@ -47,6 +71,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: "2_28"
+          sccache: "true"
           args: --release --locked --out dist
           before-script-linux: |
             cargo build --release --locked -p gf-cli --bin gf -p gf-server --bin gf-server
