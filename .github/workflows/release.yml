@@ -1,8 +1,9 @@
 name: Release
 
-# Publishes wheels for macOS on Apple silicon and Linux on x86_64 and arm64,
-# with the versioned gf-native client, as assets of the tag's GitHub release.
-# Actions are pinned by commit.
+# Builds wheels for macOS on Apple silicon and Linux on x86_64 and arm64, with
+# the versioned gf-native client. A v* tag that matches pyproject.toml's version
+# publishes them to PyPI through Trusted Publishing and attaches them to the
+# tag's GitHub release. Actions are pinned by commit.
 
 on:
   push:
@@ -10,7 +11,23 @@ on:
   workflow_dispatch:
 
 jobs:
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - if: startsWith(github.ref, 'refs/tags/v')
+        name: Check the tag matches the package version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' pyproject.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject.toml version $version"
+            exit 1
+          fi
+
   wheels:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -89,3 +106,20 @@ jobs:
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --generate-notes
           gh release upload "$GITHUB_REF_NAME" dist/*.whl --clobber --repo "$GITHUB_REPOSITORY"
+
+  pypi:
+    needs: wheels
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/generalforecast/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: wheel-*
+          merge-multiple: true
+          path: dist
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
