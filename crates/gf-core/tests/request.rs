@@ -366,7 +366,7 @@ fn forecasts_are_refused_as_the_models_api_refuses_them() {
         (&["context", "0", "time"], json!(1), "duplicate series time"),
         (
             &["queries", "0", "origin"],
-            json!(1030),
+            json!(100_030),
             "series span exceeds context bound",
         ),
         (

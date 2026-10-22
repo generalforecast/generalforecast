@@ -4056,6 +4056,9 @@ impl Shard {
             part.calls.add(time.calls);
             part.seconds.add(time.seconds);
         }
+        for (kind, bytes) in &outcome.memory {
+            self.metrics.memory_peak(kind, *bytes);
+        }
         let fits: Vec<_> = step
             .fits()
             .iter()

@@ -993,6 +993,7 @@ class Identity:
         globals_ = {
             "workspace.get": ("workspace", "/workspace", "workspace"),
             "auth.status": ("workspace", "/auth/status", "auth"),
+            "auth.logout": ("workspace", "/auth/logout", "auth"),
             "organizations.list": ("workspace", "/organizations", "organizations"),
             "organizations.create": (
                 "workspace",
@@ -1003,13 +1004,14 @@ class Identity:
             "projects.create": ("project", "/projects", payload.get("name", "new")),
         }
         if action in globals_:
+            post = action.endswith("create") or action == "auth.logout"
             require(
                 action.endswith("create") or not payload,
                 "GET operation requires empty payload",
             )
             kind, path, resource = globals_[action]
             return await self.client._call(
-                "POST" if action.endswith("create") else "GET",
+                "POST" if post else "GET",
                 path,
                 cast(ResourceKind, kind),
                 resource,

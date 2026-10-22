@@ -150,7 +150,7 @@ def test_empty_usable_context(request_data, context):
         {"queries": [{"key": "q", "features": {"x": 1, "z": 2}}] * 101},
         {
             "context": [{"key": "c", "features": {"x": 1, "z": 2}, "label": False}]
-            * 1025
+            * (catalog.V1_POLICY.context_rows + 1)
         },
         {"context": [{"key": "c", "features": {"x": 1, "z": 2}, "label": False}] * 2},
         {"options": {"unknown": True}},
