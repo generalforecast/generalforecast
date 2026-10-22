@@ -149,7 +149,7 @@ def test_client_and_cli_relay_sanitized_server_errors(monkeypatch, capsys):
         monkeypatch.setattr(
             sys,
             "argv",
-            ["gf", "model", "list", "--base-url", url],
+            ["gf", "--json", "model", "list", "--base-url", url],
         )
         with pytest.raises(SystemExit) as exit_error:
             main()

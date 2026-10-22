@@ -21,8 +21,11 @@ LOCAL_ERROR_CODES = {
     "ClientClosed",
     "ClientError",
     "DeploymentFailed",
+    "EnvironmentCredential",
     "InvalidResult",
     "JobFailed",
+    "NotLoggedIn",
+    "RequestFailed",
     "ReadinessFailed",
     "Timeout",
     "TransportError",
@@ -34,6 +37,9 @@ LOCAL_MODULES = {
     "generalforecast/transport.py",
     "generalforecast/commands.py",
     "generalforecast/cli.py",
+    "generalforecast/account.py",
+    "generalforecast/login.py",
+    "generalforecast/credentials.py",
     "generalforecast/package_commands.py",
 }
 CONSTRUCTORS = {

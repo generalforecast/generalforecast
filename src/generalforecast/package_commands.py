@@ -7,7 +7,9 @@ import argparse
 import hashlib
 import sys
 import time
+from functools import cached_property
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from generalforecast.commands import (
     client_for,
@@ -42,6 +44,9 @@ from generalforecast.packages.files import (
 )
 from generalforecast.python_packages.compiler import MAX_ARCHIVE, MAX_FILE
 
+if TYPE_CHECKING:
+    from generalforecast.client import Client
+
 
 class PackageCommands:
     """Uses the SDK transport and foundation values, never a parallel control plane."""
@@ -49,10 +54,14 @@ class PackageCommands:
     def __init__(self, args: argparse.Namespace):
         """Binds one explicit endpoint/project/profile for the complete operation."""
         self.args = args
-        self.client = client_for(args)
         self.timeout = number(getattr(args, "timeout", 40), 0.01, 300, "timeout")
         if args.group == "push" and args.watch:
             self.validate_watch()
+
+    @cached_property
+    def client(self) -> "Client":
+        """Connects on first use so offline work never needs a login."""
+        return client_for(self.args)
 
     def call(
         self,

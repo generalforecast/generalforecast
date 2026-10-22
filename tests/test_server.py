@@ -644,6 +644,7 @@ def _check_metrics(server: Server) -> None:
     assert metrics['gf_table_rebuild_seconds_total{table="rows"}'] == "0"
     # Timed steps, plans and requests count their parts.
     assert int(metrics['gf_worker_part_calls_total{part="other"}']) >= 2
+    assert int(metrics['gf_worker_memory_peak_bytes{kind="host_peak"}']) > 0
     assert int(metrics['gf_plan_part_calls_total{part="checks"}']) >= 2
     for part in ("decode", "route", "shard", "encode"):
         assert int(metrics[f"gf_request_{part}_seconds_count"]) >= 3
@@ -669,6 +670,7 @@ def test_untimed_servers_export_the_part_metrics_empty(server: Server) -> None:
     for family in ("gf_worker_part_calls_total", "gf_plan_part_calls_total"):
         assert f"# TYPE {family} counter" in text
         assert f"{family}{{" not in text
+    assert "gf_worker_memory_peak_bytes{" not in text
     for part in ("decode", "route", "shard", "encode"):
         assert f"\ngf_request_{part}_seconds_count 0\n" in text
 

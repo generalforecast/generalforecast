@@ -107,3 +107,18 @@ fn step_parts_and_request_times_render_beside_the_stages() {
     assert!(text.contains("gf_request_shard_seconds_sum 0.04\n"));
     assert!(text.contains("gf_request_encode_seconds_count 0\n"));
 }
+
+#[test]
+fn worker_memory_renders_the_most_any_step_held() {
+    let metrics = Metrics::default();
+    metrics.memory_peak("host_peak", 3 << 20);
+    metrics.memory_peak("host_peak", 1 << 20);
+
+    let text = metrics.render();
+
+    assert!(text.contains("# TYPE gf_worker_memory_peak_bytes gauge\n"));
+    assert!(text.contains(&format!(
+        "gf_worker_memory_peak_bytes{{kind=\"host_peak\"}} {}\n",
+        3 << 20
+    )));
+}

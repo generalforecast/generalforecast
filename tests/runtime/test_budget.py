@@ -188,6 +188,19 @@ def test_a_calls_handing_to_the_device_is_compile_for_a_new_shape_and_dispatch_a
     assert timed == ["compile", "wait", "dispatch", "wait"]
 
 
+def test_only_calls_that_compile_are_noted_with_their_stage() -> None:
+    noted: list[str] = []
+    chunks = Chunks(lambda *_: None, noted=lambda stage, *_: noted.append(stage))
+    doubled = jax.jit(lambda rows: rows * 2)
+    items = np.ones((2, 4), np.float32)
+
+    _run(chunks, doubled, items, 8 * items[0].nbytes)
+    _run(chunks, doubled, items, 8 * items[0].nbytes)
+    assert len(noted) == 1
+    _run(chunks, doubled, np.ones((2, 8), np.float32), 8 * items[0].nbytes)
+    assert len(noted) == 2
+
+
 def test_a_count_not_yet_compiled_compiles_on_the_side_while_compiled_counts_run() -> (
     None
 ):
