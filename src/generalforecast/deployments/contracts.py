@@ -5,11 +5,15 @@
 
 import math
 import re
+import threading
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Required, TypedDict
 
 import yaml
+
+from generalforecast.models.catalog import V1_POLICY
 
 VERSION = "gf/v1alpha1"
 MODEL = "general-forecast/tabicl-v2-classifier"
@@ -32,6 +36,7 @@ class ServiceError(Exception):
 
 PUBLIC_ERROR_CODES = frozenset(
     [
+        "AccessDenied",
         "AlreadyExists",
         "AmbiguousFrequency",
         "AmbiguousTask",
@@ -39,6 +44,7 @@ PUBLIC_ERROR_CODES = frozenset(
         "ArtifactMismatch",
         "ArtifactUnavailable",
         "ArtifactUnsupported",
+        "AuthorizationPending",
         "BackupIntegrityError",
         "BackupUnavailable",
         "CapacityExceeded",
@@ -49,14 +55,13 @@ PUBLIC_ERROR_CODES = frozenset(
         "CredentialInactive",
         "CredentialUnavailable",
         "CredentialsUnavailable",
-        "DomainUnverified",
-        "DomainVerificationFailed",
         "DurabilityUnavailable",
         "DurableStateUnavailable",
         "EffectUnavailable",
         "EmptyContext",
         "EmptySource",
         "EnterpriseSSOUnavailable",
+        "ExpiredToken",
         "Forbidden",
         "FreshnessExceeded",
         "HostAuthorityUnavailable",
@@ -82,6 +87,8 @@ PUBLIC_ERROR_CODES = frozenset(
         "LockMismatch",
         "LockOutdated",
         "LockRequired",
+        "LoginCodeUnavailable",
+        "MailUnavailable",
         "MethodNotAllowed",
         "MissingFile",
         "MissingValues",
@@ -145,6 +152,7 @@ PUBLIC_ERROR_CODES = frozenset(
         "ServiceUnavailable",
         "SessionRequired",
         "SingleWriterUnavailable",
+        "SlowDown",
         "SnapshotMismatch",
         "SnapshotNotFound",
         "SourceChanged",
@@ -173,6 +181,7 @@ PUBLIC_ERROR_CODES = frozenset(
         "UnsupportedType",
         "ValidationError",
         "WaitTimeout",
+        "WaitlistRequired",
         "WriteConflict",
     ]
 )
@@ -334,7 +343,10 @@ class DatasetConfig:
             name(feature)
         require(len(set(features)) == len(features), "duplicate features")
         require(value["target"] not in features, "target cannot be a feature")
-        for field, high in (("max_rows", 1024), ("max_writes", 10000)):
+        for field, high in (
+            ("max_rows", V1_POLICY.context_rows),
+            ("max_writes", 10000),
+        ):
             require(type(value[field]) is int, f"{field} must be an integer")
             number(value[field], 1, high, field)
         return cls(**value)
@@ -407,3 +419,24 @@ class Score(TypedDict):
     dataset: str
     serving_sequence: int
     freshness: Freshness
+
+
+class RateLimit:
+    """A token bucket: `rate` events per second with bursts up to `burst`."""
+
+    def __init__(self, rate: float, burst: int, clock: Any = time.monotonic) -> None:
+        """A full bucket that refills at `rate` per second on `clock`."""
+        self.rate, self.burst, self.clock = rate, burst, clock
+        self.tokens, self.at = float(burst), clock()
+        self._lock = threading.Lock()
+
+    def take(self) -> bool:
+        """Spends one token, or refuses when the bucket is empty."""
+        with self._lock:
+            now = self.clock()
+            self.tokens = min(self.burst, self.tokens + (now - self.at) * self.rate)
+            self.at = now
+            if self.tokens < 1:
+                return False
+            self.tokens -= 1
+            return True

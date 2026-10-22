@@ -821,9 +821,14 @@ def timing(
     seconds: float,
     stages: dict[str, tuple[int, float]] | None = None,
     parts: dict[str, tuple[int, float]] | None = None,
+    memory: dict[str, int] | None = None,
 ) -> dict[str, Any]:
-    """The fields of a predictions header that say what the step cost; see `predictions`."""
-    return {
+    """The fields of a predictions header that say what the step cost; see `predictions`.
+
+    `memory` is what the step held, in bytes by kind; see
+    `generalforecast.profiling.memory`.
+    """
+    found = {
         "seconds": seconds,
         "stages": {
             stage: {"calls": calls, "seconds": spent}
@@ -834,3 +839,6 @@ def timing(
             for part, (calls, spent) in (parts or {}).items()
         },
     }
+    if memory:
+        found["memory"] = memory
+    return found

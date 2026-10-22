@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal, NamedTuple, Protocol
 
@@ -145,6 +146,28 @@ class Decode(Protocol):
         ...
 
 
+class ReadCache(Protocol):
+    """Reads a part of the context cache for `DecodeReading`."""
+
+    def __call__(self, after: Any, part: Callable[[Any], Any], /) -> Any:
+        """`part` of the cache, read once `after` is computed."""
+        ...
+
+
+class DecodeReading(Protocol):
+    """Computes raw outputs as `Decode` does, reading the cache a part at a time.
+
+    A decode that reads each layer's keys as that layer needs them holds only
+    one layer's beside the slots it reads from.
+    """
+
+    def __call__(
+        self, model: Any, state: Any, read: ReadCache, rows: Array, /
+    ) -> Array:
+        """Decodes query rows, reading the cache's parts through `read`."""
+        ...
+
+
 class Postprocess(Protocol):
     """Computes predictions from raw outputs and the state."""
 
@@ -199,6 +222,8 @@ class TabularFunctions(NamedTuple):
             each categorical column's categories, counts the columns past it,
             so the engine can say their predictions are approximate; None for
             other models.
+        decode_reading: `decode`, reading the cache a part at a time, for a
+            model that reads its layers' keys in turn; None for other models.
     """
 
     fit: Fit
@@ -208,3 +233,4 @@ class TabularFunctions(NamedTuple):
     postprocess: Postprocess
     properties: Properties
     crowded_categories: CrowdedCategories | None = None
+    decode_reading: DecodeReading | None = None

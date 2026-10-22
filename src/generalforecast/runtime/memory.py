@@ -134,7 +134,8 @@ def _traced(
         )
 
     def encode(model: Any, state: Any, rows: Any, targets: Any, count: Any) -> Any:
-        return functions.encode(model, state, rows, targets, num_rows=count)
+        cache = functions.encode(model, state, rows, targets, num_rows=count)
+        return cache if cache_dtype is None else to_cache_dtype(cache, cache_dtype)
 
     features = jax.ShapeDtypeStruct((rows, num_features), jnp.float32)
     targets = jax.ShapeDtypeStruct((rows,), target_dtype)
@@ -196,9 +197,9 @@ def memory_profile(
 class WorkingProfile:
     """Working memory a call against one context takes, from the cache's size.
 
-    A decode copies the context it reads and works beside the copy, and an
-    encode makes the context, so the working memory of either per context row
-    follows the cache's bytes per row, which `MemoryProfile` gives for any
+    A decode works beside the context it reads, and an encode makes the
+    context, so the working memory of either per context row follows the
+    cache's bytes per row, which `MemoryProfile` gives for any
     width. These coefficients, measured once per model, turn one into the other.
 
     Attributes:
@@ -230,11 +231,11 @@ class WorkingProfile:
             rows: Context rows, padded.
 
         Returns:
-            The estimate, at least a copy of the context, with a margin.
+            The estimate, with a margin.
         """
         per_row = self.row_scale * cache_bytes_per_row + self.row_bytes
         fixed = self.fixed_scale * cache_bytes_per_row + self.fixed_bytes
-        working = max(cache_bytes_per_row, per_row) * rows + max(0.0, fixed)
+        working = max(0.0, per_row) * rows + max(0.0, fixed)
         return math.ceil(_WORKING_MARGIN * working)
 
 
@@ -243,8 +244,8 @@ class EncodeProfile:
     """Working memory an encode of one context takes, from the cache's size, by part.
 
     The call holds its inputs and outputs throughout and its temporaries
-    while it runs; once it is done, the runtime takes each item's cache from
-    its outputs, a copy of them, while they are held. The fit holds from the
+    while it runs; the runtime takes a lone context's cache from its outputs'
+    own buffers. The fit holds from the
     smaller of the sizes it was measured at; below that, XLA lays the call out
     differently, so `encode_bytes` measures it at the context's own size.
 
@@ -266,12 +267,11 @@ class EncodeProfile:
             rows: Context rows, padded.
 
         Returns:
-            The estimate, at least the cache and its copy, with a margin.
+            The estimate, at least the cache, with a margin.
         """
         held = self.held.estimate(cache_bytes_per_row, rows)
         temporaries = self.temporaries.estimate(cache_bytes_per_row, rows)
-        outputs = self.outputs.estimate(cache_bytes_per_row, rows)
-        working = max(held + max(temporaries, outputs), 2 * cache_bytes_per_row * rows)
+        working = max(held + temporaries, cache_bytes_per_row * rows)
         return math.ceil(_WORKING_MARGIN * working)
 
 
@@ -399,15 +399,25 @@ def decode_profile(
 
 
 def _encode_parts(
-    functions: TabularFunctions, model: Any, fit: bool, width: int, rows: int
+    functions: TabularFunctions,
+    model: Any,
+    fit: bool,
+    width: int,
+    rows: int,
+    cache_dtype: jnp.dtype | None = None,
 ) -> tuple[int, int, int]:
-    """An encode's inputs and outputs, temporaries, and outputs alone, as XLA measures them."""
+    """An encode's inputs and outputs, temporaries, and outputs alone, as XLA measures them.
+
+    With `cache_dtype`, the encode returns its cache in that dtype, as the
+    runtime's does.
+    """
     properties = functions.properties(model)
     target_dtype = jnp.float32 if properties.regression else jnp.int32
     classes = 0 if properties.regression else min(properties.class_slots, 2)
 
     def encode(model: Any, state: Any, rows: Any, targets: Any, count: Any) -> Any:
-        return functions.encode(model, state, rows, targets, num_rows=count)
+        cache = functions.encode(model, state, rows, targets, num_rows=count)
+        return cache if cache_dtype is None else to_cache_dtype(cache, cache_dtype)
 
     def fit_encode(
         model: Any, features: Any, targets: Any, count: Any, mask: Any
@@ -472,7 +482,9 @@ def encode_profile(
     profiles = _working_profiles(
         functions,
         model,
-        partial(_encode_parts, functions, model, fit),
+        lambda width, rows: _encode_parts(
+            functions, model, fit, width, rows, cache_dtype
+        ),
         0,
         cache_dtype,
         widths,
@@ -481,7 +493,12 @@ def encode_profile(
 
 
 def encode_bytes(
-    functions: TabularFunctions, model: Any, width: int, rows: int, fit: bool = False
+    functions: TabularFunctions,
+    model: Any,
+    width: int,
+    rows: int,
+    fit: bool = False,
+    cache_dtype: jnp.dtype | None = None,
 ) -> int:
     """Measures the encode of one context of this width and size, by compiling it.
 
@@ -493,6 +510,8 @@ def encode_bytes(
         width: The table's feature columns.
         rows: Context rows, padded.
         fit: Whether the call fits the context's own state first.
+        cache_dtype: Dtype the runtime stores caches in, or None for the dtype
+            `encode` returns.
 
     Returns:
         Bytes the encode takes at most at once, with a margin.
@@ -501,8 +520,10 @@ def encode_bytes(
         NoMemoryAnalysis: Where XLA cannot say.
         Exception: Whatever compiling the encode raised.
     """
-    held, temporaries, outputs = _encode_parts(functions, model, fit, width, rows)
-    return math.ceil(_WORKING_MARGIN * (held + max(temporaries, outputs)))
+    held, temporaries, _ = _encode_parts(
+        functions, model, fit, width, rows, cache_dtype
+    )
+    return math.ceil(_WORKING_MARGIN * (held + temporaries))
 
 
 @dataclass(frozen=True)

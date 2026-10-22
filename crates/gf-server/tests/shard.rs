@@ -290,6 +290,7 @@ fn predictions(header: &Value, failing: Option<u32>) -> Frame {
                 seconds: 0.001,
             },
         )]),
+        memory: BTreeMap::new(),
     }
     .frame()
     .header;
