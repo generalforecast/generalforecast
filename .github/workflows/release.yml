@@ -10,37 +10,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  # A commit whose CI already passed, such as main's head, skips running it again.
-  passed:
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    permissions:
-      actions: read
-    outputs:
-      ci: ${{ steps.check.outputs.ci }}
-    steps:
-      - id: check
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$GITHUB_SHA&status=success" \
-            --jq '[.workflow_runs[] | select(.name == "CI")] | length')
-          echo "ci=$([ "$runs" -gt 0 ] && echo true || echo false)" >>"$GITHUB_OUTPUT"
-
-  ci:
-    needs: passed
-    if: needs.passed.outputs.ci != 'true'
-    uses: ./.github/workflows/ci.yml
-    permissions:
-      actions: read
-      contents: read
-      pull-requests: read
-
   wheels:
-    needs: [passed, ci]
-    if: >-
-      always() && needs.passed.result == 'success' &&
-      (needs.ci.result == 'success' || needs.passed.outputs.ci == 'true')
     strategy:
       fail-fast: false
       matrix:
