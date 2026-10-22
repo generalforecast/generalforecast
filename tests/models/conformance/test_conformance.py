@@ -74,7 +74,7 @@ def test_the_custom_model_example_passes_the_conformance_check() -> None:
     import importlib.util
     from pathlib import Path
 
-    path = Path(__file__).parents[3] / "examples" / "custom_model.py"
+    path = Path(__file__).parent / "custom_model.py"
     spec = importlib.util.spec_from_file_location("custom_model", path)
     assert spec is not None and spec.loader is not None
     example = importlib.util.module_from_spec(spec)
