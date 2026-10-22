@@ -61,7 +61,7 @@ If you use General Forecast, please cite our work:
 ```bibtex
 @misc{generalforecast2026,
     title={General Forecast: A unified high-throughput inference engine for structured data foundation models},
-    author={Tejas Prabhune and Ayushi Batwara and Joseph E. Gonzalez},
+    author={Tejas Prabhune and Ayushi Batwara},
     year={2026},
     publisher={GitHub},
     howpublished={\url{https://github.com/generalforecast/gf}}
