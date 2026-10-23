@@ -2541,8 +2541,8 @@ def test_an_accelerator_worker_compiles_every_fused_stack_of_a_recorded_kind_at_
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from generalforecast._core import CacheKey
+    from generalforecast.constants import FUSED_STACKS
     from generalforecast.models.conformance import table as conformance_table
-    from generalforecast.runtime.programs import FUSED_STACKS
     from tests.models.conformance.cases import FEATURES
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
@@ -2715,8 +2715,8 @@ def test_a_fused_shape_that_cannot_be_readied_beside_steps_compiles_in_its_step(
 
 def test_stacked_fused_units_compile_a_new_count_on_the_side() -> None:
     from generalforecast._core import CacheKey
+    from generalforecast.constants import FUSED_STACKS
     from generalforecast.models.conformance import table as conformance_table
-    from generalforecast.runtime.programs import FUSED_STACKS
     from tests.models.conformance.cases import FEATURES
 
     data = conformance_table(False, rows=48, queries=6)
@@ -2811,6 +2811,7 @@ def test_a_steps_parts_add_up_to_its_seconds(monkeypatch: pytest.MonkeyPatch) ->
         "wait",
         "unstack",
         "fetch",
+        "scatter",
         "store",
         "other",
         "reply",

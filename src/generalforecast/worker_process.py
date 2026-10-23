@@ -25,10 +25,15 @@ from typing import Any
 import jax
 
 from generalforecast import protocol
+from generalforecast.constants import SAMPLE_INTERVAL
 from generalforecast.models import registry
 from generalforecast.profiling import memory
 from generalforecast.runtime.budget import MemoryBudget
-from generalforecast.runtime.device import default_settings, without_command_buffers
+from generalforecast.runtime.device import (
+    default_settings,
+    portable_cpu_programs,
+    without_command_buffers,
+)
 from generalforecast.worker import Worker
 
 Frame = tuple[dict[str, Any], list[bytes]]
@@ -62,6 +67,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
     # Before `default_settings` starts JAX's backend, which reads XLA's flags.
     without_command_buffers()
+    portable_cpu_programs()
     budget = MemoryBudget.measure(workers=options.workers)
     worker = Worker(
         default_settings(),
@@ -182,23 +188,24 @@ def _handled(
         started = time.perf_counter()
         with worker.stats.timed("frame"):
             request = protocol.request(header, buffers)
+            if worker.timers and isinstance(request, protocol.Step):
+                memory.reset()
         match request:
             case protocol.Step() as step:
                 # The step's seconds run from its frame's decode, above, to
                 # its reply's conversion, so its parts add up to them.
-                if worker.timers:
-                    memory.reset()
                 predictions, failed = worker.run_apart(step)
                 with worker.stats.timed("reply"):
                     frame = protocol.predictions(
                         predictions, failed, deferred=worker.deferred
                     )
+                    held = memory.reading() if worker.timers else None
                 frame[0].update(
                     protocol.timing(
                         time.perf_counter() - started,
                         worker.stats.stages_since(before),
                         worker.stats.parts_since(before),
-                        memory.reading() if worker.timers else None,
+                        held,
                     )
                 )
                 return lambda: frame
@@ -234,13 +241,13 @@ def _handled(
                 failures = []
                 for index, control in enumerate(requests):
                     try:
-                        _control(worker, names, control)
+                        _control(worker, names, control, progressed)
                     except Exception as error:  # noqa: BLE001
                         message = f"{type(error).__name__}: {error}"
                         failures.append(protocol.ControlFailure(index, message))
                 answer = protocol.Controlled(failures) if failures else protocol.Done()
             case protocol.AddTable() | protocol.RemoveTable() | protocol.Apply():
-                _control(worker, names, request)
+                _control(worker, names, request, progressed)
                 answer = protocol.Done()
     except Exception as error:  # noqa: BLE001
         answer = protocol.Failed(f"{type(error).__name__}: {error}")
@@ -255,16 +262,20 @@ def _control(
     | protocol.AddTable
     | protocol.RemoveTable
     | protocol.Apply,
+    progressed: Callable[[], None],
 ) -> None:
     """Loads a model, adds or removes a table, or applies tiers' copies and drops.
 
-    A model loads under its name unless the worker serves one by it, as at launch.
+    A model loads under its name unless the worker serves one by it, as at
+    launch, and compiles what earlier workers recorded for it before any step.
     """
     match control:
         case protocol.AddModel(name, spec):
             if name not in names:
-                worker.add_model(len(names), *registry.load(spec))
+                worker.add_model(len(names), *registry.load(spec), spec=spec)
                 names[name] = len(names)
+                if worker.allocated:
+                    worker.warm_start(progressed, models=[names[name]])
         case protocol.AddTable(
             table, model, classes, features, categorical, page_size, summary, series
         ):
@@ -437,10 +448,6 @@ def _captured(seconds: float, path: str, tracing: _Tracing | None) -> None:
                 tracing.stop()
         finally:
             _recording = False
-
-
-# How often the sampler reads every thread's stack.
-SAMPLE_INTERVAL = 0.001
 
 
 def _sampled(seconds: float, path: str, interval: float = SAMPLE_INTERVAL) -> None:
