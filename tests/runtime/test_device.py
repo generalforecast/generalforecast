@@ -188,15 +188,20 @@ def test_workers_keep_compiled_programs_on_disk() -> None:
     assert jax.config.jax_compilation_cache_dir
 
 
-def test_worker_parallelism_falls_back_without_process_affinity(
+def test_a_worker_starts_without_process_affinity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from generalforecast import worker
+    # As on macOS, which has no CPU affinity.
+    from generalforecast import system
+    from generalforecast.worker import Worker
 
-    monkeypatch.delattr(worker.os, "sched_getaffinity", raising=False)
-    monkeypatch.setattr(worker.os, "cpu_count", lambda: 6)
+    monkeypatch.delattr(system.os, "sched_getaffinity", raising=False)
+    monkeypatch.delattr(system.os, "sched_setaffinity", raising=False)
+    monkeypatch.setattr(system.os, "cpu_count", lambda: 6)
 
-    assert worker._parallel_cpus() == 6
+    assert system.usable_cpus() == 6
+    system.pin_cpus([0])
+    Worker().close()
 
 
 def test_command_buffers_are_off_unless_xla_flags_set_them(

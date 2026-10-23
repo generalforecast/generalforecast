@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import atexit
 import json
-import os
 import shutil
 import sys
 import tempfile
@@ -46,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 import numpy as np
 
 from generalforecast.models.catalog import ModelRef, Surface, admit, parse
+from generalforecast.system import usable_cpus
 
 if TYPE_CHECKING:
     from generalforecast._core import BoundTable, ForecastRequest, TabularRequest
@@ -141,9 +141,7 @@ def _cores() -> int:
     eight started a small model in about half the time two of four did, and
     fit new contexts 1.1 to 3.3 times faster at 100 to 10,000 rows.
     """
-    affinity = getattr(os, "sched_getaffinity", None)
-    count = len(affinity(0)) if affinity else os.cpu_count()
-    return max(1, count or 1)
+    return usable_cpus()
 
 
 def configuration(

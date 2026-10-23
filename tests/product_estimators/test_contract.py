@@ -147,6 +147,28 @@ def test_named_order_types_and_caller_buffers_are_preserved():
         estimator.predict(np.ones((2, 2)))
 
 
+def test_byte_string_columns_are_read_as_text():
+    backend = Backend()
+    protocols = pa.array([b"tcp", b"udp", b"icmp", b"tcp"], pa.binary())
+    raw = pa.table({"protocol": protocols, "bytes": [1.0, 2.0, 3.0, 4.0]})
+    estimator = Regressor(backend=backend).fit(raw, np.arange(4.0))
+    assert estimator.context_.schema.field("protocol").type == pa.string()
+    assert estimator.context_["protocol"].to_pylist() == ["tcp", "udp", "icmp", "tcp"]
+    estimator.predict(raw)
+    assert backend.requests[-1]["queries"]["protocol"].to_pylist() == [
+        "tcp",
+        "udp",
+        "icmp",
+        "tcp",
+    ]
+    invalid = raw.set_column(0, "protocol", pa.array([b"\xff"] * 4, pa.binary()))
+    with pytest.raises(ValueError, match="'protocol' holds bytes that are not UTF-8"):
+        Regressor(backend=Backend()).fit(invalid, np.arange(4.0))
+    rows = np.array([[b"tcp", 1.0], [b"udp", 2.0]], dtype=object)
+    with pytest.raises(ValueError, match="pass text columns in a pandas or polars"):
+        Regressor(backend=Backend()).fit(rows, np.arange(2.0))
+
+
 @pytest.mark.parametrize(
     "fault", ["type", "model", "task", "rows", "classes", "probability"]
 )

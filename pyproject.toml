@@ -131,12 +131,17 @@ markers = [
 ]
 
 [tool.ruff.lint]
-extend-select = ["B", "D", "I", "RUF", "UP"]
+extend-select = ["B", "D", "I", "RUF", "TID251", "UP"]
 # F722: jaxtyping shape strings. D100, D104: module and package docstrings.
 ignore = ["F722", "D100", "D104"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["D"]
+
+# Linux-only calls crash a worker on macOS; `generalforecast.system` wraps them.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"os.sched_getaffinity".msg = "Linux only: use generalforecast.system.usable_cpus"
+"os.sched_setaffinity".msg = "Linux only: use generalforecast.system.pin_cpus"
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

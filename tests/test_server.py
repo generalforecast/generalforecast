@@ -757,10 +757,15 @@ def test_worker_profiles_need_profiling_and_stay_under_its_directory(
         (answer,) = server.action("profile_workers", body)
 
         assert answer["seconds"] == 0.2 and answer["traces"] == []
-        (stacks,) = (Path(file) for file in answer["files"])
-        assert stacks == server.profiles / "run-1" / "worker-0.txt"
-        # The file appears once the window ends.
-        wait_until(stacks.exists)
-        assert stacks.read_text()
+        # One file a worker, and the server runs a worker per few cores.
+        files = [Path(file) for file in answer["files"]]
+        assert files and files == [
+            server.profiles / "run-1" / f"worker-{shard}.txt"
+            for shard in range(len(files))
+        ]
+        for stacks in files:
+            # The file appears once the window ends.
+            wait_until(stacks.exists)
+            assert stacks.read_text()
     finally:
         server.stop()

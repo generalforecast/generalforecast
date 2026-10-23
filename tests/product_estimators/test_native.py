@@ -57,6 +57,22 @@ def test_regressor_cross_validation_uses_fold_local_context():
     assert not estimator.__sklearn_is_fitted__()
 
 
+def test_byte_string_columns_predict_as_their_text():
+    protocols = np.array(["tcp", "udp", "icmp"])[np.arange(24) % 3]
+    numbers = np.random.default_rng(0).normal(size=24).astype(np.float32)
+    text = pa.table({"protocol": protocols, "x": numbers})
+    raw = text.set_column(
+        0, "protocol", pa.array(np.char.encode(protocols), pa.binary())
+    )
+    target = numbers + np.arange(24) % 3
+    model = "tests.models.tabicl.tiny:regressor"
+    from_bytes = Regressor(model).fit(raw, target)
+    from_text = Regressor(model).fit(text, target)
+    np.testing.assert_allclose(
+        from_bytes.predict(raw), from_text.predict(text), atol=1e-6
+    )
+
+
 @pytest.mark.parametrize(
     "covariates,shared", [(False, False), (True, False), (True, True)]
 )
