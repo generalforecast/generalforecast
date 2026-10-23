@@ -12,6 +12,7 @@ import pytest
 
 from generalforecast import protocol
 from generalforecast._core import CacheKey
+from generalforecast.constants import MEASURED_ROWS
 from generalforecast.models.tabicl.model import TabICL, tabicl_functions
 from generalforecast.nn.attention import AttentionKernel
 from generalforecast.runtime.budget import Call, Chunks, measured_bytes
@@ -22,7 +23,6 @@ from generalforecast.runtime.device import (
     device_settings,
 )
 from generalforecast.runtime.memory import (
-    MEASURED_ROWS,
     MemoryProfile,
     _encode_parts,
     _traced,

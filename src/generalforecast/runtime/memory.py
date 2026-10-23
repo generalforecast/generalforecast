@@ -18,41 +18,22 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from generalforecast.constants import (
+    CACHE_TRACE_LARGE,
+    CACHE_TRACE_SMALL,
+    FIT_MARGIN,
+    FIT_ROWS,
+    FIT_STEP_ROWS,
+    MIN_FIT_ROWS,
+    MIN_SUMMARY_ROWS,
+    WORKING_MARGIN,
+    WORKING_ROWS,
+    WORKING_WIDTHS,
+)
 from generalforecast.models.contract import TabularFunctions
 from generalforecast.runtime.device import to_cache_dtype, with_summary_chunk
 
 logger = logging.getLogger(__name__)
-
-# Context sizes the cache is measured at. Tracing does no arithmetic, so any two work.
-_SMALL, _LARGE = 8, 16
-# Context sizes a decode or an encode is measured at: compiling allocates
-# nothing, and at these what grows with the context's rows, such as attention
-# scores, dominates.
-_WORKING_ROWS = (2048, 4096)
-# The fewest context rows a fit from those sizes holds for.
-MEASURED_ROWS = _WORKING_ROWS[0]
-# Table widths a model's calls are measured at, once per model. An encode's
-# temporaries can grow faster than its cache with width, so a wider table's
-# encode is measured at the table's own width.
-_WORKING_WIDTHS = (4, 16)
-# Headroom over the estimate, which XLA's choices at other sizes can exceed.
-_WORKING_MARGIN = 1.05
-# Rows a model's fit is measured at, once per model and table width. Below a
-# few thousand rows, what XLA holds does not yet grow with them in a line.
-_FIT_ROWS = (4096, 16384)
-# Headroom over a fit's measure, which XLA's choices between the sizes it was
-# measured at, and past them, can exceed.
-_FIT_MARGIN = 1.1
-# Rows a step of a measured fit's column summary reads, so what the fit holds
-# per row besides its steps shows.
-_FIT_STEP_ROWS = 8
-# The fewest rows a step of a streamed column summary reads, whatever the call
-# budget leaves it: fewer would loop over the rows for little memory saved.
-MIN_SUMMARY_ROWS = 64
-# The fewest rows a call budget limits a state's fit to: fewer barely describe
-# a table, and a call past the budget at that size runs anyway, as any call
-# too large for it alone does.
-MIN_FIT_ROWS = 4096
 
 
 def tree_bytes(tree: Any) -> int:
@@ -102,7 +83,7 @@ class MemoryProfile:
 
 def _per_row(small: int, large: int, what: str) -> int:
     """Bytes per row from sizes at the two measured row counts."""
-    growth, remainder = divmod(large - small, _LARGE - _SMALL)
+    growth, remainder = divmod(large - small, CACHE_TRACE_LARGE - CACHE_TRACE_SMALL)
     if remainder:
         raise ValueError(f"{what} does not grow by a whole number of bytes per row")
     return growth
@@ -179,8 +160,8 @@ def memory_profile(
             tree_bytes(cache),
         )
 
-    small_state, small_categorical, small_rows, small_cache = sizes(_SMALL)
-    large_state, large_categorical, large_rows, large_cache = sizes(_LARGE)
+    small_state, small_categorical, small_rows, small_cache = sizes(CACHE_TRACE_SMALL)
+    large_state, large_categorical, large_rows, large_cache = sizes(CACHE_TRACE_LARGE)
     if (small_state, small_categorical) != (large_state, large_categorical):
         raise ValueError("table state size depends on the number of rows")
     cache_per_row = _per_row(small_cache, large_cache, "the context cache")
@@ -188,7 +169,7 @@ def memory_profile(
         state_bytes=small_state,
         row_bytes=_per_row(small_rows, large_rows, "a row representation"),
         cache_bytes_per_row=cache_per_row,
-        cache_fixed_bytes=small_cache - _SMALL * cache_per_row,
+        cache_fixed_bytes=small_cache - CACHE_TRACE_SMALL * cache_per_row,
         categorical_state_bytes=small_categorical,
     )
 
@@ -236,7 +217,7 @@ class WorkingProfile:
         per_row = self.row_scale * cache_bytes_per_row + self.row_bytes
         fixed = self.fixed_scale * cache_bytes_per_row + self.fixed_bytes
         working = max(0.0, per_row) * rows + max(0.0, fixed)
-        return math.ceil(_WORKING_MARGIN * working)
+        return math.ceil(WORKING_MARGIN * working)
 
 
 @dataclass(frozen=True)
@@ -272,7 +253,7 @@ class EncodeProfile:
         held = self.held.estimate(cache_bytes_per_row, rows)
         temporaries = self.temporaries.estimate(cache_bytes_per_row, rows)
         working = max(held + temporaries, cache_bytes_per_row * rows)
-        return math.ceil(_WORKING_MARGIN * working)
+        return math.ceil(WORKING_MARGIN * working)
 
 
 def _working_profiles(
@@ -281,7 +262,7 @@ def _working_profiles(
     working: Callable[[int, int], tuple[int, ...]],
     queries: int,
     cache_dtype: jnp.dtype | None,
-    widths: tuple[int, int] = _WORKING_WIDTHS,
+    widths: tuple[int, int] = WORKING_WIDTHS,
 ) -> tuple[WorkingProfile, ...]:
     """Fits parts of a call's working memory, measured at two context sizes and two widths.
 
@@ -300,7 +281,7 @@ def _working_profiles(
     Raises:
         Exception: Whatever compiling the call raised, where XLA cannot say.
     """
-    small_rows, large_rows = _WORKING_ROWS
+    small_rows, large_rows = WORKING_ROWS
     measured = []
     for width in widths:
         cache = memory_profile(functions, model, width, cache_dtype)
@@ -444,7 +425,7 @@ def _encode_parts(
 
 def encode_widths(width: int) -> tuple[int, int]:
     """Widths to measure an encode at for a table of `width` columns, around it."""
-    narrow, wide = _WORKING_WIDTHS
+    narrow, wide = WORKING_WIDTHS
     return min(narrow, width), max(wide, width)
 
 
@@ -453,7 +434,7 @@ def encode_profile(
     model: Any,
     fit: bool = False,
     cache_dtype: jnp.dtype | None = None,
-    widths: tuple[int, int] = _WORKING_WIDTHS,
+    widths: tuple[int, int] = WORKING_WIDTHS,
 ) -> EncodeProfile:
     """Measures a model's encode of a context by compiling it, without running it.
 
@@ -523,7 +504,7 @@ def encode_bytes(
     held, temporaries, _ = _encode_parts(
         functions, model, fit, width, rows, cache_dtype
     )
-    return math.ceil(_WORKING_MARGIN * (held + temporaries))
+    return math.ceil(WORKING_MARGIN * (held + temporaries))
 
 
 @dataclass(frozen=True)
@@ -543,10 +524,10 @@ class Cost:
         return self.fixed + rows * self.row
 
     def rows(self, budget: int) -> int:
-        """The most rows `budget` bytes hold, with `_FIT_MARGIN` to spare; any if a row takes none."""
+        """The most rows `budget` bytes hold, with `FIT_MARGIN` to spare; any if a row takes none."""
         if self.row <= 0:
             return sys.maxsize
-        return max(0, int((budget / _FIT_MARGIN - self.fixed) // self.row))
+        return max(0, int((budget / FIT_MARGIN - self.fixed) // self.row))
 
 
 @dataclass(frozen=True)
@@ -612,10 +593,10 @@ def fit_profile(
     properties = functions.properties(model)
     target_dtype = jnp.float32 if properties.regression else jnp.int32
     classes = 0 if properties.regression else min(properties.class_slots, 2)
-    few, many = _FIT_ROWS
+    few, many = FIT_ROWS
 
     def lowered(rows: int, state: bool) -> jax.stages.Lowered:
-        chunk = _FIT_STEP_ROWS * width if state else None
+        chunk = FIT_STEP_ROWS * width if state else None
 
         def fit(model: Any, features: Any, targets: Any, mask: Any) -> Any:
             configured = with_summary_chunk(model, chunk)
