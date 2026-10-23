@@ -19,7 +19,7 @@ pub fn starter_config(listen: &str, nodes: &[String], token: &str, replication: 
     format!(
         r#"# A generalforecast router. Each node is a gf-server whose configuration lists the
 # replication token in `replication_tokens` and sets `require_lease = true`.
-# Check it with `gf-router check --config` and start it with `gf-router run`.
+# Check it with `gf serve --check --config` and start it with `gf serve --config`.
 
 listen = {listen:?}
 name = "router-0"        # unique among routers; nodes hold leases under it
