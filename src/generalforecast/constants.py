@@ -69,6 +69,11 @@ COMPILED_SHAPES = 32
 # drops its programs whatever their count: one worker compiling many shapes
 # maps code for each, and a compile past the cap fails.
 MAPPINGS_SHORT = 3 / 4
+# Stages whose one call reads a whole table or context, as fitting its state
+# or encoding it: seconds at a large one, so a warm start runs them on zeros
+# only up to `WARM_RUN_ROWS` rows, and past that only compiles them.
+TABLE_STAGES = frozenset({"fit", "state", "encode"})
+WARM_RUN_ROWS = 1024
 # Page counts a table's embeds compile for once it is fit, this many buckets
 # from one page: a write changes one page or a few.
 WARMED_PAGES = 4
