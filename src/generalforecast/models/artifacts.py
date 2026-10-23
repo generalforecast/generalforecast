@@ -66,8 +66,52 @@ def sha256(path: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def remembered_sha256(path: Path) -> str:
+    """The SHA-256 of a file's bytes, hashed once while its size, times and inode stay the same.
+
+    Each process loading a checkpoint verifies it, so the digest is kept in
+    `$XDG_CACHE_HOME/generalforecast/digests` under the file's identity.
+    """
+    status = path.stat()
+    identity = "|".join(
+        str(part)
+        for part in (
+            path.resolve(),
+            status.st_size,
+            status.st_mtime_ns,
+            status.st_ctime_ns,
+            status.st_ino,
+        )
+    )
+    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    memo = (
+        root
+        / "generalforecast"
+        / "digests"
+        / hashlib.sha256(identity.encode()).hexdigest()
+    )
+    try:
+        digest = memo.read_text()
+        if len(digest) == 64:
+            return digest
+    except OSError:
+        pass
+    digest = sha256(path)
+    try:
+        memo.parent.mkdir(parents=True, exist_ok=True)
+        part = memo.with_suffix(f".{os.getpid()}.part")
+        part.write_text(digest)
+        part.replace(memo)
+    except OSError:
+        pass
+    return digest
+
+
 def verify(
-    directory: Path, files: Mapping[str, str], optional: tuple[str, ...] = ()
+    directory: Path,
+    files: Mapping[str, str],
+    optional: tuple[str, ...] = (),
+    remembered: bool = False,
 ) -> None:
     """Refuses a directory whose pinned files are missing or differ.
 
@@ -75,6 +119,8 @@ def verify(
         directory: The checkpoint directory.
         files: SHA-256 of each pinned file.
         optional: Pinned files that may be absent; present, they must match.
+        remembered: Whether a file unchanged since it was last hashed takes
+            its remembered digest; see `remembered_sha256`.
 
     Raises:
         ArtifactError: `ModelUnavailable` for a missing required file,
@@ -88,7 +134,8 @@ def verify(
             raise ArtifactError(
                 "ModelUnavailable", f"checkpoint lacks its pinned file {name!r}"
             )
-        if sha256(path) != expected:
+        digest = remembered_sha256(path) if remembered else sha256(path)
+        if digest != expected:
             raise ArtifactError(
                 "ArtifactMismatch", f"checkpoint file {name!r} differs from its pin"
             )
@@ -126,7 +173,10 @@ def checkpoint(
         entry, strict, allow_downloads
     )
     verify(
-        directory, entry.artifact.files, () if strict else entry.artifact.license_files
+        directory,
+        entry.artifact.files,
+        () if strict else entry.artifact.license_files,
+        remembered=not strict,
     )
     return directory
 

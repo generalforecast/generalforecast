@@ -243,3 +243,40 @@ def test_host_memory_is_a_containers_limit(tmp_path: Path) -> None:
     assert host_memory(tmp_path) == min(machine, 64 << 30)
     (tmp_path / "memory.max").write_text(f"{1 << 20}\n")
     assert host_memory(tmp_path) == 1 << 20
+
+
+@pytest.mark.parametrize(
+    ("machine", "flags", "xla", "expected"),
+    [
+        (
+            "x86_64",
+            ["avx", "avx2", "fma", "f16c", "avx512f"],
+            "",
+            "--xla_cpu_max_isa=AVX2",
+        ),
+        ("x86_64", ["avx", "sse4_2"], "", ""),
+        ("arm64", [], "", ""),
+        (
+            "x86_64",
+            ["avx", "avx2", "fma", "f16c"],
+            "--xla_cpu_max_isa=SSE4_2",
+            "--xla_cpu_max_isa=SSE4_2",
+        ),
+    ],
+)
+def test_cpu_programs_pin_avx2_where_the_cpu_has_it(
+    monkeypatch: pytest.MonkeyPatch,
+    machine: str,
+    flags: list[str],
+    xla: str,
+    expected: str,
+) -> None:
+    from generalforecast.runtime import device
+
+    monkeypatch.setattr(device.platform, "machine", lambda: machine)
+    monkeypatch.setattr(device, "cpu_flags", lambda: flags)
+    monkeypatch.setenv("XLA_FLAGS", xla)
+
+    device.portable_cpu_programs()
+
+    assert os.environ["XLA_FLAGS"] == expected

@@ -13,6 +13,7 @@ is unpickled. They need the `sklearn` extra: `pip install generalforecast[sklear
 """
 
 import contextlib
+import threading
 import uuid
 import weakref
 from collections.abc import Callable, Sequence
@@ -50,14 +51,43 @@ class _TableClient(Protocol):
 
 
 _shared: dict[bool, LocalClient] = {}
+_shared_lock = threading.Lock()
 
 
 def _local(allow_downloads: bool = False) -> LocalClient:
     """The local client of estimators given none, one per download gate, on the process's engine."""
-    client = _shared.get(allow_downloads)
-    if client is None:
-        client = _shared[allow_downloads] = LocalClient(allow_downloads=allow_downloads)
+    with _shared_lock:
+        client = _shared.get(allow_downloads)
+        if client is None:
+            client = _shared[allow_downloads] = LocalClient(
+                allow_downloads=allow_downloads
+            )
     return client
+
+
+_loading: set[tuple[str, bool]] = set()
+_loading_lock = threading.Lock()
+
+
+def _load_soon(model: str, allow_downloads: bool) -> None:
+    """Starts loading a model in the engine's workers on a thread, while the caller builds its data.
+
+    A worker compiling the model takes seconds; `fit` waits only for what is
+    left. A model that fails to load fails again, with its error, in `fit`.
+    """
+    with _loading_lock:
+        if (model, allow_downloads) in _loading:
+            return
+        _loading.add((model, allow_downloads))
+
+    def load() -> None:
+        try:
+            _local(allow_downloads)._model_ref(model)
+        except Exception:  # noqa: BLE001
+            with _loading_lock:
+                _loading.discard((model, allow_downloads))
+
+    threading.Thread(target=load, name="gf-load", daemon=True).start()
 
 
 def _named(X: Any) -> bool:
@@ -94,6 +124,8 @@ class _Estimator(BaseEstimator):
         self.page_size = page_size
         self.backend = backend
         self.allow_downloads = allow_downloads
+        if client is None and backend is None and isinstance(model, str):
+            _load_soon(model, allow_downloads)
 
     def set_params(self, **params: Any) -> Any:
         """Updates constructor parameters and invalidates fitted context."""
