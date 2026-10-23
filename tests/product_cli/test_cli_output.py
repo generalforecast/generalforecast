@@ -14,7 +14,7 @@ from typing import ClassVar
 
 import pytest
 
-from generalforecast import cli, commands, login, term
+from generalforecast import cli, command_specs, commands, login, term
 from generalforecast.credentials import CredentialStore
 from generalforecast.deployments.contracts import ServiceError
 
@@ -136,6 +136,21 @@ def test_typo_suggestions():
     assert term.suggest("jobs", ["job", "key", "model"]) == "job"
     assert term.suggest("lst", ["list", "get"]) == "list"
     assert term.suggest("zzzzzz", ["job", "key"]) is None
+
+
+@pytest.mark.parametrize(
+    ("group", "action", "expected"),
+    [
+        ("key", "create", "Create an API key from --file"),
+        ("key", "revoke", "Revoke an API key"),
+        ("audit", "get", "Show one audit event"),
+        ("organization", "delete", "Delete an organization"),
+        ("job", "retry", "Retry a failed job"),
+        ("job", "results", "Show a job's results"),
+    ],
+)
+def test_action_help_picks_the_article(group, action, expected):
+    assert command_specs.action_help(group, action) == expected
 
 
 def test_grouped_help_lists_public_commands_only(home, monkeypatch, capsys):
