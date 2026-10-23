@@ -1717,15 +1717,15 @@ def test_a_write_that_loses_the_device_pool_forgets_every_context(monkeypatch) -
     for each in tables:
         each.insert(np.arange(32), features, targets)
     expected = tables[0].predict(NEAR_A)
-    write = paging._write
+    write = paging._write_blocks
 
-    def failing(pool, slots, data):
+    def failing(layout, pool, cache, start, slots):
         # As a donated write that ran out of memory leaves the pool.
-        monkeypatch.setattr(paging, "_write", write)
+        monkeypatch.setattr(paging, "_write_blocks", write)
         pool.delete()
         raise RuntimeError("out of memory")
 
-    monkeypatch.setattr(paging, "_write", failing)
+    monkeypatch.setattr(paging, "_write_blocks", failing)
     with pytest.raises(paging.PoolLost):
         tables[1].predict(NEAR_A)
 

@@ -5,7 +5,7 @@
 
 They follow sklearn's estimator API, so `clone`, pipelines and cross-validation
 work, using one local client shared by every estimator by default. A pandas or polars frame or an Arrow table with string,
-boolean or datetime columns keeps them: its table's columns take the frame's
+boolean or datetime columns keeps them, with byte strings read as UTF-8 text: its table's columns take the frame's
 kinds, as `generalforecast.columns.infer` reads them, and queries are frames like it. Each estimator holds one table: fitting again, `close`, or
 the estimator going away drops it. A fitted estimator keeps the rows it was fit
 on, so it pickles, as joblib's workers need, and makes its table again where it
@@ -22,6 +22,7 @@ from typing import Any, Protocol
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.exceptions import NotFittedError
 from sklearn.utils.multiclass import type_of_target
@@ -97,6 +98,50 @@ def _named(X: Any) -> bool:
     )
 
 
+def _text(table: pa.Table) -> pa.Table:
+    """Decodes byte-string columns, as sklearn's dataset fetchers give text, to strings."""
+    for index, field in enumerate(table.schema):
+        if pa.types.is_binary(field.type) or pa.types.is_large_binary(field.type):
+            try:
+                values = pc.cast(table.column(index), pa.string())
+            except pa.ArrowInvalid:
+                raise ValueError(
+                    f"column {field.name!r} holds bytes that are not UTF-8 text"
+                ) from None
+            table = table.set_column(index, pa.field(field.name, pa.string()), values)
+    return table
+
+
+def _holds_text(X: Any) -> bool:
+    array = np.asarray(X)
+    if array.dtype.kind in "SU":
+        return True
+    return array.dtype.kind == "O" and any(
+        isinstance(value, (str, bytes)) for value in array.ravel()
+    )
+
+
+def _validated(estimator: BaseEstimator, X: Any, *args: Any, **options: Any) -> Any:
+    """Unnamed rows validated as sklearn does, as float32, which holds no text."""
+    try:
+        return validate_data(
+            estimator,
+            X,
+            *args,
+            dtype=np.float32,
+            order="C",
+            ensure_all_finite="allow-nan",
+            **options,
+        )
+    except ValueError as error:
+        if not _holds_text(X):
+            raise
+        raise ValueError(
+            f"{error}: an array is read as numbers, so pass text columns in a "
+            "pandas or polars frame or an Arrow table, which reads them as categorical"
+        ) from error
+
+
 def _drop(client: _TableClient, name: str) -> None:
     """Drops an estimator's table, if its client can still be reached."""
     with contextlib.suppress(Exception):
@@ -152,20 +197,13 @@ class _Estimator(BaseEstimator):
             )
         kinds = getattr(self, "_kinds", None)
         if kinds is None:
-            return validate_data(
-                self,
-                X,
-                reset=False,
-                dtype=np.float32,
-                order="C",
-                ensure_all_finite="allow-nan",
-            )
+            return _validated(self, X, reset=False)
         if not _named(X):
             raise ValueError(
                 "this estimator was fit on a frame, so it predicts from frames "
                 f"with its columns: {list(kinds)}"
             )
-        table = to_arrow(X)
+        table = _text(to_arrow(X))
         if table.column_names != list(kinds):
             raise ValueError(
                 "feature names and order must match those passed during fit"
@@ -179,7 +217,7 @@ class _Estimator(BaseEstimator):
 
     def _typed_rows(self, X: Any, y: Any) -> tuple[Any, np.ndarray]:
         """A typed frame and its targets, with the fitted columns kept as sklearn keeps them."""
-        X = to_arrow(X)
+        X = _text(to_arrow(X))
         kinds = infer(X)
         targets = np.asarray(y)
         if targets.ndim != 1 or len(targets) != len(X):
@@ -386,9 +424,7 @@ class Classifier(ClassifierMixin, _Estimator):
         if _named(X):
             rows, y = self._typed_rows(X, y)
         else:
-            rows, y = validate_data(
-                self, X, y, dtype=np.float32, order="C", ensure_all_finite="allow-nan"
-            )
+            rows, y = _validated(self, X, y)
         if type_of_target(y) not in ("binary", "multiclass"):
             raise ValueError(f"Unknown label type: {type_of_target(y)}")
         self.classes_, codes = np.unique(np.asarray(y), return_inverse=True)
@@ -497,15 +533,7 @@ class Regressor(RegressorMixin, _Estimator):
         if _named(X):
             rows, y = self._typed_rows(X, y)
         else:
-            rows, y = validate_data(
-                self,
-                X,
-                y,
-                dtype=np.float32,
-                order="C",
-                ensure_all_finite="allow-nan",
-                y_numeric=True,
-            )
+            rows, y = _validated(self, X, y, y_numeric=True)
         rows = rows if isinstance(rows, pa.Table) else np.array(rows, copy=True)
         names = list(
             getattr(

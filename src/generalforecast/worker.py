@@ -137,6 +137,7 @@ from generalforecast.runtime.series import (
     series_layout,
 )
 from generalforecast.runtime.shapes import padded as padded_items
+from generalforecast.system import usable_cpus
 
 logger = logging.getLogger(__name__)
 
@@ -389,12 +390,6 @@ def _signature(arguments: tuple) -> tuple:
     )
 
 
-def _parallel_cpus() -> int:
-    affinity = getattr(os, "sched_getaffinity", None)
-    count = len(affinity(0)) if affinity else os.cpu_count()
-    return max(1, count or 1)
-
-
 class Worker:
     """Runs steps for the tables a node assigns it."""
 
@@ -432,11 +427,11 @@ class Worker:
         # call, side by side on the worker's cores: two to four at once
         # served 20 to 40% more than one at a time on four cores.
         self._stacks = jax.default_backend() != "cpu"
-        self._side_by_side = 1 if self._stacks else _parallel_cpus()
+        self._side_by_side = 1 if self._stacks else usable_cpus()
         self._alongside: ThreadPoolExecutor | None = None
         # NumPy copies a fancy index's rows without the GIL, so answers
         # scatter on several cores.
-        self._scatter_threads = min(SCATTER_THREADS, len(os.sched_getaffinity(0)))
+        self._scatter_threads = min(SCATTER_THREADS, usable_cpus())
         self._scatterers: ThreadPoolExecutor | None = None
         # Takes the keys of programs readied beside steps for deferred
         # tables; without it, no table's part waits for a program.

@@ -34,6 +34,7 @@ from generalforecast.runtime.device import (
     portable_cpu_programs,
     without_command_buffers,
 )
+from generalforecast.system import pin_cpus
 from generalforecast.worker import Worker
 
 Frame = tuple[dict[str, Any], list[bytes]]
@@ -60,10 +61,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         help="the cores to run on, comma-separated, if this worker has its own",
     )
     options = parser.parse_args(arguments)
-    if options.cpus and sys.platform == "linux":
+    if options.cpus:
         # Before JAX starts its backend, which sizes XLA's thread pools from
         # the cores the process may run on.
-        os.sched_setaffinity(0, [int(cpu) for cpu in options.cpus.split(",")])
+        pin_cpus(int(cpu) for cpu in options.cpus.split(","))
 
     # Before `default_settings` starts JAX's backend, which reads XLA's flags.
     without_command_buffers()
