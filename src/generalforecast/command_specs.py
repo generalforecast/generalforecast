@@ -108,16 +108,16 @@ COMMAND_HELP = {
 _ACTIONS = {
     "list": "List {plural}",
     "get": "Show one {singular}",
-    "create": "Create a {singular} from --file",
-    "delete": "Delete a {singular}",
-    "rotate": "Rotate a {singular}",
-    "revoke": "Revoke a {singular}",
-    "submit": "Submit a {singular} from --file",
-    "pause": "Pause a {singular}",
+    "create": "Create {a} {singular} from --file",
+    "delete": "Delete {a} {singular}",
+    "rotate": "Rotate {a} {singular}",
+    "revoke": "Revoke {a} {singular}",
+    "submit": "Submit {a} {singular} from --file",
+    "pause": "Pause {a} {singular}",
     "resume": "Resume a paused {singular}",
-    "cancel": "Cancel a {singular}",
+    "cancel": "Cancel {a} {singular}",
     "retry": "Retry a failed {singular}",
-    "results": "Show a {singular}'s results",
+    "results": "Show {a} {singular}'s results",
     "infer": "Run a model on the request in --file",
     "mutate": "Apply the write in --file",
     "snapshot": "Read a point-in-time snapshot",
@@ -157,4 +157,5 @@ _NOUNS = {
 def action_help(group: str, action: str) -> str:
     """One line describing `gf <group> <action>`."""
     singular, plural = _NOUNS.get(group, (group, group + "s"))
-    return _ACTIONS.get(action, action).format(singular=singular, plural=plural)
+    a = "an" if singular[0].lower() in "aeiou" else "a"
+    return _ACTIONS.get(action, action).format(a=a, singular=singular, plural=plural)
