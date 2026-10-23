@@ -195,6 +195,20 @@ def test_backend_contract_failures_are_not_success(fault):
     assert error.value.code == "ProtocolError"
 
 
+def test_byte_string_labels_are_read_as_text():
+    X = pa.table({"x": [1.0, 2.0, 3.0, 4.0]})
+    labels = np.array([b"a", b"b", b"a", b"b"], dtype=object)
+    estimator = Classifier(backend=Backend()).fit(X, labels)
+    np.testing.assert_array_equal(estimator.classes_, ["a", "b"])
+    np.testing.assert_array_equal(estimator.predict(X), ["a"] * 4)
+    assert estimator.score(X, labels) == 0.5
+    with pytest.raises(ValueError, match="not UTF-8"):
+        Classifier(backend=Backend()).fit(X, np.array([b"\xff", b"a", b"\xff", b"a"]))
+    for target in (labels, labels.astype(str)):
+        with pytest.raises(ValueError, match="use a Classifier to predict labels"):
+            Regressor(backend=Backend()).fit(X, target)
+
+
 def test_forecast_cadence_horizon_and_export(tmp_path):
     backend = Backend()
     estimator = Forecaster(
