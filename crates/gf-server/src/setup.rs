@@ -85,8 +85,8 @@ pub fn starter_config(starter: &Starter) -> String {
         ),
     };
     format!(
-        r#"# A generalforecast server on this machine. Check it with `gf-server check --config`
-# and start it with `gf-server run --config`{key_note}
+        r#"# A generalforecast server on this machine. Check it with `gf serve --check --config`
+# and start it with `gf serve --config`{key_note}
 
 listen = {listen:?}
 data = {data:?}                     # table logs, replayed on restart

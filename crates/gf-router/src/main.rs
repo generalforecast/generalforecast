@@ -3,13 +3,15 @@
 
 //! `gf-router run --config router.toml`: forwards clients to the nodes that
 //! serve their tables. `init` writes a starter configuration, and `check`
-//! looks at the configuration and reaches each node.
+//! looks at the configuration and reaches each node. People reach these
+//! through `gf serve --node`, `gf serve --config` and `gf serve --check`.
 //!
 //! SIGHUP reloads the node list, the replica count, and the client tokens and
 //! quotas; tables move to match.
 
 use std::collections::HashMap;
 use std::error::Error;
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -52,10 +54,12 @@ enum Subcommand {
         /// A node's address, such as http://127.0.0.1:8816; repeat for each.
         #[arg(long = "node", value_name = "ADDRESS", required = true)]
         nodes: Vec<String>,
-        /// The client token; a random one if unset.
+        /// The client token, which `GF_TOKEN` may give instead, so it stays
+        /// out of the process list; a random one if neither is set.
         #[arg(long)]
         token: Option<String>,
-        /// The replication token the nodes list; a random one if unset.
+        /// The replication token the nodes list, or `GF_REPLICATION_TOKEN`;
+        /// a random one if neither is set.
         #[arg(long)]
         replication_token: Option<String>,
         /// Overwrite the file if it exists.
@@ -198,20 +202,33 @@ fn init(
     if path.exists() && !force {
         return Err(format!("{} exists; pass --force to overwrite it", path.display()).into());
     }
-    let token = match token {
+    let given = token.or_else(|| std::env::var("GF_TOKEN").ok());
+    let replication_given =
+        replication_token.or_else(|| std::env::var("GF_REPLICATION_TOKEN").ok());
+    let (random, replication_random) = (given.is_none(), replication_given.is_none());
+    let token = match given {
         Some(token) => token,
         None => gf_server::setup::random_hex(16)?,
     };
-    let replication = match replication_token {
+    let replication = match replication_given {
         Some(token) => token,
         None => gf_server::setup::random_hex(16)?,
     };
     let config = gf_router::setup::starter_config(listen, nodes, &token, &replication);
-    std::fs::write(path, config)?;
-    println!("wrote {}; the client token is {token}", path.display());
-    println!("each node lists the replication token {replication} in replication_tokens");
-    println!("next: gf-router check --config {}", path.display());
-    println!("      gf-router run --config {}", path.display());
+    // The file holds both tokens, so only this user reads it.
+    gf_server::setup::write_private(path, config.as_bytes())?;
+    if random && std::io::stdout().is_terminal() {
+        println!("wrote {}; the client token is {token}", path.display());
+    } else {
+        println!("wrote {}, which holds the client token", path.display());
+    }
+    if replication_random && std::io::stdout().is_terminal() {
+        println!("each node lists the replication token {replication} in replication_tokens");
+    } else {
+        println!("each node lists the replication token in replication_tokens");
+    }
+    println!("next: gf serve --check --config {}", path.display());
+    println!("      gf serve --config {}", path.display());
     Ok(())
 }
 

@@ -8,3 +8,5 @@ target/
 src/generalforecast/*.so
 # The binaries a release packs into the wheel.
 wheel-data/
+# The servers a release stages into the wheel.
+/src/generalforecast/bin/

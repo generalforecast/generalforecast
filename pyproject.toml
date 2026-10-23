@@ -1,6 +1,6 @@
 [project]
 name = "generalforecast"
-version = "0.1.2"
+version = "0.1.3"
 description = "gf: tabular foundation models, inference and deployment clients"
 readme = "README.md"
 license = "Apache-2.0"
@@ -113,8 +113,9 @@ module-name = "generalforecast._core"
 python-source = "src"
 python-packages = ["generalforecast"]
 features = ["pyo3/extension-module"]
-# A release stages gf-native and gf-server, which `gf serve` runs, into
-# wheel-data/scripts beside Python.
+include = [{ path = "src/generalforecast/bin/*", format = "wheel" }]
+# A release stages gf-native into wheel-data/scripts beside Python, and
+# gf-server and gf-router, which `gf serve` runs, into generalforecast/bin.
 # data = "wheel-data"
 
 [tool.pytest.ini_options]

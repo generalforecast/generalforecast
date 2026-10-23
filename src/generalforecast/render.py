@@ -90,6 +90,11 @@ def _check(args: Any, lock: dict, out: Output, elapsed: float) -> None:
     out.verb("Locked", "gf.lock", f"in {seconds(elapsed)}")
 
 
+def _serve(args: Any, result: dict, out: Output, elapsed: float) -> None:
+    out.verb("Checked", result["model"], f"in {seconds(elapsed)}")
+    out.note(f"start it with `gf serve {result['target']}`")
+
+
 def _push(args: Any, result: dict, out: Output, elapsed: float) -> None:
     if "session" in result:
         out.verb("Stopped", f"dev session {result['session'].get('id')}")
@@ -290,6 +295,7 @@ _HANDLERS = {
     "whoami": _whoami,
     "init": _init,
     "check": _check,
+    "serve": _serve,
     "push": _push,
     "predict": _predict,
     "status": _status,
