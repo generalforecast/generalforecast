@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from generalforecast.constants import SERIES_TRACE_LARGE, SERIES_TRACE_SMALL
 from generalforecast.models.series import (
     TARGET,
     SeriesFunctions,
@@ -29,9 +30,6 @@ from generalforecast.runtime.device import load_cache, to_cache_dtype
 from generalforecast.runtime.memory import tree_bytes
 from generalforecast.runtime.paging import CacheLayout, read_context, traced_layout
 from generalforecast.runtime.shapes import bucket_size, pad_rows
-
-# Two traced patch counts; the axis that grows between them is the patch axis.
-_SMALL, _LARGE = 2, 4
 
 
 def abstract_group(rows: int, steps: int) -> SeriesGroup:
@@ -85,7 +83,7 @@ def series_layout(
             encoded, parameters, abstract_group(rows, patches * patch)
         )
 
-    return traced_layout(traced, slot_bytes, _SMALL, _LARGE)
+    return traced_layout(traced, slot_bytes, SERIES_TRACE_SMALL, SERIES_TRACE_LARGE)
 
 
 class SeriesBytes(NamedTuple):
@@ -126,8 +124,11 @@ def series_bytes(
         )
         return layout.row_bytes, fixed
 
-    (small, small_fixed), (large, large_fixed) = measured(_SMALL), measured(_LARGE)
-    grown = _LARGE - _SMALL
+    (small, small_fixed), (large, large_fixed) = (
+        measured(SERIES_TRACE_SMALL),
+        measured(SERIES_TRACE_LARGE),
+    )
+    grown = SERIES_TRACE_LARGE - SERIES_TRACE_SMALL
     if (large - small) % grown or (large_fixed - small_fixed) % grown:
         raise ValueError("a forecaster's cache must grow linearly with a group's rows")
     per_row, fixed_per_row = (
@@ -136,9 +137,9 @@ def series_bytes(
     )
     return SeriesBytes(
         per_row,
-        small - _SMALL * per_row,
+        small - SERIES_TRACE_SMALL * per_row,
         fixed_per_row,
-        small_fixed - _SMALL * fixed_per_row,
+        small_fixed - SERIES_TRACE_SMALL * fixed_per_row,
     )
 
 

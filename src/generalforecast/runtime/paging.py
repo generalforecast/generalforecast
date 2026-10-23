@@ -27,13 +27,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from generalforecast.constants import (
+    MOVE_SLOTS,
+    PACK_BYTES,
+    PAGE_TRACE_LARGE,
+    PAGE_TRACE_SMALL,
+)
 from generalforecast.models.contract import TabularFunctions
 from generalforecast.nn.attention import AttentionCache
 from generalforecast.runtime.device import to_cache_dtype
 from generalforecast.runtime.shapes import bucket_size
-
-# Two traced context sizes; the axis that grows between them is the row axis.
-_SMALL, _LARGE = 16, 48
 
 
 @dataclass(frozen=True)
@@ -130,7 +133,9 @@ def cache_layout(
 
         return jax.eval_shape(encoded, model, features, targets, count)
 
-    return traced_layout(traced, slot_bytes, _SMALL, _LARGE, lengths_only=True)
+    return traced_layout(
+        traced, slot_bytes, PAGE_TRACE_SMALL, PAGE_TRACE_LARGE, lengths_only=True
+    )
 
 
 def traced_layout(
@@ -244,11 +249,6 @@ def _write_blocks(
     """`pool` with the cache's blocks from `start` packed into `slots`; a slot past its end is padding, and dropped."""
     count = slots.shape[0] // layout.slots_per_row
     return pool.at[slots].set(_packed(layout, cache, start, count), mode="drop")
-
-
-# Bytes of a cache packed at a time as it is written to the device pool,
-# rounded down to a power of two of blocks.
-PACK_BYTES = 1 << 30
 
 
 def pack_into(
@@ -495,12 +495,6 @@ def _read(data: jax.Array, slots: np.ndarray) -> jax.Array:
 def _write(pool: jax.Array, slots: jax.Array, data: jax.Array) -> jax.Array:
     """`pool` with `data` in `slots`; a slot past its end is padding, and dropped."""
     return pool.at[slots].set(data, mode="drop")
-
-
-# Slots a move between tiers copies at a time. Each part but the last is this
-# many, and the last pads to a bucket, so moves compile a few programs and
-# put at most a part on the device beside the pool.
-MOVE_SLOTS = 64
 
 
 def _parts(slots: list[int], pad: int) -> list[tuple[int, int, np.ndarray]]:

@@ -188,15 +188,20 @@ def test_workers_keep_compiled_programs_on_disk() -> None:
     assert jax.config.jax_compilation_cache_dir
 
 
-def test_worker_parallelism_falls_back_without_process_affinity(
+def test_a_worker_starts_without_process_affinity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from generalforecast import worker
+    # As on macOS, which has no CPU affinity.
+    from generalforecast import system
+    from generalforecast.worker import Worker
 
-    monkeypatch.delattr(worker.os, "sched_getaffinity", raising=False)
-    monkeypatch.setattr(worker.os, "cpu_count", lambda: 6)
+    monkeypatch.delattr(system.os, "sched_getaffinity", raising=False)
+    monkeypatch.delattr(system.os, "sched_setaffinity", raising=False)
+    monkeypatch.setattr(system.os, "cpu_count", lambda: 6)
 
-    assert worker._parallel_cpus() == 6
+    assert system.usable_cpus() == 6
+    system.pin_cpus([0])
+    Worker().close()
 
 
 def test_command_buffers_are_off_unless_xla_flags_set_them(
@@ -243,3 +248,40 @@ def test_host_memory_is_a_containers_limit(tmp_path: Path) -> None:
     assert host_memory(tmp_path) == min(machine, 64 << 30)
     (tmp_path / "memory.max").write_text(f"{1 << 20}\n")
     assert host_memory(tmp_path) == 1 << 20
+
+
+@pytest.mark.parametrize(
+    ("machine", "flags", "xla", "expected"),
+    [
+        (
+            "x86_64",
+            ["avx", "avx2", "fma", "f16c", "avx512f"],
+            "",
+            "--xla_cpu_max_isa=AVX2",
+        ),
+        ("x86_64", ["avx", "sse4_2"], "", ""),
+        ("arm64", [], "", ""),
+        (
+            "x86_64",
+            ["avx", "avx2", "fma", "f16c"],
+            "--xla_cpu_max_isa=SSE4_2",
+            "--xla_cpu_max_isa=SSE4_2",
+        ),
+    ],
+)
+def test_cpu_programs_pin_avx2_where_the_cpu_has_it(
+    monkeypatch: pytest.MonkeyPatch,
+    machine: str,
+    flags: list[str],
+    xla: str,
+    expected: str,
+) -> None:
+    from generalforecast.runtime import device
+
+    monkeypatch.setattr(device.platform, "machine", lambda: machine)
+    monkeypatch.setattr(device, "cpu_flags", lambda: flags)
+    monkeypatch.setenv("XLA_FLAGS", xla)
+
+    device.portable_cpu_programs()
+
+    assert os.environ["XLA_FLAGS"] == expected
