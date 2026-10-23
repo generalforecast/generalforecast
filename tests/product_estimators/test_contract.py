@@ -209,6 +209,17 @@ def test_byte_string_labels_are_read_as_text():
             Regressor(backend=Backend()).fit(X, target)
 
 
+def test_a_regressor_reads_numeric_text_and_forgets_its_table_on_a_text_refit():
+    X = np.arange(4.0).reshape(-1, 1)
+    numbers = np.array(["1", "2", "3", "4"], dtype=object)
+    estimator = Regressor(backend=Backend()).fit(X, numbers)
+    assert estimator.predict(X).shape == (4,)
+    with pytest.raises(ValueError, match="use a Classifier to predict labels"):
+        estimator.fit(X, np.array(["a", "b", "a", "b"], dtype=object))
+    with pytest.raises(NotFittedError):
+        estimator.predict(X)
+
+
 def test_forecast_cadence_horizon_and_export(tmp_path):
     backend = Backend()
     estimator = Forecaster(

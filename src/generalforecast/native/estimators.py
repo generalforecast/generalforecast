@@ -121,6 +121,17 @@ def _holds_text(X: Any) -> bool:
     )
 
 
+def _holds_words(y: Any) -> bool:
+    """Whether y holds text that doesn't read as numbers, as `"1.5"` does."""
+    if not _holds_text(y):
+        return False
+    try:
+        np.asarray(y, dtype=np.float64)
+    except (TypeError, ValueError):
+        return True
+    return False
+
+
 def _labels(y: Any) -> Any:
     """Labels with byte strings read as UTF-8 text, as sklearn takes no bytes labels."""
     array = np.asarray(y)
@@ -553,12 +564,12 @@ class Regressor(RegressorMixin, _Estimator):
         Returns:
             The fitted estimator.
         """
-        if _holds_text(y):
+        self.close()
+        if _holds_words(y):
             raise ValueError(
                 "y holds text, but a Regressor predicts numbers; use a Classifier "
                 "to predict labels"
             )
-        self.close()
         original_y = y
         self._kinds = None
         if _named(X):
