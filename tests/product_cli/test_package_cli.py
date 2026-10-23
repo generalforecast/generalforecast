@@ -5,6 +5,7 @@
 
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -475,7 +476,8 @@ def test_rust_launcher_matches_installed_python(package, action):
         result.returncode == (1 if action == "invalid" else 0) for result in results
     ), [result.stderr for result in results]
     assert results[0].stdout == results[1].stdout
-    assert results[0].stderr == results[1].stderr
+    elapsed = re.compile(r" in [\d.]+m?s$", re.MULTILINE)
+    assert elapsed.sub("", results[0].stderr) == elapsed.sub("", results[1].stderr)
     assert "Traceback" not in results[0].stderr
 
 
