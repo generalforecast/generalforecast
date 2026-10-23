@@ -15,9 +15,10 @@ import contextlib
 import dataclasses
 import functools
 import hashlib
-import importlib.metadata
 import logging
 import os
+import platform
+import re
 import sys
 import threading
 import time
@@ -35,8 +36,20 @@ import numpy as np
 
 from generalforecast import _core, protocol
 from generalforecast._core import CacheKey, bucket_size
+from generalforecast.constants import (
+    AUTOTUNE_SHARE,
+    FIT_CELL_BYTES,
+    FIT_ROW_SCALE,
+    FUSED_STACKS,
+    MEASURED_ROWS,
+    SCATTER_ROWS,
+    SCATTER_THREADS,
+    WARMED_PAGES,
+    WARMED_QUERIES,
+)
 from generalforecast.models.contract import TabularFunctions, TabularProperties
 from generalforecast.models.series import SeriesFunctions, SeriesGroup, SeriesProperties
+from generalforecast.runtime import shipped
 from generalforecast.runtime.budget import (
     Call,
     Chunks,
@@ -63,7 +76,9 @@ from generalforecast.runtime.device import (
     DeviceSettings,
     cache_root,
     configure,
+    cpu_flags,
     load_cache,
+    portable_cpu_programs,
     store_cache,
     to_cache_dtype,
     use_compile_cache,
@@ -71,7 +86,6 @@ from generalforecast.runtime.device import (
     without_command_buffers,
 )
 from generalforecast.runtime.memory import (
-    MEASURED_ROWS,
     EncodeProfile,
     FitProfile,
     MemoryProfile,
@@ -99,14 +113,12 @@ from generalforecast.runtime.paging import (
     unpack_states,
 )
 from generalforecast.runtime.programs import (
-    FUSED_STACKS,
-    WARMED_PAGES,
-    WARMED_QUERIES,
     Kind,
     Programs,
     abstract,
     counts_up_to,
     ladder,
+    zeros,
 )
 from generalforecast.runtime.programs import (
     signature as kind_signature,
@@ -125,20 +137,9 @@ from generalforecast.runtime.series import (
     series_layout,
 )
 from generalforecast.runtime.shapes import padded as padded_items
+from generalforecast.system import usable_cpus
 
 logger = logging.getLogger(__name__)
-
-# XLA's GPU autotuner times kernels on buffers of its own while it compiles,
-# beside what a step holds; a call leaves it a sixteenth of its working memory.
-# When Mitra-2 ran out of memory there, the autotuner had asked for 1.05 GiB,
-# 3.5% of that decode's.
-_AUTOTUNE_SHARE = 16
-
-# What `Worker.fit_bound` takes a fit to hold per cell, and per byte of its
-# rows' representations: built-in models' fits hold at most about a fifth of
-# the first, measured to 1,000 columns, and a sixtieth of the second.
-FIT_CELL_BYTES = 1 << 16
-FIT_ROW_SCALE = 64
 
 # A step comes from the bindings in-process, or decoded from a server's frame.
 Step = _core.Step | protocol.Step
@@ -389,12 +390,6 @@ def _signature(arguments: tuple) -> tuple:
     )
 
 
-def _parallel_cpus() -> int:
-    affinity = getattr(os, "sched_getaffinity", None)
-    count = len(affinity(0)) if affinity else os.cpu_count()
-    return max(1, count or 1)
-
-
 class Worker:
     """Runs steps for the tables a node assigns it."""
 
@@ -424,6 +419,7 @@ class Worker:
             timers: Time each part of a step; see `WorkerStats.parts`.
         """
         without_command_buffers()
+        portable_cpu_programs()
         self._settings, self._minimum = settings, bucket_minimum
         self._slot_bytes = slot_bytes
         # On a CPU a stacked fused call takes as long per unit as one alone,
@@ -431,8 +427,12 @@ class Worker:
         # call, side by side on the worker's cores: two to four at once
         # served 20 to 40% more than one at a time on four cores.
         self._stacks = jax.default_backend() != "cpu"
-        self._side_by_side = 1 if self._stacks else _parallel_cpus()
+        self._side_by_side = 1 if self._stacks else usable_cpus()
         self._alongside: ThreadPoolExecutor | None = None
+        # NumPy copies a fancy index's rows without the GIL, so answers
+        # scatter on several cores.
+        self._scatter_threads = min(SCATTER_THREADS, usable_cpus())
+        self._scatterers: ThreadPoolExecutor | None = None
         # Takes the keys of programs readied beside steps for deferred
         # tables; without it, no table's part waits for a program.
         self.announce: Callable[[list[str]], None] | None = None
@@ -454,6 +454,9 @@ class Worker:
         self._chunks = Chunks(
             self._count, self._compiled, self._part, self._seen, self._noted
         )
+        self._manifest_dir = (
+            _manifests(bucket_minimum, slot_bytes) if compile_cache else None
+        )
         # The worker's compiled programs, and those it compiles ahead.
         self.programs = Programs(
             settings,
@@ -469,7 +472,7 @@ class Worker:
                 *PROGRAMS,
             ),
             ahead=compile_ahead,
-            manifests=_manifests(bucket_minimum, slot_bytes) if compile_cache else None,
+            manifests=self._manifest_dir,
         )
         self._models: dict[int, _Model] = {}
         # The spec each model was loaded from, under which its kinds of call are recorded.
@@ -530,6 +533,11 @@ class Worker:
         )
 
     @property
+    def allocated(self) -> bool:
+        """Whether `allocate` sized the pools, which steps and `warm_start` read."""
+        return hasattr(self, "_device")
+
+    @property
     def _call_bytes(self) -> int:
         """Bytes one compiled call may take beside the device pool."""
         return self.budget.call_bytes(self._pool_bytes)
@@ -549,6 +557,9 @@ class Worker:
         if self._alongside is not None:
             self._alongside.shutdown()
             self._alongside = None
+        if self._scatterers is not None:
+            self._scatterers.shutdown()
+            self._scatterers = None
         self._contexts.clear()
         self._fixed.clear()
         self._pages.clear()
@@ -581,8 +592,25 @@ class Worker:
         self._models[model] = _Model[Any](functions, parameters)
         if spec is not None:
             self._specs[model] = spec
+            manifest = self.programs.manifest(spec)
+            if manifest is not None and not manifest.path.exists():
+                # A machine that never ran the model starts from what its
+                # release compiled on this platform, if it shipped any.
+                assert self._manifest_dir is not None
+                shipped.install(cache_root(), self._manifest_dir.name, spec)
 
-    def warm_start(self, progress: Callable[[], None] | None = None) -> None:
+    def _measured(self, model: int, key: tuple, measure: Callable[[], Any]) -> Any:
+        """What `measure` returns, kept for later processes under the model's spec and settings."""
+        spec = self._specs.get(model)
+        if spec is None:
+            return measure()
+        return self.programs.measured(spec, (*key, repr(self._settings)), measure)
+
+    def warm_start(
+        self,
+        progress: Callable[[], None] | None = None,
+        models: Sequence[int] | None = None,
+    ) -> None:
         """Compiles the kinds of call earlier processes recorded for the loaded models, before any step.
 
         Each kind compiles for every power of two of items up to the most a
@@ -594,9 +622,11 @@ class Worker:
 
         Args:
             progress: Called after each program compiles.
+            models: The loaded models to compile for; every one by default.
         """
         started = time.perf_counter()
-        for model, spec in self._specs.items():
+        chosen = self._specs.keys() if models is None else models
+        for model, spec in [(model, self._specs[model]) for model in chosen]:
             parameters = self._models[model].parameters
             recorded = self.programs.recorded(spec)
             if not self.forecaster(model) and recorded.kinds:
@@ -616,6 +646,13 @@ class Worker:
                         items = abstract(kind.item, count)
                         shared = self._shared(program, kind, items)
                         function.lower(parameters, *shared, *items).compile()
+                        # A program's first run sets it up on the device, which
+                        # would otherwise slow the first step that calls it.
+                        inputs = zeros((shared, items))
+                        if inputs is not None:
+                            jax.block_until_ready(
+                                function(parameters, *inputs[0], *inputs[1])
+                            )
                         self.programs.warmed += 1
                         if progress is not None:
                             progress()
@@ -724,8 +761,12 @@ class Worker:
         if (model, features) not in self._profiles:
             entry = self._tabular(model)
             cache_dtype = None if self._settings is None else self._settings.cache_dtype
-            self._profiles[model, features] = memory_profile(
-                entry.functions, entry.parameters, features, cache_dtype
+            self._profiles[model, features] = self._measured(
+                model,
+                ("profile", features),
+                lambda: memory_profile(
+                    entry.functions, entry.parameters, features, cache_dtype
+                ),
             )
         return self._profiles[model, features]
 
@@ -799,12 +840,16 @@ class Worker:
         if model not in self._decodes:
             entry = self._tabular(model)
             cache_dtype = None if self._settings is None else self._settings.cache_dtype
-            self._decodes[model] = decode_profile(
-                entry.functions,
-                entry.parameters,
-                self._stage("decode", model, 0),
-                self._size(1),
-                cache_dtype,
+            self._decodes[model] = self._measured(
+                model,
+                ("decode", self._size(1)),
+                lambda: decode_profile(
+                    entry.functions,
+                    entry.parameters,
+                    self._stage("decode", model, 0),
+                    self._size(1),
+                    cache_dtype,
+                ),
             )
         return self._decodes[model]
 
@@ -820,19 +865,24 @@ class Worker:
         if (model, fit, widths) not in self._encodes:
             entry = self._tabular(model)
             cache_dtype = None if self._settings is None else self._settings.cache_dtype
-            try:
-                profile = encode_profile(
-                    entry.functions, entry.parameters, fit, cache_dtype, widths
-                )
-            except Exception as error:  # noqa: BLE001
-                logger.warning(
-                    "could not measure the model's encode at widths %s (%s); each "
-                    "context's is measured at its own size",
-                    widths,
-                    error,
-                )
-                profile = None
-            self._encodes[model, fit, widths] = profile
+
+            def measure() -> EncodeProfile | None:
+                try:
+                    return encode_profile(
+                        entry.functions, entry.parameters, fit, cache_dtype, widths
+                    )
+                except Exception as error:  # noqa: BLE001
+                    logger.warning(
+                        "could not measure the model's encode at widths %s (%s); "
+                        "each context's is measured at its own size",
+                        widths,
+                        error,
+                    )
+                    return None
+
+            self._encodes[model, fit, widths] = self._measured(
+                model, ("encode_profile", fit, widths), measure
+            )
         return self._encodes[model, fit, widths]
 
     def encode_bytes(
@@ -859,8 +909,17 @@ class Worker:
                 cache_dtype = (
                     None if self._settings is None else self._settings.cache_dtype
                 )
-                measured = encode_bytes(
-                    entry.functions, entry.parameters, features, rows, fit, cache_dtype
+                measured = self._measured(
+                    model,
+                    ("encode", features, rows, fit),
+                    lambda: encode_bytes(
+                        entry.functions,
+                        entry.parameters,
+                        features,
+                        rows,
+                        fit,
+                        cache_dtype,
+                    ),
                 )
             except NoMemoryAnalysis as error:
                 logger.warning(
@@ -953,15 +1012,22 @@ class Worker:
         if (model, num_classes, features) in self._checked:
             return
         size = self._size(1)
-        targets = jnp.zeros(size, jnp.int32 if num_classes else jnp.float32)
-        jax.eval_shape(
-            self._stage("fit", model, num_classes),
-            self._models[model].parameters,
-            jnp.zeros((size, features), jnp.float32),
-            targets,
-            1,
-            None,
-        )
+
+        def check() -> bool:
+            targets = jnp.zeros(size, jnp.int32 if num_classes else jnp.float32)
+            jax.eval_shape(
+                self._stage("fit", model, num_classes),
+                self._models[model].parameters,
+                jnp.zeros((size, features), jnp.float32),
+                targets,
+                1,
+                None,
+            )
+            return True
+
+        # Tracing the model takes most of a second, so a table it accepted is
+        # remembered for later processes; one it refuses is traced again.
+        self._measured(model, ("check", num_classes, features, size), check)
         self._checked.add((model, num_classes, features))
 
     def layout(self, model: int, features: int) -> CacheLayout:
@@ -973,12 +1039,16 @@ class Worker:
         if (model, features) not in self._layouts:
             entry = self._tabular(model)
             cache_dtype = None if self._settings is None else self._settings.cache_dtype
-            self._layouts[model, features] = cache_layout(
-                entry.functions,
-                entry.parameters,
-                features,
-                self._slot_bytes,
-                cache_dtype,
+            self._layouts[model, features] = self._measured(
+                model,
+                ("layout", features),
+                lambda: cache_layout(
+                    entry.functions,
+                    entry.parameters,
+                    features,
+                    self._slot_bytes,
+                    cache_dtype,
+                ),
             )
         return self._layouts[model, features]
 
@@ -1317,7 +1387,7 @@ class Worker:
     ) -> Callable[[], int]:
         """What estimates an item's bytes in a call: its inputs and outputs."""
 
-        def estimate() -> int:
+        def measure() -> int:
             function = self._stage(stage, model, num_classes)
             outputs = jax.eval_shape(
                 function, self._models[model].parameters, *arguments
@@ -1326,6 +1396,11 @@ class Worker:
                 getattr(leaf, "nbytes", 0) for leaf in jax.tree.leaves(arguments)
             )
             return inputs + tree_bytes(outputs)
+
+        def estimate() -> int:
+            # Measured by tracing the model, so kept for later processes.
+            key = ("estimate", stage, num_classes, repr(kind_signature(arguments)))
+            return self._measured(model, key, measure)
 
         return estimate
 
@@ -1853,7 +1928,7 @@ class Worker:
             state = 0 if table.own is None else 2 * table.own.slots * self._slot_bytes
             needed = max(encode, working + state)
         if not self.budget.cpu:
-            needed += max(encode, working) // _AUTOTUNE_SHARE
+            needed += max(encode, working) // AUTOTUNE_SHARE
         room = self.budget.device - self._pool_bytes
         if needed > room:
             encoding = (
@@ -2102,16 +2177,42 @@ class Worker:
         for (model, num_classes, layout, own, _), decodings in paged.items():
             for same in alike(decodings, layout.slots_per_row, self._size):
                 outputs += self._decode_paged(model, num_classes, layout, same, own)
+        with self.stats.timed("fetch"):
+            fetched = jax.device_get([values for _, values in outputs])
         predictions: dict[int, np.ndarray] = {}
-        for (batch, queries), values in outputs:
-            with self.stats.timed("fetch"):
-                values = np.asarray(values)[: len(queries)]
-            with self.stats.timed("scatter"):
+        with self.stats.timed("scatter"):
+            parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
+            for ((batch, queries), _), values in zip(outputs, fetched, strict=True):
+                values = np.asarray(values)
                 if batch.request not in predictions:
                     shape = (len(batch.units), values.shape[-1])
                     predictions[batch.request] = np.zeros(shape, dtype=values.dtype)
-                predictions[batch.request][queries] = values
+                at = np.asarray(queries, dtype=np.intp)
+                for start in range(0, len(at), SCATTER_ROWS):
+                    stop = start + SCATTER_ROWS
+                    parts.append(
+                        (predictions[batch.request], at[start:stop], values[start:stop])
+                    )
+            self._scatter(parts)
         return predictions
+
+    def _scatter(self, parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]]) -> None:
+        """Copies each part's values to its rows of its output, side by side on the worker's cores."""
+
+        def put(part: tuple[np.ndarray, np.ndarray, np.ndarray]) -> None:
+            output, rows, values = part
+            output[rows] = values[: len(rows)]
+
+        if len(parts) < 2 or self._scatter_threads < 2:
+            for part in parts:
+                put(part)
+            return
+        if self._scatterers is None:
+            self._scatterers = ThreadPoolExecutor(
+                self._scatter_threads, thread_name_prefix="gf-scatter"
+            )
+        for _ in self._scatterers.map(put, parts):
+            pass
 
     def _decode_dense(
         self, jobs: list[_Dense], units: Sequence[Unit], transient: Transient
@@ -2921,16 +3022,18 @@ def _only_item(outputs: Any) -> Any:
 def _manifests(bucket_minimum: int, slot_bytes: int) -> Path:
     """Where workers record the kinds of call their models compile for, beside JAX's compile cache.
 
-    One directory per version of this package and JAX, device and padding,
-    since programs recorded under another may not compile, or compile alike.
+    One directory per version of the code workers trace and of JAX, device
+    and padding, since programs recorded under another may not compile, or
+    compile alike.
     """
     device = jax.devices()[0]
     identity = "|".join(
         [
-            _version(),
+            _traced(),
             jax.__version__,
             device.platform,
             device.device_kind,
+            *([_cpu_features()] if device.platform == "cpu" else []),
             str(bucket_minimum),
             str(slot_bytes),
         ]
@@ -2939,12 +3042,33 @@ def _manifests(bucket_minimum: int, slot_bytes: int) -> Path:
     return cache_root() / "programs" / digest
 
 
-def _version() -> str:
-    """This package's version, or `unknown` from a source tree that is not installed."""
-    try:
-        return importlib.metadata.version("generalforecast")
-    except importlib.metadata.PackageNotFoundError:
-        return "unknown"
+def _cpu_features() -> str:
+    """The instruction sets XLA may compile this machine's CPU programs with, which a program shipped from another must match.
+
+    The set `portable_cpu_programs` pinned, or else every flag the CPU lists.
+    """
+    pinned = re.search(r"xla_cpu_max_isa=(\w+)", os.environ.get("XLA_FLAGS", ""))
+    if pinned:
+        return f"{platform.machine()} {pinned[1]}"
+    return " ".join([platform.machine(), *sorted(cpu_flags())])
+
+
+@functools.cache
+def _traced() -> str:
+    """A digest of the code workers trace and measure, in place of this package's version.
+
+    A release that leaves this code alone compiles every program as the one
+    before did, so it keeps that release's recorded programs and bundles.
+    """
+    root = Path(__file__).parent
+    files = [root / "worker.py"]
+    for package in ("models", "nn", "profiling", "runtime"):
+        files += (root / package).rglob("*.py")
+    digest = hashlib.sha256()
+    for path in sorted(files):
+        digest.update(f"{path.relative_to(root).as_posix()}\0".encode())
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
 
 
 def _message(error: Exception) -> str:

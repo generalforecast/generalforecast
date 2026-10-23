@@ -2478,7 +2478,14 @@ impl Shard {
                 spec: spec.clone(),
             }],
         };
-        match self.ask_worker(&request).await? {
+        // The worker compiles what earlier workers recorded for the model
+        // before it answers, reporting progress after each program.
+        let frame = self
+            .worker
+            .request_progressing(&request.frame(), self.step_timeout)
+            .await
+            .map_err(ServerError::Internal)?;
+        match WorkerReply::of(&frame).map_err(|error| ServerError::Internal(error.0))? {
             WorkerReply::Ok => {
                 self.worker.models.push(name.clone());
                 self.worker.launch.config.models.insert(name, spec);
