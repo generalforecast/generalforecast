@@ -187,3 +187,29 @@ def test_estimators_fit_and_predict_on_a_server(server) -> None:
     assert len(client.tables()) == 1
     remote.close()
     assert client.tables() == []
+
+
+def test_an_estimator_starts_loading_its_model_once_as_it_is_made(monkeypatch) -> None:
+    import threading
+    from typing import Any, cast
+
+    from generalforecast.native import estimators
+
+    loaded: list[str] = []
+    done = threading.Event()
+
+    class _Client:
+        def _model_ref(self, model: str) -> str:
+            loaded.append(model)
+            done.set()
+            return model
+
+    monkeypatch.setattr(estimators, "_loading", set())
+    monkeypatch.setattr(estimators, "_local", lambda allow_downloads: _Client())
+
+    estimators.Classifier("tabicl-v2-classifier")
+    assert done.wait(10)
+    estimators.Classifier("tabicl-v2-classifier")
+    estimators.Classifier("tabicl-v2-classifier", client=cast(Any, _Client()))
+
+    assert loaded == ["tabicl-v2-classifier"]

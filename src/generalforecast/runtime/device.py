@@ -5,6 +5,7 @@ import ctypes
 import dataclasses
 import functools
 import os
+import platform
 import sys
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,6 +15,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from generalforecast.constants import ATTENTION_BLOCK_CHUNK
 from generalforecast.nn.attention import (
     AttentionCache,
     AttentionKernel,
@@ -74,20 +76,19 @@ class DeviceSettings:
 # no fast float16, so fast mode stores bfloat16 caches there until measured.
 # Attention that falls back to XLA, as masked or int8 attention does, chunks
 # its queries; cuDNN's flash attention never holds every score, so it does not.
-# Attention blocks take at most this many positions per step, so large tables
-# fit in memory; smaller ones run in one step.
-_BLOCK_CHUNK = 1 << 18
 _FAST = {
     "cpu": DeviceSettings(
-        FLOAT32, FLOAT32, AttentionKernel("xla", 256, block_chunk=_BLOCK_CHUNK)
+        FLOAT32, FLOAT32, AttentionKernel("xla", 256, block_chunk=ATTENTION_BLOCK_CHUNK)
     ),
     "gpu": DeviceSettings(
         FLOAT32,
         FLOAT16,
-        AttentionKernel("cudnn", 256, dtype=FLOAT16, block_chunk=_BLOCK_CHUNK),
+        AttentionKernel("cudnn", 256, dtype=FLOAT16, block_chunk=ATTENTION_BLOCK_CHUNK),
     ),
     "tpu": DeviceSettings(
-        FLOAT32, BFLOAT16, AttentionKernel("xla", 1024, block_chunk=_BLOCK_CHUNK)
+        FLOAT32,
+        BFLOAT16,
+        AttentionKernel("xla", 1024, block_chunk=ATTENTION_BLOCK_CHUNK),
     ),
 }
 _CHUNKS = {"cpu": 256, "gpu": 256, "tpu": 1024}
@@ -108,7 +109,9 @@ def device_settings(platform: str, exact: bool = False) -> DeviceSettings:
         raise ValueError(f"no device settings for platform {platform!r}")
     if not exact:
         return _FAST[platform]
-    kernel = AttentionKernel("xla", _CHUNKS[platform], block_chunk=_BLOCK_CHUNK)
+    kernel = AttentionKernel(
+        "xla", _CHUNKS[platform], block_chunk=ATTENTION_BLOCK_CHUNK
+    )
     return DeviceSettings(FLOAT32, FLOAT32, kernel, matmul_precision="highest")
 
 
@@ -228,6 +231,37 @@ def without_command_buffers() -> None:
     flags = os.environ.get("XLA_FLAGS", "")
     if "xla_gpu_enable_command_buffer" not in flags:
         os.environ["XLA_FLAGS"] = f"{flags} --xla_gpu_enable_command_buffer=".strip()
+
+
+def portable_cpu_programs() -> None:
+    """Compiles CPU programs for AVX2 on an x86 machine that has it, unless `XLA_FLAGS` picks an instruction set.
+
+    JAX's compile cache does not key programs by the machine's instruction
+    sets, so a program compiled for AVX-512 would load, and crash, on a
+    machine without it. Pinned to AVX2, one release's programs serve every
+    such machine. It takes effect only before JAX starts its first backend.
+    """
+    flags = os.environ.get("XLA_FLAGS", "")
+    if "xla_cpu_max_isa" in flags or platform.machine() not in ("x86_64", "AMD64"):
+        return
+    if {"avx", "avx2", "fma", "f16c"} <= set(cpu_flags()):
+        os.environ["XLA_FLAGS"] = f"{flags} --xla_cpu_max_isa=AVX2".strip()
+
+
+def cpu_flags() -> list[str]:
+    """The CPU's instruction set flags Linux lists, empty elsewhere."""
+    try:
+        lines = Path("/proc/cpuinfo").read_text().splitlines()
+    except OSError:
+        return []
+    return next(
+        (
+            line.split(":", 1)[1].split()
+            for line in lines
+            if line.startswith(("flags", "Features"))
+        ),
+        [],
+    )
 
 
 def device_memory() -> int:

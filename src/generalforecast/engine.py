@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 import numpy as np
 
 from generalforecast.models.catalog import ModelRef, Surface, admit, parse
+from generalforecast.system import usable_cpus
 
 if TYPE_CHECKING:
     from generalforecast._core import BoundTable, ForecastRequest, TabularRequest
@@ -129,8 +130,18 @@ def local(surface: Surface = "local", allow_downloads: bool = False) -> LocalEng
     global _process
     with _process_lock:
         if _process is None:
-            _process = LocalEngine()
+            _process = LocalEngine(cpu_threads=_cores())
     return _process.gated(surface, allow_downloads)
+
+
+def _cores() -> int:
+    """The cores this process may use, all for its one CPU worker.
+
+    One caller at a time is the in-process case: on 8 cores one worker of
+    eight started a small model in about half the time two of four did, and
+    fit new contexts 1.1 to 3.3 times faster at 100 to 10,000 rows.
+    """
+    return usable_cpus()
 
 
 def configuration(

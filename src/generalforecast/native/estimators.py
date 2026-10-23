@@ -5,7 +5,7 @@
 
 They follow sklearn's estimator API, so `clone`, pipelines and cross-validation
 work, using one local client shared by every estimator by default. A pandas or polars frame or an Arrow table with string,
-boolean or datetime columns keeps them: its table's columns take the frame's
+boolean or datetime columns keeps them, with byte strings read as UTF-8 text: its table's columns take the frame's
 kinds, as `generalforecast.columns.infer` reads them, and queries are frames like it. Each estimator holds one table: fitting again, `close`, or
 the estimator going away drops it. A fitted estimator keeps the rows it was fit
 on, so it pickles, as joblib's workers need, and makes its table again where it
@@ -13,6 +13,7 @@ is unpickled. They need the `sklearn` extra: `pip install generalforecast[sklear
 """
 
 import contextlib
+import threading
 import uuid
 import weakref
 from collections.abc import Callable, Sequence
@@ -21,6 +22,7 @@ from typing import Any, Protocol
 
 import numpy as np
 import pyarrow as pa
+import pyarrow.compute as pc
 from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
 from sklearn.exceptions import NotFittedError
 from sklearn.utils.multiclass import type_of_target
@@ -50,14 +52,43 @@ class _TableClient(Protocol):
 
 
 _shared: dict[bool, LocalClient] = {}
+_shared_lock = threading.Lock()
 
 
 def _local(allow_downloads: bool = False) -> LocalClient:
     """The local client of estimators given none, one per download gate, on the process's engine."""
-    client = _shared.get(allow_downloads)
-    if client is None:
-        client = _shared[allow_downloads] = LocalClient(allow_downloads=allow_downloads)
+    with _shared_lock:
+        client = _shared.get(allow_downloads)
+        if client is None:
+            client = _shared[allow_downloads] = LocalClient(
+                allow_downloads=allow_downloads
+            )
     return client
+
+
+_loading: set[tuple[str, bool]] = set()
+_loading_lock = threading.Lock()
+
+
+def _load_soon(model: str, allow_downloads: bool) -> None:
+    """Starts loading a model in the engine's workers on a thread, while the caller builds its data.
+
+    A worker compiling the model takes seconds; `fit` waits only for what is
+    left. A model that fails to load fails again, with its error, in `fit`.
+    """
+    with _loading_lock:
+        if (model, allow_downloads) in _loading:
+            return
+        _loading.add((model, allow_downloads))
+
+    def load() -> None:
+        try:
+            _local(allow_downloads)._model_ref(model)
+        except Exception:  # noqa: BLE001
+            with _loading_lock:
+                _loading.discard((model, allow_downloads))
+
+    threading.Thread(target=load, name="gf-load", daemon=True).start()
 
 
 def _named(X: Any) -> bool:
@@ -65,6 +96,50 @@ def _named(X: Any) -> bool:
     return any(
         hasattr(X, name) for name in ("collect_schema", "column_names", "columns")
     )
+
+
+def _text(table: pa.Table) -> pa.Table:
+    """Decodes byte-string columns, as sklearn's dataset fetchers give text, to strings."""
+    for index, field in enumerate(table.schema):
+        if pa.types.is_binary(field.type) or pa.types.is_large_binary(field.type):
+            try:
+                values = pc.cast(table.column(index), pa.string())
+            except pa.ArrowInvalid:
+                raise ValueError(
+                    f"column {field.name!r} holds bytes that are not UTF-8 text"
+                ) from None
+            table = table.set_column(index, pa.field(field.name, pa.string()), values)
+    return table
+
+
+def _holds_text(X: Any) -> bool:
+    array = np.asarray(X)
+    if array.dtype.kind in "SU":
+        return True
+    return array.dtype.kind == "O" and any(
+        isinstance(value, (str, bytes)) for value in array.ravel()
+    )
+
+
+def _validated(estimator: BaseEstimator, X: Any, *args: Any, **options: Any) -> Any:
+    """Unnamed rows validated as sklearn does, as float32, which holds no text."""
+    try:
+        return validate_data(
+            estimator,
+            X,
+            *args,
+            dtype=np.float32,
+            order="C",
+            ensure_all_finite="allow-nan",
+            **options,
+        )
+    except ValueError as error:
+        if not _holds_text(X):
+            raise
+        raise ValueError(
+            f"{error}: an array is read as numbers, so pass text columns in a "
+            "pandas or polars frame or an Arrow table, which reads them as categorical"
+        ) from error
 
 
 def _drop(client: _TableClient, name: str) -> None:
@@ -94,6 +169,8 @@ class _Estimator(BaseEstimator):
         self.page_size = page_size
         self.backend = backend
         self.allow_downloads = allow_downloads
+        if client is None and backend is None and isinstance(model, str):
+            _load_soon(model, allow_downloads)
 
     def set_params(self, **params: Any) -> Any:
         """Updates constructor parameters and invalidates fitted context."""
@@ -120,20 +197,13 @@ class _Estimator(BaseEstimator):
             )
         kinds = getattr(self, "_kinds", None)
         if kinds is None:
-            return validate_data(
-                self,
-                X,
-                reset=False,
-                dtype=np.float32,
-                order="C",
-                ensure_all_finite="allow-nan",
-            )
+            return _validated(self, X, reset=False)
         if not _named(X):
             raise ValueError(
                 "this estimator was fit on a frame, so it predicts from frames "
                 f"with its columns: {list(kinds)}"
             )
-        table = to_arrow(X)
+        table = _text(to_arrow(X))
         if table.column_names != list(kinds):
             raise ValueError(
                 "feature names and order must match those passed during fit"
@@ -147,7 +217,7 @@ class _Estimator(BaseEstimator):
 
     def _typed_rows(self, X: Any, y: Any) -> tuple[Any, np.ndarray]:
         """A typed frame and its targets, with the fitted columns kept as sklearn keeps them."""
-        X = to_arrow(X)
+        X = _text(to_arrow(X))
         kinds = infer(X)
         targets = np.asarray(y)
         if targets.ndim != 1 or len(targets) != len(X):
@@ -354,9 +424,7 @@ class Classifier(ClassifierMixin, _Estimator):
         if _named(X):
             rows, y = self._typed_rows(X, y)
         else:
-            rows, y = validate_data(
-                self, X, y, dtype=np.float32, order="C", ensure_all_finite="allow-nan"
-            )
+            rows, y = _validated(self, X, y)
         if type_of_target(y) not in ("binary", "multiclass"):
             raise ValueError(f"Unknown label type: {type_of_target(y)}")
         self.classes_, codes = np.unique(np.asarray(y), return_inverse=True)
@@ -465,15 +533,7 @@ class Regressor(RegressorMixin, _Estimator):
         if _named(X):
             rows, y = self._typed_rows(X, y)
         else:
-            rows, y = validate_data(
-                self,
-                X,
-                y,
-                dtype=np.float32,
-                order="C",
-                ensure_all_finite="allow-nan",
-                y_numeric=True,
-            )
+            rows, y = _validated(self, X, y, y_numeric=True)
         rows = rows if isinstance(rows, pa.Table) else np.array(rows, copy=True)
         names = list(
             getattr(
