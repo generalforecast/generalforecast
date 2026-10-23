@@ -43,16 +43,17 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # Only the canonical versioned client is an executable wheel asset. The
-      # native extension and Python workers need no server/router executable.
+      # The versioned client is the wheel's executable beside Python; the
+      # server and router `gf serve` runs ride inside the package, off PATH.
       - if: runner.os == 'macOS'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - if: runner.os == 'macOS'
         run: |
-          cargo build --release --locked -p gf-cli --bin gf -p gf-server --bin gf-server
+          cargo build --release --locked -p gf-cli --bin gf -p gf-server --bin gf-server -p gf-router --bin gf-router
           mkdir -p wheel-data/scripts
           cp target/release/gf wheel-data/scripts/gf-native
-          cp target/release/gf-server wheel-data/scripts/gf-server
+          mkdir -p src/generalforecast/bin
+          cp target/release/gf-server target/release/gf-router src/generalforecast/bin/
           sed -i '' 's/^# data = "wheel-data"/data = "wheel-data"/' pyproject.toml
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
@@ -60,10 +61,11 @@ jobs:
           manylinux: "2_28"
           args: --release --locked --out dist
           before-script-linux: |
-            cargo build --release --locked -p gf-cli --bin gf -p gf-server --bin gf-server
+            cargo build --release --locked -p gf-cli --bin gf -p gf-server --bin gf-server -p gf-router --bin gf-router
             mkdir -p wheel-data/scripts
             cp target/release/gf wheel-data/scripts/gf-native
-            cp target/release/gf-server wheel-data/scripts/gf-server
+            mkdir -p src/generalforecast/bin
+            cp target/release/gf-server target/release/gf-router src/generalforecast/bin/
             sed -i 's/^# data = "wheel-data"/data = "wheel-data"/' pyproject.toml
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
@@ -74,8 +76,11 @@ jobs:
           uv pip install --python smoke/bin/python dist/*.whl
           smoke/bin/gf --help
           smoke/bin/gf-native --help
-          smoke/bin/gf-server --help
           smoke/bin/gf serve --help
+          for server in gf-server gf-router; do
+            test ! -e "smoke/bin/$server"
+            "$(smoke/bin/python -c "from generalforecast.serve.listener import binary; print(binary('$server'))")" --help
+          done
       # The README's example, end to end on the wheel's own engine.
       - name: Fit and predict with the wheel
         run: |

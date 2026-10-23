@@ -172,8 +172,8 @@ fn init(
     if starter.key_file.is_none() {
         steps.push("export GF_LOG_KEY=$(openssl rand -hex 32)".to_string());
     }
-    steps.push(format!("gf-server check --config {}", path.display()));
-    steps.push(format!("gf-server run --config {}", path.display()));
+    steps.push(format!("gf serve --check --config {}", path.display()));
+    steps.push(format!("gf serve --config {}", path.display()));
     for (index, step) in steps.iter().enumerate() {
         println!("{}{step}", if index == 0 { "next: " } else { "      " });
     }
@@ -350,7 +350,7 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
     tracing::info!(%address, tls = config.tls.is_some(), "serving");
     if let Some((front, url, _)) = &front {
         front.start(shards.clone(), routes.clone()).await?;
-        event(&serde_json::json!({"event": "ready", "url": url}));
+        ready(url);
     }
     let mut service = Service::new(shards.clone(), placement, metrics)
         .with_request_budget(config.request_bytes_in_flight)
@@ -395,9 +395,28 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
 }
 
 /// Writes one NDJSON event on stdout, as `gf serve` reports its progress.
+/// Says the Models API is up: a status line on a terminal, else a JSON event.
+fn ready(url: &str) {
+    if !std::io::stdout().is_terminal() {
+        event(&serde_json::json!({"event": "ready", "url": url}));
+        return;
+    }
+    let (verb, stop) = (format!("{:>12}", "Serving"), "(Ctrl-C to stop)");
+    if std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()) {
+        println!("\x1b[1;32m{verb}\x1b[0m {url} \x1b[2m{stop}\x1b[0m");
+    } else {
+        println!("{verb} {url} {stop}");
+    }
+}
+
+/// A JSON line for whatever launched this server; a person at a terminal
+/// gets the `ready` status line instead.
 fn event(value: &serde_json::Value) {
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();
+    if stdout.is_terminal() {
+        return;
+    }
     let _ = writeln!(stdout, "{value}");
     let _ = stdout.flush();
 }
