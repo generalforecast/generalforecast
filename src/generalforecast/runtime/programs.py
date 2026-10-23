@@ -191,6 +191,11 @@ def abstract(signature: Signature, count: int | None = None) -> Any:
     )
 
 
+def most_rows(signature: Signature) -> int:
+    """The longest first axis of a signature's leaves: a table's rows, for a call reading one."""
+    return max((shape[0] for shape, _, _ in signature[1] if shape), default=0)
+
+
 def zeros(tree: Any) -> Any | None:
     """Zeros of each leaf's shape, dtype and weak type, for a tree of shapes; None if a leaf is a value."""
     leaves, structure = jax.tree.flatten(tree)
