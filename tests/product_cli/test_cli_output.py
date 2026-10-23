@@ -3,6 +3,7 @@
 
 """Human output, device-code login and error presentation of the gf command."""
 
+import argparse
 import io
 import json
 import os
@@ -481,3 +482,31 @@ def test_unknown_gf_yaml_field_points_at_the_line(tmp_path, monkeypatch):
     assert problem.hints == ["did you mean `target`?"]
     assert problem.pointer is not None
     assert problem.pointer[1:] == (3, 1, "traget: y", "unknown field", 6)
+
+
+def test_auth_status_shows_who_and_not_the_servers_setup():
+    from generalforecast import render
+
+    out = io.StringIO()
+    status = {
+        "authenticated": True,
+        "principal": {"kind": "api-key", "id": "key_1", "project": "acme"},
+        "email": "alice@acme.com",
+        "workspace": {"id": "ws_1", "display_name": "Acme"},
+        "key": {"id": "key_1", "name": "gf CLI on box", "project": "acme"},
+        "machine": "box",
+        "google": "configured",
+        "sign_in": ["google"],
+        "capabilities": ["a"],
+        "permission_inventory": [{}],
+        "bootstrap": "available",
+    }
+    args = argparse.Namespace(group="auth", command="status")
+    render.render(args, status, term.Output(out=out, environ={}), 0.0)
+    assert out.getvalue().splitlines() == [
+        "alice@acme.com",
+        "  workspace Acme (ws_1)",
+        "  project   acme",
+        "  key       gf CLI on box",
+        "  machine   box",
+    ]
