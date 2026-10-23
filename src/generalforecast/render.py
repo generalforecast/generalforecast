@@ -69,6 +69,31 @@ def _whoami(args: Any, result: dict, out: Output, elapsed: float) -> None:
     )
 
 
+def _auth(args: Any, result: dict, out: Output, elapsed: float) -> None:
+    key, workspace = result.get("key") or {}, result.get("workspace")
+    if not result.get("authenticated"):
+        out.line("not authenticated")
+        return
+    out.line(result.get("email") or f"API key {key.get('name') or key.get('id')}")
+    expires = date(key.get("expires_at"))
+    name = key.get("name") or key.get("id")
+    out.fields(
+        [
+            (
+                "workspace",
+                workspace and f"{workspace['display_name']} ({workspace['id']})",
+            ),
+            (
+                "project",
+                key.get("project") or (result.get("principal") or {}).get("project"),
+            ),
+            ("key", f"{name} (expires {expires})" if name and expires else name),
+            ("machine", result.get("machine")),
+        ],
+        indent=2,
+    )
+
+
 def _init(args: Any, result: dict, out: Output, elapsed: float) -> None:
     directory = args.directory if args is not None else result["name"]
     shown = directory if directory.startswith(("/", ".", "~")) else f"./{directory}"
@@ -293,6 +318,7 @@ _HANDLERS = {
     "login": _none,
     "logout": _none,
     "whoami": _whoami,
+    "auth": _auth,
     "init": _init,
     "check": _check,
     "serve": _serve,
