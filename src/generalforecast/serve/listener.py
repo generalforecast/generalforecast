@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The `gf serve` command line: writes gf-server's configuration, then runs it.
+"""The `gf serve` command line: writes a server's configuration, then runs it.
 
 gf-server answers the Models API itself, batching concurrent requests'
 queries into shared steps on one worker per device; this process only
-checks the target, writes the configuration and becomes the server.
+checks the target, writes the configuration and becomes the server. With
+`--node`s it becomes gf-router instead, which places live tables on those
+nodes, and `--config` runs either from a file.
 """
 
 import argparse
@@ -13,19 +15,29 @@ import json
 import os
 import secrets
 import shutil
+import subprocess
 import sys
 import sysconfig
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
-from typing import NoReturn
+from typing import TYPE_CHECKING, NoReturn
 
 from generalforecast.deployments.contracts import ServiceError, require
 from generalforecast.packages.validation import PackageError
 
+if TYPE_CHECKING:
+    from generalforecast.term import Output
+
 API_KEY_ENV = "GF_API_KEY"
+CLIENT_TOKEN_ENV = "GF_TOKEN"
+REPLICATION_TOKEN_ENV = "GF_REPLICATION_TOKEN"
 DEFAULT_PORT = 8000
+TABLE_PORT = 8815
 SERVER = "gf-server"
+ROUTER = "gf-router"
+# Release wheels carry the servers here, off PATH, so `gf` is the one command.
+BIN = Path(__file__).resolve().parents[1] / "bin"
 
 
 def add_arguments(parser: argparse.ArgumentParser) -> None:
@@ -36,32 +48,104 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=".",
         help="Package directory, gf.lock file or catalog model reference",
     )
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    parser.add_argument(
+        "--host", default="127.0.0.1", help="Address to listen on (default: 127.0.0.1)"
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        help=f"Port (default: {DEFAULT_PORT}; {TABLE_PORT} with --node or --init)",
+    )
     parser.add_argument(
         "--offline",
         action="store_true",
         help="Use only cached model weights; never download",
     )
-    parser.add_argument("--request-timeout", type=float, default=60.0)
+    parser.add_argument(
+        "--request-timeout",
+        type=float,
+        default=60.0,
+        metavar="<SECONDS>",
+        help="Longest a Models API request may run (default: 60)",
+    )
     parser.add_argument(
         "--upstream",
+        metavar="<URL>",
         help="Origin, such as http://127.0.0.1:8001, that every route the "
         "Models API does not own streams to",
     )
+    parser.add_argument(
+        "--node",
+        action="append",
+        metavar="<ADDRESS>",
+        help="Route live tables across this gf node, such as http://10.0.0.2:8815; "
+        f"repeat for each. Takes the tokens from {CLIENT_TOKEN_ENV} and "
+        f"{REPLICATION_TOKEN_ENV}",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        metavar="<FILE>",
+        help="Serve a node or router configuration file instead of a target",
+    )
+    parser.add_argument(
+        "--init",
+        type=Path,
+        metavar="<FILE>",
+        help="Write a starter node configuration, or a router's with --node, and exit",
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="Let --init overwrite an existing file"
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Check the target, configuration or nodes without serving",
+    )
 
 
-def binary() -> Path:
-    """The gf-server the wheel installs beside Python, or the first on PATH."""
-    installed = Path(sysconfig.get_path("scripts")) / SERVER
-    if installed.is_file():
-        return installed
-    found = shutil.which(SERVER)
+def binary(name: str = SERVER) -> Path:
+    """One of the servers the wheel carries inside the package, else the first on PATH.
+
+    Images and older wheels install them beside Python instead.
+    """
+    for directory in (BIN, Path(sysconfig.get_path("scripts"))):
+        if (directory / name).is_file():
+            return directory / name
+    found = shutil.which(name)
     if found is None:
         raise ServiceError(
-            "ConfigurationError", "gf-server is not installed beside gf", 503
+            "ConfigurationError",
+            f"{name} is not installed with gf; reinstall generalforecast",
+            503,
         )
     return Path(found)
+
+
+def _become(
+    name: str, *arguments: str, environment: Mapping[str, str] | None = None
+) -> NoReturn:
+    """Replaces this process with one of the servers, so signals reach it directly."""
+    program = binary(name)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    environ = dict(os.environ if environment is None else environment)
+    os.execve(program, [str(program), *arguments], environ)
+
+
+def _routes(config: Path) -> bool:
+    """Whether a configuration file is a router's, which lists its `[[nodes]]`."""
+    import tomllib
+
+    try:
+        with config.open("rb") as file:
+            return "nodes" in tomllib.load(file)
+    except FileNotFoundError:
+        raise ServiceError("NotFound", f"{config} does not exist", 404) from None
+    except tomllib.TOMLDecodeError as error:
+        raise ServiceError(
+            "ConfigurationError", f"{config} is not valid TOML: {error}", 400
+        ) from None
 
 
 def _toml(value: object) -> str:
@@ -138,24 +222,153 @@ def configuration(
     )
 
 
-def run(args: argparse.Namespace) -> NoReturn:
+def run(args: argparse.Namespace) -> dict:
+    """Serves the target, a configuration file or a router over `--node`s.
+
+    Each mode checks what it can, then execs gf-server or gf-router in this
+    process; `--check` and `--init` stop before serving.
+    """
+    nodes = args.node or []
+    require(1 <= len(args.host) <= 255, "invalid host")
+    require(
+        args.port is None or (type(args.port) is int and 0 <= args.port <= 65535),
+        "invalid port",
+    )
+    require(
+        0 < args.request_timeout <= 3600, "request timeout must be within (0, 3600]"
+    )
+    require(args.init is None or not args.check, "--init and --check do not combine")
+    require(args.force is False or args.init is not None, "--force goes with --init")
+    if args.config is not None or args.init is not None:
+        require(
+            args.config is None or args.init is None,
+            "--config and --init do not combine",
+        )
+        require(
+            args.target == ".",
+            "a configuration file names its own models; drop the target",
+        )
+        require(
+            args.upstream is None, "--upstream goes in the configuration's [http] table"
+        )
+    if args.config is not None:
+        require(
+            not nodes, "a router configuration lists its own [[nodes]]; drop --node"
+        )
+        name = ROUTER if _routes(args.config) else SERVER
+        _become(name, "check" if args.check else "run", "--config", str(args.config))
+    if args.init is not None:
+        listen = _address(args.host, TABLE_PORT if args.port is None else args.port)
+        force = ["--force"] if args.force else []
+        if nodes:
+            _become(
+                ROUTER,
+                "init",
+                "--path",
+                str(args.init),
+                "--listen",
+                listen,
+                *_nodes(nodes),
+                *force,
+            )
+        _become(
+            SERVER,
+            "init",
+            "--path",
+            str(args.init),
+            "--listen",
+            listen,
+            "--python",
+            sys.executable,
+            *force,
+        )
+    if nodes:
+        return _route(args, nodes)
+    return _serve(args)
+
+
+def _address(host: str, port: int) -> str:
+    return f"{f'[{host}]' if ':' in host else host}:{port}"
+
+
+def _nodes(nodes: list[str]) -> list[str]:
+    return [part for node in nodes for part in ("--node", node)]
+
+
+def _output(args: argparse.Namespace) -> "Output":
+    from generalforecast.term import Output
+
+    return Output(quiet=getattr(args, "quiet", False) or getattr(args, "json", False))
+
+
+def _route(args: argparse.Namespace, nodes: list[str]) -> dict:
+    """Writes a router configuration over `nodes`, then checks it or becomes the router.
+
+    The nodes already list the replication token, so both tokens come from
+    the environment rather than being made up here.
+    """
+    require(
+        args.target == ".", "a router serves tables, not a target; drop it or --node"
+    )
+    require(
+        args.upstream is None, "--upstream is for the Models API; drop it or --node"
+    )
+    missing = [
+        v for v in (CLIENT_TOKEN_ENV, REPLICATION_TOKEN_ENV) if not os.environ.get(v)
+    ]
+    if missing:
+        raise ServiceError(
+            "ConfigurationError",
+            f"set {' and '.join(missing)}: clients present {CLIENT_TOKEN_ENV}, and each "
+            f"node lists {REPLICATION_TOKEN_ENV} in its replication_tokens",
+            400,
+        )
+    directory = Path(tempfile.mkdtemp(prefix=f"gf-{os.getpid()}-"))
+    config = directory / "router.toml"
+    listen = _address(args.host, TABLE_PORT if args.port is None else args.port)
+    written = subprocess.run(
+        [
+            str(binary(ROUTER)),
+            "init",
+            "--path",
+            str(config),
+            "--listen",
+            listen,
+            *_nodes(nodes),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if written.returncode != 0:
+        raise ServiceError(
+            "ConfigurationError", written.stderr.strip() or "gf-router init failed", 400
+        )
+    if not args.check:
+        _output(args).verb(
+            "Routing",
+            f"tables on {listen}",
+            f"across {len(nodes)} node{'s' * (len(nodes) != 1)}",
+        )
+    _become(ROUTER, "check" if args.check else "run", "--config", str(config))
+
+
+def _serve(args: argparse.Namespace) -> dict:
     """Checks the target and its weights, then execs gf-server in this process.
 
     The configuration goes to a private directory named for this process,
     which a later server removes once this one has exited.
     """
-    require(1 <= len(args.host) <= 255, "invalid host")
-    require(type(args.port) is int and 0 <= args.port <= 65535, "invalid port")
-    require(
-        0 < args.request_timeout <= 3600, "request timeout must be within (0, 3600]"
-    )
     from generalforecast.serve.models import served
 
     directory = Path(tempfile.mkdtemp(prefix=f"gf-{os.getpid()}-"))
     model = served(args.target, directory, allow_downloads=not args.offline)
     server = binary()
+    if args.check:
+        shutil.rmtree(directory, ignore_errors=True)
+        return {"target": args.target, "model": model["name"], "server": str(server)}
     (directory / "models.json").write_text(json.dumps([model]))
-    host = f"[{args.host}]" if ":" in args.host else args.host
+    address = _address(args.host, DEFAULT_PORT if args.port is None else args.port)
     config = directory / "generalforecast.toml"
     # The configuration holds the Flight token, so only this user reads it.
     descriptor = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -163,7 +376,7 @@ def run(args: argparse.Namespace) -> NoReturn:
         file.write(
             configuration(
                 directory,
-                f"{host}:{args.port}",
+                address,
                 args.request_timeout,
                 [model],
                 upstream=args.upstream,
@@ -172,8 +385,8 @@ def run(args: argparse.Namespace) -> NoReturn:
     environment = dict(os.environ, GF_LOG_KEY=secrets.token_hex(32))
     if args.offline:
         environment["HF_HUB_OFFLINE"] = "1"
-    sys.stdout.flush()
-    os.execve(server, [str(server), "run", "--config", str(config)], environment)
+    _output(args).verb("Starting", f"{model['name']} on http://{address}")
+    _become(SERVER, "run", "--config", str(config), environment=environment)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -184,7 +397,7 @@ def main(argv: list[str] | None = None) -> None:
     add_arguments(parser)
     args = parser.parse_args(argv)
     try:
-        run(args)
+        result = run(args)
     except (ServiceError, PackageError) as error:
         print(
             json.dumps({"error": {"code": error.code, "message": str(error)}}),
@@ -192,3 +405,4 @@ def main(argv: list[str] | None = None) -> None:
             flush=True,
         )
         raise SystemExit(1) from None
+    print(json.dumps(result), flush=True)
