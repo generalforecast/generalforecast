@@ -44,6 +44,8 @@ from generalforecast.constants import (
     MEASURED_ROWS,
     SCATTER_ROWS,
     SCATTER_THREADS,
+    TABLE_STAGES,
+    WARM_RUN_ROWS,
     WARMED_PAGES,
     WARMED_QUERIES,
 )
@@ -118,6 +120,7 @@ from generalforecast.runtime.programs import (
     abstract,
     counts_up_to,
     ladder,
+    most_rows,
     zeros,
 )
 from generalforecast.runtime.programs import (
@@ -647,9 +650,14 @@ class Worker:
                         shared = self._shared(program, kind, items)
                         function.lower(parameters, *shared, *items).compile()
                         # A program's first run sets it up on the device, which
-                        # would otherwise slow the first step that calls it.
+                        # would otherwise slow the first step that calls it. One
+                        # reading a large table takes as long on zeros as the
+                        # call it would speed up, so only compiles.
                         inputs = zeros((shared, items))
-                        if inputs is not None:
+                        if inputs is not None and (
+                            kind.program[0] not in TABLE_STAGES
+                            or most_rows(kind.item) <= WARM_RUN_ROWS
+                        ):
                             jax.block_until_ready(
                                 function(parameters, *inputs[0], *inputs[1])
                             )
