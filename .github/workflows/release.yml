@@ -128,3 +128,47 @@ jobs:
           merge-multiple: true
           path: dist
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+
+  # Each released model's programs compiled for each platform, signed, beside
+  # the weights on Hugging Face, so a fresh machine's first call starts warm.
+  # Bundles are keyed by the traced code and JAX, so a release that changes
+  # neither finds its bundles already there and builds nothing.
+  compiled:
+    needs: wheels
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.8.0"
+      - name: Compile and sign the programs
+        env:
+          GF_COMPILED_SIGNING_KEY: ${{ secrets.GF_COMPILED_SIGNING_KEY }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          uv venv --python 3.12 compiled
+          uv pip install --python compiled/bin/python "$(ls dist/*.whl)[sklearn]"
+          compiled/bin/python -m generalforecast.runtime.shipped bundles
+      - if: startsWith(github.ref, 'refs/tags/v') && hashFiles('bundles/**') != ''
+        name: Upload the bundles
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          compiled/bin/hf upload general-forecast/compiled bundles . \
+            --commit-message "$GITHUB_REF_NAME ${{ matrix.target }}"
