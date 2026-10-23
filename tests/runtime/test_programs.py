@@ -18,6 +18,7 @@ from generalforecast.runtime.programs import (
     abstract,
     counts_up_to,
     ladder,
+    most_rows,
     signature,
     zeros,
 )
@@ -259,3 +260,9 @@ def test_programs_drop_at_a_new_shape_when_mappings_are_short() -> None:
     programs.add_shape(1)
     assert programs.drops == 1
     assert mine._cache_size() == 0
+
+
+def test_most_rows_is_a_signatures_longest_first_axis() -> None:
+    table = (jnp.zeros((16384, 31)), jnp.zeros(16384, jnp.int32), 3)
+    assert most_rows(signature(table)) == 16384
+    assert most_rows(signature((jnp.float32(1),))) == 0
