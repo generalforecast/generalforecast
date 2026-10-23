@@ -297,10 +297,17 @@ def paged_inputs(
         blocks[position, block_at:] = blocks[position, 0]
         if shape.masked and decoding.reads is not None:
             reads[position, : len(decoding.queries)] = False
-            for query, member in enumerate(decoding.reads):
+            members = np.asarray(decoding.reads)
+            # Queries come grouped by the context they read, so a few runs
+            # of them cover every query.
+            edges = np.flatnonzero(members[1:] != members[:-1]) + 1
+            for first, stop in zip(
+                np.r_[0, edges], np.r_[edges, len(members)], strict=True
+            ):
+                member = members[first]
                 start = starts[member]
                 end = start + decoding.contexts[member].rows
-                reads[position, query, start:end] = True
+                reads[position, first:stop, start:end] = True
     # Padding decodings read the first one's blocks, for the same reason.
     blocks[len(chunk) :] = blocks[0]
     inputs = (index, blocks, positions, counts, rows)

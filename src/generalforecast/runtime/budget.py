@@ -9,12 +9,10 @@ from typing import Any, cast
 
 import jax
 
+from generalforecast.constants import LOCAL_DEVICE_TIER
 from generalforecast.runtime.device import available_memory, device_memory, host_memory
 from generalforecast.runtime.memory import tree_bytes
 from generalforecast.runtime.shapes import bucket_size
-
-# The most device memory a local client keeps contexts in by default.
-LOCAL_DEVICE_TIER = 4 << 30
 
 
 @dataclass(frozen=True)

@@ -10,8 +10,8 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
+from generalforecast.constants import RECORDED_KINDS
 from generalforecast.runtime.programs import (
-    RECORDED_KINDS,
     Kind,
     Manifest,
     Programs,
@@ -19,6 +19,7 @@ from generalforecast.runtime.programs import (
     counts_up_to,
     ladder,
     signature,
+    zeros,
 )
 
 
@@ -172,3 +173,89 @@ def test_an_unreadable_manifest_reads_as_empty(tmp_path) -> None:
     (tmp_path / "model.pickle").write_bytes(b"not a manifest")
 
     assert Manifest(tmp_path / "model.pickle").read().kinds == {}
+
+
+def test_measures_are_kept_for_later_processes(tmp_path) -> None:
+    taken: list[str] = []
+
+    def measure(value: Any) -> Any:
+        taken.append(value)
+        return value
+
+    first = Programs(None, lambda: False, ahead=False, manifests=tmp_path)
+    assert first.measured("model", ("width", 8), lambda: measure(1)) == 1
+    assert first.measured("model", ("width", 8), lambda: measure(2)) == 1
+    assert first.measured("model", ("encode", 8), lambda: measure(None)) is None
+    later = Programs(None, lambda: False, ahead=False, manifests=tmp_path)
+
+    assert later.measured("model", ("width", 8), lambda: measure(3)) == 1
+    assert later.measured("model", ("encode", 8), lambda: measure(4)) is None
+    assert later.measured("other", ("width", 8), lambda: measure(5)) == 5
+    assert taken == [1, None, 5]
+    assert (
+        Programs(None, lambda: False, ahead=False).measured(
+            "model", ("width", 8), lambda: measure(6)
+        )
+        == 6
+    )
+
+
+def test_zeros_keep_each_leaf_s_shape_dtype_and_weak_type() -> None:
+    tree = (
+        jax.ShapeDtypeStruct((2, 3), jnp.float32),
+        jax.ShapeDtypeStruct((1,), jnp.int32, weak_type=True),
+    )
+
+    made = zeros(tree)
+
+    assert made is not None
+    assert [(leaf.shape, leaf.dtype) for leaf in made] == [
+        ((2, 3), jnp.float32),
+        ((1,), jnp.int32),
+    ]
+    assert signature(made) == signature(tree)
+    assert zeros((jnp.zeros(2),)) is None
+
+
+def test_recorded_values_round_trip_through_json_naming_only_this_package_s_types() -> (
+    None
+):
+    import json
+
+    import numpy as np
+    import pytest
+
+    from generalforecast.models.prepare import Columns
+    from generalforecast.runtime.programs import Kind, Recorded, decoded, encoded
+
+    tree = (jax.ShapeDtypeStruct((2, 3), jnp.float32), None, {"a": np.int64(3)})
+    kind = Kind(("fit", None, 2), signature(tree), signature([Columns]))
+    recorded = Recorded({kind: {1, 4}}, {("width", 10): None})
+
+    back = decoded(json.loads(json.dumps(encoded(recorded))))
+
+    assert back == recorded
+    assert hash(next(iter(back.kinds))) == hash(kind)
+    assert decoded(encoded(np.dtype("float32"))) == np.dtype("float32")
+    with pytest.raises(ValueError):
+        decoded({"class": "os:system", "items": []})
+    with pytest.raises(TypeError):
+        encoded(object())
+
+
+def test_programs_drop_at_a_new_shape_when_mappings_are_short() -> None:
+    mappings = [False]
+    mine = jax.jit(lambda values: values + 1)
+    programs = Programs(
+        None, lambda: False, [mine], short_of_mappings=lambda: mappings[0]
+    )
+    programs.add_shape(0)
+    mine(jnp.ones(3))
+    mappings[0] = True
+    programs.add_shape(0)
+    assert programs.drops == 0
+
+    # Short of mappings, even one more shape drops them, whatever memory is free.
+    programs.add_shape(1)
+    assert programs.drops == 1
+    assert mine._cache_size() == 0

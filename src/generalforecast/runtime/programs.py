@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 import fcntl
 import hashlib
+import importlib
+import json
 import logging
 import os
-import pickle
 import threading
 import time
 from collections.abc import Callable, Hashable, Iterable, Iterator
@@ -18,32 +20,9 @@ from typing import Any, cast
 import jax
 import numpy as np
 
+from generalforecast.constants import COMPILED_SHAPES, RECORDED_KINDS, WARM_QUIET
 from generalforecast.runtime.device import DeviceSettings, with_precision
-
-# Table shapes, a model, task and width each, a worker keeps compiled programs
-# for while memory is short. JAX keeps every program it compiles, about 200 MiB
-# of host memory a shape on a GPU, so a worker past this many, short of memory
-# by its budget, drops them all; those still used compile again, which with
-# many widths costs far more than the memory, so plenty keeps them.
-COMPILED_SHAPES = 32
-
-# Page counts a table's embeds compile for once it is fit, this many buckets
-# from one page: a write changes one page or a few.
-WARMED_PAGES = 4
-# Query counts a table's query embeds and decodes compile for once it has
-# decoded, this many buckets above the smallest: steps merging many callers'
-# requests reach them.
-WARMED_QUERIES = 5
-# The stacked counts an accelerator's fused calls take, each its own program
-# that compiles for tens of seconds: a step's new contexts pad up to one, or
-# split across the most, rather than compile for every power of two.
-FUSED_STACKS = (1, 4, 16, 64)
-# Seconds a worker goes without a step before compiling ahead. A caller sending
-# steps back to back would otherwise meet a compile in each of its next steps.
-WARM_QUIET = 0.5
-# Kinds of call a model's manifest keeps, the latest used last: each table
-# shape compiles about a kind per stage, so this keeps `COMPILED_SHAPES`'s.
-RECORDED_KINDS = 8 * COMPILED_SHAPES
+from generalforecast.system import mappings_short
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +56,128 @@ def signature(tree: Any, stacked: bool = False) -> Signature:
     )
 
 
+# The types a manifest's JSON may name beside this package's own.
+_BUILTIN_TYPES = {
+    f"builtins:{kind.__qualname__}": kind for kind in (tuple, list, dict, type(None))
+}
+
+
+def _type_name(kind: type) -> str:
+    return f"{kind.__module__}:{kind.__qualname__}"
+
+
+def _named_type(name: str) -> type:
+    """A type a manifest names: a builtin container or one of this package's, never another module's."""
+    if name in _BUILTIN_TYPES:
+        return _BUILTIN_TYPES[name]
+    module, _, qualname = name.partition(":")
+    if module.split(".")[0] != "generalforecast" or module == "builtins":
+        raise ValueError(f"a manifest may not name {name}")
+    found: Any = importlib.import_module(module)
+    for part in qualname.split("."):
+        found = getattr(found, part)
+    if not isinstance(found, type):
+        raise TypeError(f"{name} is not a type")
+    return found
+
+
+def encoded(value: Any) -> Any:
+    """A recorded value as JSON: containers, dtypes, shapes, tree structures and this package's dataclasses and named tuples.
+
+    Raises:
+        TypeError: For a value of another type.
+    """
+    if value is None or isinstance(value, bool | int | float | str):
+        return value
+    if isinstance(value, np.bool_ | np.integer | np.floating):
+        return value.item()
+    if isinstance(value, np.dtype):
+        return {"dtype": value.str}
+    if isinstance(value, jax.ShapeDtypeStruct):
+        return {
+            "shape": list(value.shape),
+            "dtype": np.dtype(value.dtype).str,
+            "weak": bool(value.weak_type),
+        }
+    if isinstance(value, jax.tree_util.PyTreeDef):
+        return {"tree": _encoded_tree(value)}
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        fields = dataclasses.fields(value)
+        return {
+            "class": _type_name(type(value)),
+            "fields": {
+                field.name: encoded(getattr(value, field.name)) for field in fields
+            },
+        }
+    if isinstance(value, tuple) and type(value) is not tuple:
+        return {
+            "class": _type_name(type(value)),
+            "items": [encoded(item) for item in value],
+        }
+    if isinstance(value, tuple):
+        return {"tuple": [encoded(item) for item in value]}
+    if isinstance(value, list):
+        return [encoded(item) for item in value]
+    if isinstance(value, set | frozenset):
+        return {"set": [encoded(item) for item in value]}
+    if isinstance(value, dict):
+        return {"dict": [[encoded(key), encoded(item)] for key, item in value.items()]}
+    raise TypeError(f"a manifest cannot hold a {type(value).__name__}")
+
+
+def decoded(value: Any) -> Any:
+    """The value `encoded` wrote.
+
+    Raises:
+        ValueError: If it names a type outside this package and builtin containers.
+    """
+    if isinstance(value, list):
+        return [decoded(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    if "shape" in value:
+        return jax.ShapeDtypeStruct(
+            tuple(value["shape"]), np.dtype(value["dtype"]), weak_type=value["weak"]
+        )
+    if "dtype" in value:
+        return np.dtype(value["dtype"])
+    if "tree" in value:
+        return _decoded_tree(value["tree"])
+    if "tuple" in value:
+        return tuple(decoded(item) for item in value["tuple"])
+    if "set" in value:
+        return {decoded(item) for item in value["set"]}
+    if "dict" in value:
+        return {decoded(key): decoded(item) for key, item in value["dict"]}
+    kind = _named_type(value["class"])
+    if "items" in value:
+        return kind(*(decoded(item) for item in value["items"]))
+    return kind(**{name: decoded(item) for name, item in value["fields"].items()})
+
+
+def _encoded_tree(tree: Any) -> Any:
+    data = tree.node_data()
+    if data is None:
+        return None
+    kind, aux = data
+    return [
+        _type_name(kind),
+        encoded(aux),
+        [_encoded_tree(child) for child in tree.children()],
+    ]
+
+
+def _decoded_tree(node: Any) -> Any:
+    if node is None:
+        return jax.tree.structure(0)
+    name, aux, children = node
+    return jax.tree_util.PyTreeDef.from_node_data_and_children(
+        jax.tree_util.default_registry,
+        (_named_type(name), decoded(aux)),
+        [_decoded_tree(child) for child in children],
+    )
+
+
 def abstract(signature: Signature, count: int | None = None) -> Any:
     """The tree a signature describes, of shapes and dtypes, each leaf stacked `count` times if given."""
     structure, leaves = signature
@@ -88,6 +189,23 @@ def abstract(signature: Signature, count: int | None = None) -> Any:
             for shape, dtype, weak in leaves
         ],
     )
+
+
+def zeros(tree: Any) -> Any | None:
+    """Zeros of each leaf's shape, dtype and weak type, for a tree of shapes; None if a leaf is a value."""
+    leaves, structure = jax.tree.flatten(tree)
+    if not all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in leaves):
+        return None
+
+    def zero(leaf: jax.ShapeDtypeStruct) -> Any:
+        if leaf.weak_type:
+            # Only a Python scalar makes a weakly typed array.
+            weak = jax.lax.full(leaf.shape, np.dtype(leaf.dtype).type(0).item())
+            if weak.dtype == leaf.dtype:
+                return weak
+        return np.zeros(leaf.shape, leaf.dtype)
+
+    return jax.tree.unflatten(structure, [zero(leaf) for leaf in leaves])
 
 
 @dataclass(frozen=True)
@@ -134,8 +252,8 @@ class Manifest:
     def read(self) -> Recorded:
         """What is recorded."""
         try:
-            with open(self.path, "rb") as file:
-                recorded = pickle.load(file)
+            with open(self.path) as file:
+                recorded = decoded(json.load(file))
         except FileNotFoundError:
             return Recorded({}, {})
         except Exception:  # noqa: BLE001
@@ -166,6 +284,38 @@ class Manifest:
 
         self._update(added)
 
+    def measured(self) -> dict[Hashable, Any]:
+        """The measures kept beside the manifest, by key; empty if none can be read."""
+        try:
+            with open(self._measures) as file:
+                kept = decoded(json.load(file))
+        except FileNotFoundError:
+            return {}
+        except Exception:  # noqa: BLE001
+            logger.warning("ignoring unreadable measures %s", self._measures)
+            return {}
+        return kept if isinstance(kept, dict) else {}
+
+    def keep_measured(self, key: Hashable, value: Any) -> None:
+        """Keeps a measure beside the manifest, with those other workers kept."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.path.with_suffix(".lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            kept = self.measured()
+            kept[key] = value
+            try:
+                text = json.dumps(encoded(kept))
+            except TypeError:
+                logger.warning("not keeping a measure JSON cannot hold: %r", key)
+                return
+            part = self._measures.with_suffix(f".{os.getpid()}.part")
+            part.write_text(text)
+            os.replace(part, self._measures)
+
+    @property
+    def _measures(self) -> Path:
+        return self.path.with_suffix(".measures")
+
     def _update(self, change: Callable[[Recorded], None]) -> None:
         """Reads, changes and rewrites the file, under its lock."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -174,8 +324,7 @@ class Manifest:
             recorded = self.read()
             change(recorded)
             part = self.path.with_suffix(f".{os.getpid()}.part")
-            with open(part, "wb") as file:
-                pickle.dump(recorded, file)
+            part.write_text(json.dumps(encoded(recorded)))
             os.replace(part, self.path)
 
 
@@ -197,6 +346,7 @@ class Programs:
         clock: Callable[[], float] = time.monotonic,
         ahead: bool = True,
         manifests: Path | None = None,
+        short_of_mappings: Callable[[], bool] = mappings_short,
     ) -> None:
         """Sets up with nothing compiled.
 
@@ -209,9 +359,12 @@ class Programs:
                 compiles in the step that first calls it.
             manifests: A directory for each model's `Manifest`, which the
                 kinds of call it compiles for are recorded in, if any.
+            short_of_mappings: Whether the process holds most of the memory
+                mappings it may, asked at each new shape.
         """
         self._settings = settings
         self._short_of_memory = short_of_memory
+        self._short_of_mappings = short_of_mappings
         self._helpers = tuple(helpers)
         self._clock = clock
         self._ahead = ahead
@@ -237,6 +390,8 @@ class Programs:
         self._manifests = manifests
         # Kinds and counts recorded by this process, which need no rewrite.
         self._recorded: set[tuple[str, Hashable, int]] = set()
+        # Each model's measures, by spec and key, as read from its manifest.
+        self._measures: dict[str, dict[Hashable, Any]] = {}
         # Programs compiled at start, and their seconds.
         self.warmed = 0
         self.warm_seconds = 0.0
@@ -269,7 +424,7 @@ class Programs:
         if self._manifests is None:
             return None
         digest = hashlib.sha256(model.encode()).hexdigest()[:32]
-        return Manifest(self._manifests / f"{digest}.pickle")
+        return Manifest(self._manifests / f"{digest}.json")
 
     def remember(self, model: str, kind: Kind, count: int) -> None:
         """Records that a model's kind of call compiled for `count` items, for later processes to compile at start."""
@@ -293,17 +448,43 @@ class Programs:
         except OSError as error:
             logger.warning("cannot record a measure: %s", error)
 
+    def measured(self, model: str, key: Hashable, measure: Callable[[], Any]) -> Any:
+        """What `measure` returns for a model's `key`, kept on disk for later processes.
+
+        Measures follow from the model, its shapes and the device alone, so a
+        later process reads them rather than compiling programs to take them
+        again. Without manifests, `measure` runs each time.
+        """
+        manifest = self.manifest(model)
+        if manifest is None:
+            return measure()
+        with self._lock:
+            kept = self._measures.get(model)
+        if kept is None:
+            kept = manifest.measured()
+            with self._lock:
+                kept = self._measures.setdefault(model, kept)
+        if key in kept:
+            return kept[key]
+        value = measure()
+        with self._lock:
+            kept[key] = value
+        try:
+            manifest.keep_measured(key, value)
+        except OSError as error:
+            logger.warning("cannot keep a measure: %s", error)
+        return value
+
     def recorded(self, model: str) -> Recorded:
         """What a model compiled for and served in earlier processes."""
         manifest = self.manifest(model)
         return Recorded({}, {}) if manifest is None else manifest.read()
 
     def add_shape(self, shape: Hashable) -> None:
-        """Counts a table shape, dropping every program first if memory is short past `limit`."""
-        if (
-            shape not in self._shapes
-            and len(self._shapes) >= self.limit
-            and self._short_of_memory()
+        """Counts a table shape, dropping every program first if memory is short past `limit`, or mappings are."""
+        if shape not in self._shapes and (
+            self._short_of_mappings()
+            or (len(self._shapes) >= self.limit and self._short_of_memory())
         ):
             self.drop()
         self._shapes.add(shape)
