@@ -241,3 +241,21 @@ def test_recorded_values_round_trip_through_json_naming_only_this_package_s_type
         decoded({"class": "os:system", "items": []})
     with pytest.raises(TypeError):
         encoded(object())
+
+
+def test_programs_drop_at_a_new_shape_when_mappings_are_short() -> None:
+    mappings = [False]
+    mine = jax.jit(lambda values: values + 1)
+    programs = Programs(
+        None, lambda: False, [mine], short_of_mappings=lambda: mappings[0]
+    )
+    programs.add_shape(0)
+    mine(jnp.ones(3))
+    mappings[0] = True
+    programs.add_shape(0)
+    assert programs.drops == 0
+
+    # Short of mappings, even one more shape drops them, whatever memory is free.
+    programs.add_shape(1)
+    assert programs.drops == 1
+    assert mine._cache_size() == 0

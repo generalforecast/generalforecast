@@ -65,6 +65,10 @@ MIN_FIT_ROWS = 4096
 # by its budget, drops them all; those still used compile again, which with
 # many widths costs far more than the memory, so plenty keeps them.
 COMPILED_SHAPES = 32
+# The share of Linux's memory mappings a process may hold before its worker
+# drops its programs whatever their count: one worker compiling many shapes
+# maps code for each, and a compile past the cap fails.
+MAPPINGS_SHORT = 3 / 4
 # Page counts a table's embeds compile for once it is fit, this many buckets
 # from one page: a write changes one page or a few.
 WARMED_PAGES = 4

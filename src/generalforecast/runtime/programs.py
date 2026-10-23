@@ -22,6 +22,7 @@ import numpy as np
 
 from generalforecast.constants import COMPILED_SHAPES, RECORDED_KINDS, WARM_QUIET
 from generalforecast.runtime.device import DeviceSettings, with_precision
+from generalforecast.system import mappings_short
 
 logger = logging.getLogger(__name__)
 
@@ -345,6 +346,7 @@ class Programs:
         clock: Callable[[], float] = time.monotonic,
         ahead: bool = True,
         manifests: Path | None = None,
+        short_of_mappings: Callable[[], bool] = mappings_short,
     ) -> None:
         """Sets up with nothing compiled.
 
@@ -357,9 +359,12 @@ class Programs:
                 compiles in the step that first calls it.
             manifests: A directory for each model's `Manifest`, which the
                 kinds of call it compiles for are recorded in, if any.
+            short_of_mappings: Whether the process holds most of the memory
+                mappings it may, asked at each new shape.
         """
         self._settings = settings
         self._short_of_memory = short_of_memory
+        self._short_of_mappings = short_of_mappings
         self._helpers = tuple(helpers)
         self._clock = clock
         self._ahead = ahead
@@ -476,11 +481,10 @@ class Programs:
         return Recorded({}, {}) if manifest is None else manifest.read()
 
     def add_shape(self, shape: Hashable) -> None:
-        """Counts a table shape, dropping every program first if memory is short past `limit`."""
-        if (
-            shape not in self._shapes
-            and len(self._shapes) >= self.limit
-            and self._short_of_memory()
+        """Counts a table shape, dropping every program first if memory is short past `limit`, or mappings are."""
+        if shape not in self._shapes and (
+            self._short_of_mappings()
+            or (len(self._shapes) >= self.limit and self._short_of_memory())
         ):
             self.drop()
         self._shapes.add(shape)
