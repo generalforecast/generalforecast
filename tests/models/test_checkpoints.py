@@ -162,11 +162,13 @@ def test_built_in_checkpoints_whose_weights_misfit_are_refused_at_load(
     # without recorded hashes still refuses weights that do not fit.
     with pytest.raises(ValueError, match="differs from its pin"):
         registry.load("general-forecast/tabicl-v2-classifier")
-    entry = catalog.ENTRIES["tabicl-v2-classifier"]
+    entry = catalog.ENTRIES["general-forecast/tabicl-v2-classifier"]
     unhashed = dataclasses.replace(
         entry, artifact=dataclasses.replace(entry.artifact, files=MappingProxyType({}))
     )
-    with pytest.raises(ValueError, match="'tabicl-v2-classifier' has weights"):
+    with pytest.raises(
+        ValueError, match="'general-forecast/tabicl-v2-classifier' has weights"
+    ):
         registry._native(unhashed, "local", False)
 
 
@@ -208,21 +210,22 @@ def test_a_cached_checkpoint_missing_its_weights_is_downloaded_again(
     monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot_download)
 
     # A checkpoint without recorded hashes, whose cache lacks its weights.
-    assert registry._checkpoint("limix-2-classifier") == whole
-    assert calls == [True, False]
+    assert registry._checkpoint("general-forecast/limix-2-classifier") == whole
+    assert calls == [True, True, False]
 
 
-def test_built_in_models_go_by_name_alias_or_repository_id() -> None:
+def test_built_in_models_go_by_canonical_id_alone() -> None:
     from generalforecast.models import registry
 
     assert "general-forecast/tabicl-v2-classifier" in registry.BUILT_IN
-    # Names, aliases and repository ids parse to one canonical reference.
-    for spec in ("tabicl-v2-classifier", "tabicl-classifier"):
-        assert catalog.parse(spec) == catalog.parse(
-            "general-forecast/tabicl-v2-classifier"
-        )
+    # Bare names and upstream ids are refused with the canonical id as the hint.
+    for spec in ("tabicl-v2-classifier", "tabicl-classifier", "amazon/chronos-2"):
+        with pytest.raises(
+            ValueError, match="is not a catalog model id; use general-forecast/"
+        ):
+            catalog.parse(spec)
     with pytest.raises(ValueError, match="unknown model"):
-        registry.load("tabicl-v9-classifier")
+        registry.load("general-forecast/tabicl-v9-classifier")
 
 
 def test_forecasters_load_by_name_and_take_no_estimators(
@@ -240,7 +243,7 @@ def test_forecasters_load_by_name_and_take_no_estimators(
     # The pinned mirror refuses other bytes; the tiny weights load unhashed.
     with pytest.raises(ValueError, match="differs from its pin"):
         registry.load("general-forecast/chronos-2")
-    entry = catalog.ENTRIES["chronos-2"]
+    entry = catalog.ENTRIES["general-forecast/chronos-2"]
     unhashed = dataclasses.replace(
         entry, artifact=dataclasses.replace(entry.artifact, files=MappingProxyType({}))
     )
@@ -265,14 +268,21 @@ def test_built_in_models_say_the_contexts_they_were_trained_on() -> None:
 
     model = (tabicl_functions, tiny_tabicl(regression=False))
     limits = []
-    for name in ("mitra-classifier", "mitra-2-regressor", "tabpfn-3-classifier"):
-        functions, parameters = registry._trained(name, model)
+    for name in (
+        "general-forecast/mitra-classifier",
+        "general-forecast/mitra-2-regressor",
+        "general-forecast/tabpfn-3-classifier",
+    ):
+        functions, parameters = registry._trained(catalog.ENTRIES[name], model)
         assert isinstance(functions, TabularFunctions)
         found = functions.properties(parameters)
         limits.append((found.context_rows, found.context_features))
 
     assert limits == [(512, 16), (5_120, 50), (1_000_000, 2_000)]
-    assert registry._trained("custom", model) is model
+    assert (
+        registry._trained(catalog.ENTRIES["general-forecast/limix-2-classifier"], model)
+        is model
+    )
 
 
 def test_built_in_classifiers_say_their_native_class_slots() -> None:
@@ -281,25 +291,25 @@ def test_built_in_classifiers_say_their_native_class_slots() -> None:
         for name, entry in catalog.ENTRIES.items()
         if entry.capability.task == "classification"
     } == {
-        "tabicl-v2-classifier": 10,
-        "kumo-tabular-small-classifier": 10,
-        "kumo-tabular-medium-classifier": 10,
-        "kumo-tabular-large-classifier": 10,
-        "tabpfn-3-classifier": 160,
-        "tabpfn-3.5-classifier": 160,
-        "limix-2-classifier": 10,
-        "mitra-classifier": 10,
-        "mitra-2-classifier": 10,
+        "general-forecast/tabicl-v2-classifier": 10,
+        "general-forecast/kumo-tabular-small-classifier": 10,
+        "general-forecast/kumo-tabular-medium-classifier": 10,
+        "general-forecast/kumo-tabular-large-classifier": 10,
+        "general-forecast/tabpfn-3-classifier": 160,
+        "general-forecast/tabpfn-3.5-classifier": 160,
+        "general-forecast/limix-2-classifier": 10,
+        "general-forecast/mitra-classifier": 10,
+        "general-forecast/mitra-2-classifier": 10,
     }
     assert (
-        catalog.ENTRIES["tabpfn-3-classifier"].capacity(
-            catalog.parse("tabpfn-3-classifier")
+        catalog.ENTRIES["general-forecast/tabpfn-3-classifier"].capacity(
+            catalog.parse("general-forecast/tabpfn-3-classifier")
         )
         == 160
     )
     assert (
-        catalog.ENTRIES["tabpfn-3-classifier"].capacity(
-            catalog.parse("tabpfn-3-classifier@2")
+        catalog.ENTRIES["general-forecast/tabpfn-3-classifier"].capacity(
+            catalog.parse("general-forecast/tabpfn-3-classifier@2")
         )
         == catalog.MAX_CLASSES
     )

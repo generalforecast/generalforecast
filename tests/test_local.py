@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import inspect
 import threading
 import time as clock
 import warnings
@@ -18,7 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import generalforecast
+from generalforecast import errors as generalforecast_errors
 from generalforecast import protocol
 from generalforecast.columns import MAX_WORDS, Column, datetime_parts
 from generalforecast.models import registry
@@ -32,6 +33,7 @@ from tests.models.conformance.cases import CASES, Case, table
 from tests.models.kumo.tiny import tiny_kumo
 from tests.models.tabicl.tiny import tiny_tabicl
 from tests.models.timestral.tiny import tiny_timestral
+from tests.utils import engine_client as generalforecast
 from tests.utils import node_harness
 from tests.utils.predict import predict
 
@@ -1515,10 +1517,10 @@ def test_contexts_with_no_room_are_encoded_only_as_their_decode_needs_them(
     call = worker._call
     alive: list[int] = []
 
-    def counting(stage: str, jobs: Any, consume: Any = None) -> Any:
-        if stage == "decode" and jobs:
+    def counting(stage: str, work: Any, consume: Any = None) -> Any:
+        if stage == "decode" and work:
             # Contexts on the device now, counted by this one's largest parts.
-            leaves = jax.tree.leaves(jobs[0][1][1])
+            leaves = jax.tree.leaves(work[0][1][1])
             part = max(leaves, key=lambda leaf: leaf.nbytes)
 
             def like(array: Any) -> bool:
@@ -1526,7 +1528,7 @@ def test_contexts_with_no_room_are_encoded_only_as_their_decode_needs_them(
 
             held = sum(like(array) for array in jax.live_arrays())
             alive.append(held // sum(like(leaf) for leaf in leaves))
-        return call(stage, jobs, consume)
+        return call(stage, work, consume)
 
     monkeypatch.setattr(worker, "_call", counting)
     queries = np.random.default_rng(0).normal(size=(32, 5)).astype(np.float32) * 5
@@ -1553,10 +1555,10 @@ def test_dense_contexts_are_encoded_a_call_budget_at_a_time(
     events: list[str] = []
     call = worker._call
 
-    def calling(stage: str, jobs: Any, consume: Any = None) -> Any:
-        if stage in ("encode", "decode") and jobs:
+    def calling(stage: str, work: Any, consume: Any = None) -> Any:
+        if stage in ("encode", "decode") and work:
             events.append(stage)
-        return call(stage, jobs, consume)
+        return call(stage, work, consume)
 
     monkeypatch.setattr(worker, "_call", calling)
     features, targets = _clusters(64)
@@ -1763,8 +1765,14 @@ def test_regressors_pick_quantiles_between_the_models_own() -> None:
         generalforecast.Strategy.retrieved(4, core=4, span=3600),
     ):
         assert eval(repr(strategy), {"Strategy": generalforecast.Strategy}) == strategy
-    assert generalforecast.Classifier().get_params()["model"] == "tabicl-classifier"
-    assert generalforecast.Regressor().get_params()["model"] == "tabicl-regressor"
+    from generalforecast.native.estimators import Classifier, Regressor
+
+    defaults = {
+        cls: inspect.signature(cls).parameters["model"].default
+        for cls in (Classifier, Regressor)
+    }
+    assert defaults[Classifier] == "general-forecast/tabicl-v2-classifier"
+    assert defaults[Regressor] == "general-forecast/tabicl-v2-regressor"
 
 
 def test_string_labels_code_in_order_and_stay_apart_from_codes() -> None:
@@ -2626,10 +2634,10 @@ def test_fused_units_side_by_side_answer_in_order_and_fail_apart(
 
     called = worker._call
 
-    def failing(stage: str, jobs: Any, consume: Any = None) -> list[Any]:
-        if stage == "fit_decode" and jobs[0][0] == 1:
+    def failing(stage: str, work: Any, consume: Any = None) -> list[Any]:
+        if stage == "fit_decode" and work[0][0] == 1:
             raise RuntimeError("table 1 failed")
-        return called(stage, jobs, consume)
+        return called(stage, work, consume)
 
     monkeypatch.setattr(worker, "_call", failing)
     predictions, failed = worker.run_apart(step([0, 1, 2]))
@@ -3079,3 +3087,66 @@ def test_sampling_costs_a_step_loop_a_few_percent_at_most(
     overhead = 1 - max(sampled) / max(plain)
     print(f"sampling costs {overhead:.1%} of {max(plain)} steps a second")
     assert overhead < 0.15
+
+
+def test_public_tables_take_frames_and_answer_frames() -> None:
+    import pandas as pd
+
+    from generalforecast import engine
+
+    rows = pd.DataFrame(
+        {
+            "k": np.arange(32),
+            **{f"f{i}": np.random.default_rng(i).normal(size=32) for i in range(5)},
+            "y": np.arange(32) % 3,
+        }
+    )
+    table = engine.Table(
+        "public-frames",
+        model=TABICL,
+        schema=engine.Schema(target="y", id="k"),
+        ops=engine.TableOptions(page_size=PAGE),
+        client=generalforecast.local(),
+    )
+    try:
+        assert repr(table).startswith("Table('public-frames', model=")
+        table.insert(rows)
+        assert len(table) == 32
+        assert table.inputs == ("f0", "f1", "f2", "f3", "f4")
+        assert table.classes == [0, 1, 2]
+        assert table.selection is not None and table.selection.whole
+        scored = table.predict(rows.head(4).drop(columns=["y"]))
+        assert list(scored.columns) == ["k", "label", "p_0", "p_1", "p_2"]
+        assert scored["k"].tolist() == [0, 1, 2, 3]
+        np.testing.assert_allclose(
+            scored[["p_0", "p_1", "p_2"]].sum(axis=1), 1.0, atol=1e-5
+        )
+        assert set(scored["label"]) <= {0, 1, 2}
+        with pytest.raises(generalforecast_errors.InvalidInput) as caught:
+            table.insert(rows.assign(y=7).head(1))
+        assert (
+            caught.value.message
+            == "target value `7` is not one of the classes from context"
+        )
+        with pytest.raises(generalforecast_errors.InvalidInput) as caught:
+            table.predict(rows.drop(columns=["f3", "y"]).head(1))
+        assert caught.value.message == "input column `f3` is not in the rows"
+    finally:
+        table.drop()
+    regressor = engine.Table(
+        "public-regressor",
+        model=TABICL_REGRESSOR,
+        target="y",
+        selection=engine.Retrieved(core=None, neighbors=0),
+        client=generalforecast.local(),
+    )
+    try:
+        regressor.insert(rows.assign(y=rows["f0"] + rows["f1"]).drop(columns=["k"]))
+        scored = regressor.predict(
+            rows.head(3).drop(columns=["k", "y"]), quantiles=[0.1, 0.5, 0.9]
+        )
+        assert list(scored.columns) == ["value", "q_0.1", "q_0.5", "q_0.9"]
+        assert (scored["q_0.1"] <= scored["q_0.9"]).all()
+        np.testing.assert_array_equal(scored["value"], scored["q_0.5"])
+    finally:
+        regressor.drop()

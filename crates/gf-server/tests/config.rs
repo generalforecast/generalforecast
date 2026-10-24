@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: General Forecast, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Configuration files as deployments write them.
+//! Configuration files as predictors write them.
 
 use gf_server::config::{Config, KeysConfig};
 
@@ -30,7 +30,7 @@ fn a_deployment_key_is_scoped_and_its_front_answers_exact_hosts() {
         "[http]\nlisten = \"0.0.0.0:8000\"\nmodels = \"/opt/gf/models.json\"\n\
          surface = \"remote\"\nhosts = [\"unit--gf-byoc.modal.run\"]\n\n[http.keys]\n\
          kind = \"static\"\nenv = \"GF_MODAL_INFERENCE_TOKEN\"\nproject = \"demo\"\n\
-         permissions = [\"models:infer\"]",
+         permissions = [\"predictors:predict\"]",
     );
     let http = config.http.unwrap();
     assert_eq!(http.hosts, ["unit--gf-byoc.modal.run"]);
@@ -44,7 +44,7 @@ fn a_deployment_key_is_scoped_and_its_front_answers_exact_hosts() {
     };
     assert_eq!(env, "GF_MODAL_INFERENCE_TOKEN");
     assert_eq!(project.as_deref(), Some("demo"));
-    assert_eq!(permissions, Some(vec!["models:infer".to_string()]));
+    assert_eq!(permissions, Some(vec!["predictors:predict".to_string()]));
 }
 
 #[test]

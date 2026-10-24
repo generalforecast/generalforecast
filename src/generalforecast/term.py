@@ -1,50 +1,138 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Terminal presentation shared by every gf command: one palette, one layout.
+"""Terminal output for the `gf` command.
 
-Results go to stdout and diagnostics to stderr. Color follows NO_COLOR,
-CLICOLOR_FORCE / FORCE_COLOR, CLICOLOR=0, and otherwise whether the stream is
-a terminal, so piped output is always plain.
+One renderer draws every surface the CLI shows: status lines with a
+right-aligned verb, lock change lines, the three error shapes, tables, and
+the interactive prompts `gf init` uses. Results go to stdout; status lines,
+prompts and errors go to stderr. Colour is on only when the stream is a
+terminal and `NO_COLOR` is unset.
 """
 
-import os
-import sys
-from collections.abc import Iterable, Mapping, Sequence
-from typing import IO
+from __future__ import annotations
 
+import os
+import re
+import select
+import sys
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import IO, Any
+
+# Status verbs are right-aligned in this many columns.
 VERB_WIDTH = 12
+# Collapsed prompt labels are padded to this width so values start at column 14.
+LABEL_WIDTH = 13
+# Ends every frame a raw prompt draws. The cursor stays hidden while a frame is
+# up, and whatever reads the terminal knows the frame is whole once it arrives.
+FRAME_END = "\x1b[?25l"
+# The default rendering width when the terminal does not report one.
+WIDTH = 100
+# Lock change keys (model, input, selection, target, context) share one column.
+LOCK_KEY_WIDTH = len("selection")
+
 _CODES = {
     "bold": "1",
     "dim": "2",
-    "underline": "4",
     "red": "31",
     "green": "32",
     "yellow": "33",
-    "blue": "34",
     "cyan": "36",
 }
 
 
-def color_enabled(stream: IO[str], environ: Mapping[str, str] | None = None) -> bool:
-    """Whether to style `stream`, following the NO_COLOR and CLICOLOR conventions."""
+def color_enabled(
+    stream: IO[str] | None, environ: Mapping[str, str] | None = None
+) -> bool:
+    """Whether `stream` should get ANSI colour.
+
+    `NO_COLOR` set to anything turns colour off; `FORCE_COLOR` set to a value
+    other than `0` turns it on; otherwise colour follows whether the stream is
+    a terminal and `TERM` is not `dumb`.
+    """
     env = os.environ if environ is None else environ
-    if env.get("NO_COLOR", "") != "":
+    if env.get("NO_COLOR"):
         return False
-    for force in ("CLICOLOR_FORCE", "FORCE_COLOR"):
-        value = env.get(force, "")
-        if value in ("0", "false"):
-            return False
-        if value:
-            return True
-    if env.get("CLICOLOR") == "0" or env.get("TERM") == "dumb":
+    force = env.get("FORCE_COLOR")
+    if force is not None:
+        return force != "0"
+    if env.get("TERM") == "dumb":
         return False
-    isatty = getattr(stream, "isatty", None)
-    return bool(isatty and isatty())
+    return bool(stream is not None and getattr(stream, "isatty", lambda: False)())
+
+
+def seconds(value: float) -> str:
+    """Formats a duration as the status lines show it: `0.21s`, `6.8s`, `41s`."""
+    if value < 1:
+        return f"{value:.2f}s"
+    if value < 10:
+        return f"{value:.1f}s"
+    return f"{value:.0f}s"
+
+
+def count(value: int) -> str:
+    """Formats a count with thousands separators."""
+    return f"{value:,}"
+
+
+def plural(value: int, noun: str) -> str:
+    """`1 row`, `2,052 rows`."""
+    return f"{count(value)} {noun}{'' if value == 1 else 's'}"
+
+
+def columns(stream: IO[str] | None = None) -> int:
+    """The terminal width, or `WIDTH` when it is unknown."""
+    try:
+        return os.get_terminal_size((stream or sys.stderr).fileno()).columns
+    except (OSError, ValueError, AttributeError):
+        return WIDTH
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m|\x1b\]8;;[^\x1b]*\x1b\\")
+
+
+def visible(text: str) -> int:
+    """The printed width of text that may carry ANSI codes."""
+    return len(_ANSI.sub("", text))
+
+
+def suggest(word: str, choices: Iterable[str]) -> str | None:
+    """The closest choice to a typo, or None when nothing is close."""
+    import difflib
+
+    matches = difflib.get_close_matches(word, list(choices), n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+
+@dataclass(frozen=True)
+class Pointer:
+    """Where in a file an error points, for the `-->` error shape."""
+
+    path: str
+    line: int
+    column: int
+    source: str
+    label: str = ""
+    width: int = 1
+
+
+class Aborted(Exception):
+    """The user pressed Escape in a prompt; nothing is written."""
+
+
+@dataclass(frozen=True)
+class Option:
+    """One row of a selector: the value, the shown text and a quiet detail."""
+
+    value: Any
+    text: str
+    detail: str = ""
+    shown: str = ""
 
 
 class Output:
-    """Styled writers for one invocation; quiet keeps only errors."""
+    """Writes the CLI's human output to `out` (results) and `err` (everything else)."""
 
     def __init__(
         self,
@@ -55,171 +143,481 @@ class Output:
         err: IO[str] | None = None,
         environ: Mapping[str, str] | None = None,
     ) -> None:
-        """Binds stdout/stderr and decides color for each separately."""
-        self.out = sys.stdout if out is None else out
-        self.err = sys.stderr if err is None else err
+        """Binds the renderer to its streams and colour setting."""
         self.quiet, self.verbose = quiet, verbose
-        self.color_out = color_enabled(self.out, environ)
-        self.color_err = color_enabled(self.err, environ)
+        self.out = out if out is not None else sys.stdout
+        self.err = err if err is not None else sys.stderr
+        self._environ = environ
+        self._color = {
+            id(self.out): color_enabled(self.out, environ),
+            id(self.err): color_enabled(self.err, environ),
+        }
 
-    def style(self, text: str, *names: str, stream: IO[str] | None = None) -> str:
-        """Wraps text in ANSI styles when the target stream wants color."""
-        enabled = self.color_err if stream is self.err else self.color_out
-        if not enabled or not names or not text:
+    # -- primitives --------------------------------------------------------
+
+    def colored(self, stream: IO[str] | None = None) -> bool:
+        """Whether a stream (default stderr) gets colour."""
+        stream = self.err if stream is None else stream
+        return self._color.get(id(stream), color_enabled(stream, self._environ))
+
+    def style(self, text: str, *styles: str, stream: IO[str] | None = None) -> str:
+        """Wraps text in ANSI styles when the stream is coloured."""
+        if not text or not styles or not self.colored(stream):
             return text
-        return f"\x1b[{';'.join(_CODES[n] for n in names)}m{text}\x1b[0m"
+        codes = ";".join(_CODES[name] for name in styles)
+        return f"\x1b[{codes}m{text}\x1b[0m"
 
-    def _write(self, line: str, stream: IO[str]) -> None:
-        stream.write(line + "\n")
+    def quiet_text(self, text: str, stream: IO[str] | None = None) -> str:
+        """Text in the quiet colour."""
+        return self.style(text, "dim", stream=stream)
+
+    def _write(self, text: str, stream: IO[str]) -> None:
+        stream.write(text + "\n")
         stream.flush()
 
     def line(self, text: str = "") -> None:
-        """A plain result line on stdout."""
-        if not self.quiet:
-            self._write(text, self.out)
-
-    def verb(
-        self, verb: str, text: str = "", detail: str = "", *, err: bool = True
-    ) -> None:
-        """A cargo-style status line: right-aligned bold green verb, then text."""
-        if self.quiet:
-            return
-        stream = self.err if err else self.out
-        head = self.style(verb.rjust(VERB_WIDTH), "bold", "green", stream=stream)
-        tail = f" {self.style(detail, 'dim', stream=stream)}" if detail else ""
-        self._write(f"{head} {text}{tail}".rstrip(), stream)
-
-    def _label(
-        self, label: str, colors: Sequence[str], text: str, bold_text: bool
-    ) -> None:
-        stream = self.err
-        head = self.style(label + ":", *colors, "bold", stream=stream)
-        body = self.style(text, "bold", stream=stream) if bold_text else text
-        self._write(f"{head} {body}", stream)
-
-    def error(self, text: str) -> None:
-        """`error: message` in red, always shown."""
-        self._label("error", ("red",), text, True)
-
-    def warning(self, text: str) -> None:
-        """`warning: message` in yellow."""
-        if not self.quiet:
-            self._label("warning", ("yellow",), text, True)
-
-    def hint(self, text: str, label: str = "hint") -> None:
-        """An indented cyan `hint:` or `help:` follow-up to a diagnostic."""
-        stream = self.err
-        head = self.style(f"{label}:", "cyan", "bold", stream=stream)
-        self._write(f"  {head} {text}", stream)
-
-    def cause(self, text: str) -> None:
-        """A dim `Caused by:` line under an error."""
-        stream = self.err
-        self._write(
-            f"  {self.style('Caused by:', 'dim', stream=stream)} {text}", stream
-        )
+        """One line of a result on stdout."""
+        self._write(text, self.out)
 
     def say(self, text: str = "", *, force: bool = False) -> None:
-        """A plain status line on stderr; force shows it even with --quiet."""
+        """One line of commentary on stderr, dropped under `-q` unless forced."""
         if force or not self.quiet:
             self._write(text, self.err)
 
-    def note(self, text: str) -> None:
-        """Secondary information on stderr, dimmed."""
-        if not self.quiet:
-            self._write(self.style(text, "dim", stream=self.err), self.err)
-
     def debug(self, text: str) -> None:
-        """Requests and timings, only with --verbose."""
+        """A quiet line shown only under `-v`."""
         if self.verbose:
-            stream = self.err
-            self._write(
-                self.style(f"{'debug'.rjust(VERB_WIDTH)} {text}", "dim", stream=stream),
-                stream,
-            )
+            self._write(self.quiet_text(text), self.err)
 
-    def link(self, url: str, stream: IO[str] | None = None) -> str:
-        """An underlined blue URL."""
-        return self.style(url, "blue", "underline", stream=stream or self.err)
+    def link(self, url: str, text: str | None = None) -> str:
+        """A clickable URL on terminals that support OSC 8 hyperlinks."""
+        shown = text or url
+        if not self.colored():
+            return shown
+        return f"\x1b]8;;{url}\x1b\\{shown}\x1b]8;;\x1b\\"
 
-    def code(self, text: str, stream: IO[str] | None = None) -> str:
-        """An inline command or value, in backticks for plain output."""
-        return self.style(f"`{text}`", "bold", stream=stream or self.err)
+    # -- status ------------------------------------------------------------
 
-    def pointer(
-        self, path: str, line: int, column: int, source: str, label: str, width: int = 1
+    def status(self, verb: str, message: str, *, seconds: float | None = None) -> None:
+        """A status line: the verb right-aligned in 12 columns, a space, the message.
+
+        A duration ends the line as `in 0.21s`. Dropped under `-q`.
+        """
+        if self.quiet:
+            return
+        head = self.style(verb.rjust(VERB_WIDTH), "bold", "green")
+        tail = "" if seconds is None else f" in {globals()['seconds'](seconds)}"
+        self._write(f"{head} {message}{tail}", self.err)
+
+    def verb(self, verb: str, text: str, detail: str | None = None, **_: Any) -> None:
+        """`status` with an optional two-space-separated detail."""
+        self.status(verb, text if detail is None else f"{text}  {detail}")
+
+    def changes(self, items: Sequence[tuple[str, str, Any, Any]]) -> None:
+        """Lock change lines, keys padded to the longest key in the block."""
+        if not items or self.quiet:
+            return
+        width = max(LOCK_KEY_WIDTH, *(len(key) for _, key, _, _ in items))
+        for op, key, old, new in items:
+            self.change(op, key, old, new, width=width)
+
+    def change(
+        self, op: str, key: str, old: Any, new: Any, *, width: int | None = None
     ) -> None:
-        """A cargo-style source pointer under an error for a gf.yaml location."""
-        stream, gutter = self.err, " " * len(str(line))
-        bar = self.style("|", "blue", "bold", stream=stream)
-        arrow = self.style("-->", "blue", "bold", stream=stream)
-        number = self.style(str(line), "blue", "bold", stream=stream)
-        mark = self.style(
-            "^" * max(width, 1) + " " + label, "red", "bold", stream=stream
+        """One lock change: ` + key  value`, ` - key  value` or ` ~ key  old → new`."""
+        if self.quiet:
+            return
+        colour = {"+": "green", "-": "red", "~": "yellow"}.get(op, "bold")
+        shown = key.ljust(width or len(key))
+        if op == "+" or old is None:
+            value = f"{new}"
+        elif op == "-" or new is None:
+            value = f"{old}"
+        else:
+            value = f"{old} → {new}"
+        self._write(f" {self.style(op, 'bold', colour)} {shown}  {value}", self.err)
+
+    def collapsed(self, label: str, value: str) -> None:
+        """A finished prompt: the label padded to column 14, then the value."""
+        self._write(f"{label.ljust(LABEL_WIDTH)}{value}", self.err)
+
+    # -- errors ------------------------------------------------------------
+
+    def _labelled(self, label: str, text: str, *styles: str) -> None:
+        head = self.style(f"{label}:", *styles)
+        indent = " " * (2 + len(label) + 2)
+        lines = text.split("\n")
+        self._write(f"  {head} {lines[0]}", self.err)
+        for rest in lines[1:]:
+            self._write(f"{indent}{rest}", self.err)
+
+    def error(
+        self,
+        message: str,
+        *,
+        hint: str | None = None,
+        because: str | None = None,
+        tip: str | None = None,
+        pointer: Pointer | None = None,
+        request_id: str | None = None,
+    ) -> None:
+        """An error in one of the three shapes.
+
+        Shape one is `error:` plus `hint:`. Shape two adds a `-->` pointer into a
+        file between them. Shape three adds a `because:` line before the hint.
+        `tip:` names a near-miss on a flag or a name. The request id, when there
+        is one, is the last line.
+        """
+        head = self.style("error:", "bold", "red")
+        lines = message.split("\n")
+        self._write(f"{head} {lines[0]}", self.err)
+        for rest in lines[1:]:
+            self._write(f"       {rest}", self.err)
+        if pointer is not None:
+            self.pointer(pointer)
+        if because:
+            self._labelled("because", because, "bold")
+        if hint:
+            self._labelled("hint", hint, "bold")
+        if tip:
+            self._labelled("tip", tip, "bold")
+        if request_id:
+            self._write(self.quiet_text(f"  request {request_id}"), self.err)
+
+    def pointer(self, where: Pointer) -> None:
+        """The `-->` block: location, a bar, the source line and a caret line."""
+        number = str(where.line)
+        gutter = " " * (len(number) + 1)
+        quiet = self.quiet_text
+        self._write(
+            f"{gutter}{quiet('-->')} {where.path}:{where.line}:{where.column}", self.err
         )
-        for text in (
-            f"{gutter}{arrow} {path}:{line}:{column}",
-            f"{gutter} {bar}",
-            f"{number} {bar} {source}",
-            f"{gutter} {bar} {' ' * (column - 1)}{mark}",
-            f"{gutter} {bar}",
-        ):
-            self._write(text, stream)
+        self._write(f"{gutter} {quiet('|')}", self.err)
+        self._write(
+            f"{quiet(number.rjust(len(number) + 1))} {quiet('|')} {where.source}",
+            self.err,
+        )
+        carets = self.style("^" * max(where.width, 1), "bold", "red")
+        label = f" {where.label}" if where.label else ""
+        pad = " " * max(where.column - 1, 0)
+        self._write(f"{gutter} {quiet('|')} {pad}{carets}{label}", self.err)
 
-    def table(self, headers: Sequence[str], rows: Iterable[Sequence[object]]) -> None:
-        """Left-aligned columns, two spaces apart, with dim uppercase headers."""
-        if self.quiet:
+    def warning(self, text: str) -> None:
+        """A `warning:` line."""
+        self._write(f"{self.style('warning:', 'bold', 'yellow')} {text}", self.err)
+
+    def hint(self, text: str, **_: Any) -> None:
+        """A `hint:` line on its own."""
+        self._labelled("hint", text, "bold")
+
+    # -- tables ------------------------------------------------------------
+
+    def table(
+        self,
+        rows: Sequence[Sequence[str]],
+        *,
+        indent: int = 2,
+        gap: int = 2,
+        align: Sequence[str] | None = None,
+        header: Sequence[str] | None = None,
+        stream: IO[str] | None = None,
+    ) -> None:
+        """Rows of cells, each column padded to its widest cell.
+
+        `align` gives `<` or `>` per column (default left). A header row is
+        aligned like the values beneath it.
+        """
+        stream = self.err if stream is None else stream
+        every = [list(header), *map(list, rows)] if header else list(map(list, rows))
+        if not every:
             return
-        cells = [[_cell(v) for v in row] for row in rows]
+        ncol = max(len(row) for row in every)
         widths = [
-            max([len(h)] + [len(r[i]) for r in cells]) for i, h in enumerate(headers)
+            max(visible(row[i]) if i < len(row) else 0 for row in every)
+            for i in range(ncol)
         ]
+        kinds = list(align or []) + ["<"] * (ncol - len(align or []))
+        for row in every:
+            cells = []
+            for i in range(ncol):
+                cell = row[i] if i < len(row) else ""
+                pad = " " * (widths[i] - visible(cell))
+                cells.append(pad + cell if kinds[i] == ">" else cell + pad)
+            self._write(" " * indent + (" " * gap).join(cells).rstrip(), stream)
 
-        def render(values: Sequence[str]) -> str:
-            return "  ".join(
-                v.ljust(w) for v, w in zip(values, widths, strict=True)
-            ).rstrip()
-
-        self._write(self.style(render([h.upper() for h in headers]), "dim"), self.out)
-        for row in cells:
-            self._write(render(row), self.out)
-
-    def fields(self, pairs: Iterable[tuple[str, object]], indent: int = 0) -> None:
-        """Aligned `label  value` pairs on stdout with dim labels."""
-        if self.quiet:
-            return
-        items = [(k, _cell(v)) for k, v in pairs if v is not None]
-        width = max((len(k) for k, _ in items), default=0)
-        for key, value in items:
-            label = self.style(key.ljust(width), "dim")
-            self._write(f"{' ' * indent}{label} {value}", self.out)
+    def fields(self, pairs: Sequence[tuple[str, str]], *, indent: int = 2) -> None:
+        """A two-column key/value table on stdout."""
+        self.table(pairs, indent=indent, stream=self.out)
 
 
-def _cell(value: object) -> str:
-    if value is None:
-        return "-"
-    if isinstance(value, bool):
-        return "yes" if value else "no"
-    if isinstance(value, float):
-        return f"{value:g}"
-    if isinstance(value, (list, tuple)):
-        return ", ".join(_cell(v) for v in value)
-    return str(value)
+class Prompter:
+    """Asks `gf init`'s questions one at a time.
 
+    On a terminal the prompt is a selector drawn in raw mode: `>` marks the
+    cursor, up and down move it, space toggles a multi-select row, Enter
+    confirms and Escape aborts. Without a terminal the prompt falls back to
+    numbered lines read from stdin. `yes` takes the first option everywhere
+    and `no_input` raises instead of asking.
+    """
 
-def seconds(value: float) -> str:
-    """A compact duration like 0.41s, 12s or 3m 05s."""
-    if value < 10:
-        return f"{value:.2f}s"
-    if value < 60:
-        return f"{value:.0f}s"
-    minutes, rest = divmod(int(value), 60)
-    return f"{minutes}m {rest:02d}s"
+    def __init__(
+        self,
+        out: Output,
+        *,
+        stdin: IO[str] | None = None,
+        yes: bool = False,
+        no_input: bool = False,
+        interactive: bool | None = None,
+    ) -> None:
+        """Binds the prompter to the renderer and the input stream."""
+        self.out = out
+        self.stdin = stdin if stdin is not None else sys.stdin
+        self.yes, self.no_input = yes, no_input
+        if interactive is None:
+            interactive = (
+                getattr(self.stdin, "isatty", lambda: False)()
+                and getattr(out.err, "isatty", lambda: False)()
+                and os.name == "posix"
+            )
+        self.interactive = interactive and not yes and not no_input
 
+    def _unavailable(self, label: str, flag: str) -> Exception:
+        from generalforecast.cli import Error
 
-def suggest(word: str, choices: Iterable[str]) -> str | None:
-    """The closest known name to a typo, if any is close enough."""
-    import difflib
+        return Error(
+            "ValidationError",
+            f"{label.lower()} could not be inferred and no terminal is attached",
+            hint=f"pass '{flag}', or run without --no-input in a terminal",
+            param=flag.lstrip("-"),
+        )
 
-    match = difflib.get_close_matches(word, list(choices), n=1, cutoff=0.6)
-    return match[0] if match else None
+    def choose(
+        self, label: str, options: Sequence[Option], *, flag: str, default: int = 0
+    ) -> Any:
+        """One value from `options`, with the row at `default` pre-selected."""
+        if not options:
+            raise self._unavailable(label, flag)
+        if self.yes:
+            chosen = options[default]
+        elif not self.interactive:
+            if self.no_input:
+                raise self._unavailable(label, flag)
+            chosen = self._plain(label, options, default)
+        else:
+            chosen = options[self._raw(label, options, default, multi=None)[0]]
+        self.out.collapsed(label, chosen.shown or chosen.text)
+        return chosen.value
+
+    def choose_many(
+        self,
+        label: str,
+        options: Sequence[Option],
+        *,
+        flag: str,
+        selected: Iterable[int] = (),
+    ) -> list[Any]:
+        """Several values from `options`, with `selected` rows toggled on first."""
+        picked = set(selected)
+        if self.yes:
+            indexes = sorted(picked)
+        elif not self.interactive:
+            if self.no_input:
+                raise self._unavailable(label, flag)
+            indexes = self._plain_many(label, options, picked)
+        else:
+            indexes = self._raw(label, options, 0, multi=picked)
+        values = [options[i] for i in indexes]
+        self.out.collapsed(label, ", ".join(option.text for option in values) or "none")
+        return [option.value for option in values]
+
+    def ask(
+        self,
+        label: str,
+        default: str,
+        *,
+        flag: str,
+        note: Callable[[str], str] | None = None,
+    ) -> str:
+        """One typed line, pre-filled with `default`; `note` shows a quiet aside."""
+        if self.yes:
+            value = default
+        elif not self.interactive:
+            if self.no_input:
+                raise self._unavailable(label, flag)
+            self.out.say(f"{label} [{default}]: ", force=True)
+            read = self.stdin.readline()
+            if not read:
+                raise Aborted()
+            value = read.strip() or default
+        else:
+            value = self._edit(label, default, note)
+        self.out.collapsed(
+            label, value if note is None else f"{value}  {note(value)}".rstrip()
+        )
+        return value
+
+    # -- plain fallback ----------------------------------------------------
+
+    def _plain(self, label: str, options: Sequence[Option], default: int) -> Option:
+        err = self.out.err
+        err.write(f"{label}\n")
+        for i, option in enumerate(options, 1):
+            err.write(
+                f"  {i}. {option.text}{'  ' + option.detail if option.detail else ''}\n"
+            )
+        err.write(f"Choose [{default + 1}]: ")
+        err.flush()
+        read = self.stdin.readline()
+        if not read:
+            raise Aborted()
+        text = read.strip()
+        if not text:
+            return options[default]
+        if text.isdigit() and 1 <= int(text) <= len(options):
+            return options[int(text) - 1]
+        for option in options:
+            if option.text == text:
+                return option
+        from generalforecast.cli import Error
+
+        raise Error(
+            "ValidationError", f"`{text}` is not one of the {label.lower()} choices"
+        )
+
+    def _plain_many(
+        self, label: str, options: Sequence[Option], picked: set[int]
+    ) -> list[int]:
+        err = self.out.err
+        err.write(f"{label}\n")
+        for i, option in enumerate(options, 1):
+            mark = "x" if i - 1 in picked else " "
+            err.write(f"  {i}. [{mark}] {option.text}\n")
+        err.write(
+            "Choose (comma-separated numbers or names, Enter keeps the marked rows): "
+        )
+        err.flush()
+        read = self.stdin.readline()
+        if not read:
+            raise Aborted()
+        text = read.strip()
+        if not text:
+            return sorted(picked)
+        names = {option.text: i for i, option in enumerate(options)}
+        chosen = []
+        for part in [p.strip() for p in text.split(",") if p.strip()]:
+            if part.isdigit() and 1 <= int(part) <= len(options):
+                chosen.append(int(part) - 1)
+            elif part in names:
+                chosen.append(names[part])
+            else:
+                from generalforecast.cli import Error
+
+                raise Error(
+                    "ValidationError",
+                    f"`{part}` is not one of the {label.lower()} choices",
+                )
+        return sorted(set(chosen))
+
+    # -- raw terminal ------------------------------------------------------
+
+    def _key(self) -> str:
+        fd = self.stdin.fileno()
+        char = os.read(fd, 1).decode("utf-8", "replace")
+        if char != "\x1b":
+            return char
+        if select.select([fd], [], [], 0.05)[0]:
+            rest = os.read(fd, 2).decode("utf-8", "replace")
+            if rest == "[A":
+                return "up"
+            if rest == "[B":
+                return "down"
+            return "other"
+        return "escape"
+
+    def _raw_session(
+        self, draw: Callable[[], int], handle: Callable[[str], bool]
+    ) -> None:
+        import termios
+        import tty
+
+        fd = self.stdin.fileno()
+        saved = termios.tcgetattr(fd)
+        err = self.out.err
+        drawn = 0
+        try:
+            tty.setcbreak(fd)
+            while True:
+                drawn = draw()
+                err.write(FRAME_END)
+                err.flush()
+                key = self._key()
+                err.write(f"\x1b[{drawn}A\r\x1b[J" if drawn else "\r\x1b[J")
+                if key in ("\x03", "\x04"):
+                    raise KeyboardInterrupt
+                if key == "escape":
+                    raise Aborted()
+                if handle(key):
+                    break
+        finally:
+            err.write("\x1b[?25h")
+            err.flush()
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+
+    def _raw(
+        self,
+        label: str,
+        options: Sequence[Option],
+        default: int,
+        *,
+        multi: set[int] | None,
+    ) -> list[int]:
+        err = self.out.err
+        width = max(len(option.text) for option in options)
+        state = {"cursor": default}
+
+        def draw() -> int:
+            err.write(f"{label}\n")
+            for i, option in enumerate(options):
+                cursor = ">" if i == state["cursor"] else " "
+                mark = "" if multi is None else ("[x] " if i in multi else "[ ] ")
+                text = f"{mark}{option.text}".ljust(width + len(mark))
+                detail = (
+                    f"    {self.out.quiet_text(option.detail)}" if option.detail else ""
+                )
+                err.write(f"  {cursor} {text}{detail}\n")
+            return len(options) + 1
+
+        def handle(key: str) -> bool:
+            if key in ("up", "k"):
+                state["cursor"] = (state["cursor"] - 1) % len(options)
+            elif key in ("down", "j", "\t"):
+                state["cursor"] = (state["cursor"] + 1) % len(options)
+            elif key == " " and multi is not None:
+                multi.symmetric_difference_update({state["cursor"]})
+            elif key in ("\r", "\n"):
+                return True
+            return False
+
+        self._raw_session(draw, handle)
+        return sorted(multi) if multi is not None else [state["cursor"]]
+
+    def _edit(self, label: str, default: str, note: Callable[[str], str] | None) -> str:
+        err = self.out.err
+        state = {"text": default}
+
+        def draw() -> int:
+            aside = f"  {self.out.quiet_text(note(state['text']))}" if note else ""
+            err.write(f"{label.ljust(LABEL_WIDTH)}{state['text']}{aside}\n")
+            return 1
+
+        def handle(key: str) -> bool:
+            if key in ("\r", "\n"):
+                return True
+            if key in ("\x7f", "\b"):
+                state["text"] = state["text"][:-1]
+            elif len(key) == 1 and key.isprintable():
+                state["text"] += key
+            return False
+
+        self._raw_session(draw, handle)
+        return state["text"]

@@ -38,10 +38,10 @@ def test_converts_once_into_the_cache(
     monkeypatch.delenv("GF_CHECKPOINTS", raising=False)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
 
-    first = mitra_checkpoint("mitra-classifier")
-    again = mitra_checkpoint("mitra-classifier")
+    first = mitra_checkpoint("general-forecast/mitra-classifier")
+    again = mitra_checkpoint("general-forecast/mitra-classifier")
 
-    revision = checkpoint.PUBLISHED["mitra-classifier"].revision
+    revision = checkpoint.PUBLISHED["general-forecast/mitra-classifier"].revision
     assert (
         first
         == again
@@ -64,9 +64,12 @@ def test_offline_directory_must_exist(
     monkeypatch.setenv("GF_CHECKPOINTS", str(tmp_path))
     (tmp_path / "mitra-classifier").mkdir()
 
-    assert mitra_checkpoint("mitra-classifier") == tmp_path / "mitra-classifier"
+    assert (
+        mitra_checkpoint("general-forecast/mitra-classifier")
+        == tmp_path / "mitra-classifier"
+    )
     with pytest.raises(FileNotFoundError, match="mitra-regressor"):
-        mitra_checkpoint("mitra-regressor")
+        mitra_checkpoint("general-forecast/mitra-regressor")
 
 
 def test_published_classifier_converts_exactly(
@@ -75,12 +78,12 @@ def test_published_classifier_converts_exactly(
     pytest.importorskip("torch")
     monkeypatch.delenv("GF_CHECKPOINTS", raising=False)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    published = checkpoint.PUBLISHED["mitra-classifier"]
+    published = checkpoint.PUBLISHED["general-forecast/mitra-classifier"]
     path = checkpoint.hf_hub_download(
         published.repository, "model.safetensors", revision=published.revision
     )
 
-    directory = mitra_checkpoint("mitra-classifier")
+    directory = mitra_checkpoint("general-forecast/mitra-classifier")
     expected = load_file(path)
     converted = load_file(directory / "model.safetensors")
 

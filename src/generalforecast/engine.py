@@ -3,7 +3,7 @@
 
 """The engine port: every surface's model calls, over gf-server's shards.
 
-The Models API, `gf serve`, package predictions and the native estimators
+The Models API, `gf serve`, predictor predictions and the native estimators
 hand requests `gf_core::request` validated to an `Engine` rather than calling
 a model: a `TabularRequest`'s labeled context rows and query rows, or a
 `ForecastRequest`'s queries, each with its aligned group. `LocalEngine`
@@ -18,7 +18,7 @@ callers share steps and the workers' cores whatever contexts they bring.
   reuses its table, fit and encoded contexts. A forecast reads one per
   aligned group, by the group's fingerprint.
 - `bind` writes a context that many requests read, such as a snapshot
-  package's, once as a durable table, which lives as long as its `Bound`.
+  predictor's, once as a durable table, which lives as long as its `Bound`.
 
 Models load in the workers, never here: a reference passes its surface's
 gates and its pinned files are verified in this process, which imports no
@@ -121,7 +121,7 @@ _process: LocalEngine | None = None
 _process_lock = threading.Lock()
 
 
-def local(surface: Surface = "local", allow_downloads: bool = False) -> LocalEngine:
+def local(surface: Surface = "local", allow_downloads: bool = True) -> LocalEngine:
     """This process's engine, with a caller's gates.
 
     Every surface in a process shares it, so each model loads once in each
@@ -283,7 +283,7 @@ class LocalEngine:
         admit(ref, self.surface)
         name = _unpinned(ref)
         spec = self._shared.specs.get(name)
-        if not ref.trusted and spec is None:
+        if spec is None:
             from generalforecast.models.artifacts import checkpoint
 
             checkpoint(
@@ -371,3 +371,34 @@ def _stop() -> None:
     """Stops the process engine's workers before the interpreter goes."""
     if _process is not None:
         _process.close()
+
+
+# The public engine surface, `gf.engine.Table` and its settings, lives in
+# `generalforecast.native.tables` and loads on first use so importing this
+# module stays cheap.
+_PUBLIC = {
+    name: "generalforecast.native.tables"
+    for name in (
+        "Grouping",
+        "Retrieved",
+        "Schema",
+        "SeriesSchema",
+        "SeriesTable",
+        "Table",
+        "TableOptions",
+        "TimeOptions",
+        "default_selection",
+    )
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Imports a public engine export on first use."""
+    module = _PUBLIC.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    import importlib
+
+    value = getattr(importlib.import_module(module), name)
+    globals()[name] = value
+    return value

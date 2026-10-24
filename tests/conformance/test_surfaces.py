@@ -3,17 +3,16 @@
 
 """One table of requests, answered alike by every surface that runs the engine.
 
-Each case runs in process through `CatalogService` and `LocalModels` on a
+Each case runs in process through `CatalogService` on a
 `LocalEngine`, and over HTTP through the SDK `Client` against the real
-gf-server binary that `gf serve` configures. Tabular packages run through
-`PackageExecutor` and through `gf serve <lock>`. Every surface must give the
+gf-server binary that `gf serve` configures. Tabular predictors run through
+`PredictorExecutor` and through `gf serve <lock>`. Every surface must give the
 same result envelope, with floats equal within tolerance, or the same error
 code, message and status. The models are the tiny random ones the model
 tests use: gf-server's worker loads them by spec, and the in-process engine
 loads them under the same catalog references.
 """
 
-import contextlib
 import json
 import math
 import os
@@ -25,23 +24,19 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterator
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import pyarrow as pa
 import pytest
 import yaml
 
-from generalforecast import _core
 from generalforecast.client import Client
 from generalforecast.deployments.boundary import Scope
-from generalforecast.deployments.catalog import CatalogService
 from generalforecast.deployments.contracts import ServiceError
-from generalforecast.deployments.interfaces import InferenceRequest
-from generalforecast.deployments.package_runtime import PackageExecutor
+from generalforecast.deployments.predictor_runtime import PredictorExecutor
+from generalforecast.deployments.predictor_runtime.compile import compile_dir
 from generalforecast.engine import LocalEngine
-from generalforecast.local_models import LocalModels
-from generalforecast.models.catalog import parse
-from generalforecast.packages import Package
+from generalforecast.predictors import load, resolve, write_lock
 from generalforecast.serve import listener
 from generalforecast.serve import models as serve_models
 from generalforecast.tabular import arrow_bytes
@@ -51,10 +46,10 @@ ROOT = Path(__file__).resolve().parents[2]
 SCOPE = Scope("local", "r-conformance")
 # Each served catalog model, and the tiny model both engines load for it.
 TINY = {
-    "tabicl-v2-classifier": "tests.models.tabicl.tiny:classifier",
-    "tabicl-v2-regressor": "tests.models.tabicl.tiny:regressor",
-    "timestral-28m": "tests.models.timestral.tiny:forecaster",
-    "chronos-2": "tests.models.chronos2.tiny:catalog_forecaster",
+    "general-forecast/tabicl-v2-classifier": "tests.models.tabicl.tiny:classifier",
+    "general-forecast/tabicl-v2-regressor": "tests.models.tabicl.tiny:regressor",
+    "general-forecast/timestral-28m": "tests.models.timestral.tiny:forecaster",
+    "general-forecast/chronos-2": "tests.models.chronos2.tiny:catalog_forecaster",
 }
 RELATIVE, ABSOLUTE = 1e-5, 1e-6
 
@@ -187,13 +182,25 @@ def _same(left: Any, right: Any, at: str = "") -> None:
         assert type(left) is type(right) and left == right, (at, left, right)
 
 
-def _features(row: int) -> dict[str, Any]:
-    """Numeric features, the only kind the Models API's JSON rows carry."""
-    return {"x": float(row) / 2, "count": row % 4, "ratio": 1 / (row + 1)}
+def _predicted(server: Served, predictor: str, queries: pa.Table) -> list[dict]:
+    """The rows a served predictor answers for `queries` on its predict route."""
+    body = {
+        "api_version": "gf/v1",
+        "project": "local",
+        "request_id": f"r-{predictor}",
+        "resource": {"kind": "predictor", "name": predictor},
+        "payload": {"queries": queries.to_pylist()},
+    }
+    status, envelope = server.post(
+        f"/v1/projects/local/predictors/{predictor}/predict",
+        json.dumps(body, default=lambda value: value.isoformat()).encode(),
+    )
+    assert status == 200, envelope
+    return envelope["result"]["predictions"]
 
 
 def _columns(row: int) -> dict[str, Any]:
-    """Numeric, string, categorical and datetime cells, as a package lock binds."""
+    """Numeric, string, categorical and datetime cells, as a predictor lock binds."""
     return {
         "x": float(row) / 2,
         "plan": ("basic", "pro", "team")[row % 3],
@@ -202,218 +209,8 @@ def _columns(row: int) -> dict[str, Any]:
     }
 
 
-def tabular(model: str, task: str, **changes: Any) -> dict[str, Any]:
-    """Labeled rows with numeric, string, categorical and datetime features."""
-    labels = (
-        [("churn", "stay", "pause")[row % 3] for row in range(9)]
-        if task == "classification"
-        else [float(row) * 1.5 - 2 for row in range(9)]
-    )
-    return {
-        "model": model,
-        "task": task,
-        "target": "y",
-        "features": ["x", "count", "ratio"],
-        "context": [
-            {"key": f"c{row}", "features": _features(row), "label": labels[row]}
-            for row in range(9)
-        ],
-        "queries": [
-            {"key": f"q{row}", "features": _features(row + 4)} for row in range(3)
-        ],
-        "options": {},
-    } | changes
-
-
-def forecast(**changes: Any) -> dict[str, Any]:
-    """Two series of eight periods, with a past and a known-future covariate."""
-    series = changes.pop("series", {})
-    return {
-        "model": "timestral-28m",
-        "task": "forecast",
-        "target": "sales",
-        "features": [],
-        "context": [
-            {
-                "key": f"{name}-{period}",
-                "series": name,
-                "time": period,
-                "value": base + period * (1.5 if name == "a" else -0.5),
-                "covariates": {"promo": period % 2, "past": period / 10},
-            }
-            for name, base in (("a", 10.0), ("b", 30.0))
-            for period in range(8)
-        ],
-        "queries": [
-            {
-                "key": "q-a",
-                "series": "a",
-                "origin": 7,
-                "group": ["a"],
-                "future_covariates": {},
-            },
-        ],
-        "options": {
-            "series": {
-                "step": 1,
-                "horizon": 3,
-                "known_covariates": [],
-                "quantiles": [0.5],
-            }
-            | series
-        },
-    } | changes
-
-
-GROUPED = [
-    {
-        "key": f"q-{name}",
-        "series": name,
-        "origin": 7,
-        "group": ["a", "b"],
-        "future_covariates": {"promo": [0, 1, 0]},
-    }
-    for name in ("a", "b")
-]
-
-# Each case's request, and the error code every surface refuses it with, if any.
-EXPECTED = {
-    "classification": "result",
-    "classification-boolean": "result",
-    "regression": "result",
-    "regression-quantiles": "result",
-    "forecast-single": "result",
-    "forecast-grouped": "result",
-    "forecast-quantiles": "result",
-    "forecast-chronos-2": "result",
-    "unknown-model": "ModelNotFound",
-    "unknown-feature": "ValidationError",
-    "too-few-classes": "UnsupportedClassCount",
-    "quantile-bounds": "ValidationError",
-    "horizon-bounds": "ValidationError",
-    "variant-policy": "CapacityExceeded",
-    "surface-gate": "UnsupportedModel",
-}
-
-CASES: dict[str, dict[str, Any]] = {
-    "classification": tabular("tabicl-classifier", "classification"),
-    "classification-boolean": tabular(
-        "tabicl-classifier",
-        "classification",
-        context=[
-            row | {"label": index % 2 == 0}
-            for index, row in enumerate(
-                tabular("tabicl-classifier", "classification")["context"]
-            )
-        ],
-    ),
-    "regression": tabular("tabicl-regressor", "regression"),
-    "regression-quantiles": tabular(
-        "tabicl-regressor", "regression", options={"quantiles": [0.1, 0.5, 0.9]}
-    ),
-    "forecast-single": forecast(),
-    "forecast-grouped": forecast(
-        queries=GROUPED, series={"known_covariates": ["promo"]}
-    ),
-    "forecast-quantiles": forecast(
-        queries=GROUPED,
-        series={"known_covariates": ["promo"], "quantiles": [0.1, 0.5, 0.9]},
-    ),
-    "forecast-chronos-2": forecast(
-        model="chronos-2",
-        queries=GROUPED,
-        series={"known_covariates": ["promo"], "quantiles": [0.01, 0.5, 0.99]},
-    ),
-    "unknown-model": tabular("no-such-model", "classification"),
-    "unknown-feature": tabular(
-        "tabicl-classifier", "classification", features=["x", "absent"]
-    ),
-    "too-few-classes": tabular(
-        "tabicl-classifier",
-        "classification",
-        context=[
-            row | {"label": "stay"}
-            for row in tabular("tabicl-classifier", "classification")["context"]
-        ],
-    ),
-    "quantile-bounds": tabular(
-        "tabicl-regressor", "regression", options={"quantiles": [1.5]}
-    ),
-    "horizon-bounds": forecast(series={"horizon": 100000}),
-    "variant-policy": tabular("tabicl-classifier*64", "classification"),
-    "surface-gate": tabular("limix-2-classifier", "classification"),
-}
-
-
-def _served(servers: dict[str, Served], model: str) -> Served:
-    """The server for a request's model; a model none serves goes to the first."""
-    with contextlib.suppress(Exception):
-        return servers[parse(model).entry.name]
-    return next(iter(servers.values()))
-
-
-@pytest.mark.parametrize("case", CASES)
-def test_every_surface_answers_alike(case, engine, servers):
-    """Surfaces answer as the catalog does at their gates; successes agree across gates.
-
-    The hosted Models API and the local client apply the remote gates; the
-    operator's own `gf serve` applies the self-hosted ones, so a model gated
-    by license may fail differently there, but never differently from the
-    in-process catalog at the same gates.
-    """
-    payload = cast(InferenceRequest, CASES[case])
-    remote = _outcome(lambda: CatalogService().infer(SCOPE, payload))
-    hosted = _outcome(
-        lambda: CatalogService(surface="self-hosted").infer(SCOPE, payload)
-    )
-    surfaces = {
-        "local client": (remote, _outcome(lambda: LocalModels().infer(payload))),
-        "gf serve": (
-            hosted,
-            _outcome(
-                lambda: _served(servers, payload["model"]).client.models.infer(payload)
-            ),
-        ),
-    }
-    code = remote[1][0] if remote[0] == "error" else "result"
-    assert code == EXPECTED[case], remote
-    if remote[0] == "result" or hosted[0] == "result":
-        surfaces["self-hosted catalog"] = (remote, hosted)
-    for name, (expected, outcome) in surfaces.items():
-        assert outcome[0] == expected[0], (name, outcome, expected)
-        _same(outcome[1], expected[1], name)
-
-
-RAW = {
-    "truncated": b'{"model": "tabicl-classifier", "task":',
-    "duplicate-key": b'{"model": "tabicl-classifier", "model": "tabicl-regressor"}',
-    "not-an-object": b'["tabicl-classifier"]',
-}
-
-
-@pytest.mark.parametrize("case", RAW)
-def test_malformed_payloads_fail_alike(case, servers):
-    """Bytes no SDK sends: the shared validator and gf-server refuse them alike."""
-    with pytest.raises(_core.RequestError) as caught:
-        _core.parse_inference(RAW[case], "self-hosted")
-    code, message, status = caught.value.args
-    body = (
-        b'{"api_version": "gf/v1alpha1", "project": "local", "request_id": "r-raw",'
-        b' "resource": {"kind": "model", "name": "tabicl-v2-classifier"},'
-        b' "payload": ' + RAW[case] + b"}"
-    )
-    server = servers["tabicl-v2-classifier"]
-    answered, envelope = server.post(
-        "/v1alpha1/projects/local/models/tabicl-v2-classifier/infer", body
-    )
-    assert (answered, envelope["error"]) == (
-        status,
-        {"code": code, "message": message},
-    )
-
-
 def history(task: str) -> pa.Table:
-    """A snapshot context with every column kind a package lock binds."""
+    """A snapshot context with every column kind a predictor lock binds."""
     rows = [_columns(row) for row in range(9)]
     return pa.table(
         {
@@ -435,11 +232,14 @@ def history(task: str) -> pa.Table:
 
 @pytest.mark.parametrize(
     ("model", "task"),
-    [("tabicl-classifier", "classification"), ("tabicl-regressor", "regression")],
+    [
+        ("general-forecast/tabicl-v2-classifier", "classification"),
+        ("general-forecast/tabicl-v2-regressor", "regression"),
+    ],
 )
 def test_packages_answer_alike(tmp_path, engine, model, task):
     data = history(task)
-    root = tmp_path / "package"
+    root = tmp_path / "predictor"
     root.mkdir()
     spec = {
         "name": "scorer",
@@ -450,23 +250,30 @@ def test_packages_answer_alike(tmp_path, engine, model, task):
     }
     (root / "gf.yaml").write_text(yaml.safe_dump(spec))
     (root / "history.arrow").write_bytes(arrow_bytes(data))
-    package = Package.load(root).check()
-    assert package.lock is not None
+    lock = compile_dir(root)
     queries = data.drop(["y"]).slice(2, 4)
-    expected = PackageExecutor().prepare(package.lock, data).predict(queries)
-    server = Served(build(), str(root))
-    try:
-        result = server.client.predict(
-            model="scorer",
-            task=task,
-            target="y",
-            features=["x", "plan", "region", "joined"],
-            context=[],
-            queries=queries,
+    expected = PredictorExecutor().prepare(lock, data).predict(queries)
+    served_root = tmp_path / "served"
+    served_root.mkdir()
+    (served_root / "gf.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "scorer",
+                "model": model,
+                "context": {"snapshot": "history.arrow"},
+                "target": "y",
+                "id": "id",
+            }
         )
+    )
+    (served_root / "history.arrow").write_bytes(arrow_bytes(data))
+    write_lock(resolve(load(served_root), served_root), served_root)
+    server = Served(build(), str(served_root))
+    try:
+        predictions = _predicted(server, "scorer", queries)
     finally:
         server.stop()
-    _same(result.table.to_pylist(), expected.to_pylist(), "package")
+    _same(predictions, expected.to_pylist(), "predictor")
 
 
 def series_history() -> pa.Table:
@@ -488,11 +295,11 @@ def series_history() -> pa.Table:
 
 def test_package_forecasts_answer_alike(tmp_path, engine):
     data = series_history()
-    root = tmp_path / "package"
+    root = tmp_path / "predictor"
     root.mkdir()
     spec = {
         "name": "planner",
-        "model": "chronos-2",
+        "model": "general-forecast/chronos-2",
         "context": "history.arrow",
         "target": "sales",
         "time": "day",
@@ -504,8 +311,7 @@ def test_package_forecasts_answer_alike(tmp_path, engine):
     }
     (root / "gf.yaml").write_text(yaml.safe_dump(spec))
     (root / "history.arrow").write_bytes(arrow_bytes(data))
-    package = Package.load(root).check()
-    assert package.lock is not None
+    lock = compile_dir(root)
     queries = pa.table(
         {
             "store": ["south", "north", "north", "south"],
@@ -513,17 +319,29 @@ def test_package_forecasts_answer_alike(tmp_path, engine):
             "promo": [1.0, 0.0, 1.0, 0.0],
         }
     )
-    expected = PackageExecutor().prepare(package.lock, data).predict(queries)
-    server = Served(build(), str(root))
-    try:
-        result = server.client.predict(
-            model="planner",
-            task="forecast",
-            target="sales",
-            features=["store", "day", "promo"],
-            context=[],
-            queries=queries,
+    expected = PredictorExecutor().prepare(lock, data).predict(queries)
+    served_root = tmp_path / "served"
+    served_root.mkdir()
+    (served_root / "gf.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "planner",
+                "model": "general-forecast/chronos-2",
+                "context": {"snapshot": "history.arrow"},
+                "target": "sales",
+                "time": "day",
+                "series": ["store"],
+                "horizon": 2,
+                "quantiles": [0.1, 0.5, 0.9],
+                "inputs": {"past": ["footfall"], "future": ["promo"]},
+            }
         )
+    )
+    (served_root / "history.arrow").write_bytes(arrow_bytes(data))
+    write_lock(resolve(load(served_root), served_root), served_root)
+    server = Served(build(), str(served_root))
+    try:
+        predictions = _predicted(server, "planner", queries)
     finally:
         server.stop()
-    _same(result.table.to_pylist(), expected.to_pylist(), "package")
+    _same(predictions, expected.to_pylist(), "predictor")

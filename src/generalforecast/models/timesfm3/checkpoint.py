@@ -45,7 +45,7 @@ PUBLISHED = {
         catalog.ENTRIES[name].artifact.repository,
         catalog.ENTRIES[name].artifact.revision,
     )
-    for name in ("timesfm-3",)
+    for name in ("general-forecast/timesfm-3",)
 }
 
 # Settings every release has, with the values the loader is checked against,
@@ -110,7 +110,7 @@ def timesfm_checkpoint(name: str) -> Path:
     machines without internet. Otherwise it is kept under `~/.cache/generalforecast`.
 
     Args:
-        name: A key of `PUBLISHED`, such as `timesfm-3`.
+        name: A key of `PUBLISHED`, such as `general-forecast/timesfm-3`.
 
     Returns:
         A directory with `config.json` and `model.safetensors`.

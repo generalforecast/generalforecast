@@ -109,7 +109,7 @@ pub struct Bounds {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Gates {
-    pub package: bool,
+    pub predictor: bool,
     pub remote: bool,
     /// Surfaces beyond local that run its `@K` and `*N` variants.
     pub variants: Vec<String>,
@@ -123,13 +123,25 @@ impl Gates {
     }
 }
 
+/// What one call may send a model, as the registry's `Limits` says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Limits {
+    pub context_rows: usize,
+    pub queries: usize,
+    pub inputs: usize,
+}
+
 /// One built-in model.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Entry {
-    /// The canonical name, such as `tabicl-v2-classifier`.
+    /// The canonical id, such as `general-forecast/tabicl-v2-classifier`.
+    pub id: String,
+    /// The short name, such as `tabicl-v2-classifier`: the resource routes name.
     pub name: String,
     pub task: Task,
+    pub limits: Limits,
     /// The `sha256:` digest of its pinned file manifest, if it has one.
     pub digest: Option<String>,
     /// Whether its file hashes are recorded.
@@ -160,8 +172,10 @@ pub struct Catalog {
     /// The most classes a classifier serves through `@K` codes.
     pub max_classes: usize,
     pub policy: Policy,
-    /// Every spelling that resolves to a model: names, repository ids and aliases.
+    /// Each canonical id, to the short name of its model.
     pub names: BTreeMap<String, String>,
+    /// Old spellings (bare names, upstream ids), to the canonical id to use instead.
+    pub aliases: BTreeMap<String, String>,
     pub entries: Vec<Entry>,
 }
 
@@ -194,7 +208,7 @@ pub fn catalog() -> &'static Catalog {
 /// Where a model is served, which decides the gates a reference passes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Surface {
-    /// A caller that has already admitted the model, such as a package lock:
+    /// A caller that has already admitted the model, such as a predictor lock:
     /// no gates, only the serving policy.
     Local,
     /// General Forecast's hosted Models API: remote-qualified, hostable models.
@@ -253,6 +267,30 @@ pub struct Model {
 }
 
 impl Model {
+    /// Its public id: `general-forecast/<name>`, with any variant suffix.
+    #[must_use]
+    pub fn canonical_id(&self) -> String {
+        self.to_string()
+    }
+
+    /// Its public id pinned to the catalog's digest, as results report it.
+    #[must_use]
+    pub fn pinned_id(&self) -> String {
+        match &self.entry.digest {
+            Some(digest) if self.digest.is_none() => {
+                let mut id = format!("{}@{digest}", self.entry.id);
+                if let Some(codes) = &self.codes {
+                    id.push_str(&format!("@{codes}"));
+                }
+                if let Some(estimators) = &self.estimators {
+                    id.push_str(&format!("*{estimators}"));
+                }
+                id
+            }
+            _ => self.canonical_id(),
+        }
+    }
+
     /// Whether it wraps the model in codes or an ensemble.
     #[must_use]
     pub fn variant(&self) -> bool {
@@ -278,9 +316,9 @@ impl Model {
 
 impl fmt::Display for Model {
     /// The canonical spelling, which `generalforecast.models.catalog.parse`
-    /// parses back to the same reference.
+    /// parses back to the same reference: the id, then the pin and variant.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.entry.name)?;
+        f.write_str(&self.entry.id)?;
         if let Some(digest) = &self.digest {
             write!(f, "@{digest}")?;
         }
@@ -377,8 +415,8 @@ fn sorted_names() -> String {
 ///
 /// # Errors
 ///
-/// `InvalidModel` for a malformed spelling or a zero count, `UntrustedModel`
-/// for `module:function` code, `UnknownModel` for no built-in model,
+/// `InvalidModel` for a malformed spelling, a zero count or a colon-separated code path
+/// code, `UnknownModel` for no built-in model,
 /// `ModelMismatch` for a pin to other content, and `UnsupportedCapability`
 /// for a variant the model cannot take.
 pub fn parse(spec: &str) -> Result<Model, RefError> {
@@ -390,7 +428,8 @@ pub fn parse(spec: &str) -> Result<Model, RefError> {
         ),
     };
     let parts = spec
-        .strip_prefix("catalog/")
+        .strip_prefix(&format!("{ORG}/"))
+        .or_else(|| spec.strip_prefix("catalog/"))
         .and_then(spelled)
         .or_else(|| spelled(spec))
         .ok_or_else(invalid)?;
@@ -408,18 +447,30 @@ pub fn parse(spec: &str) -> Result<Model, RefError> {
     }
     if parts.name.contains(':') {
         return Err(RefError {
-            code: "UntrustedModel",
-            message: "module:function models run only in a trusted local process".into(),
+            code: "InvalidModel",
+            message: format!(
+                "`{}` is not a catalog model id; use general-forecast/<name>",
+                parts.name
+            ),
         });
     }
-    let entry = catalog().named(parts.name).ok_or_else(|| RefError {
-        code: "UnknownModel",
-        message: format!(
-            "unknown model {}; built-in models are [{}]",
-            python_repr(parts.name),
-            sorted_names()
-        ),
-    })?;
+    let entry = catalog()
+        .named(&format!("{ORG}/{}", parts.name))
+        .or_else(|| catalog().named(parts.name))
+        .or_else(|| {
+            catalog()
+                .aliases
+                .get(parts.name)
+                .and_then(|canonical| catalog().named(canonical))
+        })
+        .ok_or_else(|| RefError {
+            code: "UnknownModel",
+            message: format!(
+                "unknown model {}; built-in models are [{}]",
+                python_repr(parts.name),
+                sorted_names()
+            ),
+        })?;
     if parts.digest.is_some() && parts.digest != entry.digest.as_deref() {
         return Err(RefError {
             code: "ModelMismatch",
@@ -453,95 +504,13 @@ pub fn parse(spec: &str) -> Result<Model, RefError> {
     Ok(model)
 }
 
-/// Which models a request may name.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Admission<'a> {
-    /// Built-in catalog models alone, as every serving surface takes them.
-    Catalog,
-    /// Also trusted `module:function` code, which only a local process that
-    /// imports it itself runs, such as an estimator's own forecaster.
-    /// `digest` names the code, such as its module file's `sha256:`, so a
-    /// context's fingerprint never outlives the code that encoded it.
-    Trusted { digest: &'a str },
-}
-
-/// What runs a request: a built-in model, or trusted local code by its spec.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Source {
-    Catalog(Model),
-    /// A `module:function` spec and its code's digest; it forecasts, at the
-    /// levels its caller gives.
-    Local {
-        spec: String,
-        digest: String,
-    },
-}
-
-impl Source {
-    /// The task it runs.
-    #[must_use]
-    pub fn task(&self) -> Task {
-        match self {
-            Self::Catalog(model) => model.entry.task,
-            Self::Local { .. } => Task::Forecast,
-        }
-    }
-
-    /// Its spelling and pinned digest, which a context's fingerprint covers.
-    #[must_use]
-    pub fn identity(&self) -> (String, &str) {
-        match self {
-            Self::Catalog(model) => model.identity(),
-            Self::Local { spec, digest } => (spec.clone(), digest),
-        }
-    }
-}
-
-impl fmt::Display for Source {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Catalog(model) => model.fmt(f),
-            Self::Local { spec, .. } => f.write_str(spec),
-        }
-    }
-}
-
-/// What a request's model names, under the models a caller admits.
-///
-/// Only a local caller admits trusted `module:function` code; every serving
-/// surface takes built-in models alone, as `resolve` gates them.
+/// What a request's model names: a built-in model, gated for `surface`.
 ///
 /// # Errors
 ///
-/// `UntrustedModel` (422) for trusted admission beyond a local surface,
-/// `ValidationError` for trusted code without a digest, and otherwise what
-/// `resolve` refuses.
-pub fn admit(
-    spec: Option<&str>,
-    surface: Surface,
-    admission: Admission<'_>,
-) -> Result<Source, RequestError> {
-    if let Admission::Trusted { digest } = admission {
-        if surface != Surface::Local {
-            return Err(RequestError::new(
-                "UntrustedModel",
-                "module:function models run only in a trusted local process",
-                422,
-            ));
-        }
-        if let Some(spec) = spec.filter(|spec| (1..=MAX_TEXT).contains(&spec.chars().count()))
-            && parse(spec).is_err_and(|error| error.code == "UntrustedModel")
-        {
-            if digest.is_empty() {
-                return Err(RequestError::invalid("trusted model code needs its digest"));
-            }
-            return Ok(Source::Local {
-                spec: spec.to_owned(),
-                digest: digest.to_owned(),
-            });
-        }
-    }
-    resolve(spec, surface).map(Source::Catalog)
+/// What `resolve` refuses.
+pub fn admit(spec: Option<&str>, surface: Surface) -> Result<Model, RequestError> {
+    resolve(spec, surface)
 }
 
 /// The model a request names, if the surface may serve it.
@@ -557,12 +526,46 @@ pub fn admit(
 /// The `ServiceError` the Python catalog service raises for the same
 /// reference: `ValidationError`, `ModelNotFound` (404), `ModelMismatch`,
 /// `UnsupportedModel`, `UnsupportedCapability` or `CapacityExceeded`.
+/// The organisation every catalog model id starts with.
+pub const ORG: &str = "general-forecast";
+
+/// A request's model id, which is `general-forecast/<name>` and nothing
+/// else: a bare or `catalog/` spelling is refused with the id to use.
+///
+/// # Errors
+///
+/// `ValidationError` (422) with `param: "model"` and a `hint` for a known
+/// model spelled another way; otherwise as `resolve`.
+pub fn canonical(spec: Option<&str>, surface: Surface) -> Result<Model, RequestError> {
+    let spec = spec
+        .filter(|spec| (1..=MAX_TEXT).contains(&spec.chars().count()))
+        .ok_or_else(|| RequestError::invalid("invalid model").param("model"))?;
+    if let Some(name) = spec.strip_prefix(&format!("{ORG}/"))
+        && !name.is_empty()
+        && !name.starts_with("catalog/")
+    {
+        return resolve(Some(spec), surface).map_err(|error| error.param("model"));
+    }
+    let mut error = RequestError::invalid(format!(
+        "model ids are spelled {ORG}/<name>; {} is not one",
+        python_repr(spec)
+    ))
+    .param("model");
+    let bare = spelled(spec).map_or(spec, |parts| parts.name);
+    if let Some(canonical) = catalog().aliases.get(bare) {
+        error = error.hint(format!("use {canonical}"));
+    } else if let Ok(model) = resolve(Some(&format!("{ORG}/{spec}")), surface) {
+        error = error.hint(format!("use {}", model.canonical_id()));
+    }
+    Err(error)
+}
+
 pub fn resolve(spec: Option<&str>, surface: Surface) -> Result<Model, RequestError> {
     let spec = spec
         .filter(|spec| (1..=MAX_TEXT).contains(&spec.chars().count()))
         .ok_or_else(|| RequestError::invalid("invalid model"))?;
     let model = parse(spec).map_err(|error| match error.code {
-        "UnknownModel" | "UntrustedModel" | "InvalidModel" => {
+        "UnknownModel" | "InvalidModel" => {
             RequestError::new("ModelNotFound", "model is not in the curated catalog", 404)
         }
         code => RequestError::new(code, error.message, 422),

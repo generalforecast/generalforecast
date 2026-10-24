@@ -6,7 +6,7 @@
 Estimator 0 sees the table as it is. Each later one sees its columns in a fixed
 random order and, in classification, its labels shifted by its index, as
 TabICL's own ensembles permute features and shift classes. Estimators combine
-as the model's own package combines them, which its `averaging` property says:
+as the model's own predictor combines them, which its `averaging` property says:
 by decoder outputs postprocessed once, by predictions, or by mixing their
 distributions over regression buckets. Class columns are shifted back first.
 

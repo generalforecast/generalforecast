@@ -36,7 +36,7 @@ def payload(seed: int, rows: int = 256, features: int = 8, queries: int = 32) ->
     labels = context[:, 0] + context[:, 1] > 0
     names = [f"f{index}" for index in range(features)]
     request = {
-        "model": "tabicl-classifier",
+        "model": "general-forecast/tabicl-v2-classifier",
         "task": "classification",
         "target": "y",
         "features": names,

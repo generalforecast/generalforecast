@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Compatibility aliases to the canonical versioned SDK, with no alpha transport."""
+"""Typed values and helpers the hosted SDK clients share."""
 
 import datetime
 import json
@@ -15,9 +15,9 @@ from typing import Any
 import pyarrow as pa
 
 from generalforecast.contracts import (
-    DevSession,
     Environment,
     PredictionResult,
+    PredictorLock,
     Revision,
 )
 from generalforecast.deployments.boundary import (
@@ -27,16 +27,12 @@ from generalforecast.deployments.boundary import (
     Scope,
     json_object,
 )
-from generalforecast.deployments.contracts import VERSION, ServiceError, name, require
-from generalforecast.packages import Package, PackageLock, PythonLock
-from generalforecast.packages.models import describe
-from generalforecast.packages.validation import bytes_digest
-from generalforecast.python_packages.compiler import MAX_ARCHIVE
-from generalforecast.tabular import file_format, read_table, to_arrow
+from generalforecast.deployments.contracts import ServiceError, name, require
+from generalforecast.predictors.lock import read_lock
+from generalforecast.predictors.models import describe
+from generalforecast.tabular import file_format, read_table, table_digest, to_arrow
 
 __all__ = ["AsyncClient", "Client", "SuiteClient", "endpoint"]  # noqa: F822
-
-PYTHON_SOURCE_MEDIA_TYPE = "application/vnd.generalforecast.python-source+tar"
 
 
 @dataclass(frozen=True, eq=False)
@@ -68,15 +64,15 @@ class Snapshot(Mapping[str, Any]):
 
 @dataclass(frozen=True)
 class RevisionDetails:
-    """An immutable revision and its exact content-addressed compiled lock."""
+    """An immutable revision and the exact lock it was pushed from."""
 
     revision: Revision
-    lock: PackageLock | PythonLock
+    lock: PredictorLock
 
 
 @dataclass(frozen=True, eq=False)
 class WriteReceipt(Snapshot):
-    """Durable dataset acceptance, distinct from serving visibility."""
+    """Durable live-context acceptance, distinct from serving visibility."""
 
     @property
     def sequence(self) -> int:
@@ -123,8 +119,8 @@ class BoundSnapshot(Snapshot):
 
 
 @dataclass(frozen=True, eq=False)
-class Deployment(BoundSnapshot):
-    """Immutable deployment metadata with explicit environment operations."""
+class HostedPredictor(BoundSnapshot):
+    """A hosted predictor's facts with explicit environment operations."""
 
     environment: Environment | None = None
 
@@ -136,7 +132,7 @@ class Deployment(BoundSnapshot):
         value: Mapping[str, Any],
         environment: Environment | None = None,
     ):
-        """Captures state without mutating older deployment handles."""
+        """Captures state without mutating older predictor handles."""
         return cls(
             Snapshot.from_dict(value)._encoded, client, name(resource), environment
         )
@@ -151,33 +147,31 @@ class Deployment(BoundSnapshot):
         """Returns reported lifecycle status, preserving pending/error states."""
         return self.environment.status if self.environment else self.get("status")
 
-    def refresh(self) -> "Deployment":
+    def refresh(self) -> "HostedPredictor":
         """Fetches a new snapshot without modifying this handle."""
-        return self._client.deployments.get(
+        return self._client.predictors.get(
             self.name, env=self.environment.name if self.environment else None
         )
 
     def predict(self, queries: Any, **options: Any) -> PredictionResult:
         """Uses the captured environment selection, not a mutable global default."""
         captured_environment(self.environment, options)
-        return self._client.deployments.predict(self.name, queries, **options)
+        return self._client.predictors.predict(self.name, queries, **options)
 
     def wait(self, **options: Any) -> Environment:
         """Waits for the captured pointer by default."""
         captured_environment(self.environment, options, pointer=True)
-        return self._client.deployments.wait(self.name, **options)
+        return self._client.predictors.wait(self.name, **options)
 
     def promote(self, *, revision: int, **options: Any) -> Environment:
         """Promotes under this snapshot's generation when an environment was selected."""
         self._guard(options)
-        return self._client.deployments.promote(self.name, revision=revision, **options)
+        return self._client.predictors.promote(self.name, revision=revision, **options)
 
     def rollback(self, *, revision: int, **options: Any) -> Environment:
         """Rolls back under this snapshot's generation."""
         self._guard(options)
-        return self._client.deployments.rollback(
-            self.name, revision=revision, **options
-        )
+        return self._client.predictors.rollback(self.name, revision=revision, **options)
 
     def _guard(self, options):
         captured_environment(self.environment, options, guard=True)
@@ -185,141 +179,69 @@ class Deployment(BoundSnapshot):
     def metrics(self, **options: Any) -> Snapshot:
         """Fetches actual metrics for the selected environment."""
         captured_environment(self.environment, options)
-        return self._client.deployments.metrics(self.name, **options)
+        return self._client.predictors.metrics(self.name, **options)
 
     def logs(self, **options: Any) -> Snapshot:
         """Fetches bounded runtime logs for the selected environment."""
         captured_environment(self.environment, options)
-        return self._client.deployments.logs(self.name, **options)
+        return self._client.predictors.logs(self.name, **options)
 
     def delete(self) -> Snapshot:
         """Requests deletion; the server owns authorization and cleanup."""
-        return self._client.deployments.delete(self.name)
+        return self._client.predictors.delete(self.name)
 
 
 @dataclass(frozen=True, eq=False)
-class Dataset(BoundSnapshot):
-    """Logical dataset snapshot and explicit append/label/import/refresh actions."""
+class LiveContext(BoundSnapshot):
+    """A live context's facts and explicit append/label/import/refresh actions."""
 
     @property
     def sequence(self) -> int | None:
         """Returns the actual accepted transaction sequence."""
         return self.get("sequence")
 
+    @property
+    def rows(self) -> int | None:
+        """Rows the context holds."""
+        return self.get("rows")
+
     def append(self, data: Any, *, id: str, idempotency_key: str) -> WriteReceipt:
-        """Appends tabular observations without mutating this state snapshot."""
-        return self._client.datasets.append(
+        """Appends rows without mutating this state snapshot."""
+        return self._client.contexts.append(
             self.name, data, id=id, idempotency_key=idempotency_key
         )
 
     def label(
         self, data: Any, *, id: str, column: str, idempotency_key: str
     ) -> WriteReceipt:
-        """Attaches labels using an explicit stable write identity."""
-        return self._client.datasets.label(
+        """Attaches target values using an explicit stable write identity."""
+        return self._client.contexts.label(
             self.name, data, id=id, column=column, idempotency_key=idempotency_key
         )
 
     def import_source(self, reference) -> ImportReceipt:
-        """Binds an import only when its logical dataset matches this handle."""
-        require(reference.dataset == self.name, "import dataset differs from handle")
-        return self._client.datasets.import_source(reference)
+        """Binds an import only when its live context matches this handle."""
+        require(reference.context == self.name, "import context differs from handle")
+        return self._client.contexts.import_source(reference)
 
-    def refresh(self) -> "Dataset":
+    def refresh(self) -> "LiveContext":
         """Explicitly requests provider refresh rather than polling source silently."""
-        return self._client.datasets.refresh(self.name)
+        return self._client.contexts.refresh(self.name)
 
-    def status(self) -> "Dataset":
+    def status(self) -> "LiveContext":
         """Fetches metadata without triggering provider ingestion."""
-        return self._client.datasets.get(self.name)
-
-
-@dataclass(frozen=True, eq=False)
-class Job(BoundSnapshot):
-    """Durable job snapshot; acceptance never implies completion."""
-
-    @property
-    def state(self) -> str:
-        """Returns the actual persisted lifecycle state."""
-        return self["state"]
-
-    def poll(self) -> "Job":
-        """Fetches a fresh job state without modifying this object."""
-        return self._client.jobs.get(self.name)
-
-    def cancel(self) -> "Job":
-        """Cancels remotely; cancelling a local wait does not cancel the job."""
-        return Job.from_response(
-            self._client, self.name, self._client.jobs.control(self.name, "cancel")
-        )
-
-    def wait(self, *, timeout: float = 120, poll_interval: float = 0.2) -> "Job":
-        """Polls with a bounded total deadline and raises for terminal failure."""
-        return self._client.jobs.wait(
-            self.name, timeout=timeout, poll_interval=poll_interval
-        )
-
-    def results(self, *, offset: int = 0, limit: int = 100) -> Snapshot:
-        """Gets one bounded page, retaining every skipped/rejected occurrence."""
-        return Snapshot.from_dict(
-            self._client.jobs.results(self.name, offset=offset, limit=limit)
-        )
+        return self._client.contexts.get(self.name)
 
 
 @dataclass(frozen=True)
-class Development:
-    """Remote development state, isolated from immutable revisions and production."""
-
-    state: DevSession
-    _client: Any = field(repr=False, compare=False)
-
-    @property
-    def id(self) -> str:
-        """Returns the server-created remote session identifier."""
-        return self.state.id
-
-    @property
-    def generation(self) -> int:
-        """Returns the generation required for the next optimistic patch."""
-        return self.state.generation
-
-    def refresh(self) -> "Development":
-        """Fetches a new session snapshot."""
-        return self._client.dev_sessions.get(self.state.deployment, self.id)
-
-    def patch(self, package: Package) -> "Development":
-        """Uploads a full replacement checked package using the captured generation."""
-        return self._client.dev_sessions.patch(self, package)
-
-    def predict(self, queries: Any, **options: Any) -> PredictionResult:
-        """Scores only this development worker, never its production environment."""
-        return self._client.dev_sessions.predict(
-            self.state.deployment, self.id, queries, **options
-        )
-
-    def stop(self) -> "Development":
-        """Stops this development worker without changing a production pointer."""
-        return self._client.dev_sessions.stop(self.state.deployment, self.id)
-
-
-@dataclass(frozen=True, eq=False)
-class Runtime(BoundSnapshot):
-    """Runtime metadata; configuration or a plan is not proof of provisioning."""
-
-    @property
-    def status(self) -> str | None:
-        """Returns provider-reported state, not client-generated readiness."""
-        return self.get("status")
-
-
-@dataclass(frozen=True)
-class DatasetSpec:
-    """Typed existing logical dataset schema and explicit admission bounds."""
+class ContextSpec:
+    """A live context's schema: its inputs, its targets and their types, its bounds."""
 
     name: str
-    features: Sequence[str]
-    targets: Sequence[Sequence[str]]
+    inputs: Sequence[str]
+    targets: Mapping[str, str] | Sequence[Sequence[str]]
     max_rows: int = 1024
+    id: str | None = None
     max_writes: int = 10000
     max_pending_labels: int = 1024
     pending_ttl_seconds: float = 3600
@@ -327,43 +249,28 @@ class DatasetSpec:
     def __post_init__(self) -> None:
         """Copies sequence inputs so caller-owned lists cannot alter the schema."""
         name(self.name)
-        object.__setattr__(self, "features", tuple(self.features))
-        object.__setattr__(self, "targets", tuple(tuple(pair) for pair in self.targets))
+        object.__setattr__(self, "inputs", tuple(self.inputs))
+        targets = (
+            tuple(self.targets.items())
+            if isinstance(self.targets, Mapping)
+            else tuple(tuple(pair) for pair in self.targets)
+        )
+        object.__setattr__(self, "targets", targets)
 
     def to_dict(self) -> JsonObject:
-        """Uses the existing mutation service schema, never a parallel dataset API."""
-        return {
-            "api_version": VERSION,
-            "kind": "dataset",
+        """The `POST /contexts` payload."""
+        value: dict[str, Any] = {
             "name": self.name,
-            "features": list(self.features),
+            "inputs": list(self.inputs),
             "targets": {column: dtype for column, dtype in self.targets},
             "max_rows": self.max_rows,
             "max_writes": self.max_writes,
             "max_pending_labels": self.max_pending_labels,
             "pending_ttl_seconds": self.pending_ttl_seconds,
         }
-
-
-@dataclass(frozen=True)
-class JobSpec:
-    """Typed durable task with a stable caller-owned submission identity."""
-
-    name: str
-    task: str
-    submission_id: str
-    parameters: Snapshot
-
-    def to_dict(self) -> JsonObject:
-        """Builds the canonical durable jobs payload."""
-        return {
-            "api_version": VERSION,
-            "kind": "job",
-            "name": self.name,
-            "task": self.task,
-            "submission_id": self.submission_id,
-            "parameters": self.parameters.to_dict(),
-        }
+        if self.id is not None:
+            value["id"] = self.id
+        return value
 
 
 def envelope(
@@ -449,7 +356,7 @@ def prediction_payload(
 ) -> JsonObject:
     """Keeps queries and context separate; never writes prediction inputs.
 
-    An empty context list or tuple is no context rows, as a snapshot package's
+    An empty context list or tuple is no context rows, as a snapshot predictor's
     request context is, since a table of no columns has none to normalize.
     """
     if features is not None:
@@ -559,86 +466,72 @@ def environment_name(value: str | None, default: str) -> str:
     return name(default if value is None else value)
 
 
-def checked_lock(package: Package) -> PackageLock | PythonLock:
-    """Requires an explicit checked package; frozen verification never upgrades pins."""
-    require(isinstance(package, Package), "push requires a checked Package")
-    return package.compile(frozen=True)
+@dataclass(frozen=True)
+class Pushed:
+    """What `push` sends for a checked predictor: its lock and snapshot rows."""
+
+    lock: PredictorLock
+    snapshot: pa.Table | None = None
+
+    @property
+    def name(self) -> str:
+        """The predictor's name."""
+        return self.lock.name
 
 
-def checked_python_source(package: Package, lock: PythonLock) -> bytes:
-    """Verifies complete source and probe data without importing customer code."""
-    archive = package.source_archive()
-    lock.verify_source(archive)
-    return archive
+def pushed(predictor: "str | Path") -> Pushed:
+    """Reads a checked predictor: a directory with `gf.yaml` and `gf.lock`.
 
-
-def python_source_upload(
-    project: str, deployment: str, archive: bytes, source: str
-) -> JsonObject:
-    """Binds bounded source bytes to their exact project/deployment receipt."""
-    name(project)
-    name(deployment)
-    require(
-        type(archive) is bytes and 0 < len(archive) <= MAX_ARCHIVE,
-        "invalid Python source archive",
-    )
-    require(
-        type(source) is str and bytes_digest(archive) == source,
-        "Python source digest mismatch",
-    )
-    return {
-        "receipt_version": 1,
-        "kind": "python-source",
-        "project": project,
-        "deployment": deployment,
-        "source": source,
-        "size": len(archive),
-    }
-
-
-def python_source_receipt(receipt: JsonObject, expected: JsonObject) -> Snapshot:
-    """Rejects forged, foreign, partial or extended upload admission evidence."""
-    if (
-        type(receipt.get("receipt_version")) is not int
-        or type(receipt.get("size")) is not int
-        or receipt != expected
-    ):
+    Predictors push the `gf.lock` `gf check` wrote and, for a snapshot
+    context, the snapshot rows.
+    """
+    root = Path(predictor)
+    document = read_lock(root)
+    if document is None:
         raise ServiceError(
-            "ProtocolError",
-            "Python source receipt does not match uploaded content",
-            502,
+            "LockRequired", f"no gf.lock in {root}; run `gf check` first", 422
         )
-    return Snapshot.from_dict(receipt)
-
-
-def mutation(
-    data: Any, *, id: str, operation: str, write_id: str, column: str | None = None
-) -> JsonObject:
-    """Adapts tabular append/labels to existing atomic component transactions."""
-    rows = records(data)
-    result = []
-    for row in rows:
+    lock = PredictorLock.from_dict(document)
+    snapshot = None
+    if lock.context_kind == "snapshot":
+        path = lock.context.get("path")
+        require(type(path) is str, "snapshot lock names no context file")
+        assert isinstance(path, str)
+        snapshot = read_table((root / path).read_bytes(), file_format(path))
         require(
-            id in row and type(row[id]) is str and bool(row[id]),
-            "dataset writes require explicit nonempty string IDs",
+            table_digest(snapshot) == lock.data_digest,
+            "snapshot differs from gf.lock; run `gf check` again",
         )
-        if column is None:
-            result.append(
-                {
-                    "key": row[id],
-                    "features": {key: value for key, value in row.items() if key != id},
-                }
-            )
-        else:
-            require(column in row, "label column missing")
-            result.append({"key": row[id], "labels": {column: row[column]}})
-    return json_object(
-        {"write_id": write_id, "operation": operation, "records": result}
-    )
+    return Pushed(lock, snapshot)
+
+
+def append_payload(data: Any, *, id: str, write_id: str) -> JsonObject:
+    """The `/contexts/{name}/append` payload: rows carrying their id column."""
+    rows = []
+    for row in records(data):
+        require(
+            id in row and row[id] not in (None, ""),
+            "live context rows need a nonempty id",
+        )
+        rows.append(dict(row))
+    return json_object({"write_id": write_id, "rows": rows})
+
+
+def label_payload(data: Any, *, id: str, column: str, write_id: str) -> JsonObject:
+    """The `/contexts/{name}/label` payload: one target's values by row id."""
+    labels = []
+    for row in records(data):
+        require(
+            id in row and row[id] not in (None, ""),
+            "live context labels need a nonempty id",
+        )
+        require(column in row, "label column missing")
+        labels.append({"id": row[id], "value": row[column]})
+    return json_object({"write_id": write_id, "target": column, "labels": labels})
 
 
 def inference_result(value: JsonObject) -> PredictionResult:
-    """Decodes the foundation result, not legacy fixture inference outputs."""
+    """Decodes the foundation result, not fixture inference outputs."""
     try:
         return PredictionResult.from_dict(value)
     except (KeyError, TypeError, ValueError):

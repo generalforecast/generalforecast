@@ -10,6 +10,7 @@ import numpy as np
 from huggingface_hub import hf_hub_download
 from jax import Array
 
+from generalforecast.models.catalog import short_name
 from generalforecast.models.checkpoints import (
     converted_checkpoint,
     load_state,
@@ -49,7 +50,10 @@ LIMIX_2 = Published(
     "stable-ai/LimiX-2", "de07b679e74a41b50b9de18251a8fa245e537440", "LimiX-2.ckpt"
 )
 # One file serves both tasks; each converts into its own directory.
-PUBLISHED = {"limix-2-classifier": LIMIX_2, "limix-2-regressor": LIMIX_2}
+PUBLISHED = {
+    "general-forecast/limix-2-classifier": LIMIX_2,
+    "general-forecast/limix-2-regressor": LIMIX_2,
+}
 
 # Settings every release has, with the values the loader is checked against.
 SUPPORTED: dict[str, tuple[Any, ...]] = {
@@ -155,19 +159,20 @@ def read_published(path: Path) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     return settings, stored["state_dict"]
 
 
-def limix_checkpoint(name: str) -> Path:
+def limix_checkpoint(id: str) -> Path:
     """A LimiX checkpoint directory, converted from the published file if missing.
 
     With `GF_CHECKPOINTS` set, the directory must already be there, as on
     machines without internet. Otherwise it is kept under `~/.cache/generalforecast`.
 
     Args:
-        name: A key of `PUBLISHED`, such as `limix-2-classifier`.
+        id: A key of `PUBLISHED`, such as `general-forecast/limix-2-classifier`.
 
     Returns:
         A directory with `config.json` and `model.safetensors`.
     """
-    published = PUBLISHED[name]
+    published = PUBLISHED[id]
+    name = short_name(id)
 
     def convert(directory: Path) -> None:
         path = hf_hub_download(

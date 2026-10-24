@@ -86,9 +86,11 @@ def test_converts_once_into_the_cache(
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
 
     with ThreadPoolExecutor(2) as pool:
-        first, again = pool.map(tabpfn_checkpoint, ["tabpfn-3-classifier"] * 2)
+        first, again = pool.map(
+            tabpfn_checkpoint, ["general-forecast/tabpfn-3-classifier"] * 2
+        )
 
-    revision = checkpoint.PUBLISHED["tabpfn-3-classifier"].revision
+    revision = checkpoint.PUBLISHED["general-forecast/tabpfn-3-classifier"].revision
     assert (
         first
         == again
@@ -111,10 +113,11 @@ def test_offline_directory_must_exist(
     (tmp_path / "tabpfn-3.5-classifier").mkdir()
 
     assert (
-        tabpfn_checkpoint("tabpfn-3.5-classifier") == tmp_path / "tabpfn-3.5-classifier"
+        tabpfn_checkpoint("general-forecast/tabpfn-3.5-classifier")
+        == tmp_path / "tabpfn-3.5-classifier"
     )
     with pytest.raises(FileNotFoundError, match="tabpfn-3-regressor"):
-        tabpfn_checkpoint("tabpfn-3-regressor")
+        tabpfn_checkpoint("general-forecast/tabpfn-3-regressor")
 
 
 @pytest.mark.parametrize("name", sorted(checkpoint.PUBLISHED))
@@ -146,7 +149,7 @@ def test_published_files_convert_exactly(
 def test_catalog_converts_the_published_ckpt(tmp_path: Path) -> None:
     from generalforecast.models import artifacts, catalog
 
-    entry = catalog.entry("tabpfn-3-classifier")
+    entry = catalog.entry("general-forecast/tabpfn-3-classifier")
     (weights,) = (name for name in entry.artifact.files if name.endswith(".ckpt"))
     raw = tmp_path / "raw"
     raw.mkdir()

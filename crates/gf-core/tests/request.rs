@@ -3,7 +3,7 @@
 
 //! The single request validator: parsing, the Models API's refusals and fingerprints.
 
-use gf_core::catalog::{self, Admission, Source, Surface};
+use gf_core::catalog::{self, Surface};
 use gf_core::forecasting::{KNOWN, PAST, TARGET};
 use gf_core::node::Targets;
 use gf_core::request::{
@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 
 fn tabular() -> Value {
     json!({
-        "model": "tabicl-v2-classifier",
+        "model": "general-forecast/tabicl-v2-classifier",
         "task": "classification",
         "target": "outcome",
         "features": ["x", "z"],
@@ -54,7 +54,7 @@ fn forecast() -> Value {
         })
         .collect();
     json!({
-        "model": "chronos-2",
+        "model": "general-forecast/chronos-2",
         "task": "forecast",
         "target": "sales",
         "features": [],
@@ -90,7 +90,10 @@ fn tabular_requests_parse_into_matrices_and_class_codes() {
     let Inference::Tabular(parsed) = parse(&tabular()).unwrap() else {
         panic!("a classification request is tabular");
     };
-    assert_eq!(parsed.model.to_string(), "tabicl-v2-classifier");
+    assert_eq!(
+        parsed.model.to_string(),
+        "general-forecast/tabicl-v2-classifier"
+    );
     assert_eq!(parsed.context, [1.0, 2.0, 3.0, 4.5]);
     assert_eq!(parsed.queries, [2.0, 3.0]);
     assert_eq!(parsed.targets, Targets::Classes(vec![0, 1]));
@@ -120,7 +123,7 @@ fn classes_sort_and_a_boolean_task_always_has_both() {
 #[test]
 fn regressions_select_levels_on_the_models_grid() {
     let mut value = tabular();
-    value["model"] = json!("tabicl-v2-regressor");
+    value["model"] = json!("general-forecast/tabicl-v2-regressor");
     value["task"] = json!("regression");
     value["context"][0]["label"] = json!(10.0);
     value["context"][1]["label"] = json!(11);
@@ -186,7 +189,7 @@ fn requests_are_refused_as_the_models_api_refuses_them() {
         ),
         (
             json!({"queries": []}),
-            ("ValidationError", "query capacity exceeded", 422),
+            ("ValidationError", "queries must not be empty", 422),
         ),
         (
             json!({"queries": {}}),
@@ -196,7 +199,15 @@ fn requests_are_refused_as_the_models_api_refuses_them() {
             json!({"queries": [{"key": "q", "features": {"x": true, "z": 2}}]}),
             (
                 "ValidationError",
-                "feature must be between -1000000000000.0 and 1000000000000.0",
+                "column x must be between -1000000000000.0 and 1000000000000.0",
+                422,
+            ),
+        ),
+        (
+            json!({"queries": [{"key": "q", "features": {"x": "plus", "z": 2}}]}),
+            (
+                "ValidationError",
+                "column x has text values; this route takes numeric inputs",
                 422,
             ),
         ),
@@ -225,7 +236,7 @@ fn requests_are_refused_as_the_models_api_refuses_them() {
             ("ValidationError", "unknown fields", 422),
         ),
         (
-            json!({"model": "tabicl-classifier@9"}),
+            json!({"model": "general-forecast/tabicl-v2-classifier@9"}),
             (
                 "CapacityExceeded",
                 "serving policy allows at most @8 error-correcting codes",
@@ -233,7 +244,7 @@ fn requests_are_refused_as_the_models_api_refuses_them() {
             ),
         ),
         (
-            json!({"model": "tabpfn-3-classifier"}),
+            json!({"model": "general-forecast/tabpfn-3-classifier"}),
             (
                 "UnsupportedModel",
                 "tabpfn-3-classifier is local-only: its license does not permit hosted serving",
@@ -241,7 +252,7 @@ fn requests_are_refused_as_the_models_api_refuses_them() {
             ),
         ),
         (
-            json!({"model": "limix-2-classifier"}),
+            json!({"model": "general-forecast/limix-2-classifier"}),
             (
                 "UnsupportedModel",
                 "limix-2-classifier is local-only: its license does not permit hosted serving",
@@ -275,7 +286,7 @@ fn requests_are_refused_as_the_models_api_refuses_them() {
         "UnsupportedClassCount",
         "ten class slots without @K codes"
     );
-    value["model"] = json!("tabicl-classifier@4");
+    value["model"] = json!("general-forecast/tabicl-v2-classifier@4");
     assert!(parse(&value).is_ok());
 }
 
@@ -403,7 +414,7 @@ fn forecasts_are_refused_as_the_models_api_refuses_them() {
 #[test]
 fn package_contexts_take_loaded_levels_and_skip_request_bounds() {
     let mut value = forecast();
-    value["model"] = json!("timesfm-3");
+    value["model"] = json!("general-forecast/timesfm-3");
     value["options"]["series"]["quantiles"] = json!([0.25]);
     let payload = serde_json::to_vec(&value).unwrap();
     let refused = request::parse(&payload, &Options::request(Surface::Remote)).unwrap_err();
@@ -411,9 +422,8 @@ fn package_contexts_take_loaded_levels_and_skip_request_bounds() {
     let levels = [0.1, 0.5, 0.9];
     let options = Options {
         surface: Surface::Local,
-        limits: Limits::Package,
+        limits: Limits::Predictor,
         levels: Some(&levels),
-        admission: Admission::Catalog,
     };
     assert_eq!(
         request::parse(&payload, &options).unwrap_err().code,
@@ -437,7 +447,7 @@ fn fingerprints_follow_the_context_and_model_only() {
     let mut context = tabular();
     context["context"][0]["features"]["x"] = json!(-1);
     let mut model = tabular();
-    model["model"] = json!("tabicl-v2-classifier@2");
+    model["model"] = json!("general-forecast/tabicl-v2-classifier@2");
     assert_eq!(base, print(&queries));
     assert_eq!(base, print(&keys));
     assert_ne!(base, print(&context));
@@ -481,21 +491,34 @@ fn references_resolve_with_their_surfaces_gates() {
         Surface::Remote,
     )
     .unwrap();
-    assert_eq!(model.to_string(), "tabicl-v2-classifier@4*2");
+    assert_eq!(
+        model.to_string(),
+        "general-forecast/tabicl-v2-classifier@4*2"
+    );
     assert_eq!(model.capacity(), catalog::catalog().max_classes);
     let refused = |spec: &str, surface| catalog::resolve(Some(spec), surface).unwrap_err();
     assert_eq!(
-        refused("tabpfn-3-classifier@4", Surface::SelfHosted).code,
+        refused(
+            "general-forecast/tabpfn-3-classifier@4",
+            Surface::SelfHosted
+        )
+        .code,
         "UnsupportedCapability"
     );
     assert_eq!(
-        refused("limix-2-classifier", Surface::SelfHosted).message,
+        refused("general-forecast/limix-2-classifier", Surface::SelfHosted).message,
         "limix-2-classifier has no pinned files"
     );
-    assert!(catalog::resolve(Some("tabpfn-3-classifier"), Surface::SelfHosted).is_ok());
-    assert!(catalog::resolve(Some("timesfm-3"), Surface::Local).is_ok());
+    assert!(
+        catalog::resolve(
+            Some("general-forecast/tabpfn-3-classifier"),
+            Surface::SelfHosted
+        )
+        .is_ok()
+    );
+    assert!(catalog::resolve(Some("general-forecast/timesfm-3"), Surface::Local).is_ok());
     assert_eq!(
-        refused("tabicl-classifier@4*8", Surface::Local).code,
+        refused("general-forecast/tabicl-v2-classifier@4*8", Surface::Local).code,
         "CapacityExceeded"
     );
     assert_eq!(
@@ -515,104 +538,16 @@ fn quoted_input_is_spelled_as_python_repr_spells_it() {
     );
 }
 
-const CODE: &str = "sha256:code";
-
 #[test]
 fn fingerprints_are_pinned_so_changing_them_is_deliberate() {
     let tabular = request::hex(&parse(&tabular()).unwrap().fingerprint());
     let forecast = request::hex(&parse(&forecast()).unwrap().fingerprint());
     assert_eq!(
         tabular,
-        "f1da5df46a674260e0d1aba77d2185e7f9e8c90bd71b1972041cf4aa22e817f3"
+        "8663745ec9febf834bb85ebe0a721f5140b4b6f27194e4018e83aa46201f9258"
     );
     assert_eq!(
         forecast,
-        "e67deb0b628634811d1c1d7cfa643e33ac8f4b61c40e2eecf1d2599d9318a0fb"
-    );
-}
-
-#[test]
-fn only_a_local_caller_admits_trusted_forecasters() {
-    let spec = "tests.models.chronos2.tiny:forecaster";
-    let mut value = forecast();
-    value["model"] = json!(spec);
-    let levels: Vec<f64> = value["options"]["series"]["quantiles"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|level| level.as_f64().unwrap())
-        .collect();
-    let payload = serde_json::to_vec(&value).unwrap();
-    let local = Options {
-        surface: Surface::Local,
-        limits: Limits::Package,
-        levels: Some(&levels),
-        admission: Admission::Catalog,
-    };
-    for surface in [Surface::Remote, Surface::SelfHosted] {
-        let refused = |admission| {
-            let options = Options {
-                surface,
-                admission,
-                ..local
-            };
-            request::parse(&payload, &options).unwrap_err().code
-        };
-        assert_eq!(refused(Admission::Catalog), "ModelNotFound");
-        assert_eq!(
-            refused(Admission::Trusted { digest: CODE }),
-            "UntrustedModel"
-        );
-        let served = request::parse(&payload, &Options::request(surface));
-        assert_eq!(served.unwrap_err().code, "ModelNotFound");
-    }
-    assert_eq!(
-        request::parse(&payload, &local).unwrap_err().code,
-        "ModelNotFound"
-    );
-    let trusted = Options {
-        admission: Admission::Trusted { digest: CODE },
-        ..local
-    };
-    let Inference::Forecast(parsed) = request::parse(&payload, &trusted).unwrap() else {
-        panic!("expected a forecast");
-    };
-    assert_eq!(
-        parsed.model,
-        Source::Local {
-            spec: spec.into(),
-            digest: CODE.into(),
-        }
-    );
-    let edited = Options {
-        admission: Admission::Trusted {
-            digest: "sha256:edited",
-        },
-        ..trusted
-    };
-    let edited = request::parse(&payload, &edited).unwrap();
-    assert_ne!(edited.fingerprint(), parsed.fingerprint);
-    let undigested = Options {
-        admission: Admission::Trusted { digest: "" },
-        ..trusted
-    };
-    assert_eq!(
-        request::parse(&payload, &undigested).unwrap_err().code,
-        "ValidationError"
-    );
-    let unleveled = Options {
-        levels: None,
-        ..trusted
-    };
-    assert_eq!(
-        request::parse(&payload, &unleveled).unwrap_err().code,
-        "ValidationError"
-    );
-    let mut value = tabular();
-    value["model"] = json!("tests.models.tabicl.tiny:classifier");
-    let payload = serde_json::to_vec(&value).unwrap();
-    assert_eq!(
-        request::parse(&payload, &trusted).unwrap_err().code,
-        "UnsupportedTask"
+        "c656ac66b7e8e55c8484e363ce672cfaafe232b6870f2a7f9f9514d454b3d263"
     );
 }

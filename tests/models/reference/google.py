@@ -20,7 +20,7 @@ from generalforecast.models.timesfm3.checkpoint import (
 )
 from generalforecast.models.timesfm3.model import timesfm_functions
 
-NAME = "timesfm-3"
+NAME = "general-forecast/timesfm-3"
 # Two targets, a past-only covariate and a known covariate over 700 steps,
 # which is not whole patches; or one target that starts after 40 unobserved
 # steps, so its first patch is never a key.

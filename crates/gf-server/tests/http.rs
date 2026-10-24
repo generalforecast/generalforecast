@@ -133,7 +133,7 @@ fn served() -> ServedModel {
         outputs: vec!["label".to_string(), "probabilities".to_string()],
         description: json!({"name": "tabicl-v2-classifier", "artifact": {"license": "BSD-3-Clause"}}),
         license_source: None,
-        package: None,
+        predictor: None,
     }
 }
 
@@ -158,14 +158,25 @@ async fn front(keys: Box<dyn KeyStore>, ready: bool) -> Arc<Front> {
 
 fn envelope(resource: &str, payload: &Value) -> Value {
     json!({
-        "api_version": "gf/v1alpha1",
+        "api_version": "gf/v1",
         "project": "local",
         "request_id": "r-test",
-        "resource": {"kind": "model", "name": resource},
+        "resource": {"kind": if resource == "ad-hoc" { "predictor" } else { "model" }, "name": resource},
         "payload": payload,
     })
 }
 
+fn adhoc_payload() -> Value {
+    json!({
+        "model": "general-forecast/tabicl-v2-classifier",
+        "target": "y",
+        "inputs": ["x"],
+        "context": [{"x": 0.0, "y": false}, {"x": 3.0, "y": true}],
+        "queries": [{"x": 1.5}],
+    })
+}
+
+#[allow(dead_code)]
 fn infer_payload() -> Value {
     json!({
         "model": "tabicl-classifier",
@@ -222,63 +233,68 @@ async fn call(
 async fn health_readiness_and_the_hosted_headers() {
     let waiting = front(Box::new(Static::new(None)), false).await;
     let (status, headers, body) = call(&waiting, "GET", "/livez", None, &[]).await;
-    assert_eq!((status, body), (StatusCode::OK, json!({"live": true})));
+    assert_eq!((status, body), (StatusCode::OK, json!({"status": "ok"})));
     assert_eq!(headers["cache-control"], "no-store");
     assert_eq!(headers["x-content-type-options"], "nosniff");
     assert_eq!(headers["content-type"], "application/json; charset=utf-8");
-    let (status, _, body) = call(&waiting, "GET", "/readyz", None, &[]).await;
-    assert_eq!(
-        (status, body),
-        (StatusCode::SERVICE_UNAVAILABLE, json!({"ready": false}))
-    );
-    let (status, _, body) = call(
-        &waiting,
-        "GET",
-        "/v1alpha1/projects/local/models",
-        None,
-        &[],
-    )
-    .await;
+    // Health and readiness both say the models are not ready until the
+    // shards are up and their programs compiled.
+    for probe in ["/healthz", "/readyz"] {
+        let (status, _, body) = call(&waiting, "GET", probe, None, &[]).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{probe}");
+        assert_eq!(body["error"]["code"], "ModelNotReady", "{probe}");
+        assert!(body["error"]["message"].is_string(), "{probe}");
+    }
+    let (status, _, body) = call(&waiting, "GET", "/v1/projects/local/models", None, &[]).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(body["error"]["code"], "NotReady");
+    assert_eq!(body["error"]["code"], "ModelNotReady");
     assert_eq!(body["project"], "local");
     let ready = front(Box::new(Static::new(None)), true).await;
-    let (status, _, body) = call(&ready, "GET", "/healthz", None, &[]).await;
-    assert_eq!((status, body), (StatusCode::OK, json!({"live": true})));
-    let (status, _, body) = call(&ready, "GET", "/readyz", None, &[]).await;
-    assert_eq!((status, body), (StatusCode::OK, json!({"ready": true})));
+    for probe in ["/healthz", "/readyz"] {
+        let (status, _, body) = call(&ready, "GET", probe, None, &[]).await;
+        assert_eq!(
+            (status, body),
+            (StatusCode::OK, json!({"status": "ok"})),
+            "{probe}"
+        );
+    }
+    let (status, _, body) = call(&ready, "GET", "/livez", None, &[]).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({"status": "ok"})));
 }
 
 #[tokio::test]
 async fn models_are_listed_and_described_in_envelopes() {
     let front = front(Box::new(Static::new(None)), true).await;
-    let (status, _, body) =
-        call(&front, "GET", "/v1alpha1/projects/team-a/models", None, &[]).await;
+    let (status, _, body) = call(&front, "GET", "/v1/projects/team-a/models", None, &[]).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["api_version"], "gf/v1alpha1");
+    assert_eq!(body["api_version"], "gf/v1");
     assert_eq!(body["project"], "team-a");
     assert_eq!(body["resource"], json!({"kind": "model", "name": "models"}));
-    assert_eq!(body["result"], json!({"models": [served().description]}));
+    let described = &body["result"]["models"][0];
+    assert_eq!(described["name"], "tabicl-v2-classifier");
+    assert_eq!(described["model"], served().resolved);
+    assert_eq!(described["artifact"], served().description["artifact"]);
+    let policy = &gf_core::catalog::catalog().policy;
+    assert_eq!(
+        described["limits"],
+        json!({"context_rows": policy.context_rows, "queries": policy.query_rows, "inputs": policy.features})
+    );
+    assert_eq!(described["warm_shapes"], json!([]));
+    assert_eq!(body["result"]["models"].as_array().unwrap().len(), 1);
     assert!(body["request_id"].as_str().unwrap().starts_with("r-"));
-    let path = "/v1alpha1/projects/local/models/tabicl-v2-classifier";
+    let path = "/v1/projects/local/models/tabicl-v2-classifier";
     let (status, _, body) = call(&front, "GET", path, None, &[("x-gf-request-id", "r-1")]).await;
     assert_eq!(
         (status, &body["request_id"]),
         (StatusCode::OK, &json!("r-1"))
     );
-    assert_eq!(body["result"], served().description);
-    let (status, _, body) = call(
-        &front,
-        "GET",
-        "/v1alpha1/projects/local/models/other",
-        None,
-        &[],
-    )
-    .await;
+    assert_eq!(body["result"]["name"], "tabicl-v2-classifier");
+    assert!(body["result"]["limits"].is_object());
+    let (status, _, body) = call(&front, "GET", "/v1/projects/local/models/other", None, &[]).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert_eq!(
         body["error"],
-        json!({"code": "ModelNotFound", "message": "model is not served here"})
+        json!({"code": "NotFound", "message": "model is not served here"})
     );
 }
 
@@ -288,7 +304,7 @@ async fn unknown_routes_methods_and_names_get_the_apis_errors() {
     let cases = [
         (
             "GET",
-            "/v1alpha1/projects/local/jobs",
+            "/v1/projects/local/nothing",
             404,
             "NotFound",
             "route not found",
@@ -296,21 +312,21 @@ async fn unknown_routes_methods_and_names_get_the_apis_errors() {
         ("GET", "/elsewhere", 404, "NotFound", "route not found"),
         (
             "DELETE",
-            "/v1alpha1/projects/local/models",
+            "/v1/projects/local/models",
             405,
             "MethodNotAllowed",
             "only GET and POST are supported",
         ),
         (
             "GET",
-            "/v1alpha1/projects/Local/models",
+            "/v1/projects/Local/models",
             422,
             "ValidationError",
             "invalid name",
         ),
         (
             "GET",
-            "/v1alpha1/projects/local/models?x=1",
+            "/v1/projects/local/models?x=1",
             422,
             "ValidationError",
             "query parameters are not supported",
@@ -328,7 +344,7 @@ async fn unknown_routes_methods_and_names_get_the_apis_errors() {
     let (status, _, body) = call(
         &front,
         "GET",
-        "/v1alpha1/projects/local/models",
+        "/v1/projects/local/models",
         None,
         &[("x-gf-project", "other")],
     )
@@ -338,7 +354,7 @@ async fn unknown_routes_methods_and_names_get_the_apis_errors() {
     let (status, _, body) = call(
         &front,
         "GET",
-        "/v1alpha1/projects/local/models",
+        "/v1/projects/local/models",
         None,
         &[("origin", "http://evil.example")],
     )
@@ -352,19 +368,19 @@ async fn unknown_routes_methods_and_names_get_the_apis_errors() {
 #[tokio::test]
 async fn envelopes_must_match_their_routes() {
     let front = front(Box::new(Static::new(None)), true).await;
-    let path = "/v1alpha1/projects/local/models/tabicl-v2-classifier/infer";
-    let mut wrong_project = envelope("tabicl-v2-classifier", &infer_payload());
+    let path = "/v1/projects/local/predict";
+    let mut wrong_project = envelope("ad-hoc", &adhoc_payload());
     wrong_project["project"] = json!("other");
-    let mut wrong_version = envelope("tabicl-v2-classifier", &infer_payload());
+    let mut wrong_version = envelope("ad-hoc", &adhoc_payload());
     wrong_version["api_version"] = json!("gf/v0");
-    let mut extra = envelope("tabicl-v2-classifier", &infer_payload());
+    let mut extra = envelope("ad-hoc", &adhoc_payload());
     extra["more"] = json!(1);
     let cases = [
         (wrong_project, "project path/envelope mismatch", false),
         (wrong_version, "unsupported api_version", false),
         (extra, "unknown fields", false),
         (
-            envelope("other", &infer_payload()),
+            envelope("other", &adhoc_payload()),
             "resource route/envelope mismatch",
             true,
         ),
@@ -379,28 +395,13 @@ async fn envelopes_must_match_their_routes() {
             "{message}"
         );
     }
-    // A request the catalog accepts, for another model than the route's.
-    let mut payload = infer_payload();
-    payload["model"] = json!("tabpfn-3-classifier");
-    let (status, _, answer) = call(
-        &front,
-        "POST",
-        path,
-        Some(&envelope("tabicl-v2-classifier", &payload)),
-        &[],
-    )
-    .await;
-    assert_eq!(
-        (status.as_u16(), &answer["error"]["message"]),
-        (422, &json!("model route mismatch"))
-    );
 }
 
 #[tokio::test]
 async fn ambiguous_and_oversized_bodies_are_refused() {
     let front = front(Box::new(Static::new(None)), true).await;
-    let path = "/v1alpha1/projects/local/models/tabicl-v2-classifier/infer";
-    let duplicated = r#"{"api_version":"gf/v1alpha1","api_version":"gf/v1alpha1"}"#;
+    let path = "/v1/projects/local/predict";
+    let duplicated = r#"{"api_version":"gf/v1","api_version":"gf/v1"}"#;
     let request = Request::builder()
         .method("POST")
         .uri(path)
@@ -433,7 +434,7 @@ async fn ambiguous_and_oversized_bodies_are_refused() {
 #[tokio::test]
 async fn a_static_key_is_required_once_configured() {
     let front = front(Box::new(Static::new(Some(KEY))), true).await;
-    let path = "/v1alpha1/projects/local/models";
+    let path = "/v1/projects/local/models";
     let (status, _, body) = call(&front, "GET", path, None, &[]).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     assert_eq!(body["error"]["message"], "application bearer required");
@@ -458,13 +459,13 @@ async fn a_static_key_is_required_once_configured() {
 async fn a_scoped_static_key_reaches_only_its_project_and_permissions() {
     let principal = Principal {
         project: Some("local".to_string()),
-        permissions: Some(vec!["models:infer".to_string()]),
+        permissions: Some(vec!["predictors:predict".to_string()]),
     };
     let front = front(Box::new(Static::scoped(Some(KEY), principal)), true).await;
     let bearer = format!("Bearer {KEY}");
     let authorized = [("authorization", bearer.as_str())];
-    let infer = envelope("tabicl-v2-classifier", &infer_payload());
-    let path = "/v1alpha1/projects/local/models/tabicl-v2-classifier/infer";
+    let infer = envelope("ad-hoc", &adhoc_payload());
+    let path = "/v1/projects/local/predict";
     let (status, _, body) = call(&front, "POST", path, Some(&infer), &[]).await;
     assert_eq!(
         (status, &body["error"]["code"]),
@@ -475,7 +476,7 @@ async fn a_scoped_static_key_reaches_only_its_project_and_permissions() {
     let (status, _, body) = call(
         &front,
         "GET",
-        "/v1alpha1/projects/local/models",
+        "/v1/projects/local/models",
         None,
         &authorized,
     )
@@ -492,7 +493,7 @@ async fn a_scoped_static_key_reaches_only_its_project_and_permissions() {
     let (status, _, body) = call(
         &front,
         "POST",
-        "/v1alpha1/projects/other/models/tabicl-v2-classifier/infer",
+        "/v1/projects/other/predict",
         Some(&elsewhere),
         &authorized,
     )
@@ -511,7 +512,7 @@ async fn an_endpoint_front_answers_only_its_host_and_no_browser() {
             .expect("one owner")
             .with_hosts(vec!["127.0.0.1:8000".to_string()]),
     );
-    let path = "/v1alpha1/projects/local/models";
+    let path = "/v1/projects/local/models";
     let (status, _, _) = call(&endpoint, "GET", path, None, &[]).await;
     assert_eq!(status, StatusCode::OK);
     for (headers, message) in [
@@ -544,75 +545,130 @@ async fn an_endpoint_front_answers_only_its_host_and_no_browser() {
 }
 
 #[tokio::test]
-async fn inference_answers_from_the_contexts_ephemeral_table() {
-    let front = front(Box::new(Static::new(None)), true).await;
-    let path = "/v1alpha1/projects/local/models/tabicl-v2-classifier/infer";
-    let body = envelope("tabicl-v2-classifier", &infer_payload());
-    let (status, _, answer) = call(&front, "POST", path, Some(&body), &[]).await;
-    assert_eq!(status, StatusCode::OK, "{answer}");
-    let result = &answer["result"];
-    assert_eq!(result["task"], "classification");
-    assert_eq!(
-        result["outputs"],
-        json!([{"key": "q", "probabilities": {"false": 0.25, "true": 0.25}}])
-    );
-    assert_eq!(
-        result["artifact"],
-        json!({"license": "BSD-3-Clause", "verified": true})
-    );
-    assert_eq!(
-        result["context_provenance"],
-        json!({
-            "source": "request", "supplied_rows": 2, "usable_labeled_rows": 2,
-            "features": ["x"], "target": "y", "persisted": false, "classes": [false, true],
-        })
-    );
-    // The validator's errors keep the hosted codes, inside the envelope.
-    let mut payload = infer_payload();
-    payload["task"] = json!("regression");
-    let (status, _, answer) = call(
-        &front,
-        "POST",
-        path,
-        Some(&envelope("tabicl-v2-classifier", &payload)),
-        &[],
-    )
-    .await;
-    assert_eq!(status.as_u16(), 422);
-    assert_eq!(answer["error"]["code"], "UnsupportedTask");
-    assert_eq!(answer["request_id"], "r-test");
-}
-
-#[tokio::test]
-async fn predictions_bind_flat_rows_and_answer_a_prediction_result() {
+async fn the_ad_hoc_route_binds_flat_rows_and_answers_a_prediction_result() {
     let front = front(Box::new(Static::new(None)), true).await;
     let payload = json!({
-        "model": "tabicl-classifier",
-        "task": "classification",
+        "model": "general-forecast/tabicl-v2-classifier",
         "target": "y",
-        "features": ["x"],
+        "inputs": ["x"],
+        "id": "id",
         "context": [{"x": 0.0, "y": false}, {"x": 3.0, "y": true}, {"x": 1.0, "y": null}],
         "queries": [{"id": "a", "x": 1.5}],
-        "options": {"id": "id"},
     });
-    let path = "/v1alpha1/projects/local/predictions";
+    let path = "/v1/projects/local/predict";
     let (status, _, answer) = call(
         &front,
         "POST",
         path,
-        Some(&envelope("predictions", &payload)),
+        Some(&envelope("ad-hoc", &payload)),
         &[],
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{answer}");
     let result = &answer["result"];
     assert_eq!(result["model"], served().resolved);
+    assert_eq!(result["task"], "classification");
     assert_eq!(result["context"]["rows"], 2);
-    assert_eq!(result["context"]["source"], "request");
+    assert_eq!(result["context"]["kind"], "request");
+    assert!(result["context"]["as_of"].is_number());
+    assert!(result.get("deployment").is_none());
     assert_eq!(
         result["predictions"],
         json!([{"id": "a", "label": false, "probabilities": {"false": 0.25, "true": 0.25}}])
     );
+    // Inputs default to every column of the first context row but the
+    // target and the id.
+    let mut implicit = payload.clone();
+    implicit.as_object_mut().unwrap().remove("inputs");
+    implicit["context"][0]["id"] = json!("c");
+    let (status, _, answer) = call(
+        &front,
+        "POST",
+        path,
+        Some(&envelope("ad-hoc", &implicit)),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+}
+
+#[tokio::test]
+async fn the_ad_hoc_route_refuses_bare_model_ids_and_retired_fields_by_name() {
+    let front = front(Box::new(Static::new(None)), true).await;
+    let path = "/v1/projects/local/predict";
+    let good = json!({
+        "model": "general-forecast/tabicl-v2-classifier",
+        "target": "y",
+        "inputs": ["x"],
+        "context": [{"x": 0.0, "y": false}, {"x": 3.0, "y": true}],
+        "queries": [{"x": 1.5}],
+    });
+    let mut bare = good.clone();
+    bare["model"] = json!("tabicl-v2-classifier");
+    let (status, _, body) = call(&front, "POST", path, Some(&envelope("ad-hoc", &bare)), &[]).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "ValidationError");
+    assert_eq!(body["error"]["param"], "model");
+    assert_eq!(
+        body["error"]["hint"],
+        "use general-forecast/tabicl-v2-classifier"
+    );
+    for (field, value) in [
+        ("task", json!("classification")),
+        ("options", json!({})),
+        ("features", json!(["x"])),
+        ("horizon", json!(3)),
+    ] {
+        let mut payload = good.clone();
+        payload[field] = value;
+        let (status, _, body) = call(
+            &front,
+            "POST",
+            path,
+            Some(&envelope("ad-hoc", &payload)),
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}: {body}");
+        assert_eq!(body["error"]["param"], field, "{body}");
+    }
+    // A text column is named, with the rule.
+    let mut text = good.clone();
+    text["context"][0]["x"] = json!("low");
+    let (status, _, body) = call(&front, "POST", path, Some(&envelope("ad-hoc", &text)), &[]).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        "column x has text values; this route takes numeric inputs"
+    );
+    assert_eq!(body["error"]["param"], "inputs.x");
+    // Too many queries carry the limit, what was sent, and the model.
+    let policy = &gf_core::catalog::catalog().policy;
+    let mut many = good.clone();
+    many["queries"] = json!(vec![json!({"x": 1.5}); policy.query_rows + 1]);
+    let (status, _, body) = call(&front, "POST", path, Some(&envelope("ad-hoc", &many)), &[]).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["code"], "CapacityExceeded");
+    assert_eq!(body["error"]["limit"], policy.query_rows);
+    assert_eq!(body["error"]["actual"], policy.query_rows + 1);
+    assert!(body["error"]["hint"].is_string());
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("tabicl-v2-classifier"),
+        "{body}"
+    );
+    // The old route is gone.
+    let (status, _, body) = call(
+        &front,
+        "POST",
+        "/v1/projects/local/predictions",
+        Some(&envelope("predictions", &good)),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 }
 
 #[tokio::test]
@@ -627,7 +683,7 @@ async fn introspected_keys_are_scoped_to_their_project_and_cached() {
     let counter = asked.clone();
     let good = request_digest(KEY);
     let plane = axum::Router::new().route(
-        "/internal/v1alpha1/keys:introspect",
+        "/internal/v1/keys:introspect",
         post(move |headers: axum::http::HeaderMap, Json(body): Json<Value>| {
             let counter = counter.clone();
             let good = good.clone();
@@ -649,60 +705,33 @@ async fn introspected_keys_are_scoped_to_their_project_and_cached() {
     let front = front(Box::new(keys), true).await;
     let bearer = format!("Bearer {KEY}");
     let auth = [("authorization", bearer.as_str())];
-    let (status, _, _) = call(
-        &front,
-        "GET",
-        "/v1alpha1/projects/team-a/models",
-        None,
-        &auth,
-    )
-    .await;
+    let (status, _, _) = call(&front, "GET", "/v1/projects/team-a/models", None, &auth).await;
     assert_eq!(status, StatusCode::OK);
-    let (status, _, _) = call(
-        &front,
-        "GET",
-        "/v1alpha1/projects/team-a/models",
-        None,
-        &auth,
-    )
-    .await;
+    let (status, _, _) = call(&front, "GET", "/v1/projects/team-a/models", None, &auth).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         asked.load(Ordering::SeqCst),
         1,
         "the second call is answered from the cache"
     );
-    let (status, _, body) = call(
-        &front,
-        "GET",
-        "/v1alpha1/projects/team-b/models",
-        None,
-        &auth,
-    )
-    .await;
+    let (status, _, body) = call(&front, "GET", "/v1/projects/team-b/models", None, &auth).await;
     assert_eq!(
         (status, &body["error"]["code"]),
         (StatusCode::FORBIDDEN, &json!("Forbidden"))
     );
-    let path = "/v1alpha1/projects/team-a/models/tabicl-v2-classifier/infer";
-    let mut body = envelope("tabicl-v2-classifier", &infer_payload());
+    let path = "/v1/projects/team-a/predict";
+    let mut body = envelope("ad-hoc", &adhoc_payload());
     body["project"] = json!("team-a");
     let (status, _, _) = call(&front, "POST", path, Some(&body), &auth).await;
     assert_eq!(
         status,
         StatusCode::FORBIDDEN,
-        "reading models does not grant inference"
+        "reading models does not grant prediction"
     );
     let wrong = [("authorization", "Bearer other-key")];
     for _ in 0..2 {
-        let (status, _, body) = call(
-            &front,
-            "GET",
-            "/v1alpha1/projects/team-a/models",
-            None,
-            &wrong,
-        )
-        .await;
+        let (status, _, body) =
+            call(&front, "GET", "/v1/projects/team-a/models", None, &wrong).await;
         assert_eq!(
             (status, &body["error"]["message"]),
             (StatusCode::UNAUTHORIZED, &json!("invalid API key"))
@@ -729,7 +758,7 @@ async fn a_refused_service_token_is_unavailable_and_never_cached() {
     let asked = Arc::new(AtomicUsize::new(0));
     let counter = asked.clone();
     let plane = axum::Router::new().route(
-        "/internal/v1alpha1/keys:introspect",
+        "/internal/v1/keys:introspect",
         post(move || {
             let counter = counter.clone();
             async move {
@@ -749,14 +778,8 @@ async fn a_refused_service_token_is_unavailable_and_never_cached() {
     let bearer = format!("Bearer {KEY}");
     let auth = [("authorization", bearer.as_str())];
     for _ in 0..2 {
-        let (status, _, body) = call(
-            &front,
-            "GET",
-            "/v1alpha1/projects/team-a/models",
-            None,
-            &auth,
-        )
-        .await;
+        let (status, _, body) =
+            call(&front, "GET", "/v1/projects/team-a/models", None, &auth).await;
         assert_eq!(
             (status, &body["error"]["code"]),
             (
@@ -772,9 +795,9 @@ async fn a_refused_service_token_is_unavailable_and_never_cached() {
     );
 }
 
-/// A locked package of `x` predicting `y`, its queries named by `id`.
-fn package_model(name: &str, context: &str, snapshot: Option<&std::path::Path>) -> ServedModel {
-    let package = json!({
+/// A locked predictor of `x` predicting `y`, its queries named by `id`.
+fn predictor_model(name: &str, context: &str, snapshot: Option<&std::path::Path>) -> ServedModel {
+    let predictor = json!({
         "schema": {
             "columns": [
                 {"name": "id", "type": "string", "nullable": false, "role": "id", "semantic": null},
@@ -787,12 +810,12 @@ fn package_model(name: &str, context: &str, snapshot: Option<&std::path::Path>) 
         },
         "task": "classification",
         "target": "y",
-        "features": ["x"],
+        "inputs": ["x"],
         "id": "id",
         "context": context,
         "quantiles": [],
-        "data_digest": "sha256:data",
-        "package_digest": format!("sha256:{name}"),
+        "context_digest": "sha256:data",
+        "lock_digest": format!("sha256:{name}"),
         "snapshot": snapshot,
     });
     ServedModel {
@@ -801,9 +824,9 @@ fn package_model(name: &str, context: &str, snapshot: Option<&std::path::Path>) 
         worker: "tiny".to_string(),
         resolved: "general-forecast/tabicl-v2-classifier@5fb6a4c".to_string(),
         outputs: vec!["label".to_string(), "probabilities".to_string()],
-        description: json!({"name": name, "kind": "package"}),
+        description: json!({"name": name, "kind": "predictor"}),
         license_source: None,
-        package: Some(serde_json::from_value(package).unwrap()),
+        predictor: Some(serde_json::from_value(predictor).unwrap()),
     }
 }
 
@@ -827,7 +850,7 @@ fn snapshot_file() -> std::path::PathBuf {
     path
 }
 
-async fn package_front(model: ServedModel) -> Arc<Front> {
+async fn predictor_front(model: ServedModel) -> Arc<Front> {
     let front = Arc::new(Front::new(
         vec![model],
         Box::new(Static::new(None)),
@@ -844,94 +867,149 @@ async fn package_front(model: ServedModel) -> Arc<Front> {
     front
 }
 
-fn package_payload(model: &str, context: Value, queries: Value) -> Value {
+/// A declared predictor's body; an empty `context` is left out, as a
+/// snapshot predictor's callers leave it.
+fn predictor_payload(_model: &str, context: Value, queries: Value) -> Value {
+    let mut payload = json!({"queries": queries});
+    if context.as_array().is_some_and(|rows| !rows.is_empty()) {
+        payload["context"] = context;
+    }
+    payload
+}
+
+fn predictor_envelope(name: &str, payload: &Value) -> Value {
     json!({
-        "model": model,
-        "task": "classification",
-        "target": "y",
-        "features": ["x"],
-        "context": context,
-        "queries": queries,
-        "options": {},
+        "api_version": "gf/v1",
+        "project": "local",
+        "request_id": "r-test",
+        "resource": {"kind": "predictor", "name": name},
+        "payload": payload,
     })
 }
 
 #[tokio::test]
 async fn snapshot_packages_bind_once_into_a_durable_table() {
     let snapshot = snapshot_file();
-    let front = package_front(package_model("churn", "snapshot", Some(&snapshot))).await;
+    let front = predictor_front(predictor_model("churn", "snapshot", Some(&snapshot))).await;
     assert!(front.ready());
-    let path = "/v1alpha1/projects/local/predictions";
-    let payload = package_payload("churn", json!([]), json!([{"id": "q", "x": 1.5}]));
+    let path = "/v1/projects/local/predictors/churn/predict";
+    let payload = predictor_payload("churn", json!([]), json!([{"id": "q", "x": 1.5}]));
     for _ in 0..2 {
         let (status, _, body) = call(
             &front,
             "POST",
             path,
-            Some(&envelope("predictions", &payload)),
+            Some(&predictor_envelope("churn", &payload)),
             &[],
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["resource"],
+            json!({"kind": "predictor", "name": "churn"})
+        );
         assert_eq!(
             body["result"]["predictions"],
             json!([{"id": "q", "label": false, "probabilities": {"false": 0.25, "true": 0.25}}])
         );
         let context = &body["result"]["context"];
         assert_eq!(
-            (&context["source"], &context["rows"], &context["version"]),
+            (&context["kind"], &context["rows"], &context["digest"]),
             (&json!("snapshot"), &json!(4), &json!("sha256:data"))
         );
     }
+    // The predictor is listed and described, with its context's size.
+    let (status, _, body) = call(&front, "GET", "/v1/projects/local/predictors", None, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["predictors"][0]["name"], "churn");
     let (status, _, body) = call(
         &front,
-        "POST",
-        "/v1alpha1/projects/local/models/churn/infer",
-        Some(&envelope("churn", &payload)),
+        "GET",
+        "/v1/projects/local/predictors/churn",
+        None,
         &[],
     )
     .await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body["error"]["code"], "UnsupportedCapability");
-    for (payload, message) in [
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["resource"],
+        json!({"kind": "predictor", "name": "churn"})
+    );
+    let described = &body["result"];
+    assert_eq!(described["model"], served().resolved);
+    assert_eq!(described["target"], "y");
+    assert_eq!(described["inputs"], json!(["x"]));
+    assert_eq!(
+        described["context"],
+        json!({"kind": "snapshot", "rows": 4, "digest": "sha256:data"})
+    );
+    assert_eq!(described["lock_digest"], "sha256:churn");
+    let (status, _, body) = call(
+        &front,
+        "GET",
+        "/v1/projects/local/predictors/other",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "NotFound");
+    // Catalog models and predictors are listed apart.
+    let (_, _, body) = call(&front, "GET", "/v1/projects/local/models", None, &[]).await;
+    assert_eq!(body["result"]["models"], json!([]));
+    let mut declared = predictor_payload("churn", json!([]), json!([{"x": 1.5}]));
+    declared["target"] = json!("y");
+    for (payload, message, param) in [
         (
-            package_payload("churn", json!([{"x": 1.0, "y": true}]), json!([{"x": 1.5}])),
-            "bound context cannot be overridden",
+            predictor_payload("churn", json!([{"x": 1.0, "y": true}]), json!([{"x": 1.5}])),
+            "context is declared by the predictor",
+            Some("context"),
         ),
         (
-            package_payload("churn", json!([]), json!([{"x": "high"}])),
+            declared,
+            "target is declared by the predictor",
+            Some("target"),
+        ),
+        (
+            predictor_payload("churn", json!([]), json!([{"x": "high"}])),
             "column \"x\" holds values that are not float64",
+            None,
         ),
         (
-            package_payload("churn", json!([]), json!([])),
+            predictor_payload("churn", json!([]), json!([])),
             "queries must contain 1..10000 rows",
+            None,
         ),
     ] {
         let (status, _, body) = call(
             &front,
             "POST",
             path,
-            Some(&envelope("predictions", &payload)),
+            Some(&predictor_envelope("churn", &payload)),
             &[],
         )
         .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["error"]["message"], message);
+        assert_eq!(
+            body["error"]["param"],
+            param.map_or(Value::Null, |param| json!(param))
+        );
     }
     std::fs::remove_file(snapshot).unwrap();
 }
 
 #[tokio::test]
 async fn request_packages_bind_each_context_into_an_ephemeral_table() {
-    let front = package_front(package_model("scorer", "request", None)).await;
-    let path = "/v1alpha1/projects/local/predictions";
+    let front = predictor_front(predictor_model("scorer", "request", None)).await;
+    let path = "/v1/projects/local/predictors/scorer/predict";
     let context = json!([
         {"x": 0.0, "y": false},
         {"x": 1.0, "y": false},
         {"x": 3.0, "y": true},
         {"x": 4.0, "y": null},
     ]);
-    let payload = package_payload(
+    let payload = predictor_payload(
         "scorer",
         context,
         json!([{"id": "q", "x": 2.5}, {"x": 0.5}]),
@@ -940,14 +1018,14 @@ async fn request_packages_bind_each_context_into_an_ephemeral_table() {
         &front,
         "POST",
         path,
-        Some(&envelope("predictions", &payload)),
+        Some(&predictor_envelope("scorer", &payload)),
         &[],
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     let result = &body["result"];
     assert_eq!(
-        (&result["context"]["source"], &result["context"]["rows"]),
+        (&result["context"]["kind"], &result["context"]["rows"]),
         (&json!("request"), &json!(3))
     );
     // Not every query has an id, so none is repeated.
@@ -955,78 +1033,66 @@ async fn request_packages_bind_each_context_into_an_ephemeral_table() {
         result["predictions"][1],
         json!({"label": false, "probabilities": {"false": 0.25, "true": 0.25}})
     );
-    let payload = package_payload("scorer", json!([]), json!([{"x": 1.5}]));
+    let payload = predictor_payload("scorer", json!([]), json!([{"x": 1.5}]));
     let (status, _, body) = call(
         &front,
         "POST",
         path,
-        Some(&envelope("predictions", &payload)),
+        Some(&predictor_envelope("scorer", &payload)),
         &[],
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
     assert_eq!(
         body["error"]["message"],
-        "context must contain 1..100000 rows"
+        "context is required: this predictor takes its context with each request"
     );
-    let mut payload = package_payload(
+    assert_eq!(body["error"]["param"], "context");
+    let (_, _, body) = call(
+        &front,
+        "GET",
+        "/v1/projects/local/predictors/scorer",
+        None,
+        &[],
+    )
+    .await;
+    assert_eq!(
+        body["result"]["context"],
+        json!({"kind": "request", "rows": null, "digest": "sha256:data"})
+    );
+    let mut payload = predictor_payload(
         "scorer",
         json!([{"x": 0.0, "y": false}]),
         json!([{"x": 1.5}]),
     );
-    payload["target"] = json!("z");
+    payload["inputs"] = json!(["z"]);
     let (status, _, body) = call(
         &front,
         "POST",
         path,
-        Some(&envelope("predictions", &payload)),
+        Some(&predictor_envelope("scorer", &payload)),
         &[],
     )
     .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body["error"]["message"], "target differs from lock");
-}
-
-#[tokio::test]
-async fn the_catalogs_refusals_come_before_routing() {
-    let front = front(Box::new(Static::new(None)), true).await;
-    let path = "/v1alpha1/projects/local/models/tabicl-v2-classifier/infer";
-    for model in ["no-such-model", "tabicl-classifier*64"] {
-        let mut payload = infer_payload();
-        payload["model"] = json!(model);
-        let expected = gf_core::request::parse(
-            payload.to_string().as_bytes(),
-            &gf_core::request::Options::request(Surface::SelfHosted),
-        )
-        .expect_err("the catalog refuses it");
-        let (status, _, body) = call(
-            &front,
-            "POST",
-            path,
-            Some(&envelope("tabicl-v2-classifier", &payload)),
-            &[],
-        )
-        .await;
-        assert_eq!(status.as_u16(), expected.status, "{model}: {body}");
-        assert_eq!(body["error"]["code"], expected.code, "{model}");
-        assert_eq!(body["error"]["message"], expected.message, "{model}");
-    }
+    assert_eq!(
+        body["error"]["message"],
+        "inputs is declared by the predictor"
+    );
+    assert_eq!(body["error"]["param"], "inputs");
 }
 
 /// A control plane that publishes `scorer`'s revisions: 1 a snapshot
-/// package, 2 a Python package, 3 a request package. `prod` serves whichever
+/// predictor, 2 a Python predictor, 3 a request predictor. `prod` serves whichever
 /// revision `serving` holds.
 struct Plane {
     serving: std::sync::atomic::AtomicU64,
-    packages: std::sync::atomic::AtomicUsize,
+    predictors: std::sync::atomic::AtomicUsize,
     records: std::sync::Mutex<Vec<Value>>,
 }
 
 fn published(revision: u64) -> Value {
     let context = if revision == 3 { "request" } else { "snapshot" };
-    if revision == 2 {
-        return json!({"kind": "python"});
-    }
     let served = json!({
         "name": "scorer",
         "reference": "tabicl-v2-classifier",
@@ -1034,8 +1100,8 @@ fn published(revision: u64) -> Value {
         "resolved": "general-forecast/tabicl-v2-classifier@5fb6a4c",
         "outputs": ["label", "probabilities"],
         "license_source": null,
-        "description": {"name": "scorer", "kind": "package"},
-        "package": {
+        "description": {"name": "scorer", "kind": "predictor"},
+        "predictor": {
             "schema": {
                 "columns": [
                     {"name": "id", "type": "string", "nullable": false, "role": "id", "semantic": null},
@@ -1048,12 +1114,12 @@ fn published(revision: u64) -> Value {
             },
             "task": "classification",
             "target": "y",
-            "features": ["x"],
+            "inputs": ["x"],
             "id": "id",
             "context": context,
             "quantiles": [],
-            "data_digest": "sha256:data",
-            "package_digest": format!("sha256:scorer-{revision}"),
+            "context_digest": "sha256:data",
+            "lock_digest": format!("sha256:scorer-{revision}"),
             "snapshot": null,
             "forecast": null,
         },
@@ -1088,7 +1154,7 @@ async fn plane(state: Arc<Plane>) -> String {
             let body = axum::body::to_bytes(request.into_body(), 1 << 20)
                 .await
                 .unwrap();
-            let base = "/internal/v1alpha1/projects/team-a/deployments/scorer";
+            let base = "/internal/v1/projects/team-a/predictors/scorer";
             let answer = |status: u16, value: Value| {
                 axum::response::Response::builder()
                     .status(status)
@@ -1096,12 +1162,12 @@ async fn plane(state: Arc<Plane>) -> String {
                     .body(Body::from(value.to_string()))
                     .unwrap()
             };
-            if path == "/internal/v1alpha1/keys:introspect" {
+            if path == "/internal/v1/keys:introspect" {
                 let body: Value = serde_json::from_slice(&body).unwrap();
                 let permissions = if body["verifier"] == request_digest(SCORER) {
-                    json!(["deployments:score"])
+                    json!(["predictors:predict"])
                 } else if body["verifier"] == request_digest(INFERRER) {
-                    json!(["models:infer"])
+                    json!(["models:read"])
                 } else {
                     return answer(200, json!({"active": false}));
                 };
@@ -1110,7 +1176,7 @@ async fn plane(state: Arc<Plane>) -> String {
                     json!({"active": true, "project": "team-a", "permissions": permissions, "expires": null}),
                 );
             }
-            if path == "/internal/v1alpha1/predictions:record" {
+            if path == "/internal/v1/predictions:record" {
                 let body: Value = serde_json::from_slice(&body).unwrap();
                 state
                     .records
@@ -1119,7 +1185,7 @@ async fn plane(state: Arc<Plane>) -> String {
                     .extend(body["records"].as_array().unwrap().iter().cloned());
                 return answer(200, json!({}));
             }
-            if path == format!("{base}/environments/prod:revision") {
+            if path == format!("{base}/environments/production:revision") {
                 let revision = state.serving.load(Ordering::SeqCst);
                 return answer(200, json!({"revision": revision, "context_version": null}));
             }
@@ -1131,26 +1197,10 @@ async fn plane(state: Arc<Plane>) -> String {
             }
             if let Some(revision) = path
                 .strip_prefix(&format!("{base}/revisions/"))
-                .and_then(|tail| tail.strip_suffix(":package"))
+                .and_then(|tail| tail.strip_suffix(":lock"))
             {
-                state.packages.fetch_add(1, Ordering::SeqCst);
+                state.predictors.fetch_add(1, Ordering::SeqCst);
                 return answer(200, published(revision.parse().unwrap()));
-            }
-            if path == format!("{base}/revisions/2:execute") {
-                let body: Value = serde_json::from_slice(&body).unwrap();
-                assert_eq!(body["payload"]["queries"], json!([{"x": 1.0}]));
-                return answer(
-                    200,
-                    json!({"result": {
-                        "model": "python/scorer",
-                        "task": "regression",
-                        "context": null,
-                        "deployment": "scorer",
-                        "revision": 2,
-                        "environment": body["environment"],
-                        "predictions": [{"prediction": 1.0}],
-                    }}),
-                );
             }
             answer(
                 404,
@@ -1203,23 +1253,28 @@ async fn revision_front(origin: &str, bytes: usize) -> Arc<Front> {
     front
 }
 
-fn deployment_envelope(payload: &Value) -> Value {
+fn served_envelope(payload: &Value) -> Value {
     json!({
-        "api_version": "gf/v1alpha1",
+        "api_version": "gf/v1",
         "project": "team-a",
         "request_id": "r-test",
-        "resource": {"kind": "deployment", "name": "scorer"},
+        "resource": {"kind": "predictor", "name": "scorer"},
         "payload": payload,
     })
 }
 
-async fn score(front: &Arc<Front>, route: &str, key: &str, payload: &Value) -> (StatusCode, Value) {
+async fn score(
+    front: &Arc<Front>,
+    _route: &str,
+    key: &str,
+    payload: &Value,
+) -> (StatusCode, Value) {
     let bearer = format!("Bearer {key}");
     let (status, _, body) = call(
         front,
         "POST",
-        &format!("/v1alpha1/projects/team-a/deployments/scorer/{route}/predict"),
-        Some(&deployment_envelope(payload)),
+        "/v1/projects/team-a/predictors/scorer/predict",
+        Some(&served_envelope(payload)),
         &[("authorization", bearer.as_str())],
     )
     .await;
@@ -1232,11 +1287,11 @@ async fn revisions_load_on_demand_evict_and_reload_when_an_environment_moves() {
 
     let state = Arc::new(Plane {
         serving: 1.into(),
-        packages: 0.into(),
+        predictors: 0.into(),
         records: std::sync::Mutex::new(Vec::new()),
     });
     let origin = plane(state.clone()).await;
-    // Room for either package, never both.
+    // Room for either predictor, never both.
     let sizes = [1, 3].map(|revision| published(revision).to_string().len());
     let front = revision_front(&origin, sizes[0].max(sizes[1]) + 1).await;
     let held = || front.revisions().unwrap().held();
@@ -1248,11 +1303,11 @@ async fn revisions_load_on_demand_evict_and_reload_when_an_environment_moves() {
         let result = &body["result"];
         assert_eq!(
             (
-                &result["deployment"],
+                &result["predictor"],
                 &result["revision"],
                 &result["environment"]
             ),
-            (&json!("scorer"), &json!(1), &json!("prod"))
+            (&json!("scorer"), &json!(1), &json!("production"))
         );
         assert_eq!(
             result["context"],
@@ -1264,7 +1319,7 @@ async fn revisions_load_on_demand_evict_and_reload_when_an_environment_moves() {
         );
         assert_eq!(result["predictions"][0]["id"], "q");
     }
-    assert_eq!(state.packages.load(Ordering::SeqCst), 1, "loaded once");
+    assert_eq!(state.predictors.load(Ordering::SeqCst), 1, "loaded once");
     assert_eq!(held().0, 1);
 
     // A promote is seen once the environment's answer expires; revision 1
@@ -1284,7 +1339,7 @@ async fn revisions_load_on_demand_evict_and_reload_when_an_environment_moves() {
         ),
         (&json!(3), &json!("request"))
     );
-    assert_eq!(state.packages.load(Ordering::SeqCst), 2);
+    assert_eq!(state.predictors.load(Ordering::SeqCst), 2);
     assert_eq!(held().0, 1, "revision 1 was evicted for revision 3");
 
     // The rollback reloads the evicted revision.
@@ -1293,14 +1348,14 @@ async fn revisions_load_on_demand_evict_and_reload_when_an_environment_moves() {
     let (status, body) = score(&front, "environments/prod", SCORER, &queries).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["result"]["revision"], 1);
-    assert_eq!(state.packages.load(Ordering::SeqCst), 3);
+    assert_eq!(state.predictors.load(Ordering::SeqCst), 3);
 
-    // A revision route names its revision directly, with no environment.
-    let (status, body) = score(&front, "revisions/1", SCORER, &queries).await;
+    // The route names the predictor; the production environment picks the revision.
+    let (status, body) = score(&front, "environments/prod", SCORER, &queries).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(
         (&body["result"]["revision"], &body["result"]["environment"]),
-        (&json!(1), &Value::Null)
+        (&json!(1), &json!("production"))
     );
 
     for _ in 0..100 {
@@ -1317,16 +1372,16 @@ async fn revisions_load_on_demand_evict_and_reload_when_an_environment_moves() {
             &records[2]["revision"],
             &records[2]["ok"]
         ),
-        (&json!("prod"), &json!(3), &json!(true))
+        (&json!("production"), &json!(3), &json!(true))
     );
-    assert_eq!(records[4]["environment"], Value::Null);
+    assert_eq!(records[4]["environment"], json!("production"));
 }
 
 #[tokio::test]
 async fn revision_predictions_are_checked_against_the_lock_and_the_key() {
     let state = Arc::new(Plane {
         serving: 1.into(),
-        packages: 0.into(),
+        predictors: 0.into(),
         records: std::sync::Mutex::new(Vec::new()),
     });
     let origin = plane(state.clone()).await;
@@ -1339,29 +1394,29 @@ async fn revision_predictions_are_checked_against_the_lock_and_the_key() {
     let (status, _) = score(&front, "environments/prod", "gf-unknown", &queries).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
     let bearer = format!("Bearer {SCORER}");
-    let mut elsewhere = deployment_envelope(&queries);
+    let mut elsewhere = served_envelope(&queries);
     elsewhere["project"] = json!("team-b");
     let (status, _, _) = call(
         &front,
         "POST",
-        "/v1alpha1/projects/team-b/deployments/scorer/environments/prod/predict",
+        "/v1/projects/team-b/predictors/scorer/predict",
         Some(&elsewhere),
         &[("authorization", bearer.as_str())],
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(
-        state.packages.load(std::sync::atomic::Ordering::SeqCst),
+        state.predictors.load(std::sync::atomic::Ordering::SeqCst),
         0,
         "nothing is loaded for a refused key"
     );
 
-    let mut model = deployment_envelope(&queries);
+    let mut model = served_envelope(&queries);
     model["resource"] = json!({"kind": "model", "name": "scorer"});
     let (status, _, body) = call(
         &front,
         "POST",
-        "/v1alpha1/projects/team-a/deployments/scorer/environments/prod/predict",
+        "/v1/projects/team-a/predictors/scorer/predict",
         Some(&model),
         &[("authorization", bearer.as_str())],
     )
@@ -1372,20 +1427,24 @@ async fn revision_predictions_are_checked_against_the_lock_and_the_key() {
     for (payload, message) in [
         (
             json!({"queries": [{"x": 1.0}], "features": ["z"]}),
-            "features differ from lock",
+            "features is declared by the predictor",
+        ),
+        (
+            json!({"queries": [{"x": 1.0}], "inputs": ["z"]}),
+            "inputs is declared by the predictor",
         ),
         (
             json!({"queries": [{"x": 1.0}], "target": "z"}),
-            "target differs from lock",
+            "target is declared by the predictor",
         ),
         (
             json!({"queries": [{"x": 1.0}], "options": {"n": 1}}),
-            "prediction options must be compiled into the package",
+            "options is declared by the predictor",
         ),
         (json!({"queries": []}), "queries must contain 1..10000 rows"),
         (
             json!({"queries": [{"x": 1.0}], "context": []}),
-            "bound context cannot be overridden",
+            "context is declared by the predictor",
         ),
         (
             json!({"queries": [{"x": 1.0}], "extra": 1}),
@@ -1396,26 +1455,6 @@ async fn revision_predictions_are_checked_against_the_lock_and_the_key() {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["error"]["message"], message);
     }
-    let (status, body) = score(&front, "revisions/3", SCORER, &queries).await;
-    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-    assert_eq!(body["error"]["message"], "request context is required");
-
-    let (status, body) = score(&front, "environments/staging", SCORER, &queries).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(body["error"]["message"], "environment not found");
-
-    let python = json!({"queries": [{"x": 1.0}]});
-    let (status, body) = score(&front, "revisions/2", SCORER, &python).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(
-        (&body["result"]["model"], &body["result"]["revision"]),
-        (&json!("python/scorer"), &json!(2))
-    );
-
-    for route in ["revisions/0", "revisions/01", "revisions/x"] {
-        let (status, _) = score(&front, route, SCORER, &queries).await;
-        assert_eq!(status, StatusCode::NOT_FOUND, "{route}");
-    }
 }
 
 #[tokio::test]
@@ -1424,11 +1463,11 @@ async fn a_front_without_revisions_refuses_deployment_predictions() {
     let (status, _, body) = call(
         &front,
         "POST",
-        "/v1alpha1/projects/team-a/deployments/scorer/environments/prod/predict",
-        Some(&deployment_envelope(&json!({"queries": [{"x": 1.0}]}))),
+        "/v1/projects/team-a/predictors/scorer/predict",
+        Some(&served_envelope(&json!({"queries": [{"x": 1.0}]}))),
         &[],
     )
     .await;
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert_eq!(body["error"]["code"], "RuntimeUnavailable");
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert_eq!(body["error"]["code"], "NotFound");
 }

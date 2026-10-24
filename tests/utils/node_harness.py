@@ -731,7 +731,7 @@ class LocalClient:
                 summary, is fit on: `table` fits it once on the table's rows,
                 so row representations are cached per page; `context` fits the
                 unit's own state on each context's rows, as the model's own
-                package does, and embeds that context's queries against it.
+                predictor does, and embeds that context's queries against it.
                 Only models whose state pools over rows, such as TabICL,
                 TabPFN and Kumo Tabular, take `context`. Such a table's units
                 depend on their rows alone, so refit policies and cutoffs

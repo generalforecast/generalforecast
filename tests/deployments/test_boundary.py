@@ -34,7 +34,7 @@ from generalforecast.deployments.interfaces import (
 
 @pytest.fixture
 def fixture():
-    return json.loads(Path(__file__).with_name("suite-v1alpha1.json").read_text())
+    return json.loads(Path(__file__).with_name("suite-v1.json").read_text())
 
 
 def test_envelope_conformance(fixture):
@@ -68,9 +68,9 @@ def test_request_detaches_input_and_result_never_echoes_payload(fixture):
         {"unexpected": True},
         {"project": "../elsewhere"},
         {"request_id": ""},
-        {"resource": {"kind": "predictor", "name": "old"}},
+        {"resource": {"kind": "widget", "name": "old"}},
         {"resource": {"kind": [], "name": "bad"}},
-        {"resource": {"kind": "dataset", "name": "ok", "project": "other"}},
+        {"resource": {"kind": "context", "name": "ok", "project": "other"}},
         {"payload": []},
     ],
 )
@@ -145,4 +145,4 @@ def test_artifact_and_identity_validation():
     with pytest.raises(ServiceError):
         Scope("../private", "request")
     with pytest.raises(ServiceError):
-        Resource("dataset", "../private")
+        Resource("context", "../private")

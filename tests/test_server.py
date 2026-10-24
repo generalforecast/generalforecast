@@ -20,7 +20,7 @@ pa = pytest.importorskip("pyarrow")
 pc = pytest.importorskip("pyarrow.compute")
 
 from tests.models.tabicl.tiny import classifier
-from tests.utils import legacy_client as generalforecast
+from tests.utils import engine_client as generalforecast
 from tests.utils.server import COLUMNS, NEAR_A, TOKEN, Server, build, wait_until
 
 pytestmark = pytest.mark.server

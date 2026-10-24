@@ -6,7 +6,7 @@
 //! Every surface that takes an `InferenceRequest` (`model, task, target,
 //! features, context, queries, options`) parses it here into a typed
 //! [`Tabular`] or [`Forecast`] request: the hosted Models API, `gf serve`,
-//! the in-process catalog service and the package runtime's forecast
+//! the in-process catalog service and the predictor runtime's forecast
 //! contexts. The checks, their order, error codes, messages and HTTP
 //! statuses are those the Python catalog service answered, so a client sees
 //! the same refusal whichever surface it calls. What only loaded weights
@@ -23,7 +23,7 @@ use std::fmt;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use sha2::{Digest, Sha256};
 
-use crate::catalog::{self, Admission, Model, Source, Surface, Task};
+use crate::catalog::{self, Model, Surface, Task};
 use crate::forecasting::{KNOWN, PAST, TARGET};
 use crate::node::Targets;
 
@@ -46,6 +46,21 @@ pub struct RequestError {
     pub code: &'static str,
     pub message: String,
     pub status: u16,
+    /// The optional fields of the error object, boxed so the common error
+    /// stays small.
+    pub detail: Option<Box<ErrorDetail>>,
+}
+
+/// The optional fields of an error object: `param`, `hint`, `limit`, `actual`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ErrorDetail {
+    /// The request field at fault, as a dotted path (`inputs.plan`).
+    pub param: Option<String>,
+    /// What to do instead.
+    pub hint: Option<String>,
+    /// For capacity errors, what the model allows and what was sent.
+    pub limit: Option<u64>,
+    pub actual: Option<u64>,
 }
 
 impl RequestError {
@@ -55,7 +70,44 @@ impl RequestError {
             code,
             message: message.into(),
             status,
+            detail: None,
         }
+    }
+
+    fn detail_mut(&mut self) -> &mut ErrorDetail {
+        self.detail.get_or_insert_with(Box::default)
+    }
+
+    /// Names the field at fault.
+    #[must_use]
+    pub fn param(mut self, param: impl Into<String>) -> Self {
+        self.detail_mut().param = Some(param.into());
+        self
+    }
+
+    /// Says what to do instead.
+    #[must_use]
+    pub fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.detail_mut().hint = Some(hint.into());
+        self
+    }
+
+    /// Too many rows or columns for `model`: `CapacityExceeded`, 422, with
+    /// the limit and what was sent.
+    #[must_use]
+    pub fn capacity(model: &str, what: &str, limit: usize, actual: usize, hint: &str) -> Self {
+        let mut error = Self::new(
+            "CapacityExceeded",
+            format!(
+                "{what} exceed the limit for {model}: this model accepts {limit} {what} per call; the request sent {actual}"
+            ),
+            422,
+        );
+        let detail = error.detail_mut();
+        detail.limit = Some(limit as u64);
+        detail.actual = Some(actual as u64);
+        detail.hint = Some(hint.to_string());
+        error
     }
 
     /// A malformed request: `ValidationError`, 422.
@@ -331,8 +383,8 @@ pub enum Limits {
     /// One Models API request's: bytes, values and nesting, and the serving
     /// policy's context and query rows.
     Request,
-    /// A package's bound context, which its lock bounds instead.
-    Package,
+    /// A predictor's bound context, which its lock bounds instead.
+    Predictor,
 }
 
 /// Parses a payload into a JSON object, held to the request bounds if asked.
@@ -357,7 +409,7 @@ fn document(payload: &[u8], limits: Limits) -> Checked<Object> {
     Ok(object)
 }
 
-/// The bounds `generalforecast.deployments.boundary.json_object` holds a value to.
+/// The bounds `generalforecast.predictors.boundary.json_object` holds a value to.
 fn portable(value: &Json, depth: usize, count: &mut usize) -> Checked<()> {
     *count += 1;
     // The root object is the first value.
@@ -451,6 +503,18 @@ fn number(value: &Json, range: &Range, field: &str) -> Checked<Num> {
             range.spelled
         ))),
     }
+}
+
+/// An input column's value: a bounded number, named by column when it is not.
+fn numeric_input(column: &str, value: &Json) -> Checked<Num> {
+    let param = format!("inputs.{column}");
+    if value.text().is_some() {
+        return Err(RequestError::invalid(format!(
+            "column {column} has text values; this route takes numeric inputs"
+        ))
+        .param(param));
+    }
+    number(value, &VALUES, &format!("column {column}")).map_err(|error| error.param(param))
 }
 
 /// Validates requested quantile levels: strictly increasing, inside (0, 1).
@@ -567,7 +631,7 @@ pub struct SeriesQuery {
 /// A forecast request: aligned groups per query, and what results report.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Forecast {
-    pub model: Source,
+    pub model: Model,
     pub target: String,
     pub step: Num,
     pub horizon: usize,
@@ -592,9 +656,9 @@ pub enum Inference {
 impl Inference {
     /// The model the request resolved to.
     #[must_use]
-    pub fn model(&self) -> Source {
+    pub fn model(&self) -> Model {
         match self {
-            Self::Tabular(request) => Source::Catalog(request.model.clone()),
+            Self::Tabular(request) => request.model.clone(),
             Self::Forecast(request) => request.model.clone(),
         }
     }
@@ -626,8 +690,6 @@ pub struct Options<'a> {
     pub limits: Limits,
     /// The levels the loaded model outputs, or None for the catalog's.
     pub levels: Option<&'a [f64]>,
-    /// The models it may name.
-    pub admission: Admission<'a>,
 }
 
 impl Options<'_> {
@@ -638,7 +700,6 @@ impl Options<'_> {
             surface,
             limits: Limits::Request,
             levels: None,
-            admission: Admission::Catalog,
         }
     }
 }
@@ -660,14 +721,14 @@ pub fn parse(payload: &[u8], options: &Options<'_>) -> Result<Inference, Request
         ],
         &[],
     )?;
-    let source = catalog::admit(request["model"].text(), options.surface, options.admission)?;
+    let model = catalog::admit(request["model"].text(), options.surface)?;
     let task = match request["task"].text() {
         Some("classification") => Task::Classification,
         Some("regression") => Task::Regression,
         Some("forecast") => Task::Forecast,
         _ => return Err(RequestError::invalid("invalid task")),
     };
-    if task != source.task() {
+    if task != model.entry.task {
         return Err(unsupported_task());
     }
     let policy = &catalog::catalog().policy;
@@ -688,17 +749,30 @@ pub fn parse(payload: &[u8], options: &Options<'_>) -> Result<Inference, Request
     let context = request["context"]
         .list()
         .ok_or_else(|| RequestError::invalid("context must be a list"))?;
-    require(
-        !bounded || context.len() <= policy.context_rows,
-        "context capacity exceeded",
-    )?;
+    if bounded && context.len() > policy.context_rows {
+        return Err(RequestError::capacity(
+            &model.to_string(),
+            "context rows",
+            policy.context_rows,
+            context.len(),
+            "sample the context, or serve a predictor whose context is pinned",
+        )
+        .param("context"));
+    }
     let queries = request["queries"]
         .list()
         .ok_or_else(|| RequestError::invalid("queries must be a list"))?;
-    require(
-        !queries.is_empty() && (!bounded || queries.len() <= policy.query_rows),
-        "query capacity exceeded",
-    )?;
+    require(!queries.is_empty(), "queries must not be empty")?;
+    if bounded && queries.len() > policy.query_rows {
+        return Err(RequestError::capacity(
+            &model.to_string(),
+            "queries",
+            policy.query_rows,
+            queries.len(),
+            "split the queries, or push a predictor and call it in batches",
+        )
+        .param("queries"));
+    }
     let settings = fields(
         &request["options"],
         &[] as &[&str],
@@ -709,29 +783,21 @@ pub fn parse(payload: &[u8], options: &Options<'_>) -> Result<Inference, Request
         }],
     )?;
     if task == Task::Forecast {
-        let levels = match (&source, options.levels) {
-            (_, Some(levels)) => levels,
-            (Source::Catalog(model), None) => {
+        let levels = match options.levels {
+            Some(levels) => levels,
+            None => {
                 let entry: &'static catalog::Entry = model.entry;
                 &entry.bounds.quantiles
             }
-            (Source::Local { .. }, None) => {
-                return Err(RequestError::invalid(
-                    "a trusted model's request needs the levels it outputs",
-                ));
-            }
         };
         let parts = Parts {
-            model: source,
+            model,
             target,
             context,
             queries,
         };
         return forecast(parts, &features, &request["options"], levels).map(Inference::Forecast);
     }
-    let Source::Catalog(model) = source else {
-        return Err(unsupported_task());
-    };
     tabular(
         Parts {
             model,
@@ -771,8 +837,8 @@ fn rows<'a>(rows: &'a [Json], features: &[String], scoring: bool) -> Checked<Vec
             let row = fields(row, &["key", "features"], optional)?;
             let key = text(&row["key"], "key")?;
             require(keys.insert(key), "duplicate row key")?;
-            for value in fields(&row["features"], features, &[])?.values() {
-                number(value, &VALUES, "feature")?;
+            for (column, value) in fields(&row["features"], features, &[])? {
+                numeric_input(column, value)?;
             }
             if let Some(time) = row.get("event_at") {
                 number(time, &VALUES, "event_at")?;
@@ -957,7 +1023,7 @@ struct Point {
 }
 
 fn forecast(
-    parts: Parts<'_, Source>,
+    parts: Parts<'_, Model>,
     features: &[String],
     options: &Json,
     declared: &[f64],

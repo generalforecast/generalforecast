@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const VERSION: &str = "gf/v1alpha1";
+pub const VERSION: &str = "gf/v1";
 
 pub fn name(value: &str) -> bool {
     !value.is_empty()
@@ -35,7 +35,7 @@ pub struct PredictionSpec {
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct DeploymentConfig {
+pub struct PredictorConfig {
     api_version: String,
     kind: String,
     name: String,
@@ -76,7 +76,7 @@ pub fn validate(value: Value, dataset: bool) -> Result<Value, String> {
         }
         serde_json::to_value(config).map_err(|e| e.to_string())
     } else {
-        let config: DeploymentConfig = serde_json::from_value(value).map_err(|e| e.to_string())?;
+        let config: PredictorConfig = serde_json::from_value(value).map_err(|e| e.to_string())?;
         let spec = &config.prediction;
         if config.api_version != VERSION
             || config.kind != "deployment"

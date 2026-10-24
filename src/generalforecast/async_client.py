@@ -9,21 +9,20 @@ import asyncio
 import builtins
 import time
 import uuid
-from collections.abc import AsyncIterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Self, cast
+from typing import Any, Self, cast
 from urllib.parse import urlencode
 
 from generalforecast.client import WORKSPACE_ACTIONS, workspace_request
 from generalforecast.contracts import (
-    DatasetImportRef,
-    DevSession,
+    ContextImportRef,
     Environment,
-    PatchRequest,
     PredictionResult,
     PromoteRequest,
     Revision,
+    parse_lock,
 )
 from generalforecast.deployments.boundary import (
     JsonObject,
@@ -37,36 +36,25 @@ from generalforecast.deployments.contracts import ServiceError, name, number, re
 from generalforecast.deployments.interfaces import (
     AcceptedWrite,
     ContextSnapshot,
-    InferenceRequest,
-    InferenceResult,
     Mutation,
     SourcePin,
 )
 from generalforecast.deployments.sdk import (
-    PYTHON_SOURCE_MEDIA_TYPE,
     BoundSnapshot,
-    DatasetSpec,
+    ContextSpec,
     ImportReceipt,
-    JobSpec,
     RevisionDetails,
-    Runtime,
     Snapshot,
     WriteReceipt,
+    append_payload,
     captured_environment,
-    checked_lock,
-    checked_python_source,
     environment_name,
     inference_result,
-    mutation,
-    one_shot_payload,
-    prediction_payload,
-    python_source_receipt,
-    python_source_upload,
+    label_payload,
+    pushed,
     table,
     unwrap,
 )
-from generalforecast.models.catalog import resource_name
-from generalforecast.packages import Package, PackageLock, PythonLock
 from generalforecast.tabular import arrow_bytes, table_digest
 from generalforecast.transport import AsyncTransport, Profile, connection
 
@@ -102,18 +90,13 @@ class AsyncClient:
         self._transport = AsyncTransport(
             self.profile.url, token=key, **transport_options
         )
-        self.datasets = Datasets(self)
+        self.contexts = Contexts(self)
         self.sources = Sources(self)
         self.models = Models(self)
-        self.jobs = Jobs(self)
-        self.packages = Packages(self)
-        self.deployments = Deployments(self)
+        self.predictors = Predictors(self)
         self.identity = Identity(self)
         self.keys = Keys(self)
         self.secrets = Secrets(self)
-        self.operators = Operators(self)
-        self.runtimes = Runtimes(self)
-        self.dev_sessions = DevSessions(self)
 
     async def __aenter__(self) -> Self:
         """Returns this asynchronous client."""
@@ -129,32 +112,44 @@ class AsyncClient:
 
     async def predict(
         self,
-        *,
         model: str,
         target: str,
         context: Any,
         queries: Any,
-        context_columns: Sequence[str] | None = None,
-        task: str | None = None,
-        features: Sequence[str] | None = None,
-        options: JsonObject | None = None,
+        *,
+        inputs: Sequence[str] | None = None,
+        id: str | None = None,
+        time: str | None = None,
+        series: Sequence[str] | None = None,
+        frequency: Any = None,
+        horizon: int | None = None,
+        quantiles: Sequence[float] | None = None,
         outputs: Sequence[str] | None = None,
+        selection: JsonObject | None = None,
     ) -> PredictionResult:
-        """Runs one-shot remote inference without creating or mutating a dataset."""
-        payload = await asyncio.to_thread(
-            one_shot_payload,
-            queries,
+        """Predicts with an ad hoc predictor; see `Client.predict`."""
+        from generalforecast.predictor import PredictRequest
+
+        request = await asyncio.to_thread(
+            PredictRequest.build,
             model=model,
-            task=task,
-            context=context,
-            context_columns=context_columns,
             target=target,
-            features=features,
-            options=options,
+            context=context,
+            queries=queries,
+            inputs=inputs,
+            id=id,
+            time=time,
+            series=series,
+            frequency=frequency,
+            horizon=horizon,
+            quantiles=quantiles,
             outputs=outputs,
+            selection=selection,
         )
         return inference_result(
-            await self._call("POST", "/predictions", "model", "predictions", payload)
+            await self._call(
+                "POST", "/predict", "predictor", "ad-hoc", request.payload()
+            )
         )
 
     async def upload_snapshot(self, data: Any) -> JsonObject:
@@ -165,7 +160,7 @@ class AsyncClient:
         request_id = "r-" + uuid.uuid4().hex
         value = await self._transport.send(
             "POST",
-            f"/v1alpha1/projects/{self.project}/snapshots",
+            f"/v1/projects/{self.project}/snapshots",
             encoded,
             {
                 "Content-Type": "application/vnd.apache.arrow.stream",
@@ -174,7 +169,7 @@ class AsyncClient:
             },
         )
         request = Request(
-            Scope(self.project, request_id), Resource("dataset", "snapshots"), {}
+            Scope(self.project, request_id), Resource("context", "snapshots"), {}
         )
         receipt = unwrap(value, request)
         if type(receipt.get("rows")) is not int or receipt != {
@@ -185,29 +180,6 @@ class AsyncClient:
                 "ProtocolError", "snapshot receipt does not match uploaded content", 502
             )
         return receipt
-
-    async def upload_python_source(
-        self, deployment: str, archive: bytes, *, source: str
-    ) -> Snapshot:
-        """Uploads bounded source with native async transport and off-loop hashing."""
-        expected = await asyncio.to_thread(
-            python_source_upload, self.project, deployment, archive, source
-        )
-        request_id = "r-" + uuid.uuid4().hex
-        value = await self._transport.send(
-            "POST",
-            f"/v1alpha1/projects/{self.project}/deployments/{deployment}/python-sources",
-            archive,
-            {
-                "Content-Type": PYTHON_SOURCE_MEDIA_TYPE,
-                "X-GF-Project": self.project,
-                "X-GF-Request-ID": request_id,
-            },
-        )
-        request = Request(
-            Scope(self.project, request_id), Resource("deployment", deployment), {}
-        )
-        return python_source_receipt(unwrap(value, request), expected)
 
     async def _call(
         self,
@@ -228,7 +200,7 @@ class AsyncClient:
                 {} if payload is None else payload,
             ).to_dict()
         )
-        prefix = "/v1alpha1" if global_route else f"/v1alpha1/projects/{self.project}"
+        prefix = "/v1" if global_route else f"/v1/projects/{self.project}"
         query = "?" + urlencode(params) if params else ""
         options = {} if deadline is None else {"deadline": deadline}
         value = await self._transport.send(
@@ -284,95 +256,86 @@ class Collection:
         )
 
 
-class Datasets(Collection):
+class Contexts(Collection):
     """Create-only observations and guarded component corrections."""
 
-    kind: ResourceKind = "dataset"
-    collection = "datasets"
+    kind: ResourceKind = "context"
+    collection = "contexts"
 
-    async def create(self, config: JsonObject | DatasetSpec) -> AsyncDataset:
-        """Creates a bounded immutable schema using the direct config payload."""
-        value = config.to_dict() if isinstance(config, DatasetSpec) else config
-        return AsyncDataset.from_response(
+    async def create(self, config: JsonObject | ContextSpec) -> AsyncLiveContext:
+        """Creates a live context from its schema."""
+        value = config.to_dict() if isinstance(config, ContextSpec) else config
+        return AsyncLiveContext.from_response(
             self.client, value["name"], await self._create(value["name"], value)
         )
 
-    async def get(self, resource: str) -> AsyncDataset:
-        """Returns a detached dataset snapshot with typed mutation methods."""
-        return AsyncDataset.from_response(
+    async def get(self, resource: str) -> AsyncLiveContext:
+        """Returns a detached live-context snapshot with typed write methods."""
+        return AsyncLiveContext.from_response(
             self.client, resource, await super().get(resource)
         )
 
     async def append(
-        self, dataset: str, data: Any, *, id: str, idempotency_key: str
+        self, context: str, data: Any, *, id: str, idempotency_key: str
     ) -> WriteReceipt:
-        """Appends observations using the existing durable write-ID namespace."""
+        """Appends rows under a durable write id."""
         return WriteReceipt.from_dict(
             await self._post(
-                dataset,
-                "mutations",
+                context,
+                "append",
                 await asyncio.to_thread(
-                    mutation,
-                    data,
-                    id=id,
-                    operation="create_features",
-                    write_id=idempotency_key,
+                    append_payload, data, id=id, write_id=idempotency_key
                 ),
             )
         )
 
     async def label(
-        self, dataset: str, data: Any, *, id: str, column: str, idempotency_key: str
+        self, context: str, data: Any, *, id: str, column: str, idempotency_key: str
     ) -> WriteReceipt:
-        """Attaches outcome components independently of prediction requests."""
+        """Attaches one target's values to rows already in the context."""
         return WriteReceipt.from_dict(
             await self._post(
-                dataset,
-                "mutations",
+                context,
+                "label",
                 await asyncio.to_thread(
-                    mutation,
-                    data,
-                    id=id,
-                    column=column,
-                    operation="attach_labels",
-                    write_id=idempotency_key,
+                    label_payload, data, id=id, column=column, write_id=idempotency_key
                 ),
             )
         )
 
-    async def import_source(self, reference: DatasetImportRef) -> ImportReceipt:
-        """Binds a cloud or uploaded table to an existing logical dataset."""
+    async def import_source(self, reference: ContextImportRef) -> ImportReceipt:
+        """Binds a cloud or uploaded table to an existing live context."""
         return ImportReceipt.from_dict(
-            await self._post(reference.dataset, "imports", reference.to_dict())
+            await self._post(reference.context, "imports", reference.to_dict())
         )
 
-    async def import_file(self, dataset: str, data: Any) -> ImportReceipt:
-        """Uploads a local bounded table before binding it to a logical dataset."""
+    async def import_file(self, context: str, data: Any) -> ImportReceipt:
+        """Uploads a local bounded table before binding it to a live context."""
         receipt = await self.client.upload_snapshot(data)
         return await self.import_source(
-            DatasetImportRef(
-                dataset,
+            ContextImportRef(
+                context,
                 "upload://" + receipt["digest"],
                 "arrow",
                 digest=receipt["digest"],
             )
         )
 
-    async def refresh(self, dataset: str) -> AsyncDataset:
+    async def refresh(self, context: str) -> AsyncLiveContext:
         """Requests an explicit provider refresh; unsupported adapters fail visibly."""
-        return AsyncDataset.from_response(
-            self.client, dataset, await self._post(dataset, "refresh", {})
+        return AsyncLiveContext.from_response(
+            self.client, context, await self._post(context, "refresh", {})
         )
 
-    async def mutate(self, dataset: str, mutation: Mutation) -> AcceptedWrite:
+    async def mutate(self, context: str, mutation: Mutation) -> AcceptedWrite:
         """Accepts an atomic write, not serving readiness. Preserve write_id."""
         return cast(
-            AcceptedWrite, await self._post(dataset, "mutations", dict(mutation))
+            AcceptedWrite, await self._post(context, "mutations", dict(mutation))
         )
 
     async def snapshot(
         self,
-        dataset: str,
+        context: str,
         *,
         target: str,
         knowledge_at: float | None = None,
@@ -382,7 +345,7 @@ class Datasets(Collection):
         return cast(
             ContextSnapshot,
             await self._post(
-                dataset,
+                context,
                 "snapshot",
                 {
                     "target": target,
@@ -410,199 +373,83 @@ class Models(Collection):
     kind: ResourceKind = "model"
     collection = "models"
 
-    async def infer(self, request: InferenceRequest) -> InferenceResult:
-        """Never ingests queries; returns genuine outputs or a typed gate."""
-        return cast(
-            InferenceResult,
-            await self._post(resource_name(request["model"]), "infer", dict(request)),
-        )
 
+class Predictors(Collection):
+    """Hosted predictors: immutable revisions and runtime-bound environments."""
 
-class Jobs(Collection):
-    """Durable jobs with linked retries and paginated per-occurrence reports."""
+    kind: ResourceKind = "predictor"
+    collection = "predictors"
 
-    kind: ResourceKind = "job"
-    collection = "jobs"
-
-    async def submit(self, spec: JsonObject | JobSpec) -> AsyncJob:
-        """Preserves submission_id; acceptance is not job completion."""
-        value = spec.to_dict() if isinstance(spec, JobSpec) else spec
-        return AsyncJob.from_response(
-            self.client, value["name"], await self._create(value["name"], value)
-        )
-
-    async def get(self, resource: str) -> AsyncJob:
-        """Returns a durable job snapshot; polling creates new snapshots."""
-        return AsyncJob.from_response(
-            self.client, resource, await super().get(resource)
-        )
-
-    async def wait(
-        self, job: str, *, timeout: float = 120, poll_interval: float = 0.2
-    ) -> AsyncJob:
-        """Polls a durable job with one deadline; failures are never successful results."""
-        number(timeout, 0.001, 86400, "timeout")
-        number(poll_interval, 0.001, 30, "poll_interval")
-        deadline = time.monotonic() + timeout
-        while True:
-            state = AsyncJob.from_response(
-                self.client,
-                job,
-                await self.client._call(
-                    "GET", f"/jobs/{name(job)}", self.kind, job, deadline=deadline
-                ),
-            )
-            if state.state in {"completed", "completed_with_issues"}:
-                return state
-            if state.state in {"failed", "cancelled"}:
-                raise ServiceError(
-                    "JobFailed", "job did not complete successfully", 409
-                )
-            if time.monotonic() >= deadline:
-                raise ServiceError("WaitTimeout", "job readiness timed out", 504)
-            await asyncio.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
-
-    async def control(
-        self, job: str, action: Literal["pause", "resume", "cancel", "retry"]
-    ) -> JsonObject:
-        """Retry links a NEW job; it does not rewrite a completed report."""
-        require(action in ("pause", "resume", "cancel", "retry"), "invalid job action")
-        return await self._post(job, action, {})
-
-    async def results(
-        self, job: str, *, offset: int = 0, limit: int = 100
-    ) -> JsonObject:
-        """Pages every occurrence, including skipped and rejected records."""
-        require(type(offset) is int and 0 <= offset <= 2**53 - 1, "invalid offset")
-        require(type(limit) is int and 1 <= limit <= 100, "invalid limit")
-        return await self.client._call(
-            "GET",
-            f"/jobs/{name(job)}/results",
-            self.kind,
-            job,
-            params={"offset": offset, "limit": limit},
-        )
-
-    async def iter_results(self, job: str) -> AsyncIterator[JsonObject]:
-        """Iterates all report pages, rejecting a non-progressing cursor."""
-        offset = 0
-        while True:
-            page = await self.results(job, offset=offset)
-            rows, next_offset = (page.get("results"), page.get("next_offset"))
-            if type(rows) is not list or any(type(row) is not dict for row in rows):
-                raise ServiceError("ProtocolError", "invalid job results", 502)
-            for row in rows:
-                yield row
-            if next_offset is None:
-                return
-            if type(next_offset) is not int or next_offset <= offset:
-                raise ServiceError("ProtocolError", "job results did not advance", 502)
-            offset = next_offset
-
-
-class Packages(Collection):
-    """Immutable packages. A test succeeds only with a proven isolation boundary."""
-
-    kind: ResourceKind = "package"
-    collection = "packages"
-
-    @staticmethod
-    async def load(path: str | Path = ".") -> Package:
-        """Loads a declarative package without network access."""
-        return await asyncio.to_thread(Package.load, path)
-
-    @staticmethod
-    async def check(package: Package, **options: Any) -> Package:
-        """Returns a new checked package using the canonical compiler."""
-        return await asyncio.to_thread(package.check, **options)
-
-    async def inspect(self, manifest: JsonObject) -> JsonObject:
-        """Validates metadata without executing untrusted code."""
-        return await self.client._call(
-            "POST", "/packages/inspect", self.kind, "new", manifest
-        )
-
-    async def register(self, manifest: JsonObject) -> JsonObject:
-        """Registers a digest-verified manifest, not a running deployment."""
-        return await self._create(manifest["name"], manifest)
-
-    async def test(self, package: str) -> JsonObject:
-        """Preserves typed IsolationUnavailable when the boundary is absent."""
-        return await self._post(package, "test", {})
-
-
-class Deployments(Collection):
-    """Immutable package revisions and runtime-bound environment operations."""
-
-    kind: ResourceKind = "deployment"
-    collection = "deployments"
-
-    async def get(self, resource: str, *, env: str | None = None) -> AsyncDeployment:
-        """Returns immutable deployment metadata and optional environment state."""
+    async def get(
+        self, resource: str, *, env: str | None = None
+    ) -> AsyncHostedPredictor:
+        """Returns the predictor's facts and optional environment state."""
         state = await super().get(resource)
         environment = await self.environment(resource, env) if env is not None else None
-        return AsyncDeployment.from_response(self.client, resource, state, environment)
-
-    async def create(self, deployment: str) -> AsyncDeployment:
-        """Creates only the deployment identity, not serving readiness."""
-        return AsyncDeployment.from_response(
-            self.client,
-            deployment,
-            await self._create(deployment, {"name": name(deployment)}),
+        return AsyncHostedPredictor.from_response(
+            self.client, resource, state, environment
         )
 
-    async def revisions(self, deployment: str) -> tuple[Revision, ...]:
+    async def create(self, predictor: str) -> AsyncHostedPredictor:
+        """Creates only the predictor name, not serving readiness."""
+        return AsyncHostedPredictor.from_response(
+            self.client,
+            predictor,
+            await self._create(predictor, {"name": name(predictor)}),
+        )
+
+    async def revisions(self, predictor: str) -> tuple[Revision, ...]:
         """Lists immutable revisions without inferring environment readiness."""
         value = await self.client._call(
-            "GET", f"/deployments/{name(deployment)}/revisions", self.kind, deployment
+            "GET", f"/predictors/{name(predictor)}/revisions", self.kind, predictor
         )
         return tuple(Revision.from_dict(row) for row in value["revisions"])
 
-    async def revision(self, deployment: str, number: int) -> RevisionDetails:
+    async def revision(self, predictor: str, number: int) -> RevisionDetails:
         """Reads the exact immutable compiled lock for a revision."""
         require(type(number) is int and number > 0, "invalid revision")
         value = await self.client._call(
             "GET",
-            f"/deployments/{name(deployment)}/revisions/{number}",
+            f"/predictors/{name(predictor)}/revisions/{number}",
             self.kind,
-            deployment,
+            predictor,
         )
         return RevisionDetails(
-            Revision.from_dict(value["revision"]), PackageLock.from_dict(value["lock"])
+            Revision.from_dict(value["revision"]), parse_lock(value["lock"])
         )
 
-    async def environments(self, deployment: str) -> tuple[Environment, ...]:
+    async def environments(self, predictor: str) -> tuple[Environment, ...]:
         """Lists runtime-bound environment pointers and their actual states."""
         value = await self.client._call(
             "GET",
-            f"/deployments/{name(deployment)}/environments",
+            f"/predictors/{name(predictor)}/environments",
             self.kind,
-            deployment,
+            predictor,
         )
         return tuple(Environment.from_dict(row) for row in value["environments"])
 
     async def environment(
-        self, deployment: str, env: str | None = None, *, deadline: float | None = None
+        self, predictor: str, env: str | None = None, *, deadline: float | None = None
     ) -> Environment:
         """Gets one environment with revision and CAS generation."""
         selected = environment_name(env, self.client.profile.environment)
         return Environment.from_dict(
             await self.client._call(
                 "GET",
-                f"/deployments/{name(deployment)}/environments/{selected}",
+                f"/predictors/{name(predictor)}/environments/{selected}",
                 self.kind,
-                deployment,
+                predictor,
                 deadline=deadline,
             )
         )
 
     async def create_environment(
-        self, deployment: str, *, env: str, runtime: str
+        self, predictor: str, *, env: str, runtime: str
     ) -> Environment:
-        """Binds a runtime separately from package content and authentication."""
+        """Binds a runtime separately from predictor content and authentication."""
         return Environment.from_dict(
             await self._post(
-                deployment,
+                predictor,
                 "environments",
                 {"name": name(env), "runtime": name(runtime)},
             )
@@ -610,7 +457,7 @@ class Deployments(Collection):
 
     async def promote(
         self,
-        deployment: str,
+        predictor: str,
         *,
         revision: int,
         env: str | None = None,
@@ -619,13 +466,13 @@ class Deployments(Collection):
         """CAS-promotes an explicit revision; races remain visible conflicts."""
         selected = environment_name(env, self.client.profile.environment)
         generation = (
-            (await self.environment(deployment, selected)).generation
+            (await self.environment(predictor, selected)).generation
             if expected_generation is None
             else expected_generation
         )
         return Environment.from_dict(
             await self._post(
-                deployment,
+                predictor,
                 f"environments/{name(selected)}/promote",
                 PromoteRequest(revision, generation).to_dict(),
             )
@@ -633,7 +480,7 @@ class Deployments(Collection):
 
     async def rollback(
         self,
-        deployment: str,
+        predictor: str,
         *,
         revision: int,
         env: str | None = None,
@@ -642,74 +489,80 @@ class Deployments(Collection):
         """Rolls back to an explicit immutable revision under the same CAS guard."""
         selected = environment_name(env, self.client.profile.environment)
         generation = (
-            (await self.environment(deployment, selected)).generation
+            (await self.environment(predictor, selected)).generation
             if expected_generation is None
             else expected_generation
         )
         return Environment.from_dict(
             await self._post(
-                deployment,
+                predictor,
                 f"environments/{name(selected)}/rollback",
                 PromoteRequest(revision, generation).to_dict(),
             )
         )
 
     async def predict(
-        self, deployment: str, queries: Any, *, env: str | None = None, **options: Any
+        self,
+        predictor: str,
+        queries: Any,
+        *,
+        context: Any = None,
+        as_of: Any = None,
+        env: str | None = None,
     ) -> PredictionResult:
-        """Predicts through the runtime-bound environment with actual context metadata."""
+        """Predicts with a declared predictor; see `Predictors.predict`."""
+        from generalforecast.predictor import PredictRequest
+
+        payload = await asyncio.to_thread(
+            PredictRequest.declared_payload, queries, context=context, as_of=as_of
+        )
+        params = (
+            {"env": environment_name(env, "production")} if env is not None else None
+        )
         return inference_result(
-            await self._post(
-                deployment,
-                f"environments/{environment_name(env, self.client.profile.environment)}/predict",
-                await asyncio.to_thread(prediction_payload, queries, **options),
+            await self.client._call(
+                "POST",
+                f"/{self.collection}/{predictor}/predict",
+                "predictor",
+                predictor,
+                payload,
+                params=params,
             )
         )
 
     async def push(
         self,
-        package: Package,
+        predictor: str | Path,
         *,
         env: str | None = None,
         runtime: str | None = None,
         wait: bool = False,
         timeout: float = 120,
     ) -> Revision:
-        """Uploads a checked package, registers an immutable revision and CAS-promotes."""
-        lock = await asyncio.to_thread(checked_lock, package)
-        deployment, selected = (
-            lock.spec.name,
+        """Pushes a checked predictor: registers a revision and points an environment at it."""
+        checked = await asyncio.to_thread(pushed, predictor)
+        lock = checked.lock
+        predictor, selected = (
+            checked.name,
             environment_name(env, self.client.profile.environment),
         )
         try:
-            await self.get(deployment)
+            await self.get(predictor)
         except ServiceError as error:
             if error.status != 404:
                 raise
-            await self.create(deployment)
+            await self.create(predictor)
         snapshot = None
-        if isinstance(lock, PythonLock):
-            await self.client.upload_python_source(
-                deployment,
-                await asyncio.to_thread(checked_python_source, package, lock),
-                source=lock.python.source,
-            )
-        elif lock.spec.context.mode == "snapshot":
-            snapshot = (
-                await self.client.upload_snapshot(
-                    await asyncio.to_thread(package.snapshot_table)
-                )
-            )["digest"]
-            require(
-                snapshot == lock.data_digest, "snapshot differs from checked package"
-            )
+        if checked.snapshot is not None:
+            snapshot = (await self.client.upload_snapshot(checked.snapshot))["digest"]
+            require(snapshot == lock.data_digest, "snapshot differs from gf.lock")
         revision = Revision.from_dict(
             await self._post(
-                deployment, "revisions", {"lock": lock.to_dict(), "snapshot": snapshot}
+                predictor, "revisions", {"lock": lock.to_dict(), "snapshot": snapshot}
             )
         )
         try:
-            environment = await self.environment(deployment, selected)
+            environment = await self.environment(predictor, selected)
             if runtime is not None:
                 require(
                     environment.runtime == runtime,
@@ -722,17 +575,17 @@ class Deployments(Collection):
             require(chosen is not None, "runtime is required for a new environment")
             assert chosen is not None
             environment = await self.create_environment(
-                deployment, env=selected, runtime=chosen
+                predictor, env=selected, runtime=chosen
             )
         promoted = await self.promote(
-            deployment,
+            predictor,
             revision=revision.number,
             env=selected,
             expected_generation=environment.generation,
         )
         if wait:
             await self.wait(
-                deployment,
+                predictor,
                 env=selected,
                 revision=revision.number,
                 generation=promoted.generation,
@@ -742,7 +595,7 @@ class Deployments(Collection):
 
     async def wait(
         self,
-        deployment: str,
+        predictor: str,
         *,
         env: str | None = None,
         revision: int | None = None,
@@ -755,7 +608,7 @@ class Deployments(Collection):
         number(poll_interval, 0.001, 30, "poll_interval")
         deadline = time.monotonic() + timeout
         while True:
-            state = await self.environment(deployment, env, deadline=deadline)
+            state = await self.environment(predictor, env, deadline=deadline)
             if (revision is not None and state.revision != revision) or (
                 generation is not None and state.generation != generation
             ):
@@ -767,7 +620,7 @@ class Deployments(Collection):
                 return state
             if state.status in {"failed", "stopped"}:
                 raise ServiceError(
-                    "DeploymentFailed", "environment did not become ready", 409
+                    "EnvironmentFailed", "environment did not become ready", 409
                 )
             if time.monotonic() >= deadline:
                 raise ServiceError(
@@ -775,196 +628,31 @@ class Deployments(Collection):
                 )
             await asyncio.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
 
-    async def metrics(self, deployment: str, *, env: str | None = None) -> Snapshot:
+    async def metrics(self, predictor: str, *, env: str | None = None) -> Snapshot:
         """Gets reported metrics without fabricating missing samples."""
         return Snapshot.from_dict(
             await self.client._call(
                 "GET",
-                f"/deployments/{name(deployment)}/environments/{environment_name(env, self.client.profile.environment)}/metrics",
+                f"/predictors/{name(predictor)}/environments/{environment_name(env, self.client.profile.environment)}/metrics",
                 self.kind,
-                deployment,
+                predictor,
             )
         )
 
-    async def logs(self, deployment: str, *, env: str | None = None) -> Snapshot:
+    async def logs(self, predictor: str, *, env: str | None = None) -> Snapshot:
         """Gets bounded safe runtime logs."""
         return Snapshot.from_dict(
             await self.client._call(
                 "GET",
-                f"/deployments/{name(deployment)}/environments/{environment_name(env, self.client.profile.environment)}/logs",
+                f"/predictors/{name(predictor)}/environments/{environment_name(env, self.client.profile.environment)}/logs",
                 self.kind,
-                deployment,
+                predictor,
             )
         )
 
-    async def delete(self, deployment: str) -> Snapshot:
+    async def delete(self, predictor: str) -> Snapshot:
         """Requests explicit stop/delete, never treating unsupported cleanup as success."""
-        return Snapshot.from_dict(await self._post(deployment, "delete", {}))
-
-
-class DevSessions:
-    """Remote dev-only worker sessions with full compiled replacement patches."""
-
-    def __init__(self, client: AsyncClient) -> None:
-        """Uses the same authenticated scoped transport as deployment operations."""
-        self.client = client
-
-    async def _call(
-        self, deployment, session, action="", payload=None, method="POST"
-    ) -> JsonObject:
-        path = f"/deployments/{name(deployment)}/dev-sessions"
-        if session is not None:
-            path += "/" + name(session)
-        if action:
-            path += "/" + action
-        return await self.client._call(method, path, "deployment", deployment, payload)
-
-    async def start(
-        self,
-        deployment: str,
-        *,
-        base_revision: int,
-        runtime: str,
-        ttl_seconds: int = 3600,
-    ) -> AsyncDevelopment:
-        """Starts from an immutable base without selecting any production environment."""
-        from generalforecast.contracts import DevSession
-
-        value = await self._call(
-            deployment,
-            None,
-            payload={
-                "base_revision": base_revision,
-                "runtime": name(runtime),
-                "ttl_seconds": ttl_seconds,
-            },
-        )
-        return AsyncDevelopment(DevSession.from_dict(value), self.client)
-
-    async def get(self, deployment: str, session: str) -> AsyncDevelopment:
-        """Reads actual development lifecycle state."""
-        from generalforecast.contracts import DevSession
-
-        return AsyncDevelopment(
-            DevSession.from_dict(await self._call(deployment, session, method="GET")),
-            self.client,
-        )
-
-    async def patch(
-        self, development: AsyncDevelopment, package: Package
-    ) -> AsyncDevelopment:
-        """CAS-patches a dev worker; stale handles fail without automatic rebase."""
-        from generalforecast.contracts import DevSession
-
-        require(
-            development._client is self.client,
-            "development session belongs to another client",
-        )
-        lock = await asyncio.to_thread(checked_lock, package)
-        require(
-            lock.spec.name == development.state.deployment,
-            "patch deployment differs from development session",
-        )
-        if isinstance(lock, PythonLock):
-            await self.client.upload_python_source(
-                development.state.deployment,
-                await asyncio.to_thread(checked_python_source, package, lock),
-                source=lock.python.source,
-            )
-        snapshot = (
-            (
-                await self.client.upload_snapshot(
-                    await asyncio.to_thread(package.snapshot_table)
-                )
-            )["digest"]
-            if lock.spec.context.mode == "snapshot"
-            else None
-        )
-        request = PatchRequest(
-            development.generation, development.state.base_revision, lock, snapshot
-        )
-        return AsyncDevelopment(
-            DevSession.from_dict(
-                await self._call(
-                    development.state.deployment,
-                    development.id,
-                    "patch",
-                    request.to_dict(),
-                )
-            ),
-            self.client,
-        )
-
-    async def predict(
-        self, deployment: str, session: str, queries: Any, **options: Any
-    ) -> PredictionResult:
-        """Runs the isolated remote development package, not production."""
-        return inference_result(
-            await self._call(
-                deployment,
-                session,
-                "predict",
-                await asyncio.to_thread(prediction_payload, queries, **options),
-            )
-        )
-
-    async def stop(self, deployment: str, session: str) -> AsyncDevelopment:
-        """Stops only the named remote development session."""
-        from generalforecast.contracts import DevSession
-
-        return AsyncDevelopment(
-            DevSession.from_dict(await self._call(deployment, session, "stop", {})),
-            self.client,
-        )
-
-
-class Runtimes:
-    """Authenticated runtime inventory; provisioning is never inferred from a plan."""
-
-    def __init__(self, client: AsyncClient) -> None:
-        """Shares project scope and transport, not provider credentials in config."""
-        self.client = client
-
-    async def list(self) -> tuple[Runtime, ...]:
-        """Lists configured runtime metadata."""
-        value = await self.client._call("GET", "/runtimes", "operator", "runtimes")
-        return tuple(
-            Runtime.from_response(self.client, row["name"], row)
-            for row in value["runtimes"]
-        )
-
-    async def get(self, runtime: str) -> Runtime:
-        """Gets actual runtime state or a typed unsupported/provider error."""
-        return Runtime.from_response(
-            self.client,
-            runtime,
-            await self.client._call(
-                "GET", f"/runtimes/{name(runtime)}", "operator", runtime
-            ),
-        )
-
-    async def preflight(self, runtime: str) -> Snapshot:
-        """Runs explicit provider preflight separately from authentication."""
-        return Snapshot.from_dict(
-            await self.client._call(
-                "POST", f"/runtimes/{name(runtime)}/preflight", "operator", runtime, {}
-            )
-        )
-
-    async def connect(self, runtime: str) -> Snapshot:
-        """Explicitly connects a configured provider, never changing authentication."""
-        return await self._action(runtime, "connect")
-
-    async def cleanup(self, runtime: str) -> Snapshot:
-        """Cleans up only the named configured runtime through provider policy."""
-        return await self._action(runtime, "cleanup")
-
-    async def _action(self, runtime: str, action: str) -> Snapshot:
-        return Snapshot.from_dict(
-            await self.client._call(
-                "POST", f"/runtimes/{name(runtime)}/{action}", "operator", runtime, {}
-            )
-        )
+        return Snapshot.from_dict(await self._post(predictor, "delete", {}))
 
 
 class Identity:
@@ -1129,37 +817,9 @@ class Secrets(Collection):
         return await self.client.identity.manage("secrets.delete", {"name": secret})
 
 
-class Operators:
-    """Project-safe doctor only. Full-store operations require host authority."""
-
-    def __init__(self, client: AsyncClient) -> None:
-        """Keeps operator authority separate from ordinary project credentials."""
-        self.client = client
-
-    async def doctor(self) -> JsonObject:
-        """Returns redacted capability metadata, never host backup contents."""
-        return await self.client._call("GET", "/operators/doctor", "operator", "doctor")
-
-    async def backup(self, _spec: JsonObject) -> JsonObject:
-        """Fails closed until an independent host authority exists."""
-        raise ServiceError(
-            "HostAuthorityUnavailable",
-            "full-store backup is not a project operation",
-            501,
-        )
-
-    async def restore_check(self, _manifest: JsonObject) -> JsonObject:
-        """Fails closed; a project administrator is not a host administrator."""
-        raise ServiceError(
-            "HostAuthorityUnavailable",
-            "full-store restore check requires independent host authority",
-            501,
-        )
-
-
 @dataclass(frozen=True, eq=False)
-class AsyncDeployment(BoundSnapshot):
-    """Immutable deployment metadata with explicit environment operations."""
+class AsyncHostedPredictor(BoundSnapshot):
+    """Immutable predictor metadata with explicit environment operations."""
 
     environment: Environment | None = None
 
@@ -1171,7 +831,7 @@ class AsyncDeployment(BoundSnapshot):
         value: Mapping[str, Any],
         environment: Environment | None = None,
     ):
-        """Captures state without mutating older deployment handles."""
+        """Captures state without mutating older predictor handles."""
         return cls(
             Snapshot.from_dict(value)._encoded, client, name(resource), environment
         )
@@ -1186,33 +846,33 @@ class AsyncDeployment(BoundSnapshot):
         """Returns reported lifecycle status, preserving pending/error states."""
         return self.environment.status if self.environment else self.get("status")
 
-    async def refresh(self) -> AsyncDeployment:
+    async def refresh(self) -> AsyncHostedPredictor:
         """Fetches a new snapshot without modifying this handle."""
-        return await self._client.deployments.get(
+        return await self._client.predictors.get(
             self.name, env=self.environment.name if self.environment else None
         )
 
     async def predict(self, queries: Any, **options: Any) -> PredictionResult:
         """Uses the captured environment selection, not a mutable global default."""
         captured_environment(self.environment, options)
-        return await self._client.deployments.predict(self.name, queries, **options)
+        return await self._client.predictors.predict(self.name, queries, **options)
 
     async def wait(self, **options: Any) -> Environment:
         """Waits for the captured pointer by default."""
         captured_environment(self.environment, options, pointer=True)
-        return await self._client.deployments.wait(self.name, **options)
+        return await self._client.predictors.wait(self.name, **options)
 
     async def promote(self, *, revision: int, **options: Any) -> Environment:
         """Promotes under this snapshot's generation when an environment was selected."""
         self._guard(options)
-        return await self._client.deployments.promote(
+        return await self._client.predictors.promote(
             self.name, revision=revision, **options
         )
 
     async def rollback(self, *, revision: int, **options: Any) -> Environment:
         """Rolls back under this snapshot's generation."""
         self._guard(options)
-        return await self._client.deployments.rollback(
+        return await self._client.predictors.rollback(
             self.name, revision=revision, **options
         )
 
@@ -1222,21 +882,21 @@ class AsyncDeployment(BoundSnapshot):
     async def metrics(self, **options: Any) -> Snapshot:
         """Fetches actual metrics for the selected environment."""
         captured_environment(self.environment, options)
-        return await self._client.deployments.metrics(self.name, **options)
+        return await self._client.predictors.metrics(self.name, **options)
 
     async def logs(self, **options: Any) -> Snapshot:
         """Fetches bounded runtime logs for the selected environment."""
         captured_environment(self.environment, options)
-        return await self._client.deployments.logs(self.name, **options)
+        return await self._client.predictors.logs(self.name, **options)
 
     async def delete(self) -> Snapshot:
         """Requests deletion; the server owns authorization and cleanup."""
-        return await self._client.deployments.delete(self.name)
+        return await self._client.predictors.delete(self.name)
 
 
 @dataclass(frozen=True, eq=False)
-class AsyncDataset(BoundSnapshot):
-    """Logical dataset snapshot and explicit append/label/import/refresh actions."""
+class AsyncLiveContext(BoundSnapshot):
+    """Logical context snapshot and explicit append/label/import/refresh actions."""
 
     @property
     def sequence(self) -> int | None:
@@ -1245,7 +905,7 @@ class AsyncDataset(BoundSnapshot):
 
     async def append(self, data: Any, *, id: str, idempotency_key: str) -> WriteReceipt:
         """Appends tabular observations without mutating this state snapshot."""
-        return await self._client.datasets.append(
+        return await self._client.contexts.append(
             self.name, data, id=id, idempotency_key=idempotency_key
         )
 
@@ -1253,91 +913,19 @@ class AsyncDataset(BoundSnapshot):
         self, data: Any, *, id: str, column: str, idempotency_key: str
     ) -> WriteReceipt:
         """Attaches labels using an explicit stable write identity."""
-        return await self._client.datasets.label(
+        return await self._client.contexts.label(
             self.name, data, id=id, column=column, idempotency_key=idempotency_key
         )
 
     async def import_source(self, reference) -> ImportReceipt:
-        """Binds an import only when its logical dataset matches this handle."""
-        require(reference.dataset == self.name, "import dataset differs from handle")
-        return await self._client.datasets.import_source(reference)
+        """Binds an import only when its logical context matches this handle."""
+        require(reference.context == self.name, "import context differs from handle")
+        return await self._client.contexts.import_source(reference)
 
-    async def refresh(self) -> AsyncDataset:
+    async def refresh(self) -> AsyncLiveContext:
         """Explicitly requests provider refresh rather than polling source silently."""
-        return await self._client.datasets.refresh(self.name)
+        return await self._client.contexts.refresh(self.name)
 
-    async def status(self) -> AsyncDataset:
+    async def status(self) -> AsyncLiveContext:
         """Fetches metadata without triggering provider ingestion."""
-        return await self._client.datasets.get(self.name)
-
-
-@dataclass(frozen=True, eq=False)
-class AsyncJob(BoundSnapshot):
-    """Durable job snapshot; acceptance never implies completion."""
-
-    @property
-    def state(self) -> str:
-        """Returns the actual persisted lifecycle state."""
-        return self["state"]
-
-    async def poll(self) -> AsyncJob:
-        """Fetches a fresh job state without modifying this object."""
-        return await self._client.jobs.get(self.name)
-
-    async def cancel(self) -> AsyncJob:
-        """Cancels remotely; cancelling a local wait does not cancel the job."""
-        return AsyncJob.from_response(
-            self._client,
-            self.name,
-            await self._client.jobs.control(self.name, "cancel"),
-        )
-
-    async def wait(
-        self, *, timeout: float = 120, poll_interval: float = 0.2
-    ) -> AsyncJob:
-        """Polls with a bounded total deadline and raises for terminal failure."""
-        return await self._client.jobs.wait(
-            self.name, timeout=timeout, poll_interval=poll_interval
-        )
-
-    async def results(self, *, offset: int = 0, limit: int = 100) -> Snapshot:
-        """Gets one bounded page, retaining every skipped/rejected occurrence."""
-        return Snapshot.from_dict(
-            await self._client.jobs.results(self.name, offset=offset, limit=limit)
-        )
-
-
-@dataclass(frozen=True)
-class AsyncDevelopment:
-    """Remote development state, isolated from immutable revisions and production."""
-
-    state: DevSession
-    _client: Any = field(repr=False, compare=False)
-
-    @property
-    def id(self) -> str:
-        """Returns the server-created remote session identifier."""
-        return self.state.id
-
-    @property
-    def generation(self) -> int:
-        """Returns the generation required for the next optimistic patch."""
-        return self.state.generation
-
-    async def refresh(self) -> AsyncDevelopment:
-        """Fetches a new session snapshot."""
-        return await self._client.dev_sessions.get(self.state.deployment, self.id)
-
-    async def patch(self, package: Package) -> AsyncDevelopment:
-        """Uploads a full replacement checked package using the captured generation."""
-        return await self._client.dev_sessions.patch(self, package)
-
-    async def predict(self, queries: Any, **options: Any) -> PredictionResult:
-        """Scores only this development worker, never its production environment."""
-        return await self._client.dev_sessions.predict(
-            self.state.deployment, self.id, queries, **options
-        )
-
-    async def stop(self) -> AsyncDevelopment:
-        """Stops this development worker without changing a production pointer."""
-        return await self._client.dev_sessions.stop(self.state.deployment, self.id)
+        return await self._client.contexts.get(self.name)

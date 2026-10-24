@@ -52,7 +52,7 @@ def _series(case: str) -> tuple[np.ndarray, np.ndarray]:
 def _upstream() -> Any:
     from chronos import Chronos2Pipeline
 
-    published = PUBLISHED["chronos-2"]
+    published = PUBLISHED["general-forecast/chronos-2"]
     return Chronos2Pipeline.from_pretrained(
         published.repository, revision=published.revision, device_map="cpu"
     )
@@ -94,7 +94,7 @@ def our_forecast(case: str, horizon: int) -> np.ndarray:
     """generalforecast's port on the same group, converted from the same files."""
     roles = GROUPS[case]
     context, future = _series(case)
-    model = load_chronos2(chronos2_checkpoint("chronos-2"))
+    model = load_chronos2(chronos2_checkpoint("general-forecast/chronos-2"))
     rows = len(roles)
     pad = -STEPS % model.patch
     values = np.concatenate([np.zeros((rows, pad), np.float32), context], axis=1)
