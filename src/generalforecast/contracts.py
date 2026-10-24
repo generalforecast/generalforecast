@@ -4,18 +4,18 @@
 """Shared immutable surface values and ports, not a second control plane."""
 
 import datetime
+import re
 from dataclasses import MISSING, asdict, dataclass, is_dataclass, replace
 from dataclasses import fields as dataclass_fields
-from typing import Protocol, Self
+from typing import Any, Protocol, Self
 from urllib.parse import urlsplit
 
 import pyarrow as pa
 
 from generalforecast.deployments.boundary import Scope
-from generalforecast.packages.lock import PackageLock
-from generalforecast.packages.python_lock import PythonLock
-from generalforecast.packages.validation import (
-    PackageError,
+from generalforecast.predictors.validation import (
+    PredictorError,
+    digest,
     ensure,
     fields,
     hash_value,
@@ -24,8 +24,181 @@ from generalforecast.packages.validation import (
     text,
 )
 
-API_PREFIX = "/v1alpha1"
+API_PREFIX = "/v1"
 STATES = frozenset({"pending", "building", "ready", "failed", "stopped"})
+TASKS = ("classification", "regression", "forecast")
+CONTEXT_KINDS = ("snapshot", "request", "live")
+MODEL_ID = re.compile(r"general-forecast/[a-z0-9][a-z0-9.-]*(@[^@\s]+)?")
+LOCK_VERSION = 1
+
+
+@dataclass(frozen=True)
+class PredictorLock:
+    """A pushed `gf.lock`: the predictor's resolved intent, content-addressed.
+
+    The hosted plane keeps the document byte-for-byte as `gf check` wrote it;
+    `digest` names the revision and `identity` the pinned model.
+    """
+
+    document: dict
+
+    def __post_init__(self):
+        """Checks the lock's shape, the canonical model id and its context kind."""
+        value = self.document
+        fields(value, {"lock_version", "predictor", "model"})
+        ensure(
+            value["lock_version"] == LOCK_VERSION,
+            "unsupported lock version; run `gf check` to write version 2",
+            "UnsupportedLockVersion",
+        )
+        predictor = fields(
+            value["predictor"],
+            {
+                "name",
+                "model",
+                "model_digest",
+                "task",
+                "target",
+                "target_type",
+                "inputs",
+                "context",
+                "selection",
+            },
+            {
+                "classes",
+                "id",
+                "id_type",
+                "time",
+                "series",
+                "frequency",
+                "horizon",
+                "quantiles",
+            },
+        )
+        name(predictor["name"])
+        ensure(
+            type(predictor["model"]) is str
+            and MODEL_ID.fullmatch(predictor["model"]) is not None,
+            f"model `{predictor['model']}` is not a catalog id; use general-forecast/<name>",
+            "ValidationError",
+        )
+        hash_value(predictor["model_digest"])
+        ensure(predictor["task"] in TASKS, "invalid predictor task")
+        text(predictor["target"])
+        inputs = predictor["inputs"]
+        ensure(
+            type(inputs) is list
+            and all(
+                type(column) is dict
+                and {"name", "type"} <= set(column)
+                and type(column["name"]) is str
+                and (column["type"] is None or type(column["type"]) is str)
+                for column in inputs
+            ),
+            "lock inputs must list {name, type} columns",
+        )
+        context = fields(
+            predictor["context"],
+            {"kind"},
+            {"digest", "rows", "query_rows", "path", "name", "max_rows"},
+        )
+        ensure(context["kind"] in CONTEXT_KINDS, "invalid context kind")
+        if context["kind"] == "snapshot":
+            hash_value(context.get("digest"))
+            integer(context.get("rows"), 0)
+        if context["kind"] == "live":
+            name(context.get("name"))
+        fields(value["model"], {"files"})
+        object.__setattr__(self, "document", json_copy(value))
+
+    @property
+    def predictor(self) -> dict:
+        """The resolved predictor section."""
+        return self.document["predictor"]
+
+    @property
+    def name(self) -> str:
+        """The predictor name the lock was checked for."""
+        return self.predictor["name"]
+
+    @property
+    def model(self) -> str:
+        """The canonical catalog id."""
+        return self.predictor["model"]
+
+    @property
+    def identity(self) -> str:
+        """The pinned model, `general-forecast/<name>@sha256:...`."""
+        return f"{self.model}@{self.predictor['model_digest']}"
+
+    @property
+    def task(self) -> str:
+        """classification, regression or forecast."""
+        return self.predictor["task"]
+
+    @property
+    def context(self) -> dict:
+        """The locked context: kind, and digest/rows or the live context name."""
+        return self.predictor["context"]
+
+    @property
+    def context_kind(self) -> str:
+        """snapshot, request or live."""
+        return self.context["kind"]
+
+    @property
+    def context_name(self) -> str | None:
+        """The live context this predictor binds to, when its kind is live."""
+        return self.context.get("name") if self.context_kind == "live" else None
+
+    @property
+    def data_digest(self) -> str | None:
+        """The snapshot's content digest, when the context is a snapshot."""
+        return self.context.get("digest") if self.context_kind == "snapshot" else None
+
+    @property
+    def digest(self) -> str:
+        """The revision's content address: the digest of the canonical lock."""
+        return digest(self.document)
+
+    def to_dict(self) -> dict:
+        """A copy of the lock document."""
+        return json_copy(self.document)
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "PredictorLock":
+        """Decodes a `gf.lock` document."""
+        ensure(type(value) is dict, "lock must be a document")
+        return cls(value)
+
+
+def parse_lock(value: Any) -> "PredictorLock":
+    """A pushed lock: the `gf.lock` of a catalog predictor."""
+    ensure(
+        type(value) is dict and "predictor" in value,
+        "unsupported lock; run `gf check` to write a version 1 lock",
+        "UnsupportedLockVersion",
+    )
+    return PredictorLock.from_dict(value)
+
+
+def lock_name(lock: "PredictorLock") -> str:
+    """The predictor a lock was checked for."""
+    return lock.name
+
+
+def lock_digest(lock: "PredictorLock") -> str:
+    """The lock's content address."""
+    return lock.digest
+
+
+def json_copy(value: Any) -> Any:
+    """A deep copy of plain JSON data."""
+    if isinstance(value, dict):
+        return {key: json_copy(child) for key, child in value.items()}
+    if isinstance(value, list):
+        return [json_copy(child) for child in value]
+    return value
 
 
 class WireValue:
@@ -72,20 +245,20 @@ class WireValue:
 
 @dataclass(frozen=True)
 class Revision(WireValue):
-    """A named deployment's immutable package identity and lifecycle state."""
+    """A predictor's immutable pushed identity and lifecycle state."""
 
-    deployment: str
+    predictor: str
     number: int
-    package_digest: str
+    predictor_digest: str
     model: str
     created_at: float
     status: str = "pending"
 
     def __post_init__(self):
         """Checks portable identity without claiming the revision is serving."""
-        name(self.deployment)
+        name(self.predictor)
         integer(self.number)
-        hash_value(self.package_digest)
+        hash_value(self.predictor_digest)
         text(self.model)
         ensure(
             type(self.created_at) in (int, float) and 0 <= self.created_at < 1e12,
@@ -98,7 +271,7 @@ class Revision(WireValue):
 class Environment(WireValue):
     """Mutable environment pointer; generation supports compare-and-swap updates."""
 
-    deployment: str
+    predictor: str
     name: str
     revision: int | None
     generation: int
@@ -106,8 +279,8 @@ class Environment(WireValue):
     status: str = "pending"
 
     def __post_init__(self):
-        """Keeps environment identity distinct from the immutable package."""
-        name(self.deployment)
+        """Keeps environment identity distinct from the immutable revision."""
+        name(self.predictor)
         name(self.name)
         name(self.runtime)
         integer(self.generation, 0)
@@ -166,11 +339,31 @@ class ContextVersion(WireValue):
             )
 
 
-@dataclass(frozen=True)
-class DatasetImportRef(WireValue):
-    """An import binds a trusted source to a logical dataset; credentials are refs only."""
+def context_version(value: dict) -> ContextVersion:
+    """Decodes a context as the SDK or the predictor API describes it.
 
-    dataset: str
+    The predictor API sends `{kind, rows, digest?, as_of?}`; the kind is the
+    source and the digest is the version.
+    """
+    if type(value) is dict and "kind" in value and "source" not in value:
+        body = dict(fields(value, {"kind"}, {"rows", "digest", "as_of"}))
+        as_of = body.get("as_of")
+        if isinstance(as_of, str):
+            as_of = datetime.datetime.fromisoformat(as_of).timestamp()
+        return ContextVersion(
+            source=body["kind"],
+            version=body.get("digest"),
+            rows=body.get("rows"),
+            as_of=as_of,
+        )
+    return ContextVersion.from_dict(value)
+
+
+@dataclass(frozen=True)
+class ContextImportRef(WireValue):
+    """An import binds a trusted source to a live context; credentials are refs only."""
+
+    context: str
     source: str
     format: str
     credential_ref: str | None = None
@@ -179,7 +372,7 @@ class DatasetImportRef(WireValue):
 
     def __post_init__(self):
         """Rejects signed URLs, userinfo and inline credentials before transmission."""
-        name(self.dataset)
+        name(self.context)
         ensure(
             type(self.source) is str
             and 0 < len(self.source) <= 2048
@@ -244,11 +437,11 @@ class DatasetImportRef(WireValue):
 
 @dataclass(frozen=True)
 class RuntimePlan(WireValue):
-    """Placement and resources for an exact package, separate from provider provisioning."""
+    """Placement and resources for an exact revision, separate from provider provisioning."""
 
     runtime: str
     environment: str
-    package_digest: str
+    predictor_digest: str
     model_digest: str | None
     data_digest: str | None
     region: str | None
@@ -263,7 +456,7 @@ class RuntimePlan(WireValue):
         """Validates caller-selected runtime and trusted secret references."""
         name(self.runtime)
         name(self.environment)
-        hash_value(self.package_digest)
+        hash_value(self.predictor_digest)
         if self.model_digest is not None:
             hash_value(self.model_digest)
         if self.data_digest is not None:
@@ -302,148 +495,30 @@ class RuntimePlan(WireValue):
             )
 
     @classmethod
-    def for_package(
+    def for_lock(
         cls,
-        lock: PackageLock | PythonLock,
+        lock: "PredictorLock",
         *,
         runtime: str,
         environment: str,
         secret_refs: tuple[str, ...] = (),
     ) -> "RuntimePlan":
         """Compiles portable placement without creating infrastructure or identities."""
-        lock = PackageLock.from_dict(lock.to_dict())
-        if isinstance(lock, PythonLock):
-            return cls(
-                runtime,
-                environment,
-                lock.package_digest,
-                None,
-                None,
-                None,
-                (),
-                lock.cpu,
-                lock.memory,
-                lock.spec.min_replicas,
-                lock.spec.max_replicas,
-                secret_refs,
-            )
+        lock = parse_lock(lock.to_dict())
         return cls(
             runtime,
             environment,
-            lock.package_digest,
-            lock.model_digest,
+            lock.digest,
+            lock.predictor["model_digest"],
             lock.data_digest,
-            lock.spec.region,
-            lock.spec.residency,
-            lock.cpu,
-            lock.memory,
-            lock.spec.min_replicas,
-            lock.spec.max_replicas,
+            None,
+            (),
+            1,
+            "2Gi",
+            1,
+            1,
             secret_refs,
         )
-
-
-@dataclass(frozen=True)
-class DevSession(WireValue):
-    """An isolated development pointer; never an environment or production revision."""
-
-    id: str
-    deployment: str
-    base_revision: int
-    generation: int
-    package_digest: str
-    expires_at: float
-    status: str = "pending"
-
-    def __post_init__(self):
-        """Checks patch CAS identity without inventing an execution boundary."""
-        name(self.id)
-        name(self.deployment)
-        integer(self.base_revision)
-        integer(self.generation, 0)
-        hash_value(self.package_digest)
-        ensure(
-            type(self.expires_at) in (int, float) and 0 <= self.expires_at < 1e12,
-            "invalid dev-session expiry",
-        )
-        ensure(self.status in STATES, "invalid dev-session status")
-
-    def apply_patch(self, request: "PatchRequest", *, now: float) -> "DevSession":
-        """Pure isolated CAS transition; never mutates an environment pointer."""
-        ensure(
-            type(now) in (int, float)
-            and 0 <= now < self.expires_at
-            and self.status != "stopped",
-            "development session is expired or stopped",
-            "Conflict",
-        )
-        ensure(
-            request.base_revision == self.base_revision
-            and request.expected_generation == self.generation,
-            "development base revision or generation is stale",
-            "Conflict",
-        )
-        ensure(
-            request.lock.spec.name == self.deployment,
-            "patch deployment differs from development session",
-        )
-        return replace(
-            self,
-            generation=self.generation + 1,
-            package_digest=request.lock.package_digest,
-            status="pending",
-        )
-
-
-@dataclass(frozen=True)
-class PatchRequest:
-    """A complete replacement compiled package at an expected dev generation."""
-
-    expected_generation: int
-    base_revision: int
-    lock: PackageLock | PythonLock
-    snapshot: str | None = None
-
-    def __post_init__(self):
-        """Validates patch identity; server must atomically compare and update."""
-        integer(self.expected_generation, 0)
-        integer(self.base_revision)
-        ensure(isinstance(self.lock, (PackageLock, PythonLock)), "invalid package lock")
-        PackageLock.from_dict(self.lock.to_dict())
-        if isinstance(self.lock, PythonLock):
-            ensure(self.snapshot is None, "Python patches cannot include a snapshot")
-            return
-        if self.snapshot is not None:
-            hash_value(self.snapshot)
-        ensure(
-            (self.lock.spec.context.mode == "snapshot") == (self.snapshot is not None),
-            "snapshot patches require uploaded content identity",
-        )
-        if self.snapshot is not None:
-            ensure(
-                self.snapshot == self.lock.data_digest,
-                "snapshot identity differs from locked data",
-            )
-
-    def to_dict(self) -> dict:
-        """Copies the locked package with no mutable source-tree or credential capture."""
-        return {
-            "expected_generation": self.expected_generation,
-            "base_revision": self.base_revision,
-            "lock": self.lock.to_dict(),
-            "snapshot": self.snapshot,
-        }
-
-    @classmethod
-    def from_dict(cls, value: dict) -> "PatchRequest":
-        """Decodes a complete compiled patch, never executable source or inline secrets."""
-        body = dict(
-            fields(
-                value, {"expected_generation", "base_revision", "lock"}, {"snapshot"}
-            )
-        )
-        body["lock"] = PackageLock.from_dict(body["lock"])
-        return cls(**body)
 
 
 @dataclass(frozen=True)
@@ -454,7 +529,7 @@ class PredictionResult:
     model: str
     task: str
     context: ContextVersion | None = None
-    deployment: str | None = None
+    predictor: str | None = None
     revision: int | None = None
     environment: str | None = None
 
@@ -476,8 +551,8 @@ class PredictionResult:
             self.task in ("classification", "regression", "forecast"),
             "invalid prediction task",
         )
-        if self.deployment is not None:
-            name(self.deployment)
+        if self.predictor is not None:
+            name(self.predictor)
         if self.revision is not None:
             integer(self.revision)
         if self.environment is not None:
@@ -527,7 +602,7 @@ class PredictionResult:
             "model": self.model,
             "task": self.task,
             "context": self.context.to_dict() if self.context else None,
-            "deployment": self.deployment,
+            "predictor": self.predictor,
             "revision": self.revision,
             "environment": self.environment,
             "predictions": [
@@ -543,7 +618,7 @@ class PredictionResult:
             fields(
                 value,
                 {"model", "task", "predictions"},
-                {"context", "deployment", "revision", "environment"},
+                {"context", "predictor", "revision", "environment"},
             )
         )
         rows = body.pop("predictions")
@@ -557,9 +632,11 @@ class PredictionResult:
                 {key: [row.get(key) for row in rows] for key in keys}
             )
         except (ValueError, TypeError, pa.ArrowException):
-            raise PackageError("InvalidResult", "prediction rows are invalid") from None
+            raise PredictorError(
+                "InvalidResult", "prediction rows are invalid"
+            ) from None
         if body.get("context") is not None:
-            body["context"] = ContextVersion.from_dict(body["context"])
+            body["context"] = context_version(body["context"])
         return cls(**body)
 
 
@@ -569,24 +646,16 @@ class RevisionStore(Protocol):
     def create(
         self,
         scope: Scope,
-        deployment: str,
-        lock: PackageLock | PythonLock,
+        predictor: str,
+        lock: "PredictorLock",
         *,
         snapshot: str | None = None,
     ) -> Revision:
-        """Persists immutable package identity and authenticated snapshot binding."""
+        """Persists immutable revision identity and authenticated snapshot binding."""
         ...
 
     def promote(
-        self, scope: Scope, deployment: str, environment: str, request: PromoteRequest
+        self, scope: Scope, predictor: str, environment: str, request: PromoteRequest
     ) -> Environment:
         """Atomically updates one pointer after authorization and runtime admission."""
-        ...
-
-
-class DevPatchStore(Protocol):
-    """Durable development CAS port; a production environment is not a dev session."""
-
-    def patch(self, scope: Scope, session: str, request: PatchRequest) -> DevSession:
-        """Rejects stale generation and leaves production immutable on every failure."""
         ...

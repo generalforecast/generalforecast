@@ -2,23 +2,21 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import hashlib
-from types import SimpleNamespace
 
-import numpy as np
 import pytest
 from huggingface_hub.errors import LocalEntryNotFoundError
 
 from generalforecast.deployments import catalog_artifacts
-from generalforecast.deployments.catalog import CatalogService
 from generalforecast.deployments.catalog_artifacts import preload, verify
 from generalforecast.deployments.contracts import ServiceError
-from generalforecast.engine import _checked
 from generalforecast.models import artifacts, catalog
 from generalforecast.models.artifacts import ArtifactError
 from tests.utils.engine import tabular_request
 
-ENTRY = catalog.ENTRIES["tabicl-v2-classifier"]
-TABULAR = tabular_request("tabicl-classifier", [[0.0], [1.0]], [False, True], [[2.0]])
+ENTRY = catalog.ENTRIES["general-forecast/tabicl-v2-classifier"]
+TABULAR = tabular_request(
+    "general-forecast/tabicl-v2-classifier", [[0.0], [1.0]], [False, True], [[2.0]]
+)
 
 
 @pytest.mark.parametrize("online", [False, True])
@@ -37,10 +35,10 @@ def test_checkpoint_access_is_explicitly_configured(online, monkeypatch):
     monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
     with pytest.raises(ArtifactError) as caught:
         artifacts.checkpoint(ENTRY, surface="remote", allow_downloads=online)
-    assert caught.value.code == "ModelUnavailable"
-    assert [call[1]["local_files_only"] for call in calls] == [True, False][
-        : 1 + online
-    ]
+    assert caught.value.code == ("ModelUnavailable" if online else "NotFound")
+    assert [call[1]["local_files_only"] for call in calls] == (
+        [True, True, False] if online else [True]
+    )
     assert len(calls[0][1]["revision"]) == 40
     assert calls[0][1]["allow_patterns"] == list(ENTRY.artifact.files)
 
@@ -112,62 +110,6 @@ def test_preload_rejects_corrupted_download_before_fetching_another_pin(
         preload()
     assert caught.value.code == "ArtifactMismatch"
     assert len(calls) == 1
-
-
-def test_download_failures_are_typed_and_redacted(monkeypatch):
-    import huggingface_hub
-
-    def refuse(*_args, **_kwargs):
-        raise RuntimeError("private-signed-url")
-
-    monkeypatch.delenv("GF_CHECKPOINTS", raising=False)
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", refuse)
-    with pytest.raises(ServiceError) as caught:
-        CatalogService(allow_downloads=True)._run(
-            catalog.parse("tabicl-classifier"), TABULAR
-        )
-    assert (caught.value.code, caught.value.status) == ("ModelUnavailable", 503)
-    assert "private-signed-url" not in str(caught.value)
-
-
-@pytest.mark.parametrize(
-    "kind",
-    ["shape", "finite", "normalization", "negative", "quantile-order", "exception"],
-)
-def test_native_output_validation(kind, monkeypatch):
-    regression = kind == "quantile-order"
-    functions = SimpleNamespace(properties=lambda _: SimpleNamespace(num_outputs=999))
-    monkeypatch.setattr(
-        "generalforecast.models.registry.load_ref", lambda *_, **__: (functions, None)
-    )
-
-    def run(*_):
-        if kind == "exception":
-            raise RuntimeError("private-context")
-        return {
-            "shape": np.ones((2, 2)),
-            "finite": np.array([[np.nan, 0.5]]),
-            "normalization": np.array([[0.2, 0.2]]),
-            "negative": np.array([[-0.1, 1.1]]),
-            "quantile-order": -np.arange(999).reshape(1, 999),
-        }[kind]
-
-    class Engine:
-        def tabular(self, ref, request):
-            return _checked(run(), len(request.queries), len(request.classes))
-
-    monkeypatch.setattr("generalforecast.engine.local", lambda *_: Engine())
-    request = TABULAR
-    if regression:
-        request = tabular_request(
-            "tabicl-regressor", [[0.0], [1.0]], [0.0, 1.0], [[2.0]]
-        )
-    model = "tabicl-regressor" if regression else "tabicl-classifier"
-    with pytest.raises(ServiceError) as caught:
-        CatalogService()._run(catalog.parse(model), request)
-    assert caught.value.code == (
-        "InferenceFailed" if kind == "exception" else "ModelOutputError"
-    )
 
 
 def test_catalog_artifacts_module_has_no_private_loaders():

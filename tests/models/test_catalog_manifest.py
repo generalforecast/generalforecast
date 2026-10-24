@@ -13,7 +13,7 @@ from generalforecast.deployments.boundary import json_bytes
 from generalforecast.models import catalog
 
 MANIFEST = Path(__file__).resolve().parents[2] / "crates" / "gf-core" / "catalog.json"
-DIGEST = catalog.ENTRIES["tabicl-v2-classifier"].artifact.digest
+DIGEST = catalog.ENTRIES["general-forecast/tabicl-v2-classifier"].artifact.digest
 
 
 def test_checked_in_manifest_is_the_catalogs() -> None:
@@ -26,29 +26,30 @@ def test_checked_in_manifest_is_the_catalogs() -> None:
 @pytest.mark.parametrize(
     "spec",
     [
+        "general-forecast/tabicl-v2-classifier",
         "tabicl-v2-classifier",
         "tabicl-classifier",
-        "catalog/tabicl-classifier",
+        "general-forecast/tabicl-classifier",
         "general-forecast/tabicl-v2-classifier@4*2",
-        f"tabicl-v2-classifier@{DIGEST}",
-        f"catalog/tabicl-classifier@{DIGEST}@3*2",
-        f"tabicl-v2-classifier@{DIGEST}0",
-        "tabicl-v2-classifier@sha256:" + "0" * 64,
-        "tabicl-classifier@007",
-        "tabicl-classifier@0",
-        "tabicl-classifier*00",
-        "tabicl-classifier*2@4",
-        "tabicl-classifier@",
-        "tabicl-regressor@2",
-        "tabicl-regressor*3",
-        "chronos-2*2",
+        f"general-forecast/tabicl-v2-classifier@{DIGEST}",
+        f"general-forecast/tabicl-v2-classifier@{DIGEST}@3*2",
+        f"general-forecast/tabicl-v2-classifier@{DIGEST}0",
+        "general-forecast/tabicl-v2-classifier@sha256:" + "0" * 64,
+        "general-forecast/tabicl-v2-classifier@007",
+        "general-forecast/tabicl-v2-classifier@0",
+        "general-forecast/tabicl-v2-classifier*00",
+        "general-forecast/tabicl-v2-classifier*2@4",
+        "general-forecast/tabicl-v2-classifier@",
+        "general-forecast/tabicl-v2-regressor@2",
+        "general-forecast/tabicl-v2-regressor*3",
+        "general-forecast/chronos-2*2",
         "amazon/chronos-2",
         "mistralai/Timestral-28M",
         "os:system",
         "catalog/",
         "catalog/os:system",
         "unknown-model",
-        "tabpfn-3.5-classifier",
+        "general-forecast/tabpfn-3.5-classifier",
         "it's\n\x00\u00a0é",
         "",
     ],
@@ -59,7 +60,6 @@ def test_native_references_parse_as_the_catalog_does(spec: str) -> None:
     except catalog.ModelRefError as error:
         expected = {
             "UnknownModel": ("ModelNotFound", "model is not in the curated catalog"),
-            "UntrustedModel": ("ModelNotFound", "model is not in the curated catalog"),
             "InvalidModel": ("ModelNotFound", "model is not in the curated catalog"),
         }.get(error.code, (error.code, str(error)))
     if spec == "":
@@ -74,7 +74,7 @@ def test_native_references_parse_as_the_catalog_does(spec: str) -> None:
 def _tabular(context: list, queries: list, options: dict | None = None) -> bytes:
     return json_bytes(
         {
-            "model": "tabicl-v2-classifier",
+            "model": "general-forecast/tabicl-v2-classifier",
             "task": "classification",
             "target": "y",
             "features": ["x"],

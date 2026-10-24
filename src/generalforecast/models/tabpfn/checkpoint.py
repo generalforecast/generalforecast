@@ -11,6 +11,7 @@ from jax import Array
 from safetensors import safe_open
 from safetensors.numpy import load_file
 
+from generalforecast.models.catalog import short_name
 from generalforecast.models.checkpoints import (
     converted_checkpoint,
     load_state,
@@ -52,11 +53,19 @@ class Published(NamedTuple):
 TABPFN_3 = ("Prior-Labs/tabpfn_3", "24a16a89d245878b846555110985634aa2e656d7")
 TABPFN_3_5 = ("Prior-Labs/tabpfn_3_5", "06bf2ba35c80a92a3b9abb436b99cf49e7a0365e")
 PUBLISHED = {
-    "tabpfn-3-classifier": Published(*TABPFN_3, "tabpfn-v3-classifier-v3_default.ckpt"),
-    "tabpfn-3-regressor": Published(*TABPFN_3, "tabpfn-v3-regressor-v3_default.ckpt"),
+    "general-forecast/tabpfn-3-classifier": Published(
+        *TABPFN_3, "tabpfn-v3-classifier-v3_default.ckpt"
+    ),
+    "general-forecast/tabpfn-3-regressor": Published(
+        *TABPFN_3, "tabpfn-v3-regressor-v3_default.ckpt"
+    ),
     # One file serves both tasks; each converts into its own directory.
-    "tabpfn-3.5-classifier": Published(*TABPFN_3_5, "tabpfn-v3.5-20260909.safetensors"),
-    "tabpfn-3.5-regressor": Published(*TABPFN_3_5, "tabpfn-v3.5-20260909.safetensors"),
+    "general-forecast/tabpfn-3.5-classifier": Published(
+        *TABPFN_3_5, "tabpfn-v3.5-20260909.safetensors"
+    ),
+    "general-forecast/tabpfn-3.5-regressor": Published(
+        *TABPFN_3_5, "tabpfn-v3.5-20260909.safetensors"
+    ),
 }
 # A multitask checkpoint's parameters for one task only, by whether it regresses.
 _TASK_ONLY = {
@@ -113,19 +122,20 @@ def _settings(metadata: dict[str, Any]) -> dict[str, Any]:
     return {**metadata["config"], "inference_config": metadata["inference_config"]}
 
 
-def tabpfn_checkpoint(name: str) -> Path:
+def tabpfn_checkpoint(id: str) -> Path:
     """A TabPFN checkpoint directory, converted from the published file if missing.
 
     With `GF_CHECKPOINTS` set, the directory must already be there, as on
     machines without internet. Otherwise it is kept under `~/.cache/generalforecast`.
 
     Args:
-        name: A key of `PUBLISHED`, such as `tabpfn-3-classifier`.
+        id: A key of `PUBLISHED`, such as `general-forecast/tabpfn-3-classifier`.
 
     Returns:
         A directory with `config.json` and `model.safetensors`.
     """
-    published = PUBLISHED[name]
+    published = PUBLISHED[id]
+    name = short_name(id)
 
     def convert(directory: Path) -> None:
         path = hf_hub_download(

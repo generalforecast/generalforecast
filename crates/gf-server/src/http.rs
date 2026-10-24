@@ -23,11 +23,13 @@ use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use futures::future::BoxFuture;
-use gf_core::catalog::{self, Admission, Surface};
+use gf_core::catalog::{self, Surface};
 
 use gf_core::forecasting::KNOWN;
 use gf_core::node::Targets;
-use gf_core::request::{self, Forecast, Inference, Label, Limits, Num, Options, RequestError};
+use gf_core::request::{
+    self, ErrorDetail, Forecast, Inference, Label, Limits, Options, RequestError,
+};
 use serde::Deserialize;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value, json};
@@ -35,17 +37,17 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::engine::{self, Bound, Engine};
-use crate::packages::{self, ContextMode, ForecastPackage, ServedPackage};
-use crate::revisions::{Published, Record, Revisions, Selector};
+use crate::predictors::{self, ContextMode, ForecastPredictor, ServedPredictor};
+use crate::revisions::{Published, Record, Revisions};
 use crate::routes::Routes;
 use crate::service::{Charge, RequestBudget, quantile_values};
 use crate::shard::{Asked, Command, Inferred, ServerError};
 use crate::upstream::Upstream;
 use arrow_array::RecordBatch;
-use gf_core::package;
+use gf_core::predictor;
 
 /// The API version every envelope carries.
-pub const VERSION: &str = "gf/v1alpha1";
+pub const VERSION: &str = "gf/v1";
 /// The most bytes a request body may hold.
 pub const MAX_BYTES: usize = 1_048_576;
 /// The deepest and largest JSON a body may be, as the hosted API bounds it.
@@ -53,24 +55,72 @@ const MAX_DEPTH: usize = 16;
 const MAX_NODES: usize = 65_536;
 const MAX_INTEGER: i64 = (1 << 53) - 1;
 /// The kinds of resource an envelope may name.
-const RESOURCE_KINDS: [&str; 11] = [
+const RESOURCE_KINDS: [&str; 9] = [
     "workspace",
     "project",
-    "dataset",
+    "context",
     "source",
     "model",
-    "deployment",
-    "job",
-    "package",
+    "predictor",
     "operator",
     "api-key",
     "secret",
 ];
-/// The most query and context rows a package's `/predictions` takes.
+/// The most query and context rows a predictor's `/predictions` takes.
 const MAX_QUERY_ROWS: usize = 10_000;
 const MAX_CONTEXT_ROWS: usize = 100_000;
 /// The quantiles a regressor's `/predictions` reports when it asks for none.
 const DEFAULT_QUANTILES: [f64; 3] = [0.1, 0.5, 0.9];
+/// The (context rows, queries) buckets `Front::warm` compiles at startup:
+/// the shapes a first request most often takes.
+const WARM_SHAPES: &[(usize, usize)] = &[(100, 1), (1_000, 1), (10_000, 1)];
+/// How many input columns the warm contexts have.
+const WARM_INPUTS: usize = 2;
+/// How long one warm bucket may take to compile and run.
+const WARM_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// A synthetic ad hoc body of `context_rows` rows over `WARM_INPUTS`
+/// deterministic pseudo-uniform inputs and a 0/1 (or real) target; `seed`
+/// varies the rows, so two bodies are two contexts.
+fn warm_payload(
+    model: &str,
+    context_rows: usize,
+    queries: usize,
+    regression: bool,
+    seed: u64,
+) -> Value {
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15 ^ seed.wrapping_mul(0x2545_F491_4F6C_DD1D);
+    let mut uniform = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        #[allow(clippy::cast_precision_loss)]
+        let unit = (state >> 11) as f64 / (1u64 << 53) as f64;
+        unit
+    };
+    let row = |uniform: &mut dyn FnMut() -> f64, target: bool| {
+        let a = uniform();
+        let b = uniform();
+        let mut row = json!({"a": a, "b": b});
+        if target {
+            row["y"] = if regression {
+                json!(a + b)
+            } else {
+                json!(i32::from(a + b > 1.0))
+            };
+        }
+        row
+    };
+    let context: Vec<Value> = (0..context_rows).map(|_| row(&mut uniform, true)).collect();
+    let queries: Vec<Value> = (0..queries).map(|_| row(&mut uniform, false)).collect();
+    json!({
+        "model": model,
+        "target": "y",
+        "inputs": ["a", "b"],
+        "context": context,
+        "queries": queries,
+    })
+}
 /// How long introspection answers are trusted: valid keys, and refused ones.
 const POSITIVE_TTL: Duration = Duration::from_secs(30);
 const NEGATIVE_TTL: Duration = Duration::from_secs(5);
@@ -83,6 +133,9 @@ pub struct ApiError {
     pub code: String,
     pub message: String,
     pub status: u16,
+    /// The optional fields of the error object (`param`, `hint`, `limit`,
+    /// `actual`), boxed so the common error stays small.
+    pub detail: Option<Box<ErrorDetail>>,
 }
 
 impl ApiError {
@@ -92,7 +145,26 @@ impl ApiError {
             code: code.to_string(),
             message: message.into(),
             status,
+            detail: None,
         }
+    }
+
+    fn detail_mut(&mut self) -> &mut ErrorDetail {
+        self.detail.get_or_insert_with(Box::default)
+    }
+
+    /// Names the field at fault.
+    #[must_use]
+    pub fn param(mut self, param: impl Into<String>) -> Self {
+        self.detail_mut().param = Some(param.into());
+        self
+    }
+
+    /// Says what to do instead.
+    #[must_use]
+    pub fn hint(mut self, hint: impl Into<String>) -> Self {
+        self.detail_mut().hint = Some(hint.into());
+        self
     }
 
     /// Malformed input, as the hosted API's `require` refuses it.
@@ -102,7 +174,7 @@ impl ApiError {
     }
 
     fn not_served() -> Self {
-        Self::new("ModelNotFound", "model is not served here", 404)
+        Self::new("NotFound", "model is not served here", 404)
     }
 
     fn unauthorized(message: &str) -> Self {
@@ -110,13 +182,32 @@ impl ApiError {
     }
 
     fn body(&self) -> Value {
-        json!({"error": {"code": self.code, "message": self.message}})
+        let mut error = json!({"code": self.code, "message": self.message});
+        if let Some(detail) = &self.detail {
+            let fields = [
+                ("param", detail.param.as_ref().map(|value| json!(value))),
+                ("hint", detail.hint.as_ref().map(|value| json!(value))),
+                ("limit", detail.limit.map(|value| json!(value))),
+                ("actual", detail.actual.map(|value| json!(value))),
+            ];
+            for (key, value) in fields {
+                if let Some(value) = value {
+                    error[key] = value;
+                }
+            }
+        }
+        json!({"error": error})
     }
 }
 
 impl From<RequestError> for ApiError {
     fn from(error: RequestError) -> Self {
-        Self::new(error.code, error.message, error.status)
+        Self {
+            code: error.code.to_string(),
+            message: error.message,
+            status: error.status,
+            detail: error.detail,
+        }
     }
 }
 
@@ -167,9 +258,9 @@ pub struct ServedModel {
     /// reports, as the catalog's forecasts do.
     #[serde(default)]
     pub license_source: Option<String>,
-    /// The locked package served, if the model is one.
+    /// The locked predictor served, if the model is one.
     #[serde(default)]
-    pub package: Option<ServedPackage>,
+    pub predictor: Option<ServedPredictor>,
 }
 
 /// Who a bearer key belongs to, and what it may do.
@@ -333,10 +424,7 @@ impl Introspect {
             .map_err(|error| error.to_string())?;
         Ok(Self {
             client,
-            url: format!(
-                "{}/internal/v1alpha1/keys:introspect",
-                base.trim_end_matches('/')
-            ),
+            url: format!("{}/internal/v1/keys:introspect", base.trim_end_matches('/')),
             token,
             cache: Mutex::new(HashMap::new()),
         })
@@ -432,28 +520,33 @@ struct Scope {
 /// The Models API actions.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Action {
+    /// The catalog models served, with their limits.
     List,
     Get,
-    Infer,
-    Predict,
-    /// A deployment's prediction, from the revision the selector names.
-    Score(Selector),
+    /// The predictors served, declared in a lock.
+    Predictors,
+    Predictor,
+    /// A declared predictor's prediction, `POST predictors/{name}/predict`.
+    PredictorPredict,
+    /// An ad hoc prediction from a manifest fragment, `POST predict`.
+    AdHoc,
 }
 
 impl Action {
     fn permission(&self) -> &'static str {
         match self {
-            Self::List | Self::Get => "models:read",
-            Self::Infer | Self::Predict => "models:infer",
-            Self::Score(_) => "deployments:score",
+            Self::List | Self::Get | Self::Predictors | Self::Predictor => "models:read",
+            Self::PredictorPredict | Self::AdHoc => "predictors:predict",
         }
     }
 
     /// The resource kind the action's envelope names.
     fn kind(&self) -> &'static str {
         match self {
-            Self::Score(_) => "deployment",
-            _ => "model",
+            Self::Predictors | Self::Predictor | Self::PredictorPredict | Self::AdHoc => {
+                "predictor"
+            }
+            Self::List | Self::Get => "model",
         }
     }
 }
@@ -471,21 +564,24 @@ pub struct Front {
     budget: RequestBudget,
     timeout: Duration,
     engine: OnceLock<Engine>,
-    /// Snapshot packages' tables, by package name, once they are bound.
+    /// Snapshot predictors' tables, by predictor name, once they are bound.
     bound: OnceLock<HashMap<String, Bound>>,
-    /// Snapshot forecast packages' series, by package name, once aligned.
+    /// Snapshot forecast predictors' series, by predictor name, once aligned.
     series: OnceLock<HashMap<String, SeriesBound>>,
     draining: Arc<AtomicBool>,
     /// Where the routes the front does not own stream to, if anywhere.
     upstream: Option<Upstream>,
     /// The deployed revisions predicted from, if any are.
     revisions: Option<Revisions>,
+    /// The shape buckets compiled at startup, which `GET models` reports as
+    /// `warm_shapes`.
+    warm: OnceLock<Vec<Value>>,
 }
 
-/// A forecast package's context: its series aligned, and their forecast
+/// A forecast predictor's context: its series aligned, and their forecast
 /// request parsed, once.
 struct SeriesBound {
-    context: packages::ForecastContext,
+    context: predictors::ForecastContext,
     forecast: Forecast,
     rows: usize,
 }
@@ -515,7 +611,86 @@ impl Front {
             draining,
             upstream: None,
             revisions: None,
+            warm: OnceLock::new(),
         }
+    }
+
+    /// Compiles the common shape buckets for every tabular catalog model
+    /// served, by scoring a synthetic context in each, so the first request
+    /// does not pay for the compile; the buckets go to `GET models` as
+    /// `warm_shapes`. Each bucket is scored once per shard at the same time,
+    /// pinned to it, so every worker compiles it. A bucket that fails is
+    /// logged and skipped, so a
+    /// slow compile never keeps the server from starting. Returns how many
+    /// buckets compiled.
+    pub async fn warm(&self) -> usize {
+        let mut shapes = Vec::new();
+        let Ok(engine) = self.engine() else {
+            return 0;
+        };
+        let engine = engine.with_timeout(WARM_TIMEOUT);
+        for served in self.catalog_models() {
+            let Ok(model) = catalog::resolve(Some(&served.reference), self.surface) else {
+                continue;
+            };
+            if model.entry.task == catalog::Task::Forecast {
+                continue;
+            }
+            let regression = model.entry.task == catalog::Task::Regression;
+            for &(context_rows, queries) in WARM_SHAPES {
+                let replicas = (0..engine.shards()).map(|shard| {
+                    let payload = warm_payload(
+                        &model.canonical_id(),
+                        context_rows,
+                        queries,
+                        regression,
+                        shard as u64,
+                    );
+                    let engine = engine.pinned(shard);
+                    async move {
+                        adhoc_predict_with(self, &engine, &payload, self.budget.charge()).await
+                    }
+                });
+                let mut failed = None;
+                for outcome in futures::future::join_all(replicas).await {
+                    if let Err(error) = outcome {
+                        failed = Some(error.message);
+                    }
+                }
+                if let Some(message) = failed {
+                    tracing::warn!(
+                        model = served.name.as_str(),
+                        context_rows,
+                        "not warming a shape bucket: {message}"
+                    );
+                    continue;
+                }
+                shapes.push(json!({
+                    "model": served.resolved,
+                    "context_rows": context_rows,
+                    "inputs": WARM_INPUTS,
+                    "queries": queries,
+                }));
+            }
+        }
+        let count = shapes.len();
+        let _ = self.warm.set(shapes);
+        count
+    }
+
+    /// Everything served here, catalog models and predictors alike.
+    #[must_use]
+    pub fn models(&self) -> &[ServedModel] {
+        &self.models
+    }
+
+    /// The catalog models served here, in the order they were declared.
+    #[must_use]
+    pub fn catalog_models(&self) -> Vec<&ServedModel> {
+        self.models
+            .iter()
+            .filter(|served| served.predictor.is_none())
+            .collect()
     }
 
     /// Streams every route the front does not own to `upstream`.
@@ -525,7 +700,7 @@ impl Front {
         self
     }
 
-    /// Predicts deployments' revisions, loaded from `revisions` on demand.
+    /// Predicts predictors' revisions, loaded from `revisions` on demand.
     #[must_use]
     pub fn with_revisions(mut self, revisions: Revisions) -> Self {
         self.revisions = Some(revisions);
@@ -547,11 +722,11 @@ impl Front {
     }
 
     /// Starts answering inference once the shards' workers are up, and is
-    /// ready once each snapshot package's rows are bound into their table.
+    /// ready once each snapshot predictor's rows are bound into their table.
     ///
     /// # Errors
     ///
-    /// Which snapshot package could not be bound, and why.
+    /// Which snapshot predictor could not be bound, and why.
     pub async fn start(
         &self,
         shards: Vec<mpsc::Sender<Command>>,
@@ -567,20 +742,20 @@ impl Front {
         let mut bound = HashMap::new();
         let mut series = HashMap::new();
         for served in &self.models {
-            if let Some(package) = &served.package
-                && package.context == ContextMode::Snapshot
+            if let Some(predictor) = &served.predictor
+                && predictor.context == ContextMode::Snapshot
             {
                 let refused =
-                    |error: ApiError| format!("package {:?}: {}", served.name, error.message);
-                if let Some(forecast) = &package.forecast {
-                    let rows = snapshot_rows(package).map_err(refused)?;
+                    |error: ApiError| format!("predictor {:?}: {}", served.name, error.message);
+                if let Some(forecast) = &predictor.forecast {
+                    let rows = snapshot_rows(predictor).map_err(refused)?;
                     let aligned = self
-                        .bind_series(served, package, forecast, &rows, forecast.frequency)
+                        .bind_series(served, predictor, forecast, &rows, forecast.frequency)
                         .map_err(refused)?;
                     series.insert(served.name.clone(), aligned);
                 } else {
                     let snapshot = engine
-                        .bind_snapshot(&served.worker, package)
+                        .bind_snapshot(&served.worker, predictor)
                         .await
                         .map_err(refused)?;
                     bound.insert(served.name.clone(), snapshot);
@@ -593,7 +768,7 @@ impl Front {
     }
 
     /// Whether the front takes inference: its shards are up, its snapshot
-    /// packages bound, and it is not draining.
+    /// predictors bound, and it is not draining.
     #[must_use]
     pub fn ready(&self) -> bool {
         self.bound.get().is_some() && !self.draining.load(Ordering::SeqCst)
@@ -607,14 +782,31 @@ impl Front {
 
     /// The served models' names.
     #[must_use]
+    /// What this server serves, predictors by name and catalog models by
+    /// canonical id.
     pub fn names(&self) -> Vec<String> {
-        self.models.iter().map(|model| model.name.clone()).collect()
+        self.models
+            .iter()
+            .map(|model| match model.predictor {
+                Some(_) => model.name.clone(),
+                None => model.reference.clone(),
+            })
+            .collect()
     }
 }
 
 /// The router answering every path, so unknown routes get the API's errors.
 pub fn router(front: Arc<Front>) -> Router {
     Router::new().fallback(handle).with_state(front)
+}
+
+/// The reply while a served model is still loading or compiling.
+fn not_ready() -> ApiError {
+    ApiError::new(
+        "ModelNotReady",
+        "models are still loading; retry once /healthz answers 200",
+        503,
+    )
 }
 
 fn respond(status: u16, value: &Value) -> Response {
@@ -650,10 +842,7 @@ fn failure(scope: Option<&Scope>, error: &ApiError) -> Response {
     let body = match scope {
         Some(scope) => {
             let mut body = envelope(scope);
-            body.insert(
-                "error".into(),
-                json!({"code": error.code, "message": error.message}),
-            );
+            body.insert("error".into(), error.body()["error"].take());
             Value::Object(body)
         }
         None => error.body(),
@@ -746,19 +935,23 @@ async fn answer(
         parts.method != Method::GET || body.is_empty(),
         "GET bodies are forbidden",
     )?;
-    if target == "/livez" || target == "/healthz" {
-        return Ok(respond(200, &json!({"live": true})));
+    if target == "/livez" {
+        return Ok(respond(200, &json!({"status": "ok"})));
     }
-    if target == "/readyz" {
+    // Health is readiness: 200 only once every served model is loaded and
+    // its recorded programs compiled, so a probe never admits traffic the
+    // inference routes would refuse.
+    if target == "/healthz" || target == "/readyz" {
         let ready = front.ready()
             && match &front.upstream {
                 Some(upstream) => upstream.ready().await,
                 None => true,
             };
-        return Ok(respond(
-            if ready { 200 } else { 503 },
-            &json!({"ready": ready}),
-        ));
+        return Ok(if ready {
+            respond(200, &json!({"status": "ok"}))
+        } else {
+            respond(503, &not_ready().body())
+        });
     }
     if !front.hosts.is_empty() {
         check_endpoint(headers, &front.hosts)?;
@@ -794,7 +987,7 @@ async fn answer(
         *scope = Some(Scope {
             project: project.clone(),
             request_id,
-            kind: "model".into(),
+            kind: action.kind().into(),
             name: resource.clone(),
         });
         Value::Object(Map::new())
@@ -816,7 +1009,7 @@ async fn answer(
             require(parsed.request_id == request_id, "request id mismatch")?;
         }
         require(
-            parsed.kind == action.kind() && parsed.name == resource,
+            parsed.kind == action.kind() && names_match(&parsed.name, &resource),
             "resource route/envelope mismatch",
         )?;
         payload
@@ -824,7 +1017,7 @@ async fn answer(
     let principal = front.keys.verify(header("authorization")).await?;
     principal.authorize(&project, action.permission())?;
     if !front.ready() {
-        return Err(ApiError::new("NotReady", "models are not ready", 503));
+        return Err(not_ready());
     }
     let result = dispatch(front, &project, action, &resource, payload, charge).await?;
     let mut body = envelope(scope.as_ref().expect("set above"));
@@ -901,6 +1094,27 @@ fn check_endpoint(headers: &HeaderMap, hosts: &[String]) -> Result<(), ApiError>
     Ok(())
 }
 
+/// An envelope's resource name: a plain name, or for a model its canonical
+/// id `general-forecast/<name>`, kept as sent.
+fn resource_name(kind: &str, value: &str) -> Result<String, ApiError> {
+    match value.strip_prefix(&format!("{}/", catalog::ORG)) {
+        Some(bare) if kind == "model" => {
+            name(bare)?;
+            Ok(value.to_string())
+        }
+        _ => name(value),
+    }
+}
+
+/// Whether an envelope's resource name names the route's resource; a model's
+/// canonical id names its bare route segment.
+fn names_match(envelope: &str, resource: &str) -> bool {
+    envelope == resource
+        || envelope
+            .strip_prefix(&format!("{}/", catalog::ORG))
+            .is_some_and(|bare| bare == resource)
+}
+
 /// A resource name: a lowercase letter, then up to 62 letters, digits or `-`.
 fn name(value: &str) -> Result<String, ApiError> {
     let mut bytes = value.bytes();
@@ -924,7 +1138,7 @@ pub fn owns(path: &str) -> bool {
     let [api, projects, _, tail @ ..] = parts.as_slice() else {
         return false;
     };
-    if !api.eq_ignore_ascii_case("v1alpha1") || !projects.eq_ignore_ascii_case("projects") {
+    if !api.eq_ignore_ascii_case("v1") || !projects.eq_ignore_ascii_case("projects") {
         return false;
     }
     let lower: Vec<String> = tail.iter().map(|part| part.to_ascii_lowercase()).collect();
@@ -936,15 +1150,7 @@ pub fn owns(path: &str) -> bool {
     {
         [] => false,
         [first, ..] if first.contains('%') => true,
-        ["models", ..] | ["predictions", ..] => true,
-        [
-            "deployments",
-            _,
-            "revisions" | "environments",
-            _,
-            "predict",
-            ..,
-        ] => true,
+        ["models", ..] | ["predictors", ..] | ["predict", ..] => true,
         _ => false,
     }
 }
@@ -952,7 +1158,7 @@ pub fn owns(path: &str) -> bool {
 fn resolve(method: &Method, path: &str) -> Result<(String, Action, String), ApiError> {
     let not_found = || ApiError::new("NotFound", "route not found", 404);
     let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() < 5 || parts[..3] != ["", "v1alpha1", "projects"] {
+    if parts.len() < 5 || parts[..3] != ["", "v1", "projects"] {
         return Err(not_found());
     }
     if parts[3..].iter().any(|part| part.is_empty()) {
@@ -963,37 +1169,14 @@ fn resolve(method: &Method, path: &str) -> Result<(String, Action, String), ApiE
     match (method, tail) {
         (&Method::GET, ["models"]) => Ok((project, Action::List, "models".into())),
         (&Method::GET, ["models", model]) => Ok((project, Action::Get, name(model)?)),
-        (&Method::POST, ["models", model, "infer"]) => Ok((project, Action::Infer, name(model)?)),
-        (&Method::POST, ["predictions"]) => Ok((project, Action::Predict, "predictions".into())),
-        (
-            &Method::POST,
-            [
-                "deployments",
-                deployment,
-                "environments",
-                environment,
-                "predict",
-            ],
-        ) => Ok((
-            project,
-            Action::Score(Selector::Environment(name(environment)?)),
-            name(deployment)?,
-        )),
-        (&Method::POST, ["deployments", deployment, "revisions", number, "predict"]) => {
-            let revision = Some(number)
-                .filter(|number| {
-                    number.len() <= 18
-                        && !number.starts_with('0')
-                        && number.bytes().all(|byte| byte.is_ascii_digit())
-                })
-                .and_then(|number| number.parse::<u64>().ok())
-                .ok_or_else(not_found)?;
-            Ok((
-                project,
-                Action::Score(Selector::Revision(revision)),
-                name(deployment)?,
-            ))
+        (&Method::GET, ["predictors"]) => Ok((project, Action::Predictors, "predictors".into())),
+        (&Method::GET, ["predictors", predictor]) => {
+            Ok((project, Action::Predictor, name(predictor)?))
         }
+        (&Method::POST, ["predictors", predictor, "predict"]) => {
+            Ok((project, Action::PredictorPredict, name(predictor)?))
+        }
+        (&Method::POST, ["predict"]) => Ok((project, Action::AdHoc, "ad-hoc".into())),
         _ => Err(not_found()),
     }
 }
@@ -1167,8 +1350,8 @@ fn parse_envelope(body: &[u8]) -> Result<(Scope, Value), ApiError> {
         .as_str()
         .filter(|kind| RESOURCE_KINDS.contains(kind))
         .ok_or_else(|| ApiError::validation("invalid resource kind"))?;
-    let resource_name = name(resource["name"].as_str().unwrap_or_default())?;
     require(object["payload"].is_object(), "expected JSON object")?;
+    let resource_name = resource_name(kind, resource["name"].as_str().unwrap_or_default())?;
     let scope = Scope {
         project,
         request_id: request_id.to_string(),
@@ -1187,10 +1370,91 @@ impl Front {
             .map(|resolved| resolved.entry.name.to_string());
         self.models
             .iter()
+            .filter(|served| served.predictor.is_none())
             .find(|served| {
                 served.name == model || canonical.as_deref() == Some(served.name.as_str())
             })
             .ok_or_else(ApiError::not_served)
+    }
+
+    /// The predictor `name` serves, with its lock.
+    fn predictor(&self, name: &str) -> Result<(&ServedModel, &ServedPredictor), ApiError> {
+        self.models
+            .iter()
+            .find_map(|served| {
+                served
+                    .predictor
+                    .as_ref()
+                    .map(|predictor| (served, predictor))
+            })
+            .filter(|(served, _)| served.name == name)
+            .or_else(|| {
+                self.models.iter().find_map(|served| {
+                    served
+                        .predictor
+                        .as_ref()
+                        .filter(|_| served.name == name)
+                        .map(|predictor| (served, predictor))
+                })
+            })
+            .ok_or_else(|| {
+                ApiError::new(
+                    "NotFound",
+                    format!("predictor {name} is not served here"),
+                    404,
+                )
+                .param("name")
+            })
+    }
+
+    /// A catalog model's `GET models` entry: the catalog's description, the
+    /// limits a request must keep to, and the shapes compiled at startup.
+    fn model_description(&self, served: &ServedModel) -> Value {
+        let policy = &catalog::catalog().policy;
+        let mut description = served.description.clone();
+        description["model"] = json!(served.resolved);
+        description["limits"] = json!({
+            "context_rows": policy.context_rows,
+            "queries": policy.query_rows,
+            "inputs": policy.features,
+        });
+        description["warm_shapes"] = json!(self.warm.get().cloned().unwrap_or_default());
+        description
+    }
+
+    /// A predictor's `GET predictors/{name}` entry: its resolved manifest,
+    /// lock digests, context kind and size, and what it answers.
+    fn predictor_description(&self, served: &ServedModel, predictor: &ServedPredictor) -> Value {
+        let rows = match predictor.context {
+            ContextMode::Snapshot => self
+                .bound
+                .get()
+                .and_then(|bound| bound.get(&served.name))
+                .map(|bound| bound.rows)
+                .or_else(|| {
+                    self.series
+                        .get()
+                        .and_then(|series| series.get(&served.name))
+                        .map(|series| series.rows)
+                }),
+            ContextMode::Request => None,
+        };
+        json!({
+            "name": served.name,
+            "model": served.resolved,
+            "task": predictor.task,
+            "target": predictor.target,
+            "inputs": predictor.inputs,
+            "id": predictor.id,
+            "context": {
+                "kind": predictor.context.kind(),
+                "rows": rows,
+                "digest": predictor.context_digest,
+            },
+            "lock_digest": predictor.lock_digest,
+            "outputs": served.outputs,
+            "quantiles": predictor.quantiles,
+        })
     }
 
     /// The catalog model served as exactly this reference, variant and all.
@@ -1198,58 +1462,54 @@ impl Front {
         let reference = model.to_string();
         self.models
             .iter()
-            .find(|served| served.package.is_none() && served.reference == reference)
+            .find(|served| {
+                served.predictor.is_none()
+                    && (served.reference == reference
+                        || (served.name == model.entry.name
+                            && model.digest.is_none()
+                            && !model.variant())
+                        || catalog::resolve(Some(&served.reference), self.surface)
+                            .is_ok_and(|resolved| resolved.to_string() == reference))
+            })
             .ok_or_else(ApiError::not_served)
     }
 
     /// Admits a payload's model only if it is exactly the reference served,
     /// variant and all.
-    fn admitted(&self, served: &ServedModel, model: &Value) -> Result<(), ApiError> {
-        let reference = model
-            .as_str()
-            .and_then(|model| catalog::resolve(Some(model), self.surface).ok())
-            .map(|resolved| resolved.to_string());
-        if reference.as_deref() == Some(served.reference.as_str()) {
-            Ok(())
-        } else {
-            Err(ApiError::not_served())
-        }
-    }
-
-    /// The engine, once the shards' workers are up.
     fn engine(&self) -> Result<&Engine, ApiError> {
-        self.engine
-            .get()
-            .ok_or_else(|| ApiError::new("NotReady", "models are not ready", 503))
+        self.engine.get().ok_or_else(not_ready)
     }
 
-    /// Aligns a forecast package's context and parses its group's forecast
+    /// Aligns a forecast predictor's context and parses its group's forecast
     /// request, as `ForecastContext.build` does in process.
     fn bind_series(
         &self,
         served: &ServedModel,
-        package: &ServedPackage,
-        forecast: &ForecastPackage,
+        predictor: &ServedPredictor,
+        forecast: &ForecastPredictor,
         rows: &RecordBatch,
         frequency: Option<f64>,
     ) -> Result<SeriesBound, ApiError> {
         let failed = || ApiError::new("InternalError", "request failed safely", 500);
-        let target = package.target.as_deref().ok_or_else(|| {
-            ApiError::new("InvalidPackage", "a forecast package names its target", 422)
+        let target = predictor.target.as_deref().ok_or_else(|| {
+            ApiError::new(
+                "InvalidPredictor",
+                "a forecast predictor names its target",
+                422,
+            )
         })?;
         let context = forecast.context(
             &served.reference,
             target,
-            &package.quantiles,
+            &predictor.quantiles,
             rows,
             frequency,
         )?;
         let bytes = serde_json::to_vec(&context.request).map_err(|_| failed())?;
         let options = Options {
             surface: self.surface,
-            limits: Limits::Package,
+            limits: Limits::Predictor,
             levels: None,
-            admission: Admission::Catalog,
         };
         let Inference::Forecast(parsed) = request::parse(&bytes, &options)? else {
             return Err(failed());
@@ -1344,385 +1604,48 @@ async fn dispatch(
 ) -> Result<Value, ApiError> {
     match action {
         Action::List => Ok(json!({
-            "models": front.models.iter().map(|model| model.description.clone()).collect::<Vec<_>>()
+            "models": front
+                .models
+                .iter()
+                .filter(|model| model.predictor.is_none())
+                .map(|model| front.model_description(model))
+                .collect::<Vec<_>>()
         })),
-        Action::Get => Ok(front.served(resource)?.description.clone()),
-        Action::Infer => {
-            if front
+        Action::Get => Ok(front.model_description(front.served(resource)?)),
+        Action::Predictors => Ok(json!({
+            "predictors": front
                 .models
                 .iter()
-                .any(|model| model.name == resource && model.package.is_some())
-            {
-                return Err(ApiError::new(
-                    "UnsupportedCapability",
-                    "packages serve POST predictions with the package name as model",
-                    422,
-                ));
-            }
-            // The catalog's answer comes first: a request it refuses gets its
-            // code, and only a valid one this server does not serve is not found.
-            let bytes = serde_json::to_vec(&payload)
-                .map_err(|_| ApiError::new("InternalError", "request failed safely", 500))?;
-            let inference = request::parse(&bytes, &Options::request(front.surface))?;
-            let named =
-                catalog::resolve(payload.get("model").and_then(Value::as_str), front.surface)?;
-            let route = catalog::resolve(Some(resource), front.surface).ok();
-            require(
-                route.is_some_and(|route| route.entry.name == named.entry.name),
-                "model route mismatch",
-            )?;
-            let served = front.serving(&named)?;
-            infer(front, served, inference, charge).await
-        }
-        Action::Predict => {
-            let model = payload
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let packaged = front
-                .models
-                .iter()
-                .find(|served| served.name == model && served.package.is_some());
-            let served = match packaged {
-                Some(served) => served,
-                None => front.serving(&catalog::resolve(Some(model), front.surface)?)?,
-            };
-            match &served.package {
-                Some(package) => package_predict(front, served, package, &payload, charge).await,
-                None => predict(front, served, &payload, charge).await,
-            }
-        }
-        Action::Score(selector) => {
-            revision_predict(front, project, resource, &selector, &payload, charge).await
-        }
-    }
-}
-
-/// A deployment's prediction, from the revision its environment serves or
-/// the route names, in the control plane's `PredictionResult`; each one is
-/// reported back for the deployment's metrics and events.
-async fn revision_predict(
-    front: &Front,
-    project: &str,
-    deployment: &str,
-    selector: &Selector,
-    payload: &Value,
-    charge: Charge,
-) -> Result<Value, ApiError> {
-    let revisions = front.revisions.as_ref().ok_or_else(|| {
-        ApiError::new(
-            "RuntimeUnavailable",
-            "deployed revisions are not served here",
-            503,
-        )
-    })?;
-    let (environment, revision, version) = match selector {
-        Selector::Environment(environment) => {
-            let resolved = revisions.resolve(project, deployment, environment).await?;
-            (
-                Some(environment.as_str()),
-                resolved.revision,
-                Some(resolved.context_version.unwrap_or(Value::Null)),
-            )
-        }
-        Selector::Revision(revision) => (None, *revision, None),
-    };
-    let started = std::time::Instant::now();
-    let scored = async {
-        let published = revisions
-            .load(project, deployment, revision, version.as_ref())
-            .await?;
-        match &*published {
-            Published::Python {} => {
-                drop(charge);
-                revisions
-                    .execute(project, deployment, revision, environment, payload)
-                    .await
-            }
-            Published::Native {
-                served,
-                context,
-                rows,
-            } => {
-                native_predict(
-                    front,
-                    served,
-                    context.as_ref(),
-                    rows.as_deref(),
-                    payload,
-                    charge,
-                )
-                .await
-            }
-        }
-    }
-    .await;
-    revisions.record(Record {
-        project: project.to_string(),
-        deployment: deployment.to_string(),
-        environment: environment.map(str::to_string),
-        revision,
-        ok: scored.is_ok(),
-        latency_seconds: started.elapsed().as_secs_f64(),
-    });
-    let mut result = scored?;
-    result["deployment"] = json!(deployment);
-    result["revision"] = json!(revision);
-    result["environment"] = json!(environment);
-    Ok(result)
-}
-
-/// A catalog revision's prediction: the payload checked as the control
-/// plane checks it against the lock, then predicted on the package path with
-/// the revision's captured rows, or the request's own, as an ephemeral
-/// context.
-async fn native_predict(
-    front: &Front,
-    served: &ServedModel,
-    captured: Option<&Value>,
-    rows: Option<&[Value]>,
-    payload: &Value,
-    charge: Charge,
-) -> Result<Value, ApiError> {
-    let body = fields(
-        payload,
-        &["queries"],
-        &["context", "target", "features", "options"],
-    )?;
-    let failed = || ApiError::new("InternalError", "request failed safely", 500);
-    let package = served.package.as_ref().ok_or_else(failed)?;
-    let base = front
-        .models
-        .iter()
-        .find(|model| model.package.is_none() && model.resolved == served.resolved)
-        .ok_or_else(|| {
-            ApiError::new(
-                "ModelUnavailable",
-                "the revision's model is not served here",
-                503,
-            )
-        })?;
-    if !package.schema_free() {
-        require(
-            body.get("target")
-                .is_none_or(|target| target.as_str() == package.target.as_deref()),
-            "target differs from lock",
-        )?;
-        require(
-            body.get("features")
-                .is_none_or(|features| *features == json!(package.features)),
-            "features differ from lock",
-        )?;
-    }
-    require(
-        body.get("options").is_none_or(|options| {
-            options.is_null() || options.as_object().is_some_and(Map::is_empty)
-        }),
-        "prediction options must be compiled into the package",
-    )?;
-    require(
-        body["queries"]
-            .as_array()
-            .is_some_and(|queries| (1..=MAX_QUERY_ROWS).contains(&queries.len())),
-        "queries must contain 1..10000 rows",
-    )?;
-    let context = match package.context {
-        ContextMode::Request => body
-            .get("context")
-            .cloned()
-            .ok_or_else(|| ApiError::validation("request context is required"))?,
-        ContextMode::Snapshot => {
-            require(
-                !body.contains_key("context"),
-                "bound context cannot be overridden",
-            )?;
-            Value::Array(rows.ok_or_else(failed)?.to_vec())
-        }
-    };
-    let mut ephemeral = served.clone();
-    ephemeral.worker.clone_from(&base.worker);
-    let mut bound = package.clone();
-    bound.context = ContextMode::Request;
-    bound.snapshot = None;
-    ephemeral.package = Some(bound.clone());
-    let call = json!({
-        "model": ephemeral.name,
-        "task": package.task,
-        "target": body.get("target").cloned().unwrap_or_else(|| json!(package.target)),
-        "features": body.get("features").cloned().unwrap_or_else(|| json!(package.features)),
-        "context": context,
-        "queries": body["queries"],
-        "options": {},
-    });
-    let mut result = package_predict(front, &ephemeral, &bound, &call, charge).await?;
-    if package.context == ContextMode::Snapshot
-        && let Some(captured) = captured
-    {
-        let rows = result["context"]["rows"].clone();
-        result["context"] = captured.clone();
-        result["context"]["rows"] = rows;
-    }
-    Ok(result)
-}
-
-/// The hosted `models/{name}/infer` result for the served reference.
-async fn infer(
-    front: &Front,
-    served: &ServedModel,
-    inference: Inference,
-    charge: Charge,
-) -> Result<Value, ApiError> {
-    let request = match inference {
-        Inference::Tabular(request) => request,
-        Inference::Forecast(request) => return forecasts(front, served, &request, charge).await,
-    };
-    let inferred = front
-        .engine()?
-        .tabular(&served.worker, &request, charge)
-        .await?;
-    let outputs: Vec<Value> = if request.classes.is_empty() {
-        quantiles(&inferred, &request.levels)?
-            .into_iter()
-            .zip(&request.query_keys)
-            .map(|(quantiles, key)| json!({"key": key, "quantiles": quantiles}))
-            .collect()
-    } else {
-        probabilities(&request.classes, &inferred)
-            .into_iter()
-            .zip(&request.query_keys)
-            .map(|(probabilities, key)| json!({"key": key, "probabilities": probabilities}))
-            .collect()
-    };
-    Ok(json!({
-        "task": request.task.as_str(),
-        "outputs": outputs,
-        "artifact": verified(served),
-        "context_provenance": {
-            "source": "request",
-            "supplied_rows": request.supplied_rows,
-            "usable_labeled_rows": request.usable_rows(),
-            "features": request.features,
-            "target": request.target,
-            "persisted": false,
-            "classes": request.classes.iter().map(label_json).collect::<Vec<_>>(),
-        },
-    }))
-}
-
-/// The served model's artifact, verified by the worker that loaded it.
-/// A forecast's artifact: the verified artifact and its license's source,
-/// as the catalog's forecasts report them.
-fn forecast_artifact(served: &ServedModel) -> Value {
-    let mut artifact = verified(served);
-    if let Some(fields) = artifact.as_object_mut() {
-        fields.insert("license_source".into(), json!(served.license_source));
-    }
-    artifact
-}
-
-fn verified(served: &ServedModel) -> Value {
-    let mut artifact = served.description["artifact"].clone();
-    if let Some(artifact) = artifact.as_object_mut() {
-        artifact.insert("verified".into(), json!(true));
-    }
-    artifact
-}
-
-fn num_json(value: Num) -> Value {
-    match value {
-        Num::Int(value) => json!(value),
-        Num::Float(value) => json!(value),
-    }
-}
-
-/// The hosted `models/{name}/infer` result of a forecast: each query's
-/// series forecast from its aligned group's table, a table per group
-/// fingerprint, the groups asked of the engine at once.
-async fn forecasts(
-    front: &Front,
-    served: &ServedModel,
-    request: &Forecast,
-    charge: Charge,
-) -> Result<Value, ApiError> {
-    let groups = front
-        .engine()?
-        .forecast_request(&served.worker, request)
-        .await?;
-    drop(charge);
-    let invalid = || {
-        ApiError::new(
-            "ModelOutputError",
-            "native forecaster returned invalid forecasts",
-            503,
-        )
-    };
-    let mut outputs = vec![Value::Null; request.queries.len()];
-    for (indices, inferred) in &groups {
-        let levels = inferred.levels.as_deref().ok_or_else(invalid)?;
-        let columns: Vec<usize> = request
-            .levels
-            .iter()
-            .map(|level| levels.iter().position(|known| known == level))
-            .collect::<Option<_>>()
-            .ok_or_else(|| {
-                ApiError::new(
-                    "UnsupportedQuantiles",
-                    "the model only returns its own published quantile levels",
-                    422,
-                )
-            })?;
-        let forecast = &inferred.predictions;
-        let steps = request.horizon;
-        if (forecast.rows, forecast.horizon, forecast.columns)
-            != (indices.len(), Some(steps), levels.len())
-            || !forecast.values.iter().all(|value| value.is_finite())
-        {
-            return Err(invalid());
-        }
-        for (row, &index) in indices.iter().enumerate() {
-            let query = &request.queries[index];
-            let quantiles: Map<String, Value> = request
-                .levels
-                .iter()
-                .zip(&columns)
-                .map(|(&level, &column)| {
-                    let path: Vec<f64> = (0..steps)
-                        .map(|step| {
-                            f64::from(
-                                forecast.values[(row * steps + step) * forecast.columns + column],
-                            )
-                        })
-                        .collect();
-                    (level_key(level), json!(path))
+                .filter_map(|served| {
+                    served
+                        .predictor
+                        .as_ref()
+                        .map(|predictor| front.predictor_description(served, predictor))
                 })
-                .collect();
-            outputs[index] = json!({
-                "key": query.key,
-                "series": query.series,
-                "origin": num_json(query.origin),
-                "times": query.times.iter().copied().map(num_json).collect::<Vec<_>>(),
-                "quantiles": quantiles,
-            });
+                .collect::<Vec<_>>()
+        })),
+        Action::Predictor => {
+            let (served, predictor) = front.predictor(resource)?;
+            Ok(front.predictor_description(served, predictor))
         }
-    }
-    Ok(json!({
-        "task": "forecast",
-        "outputs": outputs,
-        "artifact": forecast_artifact(served),
-        "context_provenance": {
-            "source": "request",
-            "supplied_rows": request.supplied_rows,
-            "usable_observations": request.usable_observations,
-            "persisted": false,
-            "covariate_policy": "shared-within-query-group",
-            "time_axis": request.clock.as_str(),
+        Action::PredictorPredict => match front.predictor(resource) {
+            Ok((served, predictor)) => {
+                predictor_predict(front, served, predictor, &payload, charge).await
+            }
+            Err(error) => match front.revisions.as_ref() {
+                Some(revisions) => {
+                    revision_predict(front, revisions, project, resource, &payload, charge).await
+                }
+                None => Err(error),
+            },
         },
-    }))
+        Action::AdHoc => adhoc_predict(front, &payload, charge).await,
+    }
 }
 
 fn forecasting_unserved() -> ApiError {
     ApiError::new(
-        "UnsupportedCapability",
+        "ValidationError",
         "this server answers tabular models; forecasters are served by the Python engine",
         422,
     )
@@ -1731,35 +1654,194 @@ fn forecasting_unserved() -> ApiError {
 /// The `/predictions` body for a catalog model: flat rows, bound as an
 /// inference request whose context is the rows with a target, then
 /// answered as the shared `PredictionResult`.
-async fn predict(
+/// Refuses the fields of `payload` named in `fields`, each with `reason`
+/// after its name, so a caller learns which field to drop.
+fn refuse_fields(payload: &Value, fields: &[&str], reason: &str) -> Result<(), ApiError> {
+    if let Some(object) = payload.as_object() {
+        for field in fields {
+            if object.contains_key(*field) {
+                return Err(ApiError::validation(format!("{field} {reason}")).param(*field));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn context_declared() -> ApiError {
+    ApiError::validation("context is declared by the predictor")
+        .param("context")
+        .hint("drop context: this predictor's context is pinned in its lock")
+}
+
+/// A declared predictor's body: `queries`, and `context` only when the lock
+/// says each request brings it; what the manifest declares is refused.
+async fn predictor_predict(
     front: &Front,
     served: &ServedModel,
+    predictor: &ServedPredictor,
     payload: &Value,
     charge: Charge,
 ) -> Result<Value, ApiError> {
-    let body = fields(
+    refuse_fields(
         payload,
         &[
-            "model", "task", "target", "features", "context", "queries", "options",
+            "target",
+            "inputs",
+            "model",
+            "task",
+            "features",
+            "options",
+            "quantiles",
+            "outputs",
+            "id",
         ],
-        &[],
+        "is declared by the predictor",
     )?;
-    front.admitted(served, &body["model"])?;
-    let options = fields(&body["options"], &[], &["id", "quantiles", "outputs"])?;
-    let task = body["task"].as_str().unwrap_or_default();
+    let body = fields(payload, &["queries"], &["context", "as_of"])?;
+    let context = match predictor.context {
+        ContextMode::Request => body.get("context").cloned().ok_or_else(|| {
+            ApiError::validation(
+                "context is required: this predictor takes its context with each request",
+            )
+            .param("context")
+        })?,
+        ContextMode::Snapshot => {
+            if body.contains_key("context") {
+                return Err(context_declared());
+            }
+            json!([])
+        }
+    };
+    let inputs: Vec<&str> = match &predictor.forecast {
+        Some(forecast) => {
+            let queried = forecast.query_columns();
+            predictor
+                .schema
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .filter(|name| queried.contains(name))
+                .collect()
+        }
+        None => predictor.inputs.iter().map(String::as_str).collect(),
+    };
+    let call = json!({
+        "target": predictor.target,
+        "inputs": inputs,
+        "context": context,
+        "queries": body["queries"],
+    });
+    served_predict(front, served, predictor, &call, charge).await
+}
+
+/// The ad hoc route's body: a manifest fragment (`model`, `target`, and
+/// optionally `inputs`, `id`, `quantiles`, `outputs`, `selection`) with the
+/// `context` and `queries` rows, for a catalog model served here.
+async fn adhoc_predict(front: &Front, payload: &Value, charge: Charge) -> Result<Value, ApiError> {
+    adhoc_predict_with(front, front.engine()?, payload, charge).await
+}
+
+async fn adhoc_predict_with(
+    front: &Front,
+    engine: &Engine,
+    payload: &Value,
+    charge: Charge,
+) -> Result<Value, ApiError> {
+    refuse_fields(
+        payload,
+        &["task"],
+        "is not a field: the model determines the task",
+    )?;
+    refuse_fields(
+        payload,
+        &["options"],
+        "is not a field: id, quantiles and outputs are top-level fields",
+    )?;
+    refuse_fields(payload, &["features"], "is spelled inputs")?;
+    let body = fields(
+        payload,
+        &["model", "target", "context", "queries"],
+        &[
+            "inputs",
+            "id",
+            "time",
+            "series",
+            "frequency",
+            "horizon",
+            "quantiles",
+            "outputs",
+            "selection",
+        ],
+    )?;
+    let model = catalog::canonical(body["model"].as_str(), front.surface)?;
+    if model.entry.task == catalog::Task::Forecast {
+        return Err(forecasting_unserved());
+    }
+    let served = front.serving(&model)?;
+    let task = match model.entry.task {
+        catalog::Task::Classification => "classification",
+        _ => "regression",
+    };
+    for field in ["time", "series", "frequency", "horizon"] {
+        if body.contains_key(field) {
+            return Err(ApiError::validation(format!(
+                "{field} is a forecast field; {} is a {task} model",
+                model.canonical_id()
+            ))
+            .param(field));
+        }
+    }
+    if let Some(selection) = body.get("selection")
+        && !selection.is_object()
+    {
+        return Err(ApiError::validation("selection must be an object").param("selection"));
+    }
     let target = &body["target"];
+    let target_name = target
+        .as_str()
+        .filter(|target| !target.is_empty())
+        .ok_or_else(|| ApiError::validation("target must name a column").param("target"))?;
     let (Some(rows), Some(queries)) = (body["context"].as_array(), body["queries"].as_array())
     else {
-        return Err(ApiError::validation("rows must be lists"));
+        return Err(ApiError::validation(
+            "context and queries must be lists of rows",
+        ));
     };
     require(
         rows.iter().chain(queries).all(Value::is_object),
         "rows must be objects",
     )?;
-    let features = body["features"]
-        .as_array()
-        .ok_or_else(|| ApiError::validation("features must be a list"))?;
-    let outputs: Vec<String> = match options.get("outputs") {
+    let id = match body.get("id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(id)) => Some(id.as_str()),
+        Some(_) => return Err(ApiError::validation("id must name a column").param("id")),
+    };
+    let inputs: Vec<Value> = match body.get("inputs") {
+        None | Some(Value::Null) => rows
+            .first()
+            .and_then(Value::as_object)
+            .map(|row| {
+                row.keys()
+                    .filter(|column| column.as_str() != target_name && Some(column.as_str()) != id)
+                    .map(|column| json!(column))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Some(Value::Array(inputs)) if inputs.iter().all(Value::is_string) => inputs.clone(),
+        Some(_) => {
+            return Err(
+                ApiError::validation("inputs must be a list of column names").param("inputs"),
+            );
+        }
+    };
+    if inputs.is_empty() {
+        return Err(ApiError::validation(
+            "no input columns: the context rows need a column besides the target",
+        )
+        .param("inputs"));
+    }
+    let features = &inputs;
+    let outputs: Vec<String> = match body.get("outputs") {
         Some(Value::Array(outputs)) if !outputs.is_empty() => outputs
             .iter()
             .map(|output| output.as_str().map(str::to_string))
@@ -1784,12 +1866,11 @@ async fn predict(
             && outputs.iter().all(|output| served.outputs.contains(output)),
         "model does not support requested outputs",
     )?;
-    let levels = options.get("quantiles");
+    let levels = body.get("quantiles");
     require(
         levels.is_none() || outputs.iter().any(|output| output == "quantiles"),
         "quantiles require the quantiles output",
     )?;
-    let target_name = target.as_str().unwrap_or_default();
     let select = |row: &Value| -> Value {
         Value::Object(
             features
@@ -1837,17 +1918,14 @@ async fn predict(
     else {
         return Err(forecasting_unserved());
     };
-    let inferred = front
-        .engine()?
-        .tabular(&served.worker, &parsed, charge)
-        .await?;
+    let inferred = engine.tabular(&served.worker, &parsed, charge).await?;
     let predictions = prediction_rows(
         &parsed.classes,
         &parsed.levels,
         &inferred,
         &outputs,
         queries,
-        options.get("id").and_then(Value::as_str),
+        id,
     )?;
     Ok(prediction_result(
         &served.resolved,
@@ -1969,53 +2047,30 @@ fn prediction_result(
     json!({
         "model": model,
         "task": task,
-        "context": {"source": source, "version": version, "rows": rows, "as_of": now},
-        "deployment": null,
-        "revision": null,
-        "environment": null,
+        "context": {"kind": source, "rows": rows, "digest": version, "as_of": now},
         "predictions": predictions,
     })
 }
 
-/// A locked package's `/predictions`: the body checked against the lock,
+/// A locked predictor's `/predictions`: the body checked against the lock,
 /// then the queries encoded by the binder and predicted from the
 /// snapshot's durable table, or from the ephemeral table of the request's
 /// own bound context.
-async fn package_predict(
+async fn served_predict(
     front: &Front,
     served: &ServedModel,
-    package: &ServedPackage,
+    predictor: &ServedPredictor,
     payload: &Value,
     charge: Charge,
 ) -> Result<Value, ApiError> {
-    let body = fields(
-        payload,
-        &[
-            "model", "task", "target", "features", "context", "queries", "options",
-        ],
-        &[],
-    )?;
-    if body["model"].as_str() != Some(served.name.as_str()) {
-        return Err(ApiError::not_served());
-    }
-    if body["task"].as_str() != Some(package.task.as_str()) {
-        return Err(ApiError::new(
-            "UnsupportedTask",
-            "package does not serve this task",
-            422,
-        ));
-    }
-    require(
-        body["options"] == json!({}),
-        "package options are compiled into its lock",
-    )?;
-    let features: Vec<String> = body["features"]
+    let body = fields(payload, &["target", "inputs", "context", "queries"], &[])?;
+    let features: Vec<String> = body["inputs"]
         .as_array()
-        .ok_or_else(|| ApiError::validation("features must be a list"))?
+        .ok_or_else(|| ApiError::validation("inputs must be a list"))?
         .iter()
-        .map(|feature| feature.as_str().map(str::to_string))
+        .map(|input| input.as_str().map(str::to_string))
         .collect::<Option<_>>()
-        .ok_or_else(|| ApiError::validation("features differ from lock"))?;
+        .ok_or_else(|| ApiError::validation("inputs differ from lock"))?;
     let queries = body["queries"]
         .as_array()
         .filter(|queries| (1..=MAX_QUERY_ROWS).contains(&queries.len()))
@@ -2027,19 +2082,19 @@ async fn package_predict(
         queries.iter().chain(context).all(Value::is_object),
         "rows must be objects",
     )?;
-    if let Some(forecast) = &package.forecast {
+    if let Some(forecast) = &predictor.forecast {
         return series_predict(
-            front, served, package, forecast, body, &features, queries, context, charge,
+            front, served, predictor, forecast, body, &features, queries, context, charge,
         )
         .await;
     }
-    let schema_free = package.schema_free();
+    let schema_free = predictor.schema_free();
     let target = if schema_free {
         let target = body["target"]
             .as_str()
             .ok_or_else(|| ApiError::validation("request target is required"))?;
         require(
-            package
+            predictor
                 .target
                 .as_deref()
                 .is_none_or(|locked| locked == target),
@@ -2049,30 +2104,32 @@ async fn package_predict(
     } else {
         require(
             body["target"].as_str().is_some()
-                && body["target"].as_str() == package.target.as_deref(),
+                && body["target"].as_str() == predictor.target.as_deref(),
             "target differs from lock",
         )?;
-        require(features == package.features, "features differ from lock")?;
-        package.target.clone().unwrap_or_default()
+        require(features == predictor.inputs, "inputs differ from lock")?;
+        predictor.target.clone().unwrap_or_default()
     };
-    let (inferred, classes, rows, source, version) = match package.context {
+    let (inferred, classes, rows, source, version) = match predictor.context {
         ContextMode::Snapshot => {
-            require(context.is_empty(), "bound context cannot be overridden")?;
+            if !context.is_empty() {
+                return Err(context_declared());
+            }
             let bound = front
                 .bound
                 .get()
                 .and_then(|bound| bound.get(&served.name))
-                .ok_or_else(|| ApiError::new("NotReady", "model is loading", 503))?;
+                .ok_or_else(not_ready)?;
             let encoded = bound
                 .encoder
-                .encode(&packages::records(&package.schema.columns, queries)?)?;
+                .encode(&predictors::records(&predictor.schema.columns, queries)?)?;
             let inferred = front.engine()?.predicted(bound, encoded).await?;
             (
                 inferred,
                 bound.classes.clone(),
                 bound.rows,
                 "snapshot",
-                package.data_digest.as_deref(),
+                predictor.context_digest.as_deref(),
             )
         }
         ContextMode::Request => {
@@ -2081,19 +2138,19 @@ async fn package_predict(
                 "context must contain 1..100000 rows",
             )?;
             let schema = if schema_free {
-                packages::inferred(&features, &target, context)
+                predictors::inferred(&features, &target, context)
             } else {
-                package.schema.clone()
+                predictor.schema.clone()
             };
-            let bound = package::bind(
+            let bound = predictor::bind(
                 &schema,
-                package.task()?,
+                predictor.task()?,
                 &target,
-                &packages::records(&schema.columns, context)?,
+                &predictors::records(&schema.columns, context)?,
             )?;
             let encoded = bound
                 .encoder
-                .encode(&packages::records(&schema.columns, queries)?)?;
+                .encode(&predictors::records(&schema.columns, queries)?)?;
             let fingerprint = bound_fingerprint(served, &bound);
             let context = engine::rows_context(
                 &served.worker,
@@ -2114,15 +2171,15 @@ async fn package_predict(
     drop(charge);
     let predictions = prediction_rows(
         &classes,
-        &package.quantiles,
+        &predictor.quantiles,
         &inferred,
         &served.outputs,
         queries,
-        package.id.as_deref(),
+        predictor.id.as_deref(),
     )?;
     Ok(prediction_result(
         &served.resolved,
-        &package.task,
+        &predictor.task,
         source,
         version,
         rows,
@@ -2130,19 +2187,19 @@ async fn package_predict(
     ))
 }
 
-/// A snapshot package's context rows, from the file `gf serve` wrote.
-pub(crate) fn snapshot_rows(package: &ServedPackage) -> Result<RecordBatch, ApiError> {
-    let path = package.snapshot.as_deref().ok_or_else(|| {
+/// A snapshot predictor's context rows, from the file `gf serve` wrote.
+pub(crate) fn snapshot_rows(predictor: &ServedPredictor) -> Result<RecordBatch, ApiError> {
+    let path = predictor.snapshot.as_deref().ok_or_else(|| {
         ApiError::new(
             "ContextRequired",
-            "snapshot packages are served from their package directory",
+            "snapshot predictors are served from their predictor directory",
             422,
         )
     })?;
-    packages::read_snapshot(path).map_err(|error| ApiError::new("MissingFile", error, 503))
+    predictors::read_snapshot(path).map_err(|error| ApiError::new("MissingFile", error, 503))
 }
 
-/// A forecast package's `/predictions`: the queries placed on the bound
+/// A forecast predictor's `/predictions`: the queries placed on the bound
 /// group's series and horizon, the known inputs' future filled in, and the
 /// group forecast on the shard path catalog forecasts take, from the table
 /// its context and future values name.
@@ -2150,8 +2207,8 @@ pub(crate) fn snapshot_rows(package: &ServedPackage) -> Result<RecordBatch, ApiE
 async fn series_predict(
     front: &Front,
     served: &ServedModel,
-    package: &ServedPackage,
-    forecast: &ForecastPackage,
+    predictor: &ServedPredictor,
+    forecast: &ForecastPredictor,
     body: &Map<String, Value>,
     features: &[String],
     queries: &[Value],
@@ -2163,26 +2220,28 @@ async fn series_predict(
         .as_str()
         .ok_or_else(|| ApiError::validation("target differs from lock"))?;
     require(
-        package
+        predictor
             .target
             .as_deref()
             .is_none_or(|locked| locked == target),
         "target differs from lock",
     )?;
     let aligned;
-    let (bound, schema, source, version) = match package.context {
+    let (bound, schema, source, version) = match predictor.context {
         ContextMode::Snapshot => {
-            require(context.is_empty(), "bound context cannot be overridden")?;
+            if !context.is_empty() {
+                return Err(context_declared());
+            }
             let bound = front
                 .series
                 .get()
                 .and_then(|series| series.get(&served.name))
-                .ok_or_else(|| ApiError::new("NotReady", "model is loading", 503))?;
+                .ok_or_else(not_ready)?;
             (
                 bound,
-                package.schema.clone(),
+                predictor.schema.clone(),
                 "snapshot",
-                package.data_digest.as_deref(),
+                predictor.context_digest.as_deref(),
             )
         }
         ContextMode::Request => {
@@ -2190,13 +2249,13 @@ async fn series_predict(
                 !context.is_empty() && context.len() <= MAX_CONTEXT_ROWS,
                 "context must contain 1..100000 rows",
             )?;
-            let schema = if package.schema_free() {
-                packages::inferred(&forecast.context_columns(), target, context)
+            let schema = if predictor.schema_free() {
+                predictors::inferred(&forecast.context_columns(), target, context)
             } else {
-                package.schema.clone()
+                predictor.schema.clone()
             };
-            let rows = packages::records(&schema.columns, context)?;
-            aligned = front.bind_series(served, package, forecast, &rows, None)?;
+            let rows = predictors::records(&schema.columns, context)?;
+            aligned = front.bind_series(served, predictor, forecast, &rows, None)?;
             (&aligned, schema, "request", None)
         }
     };
@@ -2207,7 +2266,7 @@ async fn series_predict(
         .filter(|name| forecast.query_columns().contains(name))
         .collect();
     require(features == expected.as_slice(), "features differ from lock")?;
-    let rows = forecast.query_rows(&schema, package.id.as_deref(), queries)?;
+    let rows = forecast.query_rows(&schema, predictor.id.as_deref(), queries)?;
     let queried = forecast.queries(&bound.context, &rows)?;
     let query = bound.forecast.queries.first().ok_or_else(failed)?;
     let horizon = forecast.horizon;
@@ -2220,7 +2279,7 @@ async fn series_predict(
     covariates.sort();
     covariates.dedup();
     let mut known = Sha256::new();
-    known.update(b"package-forecast\0");
+    known.update(b"predictor-forecast\0");
     known.update(query.fingerprint);
     for (name, values) in forecast.future_inputs.iter().zip(&queried.future) {
         let row = bound.context.identities.len()
@@ -2263,7 +2322,7 @@ async fn series_predict(
     let levels = inferred.levels.as_deref().ok_or_else(invalid)?;
     let column = |level: f64| levels.iter().position(|known| *known == level);
     let median = column(0.5).ok_or_else(invalid)?;
-    let columns: Vec<usize> = package
+    let columns: Vec<usize> = predictor
         .quantiles
         .iter()
         .map(|&level| column(level))
@@ -2306,7 +2365,7 @@ async fn series_predict(
             .iter()
             .map(|&(member, position)| {
                 Value::Object(
-                    package
+                    predictor
                         .quantiles
                         .iter()
                         .zip(&columns)
@@ -2322,12 +2381,12 @@ async fn series_predict(
         values,
         &served.outputs,
         queries,
-        package.id.as_deref(),
+        predictor.id.as_deref(),
         queried.positions.len(),
     );
     Ok(prediction_result(
         &served.resolved,
-        &package.task,
+        &predictor.task,
         source,
         version,
         bound.rows,
@@ -2338,9 +2397,9 @@ async fn series_predict(
 /// A bound request context's fingerprint: its model and its rows as the
 /// binder encoded them, which is all its table holds, so contexts that
 /// encode alike share one table and one fit.
-fn bound_fingerprint(served: &ServedModel, bound: &package::Context) -> [u8; 32] {
+fn bound_fingerprint(served: &ServedModel, bound: &predictor::Context) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"package\0");
+    hasher.update(b"predictor\0");
     hasher.update(served.worker.as_bytes());
     hasher.update([0]);
     hasher.update((bound.encoder.width() as u64).to_le_bytes());
@@ -2360,4 +2419,134 @@ fn bound_fingerprint(served: &ServedModel, bound: &package::Context) -> [u8; 32]
     };
     hasher.update(&targets);
     hasher.finalize().into()
+}
+
+/// A hosted predictor: the revision its `production` environment serves,
+/// loaded from the control plane on demand and predicted as a native predictor.
+async fn revision_predict(
+    front: &Front,
+    revisions: &Revisions,
+    project: &str,
+    predictor: &str,
+    payload: &Value,
+    charge: Charge,
+) -> Result<Value, ApiError> {
+    let environment = "production";
+    let resolved = revisions.resolve(project, predictor, environment).await?;
+    let revision = resolved.revision;
+    let version = resolved.context_version.unwrap_or(Value::Null);
+    let started = std::time::Instant::now();
+    let scored = async {
+        let published = revisions
+            .load(project, predictor, revision, Some(&version))
+            .await?;
+        let Published::Native {
+            served,
+            context,
+            rows,
+        } = &*published;
+        native_predict(
+            front,
+            served,
+            context.as_ref(),
+            rows.as_deref(),
+            payload,
+            charge,
+        )
+        .await
+    }
+    .await;
+    revisions.record(Record {
+        project: project.to_string(),
+        deployment: predictor.to_string(),
+        environment: Some(environment.to_string()),
+        revision,
+        ok: scored.is_ok(),
+        latency_seconds: started.elapsed().as_secs_f64(),
+    });
+    let mut result = scored?;
+    // The hosted result keeps the control plane's context shape: `source`
+    // and `version`, which its Python path and console read.
+    if let Some(context) = result["context"].as_object_mut() {
+        if let Some(kind) = context.remove("kind") {
+            context.insert("source".into(), kind);
+        }
+        if let Some(digest) = context.remove("digest") {
+            context.insert("version".into(), digest);
+        }
+    }
+    result["predictor"] = json!(predictor);
+    result["revision"] = json!(revision);
+    result["environment"] = json!(environment);
+    Ok(result)
+}
+
+async fn native_predict(
+    front: &Front,
+    served: &ServedModel,
+    captured: Option<&Value>,
+    rows: Option<&[Value]>,
+    payload: &Value,
+    charge: Charge,
+) -> Result<Value, ApiError> {
+    refuse_fields(
+        payload,
+        &["target", "inputs", "model", "task", "features", "options"],
+        "is declared by the predictor",
+    )?;
+    let body = fields(payload, &["queries"], &["context", "as_of"])?;
+    let failed = || ApiError::new("InternalError", "request failed safely", 500);
+    let predictor = served.predictor.as_ref().ok_or_else(failed)?;
+    let base = front
+        .models
+        .iter()
+        .find(|model| model.predictor.is_none() && model.resolved == served.resolved)
+        .ok_or_else(|| {
+            ApiError::new(
+                "ModelUnavailable",
+                "the revision's model is not served here",
+                503,
+            )
+        })?;
+    require(
+        body["queries"]
+            .as_array()
+            .is_some_and(|queries| (1..=MAX_QUERY_ROWS).contains(&queries.len())),
+        "queries must contain 1..10000 rows",
+    )?;
+    let context = match predictor.context {
+        ContextMode::Request => body.get("context").cloned().ok_or_else(|| {
+            ApiError::validation(
+                "context is required: this predictor takes its context with each request",
+            )
+            .param("context")
+        })?,
+        ContextMode::Snapshot => {
+            if body.contains_key("context") {
+                return Err(context_declared());
+            }
+            Value::Array(rows.ok_or_else(failed)?.to_vec())
+        }
+    };
+    let mut ephemeral = served.clone();
+    ephemeral.worker.clone_from(&base.worker);
+    let mut bound = predictor.clone();
+    bound.context = ContextMode::Request;
+    bound.snapshot = None;
+    ephemeral.predictor = Some(bound.clone());
+    let call = json!({
+        "target": predictor.target,
+        "inputs": predictor.inputs,
+        "context": context,
+        "queries": body["queries"],
+    });
+    let mut result = served_predict(front, &ephemeral, &bound, &call, charge).await?;
+    if predictor.context == ContextMode::Snapshot
+        && let Some(captured) = captured
+    {
+        let rows = result["context"]["rows"].clone();
+        result["context"] = captured.clone();
+        result["context"]["rows"] = rows;
+    }
+    Ok(result)
 }

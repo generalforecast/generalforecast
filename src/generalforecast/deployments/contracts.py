@@ -15,7 +15,7 @@ import yaml
 
 from generalforecast.models.catalog import V1_POLICY
 
-VERSION = "gf/v1alpha1"
+VERSION = "gf/v1"
 MODEL = "general-forecast/tabicl-v2-classifier"
 PIN = "5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b"
 NAME = re.compile(r"[a-z][a-z0-9-]{0,62}")
@@ -29,168 +29,95 @@ class ServiceError(Exception):
         super().__init__(message)
         self.code, self.message, self.status = code, message, status
 
+    @property
+    def public(self) -> str:
+        """The wire code, one of the OpenAPI `ErrorCode` enum."""
+        return public_code(self.code, self.status)
+
     def body(self) -> dict[str, Any]:
-        """Returns the shared wire error envelope."""
+        """The console session routes' error envelope, with the typed code."""
         return {"error": {"code": self.code, "message": self.message}}
 
+    def public_body(self) -> dict[str, Any]:
+        """The API's bare error envelope, with the OpenAPI code."""
+        return {"error": {"code": self.public, "message": self.message}}
 
-PUBLIC_ERROR_CODES = frozenset(
+
+WIRE_ERROR_CODES = frozenset(
     [
-        "AccessDenied",
-        "AlreadyExists",
-        "AmbiguousFrequency",
-        "AmbiguousTask",
-        "ArtifactIntegrityError",
-        "ArtifactMismatch",
-        "ArtifactUnavailable",
-        "ArtifactUnsupported",
-        "AuthorizationPending",
-        "BackupIntegrityError",
-        "BackupUnavailable",
-        "CapacityExceeded",
-        "ConfigurationError",
-        "Conflict",
-        "ContextCapacityExceeded",
-        "ContextRequired",
-        "CredentialInactive",
-        "CredentialUnavailable",
-        "CredentialsUnavailable",
-        "DurabilityUnavailable",
-        "DurableStateUnavailable",
-        "EffectUnavailable",
-        "EmptyContext",
-        "EmptySource",
-        "EnterpriseSSOUnavailable",
-        "ExpiredToken",
-        "Forbidden",
-        "FreshnessExceeded",
-        "HostAuthorityUnavailable",
-        "ImmutableRevision",
-        "InferenceFailed",
-        "InstanceClosed",
-        "InternalError",
-        "InvalidContext",
-        "InvalidLogin",
-        "InvalidPackage",
-        "InvalidTable",
-        "InvitationEmailMismatch",
-        "InvitationUnavailable",
-        "IsolationUnavailable",
-        "JobBusy",
-        "JobCapacityExceeded",
-        "JobExists",
-        "JobIntegrityError",
-        "JobStorageUnavailable",
-        "JobTerminal",
-        "LastAdministrator",
-        "LinkConfirmationRequired",
-        "LockMismatch",
-        "LockOutdated",
-        "LockRequired",
-        "LoginCodeUnavailable",
-        "MailUnavailable",
-        "MethodNotAllowed",
-        "MissingFile",
-        "MissingValues",
-        "ModelMismatch",
-        "ModelNotFound",
-        "ModelOutputError",
-        "ModelResolutionRequired",
-        "ModelRuntimeUnavailable",
-        "ModelUnavailable",
-        "NotFound",
-        "NotReady",
-        "NothingToRetry",
-        "OperationSuperseded",
-        "OperationUnresolved",
-        "OwnershipMismatch",
-        "PackageOutputExceeded",
-        "PackageProtocolError",
-        "PackageTestFailed",
-        "PackageTestTimeout",
-        "PendingExpired",
-        "PersistenceUnavailable",
-        "PersonalEmailDomain",
-        "PredictorFailed",
-        "PredictorTimeout",
-        "ProtocolError",
-        "ProviderAuthenticationUnavailable",
-        "ProviderConflict",
-        "ProviderError",
-        "ProviderNotFound",
-        "ProviderOperationFailed",
-        "ProviderPending",
-        "ProviderPrerequisiteMissing",
-        "ProviderProtocolError",
-        "ProviderProvisioningFailed",
-        "ProviderRuntimeError",
-        "ProviderTimeout",
-        "ProviderTransportError",
-        "ProviderUnavailable",
-        "RateLimited",
-        "ReauthenticationRequired",
-        "RebuildRequired",
-        "RecoveryUnavailable",
-        "RedeployRequiresStop",
-        "RedirectRefused",
-        "RegistryAuthenticationUnavailable",
-        "RequestDisconnected",
-        "RequestTimeout",
-        "RequestTooLarge",
-        "ResidencyMismatch",
-        "RevisionConflict",
-        "RevisionSuperseded",
-        "RuntimeUnavailable",
-        "SSOUnconfigured",
-        "SchemaChanged",
-        "SchemaMismatch",
-        "SchemaRequired",
-        "SchemaVersionUnsupported",
-        "ScopeMismatch",
-        "SecretUnavailable",
-        "SecretsUnconfigured",
-        "ServiceUnavailable",
-        "SessionRequired",
-        "SingleWriterUnavailable",
-        "SlowDown",
-        "SnapshotMismatch",
-        "SnapshotNotFound",
-        "SourceChanged",
-        "SourceNotConfigured",
-        "SourceUnavailable",
-        "StaleComponent",
-        "StateBusy",
-        "SubmissionConflict",
-        "Unauthorized",
-        "UnknownRow",
-        "UnsafePath",
-        "Unsupported",
-        "UnsupportedCapability",
-        "UnsupportedClassCount",
-        "UnsupportedCovariates",
-        "UnsupportedDeploymentTask",
-        "UnsupportedFormat",
-        "UnsupportedJobTask",
-        "UnsupportedLockVersion",
-        "UnsupportedMode",
-        "UnsupportedModel",
-        "UnsupportedOperation",
-        "UnsupportedProvider",
-        "UnsupportedQuantiles",
-        "UnsupportedTask",
-        "UnsupportedType",
         "ValidationError",
-        "WaitTimeout",
-        "WaitlistRequired",
-        "WriteConflict",
+        "NotFound",
+        "Unauthorized",
+        "CapacityExceeded",
+        "ModelNotReady",
+        "Internal",
+        "Conflict",
     ]
 )
-"""Codes a GF service may return; clients map any other code to RemoteError."""
+"""The OpenAPI `ErrorCode` enum: the only codes a GF service puts on the wire."""
+
+_PUBLIC_BY_CODE = {
+    **dict.fromkeys(
+        (
+            "Forbidden",
+            "AccessDenied",
+            "InvalidLogin",
+            "ExpiredToken",
+            "NotLoggedIn",
+            "SessionRequired",
+            "ReauthenticationRequired",
+            "CredentialInactive",
+            "AuthorizationPending",
+        ),
+        "Unauthorized",
+    ),
+    **dict.fromkeys(
+        (
+            "AlreadyExists",
+            "WriteConflict",
+            "StaleComponent",
+            "OperationSuperseded",
+            "LinkConfirmationRequired",
+        ),
+        "Conflict",
+    ),
+    **dict.fromkeys(("RateLimited", "ContextCapacityExceeded"), "CapacityExceeded"),
+    **dict.fromkeys(
+        (
+            "NotReady",
+            "ModelUnavailable",
+            "RuntimeUnavailable",
+            "ProviderUnavailable",
+            "SingleWriterUnavailable",
+            "Timeout",
+            "WaitTimeout",
+            "PredictorTimeout",
+        ),
+        "ModelNotReady",
+    ),
+    "InternalError": "Internal",
+}
 
 
-def public_code(code: str) -> str:
-    """Classifies an untrusted remote code without echoing unknown values."""
-    return code if code in PUBLIC_ERROR_CODES else "RemoteError"
+def public_code(code: str, status: int) -> str:
+    """The wire code for an internal failure code raised with `status`."""
+    if code in WIRE_ERROR_CODES:
+        return code
+    if code in _PUBLIC_BY_CODE:
+        return _PUBLIC_BY_CODE[code]
+    if code.endswith("NotFound") or status == 404:
+        return "NotFound"
+    if status in (401, 403):
+        return "Unauthorized"
+    if status == 409:
+        return "Conflict"
+    if status == 429:
+        return "CapacityExceeded"
+    if status == 503:
+        return "ModelNotReady"
+    if status >= 500:
+        return "Internal"
+    return "ValidationError"
 
 
 def require(condition: bool, message: str) -> None:
@@ -204,6 +131,20 @@ def fields(value: Any, required: set[str], optional: set[str] | None = None) -> 
     require(isinstance(value, dict), "expected an object")
     require(required <= value.keys(), f"required fields: {sorted(required)}")
     require(not value.keys() - required - (optional or set()), "unknown fields")
+    return value
+
+
+MODEL_ID = re.compile(
+    r"[a-z][a-z0-9-]{0,62}/[a-z0-9][a-z0-9.-]{0,62}(?:@sha256:[0-9a-f]{64})?(?:@\d+)?(?:\*\d+)?"
+)
+
+
+def model_id(value: Any) -> str:
+    """Validates a canonical `general-forecast/<name>` model id."""
+    require(
+        isinstance(value, str) and MODEL_ID.fullmatch(value) is not None,
+        "invalid model id",
+    )
     return value
 
 
@@ -239,7 +180,7 @@ class ModelPin:
 
     @classmethod
     def parse(cls, value: Any) -> "ModelPin":
-        """Rejects arbitrary code packages and mutable aliases."""
+        """Rejects arbitrary code paths and mutable aliases."""
         fields(value, {"repository", "revision"})
         require(
             value["repository"] == MODEL,

@@ -82,7 +82,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     for entry in options.model or []:
         name, spec = entry.split("=", 1)
         names[name] = len(names)
-        worker.add_model(names[name], *registry.load(spec), spec=spec)
+        worker.add_model(names[name], *registry.load_engine_spec(spec), spec=spec)
 
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     connection.connect(options.socket)
@@ -273,7 +273,9 @@ def _control(
     match control:
         case protocol.AddModel(name, spec):
             if name not in names:
-                worker.add_model(len(names), *registry.load(spec), spec=spec)
+                worker.add_model(
+                    len(names), *registry.load_engine_spec(spec), spec=spec
+                )
                 names[name] = len(names)
                 if worker.allocated:
                     worker.warm_start(progressed, models=[names[name]])

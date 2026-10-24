@@ -136,16 +136,14 @@ fn the_fronts_routes_are_owned_however_they_are_spelled() {
     for path in [
         "/livez",
         "/readyz",
-        "/v1alpha1/projects/p/models",
-        "/v1alpha1/projects/p/models/m/infer",
-        "/v1alpha1/projects/p/models/",
-        "//v1alpha1//projects/p//models",
-        "/V1ALPHA1/Projects/p/Models/m",
-        "/v1alpha1/projects/p/predictions",
-        "/v1alpha1/projects/p/predictions/x",
-        "/v1alpha1/projects/p/%6dodels",
-        "/v1alpha1/projects/p/deployments/d/revisions/3/predict",
-        "/v1alpha1/projects/p/deployments/d/environments/prod/predict",
+        "/v1/projects/p/models",
+        "/v1/projects/p/models/m/infer",
+        "/v1/projects/p/models/",
+        "//v1//projects/p//models",
+        "/V1/Projects/p/Models/m",
+        "/v1/projects/p/predict",
+        "/v1/projects/p/predictors/x/predict",
+        "/v1/projects/p/%6dodels",
     ] {
         assert!(owns(path), "{path}");
     }
@@ -153,12 +151,12 @@ fn the_fronts_routes_are_owned_however_they_are_spelled() {
         "/",
         "/console",
         "/auth/callback",
-        "/v1alpha1/projects",
-        "/v1alpha1/projects/p",
-        "/v1alpha1/projects/p/keys",
-        "/v1alpha1/projects/p/deployments/d",
-        "/v1alpha1/projects/p/deployments/d/revisions/3",
-        "/internal/v1alpha1/keys:introspect",
+        "/v1/projects",
+        "/v1/projects/p",
+        "/v1/projects/p/keys",
+        "/v1/projects/p/contexts/c",
+        "/v1/projects/p/environments/e",
+        "/internal/v1/keys:introspect",
     ] {
         assert!(!owns(path), "{path}");
     }
@@ -168,7 +166,7 @@ fn the_fronts_routes_are_owned_however_they_are_spelled() {
 async fn unowned_routes_pass_through_unchanged() {
     let (origin, front) = origin_and_front().await;
     let response = client()
-        .post(format!("{front}/v1alpha1/projects/p/keys?page=2&a=%2F"))
+        .post(format!("{front}/v1/projects/p/keys?page=2&a=%2F"))
         .header("cookie", "gf_session=s1")
         .header("x-custom", "kept")
         .header("connection", "x-private")
@@ -184,7 +182,7 @@ async fn unowned_routes_pass_through_unchanged() {
     assert!(!response.headers().contains_key("x-hop"));
     let echo: Value = response.json().await.unwrap();
     assert_eq!(echo["method"], "POST");
-    assert_eq!(echo["target"], "/v1alpha1/projects/p/keys?page=2&a=%2F");
+    assert_eq!(echo["target"], "/v1/projects/p/keys?page=2&a=%2F");
     assert_eq!(echo["body"], 5);
     let headers = &echo["headers"];
     assert_eq!(headers["cookie"], "gf_session=s1");
@@ -322,15 +320,12 @@ async fn upstream_failures_answer_502_and_504_in_the_error_envelope() {
 async fn inference_routes_are_never_proxied() {
     let (origin, front) = origin_and_front().await;
     for (method, path) in [
-        ("GET", "/v1alpha1/projects/local/models"),
-        ("POST", "/v1alpha1/projects/local/models/m/infer"),
-        ("POST", "/v1alpha1/projects/local/predictions"),
-        ("DELETE", "/v1alpha1/projects/local/models/m"),
-        ("GET", "/v1alpha1/projects/local/models/"),
-        (
-            "POST",
-            "/v1alpha1/projects/local/deployments/d/revisions/1/predict",
-        ),
+        ("GET", "/v1/projects/local/models"),
+        ("POST", "/v1/projects/local/models/m/infer"),
+        ("POST", "/v1/projects/local/predict"),
+        ("POST", "/v1/projects/local/predictors/x/predict"),
+        ("DELETE", "/v1/projects/local/models/m"),
+        ("GET", "/v1/projects/local/models/"),
         ("GET", "/readyz"),
     ] {
         let response = client()

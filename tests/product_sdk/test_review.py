@@ -11,7 +11,11 @@ import httpx
 import pytest
 
 import generalforecast as gf
-from generalforecast.async_client import AsyncClient, AsyncDeployment
+from generalforecast.async_client import AsyncClient, AsyncHostedPredictor
+from generalforecast.client import Client
+from generalforecast.contracts import Environment, PredictionResult
+from generalforecast.deployments.contracts import ServiceError
+from generalforecast.deployments.sdk import HostedPredictor
 from generalforecast.transport import (
     AsyncTransport,
     RelayedError,
@@ -24,7 +28,7 @@ from tests.product_sdk.test_lifecycle import invoke
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_retired_deployment_plane_is_not_exposed(asynchronous):
     async def run():
-        client = (gf.AsyncClient if asynchronous else gf.Client)(api_key="fixture-key")
+        client = (AsyncClient if asynchronous else Client)(api_key="fixture-key")
         try:
             for attribute in (
                 "apply",
@@ -33,7 +37,7 @@ def test_retired_deployment_plane_is_not_exposed(asynchronous):
                 "effect_status",
                 "wait_effect",
             ):
-                assert not hasattr(client.deployments, attribute)
+                assert not hasattr(client.predictors, attribute)
             assert not hasattr(gf, "ServingEffect")
         finally:
             await invoke(
@@ -44,14 +48,14 @@ def test_retired_deployment_plane_is_not_exposed(asynchronous):
 
 
 def result(task="classification"):
-    return gf.PredictionResult.from_dict(
+    return PredictionResult.from_dict(
         {
-            "model": "catalog/chronos-2"
+            "model": "general-forecast/chronos-2"
             if task == "forecast"
-            else "catalog/tabicl-v2-classifier",
+            else "general-forecast/tabicl-v2-classifier",
             "task": task,
             "context": None,
-            "deployment": None,
+            "predictor": None,
             "revision": None,
             "environment": None,
             "predictions": [{"value": 2.0}]
@@ -63,51 +67,50 @@ def result(task="classification"):
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_one_shot_forecast_uses_declared_roles_and_nested_options(wire, asynchronous):
-    options = {
-        "time": "t",
-        "series": ["s"],
-        "horizon": 1,
-        "frequency": 1,
-        "past_inputs": ["past"],
-        "future_inputs": ["future"],
-        "quantiles": [0.5],
-    }
     context = [{"t": 1, "s": "a", "y": 2.0, "past": 3.0, "future": 4.0}]
     queries = [{"t": 2, "s": "a", "future": 5.0}]
     wire.expect(
         "POST",
-        "/predictions",
+        "/predict",
         result("forecast"),
         payload={
-            "model": "chronos-2",
-            "task": "forecast",
+            "model": "general-forecast/chronos-2",
             "target": "y",
-            "features": [],
             "context": context,
             "queries": queries,
-            "options": options | {"outputs": ["value"]},
+            "inputs": ["future"],
+            "time": "t",
+            "frequency": 1,
+            "horizon": 1,
+            "series": ["s"],
+            "quantiles": [0.5],
+            "outputs": ["value"],
         },
     )
 
     async def run():
-        client = (gf.AsyncClient if asynchronous else gf.Client)(
+        client = (AsyncClient if asynchronous else Client)(
             wire.url, project="test", api_key="fixture-key"
         )
         try:
             prediction = await invoke(
                 client.predict,
-                model="chronos-2",
-                target="y",
-                context=context,
-                queries=queries,
-                options=options,
+                "general-forecast/chronos-2",
+                "y",
+                context,
+                queries,
+                inputs=["future"],
+                time="t",
+                series=["s"],
+                frequency=1,
+                horizon=1,
+                quantiles=[0.5],
                 outputs=["value"],
             )
             assert prediction.task == "forecast"
-            assert "outputs" not in options
         finally:
             await invoke(
-                client.aclose if isinstance(client, gf.AsyncClient) else client.close
+                client.aclose if isinstance(client, AsyncClient) else client.close
             )
 
     asyncio.run(run())
@@ -115,41 +118,29 @@ def test_one_shot_forecast_uses_declared_roles_and_nested_options(wire, asynchro
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_named_prediction_retains_optional_request_bindings(wire, asynchronous):
-    payload = {
-        "queries": [{"x": 2}],
-        "context": [{"x": 1, "y": True}],
-        "target": "y",
-        "features": ["x"],
-    }
-    for path in (
-        "/deployments/risk/environments/staging/predict",
-        "/deployments/risk/dev-sessions/dev-one/predict",
-    ):
-        wire.expect("POST", path, result(), payload=payload)
+    payload = {"queries": [{"x": 2}], "context": [{"x": 1, "y": True}]}
+    wire.expect(
+        "POST", "/predictors/risk/predict?env=staging", result(), payload=payload
+    )
 
     async def run():
-        client = (gf.AsyncClient if asynchronous else gf.Client)(
+        client = (AsyncClient if asynchronous else Client)(
             wire.url, project="test", api_key="fixture-key"
         )
         try:
-            bindings = {
-                "context": [{"x": 1, "y": True}],
-                "target": "y",
-                "features": ["x"],
-            }
+            bindings = {"context": [{"x": 1, "y": True}]}
             await invoke(
-                client.deployments.predict,
+                client.predictors.predict,
                 "risk",
                 {"x": [2]},
                 env="staging",
                 **bindings,
             )
-            await invoke(
-                client.dev_sessions.predict, "risk", "dev-one", {"x": [2]}, **bindings
-            )
+            with pytest.raises(TypeError):
+                await invoke(client.predictors.predict, "risk", {"x": [2]}, target="y")
         finally:
             await invoke(
-                client.aclose if isinstance(client, gf.AsyncClient) else client.close
+                client.aclose if isinstance(client, AsyncClient) else client.close
             )
 
     asyncio.run(run())
@@ -157,9 +148,9 @@ def test_named_prediction_retains_optional_request_bindings(wire, asynchronous):
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_captured_environment_never_lends_other_environment_its_cas(wire, asynchronous):
-    captured = gf.Environment("risk", "production", 1, 3, "local", "ready")
-    staging = gf.Environment("risk", "staging", 2, 9, "local", "ready")
-    base = "/deployments/risk/environments/staging"
+    captured = Environment("risk", "production", 1, 3, "local", "ready")
+    staging = Environment("risk", "staging", 2, 9, "local", "ready")
+    base = "/predictors/risk/environments/staging"
     for action in ("promote", "rollback"):
         wire.expect("GET", base, staging.to_dict())
         wire.expect(
@@ -169,31 +160,31 @@ def test_captured_environment_never_lends_other_environment_its_cas(wire, asynch
             payload={"revision": 2, "expected_generation": 9},
         )
     wire.expect("GET", base, staging.to_dict())
-    wire.expect("GET", "/deployments/risk/environments/production", captured.to_dict())
-    moved = gf.Environment("risk", "production", 2, 4, "local", "ready")
-    wire.expect("GET", "/deployments/risk/environments/production", moved.to_dict())
+    wire.expect("GET", "/predictors/risk/environments/production", captured.to_dict())
+    moved = Environment("risk", "production", 2, 4, "local", "ready")
+    wire.expect("GET", "/predictors/risk/environments/production", moved.to_dict())
     wire.expect(
         "POST",
-        "/deployments/risk/environments/production/promote",
+        "/predictors/risk/environments/production/promote",
         moved.to_dict(),
         payload={"revision": 2, "expected_generation": 3},
     )
 
     async def run():
-        client = (gf.AsyncClient if asynchronous else gf.Client)(
+        client = (AsyncClient if asynchronous else Client)(
             wire.url, project="test", api_key="fixture-key"
         )
         try:
-            handle = (AsyncDeployment if asynchronous else gf.Deployment).from_response(
-                client, "risk", {"name": "risk"}, captured
-            )
+            handle = (
+                AsyncHostedPredictor if asynchronous else HostedPredictor
+            ).from_response(client, "risk", {"name": "risk"}, captured)
             for action in ("promote", "rollback"):
                 assert (
                     await invoke(getattr(handle, action), env="staging", revision=2)
                 ).generation == 9
             assert (await invoke(handle.wait, env="staging")).revision == 2
             assert (await invoke(handle.wait, env=None)).revision == 1
-            with pytest.raises(gf.ServiceError) as error:
+            with pytest.raises(ServiceError) as error:
                 await invoke(handle.wait, revision=None, generation=None)
             assert error.value.code == "Conflict"
             assert (
@@ -202,7 +193,7 @@ def test_captured_environment_never_lends_other_environment_its_cas(wire, asynch
             assert handle.environment == captured
         finally:
             await invoke(
-                client.aclose if isinstance(client, gf.AsyncClient) else client.close
+                client.aclose if isinstance(client, AsyncClient) else client.close
             )
 
     asyncio.run(run())
@@ -214,7 +205,7 @@ def test_error_code_is_not_an_untrusted_credential_echo():
         "Bearer fixture-secret",
         "UnpublishedCredentialValue",
     ):
-        with pytest.raises(gf.ServiceError) as error:
+        with pytest.raises(ServiceError) as error:
             response_value(
                 401,
                 json.dumps(
@@ -242,7 +233,7 @@ def test_printable_removes_terminal_escapes_and_controls(message, expected):
 @pytest.mark.parametrize("message", ["x" * 513, "", "\x00\u202e"])
 def test_response_value_falls_back_for_long_or_empty_printable_messages(message):
     raw = json.dumps({"error": {"code": "Forbidden", "message": message}}).encode()
-    with pytest.raises(gf.ServiceError) as error:
+    with pytest.raises(ServiceError) as error:
         response_value(403, raw)
     assert not isinstance(error.value, RelayedError)
     assert str(error.value) == "service rejected request"
@@ -275,7 +266,7 @@ def test_async_refuses_compressed_bodies_before_consuming_or_decoding():
             http_transport=httpx.MockTransport(handler),
         )
         try:
-            with pytest.raises(gf.ServiceError) as error:
+            with pytest.raises(ServiceError) as error:
                 await transport.send("GET", "/test", None, {})
             assert error.value.code == "ProtocolError" and stream.closed
         finally:
@@ -305,7 +296,7 @@ def test_async_snapshot_encoding_and_digest_do_not_block_event_loop(wire, monkey
     wire.expect("POST", "/snapshots")
 
     async def run():
-        async with gf.AsyncClient(
+        async with AsyncClient(
             wire.url, project="test", api_key="fixture-key"
         ) as client:
             assert (await client.upload_snapshot({"x": [1]}))["rows"] == 1

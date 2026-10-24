@@ -350,7 +350,16 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
     tracing::info!(%address, tls = config.tls.is_some(), "serving");
     if let Some((front, url, _)) = &front {
         front.start(shards.clone(), routes.clone()).await?;
-        ready(url);
+        let started = std::time::Instant::now();
+        let buckets = front.warm().await;
+        let programs = metrics.warm_compiles.get() + buckets as u64;
+        compiled(programs, started.elapsed().as_secs_f64());
+        let names: Vec<&str> = front
+            .models()
+            .iter()
+            .map(|served| served.name.as_str())
+            .collect();
+        ready(&names.join(", "), url);
     }
     let mut service = Service::new(shards.clone(), placement, metrics)
         .with_request_budget(config.request_bytes_in_flight)
@@ -396,17 +405,70 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
 
 /// Writes one NDJSON event on stdout, as `gf serve` reports its progress.
 /// Says the Models API is up: a status line on a terminal, else a JSON event.
-fn ready(url: &str) {
+fn ready(names: &str, url: &str) {
     if !std::io::stdout().is_terminal() {
         event(&serde_json::json!({"event": "ready", "url": url}));
         return;
     }
-    let (verb, stop) = (format!("{:>12}", "Serving"), "(Ctrl-C to stop)");
-    if std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()) {
-        println!("\x1b[1;32m{verb}\x1b[0m {url} \x1b[2m{stop}\x1b[0m");
-    } else {
-        println!("{verb} {url} {stop}");
+    status(
+        "Serving",
+        &format!("{names} at {url}"),
+        Some("(Ctrl-C to stop)"),
+    );
+}
+
+/// The `Compiled N programs in Xs` line, once the workers' recorded programs
+/// and the warm shape buckets are compiled.
+fn compiled(programs: u64, seconds: f64) {
+    if !std::io::stdout().is_terminal() {
+        event(&serde_json::json!({"event": "compiled", "programs": programs, "seconds": seconds}));
+        return;
     }
+    let noun = if programs == 1 { "program" } else { "programs" };
+    status(
+        "Compiled",
+        &format!("{} {noun} in {seconds:.1}s", thousands(programs)),
+        None,
+    );
+}
+
+/// The `Loading <model>` line for each model the front serves.
+fn loading(models: &[ServedModel]) {
+    if !std::io::stdout().is_terminal() {
+        return;
+    }
+    for served in models {
+        status("Loading", &served.resolved, None);
+    }
+}
+
+/// A status line: the past-tense verb right-aligned in twelve columns, a
+/// space, the message, and a quiet trailer if any.
+fn status(verb: &str, message: &str, trailer: Option<&str>) {
+    let verb = format!("{verb:>12}");
+    let colour = std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
+    let trailer = match (trailer, colour) {
+        (Some(trailer), true) => format!(" \x1b[2m{trailer}\x1b[0m"),
+        (Some(trailer), false) => format!(" {trailer}"),
+        (None, _) => String::new(),
+    };
+    if colour {
+        println!("\x1b[1;32m{verb}\x1b[0m {message}{trailer}");
+    } else {
+        println!("{verb} {message}{trailer}");
+    }
+}
+
+fn thousands(count: u64) -> String {
+    let digits = count.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 /// A JSON line for whatever launched this server; a person at a terminal
@@ -433,6 +495,7 @@ async fn listen_http(
         .map_err(|error| format!("{}: {error}", http.models.display()))?;
     let models: Vec<ServedModel> = serde_json::from_str(&text)
         .map_err(|error| format!("{}: {error}", http.models.display()))?;
+    loading(&models);
     let listener = tokio::net::TcpListener::bind(&http.listen)
         .await
         .map_err(|error| format!("cannot listen on {}: {error}", http.listen))?;

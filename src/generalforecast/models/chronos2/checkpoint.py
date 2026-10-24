@@ -42,7 +42,7 @@ class Published(NamedTuple):
 
 # The upstream revision the catalog's mirror was converted from.
 PUBLISHED = {
-    "chronos-2": Published(
+    "general-forecast/chronos-2": Published(
         "amazon/chronos-2", "29ec3766d36d6f73f0696f85560a422f50e8498c"
     ),
 }
@@ -101,7 +101,7 @@ def chronos2_checkpoint(name: str) -> Path:
     machines without internet. Otherwise it is kept under `~/.cache/generalforecast`.
 
     Args:
-        name: A catalog name, such as `chronos-2`.
+        name: A canonical id, such as `general-forecast/chronos-2`.
 
     Returns:
         A directory with `config.json` and `model.safetensors`.

@@ -31,11 +31,10 @@ import httpx
 from generalforecast._files import private_lock, read_private, write_private
 from generalforecast.deployments.boundary import MAX_BYTES, json_object
 from generalforecast.deployments.contracts import (
-    PUBLIC_ERROR_CODES,
+    WIRE_ERROR_CODES,
     ServiceError,
     name,
     number,
-    public_code,
     require,
 )
 
@@ -308,11 +307,11 @@ def connection(
     return settings.profile, settings.token
 
 
-PLATFORM_PROBE = "/v1alpha1/auth/status"
+PLATFORM_PROBE = "/v1/auth/status"
 _PORTABLE_ROUTES = (
-    ("GET", re.compile(r"/v1alpha1/projects/[^/]+/models(/[^/]+)?")),
-    ("POST", re.compile(r"/v1alpha1/projects/[^/]+/models/[^/]+/infer")),
-    ("POST", re.compile(r"/v1alpha1/projects/[^/]+/predictions")),
+    ("GET", re.compile(r"/v1/projects/[^/]+/models(/[^/]+)?")),
+    ("POST", re.compile(r"/v1/projects/[^/]+/models/[^/]+/infer")),
+    ("POST", re.compile(r"/v1/projects/[^/]+/predictions")),
 )
 
 
@@ -334,7 +333,7 @@ class HostedOnlyError(ServiceError):
 def hosted_only(method: str, path: str) -> bool:
     """True for versioned routes a standalone `gf serve` model server lacks."""
     route = path.split("?", 1)[0]
-    return route.startswith("/v1alpha1/") and not any(
+    return route.startswith("/v1/") and not any(
         method == verb and pattern.fullmatch(route)
         for verb, pattern in _PORTABLE_ROUTES
     )
@@ -358,6 +357,11 @@ def retryable(method: str, body: Any) -> bool:
     )
 
 
+_ERROR_KEYS = frozenset(
+    {"code", "message", "param", "hint", "limit", "actual", "request_id"}
+)
+
+
 def response_value(status: int, raw: bytes) -> dict[str, Any]:
     """Decodes bounded JSON, refusing credential forwarding and unsafe errors."""
     if 300 <= status < 400:
@@ -371,20 +375,42 @@ def response_value(status: int, raw: bytes) -> dict[str, Any]:
         detail = value.get("error")
         if (
             type(detail) is not dict
-            or set(detail) != {"code", "message"}
-            or any(type(v) is not str for v in detail.values())
+            or not {"code", "message"} <= set(detail)
+            or not set(detail) <= _ERROR_KEYS
+            or any(type(detail[key]) is not str for key in ("code", "message"))
+            or any(
+                type(detail.get(key, "")) is not str
+                for key in ("param", "hint", "request_id")
+            )
+            or any(
+                type(detail.get(key, 0)) not in (int, float)
+                for key in ("limit", "actual")
+            )
         ):
             raise ServiceError("ProtocolError", "invalid service error", status)
         message = printable(detail["message"]) if len(detail["message"]) <= 512 else ""
+        fields = {
+            key: (printable(value) if type(value) is str else value)
+            for key, value in detail.items()
+            if key not in ("code", "message") and value is not None
+        }
         if message:
-            raise RelayedError(public_code(detail["code"]), message, status)
-        raise ServiceError(
-            public_code(detail["code"]), "service rejected request", status
-        )
+            error: ServiceError = RelayedError(
+                _wire_code(detail["code"]), message, status
+            )
+        else:
+            error = ServiceError(
+                _wire_code(detail["code"]), "service rejected request", status
+            )
+        for key, value in fields.items():
+            setattr(error, key, value)
+        raise error
     return value
 
 
-SERVICE_ERROR_CODES = PUBLIC_ERROR_CODES
+def _wire_code(code: str) -> str:
+    """Classifies an untrusted remote code without echoing unknown values."""
+    return code if code in WIRE_ERROR_CODES else "RemoteError"
 
 
 def request_data(body: Any) -> bytes | None:
@@ -580,8 +606,7 @@ class Transport:
                 if (
                     not retryable(method, body)
                     or attempt == self.retries
-                    or error.code
-                    not in {"TransportError", "ModelUnavailable", "ServiceUnavailable"}
+                    or (error.code != "TransportError" and error.status != 503)
                 ):
                     raise
                 time.sleep(
@@ -814,12 +839,7 @@ class AsyncTransport:
                     if (
                         not retryable(method, body)
                         or attempt == self.retries
-                        or error.code
-                        not in {
-                            "TransportError",
-                            "ModelUnavailable",
-                            "ServiceUnavailable",
-                        }
+                        or (error.code != "TransportError" and error.status != 503)
                     ):
                         raise error
                     await asyncio.sleep(self.retry_delay * 2**attempt)

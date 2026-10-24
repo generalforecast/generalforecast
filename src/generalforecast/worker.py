@@ -1270,7 +1270,7 @@ class Worker:
     def _call(
         self,
         stage: str,
-        jobs: Sequence[tuple[int, tuple]],
+        work: Sequence[tuple[int, tuple]],
         consume: Callable[[int, Any], None] | None = None,
     ) -> list[Any]:
         """Runs one stage for many tables, vectorized over items that share a signature.
@@ -1280,7 +1280,7 @@ class Worker:
 
         Args:
             stage: `fit`, `embed`, `encode` or `decode`.
-            jobs: Per item, its table and its arguments after the model
+            work: Per item, its table and its arguments after the model
                 parameters; host arrays move to the device only with their call.
             consume: Takes each item's outputs as its call finishes, with the
                 item's position, instead of holding them all until the end.
@@ -1289,10 +1289,10 @@ class Worker:
             Each item's outputs, in order, or None for each with `consume`.
         """
         groups: dict[tuple, list[int]] = defaultdict(list)
-        for index, (table, arguments) in enumerate(jobs):
+        for index, (table, arguments) in enumerate(work):
             spec = self._tables[table]
             groups[(spec.model, spec.num_classes, _signature(arguments))].append(index)
-        results: list[Any] = [None] * len(jobs)
+        results: list[Any] = [None] * len(work)
 
         def keep(index: int, item: Any) -> None:
             if consume is None:
@@ -1302,7 +1302,7 @@ class Worker:
 
         for (model, num_classes, signature), indices in groups.items():
             key = (stage, model, num_classes, signature)
-            items = [jobs[index][1] for index in indices]
+            items = [work[index][1] for index in indices]
             self._call_alike(key, items, indices, keep)
         return results
 
@@ -1632,7 +1632,7 @@ class Worker:
         self, fits: Sequence[Fit], pages: Sequence[Page]
     ) -> dict[int, Representations]:
         """Fits tables, and splits the rows of fits that fill pages into them."""
-        jobs = [
+        work = [
             (
                 fit.table,
                 (
@@ -1648,14 +1648,14 @@ class Worker:
         fused = [index for index, fit in enumerate(fits) if fit.pages]
         alone = [index for index, fit in enumerate(fits) if not fit.pages]
         for index, state in zip(
-            alone, self._call("state", [jobs[index] for index in alone]), strict=True
+            alone, self._call("state", [work[index] for index in alone]), strict=True
         ):
             self._tables[fits[index].table].state = state
             self._warn_crowded(fits[index].table, state)
             self._warm(fits[index])
         filled: dict[int, Representations] = {}
         for index, (state, representations) in zip(
-            fused, self._call("fit", [jobs[index] for index in fused]), strict=True
+            fused, self._call("fit", [work[index] for index in fused]), strict=True
         ):
             fit = fits[index]
             self._tables[fit.table].state = state
@@ -1707,7 +1707,7 @@ class Worker:
         size: a page written a row at a time then embeds a few rows, or none.
         """
         found: dict[int, Representations] = {}
-        jobs: list[tuple[int, tuple]] = []
+        work: list[tuple[int, tuple]] = []
         embedding: list[tuple[int, list[int]]] = []
         partial: dict[int, Representations] = {}
         for index, page in enumerate(pages):
@@ -1729,12 +1729,12 @@ class Worker:
                 continue
             at_least = 1 if page.copies else self._tables[page.table].page_size
             features, targets, _ = self._padded(page.features, page.targets, at_least)
-            jobs.append(
+            work.append(
                 (page.table, (self._tables[page.table].state, features, targets))
             )
             embedding.append((index, missing))
         for (index, missing), representations in zip(
-            embedding, self._call("embed", jobs), strict=True
+            embedding, self._call("embed", work), strict=True
         ):
             page = pages[index]
             with self.stats.timed("fetch"):
@@ -1823,7 +1823,7 @@ class Worker:
             len(unit.rows) for unit in units if unit.action == "reuse"
         )
         joined = self._tables_rows(pages, computed) if waiting else {}
-        jobs: dict[str, list[tuple[int, tuple]]] = defaultdict(list)
+        work: dict[str, list[tuple[int, tuple]]] = defaultdict(list)
         group: dict[str, list[int]] = defaultdict(list)
         for index in waiting:
             unit = units[index]
@@ -1837,7 +1837,7 @@ class Worker:
                     unit.table, arguments, len(unit.rows), stage
                 )
                 continue
-            jobs[stage].append((unit.table, arguments))
+            work[stage].append((unit.table, arguments))
             group[stage].append(index)
 
         # Each context goes to its slots as its call finishes, so a step never
@@ -1864,7 +1864,7 @@ class Worker:
 
             return keep
 
-        for stage, items in jobs.items():
+        for stage, items in work.items():
             self._call(stage, items, consume=keeper(stage))
         return transient
 
@@ -2023,7 +2023,7 @@ class Worker:
         if not batches:
             return {}
         joined, parts = merged(batches)
-        jobs = []
+        work = []
         kept = []
         for batch, owned in zip(joined, parts, strict=True):
             unit = units[batch.units[0]]
@@ -2037,13 +2037,13 @@ class Worker:
             if self._defers(unit, arguments):
                 continue
             self._fits_device(unit)
-            jobs.append((batch.table, arguments))
+            work.append((batch.table, arguments))
             kept.append((batch, owned))
         predictions: dict[int, np.ndarray] = {}
         if self._stacks:
-            outputs = self._call("fit_decode", jobs)
+            outputs = self._call("fit_decode", work)
         else:
-            outputs = self._alone("fit_decode", jobs)
+            outputs = self._alone("fit_decode", work)
         for (batch, owned), (state, values) in zip(kept, outputs, strict=True):
             unit = units[batch.units[0]]
             self._tables[batch.table].state = state
@@ -2106,22 +2106,22 @@ class Worker:
             if self.announce is not None:
                 self.announce([name])
 
-    def _alone(self, stage: str, jobs: Sequence[tuple[int, tuple]]) -> list[Any]:
-        """Runs each job in a call of its own, up to a core's worth side by side.
+    def _alone(self, stage: str, work: Sequence[tuple[int, tuple]]) -> list[Any]:
+        """Runs each item in a call of its own, up to a core's worth side by side.
 
-        Outputs come back in the jobs' order. Every call ends before this
-        returns, and a failure raises the first failed job's error, as when
+        Outputs come back in the work' order. Every call ends before this
+        returns, and a failure raises the first failed item's error, as when
         they run in turn, so `run_apart` still fails only its table.
         """
-        if len(jobs) < 2 or self._side_by_side < 2:
-            return [self._call(stage, [job])[0] for job in jobs]
+        if len(work) < 2 or self._side_by_side < 2:
+            return [self._call(stage, [item])[0] for item in work]
         if self._alongside is None:
             self._alongside = ThreadPoolExecutor(
                 self._side_by_side, thread_name_prefix="gf-alone"
             )
         calls: list[Future[Any]] = [
-            self._alongside.submit(lambda job=job: self._call(stage, [job])[0])
-            for job in jobs
+            self._alongside.submit(lambda item=item: self._call(stage, [item])[0])
+            for item in work
         ]
         finished(calls)
         return [call.result() for call in calls]
@@ -2224,7 +2224,7 @@ class Worker:
             pass
 
     def _decode_dense(
-        self, jobs: list[_Dense], units: Sequence[Unit], transient: Transient
+        self, work: list[_Dense], units: Sequence[Unit], transient: Transient
     ) -> list[tuple[tuple[QueryBatch, list[int]], Any]]:
         """Decodes queries against units put off until now, a window of contexts at a time.
 
@@ -2234,30 +2234,30 @@ class Worker:
         outputs: list[tuple[tuple[QueryBatch, list[int]], Any]] = []
         window: list[_Dense] = []
         held = 0
-        for job in jobs:
-            window.append(job)
-            held += self._context_bytes(units[job.unit])
+        for item in work:
+            window.append(item)
+            held += self._context_bytes(units[item.unit])
             if held >= self._window_bytes:
                 outputs += self._decode_window(window, transient)
                 window, held = [], 0
         return outputs + self._decode_window(window, transient)
 
     def _decode_window(
-        self, jobs: list[_Dense], transient: Transient
+        self, work: list[_Dense], transient: Transient
     ) -> list[tuple[tuple[QueryBatch, list[int]], Any]]:
         """Decodes some dense queries, encoding the units they read first."""
-        encoded = self._encode_deferred([job.unit for job in jobs], transient)
+        encoded = self._encode_deferred([item.unit for item in work], transient)
         kinds: dict[tuple, list[_Dense]] = defaultdict(list)
-        for job in jobs:
-            table = self._tables[job.batch.table]
-            kinds["dense", table.model, table.num_classes, table.features].append(job)
+        for item in work:
+            table = self._tables[item.batch.table]
+            kinds["dense", table.model, table.num_classes, table.features].append(item)
         outputs: list[tuple[tuple[QueryBatch, list[int]], Any]] = []
         for key, same in kinds.items():
             outputs += self._decode_parts(key, same, encoded)
         return outputs
 
     def _decode_parts(
-        self, key: tuple, jobs: list[_Dense], encoded: dict[int, tuple[Any, Any]]
+        self, key: tuple, work: list[_Dense], encoded: dict[int, tuple[Any, Any]]
     ) -> list[tuple[tuple[QueryBatch, list[int]], Any]]:
         """Decodes dense queries of one model, task and width against their contexts.
 
@@ -2267,7 +2267,7 @@ class Worker:
         smallest chunk; later calls start at that size.
         """
         limit = self._chunks.parts(key)
-        parts = [part for job in jobs for part in job.split(limit)]
+        parts = [part for item in work for part in item.split(limit)]
         stages: dict[str, list[int]] = defaultdict(list)
         items: list[tuple[int, tuple]] = []
         for index, part in enumerate(parts):
@@ -2337,14 +2337,14 @@ class Worker:
             encoded[unit] = (state, cache)
         return encoded
 
-    def _staged(self, jobs: Sequence[tuple[str, int, tuple]]) -> list[Any]:
-        """Runs jobs of several stages, one `_call` per stage, with outputs in order."""
+    def _staged(self, work: Sequence[tuple[str, int, tuple]]) -> list[Any]:
+        """Runs work of several stages, one `_call` per stage, with outputs in order."""
         by_stage: dict[str, list[int]] = defaultdict(list)
-        for index, (stage, _, _) in enumerate(jobs):
+        for index, (stage, _, _) in enumerate(work):
             by_stage[stage].append(index)
-        outputs: list[Any] = [None] * len(jobs)
+        outputs: list[Any] = [None] * len(work)
         for stage, indices in by_stage.items():
-            done = self._call(stage, [jobs[index][1:] for index in indices])
+            done = self._call(stage, [work[index][1:] for index in indices])
             for index, output in zip(indices, done, strict=True):
                 outputs[index] = output
         return outputs

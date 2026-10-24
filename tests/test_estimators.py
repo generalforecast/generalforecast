@@ -16,6 +16,7 @@ from sklearn.exceptions import NotFittedError
 import generalforecast
 from generalforecast.models.tabicl.model import tabicl_functions
 from tests.models.tabicl.tiny import classifier, tiny_tabicl
+from tests.utils import engine_client
 
 LABELS = np.array(["cat", "dog", "fish"])
 
@@ -33,7 +34,7 @@ def test_classifiers_learn_their_classes_from_the_labels() -> None:
     estimator = generalforecast.Classifier(model).fit(features, labels)
     probabilities = estimator.predict_proba(features[:4])
 
-    table = generalforecast.local().create_table(
+    table = engine_client.local().create_table(
         "check", model=model, features=5, classes=3
     )
     table.insert(np.arange(32), features, np.arange(32) % 3)
@@ -63,9 +64,7 @@ def test_estimators_work_with_sklearn_tools() -> None:
     from sklearn.model_selection import cross_val_score
 
     features, labels = _data(48)
-    estimator = generalforecast.Classifier(
-        classifier(), strategy=generalforecast.Strategy.exact()
-    )
+    estimator = generalforecast.Classifier(classifier())
 
     copy = clone(estimator)
     scores = cross_val_score(estimator, features, labels, cv=2)
@@ -123,7 +122,7 @@ def test_frames_keep_their_string_and_datetime_columns() -> None:
 
     columns = {"store": "categorical", "day": "datetime", "x0": "numeric"}
     columns |= {"x1": "numeric", "x2": "numeric"}
-    table = generalforecast.local().create_table(
+    table = engine_client.local().create_table(
         "typed", model=model, columns=columns, classes=3
     )
     table.insert(np.arange(32), frame, np.unique(labels, return_inverse=True)[1])
@@ -143,7 +142,7 @@ def test_frames_keep_their_string_and_datetime_columns() -> None:
 def test_fitted_estimators_pickle_and_make_their_table_again() -> None:
     features, labels = _data()
     estimator = generalforecast.Classifier(
-        classifier(), client=generalforecast.local()
+        classifier(), client=engine_client.local()
     ).fit(features, labels)
 
     copy = pickle.loads(pickle.dumps(estimator))
@@ -172,7 +171,7 @@ def server(tmp_path: Path) -> Iterator[object]:
 @pytest.mark.server
 def test_estimators_fit_and_predict_on_a_server(server) -> None:
     features, labels = _data()
-    from tests.utils.legacy_client import connect
+    from tests.utils.engine_client import connect
 
     client = connect(f"grpc://127.0.0.1:{server.port}", token="secret")
 
@@ -205,11 +204,13 @@ def test_an_estimator_starts_loading_its_model_once_as_it_is_made(monkeypatch) -
             return model
 
     monkeypatch.setattr(estimators, "_loading", set())
-    monkeypatch.setattr(estimators, "_local", lambda allow_downloads: _Client())
+    monkeypatch.setattr(estimators, "_local", lambda download: _Client())
 
-    estimators.Classifier("tabicl-v2-classifier")
+    estimators.Classifier("general-forecast/tabicl-v2-classifier")
     assert done.wait(10)
-    estimators.Classifier("tabicl-v2-classifier")
-    estimators.Classifier("tabicl-v2-classifier", client=cast(Any, _Client()))
+    estimators.Classifier("general-forecast/tabicl-v2-classifier")
+    estimators.Classifier(
+        "general-forecast/tabicl-v2-classifier", client=cast(Any, _Client())
+    )
 
     assert loaded == ["tabicl-v2-classifier"]
