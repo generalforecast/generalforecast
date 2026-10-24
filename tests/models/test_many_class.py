@@ -11,11 +11,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import generalforecast
 from generalforecast.models import registry
 from generalforecast.models.many_class import ManyClass, codebook, many_class_functions
 from generalforecast.models.tabicl.model import tabicl_functions
 from tests.models.tabicl.tiny import CLASS_SLOTS, tiny_tabicl
+from tests.utils.engine_client import local
 from tests.utils.predict import predict
 
 
@@ -61,7 +61,7 @@ def test_tables_with_more_classes_than_slots_predict_every_class() -> None:
         )
     # A table the codes cannot serve is refused when it is created.
     with pytest.raises(ValueError, match="more codes"):
-        generalforecast.local().create_table(
+        local().create_table(
             "t", model="tests.models.tabicl.tiny:classifier@1", features=4, classes=25
         )
     for spec in ("classifier@0", "classifier@8@4"):

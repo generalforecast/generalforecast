@@ -10,9 +10,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from generalforecast.deployments.package_runtime import PackageExecutor
-from generalforecast.deployments.package_runtime.forecast import ForecastContext
-from generalforecast.packages import Package, PackageLock
+from generalforecast.deployments.predictor_runtime import PredictorExecutor
+from generalforecast.deployments.predictor_runtime.compile import compile_dir
+from generalforecast.deployments.predictor_runtime.forecast import ForecastContext
+from generalforecast.deployments.predictor_runtime.lock import ExecutionLock
 from tests.product_runtime.test_executor import checked
 
 pytestmark = pytest.mark.slow
@@ -29,17 +30,19 @@ def test_real_tabicl_prepare_predict_and_isolated_patch(tmp_path, task):
             else [float(i * 2) for i in range(8)],
         }
     )
-    package = checked(
+    locked = checked(
         tmp_path / "first",
         context,
         id="id",
-        model="tabicl-classifier" if task == "classification" else "tabicl-regressor",
+        model="general-forecast/tabicl-v2-classifier"
+        if task == "classification"
+        else "tabicl-regressor",
         outputs=["label", "probabilities"]
         if task == "classification"
         else ["value", "quantiles"],
     )
-    executor = PackageExecutor()
-    old = executor.prepare(package.lock, context)
+    executor = PredictorExecutor()
+    old = executor.prepare(locked, context)
     q = pa.table({"id": ["query"], "x": [1.5]})
     before = old.predict(q)
     assert before["id"].to_pylist() == ["query"]
@@ -56,8 +59,8 @@ def test_real_tabicl_prepare_predict_and_isolated_patch(tmp_path, task):
         tmp_path / "patch",
         changed,
         id="id",
-        model=package.spec.model,
-        outputs=list(package.lock.outputs),
+        model=locked.spec.model,
+        outputs=list(locked.outputs),
     )
     patched = executor.prepare(second.lock, changed)
     assert patched.predict(q).to_pylist() != before.to_pylist()
@@ -79,10 +82,10 @@ def test_real_grouped_chronos_known_future_and_production_isolation(tmp_path):
             for i in range(16)
         ]
     )
-    package = checked(
+    locked = checked(
         tmp_path,
         context,
-        model="chronos-2",
+        model="general-forecast/chronos-2",
         id="id",
         time="time",
         series=["series"],
@@ -93,7 +96,7 @@ def test_real_grouped_chronos_known_future_and_production_isolation(tmp_path):
         outputs=["value", "quantiles"],
         quantiles=[0.1, 0.5, 0.9],
     )
-    old = PackageExecutor().prepare(package.lock, context)
+    old = PredictorExecutor().prepare(locked, context)
     queries = pa.Table.from_pylist(
         [
             {"id": f"q-{s}-{i}", "series": s, "time": i, "promo": float(i % 2)}
@@ -119,11 +122,11 @@ def test_real_schema_free_request_multiclass_categories_and_datetime(tmp_path):
             "y": ["low", "medium", "high"] * 3,
         }
     )
-    package = checked(tmp_path, context, context="request", id="id")
-    package = Package.load(tmp_path).check(write=False, upgrade=True)
-    assert isinstance(package.lock, PackageLock)
-    assert package.lock.schema.columns == ()
-    prepared = PackageExecutor().prepare(package.lock, None)
+    checked(tmp_path, context, context="request", id="id")
+    lock = compile_dir(tmp_path, upgrade=True)
+    assert isinstance(lock, ExecutionLock)
+    assert lock.schema.columns == ()
+    prepared = PredictorExecutor().prepare(lock, None)
     queries = pa.table(
         {
             "id": ["known", "unseen"],
@@ -154,16 +157,16 @@ def test_real_grouped_forecast_overlapping_covariates_follow_native_channels(tmp
             for i in range(16)
         ]
     )
-    package = checked(
+    locked = checked(
         tmp_path,
         context,
-        model="chronos-2",
+        model="general-forecast/chronos-2",
         time="time",
         series=["series"],
         horizon=2,
         future_inputs=["driver", "zz"],
     )
-    prepared = PackageExecutor().prepare(package.lock, context)
+    prepared = PredictorExecutor().prepare(locked, context)
     assert isinstance(prepared._context, ForecastContext)
     overlap = replace(
         prepared.lock, spec=replace(prepared.lock.spec, past_inputs=("driver",))
@@ -190,15 +193,15 @@ def test_real_forecast_date_axis_preserves_out_of_order_rows(tmp_path):
             "y": [float(i) for i in range(16)],
         }
     )
-    package = checked(
+    locked = checked(
         tmp_path,
         context,
-        model="chronos-2",
+        model="general-forecast/chronos-2",
         time="time",
         horizon=2,
         frequency="1d",
     )
-    prepared = PackageExecutor().prepare(package.lock, context)
+    prepared = PredictorExecutor().prepare(locked, context)
     queries = pa.table(
         {"time": [datetime.date(2026, 1, 18), datetime.date(2026, 1, 17)]}
     )

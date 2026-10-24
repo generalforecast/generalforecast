@@ -19,7 +19,7 @@ pa = pytest.importorskip("pyarrow")
 
 from pyarrow import flight
 
-from tests.utils import legacy_client as generalforecast
+from tests.utils import engine_client as generalforecast
 from tests.utils.server import NEAR_A, Server, build
 
 NEAR_B = np.full((2, 5), 10.0, dtype=np.float32)

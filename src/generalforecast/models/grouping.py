@@ -4,7 +4,7 @@
 """Forecast times as `gf_core::request` takes them, shared by every forecast surface.
 
 `gf_core::request` aligns a query's related series and covariates into its
-group; packages read their context's times as integer periods or UTC seconds
+group; predictors read their context's times as integer periods or UTC seconds
 here first.
 """
 

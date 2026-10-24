@@ -16,7 +16,7 @@ import time
 
 import numpy as np
 
-import generalforecast
+from tests.utils.engine_client import LocalClient
 
 
 def main() -> None:
@@ -24,9 +24,9 @@ def main() -> None:
     features = generator.normal(size=(256, 8)).astype(np.float32)
     labels = (features[:, 0] + features[:, 1] > 0).astype(np.float32)
     started = time.perf_counter()
-    client = generalforecast.LocalClient()
+    client = LocalClient()
     table = client.create_table(
-        "bench", model="tabicl-classifier", features=8, classes=2
+        "bench", model="general-forecast/tabicl-v2-classifier", features=8, classes=2
     )
     table.insert(np.arange(256), features, labels)
     table.predict(generator.normal(size=(32, 8)).astype(np.float32))

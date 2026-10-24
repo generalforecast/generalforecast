@@ -5,9 +5,9 @@
 //! publishes them, and the metrics their predictions report back to it.
 //!
 //! An environment resolves to its revision for a few seconds at a time, so
-//! a promote or rollback is seen within that window. A revision's package
+//! a promote or rollback is seen within that window. A revision's predictor
 //! is held in a byte-budgeted LRU that also drops what sat idle; its rows
-//! bind through `gf_core::package` into the same ephemeral tables, under the
+//! bind through `gf_core::predictor` into the same ephemeral tables, under the
 //! same budget, as a request's own context.
 
 use std::collections::HashMap;
@@ -37,25 +37,22 @@ pub struct Resolved {
     pub context_version: Option<Value>,
 }
 
-/// A revision's locked package, as the control plane publishes it.
+/// A revision's locked predictor, as the control plane publishes it.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
 pub enum Published {
-    /// A catalog package gf-server binds and predicts itself.
+    /// A catalog predictor gf-server binds and predicts itself.
     Native {
-        /// The package as `gf serve` would serve it.
+        /// The predictor as `gf serve` would serve it.
         served: Box<ServedModel>,
         /// The context version a bound context reports, as the control
         /// plane captured it.
         #[serde(default)]
         context: Option<Value>,
-        /// The bound context's rows; None for a request-context package.
+        /// The bound context's rows; None for a request-context predictor.
         #[serde(default)]
         rows: Option<Vec<Value>>,
     },
-    /// A Python package, which only the control plane's isolated runtime
-    /// may execute.
-    Python {},
 }
 
 /// One prediction, as the control plane's metrics and events count it.
@@ -72,9 +69,9 @@ pub struct Record {
 /// How [`Revisions`] reaches the control plane and what it holds.
 #[derive(Clone, Debug)]
 pub struct Limits {
-    /// Bytes of published packages held at once.
+    /// Bytes of published predictors held at once.
     pub bytes: usize,
-    /// How long a package nobody predicted from is held.
+    /// How long a predictor nobody predicted from is held.
     pub idle: Duration,
     /// How long an environment's revision is trusted before it is asked again.
     pub resolve: Duration,
@@ -82,7 +79,7 @@ pub struct Limits {
     pub timeout: Duration,
 }
 
-/// A held package: project, deployment, revision and context version.
+/// A held predictor: project, deployment, revision and context version.
 type Key = (String, String, u64, String);
 /// An environment: project, deployment and name.
 type Environment = (String, String, String);
@@ -116,7 +113,7 @@ impl Cache {
     }
 
     /// Drops what sat idle, then the least recently used, until `incoming`
-    /// fits; a package larger than the whole budget is served unheld.
+    /// fits; a predictor larger than the whole budget is served unheld.
     fn insert(&mut self, key: Key, entry: Entry, limits: &Limits, now: Instant) {
         let idle: Vec<Key> = self
             .entries
@@ -188,7 +185,7 @@ impl Revisions {
         let (records, pending) = mpsc::channel(4 * BATCH);
         tokio::spawn(report(
             client.clone(),
-            format!("{origin}/internal/v1alpha1/predictions:record"),
+            format!("{origin}/internal/v1/predictions:record"),
             token.clone(),
             pending,
         ));
@@ -204,13 +201,13 @@ impl Revisions {
         })
     }
 
-    /// How many packages were fetched from the control plane so far.
+    /// How many predictors were fetched from the control plane so far.
     #[must_use]
     pub fn loads(&self) -> u64 {
         self.loads.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// The packages held, and their bytes.
+    /// The predictors held, and their bytes.
     ///
     /// # Panics
     ///
@@ -225,7 +222,7 @@ impl Revisions {
     ///
     /// # Errors
     ///
-    /// The control plane's own refusal, or `RuntimeUnavailable`.
+    /// The control plane's own refusal, or `ModelNotReady`.
     ///
     /// # Panics
     ///
@@ -249,7 +246,7 @@ impl Revisions {
         }
         let resolved: Resolved = self
             .get(&format!(
-                "/internal/v1alpha1/projects/{project}/deployments/{deployment}/environments/{environment}:revision"
+                "/internal/v1/projects/{project}/predictors/{deployment}/environments/{environment}:revision"
             ))
             .await?;
         let mut held = self.resolved.lock().expect("resolved");
@@ -258,12 +255,12 @@ impl Revisions {
         Ok(resolved)
     }
 
-    /// A revision's published package, fetched on a miss. `version` is the
+    /// A revision's published predictor, fetched on a miss. `version` is the
     /// context version its environment resolved to, if a route named one.
     ///
     /// # Errors
     ///
-    /// The control plane's own refusal, or `RuntimeUnavailable`.
+    /// The control plane's own refusal, or `ModelNotReady`.
     ///
     /// # Panics
     ///
@@ -291,7 +288,7 @@ impl Revisions {
         }
         let (published, bytes): (Published, usize) = self
             .fetch(&format!(
-                "/internal/v1alpha1/projects/{project}/deployments/{deployment}/revisions/{revision}:package"
+                "/internal/v1/projects/{project}/predictors/{deployment}/revisions/{revision}:lock"
             ))
             .await?;
         self.loads
@@ -314,34 +311,6 @@ impl Revisions {
             now,
         );
         Ok(published)
-    }
-
-    /// A Python revision's prediction, from the isolated runtime the control
-    /// plane executes it in.
-    ///
-    /// # Errors
-    ///
-    /// The control plane's own refusal, or `RuntimeUnavailable`.
-    pub async fn execute(
-        &self,
-        project: &str,
-        deployment: &str,
-        revision: u64,
-        environment: Option<&str>,
-        payload: &Value,
-    ) -> Result<Value, ApiError> {
-        let answer = self
-            .client
-            .post(format!(
-                "{}/internal/v1alpha1/projects/{project}/deployments/{deployment}/revisions/{revision}:execute",
-                self.origin
-            ))
-            .bearer_auth(&self.token)
-            .json(&json!({"environment": environment, "payload": payload}))
-            .send()
-            .await;
-        let (answer, _): (Executed, usize) = self.read(answer).await?;
-        Ok(answer.result)
     }
 
     /// Counts one prediction for the control plane, off the request's path;
@@ -367,13 +336,12 @@ impl Revisions {
     }
 
     /// A control-plane answer, its refusals kept and everything else
-    /// `RuntimeUnavailable`.
+    /// `ModelNotReady`.
     async fn read<T: DeserializeOwned>(
         &self,
         answer: reqwest::Result<reqwest::Response>,
     ) -> Result<(T, usize), ApiError> {
-        let unavailable =
-            || ApiError::new("RuntimeUnavailable", "control plane is unavailable", 503);
+        let unavailable = || ApiError::new("ModelNotReady", "control plane is unavailable", 503);
         let mut answer = answer.map_err(|error| {
             tracing::warn!(%error, "control plane call failed");
             unavailable()
@@ -408,11 +376,6 @@ impl Revisions {
     }
 }
 
-#[derive(Deserialize)]
-struct Executed {
-    result: Value,
-}
-
 /// Sends records in batches until the front is dropped.
 async fn report(
     client: reqwest::Client,
@@ -443,7 +406,20 @@ mod tests {
 
     fn entry(bytes: usize, used: Instant) -> Entry {
         Entry {
-            published: std::sync::Arc::new(Published::Python {}),
+            published: std::sync::Arc::new(
+                serde_json::from_value(json!({
+                    "kind": "native",
+                    "served": {
+                        "name": "churn",
+                        "reference": "general-forecast/tabicl-v2-classifier",
+                        "worker": "churn",
+                        "resolved": "general-forecast/tabicl-v2-classifier",
+                        "outputs": [],
+                        "description": {},
+                    },
+                }))
+                .expect("a native published revision"),
+            ),
             bytes,
             used,
             stale: None,

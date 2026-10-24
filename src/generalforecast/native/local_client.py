@@ -45,7 +45,7 @@ class LocalClient(RemoteClient):
         disk_bytes: int = 0,
         step_bytes: int | None = None,
         eviction: Literal["gdsf", "lru"] = "gdsf",
-        allow_downloads: bool = False,
+        allow_downloads: bool = True,
     ) -> None:
         """Connects to the process's engine, or starts one with other memory.
 
@@ -112,7 +112,7 @@ class LocalClient(RemoteClient):
         These are the built-in models, which load on first use, and any other
         spec loaded so far.
         """
-        built_in = {entry.repository_id for entry in entries()}
+        built_in = {entry.id for entry in entries()}
         return sorted(
             {_catalog_name(name) for name in built_in | set(super().models())}
         )
@@ -123,9 +123,9 @@ class LocalClient(RemoteClient):
         if not isinstance(model, str):
             raise TypeError(
                 "LocalClient runs models in the engine's workers; give a model "
-                "spec, such as 'tabicl-classifier' or 'package.module:function'"
+                "spec, such as 'general-forecast/tabicl-v2-classifier'"
             )
-        return self._engine.load(parse(model, trusted=True))
+        return self._engine.load(parse(model))
 
 
 def local(**options: Any) -> LocalClient:
@@ -136,6 +136,6 @@ def local(**options: Any) -> LocalClient:
 def _catalog_name(model: str) -> str:
     """A model's catalog name, as tables name it; other specs as given."""
     try:
-        return str(parse(model, trusted=True))
+        return str(parse(model))
     except ModelRefError:
         return model

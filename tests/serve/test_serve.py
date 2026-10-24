@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""`gf serve`, which runs gf-server's Models API over a catalog model or a locked package."""
+"""`gf serve`, which runs gf-server's Models API over a catalog model or a locked predictor."""
 
 import json
 import os
@@ -13,22 +13,20 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pyarrow as pa
 import pytest
 import yaml
 
-from generalforecast.client import Client
 from generalforecast.deployments.boundary import Scope
 from generalforecast.deployments.catalog import CatalogService
-from generalforecast.packages import Package
-from generalforecast.packages.validation import PackageError
+from generalforecast.predictors.validation import PredictorError
 from generalforecast.serve.models import served
 from generalforecast.tabular import arrow_bytes
 
 ROOT = Path(__file__).resolve().parents[2]
+MODEL = "general-forecast/tabicl-v2-classifier"
 KEY = "gf-serve-test-key"
 CLEAN = (
     "GF_MICROSOFT_CLIENT_SECRET",
@@ -44,12 +42,12 @@ def _port() -> int:
         return probe.getsockname()[1]
 
 
-def envelope(resource, payload, *, project="local", request_id="r-test"):
+def envelope(resource, payload, *, project="local", request_id="r-test", kind="model"):
     return {
-        "api_version": "gf/v1alpha1",
+        "api_version": "gf/v1",
         "project": project,
         "request_id": request_id,
-        "resource": {"kind": "model", "name": resource},
+        "resource": {"kind": kind, "name": resource},
         "payload": payload,
     }
 
@@ -66,21 +64,6 @@ def call(url, path, body=None, *, key=None, headers=None):
             return response.status, json.loads(response.read())
     except urllib.error.HTTPError as error:
         return error.code, json.loads(error.read())
-
-
-def infer_payload(**changes):
-    return {
-        "model": "tabicl-classifier",
-        "task": "classification",
-        "target": "y",
-        "features": ["x"],
-        "context": [
-            {"key": "c1", "features": {"x": 0.0}, "label": False},
-            {"key": "c2", "features": {"x": 3.0}, "label": True},
-        ],
-        "queries": [{"key": "q", "features": {"x": 1.5}}],
-        "options": {},
-    } | changes
 
 
 def _start(arguments, *, env=None):
@@ -115,14 +98,12 @@ def _event(process, expected):
 @pytest.fixture(scope="module")
 def server():
     port = _port()
-    process = _start(
-        ["tabicl-classifier", "--port", str(port)], env={"GF_API_KEY": KEY}
-    )
+    process = _start([MODEL, "--port", str(port)], env={"GF_API_KEY": KEY})
     serving = _event(process, "serving")
     assert serving == {
         "event": "serving",
         "url": f"http://127.0.0.1:{port}",
-        "models": ["tabicl-v2-classifier"],
+        "models": ["general-forecast/tabicl-v2-classifier"],
         "auth": "bearer",
     }
     _event(process, "ready")
@@ -137,74 +118,123 @@ def test_serve_answers_the_hosted_models_api(server):
     url, _ = server
     hosted = CatalogService(allow_downloads=True)
     scope = Scope("local", "r-test")
-    assert call(url, "/livez") == (200, {"live": True})
-    assert call(url, "/readyz") == (200, {"ready": True})
-    status, body = call(url, "/v1alpha1/projects/local/models", key=KEY)
+    assert call(url, "/livez") == (200, {"status": "ok"})
+    assert call(url, "/readyz") == (200, {"status": "ok"})
+    assert call(url, "/healthz") == (200, {"status": "ok"})
+    status, body = call(url, "/v1/projects/local/models", key=KEY)
     assert status == 200
-    assert body["result"] == {"models": [hosted.get(scope, "tabicl-classifier")]}
-    path = "/v1alpha1/projects/local/models/tabicl-v2-classifier/infer"
-    status, body = call(
-        url, path, envelope("tabicl-v2-classifier", infer_payload()), key=KEY
-    )
-    assert status == 200, body
-    expected = hosted.infer(scope, infer_payload())
-    got = body["result"]
-    assert {k: v for k, v in got.items() if k != "outputs"} == {
-        k: v for k, v in expected.items() if k != "outputs"
+    [described] = body["result"]["models"]
+    extras = {"model", "limits", "warm_shapes"}
+    assert {k: v for k, v in described.items() if k not in extras} == {
+        k: v
+        for k, v in hosted.get(scope, "general-forecast/tabicl-v2-classifier").items()
+        if k not in extras
     }
-    [output] = got["outputs"]
-    [reference] = expected["outputs"]
-    assert output["key"] == "q"
-    for label, probability in reference["probabilities"].items():
-        assert output["probabilities"][label] == pytest.approx(probability, abs=1e-3)
+    assert described["model"].startswith(f"{MODEL}@sha256:")
+    assert set(described["limits"]) == {"context_rows", "queries", "inputs"}
+    assert [shape["context_rows"] for shape in described["warm_shapes"]] == [
+        100,
+        1_000,
+        10_000,
+    ]
 
 
 @pytest.mark.slow
 def test_serve_requires_its_key_and_keeps_the_api_errors(server):
     url, _ = server
-    status, body = call(url, "/v1alpha1/projects/local/models")
+    status, body = call(url, "/v1/projects/local/models")
     assert (status, body["error"]["message"]) == (401, "application bearer required")
-    status, body = call(url, "/v1alpha1/projects/local/models/other", key=KEY)
-    assert (status, body["error"]["code"]) == (404, "ModelNotFound")
-    path = "/v1alpha1/projects/local/models/tabicl-v2-classifier/infer"
-    payload = infer_payload(task="regression")
-    status, body = call(url, path, envelope("tabicl-v2-classifier", payload), key=KEY)
-    assert (status, body["error"]["code"]) == (422, "UnsupportedTask")
+    status, body = call(url, "/v1/projects/local/models/other", key=KEY)
+    assert (status, body["error"]["code"]) == (404, "NotFound")
     assert body["request_id"] == "r-test"
 
 
-@pytest.mark.slow
-def test_sdk_client_and_predictions_work_against_gf_serve(server):
-    url, _ = server
-    client = Client(base_url=url, api_key=KEY)
-    [described] = client.models.list()
-    assert described["name"] == "tabicl-v2-classifier"
-    payload = {
-        "model": "tabicl-classifier",
-        "task": "classification",
+def adhoc_payload(**changes):
+    return {
+        "model": MODEL,
         "target": "y",
-        "features": ["x"],
+        "inputs": ["x"],
+        "id": "id",
         "context": [{"x": 0.0, "y": False}, {"x": 3.0, "y": True}],
         "queries": [{"id": "a", "x": 1.5}],
-        "options": {"id": "id"},
-    }
-    status, body = call(
-        url,
-        "/v1alpha1/projects/local/predictions",
-        envelope("predictions", payload),
-        key=KEY,
+    } | changes
+
+
+def predict(url, payload):
+    return call(
+        url, "/v1/projects/local/predict", envelope("predict", payload), key=KEY
     )
+
+
+@pytest.mark.slow
+def test_the_ad_hoc_route_predicts_and_names_what_it_refuses(server):
+    url, _ = server
+    status, body = predict(url, adhoc_payload())
     assert status == 200, body
     [row] = body["result"]["predictions"]
     assert row["id"] == "a" and type(row["label"]) is bool
     assert set(row["probabilities"]) == {"false", "true"}
     assert body["result"]["context"]["rows"] == 2
+    assert body["result"]["context"]["kind"] == "request"
+    assert body["result"]["model"].startswith(f"{MODEL}@sha256:")
+    status, body = predict(url, adhoc_payload(model="tabicl-v2-classifier"))
+    assert status == 422, body
+    assert body["error"]["param"] == "model"
+    assert body["error"]["hint"] == f"use {MODEL}"
+    for field, value in [
+        ("task", "classification"),
+        ("options", {}),
+        ("features", ["x"]),
+    ]:
+        status, body = predict(url, adhoc_payload(**{field: value}))
+        assert (status, body["error"]["param"]) == (422, field), body
+    status, body = predict(
+        url, adhoc_payload(context=[{"x": "low", "y": False}, {"x": 3.0, "y": True}])
+    )
+    assert status == 422
+    assert body["error"]["message"] == (
+        "column x has text values; this route takes numeric inputs"
+    )
+    assert body["error"]["param"] == "inputs.x"
+    status, body = predict(url, adhoc_payload(queries=[{"x": 1.5}] * 10_001))
+    assert status == 422
+    assert body["error"]["code"] == "CapacityExceeded"
+    assert body["error"]["actual"] == 10_001 and body["error"]["limit"] <= 10_000
+    assert "general-forecast/tabicl-v2-classifier" in body["error"]["message"]
+    status, body = call(
+        url,
+        "/v1/projects/local/predictions",
+        envelope("predictions", adhoc_payload()),
+        key=KEY,
+    )
+    assert status == 404
+
+
+@pytest.mark.slow
+def test_ten_thousand_context_rows_are_answered(server):
+    url, _ = server
+    rng = random.Random(0)
+    context = [
+        {"a": rng.random(), "b": rng.random(), "y": rng.randint(0, 1)}
+        for _ in range(10_000)
+    ]
+    payload = adhoc_payload(
+        inputs=["a", "b"], id=None, context=context, queries=[{"a": 0.5, "b": 0.5}]
+    )
+    del payload["id"]
+    started = time.perf_counter()
+    status, body = predict(url, payload)
+    assert status == 200, body
+    assert time.perf_counter() - started < 120
+    assert body["result"]["context"]["rows"] == 10_000
+    [row] = body["result"]["predictions"]
+    assert set(row["probabilities"]) == {"0", "1"}
 
 
 @pytest.mark.slow
 def test_public_bind_without_a_key_warns():
     port = _port()
-    process = _start(["tabicl-classifier", "--host", "0.0.0.0", "--port", str(port)])
+    process = _start([MODEL, "--host", "0.0.0.0", "--port", str(port)])
     try:
         _event(process, "serving")
         warning = process.stderr.readline()
@@ -235,7 +265,7 @@ def test_unservable_targets_fail_before_listening(tmp_path):
     assert result.returncode == 1
     assert (
         json.loads(result.stderr.strip().splitlines()[-1])["error"]["code"]
-        == "ModelNotFound"
+        == "NotFound"
     )
 
 
@@ -249,51 +279,71 @@ def history():
     )
 
 
+def lock(name, context, **predictor):
+    """A version-1 `gf.lock` as `gf check` writes it, by hand."""
+    return {
+        "lock_version": 1,
+        "predictor": {
+            "name": name,
+            "model": MODEL,
+            "target": "y",
+            "target_type": "bool",
+            "classes": [False, True],
+            "inputs": [{"name": "x", "type": "float"}],
+            "context": context,
+            "selection": {"core": None, "neighbors": 0, "kind": "stratified"},
+            **predictor,
+        },
+        "model": {"files": {}},
+    }
+
+
 @pytest.fixture
-def package(tmp_path):
+def predictor_dir(tmp_path):
     root = tmp_path / "churn"
     root.mkdir()
-    spec = {
-        "name": "churn",
-        "model": "tabicl-classifier",
-        "context": "history.arrow",
-        "target": "y",
-        "id": "id",
-    }
-    (root / "gf.yaml").write_text(yaml.safe_dump(spec))
+    (root / "gf.yaml").write_text(
+        yaml.safe_dump({"name": "churn", "model": MODEL, "target": "y", "id": "id"})
+    )
+    (root / "gf.lock").write_text(
+        yaml.safe_dump(
+            lock(
+                "churn",
+                {
+                    "kind": "snapshot",
+                    "path": "history.arrow",
+                    "rows": 4,
+                    "digest": "sha256:history",
+                },
+                id="id",
+            )
+        )
+    )
     (root / "history.arrow").write_bytes(arrow_bytes(history()))
-    Package.load(root).check()
     return root
 
 
 @pytest.fixture
 def lone_lock(tmp_path):
-    root = tmp_path / "request"
-    root.mkdir()
-    spec = {
-        "name": "scorer",
-        "model": "tabicl-classifier",
-        "context": "request",
-        "target": "y",
-    }
-    (root / "gf.yaml").write_text(yaml.safe_dump(spec))
-    Package.load(root).check(data=history().drop(["id"]))
     lone = tmp_path / "elsewhere"
     lone.mkdir()
-    (lone / "gf.lock").write_bytes((root / "gf.lock").read_bytes())
+    (lone / "gf.lock").write_text(
+        yaml.safe_dump(lock("scorer", {"kind": "request", "digest": None}))
+    )
     return lone / "gf.lock"
 
 
-def predictions_payload(**changes):
-    return {
-        "model": "churn",
-        "task": "classification",
-        "target": "y",
-        "features": ["x"],
-        "context": [],
-        "queries": [{"id": "q", "x": 1.5}],
-        "options": {},
-    } | changes
+def predictor_payload(**changes):
+    return {"queries": [{"id": "q", "x": 1.5}]} | changes
+
+
+def predictor_predict(url, name, payload, project="local"):
+    return call(
+        url,
+        f"/v1/projects/{project}/predictors/{name}/predict",
+        envelope(name, payload, project=project, kind="predictor"),
+        key=KEY,
+    )
 
 
 def _serving(target):
@@ -311,27 +361,29 @@ def _stop(process):
 
 
 @pytest.mark.slow
-def test_snapshot_package_binds_once_and_answers_predictions(package):
-    url, process = _serving(package)
+def test_snapshot_predictor_binds_once_and_answers_predictions(predictor_dir):
+    url, process = _serving(predictor_dir)
     try:
-        status, body = call(url, "/v1alpha1/projects/local/models", key=KEY)
+        status, body = call(url, "/v1/projects/local/models", key=KEY)
+        assert status == 200 and body["result"] == {"models": []}
+        status, body = call(url, "/v1/projects/local/predictors", key=KEY)
         assert status == 200
-        [described] = body["result"]["models"]
-        assert described["name"] == "churn" and described["kind"] == "package"
-        assert described["features"] == ["x"] and described["context_rows"] == 4
-        assert described["context"] == "snapshot"
-        status, body = call(url, "/v1alpha1/projects/team-a/models/churn", key=KEY)
+        [described] = body["result"]["predictors"]
+        assert described["name"] == "churn" and described["inputs"] == ["x"]
+        assert described["model"].startswith(f"{MODEL}@sha256:")
+        assert described["context"] == {
+            "kind": "snapshot",
+            "rows": 4,
+            "digest": "sha256:history",
+        }
+        assert described["lock_digest"].startswith("sha256:")
+        status, body = call(url, "/v1/projects/team-a/predictors/churn", key=KEY)
         assert status == 200 and body["result"] == described
-        status, body = call(
+        assert body["resource"] == {"kind": "predictor", "name": "churn"}
+        status, body = predictor_predict(
             url,
-            "/v1alpha1/projects/local/predictions",
-            envelope(
-                "predictions",
-                predictions_payload(
-                    queries=[{"id": "q", "x": 2.9}, {"id": "r", "x": 0.1}]
-                ),
-            ),
-            key=KEY,
+            "churn",
+            predictor_payload(queries=[{"id": "q", "x": 2.9}, {"id": "r", "x": 0.1}]),
         )
         assert status == 200, body
         result = body["result"]
@@ -339,34 +391,35 @@ def test_snapshot_package_binds_once_and_answers_predictions(package):
         assert [row["label"] for row in result["predictions"]] == [True, False]
         assert set(result["predictions"][0]["probabilities"]) == {"false", "true"}
         assert result["task"] == "classification"
-        assert result["context"]["source"] == "snapshot"
+        assert result["context"]["kind"] == "snapshot"
         assert result["context"]["rows"] == 4
-        lock = Package.load(package).lock
-        assert lock is not None
-        assert result["context"]["version"] == lock.data_digest
+        assert result["context"]["digest"] == "sha256:history"
+        assert result["model"].startswith(f"{MODEL}@sha256:")
         status, body = call(
             url,
-            "/v1alpha1/projects/local/models/churn/infer",
-            envelope("churn", predictions_payload()),
+            "/v1/projects/local/models/churn/infer",
+            envelope("churn", predictor_payload()),
             key=KEY,
         )
-        assert status == 422 and body["error"]["code"] == "UnsupportedCapability"
-        for change, code in [
-            ({"target": "z"}, "ValidationError"),
-            ({"features": ["x", "w"]}, "ValidationError"),
-            ({"task": "regression"}, "UnsupportedTask"),
-            ({"options": {"quantiles": [0.5]}}, "ValidationError"),
-            ({"context": [{"x": 1.0, "y": True}]}, "ValidationError"),
-            ({"queries": []}, "ValidationError"),
-            ({"queries": [{"id": "q", "x": "high"}]}, "ValidationError"),
+        assert status == 422 and body["error"]["code"] == "ValidationError"
+        for change, param in [
+            ({"target": "z"}, "target"),
+            ({"inputs": ["x", "w"]}, "inputs"),
+            ({"features": ["x", "w"]}, "features"),
+            ({"task": "regression"}, "task"),
+            ({"model": MODEL}, "model"),
+            ({"options": {"quantiles": [0.5]}}, "options"),
+            ({"context": [{"x": 1.0, "y": True}]}, "context"),
+            ({"queries": []}, None),
+            ({"queries": [{"id": "q", "x": "high"}]}, None),
         ]:
-            status, body = call(
-                url,
-                "/v1alpha1/projects/local/predictions",
-                envelope("predictions", predictions_payload(**change)),
-                key=KEY,
-            )
-            assert (status, body["error"]["code"]) == (422, code), change
+            status, body = predictor_predict(url, "churn", predictor_payload(**change))
+            assert (status, body["error"]["code"]) == (422, "ValidationError"), change
+            assert body["error"].get("param") == param, change
+            if param in ("target", "inputs", "model", "task"):
+                assert (
+                    body["error"]["message"] == f"{param} is declared by the predictor"
+                )
     finally:
         _stop(process)
 
@@ -380,98 +433,181 @@ def test_lone_lock_file_serves_request_context(lone_lock):
             {"x": 1.0, "y": False},
             {"x": 3.0, "y": True},
         ]
-        status, body = call(
+        status, body = predictor_predict(
             url,
-            "/v1alpha1/projects/local/predictions",
-            envelope(
-                "predictions",
-                predictions_payload(
-                    model="scorer", context=context, queries=[{"x": 2.9}, {"x": 0.1}]
-                ),
-            ),
-            key=KEY,
+            "scorer",
+            predictor_payload(context=context, queries=[{"x": 2.9}, {"x": 0.1}]),
         )
         assert status == 200, body
-        assert body["result"]["context"]["source"] == "request"
+        assert body["result"]["context"]["kind"] == "request"
         assert body["result"]["context"]["rows"] == 3
         labels = [row["label"] for row in body["result"]["predictions"]]
         assert labels == [True, False]
-        status, body = call(
-            url,
-            "/v1alpha1/projects/local/predictions",
-            envelope("predictions", predictions_payload(model="scorer")),
-            key=KEY,
-        )
+        status, body = predictor_predict(url, "scorer", predictor_payload())
         assert status == 422
+        assert body["error"]["param"] == "context"
+        status, body = call(url, "/v1/projects/local/predictors/scorer", key=KEY)
+        assert status == 200
+        assert body["result"]["context"] == {
+            "kind": "request",
+            "rows": None,
+            "digest": None,
+        }
     finally:
         _stop(process)
 
 
-def test_package_targets_are_checked_before_serving(tmp_path, package, lone_lock):
-    entry = served(str(package), tmp_path, allow_downloads=True)
-    assert entry["name"] == "churn" and entry["worker"] == "tabicl-v2-classifier"
-    assert entry["package"]["context"] == "snapshot"
-    snapshot = Path(entry["package"]["snapshot"])
+def test_predictor_targets_are_checked_before_serving(
+    tmp_path, predictor_dir, lone_lock
+):
+    entry = served(str(predictor_dir), tmp_path, allow_downloads=True)
+    assert (
+        entry["name"] == "churn"
+        and entry["worker"] == "general-forecast/tabicl-v2-classifier"
+    )
+    assert entry["predictor"]["context"] == "snapshot"
+    snapshot = Path(entry["predictor"]["snapshot"])
     assert snapshot.parent == tmp_path and snapshot.read_bytes()
     entry = served(str(lone_lock), tmp_path, allow_downloads=True)
-    assert entry["package"]["context"] == "request"
-    assert entry["package"]["snapshot"] is None
+    assert entry["predictor"]["context"] == "request"
+    assert entry["predictor"]["snapshot"] is None
     unlocked = tmp_path / "unlocked"
     unlocked.mkdir()
-    (unlocked / "gf.yaml").write_text((package / "gf.yaml").read_text())
+    (unlocked / "gf.yaml").write_text((predictor_dir / "gf.yaml").read_text())
     (unlocked / "history.arrow").write_bytes(arrow_bytes(history()))
-    with pytest.raises(PackageError) as caught:
+    with pytest.raises(PredictorError) as caught:
         served(str(unlocked), tmp_path)
     assert caught.value.code == "LockRequired"
+    with pytest.raises(PredictorError) as caught:
+        served("tabicl-v2-classifier", tmp_path)
+    assert caught.value.code == "ValidationError"
+    assert str(caught.value).endswith(f"use {MODEL}")
+    entry = served(MODEL, tmp_path, allow_downloads=True)
+    assert entry["resolved"].startswith(f"{MODEL}@sha256:")
+    assert entry["description"]["model"] == entry["resolved"]
     lone_snapshot = tmp_path / "lone"
     lone_snapshot.mkdir()
-    (lone_snapshot / "gf.lock").write_bytes((package / "gf.lock").read_bytes())
-    with pytest.raises(PackageError) as caught:
+    (lone_snapshot / "gf.lock").write_bytes((predictor_dir / "gf.lock").read_bytes())
+    with pytest.raises(PredictorError) as caught:
         served(str(lone_snapshot / "gf.lock"), tmp_path)
     assert caught.value.code == "ContextRequired"
 
 
-def _context_load(url, concurrency, requests, seed):
-    """Requests per second for `requests` calls, each with a new 64-row context."""
+def _read_snapshot(entry):
+    with pa.ipc.open_stream(
+        Path(entry["predictor"]["snapshot"]).read_bytes()
+    ) as reader:
+        return reader.read_all()
 
-    def one(index):
-        rng = random.Random(seed + index)
-        payload = infer_payload(
-            features=["a", "b"],
-            context=[
-                {
-                    "key": f"c{row}",
-                    "features": {"a": rng.random(), "b": rng.random()},
-                    "label": row % 2 == 0,
-                }
-                for row in range(64)
-            ],
-            queries=[{"key": "q", "features": {"a": 0.5, "b": 0.5}}],
+
+def test_snapshot_context_follows_the_manifest_split(tmp_path):
+    from generalforecast.predictors import load, split
+
+    root = tmp_path / "held"
+    root.mkdir()
+    rows = pa.table(
+        {
+            "id": list(range(10)),
+            "x": [float(i) for i in range(10)],
+            "y": [i % 2 == 0 for i in range(10)],
+        }
+    )
+    (root / "history.arrow").write_bytes(arrow_bytes(rows))
+    (root / "gf.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "held",
+                "model": MODEL,
+                "target": "y",
+                "id": "id",
+                "context": {
+                    "snapshot": "history.arrow",
+                    "holdout": {"fraction": 0.2, "seed": 0},
+                },
+            }
         )
-        status, body = call(
-            url,
-            "/v1alpha1/projects/local/models/tabicl-v2-classifier/infer",
-            envelope("tabicl-v2-classifier", payload),
-            key=KEY,
+    )
+    context = {"kind": "snapshot", "path": "history.arrow", "rows": 8, "digest": "d"}
+    (root / "gf.lock").write_text(
+        yaml.safe_dump(lock("held", context, id="id", id_type="int"))
+    )
+    entry = served(str(root), tmp_path, allow_downloads=True)
+    snapshot = _read_snapshot(entry)
+    expected, _ = split(rows, load(root))
+    assert snapshot.num_rows == 8
+    assert snapshot["id"].to_pylist() == expected["id"].to_pylist()
+    [id_column] = [
+        c for c in entry["predictor"]["schema"]["columns"] if c["role"] == "id"
+    ]
+    assert id_column["type"] == "int64"
+
+
+def test_blank_and_whole_number_targets_count_like_gf_check(tmp_path):
+    root = tmp_path / "blank"
+    root.mkdir()
+    rows = pa.table(
+        {
+            "id": ["a", "b", "c", "d"],
+            "x": [0.0, 1.0, 2.0, 3.0],
+            "y": ["no", "yes", "", ""],
+        }
+    )
+    (root / "history.arrow").write_bytes(arrow_bytes(rows))
+    (root / "gf.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "blank",
+                "model": MODEL,
+                "target": "y",
+                "id": "id",
+                "context": {"snapshot": "history.arrow"},
+            }
         )
-        assert status == 200, body
+    )
+    context = {"kind": "snapshot", "path": "history.arrow", "rows": 2, "digest": "d"}
+    (root / "gf.lock").write_text(
+        yaml.safe_dump(
+            lock(
+                "blank",
+                context,
+                id="id",
+                id_type="text",
+                target_type="category",
+                classes=["no", "yes"],
+            )
+        )
+    )
+    entry = served(str(root), tmp_path, allow_downloads=True)
+    assert _read_snapshot(entry)["y"].to_pylist() == ["no", "yes"]
 
-    start = time.perf_counter()
-    with ThreadPoolExecutor(concurrency) as pool:
-        list(pool.map(one, range(requests)))
-    return requests / (time.perf_counter() - start)
-
-
-@pytest.mark.slow
-def test_new_contexts_hold_throughput_past_saturation(server):
-    """Past saturation, a request per new context keeps the throughput it had.
-
-    Every call fits a table of its own; doubling the callers from 256 to 512
-    queues more fits per step, so throughput plateaus rather than falls. The
-    first pass at 512 compiles the step sizes the measured ones reach.
-    """
-    url, _ = server
-    _context_load(url, 512, 1024, seed=0)
-    at_256 = _context_load(url, 256, 1024, seed=1 << 20)
-    at_512 = _context_load(url, 512, 2048, seed=2 << 20)
-    assert at_512 >= 0.8 * at_256, (at_256, at_512)
+    floaty = tmp_path / "floaty"
+    floaty.mkdir()
+    rows = pa.table(
+        {"id": ["a", "b", "c"], "x": [0.0, 1.0, 2.0], "y": [0.0, 1.0, None]}
+    )
+    (floaty / "history.arrow").write_bytes(arrow_bytes(rows))
+    (floaty / "gf.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "name": "floaty",
+                "model": MODEL,
+                "target": "y",
+                "id": "id",
+                "context": {"snapshot": "history.arrow"},
+            }
+        )
+    )
+    (floaty / "gf.lock").write_text(
+        yaml.safe_dump(
+            lock(
+                "floaty",
+                context,
+                id="id",
+                id_type="text",
+                target_type="0/1",
+                classes=[0, 1],
+            )
+        )
+    )
+    snapshot = _read_snapshot(served(str(floaty), tmp_path, allow_downloads=True))
+    assert snapshot["y"].type == pa.int64() and snapshot["y"].to_pylist() == [0, 1]

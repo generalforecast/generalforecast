@@ -68,9 +68,9 @@ def test_converts_each_task_once_into_the_cache(
     monkeypatch.delenv("GF_CHECKPOINTS", raising=False)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
 
-    first = limix_checkpoint("limix-2-classifier")
-    again = limix_checkpoint("limix-2-classifier")
-    regressor = limix_checkpoint("limix-2-regressor")
+    first = limix_checkpoint("general-forecast/limix-2-classifier")
+    again = limix_checkpoint("general-forecast/limix-2-classifier")
+    regressor = limix_checkpoint("general-forecast/limix-2-regressor")
 
     revision = checkpoint.LIMIX_2.revision
     assert (
@@ -98,9 +98,12 @@ def test_offline_directory_must_exist(
     monkeypatch.setenv("GF_CHECKPOINTS", str(tmp_path))
     (tmp_path / "limix-2-classifier").mkdir()
 
-    assert limix_checkpoint("limix-2-classifier") == tmp_path / "limix-2-classifier"
+    assert (
+        limix_checkpoint("general-forecast/limix-2-classifier")
+        == tmp_path / "limix-2-classifier"
+    )
     with pytest.raises(FileNotFoundError, match="limix-2-regressor"):
-        limix_checkpoint("limix-2-regressor")
+        limix_checkpoint("general-forecast/limix-2-regressor")
 
 
 @pytest.mark.parametrize("name", sorted(checkpoint.PUBLISHED))

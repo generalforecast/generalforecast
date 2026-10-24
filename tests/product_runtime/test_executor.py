@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Package execution contract tests. Injected numeric kernels are not model evidence."""
+"""Predictor execution contract tests. Injected numeric kernels are not model evidence."""
 
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
@@ -12,10 +12,16 @@ import yaml
 
 from generalforecast.deployments.contracts import ServiceError
 from generalforecast.deployments.interfaces import PreparedExecution
-from generalforecast.deployments.package_runtime import PackageExecutor
+from generalforecast.deployments.predictor_runtime import PredictorExecutor
+from generalforecast.deployments.predictor_runtime.compile import (
+    compile_dir,
+    compile_plan,
+    plan_from_dir,
+)
+from generalforecast.deployments.predictor_runtime.lock import ExecutionLock
 from generalforecast.engine import ModelOutputError
-from generalforecast.packages import ModelPin, Package, PackageLock
-from generalforecast.packages.validation import digest
+from generalforecast.predictors.models import ModelPin
+from generalforecast.predictors.validation import digest
 from generalforecast.tabular import arrow_bytes
 from tests.utils.engine import FakeEngine
 
@@ -24,15 +30,15 @@ def checked(root, data, **changes):
     root.mkdir(exist_ok=True)
     spec = {
         "name": "test-model",
-        "model": "tabicl-classifier",
+        "model": "general-forecast/tabicl-v2-classifier",
         "context": "history.arrow",
         "target": "y",
         **changes,
     }
     (root / "gf.yaml").write_text(yaml.safe_dump(spec))
     (root / "history.arrow").write_bytes(arrow_bytes(data))
-    package = Package.load(root)
-    return package.check(data=data if package.spec.context.mode != "snapshot" else None)
+    plan, snapshot = plan_from_dir(root)
+    return compile_plan(plan, snapshot if plan.context.mode == "snapshot" else data)
 
 
 @pytest.fixture
@@ -54,8 +60,8 @@ def kernels(monkeypatch):
 def test_prepare_warms_once_preserves_ids_outputs_and_immutable_state(
     tmp_path, data, kernels
 ):
-    package = checked(tmp_path, data, id="id", outputs=["probabilities"])
-    prepared = PackageExecutor().prepare(package.lock, data)
+    locked = checked(tmp_path, data, id="id", outputs=["probabilities"])
+    prepared = PredictorExecutor().prepare(locked, data)
     assert prepared.context_rows == 4 and len(kernels) == 1
     assert isinstance(prepared, PreparedExecution) and prepared.usable
     q = pa.table({"id": ["q"], "x": [1.5]})
@@ -72,7 +78,7 @@ def test_prepare_warms_once_preserves_ids_outputs_and_immutable_state(
 
 
 def test_full_snapshot_checked_before_explicit_selection(tmp_path, data, kernels):
-    package = checked(
+    locked = checked(
         tmp_path,
         data,
         id="id",
@@ -83,34 +89,34 @@ def test_full_snapshot_checked_before_explicit_selection(tmp_path, data, kernels
             "max_rows": 3,
         },
     )
-    prepared = PackageExecutor().prepare(package.lock, data)
+    prepared = PredictorExecutor().prepare(locked, data)
     assert prepared.context_rows == 3
     assert kernels[0][:, 0].tolist() == [1, 2, 3]
     with pytest.raises(ServiceError, match="snapshot digest") as error:
-        PackageExecutor().prepare(package.lock, data.slice(1))
+        PredictorExecutor().prepare(locked, data.slice(1))
     assert error.value.code == "SnapshotMismatch"
 
 
 def test_dev_replacement_does_not_mutate_existing_context(tmp_path, data, kernels):
     first = checked(tmp_path / "first", data, id="id")
-    old = PackageExecutor().prepare(first.lock, data)
+    old = PredictorExecutor().prepare(first, data)
     changed = data.set_column(1, "x", pa.array([10.0, 11.0, 12.0, 13.0]))
     second = checked(tmp_path / "second", changed, id="id")
-    new = PackageExecutor().prepare(second.lock, changed)
+    new = PredictorExecutor().prepare(second, changed)
     assert old.lock != new.lock and old._context is not new._context
     assert kernels[0][:, 0].tolist() == [0, 1, 2, 3]
     assert kernels[1][:, 0].tolist() == [10, 11, 12, 13]
     assert old.predict(pa.table({"x": [1.0]})).num_rows == 1
     with pytest.raises(ServiceError):
-        PackageExecutor().prepare(second.lock, data)
+        PredictorExecutor().prepare(second, data)
     assert old.context_rows == 4
 
 
-@pytest.mark.parametrize("mode", ["request", "dataset/events"])
+@pytest.mark.parametrize("mode", ["request", "live/events"])
 def test_dynamic_context_validation_and_no_override(tmp_path, data, kernels, mode):
-    package = checked(tmp_path, data, context=mode, id="id")
-    executor = PackageExecutor()
-    prepared = executor.prepare(package.lock, None if mode == "request" else data)
+    locked = checked(tmp_path, data, context=mode, id="id")
+    executor = PredictorExecutor()
+    prepared = executor.prepare(locked, None if mode == "request" else data)
     q = pa.table({"x": [1.0]})
     if mode == "request":
         with pytest.raises(ServiceError) as error:
@@ -132,38 +138,38 @@ def test_dynamic_context_validation_and_no_override(tmp_path, data, kernels, mod
 def test_queries_reject_physical_drift_missing_leakage_and_unknown(
     tmp_path, data, kernels, queries
 ):
-    package = checked(tmp_path, data, id="id")
-    prepared = PackageExecutor().prepare(package.lock, data)
+    locked = checked(tmp_path, data, id="id")
+    prepared = PredictorExecutor().prepare(locked, data)
     with pytest.raises(ServiceError) as error:
         prepared.predict(pa.table(queries))
     assert error.value.status == 422
 
 
 def test_forged_capability_rehashed_lock_still_fails_admission(tmp_path, data, kernels):
-    package = checked(tmp_path, data, id="id")
-    value = package.lock.to_dict()
+    locked = checked(tmp_path, data, id="id")
+    value = locked.to_dict()
     value["model"]["max_context_rows"] += 1
     value["model_digest"] = digest(ModelPin.from_dict(value["model"]).identity())
-    value["package"] = digest({k: v for k, v in value.items() if k != "package"})
-    lock = PackageLock.from_dict(value)
+    value["lock"] = digest({k: v for k, v in value.items() if k != "lock"})
+    lock = ExecutionLock.from_dict(value)
     with pytest.raises(ServiceError) as error:
-        PackageExecutor().prepare(lock, data)
+        PredictorExecutor().prepare(lock, data)
     assert error.value.code == "ModelMismatch" and kernels == []
 
 
 def test_missing_bound_context_and_unexpected_request_context(tmp_path, data, kernels):
-    package = checked(tmp_path, data, id="id")
+    locked = checked(tmp_path, data, id="id")
     with pytest.raises(ServiceError):
-        PackageExecutor().prepare(package.lock, None)
-    package = checked(tmp_path, data, context="request", id="id")
+        PredictorExecutor().prepare(locked, None)
+    locked = checked(tmp_path, data, context="request", id="id")
     with pytest.raises(ServiceError):
-        PackageExecutor().prepare(package.lock, data)
+        PredictorExecutor().prepare(locked, data)
 
 
 def test_actual_labeled_rows_metadata_for_request_selection(tmp_path, data, kernels):
     data = data.set_column(2, "y", pa.array([None, False, True, True]))
-    package = checked(tmp_path, data, context="request", id="id")
-    prepared = PackageExecutor().prepare(package.lock, None)
+    locked = checked(tmp_path, data, context="request", id="id")
+    prepared = PredictorExecutor().prepare(locked, None)
     result = prepared.predict(pa.table({"x": [1.0]}), context=data)
     assert result.schema.metadata == {b"generalforecast.context_rows": b"3"}
     assert prepared.context_rows is None
@@ -172,8 +178,8 @@ def test_actual_labeled_rows_metadata_for_request_selection(tmp_path, data, kern
 def test_query_intermediates_batched_and_capacity_rejected_not_sampled(
     tmp_path, data, kernels
 ):
-    package = checked(tmp_path, data, id="id")
-    prepared = PackageExecutor().prepare(package.lock, data)
+    locked = checked(tmp_path, data, id="id")
+    prepared = PredictorExecutor().prepare(locked, data)
     q = pa.table({"id": [str(i) for i in range(257)], "x": [1.0] * 257})
     result = prepared.predict(q)
     assert result.num_rows == 257 and result["id"].equals(q["id"])
@@ -185,18 +191,18 @@ def test_query_intermediates_batched_and_capacity_rejected_not_sampled(
 
 def test_schema_free_request_and_regression_projection(tmp_path, kernels):
     data = pa.table({"x": [1.0, 2.0], "y": [3.0, 5.0]})
-    package = checked(
+    locked = checked(
         tmp_path,
         data,
         context="request",
-        model="tabicl-regressor",
+        model="general-forecast/tabicl-v2-regressor",
         outputs=["quantiles", "value"],
         quantiles=[0.1, 0.5, 0.9],
     )
-    lock = replace(package.lock, schema=type(package.lock.schema)())
+    lock = replace(locked, schema=type(locked.schema)())
     value = lock.to_dict()
-    value["package"] = digest({k: v for k, v in value.items() if k != "package"})
-    prepared = PackageExecutor().prepare(PackageLock.from_dict(value), None)
+    value["lock"] = digest({k: v for k, v in value.items() if k != "lock"})
+    prepared = PredictorExecutor().prepare(ExecutionLock.from_dict(value), None)
     result = prepared.predict(pa.table({"x": [1.5]}), context=data)
     assert result.column_names == ["quantiles", "value"]
     assert result.to_pylist() == [
@@ -208,12 +214,17 @@ def test_concurrent_request_contexts_do_not_mutate_bound_production(tmp_path, ke
     first = pa.table({"x": [1.0, 2.0], "y": [3.0, 5.0]})
     second = first.set_column(1, "y", pa.array([7.0, 9.0]))
     request = checked(
-        tmp_path / "request", first, context="request", model="tabicl-regressor"
+        tmp_path / "request",
+        first,
+        context="request",
+        model="general-forecast/tabicl-v2-regressor",
     )
-    snapshot = checked(tmp_path / "snapshot", first, model="tabicl-regressor")
-    executor = PackageExecutor()
-    remote = executor.prepare(request.lock, None)
-    production = executor.prepare(snapshot.lock, first)
+    snapshot = checked(
+        tmp_path / "snapshot", first, model="general-forecast/tabicl-v2-regressor"
+    )
+    executor = PredictorExecutor()
+    remote = executor.prepare(request, None)
+    production = executor.prepare(snapshot, first)
     queries = pa.table({"x": [1.5]})
 
     def predict(i):
@@ -230,30 +241,31 @@ def test_concurrent_request_contexts_do_not_mutate_bound_production(tmp_path, ke
 def test_target_free_schema_free_request_can_warm_without_guessing_target(
     tmp_path, kernels
 ):
-    (tmp_path / "gf.yaml").write_text("name: test-model\nmodel: tabicl-classifier\n")
-    package = Package.load(tmp_path).check(write=False)
-    assert package.lock is not None
-    prepared = PackageExecutor().prepare(package.lock, None)
+    (tmp_path / "gf.yaml").write_text(
+        "name: test-model\nmodel: general-forecast/tabicl-v2-classifier\n"
+    )
+    lock = compile_dir(tmp_path)
+    prepared = PredictorExecutor().prepare(lock, None)
     assert prepared.lock.spec.target is None and prepared._context is None
     assert prepared.context_rows is None and not kernels
     with pytest.raises(ServiceError, match="explicit target binding") as error:
         prepared.predict(
             pa.table({"x": [1.0]}), context=pa.table({"x": [1.0], "y": [True]})
         )
-    assert error.value.code == "InvalidPackage"
+    assert error.value.code == "InvalidPredictor"
 
 
-@pytest.mark.parametrize("context", ["history.arrow", "dataset/history", "request"])
+@pytest.mark.parametrize("context", ["history.arrow", "live/history", "request"])
 def test_target_free_schema_bearing_or_bound_context_is_rejected(
     tmp_path, data, kernels, context
 ):
-    package = checked(tmp_path, data, context=context)
-    lock = replace(package.lock, spec=replace(package.lock.spec, target=None))
+    locked = checked(tmp_path, data, context=context)
+    lock = replace(locked, spec=replace(locked.spec, target=None))
     value = lock.to_dict()
-    value["package"] = digest({k: v for k, v in value.items() if k != "package"})
+    value["lock"] = digest({k: v for k, v in value.items() if k != "lock"})
     with pytest.raises(ServiceError, match="explicit target"):
-        PackageExecutor().prepare(
-            replace(lock, package_digest=value["package"]),
+        PredictorExecutor().prepare(
+            replace(lock, lock_digest=value["lock"]),
             None if context == "request" else data,
         )
 
@@ -261,8 +273,8 @@ def test_target_free_schema_bearing_or_bound_context_is_rejected(
 def test_bad_native_output_and_private_error_are_typed(
     tmp_path, data, kernels, monkeypatch
 ):
-    package = checked(tmp_path, data, id="id")
-    prepared = PackageExecutor().prepare(package.lock, data)
+    locked = checked(tmp_path, data, id="id")
+    prepared = PredictorExecutor().prepare(locked, data)
     monkeypatch.undo()
 
     def invalid(*_args):
@@ -278,9 +290,9 @@ def test_bad_native_output_and_private_error_are_typed(
     def private(*args):
         raise RuntimeError("credential=must-not-leak")
 
-    monkeypatch.setattr("generalforecast.deployments.package_runtime._load", private)
+    monkeypatch.setattr("generalforecast.deployments.predictor_runtime._load", private)
     with pytest.raises(ServiceError) as error:
-        PackageExecutor().prepare(package.lock, data)
+        PredictorExecutor().prepare(locked, data)
     assert error.value.code == "InferenceFailed" and "credential" not in str(
         error.value
     )

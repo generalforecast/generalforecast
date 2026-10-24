@@ -1,35 +1,41 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Scoped API operations, local input adapters and non-secret CLI profiles."""
+"""The `gf model`, `gf context` and `gf admin` commands, and the connection plumbing.
+
+Model commands read the catalog registry; context commands call the live
+context (dataset) SDK methods; admin nouns bind to the SDK's identity and
+collection operations or start a node or router on this machine.
+"""
 
 import argparse
 import datetime
 import json
 import os
-import re
 import ssl
 import sys
-from collections.abc import Mapping
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 
+from generalforecast import term
 from generalforecast.client import Client
 from generalforecast.command_specs import (
     COLLECTIONS,
     IDENTITY_GROUPS,
-    LEGACY_DEPLOY,
     OPERATIONS,
 )
-from generalforecast.contracts import DatasetImportRef
-from generalforecast.deployments.boundary import JsonObject, ResourceKind
+from generalforecast.deployments.boundary import JsonObject
 from generalforecast.deployments.contracts import ServiceError, name
 from generalforecast.deployments.sdk import Snapshot
-from generalforecast.packages.files import MAX_DATA_BYTES
 from generalforecast.tabular import file_format, read_table, table_digest
 from generalforecast.transport import ConnectionSettings, Profile
+
+# The largest table a command reads from disk.
+MAX_DATA_BYTES = 128 * 1024 * 1024
 
 
 class CLIError(ServiceError):
@@ -72,7 +78,7 @@ class _Stdin:
 
 
 def read_data(path: str, root: Path):
-    """Reads bounded local tabular data relative to the selected package directory."""
+    """Reads a bounded local table relative to the predictor directory."""
     target = Path(path) if Path(path).is_absolute() else root / path
     with target.open("rb") as stream:
         raw = stream.read(MAX_DATA_BYTES + 1)
@@ -94,7 +100,7 @@ def records(table) -> list[dict]:
 
 
 # Server and credential source of the last resolved connection, for diagnostics.
-def _legacy(args: argparse.Namespace) -> bool:
+def _profile_resolver(args: argparse.Namespace) -> bool:
     """Explicit endpoint flags, GF_PROFILE or a saved profile keep the old resolver."""
     return uses_profiles(args)
 
@@ -118,11 +124,13 @@ def connection_for(args: argparse.Namespace) -> ConnectionSettings:
         return ConnectionSettings.resolve(
             project=getattr(args, "project", None), base_url=local
         )
-    if not _legacy(args):
+    if not _profile_resolver(args):
         server = server_url()
         found = CredentialStore().resolve(server)
         if found is None:
-            raise CLIError("NotLoggedIn", "not logged in", 401)
+            from generalforecast.cli import Error
+
+            raise Error("Unauthorized", "not logged in", hint="run `gf login`")
         CONNECTION.update(server=server, source=found.source)
         project = (
             getattr(args, "project", None)
@@ -260,46 +268,33 @@ def upload_snapshot(client: Client, table) -> dict:
     return result
 
 
-def upload_python_source(client: Client, deployment: str, package) -> None:
-    """Uploads a verified archive and requires an exact scoped source receipt."""
-    from generalforecast.packages import PythonLock
-
-    require(isinstance(package.lock, PythonLock), "expected a Python package lock")
-    archive = package.source_archive()
-    upload = getattr(client, "upload_python_source", None)
-    if not callable(upload):
-        raise ServiceError(
-            "RuntimeUnavailable", "Python source upload is unavailable", 503
-        )
-    result = upload(deployment, archive, source=package.lock.python.source)
-    if isinstance(result, Mapping):
-        result = dict(result)
-    expected = {
-        "receipt_version": 1,
-        "kind": "python-source",
-        "project": client.project,
-        "deployment": deployment,
-        "source": package.lock.python.source,
-        "size": len(archive),
-    }
-    if (
-        type(result) is not dict
-        or result != expected
-        or type(result.get("receipt_version")) is not int
-        or type(result.get("size")) is not int
-    ):
-        raise ServiceError(
-            "ProtocolError", "Python source receipt identity mismatch", 502
-        )
+def execute(args: argparse.Namespace, out: term.Output) -> dict | None:
+    """Runs `gf model`, `gf context` or `gf admin`."""
+    if args.command == "model":
+        return _model(args, out)
+    if args.command == "context":
+        return _context(args, out)
+    return _admin(args, out)
 
 
-def execute(args: argparse.Namespace) -> dict:
-    """Executes authenticated commands; receipt acceptance never implies readiness."""
-    if args.group == "login":
-        return configured_login(args)
+def _admin(args: argparse.Namespace, out: term.Output) -> dict | None:
+    """`gf admin <noun> <action>`: API collections, hosted predictors, nodes and routers."""
+    noun = args.noun
+    if noun in ("node", "router"):
+        from generalforecast.predictor_commands import serve_process
+
+        return serve_process(args, out)
+    if noun in ("logs", "diff", "delete"):
+        from generalforecast.predictor_commands import PredictorCommands
+
+        return getattr(PredictorCommands(args, out), noun)()
+    args.group = noun
+    args.name = getattr(args, "name", None)
+    args.file = getattr(args, "file", None)
+    for field, default in (("after", 0), ("limit", 100)):
+        if not hasattr(args, field):
+            setattr(args, field, default)
     client = client_for(args)
-    if args.group == "datasets":
-        return _dataset(client, args)
     return _scoped(client, args)
 
 
@@ -325,33 +320,6 @@ def configured_login(args: argparse.Namespace) -> dict:
 
 
 def _scoped(client: Client, args: argparse.Namespace) -> dict:
-    if args.group == "runtimes":
-        ident = name(args.name)
-        require(args.action != "cleanup" or args.yes, "cleanup requires --yes")
-        payload = read_object(args.file)
-        # Reject inline secrets before any remote provisioning operation.
-        from generalforecast.packages.validation import text
-
-        def references(value):
-            if isinstance(value, dict):
-                for key, item in value.items():
-                    require(
-                        not re.search(r"(?i)(token|password|secret|credential)", key)
-                        or key.endswith(("_ref", "_refs")),
-                        "runtime credentials require trusted refs",
-                    )
-                    references(item)
-            elif isinstance(value, list):
-                for item in value:
-                    references(item)
-            elif isinstance(value, str):
-                text(value)
-
-        references(payload)
-        if args.action == "status":
-            return client.runtimes.get(ident).to_dict()
-        require(not payload, "runtime operations do not accept a body")
-        return getattr(client.runtimes, args.action)(ident).to_dict()
     payload = read_object(args.file)
     if args.group in IDENTITY_GROUPS:
         return _identity(client, args, payload)
@@ -360,7 +328,7 @@ def _scoped(client: Client, args: argparse.Namespace) -> dict:
 
 def _identity(client: Client, args: argparse.Namespace, payload: JsonObject) -> dict:
     """Binds CLI arguments to the SDK's allowlisted identity operations."""
-    group, action, resource = args.group, args.action, args.name
+    group, action, resource = args.group, args.action, getattr(args, "name", None)
     require(action in OPERATIONS[group], "unsupported operation")
     if action in ("list", "get", "status"):
         require(not payload, "GET operations do not accept a body")
@@ -395,26 +363,17 @@ def _wire(value: Any) -> dict:
 
 def _collection(client: Client, args: argparse.Namespace, payload: JsonObject) -> dict:
     """Binds CLI arguments to public SDK collection methods; output stays wire JSON."""
-    group, action, resource = args.group, args.action, args.name
-    if group == "operator" and action in ("backup", "restore-check"):
-        raise ServiceError(
-            "HostAuthorityUnavailable",
-            "full-store operations require independent host authority",
-            501,
-        )
+    group, action, resource = args.group, args.action, getattr(args, "name", None)
     require(action in OPERATIONS[group], "unsupported operation")
-    if group == "deploy" and action in LEGACY_DEPLOY:
-        method, path, kind, ident = route(group, action, resource, payload)
-        return client._call(method, path, kind, ident, payload)
-    if action in ("list", "get", "results", "doctor"):
+    if action in ("list", "get", "doctor"):
         require(not payload, "GET operations do not accept a body")
     if group == "operator":
-        return client.operators.doctor()
+        return client._call("GET", "/operators/doctor", "operator", "doctor")
     collection = COLLECTIONS[group][1]
     sdk = getattr(client, collection)
     if action == "list":
         return {collection: sdk.list()}
-    if action in ("create", "submit", "register"):
+    if action in ("create", "register"):
         ident = payload.get("name", "")
         if resource is not None:
             require(resource == ident, "resource name must match config/spec name")
@@ -427,15 +386,6 @@ def _collection(client: Client, args: argparse.Namespace, payload: JsonObject) -
     ident = name(resource or "")
     if action == "get":
         return _wire(sdk.get(ident))
-    if action == "results":
-        require(
-            0 <= args.offset <= 2**53 - 1 and 1 <= args.limit <= 100,
-            "invalid result page",
-        )
-        return sdk.results(ident, offset=args.offset, limit=args.limit)
-    if action == "infer":
-        require(payload.get("model") == ident, "model must match request")
-        return sdk.infer(payload)
     if action == "mutate":
         return sdk.mutate(ident, payload)
     if action == "snapshot":
@@ -448,88 +398,182 @@ def _collection(client: Client, args: argparse.Namespace, payload: JsonObject) -
     require(not payload, "operation does not accept a body")
     if action == "test":
         return sdk.test(ident)
-    return sdk.control(ident, action)
+    return getattr(sdk, action)(ident)
 
 
-def _dataset(client: Client, args: argparse.Namespace) -> dict:
+def _context(args: argparse.Namespace, out: term.Output) -> dict:
+    """`gf context create|append|label|show`, over the live context SDK methods."""
+    client = client_for(args)
     ident = name(args.name)
-    if args.action == "status":
-        return client.datasets.get(ident).to_dict()
-    if args.action == "refresh":
-        return client.datasets.refresh(ident).to_dict()
+    if args.action == "show":
+        return client.contexts.get(ident).to_dict()
     if args.action == "create":
         payload = read_object(args.file)
-        require(payload.get("name") == ident, "dataset name differs from config")
-        return client.datasets.create(payload).to_dict()
-    if args.action == "import":
-        require(
-            bool(args.source) != bool(args.input),
-            "provide one cloud source or local table",
-        )
-        if args.input:
-            uploaded = upload_snapshot(client, read_data(args.input, Path.cwd()))
-            source, digest = (
-                "upload://" + uploaded["digest"].replace(":", "-"),
-                uploaded["digest"],
-            )
-        else:
-            source, digest = args.source, None
-        spec = DatasetImportRef(
-            dataset=ident,
-            source=source,
-            format="arrow" if args.input else args.format or "table",
-            credential_ref=args.credential_ref,
-            digest=digest,
-        )
-        return client.datasets.import_source(spec).to_dict()
-    require(
-        bool(args.input) and bool(args.id) and bool(args.idempotency_key),
-        "writes require a local table, --id and --idempotency-key",
-    )
-    rows = records(read_data(args.input, Path.cwd()))
-    require(bool(rows), "empty dataset writes are not supported")
+        require(payload.get("name") == ident, "the config's name differs from NAME")
+        result = client.contexts.create(payload).to_dict()
+        out.status("Created", f"context {ident}")
+        return result
+    table = read_data(args.file, Path.cwd())
+    require(table.num_rows > 0, "the file has no rows")
+    write_id = args.write_id or uuid.uuid4().hex
+    require(args.id in table.column_names, f"column `{args.id}` is not in the file")
     if args.action == "label":
-        require(bool(args.column), "label requires --column")
-    observations = []
-    for row in rows:
-        require(args.id in row and row[args.id] is not None, "row lacks declared id")
-        item = {"key": str(row[args.id])}
-        if args.action == "label":
-            require(
-                args.column in row and row[args.column] is not None,
-                "row lacks declared label",
-            )
-            item["labels"] = {args.column: row[args.column]}
-        else:
-            item["features"] = {
-                key: value
-                for key, value in row.items()
-                if key not in {args.id, args.column}
-            }
-            if args.column and row.get(args.column) is not None:
-                item["labels"] = {args.column: row[args.column]}
-        observations.append(item)
-    mutation: Any = {
-        "write_id": args.idempotency_key,
-        "operation": "attach_labels" if args.action == "label" else "create_features",
-        "records": observations,
+        require(
+            args.target in table.column_names,
+            f"column `{args.target}` is not in the file",
+        )
+        result = client.contexts.label(
+            ident, table, id=args.id, column=args.target, idempotency_key=write_id
+        )
+        out.status("Labeled", f"{term.plural(table.num_rows, 'row')} in {ident}")
+    else:
+        result = client.contexts.append(
+            ident, table, id=args.id, idempotency_key=write_id
+        )
+        out.status("Appended", f"{term.plural(table.num_rows, 'row')} to {ident}")
+    return _wire(result) if not isinstance(result, dict) else result
+
+
+def _model(args: argparse.Namespace, out: term.Output) -> dict:
+    """`gf model list|show|pull`, over the model registry."""
+    registry = model_registry()
+    if args.action == "list":
+        models = registry.catalog(task=args.task)
+        return {"models": [_model_info(registry, info) for info in models]}
+    ref = registry.canonical(args.model)
+    if args.action == "show":
+        info = next(m for m in registry.catalog() if ref.startswith(m.id))
+        return _model_info(registry, info) | {"id": ref}
+    if registry.is_cached(ref):
+        out.status("Cached", ref)
+        return {"id": ref, "cached": True}
+    out.status("Pulling", ref)
+    path = registry.pull(ref, progress=out.debug)
+    out.status("Pulled", f"{ref} to {path}")
+    return {"id": ref, "cached": True, "path": str(path)}
+
+
+def _model_info(registry: Any, info: Any) -> dict:
+    limits = registry.limits(info.id)
+    return {
+        "id": info.id,
+        "task": info.task,
+        "limits": {
+            "context_rows": limits.context_rows,
+            "queries": limits.queries,
+            "inputs": limits.inputs,
+        },
+        "cached": registry.is_cached(info.id),
     }
-    return dict(client.datasets.mutate(ident, mutation))
 
 
-def route(
-    group: str, action: str, resource: str | None, payload: JsonObject
-) -> tuple[str, str, ResourceKind, str]:
-    """Resolves legacy deploy operations that have no public SDK method."""
-    require(group == "deploy" and action in LEGACY_DEPLOY, "unsupported operation")
-    kind = COLLECTIONS[group][0]
-    if action == "apply":
-        ident = payload.get("name", "")
-        if resource is not None:
-            require(resource == ident, "resource name must match config/spec name")
-        return "POST", "/deployments", kind, name(ident)
-    ident = name(resource or "")
-    suffix = {"effect-status": "effects/status", "effect-wait": "effects/wait"}.get(
-        action, action
-    )
-    return "POST", f"/deployments/{ident}/{suffix}", kind, ident
+def model_registry() -> Any:
+    """The model registry: session F's module, or the fallback over the catalog."""
+    return _CatalogRegistry()
+
+
+@dataclass(frozen=True)
+class ModelInfo:
+    """One catalog model as `gf model list` shows it."""
+
+    id: str
+    task: str
+
+
+@dataclass(frozen=True)
+class Limits:
+    """A model's per-call caps."""
+
+    context_rows: int
+    queries: int
+    inputs: int
+
+
+class _CatalogRegistry:
+    """The registry interface over `generalforecast.models.catalog`."""
+
+    def _entries(self) -> list[Any]:
+        from generalforecast.models.catalog import entries
+
+        return list(entries())
+
+    def catalog(self, task: str | None = None) -> list[ModelInfo]:
+        """Catalog models, newest first, optionally for one task."""
+        found = [
+            ModelInfo(e.id, e.capability.task)
+            for e in reversed(self._entries())
+            if task is None or e.capability.task == task
+        ]
+        return found
+
+    def default(self, task: str) -> str:
+        """The model `gf init` picks for a task when none is named."""
+        from generalforecast.models.catalog import DEFAULTS
+
+        return DEFAULTS[task]
+
+    def canonical(self, ref: str) -> str:
+        """`general-forecast/<name>[@variant]`, or an error with the right id."""
+        from generalforecast.cli import Error
+        from generalforecast.models.catalog import ORGANIZATION, known_as, not_canonical
+
+        base, _, variant = ref.partition("@")
+        suffix = f"@{variant}" if variant else ""
+        for e in self._entries():
+            if base == e.id:
+                return ref
+            if base == e.name or base in e.aliases:
+                raise Error(
+                    "InvalidInput", not_canonical(ref, f"{e.id}{suffix}"), param="model"
+                )
+        if (known := known_as(base)) is not None:
+            raise Error(
+                "InvalidInput", not_canonical(ref, f"{known}{suffix}"), param="model"
+            )
+        close = term.suggest(base.split("/")[-1], [e.name for e in self._entries()])
+        hint = (
+            f"use {ORGANIZATION}/{close}"
+            if close
+            else "run `gf model list` to see the catalog"
+        )
+        raise Error(
+            "NotFound", f"model `{ref}` is not in the catalog", hint=hint, param="model"
+        )
+
+    def _entry(self, ref: str) -> Any:
+        base = self.canonical(ref).partition("@")[0]
+        return next(e for e in self._entries() if e.id == base)
+
+    def task_of(self, ref: str) -> str:
+        """classification, regression or forecast."""
+        return self._entry(ref).capability.task
+
+    def limits(self, ref: str) -> Limits:
+        """The model's caps from the serving policy and its capability."""
+        from generalforecast.models.catalog import V1_POLICY
+
+        capability = self._entry(ref).capability
+        return Limits(
+            min(
+                capability.context_rows or V1_POLICY.context_rows,
+                V1_POLICY.context_rows,
+            ),
+            V1_POLICY.query_rows,
+            min(capability.context_features or V1_POLICY.features, V1_POLICY.features),
+        )
+
+    def is_cached(self, ref: str) -> bool:
+        """Whether the weights are in the local cache."""
+        from generalforecast.models.artifacts import ArtifactError, checkpoint
+
+        try:
+            checkpoint(self._entry(ref), allow_downloads=False)
+        except ArtifactError:
+            return False
+        return True
+
+    def pull(self, ref: str, *, progress: Any = None) -> Path:
+        """Downloads the weights and returns the cache directory."""
+        from generalforecast.models.artifacts import checkpoint
+
+        return checkpoint(self._entry(ref), allow_downloads=True)

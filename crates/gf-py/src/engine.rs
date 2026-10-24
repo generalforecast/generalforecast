@@ -225,8 +225,8 @@ impl Engine {
 
     /// Has every worker load a model under `name` from `spec`.
     ///
-    /// `spec` is a built-in model's repository id or a `module:function`
-    /// spec; a worker serving that name already keeps it.
+    /// `spec` is a built-in model's repository id; a worker serving that
+    /// name already keeps it.
     fn add_model(&self, py: Python<'_>, name: &str, spec: &str) -> PyResult<()> {
         let running = self.running()?;
         py.detach(|| {

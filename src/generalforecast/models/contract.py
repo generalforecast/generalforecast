@@ -9,7 +9,7 @@ from jax import Array
 
 
 class Averaging(NamedTuple):
-    """How a model's ensembles combine estimators, as its own package's do.
+    """How a model's ensembles combine estimators, as its own predictor's do.
 
     Attributes:
         over: `outputs` averages the decoder outputs and postprocesses the mean;

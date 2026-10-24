@@ -3,31 +3,40 @@
 
 """sklearn adapters over the existing optimized native tabular and series engine."""
 
-import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pyarrow as pa
-from sklearn.base import BaseEstimator, RegressorMixin
-from sklearn.exceptions import NotFittedError
 
-from generalforecast.local_models import custom_model, native_model
+from generalforecast.deployments.predictor_runtime.plan import ExecutionPlan
+from generalforecast.deployments.predictor_runtime.schema import infer_schema
+from generalforecast.errors import InvalidInput
+from generalforecast.native import models as registry
 from generalforecast.native.estimators import Classifier, Regressor
-from generalforecast.native.package import (
+from generalforecast.native.predictor import (
     admitted_spec,
     copy_table,
-    export_package,
+    export_predictor,
     remote_result,
 )
-from generalforecast.native.package import (
+from generalforecast.native.predictor import (
     forecast as native_forecast,
 )
-from generalforecast.packages import Package, PackageSpec
-from generalforecast.packages.models import describe, trusted
-from generalforecast.packages.schema import infer_schema
-from generalforecast.packages.validation import ensure
+from generalforecast.native.sklearn_shim import (
+    BaseEstimator,
+    NotFittedError,
+    RegressorMixin,
+    public,
+    require_sklearn,
+)
+from generalforecast.predictors import frequency as _frequency
+from generalforecast.predictors.models import describe, for_task
+from generalforecast.predictors.validation import ensure
 from generalforecast.tabular import physical_type, to_arrow
+
+if TYPE_CHECKING:
+    from generalforecast.predictor import Predictor
 
 __all__ = ["Classifier", "Forecaster", "Regressor"]
 
@@ -43,7 +52,7 @@ class Forecaster(RegressorMixin, BaseEstimator):
 
     def __init__(
         self,
-        model: Any = "chronos-2",
+        model: Any = "general-forecast/chronos-2",
         *,
         target: str = "target",
         time: str = "time",
@@ -54,9 +63,15 @@ class Forecaster(RegressorMixin, BaseEstimator):
         future_inputs: tuple[str, ...] = (),
         quantiles: tuple[float, ...] = (0.1, 0.5, 0.9),
         backend: Any = None,
-        allow_downloads: bool = False,
+        download: bool = True,
     ) -> None:
         """Stores cloneable settings; local checkpoints are cache-only by default."""
+        require_sklearn()
+        if isinstance(model, str):
+            model = registry.canonical(model)
+            from generalforecast.native.estimators import note_download
+
+            note_download(model, download)
         self.model = model
         self.target = target
         self.time = time
@@ -67,7 +82,7 @@ class Forecaster(RegressorMixin, BaseEstimator):
         self.future_inputs = future_inputs
         self.quantiles = quantiles
         self.backend = backend
-        self.allow_downloads = allow_downloads
+        self.download = download
 
     def __sklearn_is_fitted__(self) -> bool:
         """Reports only successfully prepared context as fitted."""
@@ -82,7 +97,7 @@ class Forecaster(RegressorMixin, BaseEstimator):
 
     def _require_fitted(self) -> None:
         if not self.__sklearn_is_fitted__():
-            raise NotFittedError("call fit before predicting or exporting a package")
+            raise NotFittedError("call fit before predicting or saving a predictor")
 
     def _intent(self) -> dict:
         series = [self.series] if isinstance(self.series, str) else list(self.series)
@@ -94,9 +109,14 @@ class Forecaster(RegressorMixin, BaseEstimator):
             "future_inputs": list(self.future_inputs),
             "quantiles": list(self.quantiles),
             "outputs": ["value", "quantiles"],
-            **({"frequency": self.frequency} if self.frequency is not None else {}),
+            **(
+                {"frequency": self._spelled_frequency()}
+                if self.frequency is not None
+                else {}
+            ),
         }
 
+    @public
     def fit(self, X: Any, y: Any = None) -> "Forecaster":
         """Copies bounded context and validates regular cadence for every series."""
         self.close()
@@ -114,29 +134,12 @@ class Forecaster(RegressorMixin, BaseEstimator):
             table = to_arrow(table.append_column(self.target, pa.array(values)))
         else:
             features = [column for column in features if column != self.target]
-        custom = custom_model(self.model)
-        if custom:
-            ensure(
-                self.backend is None,
-                "remote backend requires an admitted catalog model",
-            )
-        pin = (
-            trusted(
-                self.model,
-                "forecast",
-                max_context_rows=table.num_rows,
-                max_features=len({*self.past_inputs, *self.future_inputs}),
-                max_horizon=self.horizon,
-                quantiles=tuple(self.quantiles),
-            )
-            if custom
-            else describe(self.model)
-        )
+        pin = describe(self.model)
         ensure("forecast" in pin.tasks, "model does not support forecasting")
-        spec = PackageSpec.from_dict(
+        spec = ExecutionPlan.from_dict(
             {
                 "name": "estimator",
-                "model": self.model if custom else pin.resolved,
+                "model": pin.resolved,
                 "task": "forecast",
                 "target": self.target,
                 "context": "context.arrow",
@@ -198,13 +201,14 @@ class Forecaster(RegressorMixin, BaseEstimator):
         self._identities = identities
         assert schema.frequency is not None
         self._frequency = schema.frequency
+        self._step = spec.frequency if spec.frequency is not None else schema.frequency
         self._clock = clock
         self.n_features_in_ = len(features)
         self.feature_names_in_ = np.asarray(features, dtype=object)
         self.context_ = copy_table(table)
         try:
             if self.backend is None:
-                native_model(self.model, "forecast")
+                for_task(self.model, "forecast")
         except BaseException:
             self.close()
             raise
@@ -250,11 +254,6 @@ class Forecaster(RegressorMixin, BaseEstimator):
                     "UnsupportedCovariates",
                 )
                 known[item] = row[column]
-        step = (
-            self._frequency
-            if self._clock == "int64"
-            else datetime.timedelta(seconds=self._frequency)
-        )
         for key, indexes in groups.items():
             ensure(
                 len(indexes) == self.horizon,
@@ -264,11 +263,31 @@ class Forecaster(RegressorMixin, BaseEstimator):
             origin = max(history[key])
             ensure(
                 [rows[index][self.time] for index in indexes]
-                == [origin + step * (i + 1) for i in range(self.horizon)],
+                == self._steps_after(origin),
                 "future times must immediately follow fitted context on its regular grid",
             )
         return table
 
+    def _spelled_frequency(self) -> str | int | float:
+        try:
+            return _frequency.normalize(self.frequency)
+        except (TypeError, ValueError):
+            raise InvalidInput(
+                f"frequency `{self.frequency}` is not a frequency",
+                param="frequency",
+                hint="use a span such as `1d` or `15min`, a pandas offset alias "
+                "such as `W-MON` or `MS`, or seconds as a number",
+            ) from None
+
+    def _steps_after(self, origin: Any) -> list[Any]:
+        """The `horizon` times after `origin` on the fitted grid."""
+        if self._clock == "int64":
+            return [
+                origin + int(self._frequency) * (i + 1) for i in range(self.horizon)
+            ]
+        return _frequency.grid(origin, self.horizon, self._step)
+
+    @public
     def predict_quantiles(self, X: Any) -> np.ndarray:
         """Returns one row per supplied future row, in its original order."""
         queries = self._future(X)
@@ -306,8 +325,8 @@ class Forecaster(RegressorMixin, BaseEstimator):
             self._spec,
             self.context_,
             queries,
-            self._frequency,
-            allow_downloads=self.allow_downloads,
+            self._step,
+            allow_downloads=self.download,
         )
         ensure(
             np.isfinite(values).all(),
@@ -316,17 +335,88 @@ class Forecaster(RegressorMixin, BaseEstimator):
         )
         return values
 
+    @public
     def predict(self, X: Any) -> np.ndarray:
         """Returns the forecast median on the original target scale."""
         return self.predict_quantiles(X)[:, list(self.quantiles).index(0.5)]
 
-    def to_package(self, path: str | Path, *, name: str) -> Package:
-        """Exports the exact context, cadence, horizon and explicit covariate roles."""
+    @public
+    def forecast(self, horizon: int | None = None, *, future: Any = None) -> np.ndarray:
+        """Forecasts every fitted series past its last observation.
+
+        Args:
+            horizon: Steps to forecast; the fitted horizon if None. The
+                model's horizon is fixed at fit, so another value refits
+                the intent on the same context.
+            future: The future rows, one per series and step, with the
+                series, time and every `future_inputs` column; `future_grid()`
+                lists the times. Required when the forecaster has
+                `future_inputs`, and the only way to score with them.
+
+        Returns:
+            Quantiles `(series * horizon, levels)`, one row per series and
+            step, series in the order they were first seen (the order of
+            `future` when given).
+        """
         self._require_fitted()
+        if horizon is not None and horizon != self.horizon:
+            context = self.context_
+            self.set_params(horizon=horizon)
+            self.fit(context)
+        if future is None:
+            if self.future_inputs:
+                raise InvalidInput(
+                    "this forecaster has known-future inputs; pass forecast(future=...)",
+                    param="future",
+                    hint="future rows need "
+                    + ", ".join(self.future_inputs)
+                    + f" at each of the {self.horizon} times future_grid() lists",
+                )
+            future = self.future_grid()
+        return self.predict_quantiles(future)
+
+    @public
+    def future_grid(self) -> Any:
+        """The time grid `forecast` scores: `horizon` steps after each series.
+
+        Returns:
+            A pandas DataFrame with the series and time columns, one row per
+            series and step, series in the order they were first seen.
+        """
+        self._require_fitted()
+        latest: dict[str, dict] = {}
+        for row in self.context_.to_pylist():
+            key = self._identity(row)
+            if key not in latest or row[self.time] > latest[key][self.time]:
+                latest[key] = row
+        columns = [*self._spec.series, self.time]
+        rows = [
+            {**{name: last[name] for name in self._spec.series}, self.time: when}
+            for last in latest.values()
+            for when in self._steps_after(last[self.time])
+        ]
+        grid = pa.Table.from_pylist(rows, schema=self.context_.select(columns).schema)
+        return grid.to_pandas()
+
+    @public
+    def save(self, path: str | Path, *, name: str | None = None) -> "Predictor":
+        """Writes the fitted forecaster as a predictor directory at `path`.
+
+        Returns:
+            The saved predictor, `gf.Predictor(path)`, with `gf.yaml`,
+            `gf.lock` and the context snapshot.
+        """
+        from generalforecast.predictor import Predictor
+
+        self._require_fitted()
+        if name is None:
+            name = Path(path).resolve().name
         spec = admitted_spec(
             self.model, "forecast", self.context_, target=self.target, **self._intent()
         )
-        return export_package(path, name=name, spec=spec, context=self.context_)
+        return Predictor(
+            export_predictor(path, name=name, spec=spec, context=self.context_)
+        )
 
     def close(self) -> None:
         """Releases native context; the estimator must be fitted again."""
@@ -337,6 +427,7 @@ class Forecaster(RegressorMixin, BaseEstimator):
             "_spec",
             "_clock",
             "_frequency",
+            "_step",
             "_identities",
         ):
             self.__dict__.pop(name, None)

@@ -11,7 +11,20 @@ import time
 import pytest
 import yaml
 
-import generalforecast as gf
+from generalforecast import predictors
+from generalforecast.async_client import AsyncClient
+from generalforecast.client import Client
+from generalforecast.contracts import (
+    ContextImportRef,
+    Environment,
+    PredictionResult,
+    PredictorLock,
+    PromoteRequest,
+    Revision,
+)
+from generalforecast.deployments.contracts import ServiceError
+from generalforecast.deployments.sdk import ContextSpec
+from generalforecast.predictors.lock import read_lock
 from generalforecast.tabular import table_digest
 
 
@@ -21,78 +34,83 @@ async def invoke(function, *args, **kwargs):
 
 
 def checked(tmp_path, *, selection=False):
+    """A checked predictor directory: gf.yaml, its snapshot and the gf.lock it resolved to."""
     spec = {
         "name": "risk",
-        "model": "tabicl-classifier",
+        "model": "general-forecast/tabicl-v2-classifier",
         "target": "y",
-        "context": "history.csv",
+        "context": {"snapshot": "history.csv"},
         "id": "id",
-        "inputs": {"include": ["x"]},
+        "inputs": ["x"],
     }
     if selection:
-        spec["context"] = {
-            "source": "history.csv",
-            "selection": "most_recent",
-            "order_by": "id",
-            "max_rows": 2,
-        }
+        spec["selection"] = {"core": 0.5, "neighbors": 0.5, "kind": "stratified"}
     (tmp_path / "gf.yaml").write_text(yaml.safe_dump(spec))
     (tmp_path / "history.csv").write_text("id,x,y\na,1,false\nb,2,true\nc,3,false\n")
-    return gf.Package.load(tmp_path).check()
+    predictors.write_lock(
+        predictors.resolve(predictors.load(tmp_path), tmp_path), tmp_path
+    )
+    return tmp_path
+
+
+def checked_lock(root) -> PredictorLock:
+    """The lock a checked predictor directory holds."""
+    document = read_lock(root)
+    assert document is not None
+    return PredictorLock(document)
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_explicit_empty_environment_never_falls_back_to_production(
     wire, tmp_path, asynchronous
 ):
-    package = checked(tmp_path)
+    authored = checked(tmp_path)
 
     async def run():
-        client = (gf.AsyncClient if asynchronous else gf.Client)(
+        client = (AsyncClient if asynchronous else Client)(
             wire.url, project="test", api_key="fixture-key"
         )
         try:
             for operation, args, kwargs in (
-                (client.deployments.environment, ("risk", ""), {}),
-                (client.deployments.metrics, ("risk",), {"env": ""}),
-                (client.deployments.logs, ("risk",), {"env": ""}),
-                (client.deployments.predict, ("risk", {"x": [1]}), {"env": ""}),
+                (client.predictors.environment, ("risk", ""), {}),
+                (client.predictors.metrics, ("risk",), {"env": ""}),
+                (client.predictors.logs, ("risk",), {"env": ""}),
+                (client.predictors.predict, ("risk", {"x": [1]}), {"env": ""}),
                 (
-                    client.deployments.promote,
+                    client.predictors.promote,
                     ("risk",),
                     {"env": "", "revision": 1, "expected_generation": 0},
                 ),
                 (
-                    client.deployments.rollback,
+                    client.predictors.rollback,
                     ("risk",),
                     {"env": "", "revision": 1, "expected_generation": 0},
                 ),
-                (client.deployments.push, (package,), {"env": "", "runtime": "local"}),
+                (client.predictors.push, (authored,), {"env": "", "runtime": "local"}),
             ):
-                with pytest.raises(gf.ServiceError):
+                with pytest.raises(ServiceError):
                     await invoke(operation, *args, **kwargs)
             assert not wire.requests
         finally:
             await invoke(
-                client.aclose if isinstance(client, gf.AsyncClient) else client.close
+                client.aclose if isinstance(client, AsyncClient) else client.close
             )
 
     asyncio.run(run())
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_push_cas_readiness_rollback_and_dev_patch(wire, tmp_path, asynchronous):
-    package = checked(tmp_path, selection=True)
-    lock = package.compile()
-    assert package.context_table().num_rows == 2
-    assert package.snapshot_table().num_rows == 3
-    revision = gf.Revision("risk", 1, lock.package_digest, lock.model.name, time.time())
-    initial = gf.Environment("risk", "production", None, 0, "local")
-    pending = initial.promote(gf.PromoteRequest(1, 0))
+def test_push_cas_readiness_and_rollback(wire, tmp_path, asynchronous):
+    authored = checked(tmp_path, selection=True)
+    lock = checked_lock(authored)
+    assert lock.context_kind == "snapshot" and lock.context["rows"] == 3
+    revision = Revision("risk", 1, lock.digest, lock.model, time.time())
+    initial = Environment("risk", "production", None, 0, "local")
+    pending = initial.promote(PromoteRequest(1, 0))
     ready = dataclasses.replace(pending, status="ready")
-    base = "/deployments/risk"
+    base = "/predictors/risk"
     wire.expect("GET", base, "NotFound", status=404)
-    wire.expect("POST", "/deployments", {"name": "risk"}, payload={"name": "risk"})
+    wire.expect("POST", "/predictors", {"name": "risk"}, payload={"name": "risk"})
     wire.expect("POST", "/snapshots")
     wire.expect(
         "POST",
@@ -137,226 +155,141 @@ def test_push_cas_readiness_rollback_and_dev_patch(wire, tmp_path, asynchronous)
         payload={"revision": 1, "expected_generation": 1},
         status=409,
     )
-    dev = gf.DevSession(
-        "dev-test", "risk", 1, 0, lock.package_digest, time.time() + 600, "ready"
-    )
-    wire.expect(
-        "POST",
-        base + "/dev-sessions",
-        dev.to_dict(),
-        payload={"base_revision": 1, "runtime": "local", "ttl_seconds": 3600},
-    )
-    wire.expect("GET", base + "/dev-sessions/dev-test", dev.to_dict())
-    wire.expect("POST", "/snapshots")
-    patch = gf.PatchRequest(0, 1, lock, lock.data_digest)
-    patched = dev.apply_patch(patch, now=time.time())
-    wire.expect(
-        "POST",
-        base + "/dev-sessions/dev-test/patch",
-        patched.to_dict(),
-        payload=patch.to_dict(),
-    )
-    wire.expect("GET", base + "/environments/production", ready.to_dict())
-    wire.expect(
-        "POST",
-        base + "/dev-sessions/dev-test/stop",
-        dataclasses.replace(patched, status="stopped").to_dict(),
-        payload={},
-    )
     wire.expect(
         "POST", base + "/delete", {"name": "risk", "status": "stopped"}, payload={}
     )
 
     async def run():
-        client = (gf.AsyncClient if asynchronous else gf.Client)(
+        client = (AsyncClient if asynchronous else Client)(
             wire.url, project="test", api_key="fixture-key"
         )
         try:
             pushed = await invoke(
-                client.deployments.push, package, runtime="local", wait=True
+                client.predictors.push, authored, runtime="local", wait=True
             )
             assert pushed == revision
             uploaded = next(
                 value for path, value in wire.requests if path.endswith("/snapshots")
             )
             assert uploaded.num_rows == 3 and table_digest(uploaded) == lock.data_digest
-            deployment = await invoke(client.deployments.get, "risk", env="production")
+            deployment = await invoke(client.predictors.get, "risk", env="production")
             assert deployment.revision == 1 and deployment.status == "ready"
             with pytest.raises(dataclasses.FrozenInstanceError):
                 deployment.name = "changed"
-            assert await invoke(client.deployments.revisions, "risk") == (revision,)
-            assert (await invoke(client.deployments.revision, "risk", 1)).lock == lock
-            assert await invoke(client.deployments.environments, "risk") == (ready,)
+            assert await invoke(client.predictors.revisions, "risk") == (revision,)
+            assert (await invoke(client.predictors.revision, "risk", 1)).lock == lock
+            assert await invoke(client.predictors.environments, "risk") == (ready,)
             assert (await invoke(deployment.metrics))["requests"] == 0
             assert (await invoke(deployment.logs))["logs"] == []
-            with pytest.raises(gf.ServiceError) as error:
+            with pytest.raises(ServiceError) as error:
                 await invoke(deployment.rollback, revision=1)
             assert error.value.code == "Conflict" and "fixture-key" not in str(
                 error.value
             )
-            development = await invoke(
-                client.dev_sessions.start, "risk", base_revision=1, runtime="local"
-            )
-            assert (await invoke(development.refresh)).state == dev
-            updated = await invoke(development.patch, package)
-            assert updated.generation == 1 and development.generation == 0
-            assert await invoke(client.deployments.environment, "risk") == ready
-            assert (await invoke(updated.stop)).state.status == "stopped"
             assert (await invoke(deployment.delete))["status"] == "stopped"
         finally:
             await invoke(
-                client.aclose if isinstance(client, gf.AsyncClient) else client.close
+                client.aclose if isinstance(client, AsyncClient) else client.close
             )
 
     asyncio.run(run())
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_predictions_dataset_transactions_jobs_and_runtimes(wire, asynchronous):
+def test_predictions_and_context_transactions(wire, asynchronous):
     context = {"x": [1, 2], "y": [False, True]}
     result = {
-        "model": "catalog/tabicl-v2-classifier",
+        "model": "general-forecast/tabicl-v2-classifier",
         "task": "classification",
         "context": {"source": "request", "version": None, "rows": 2, "as_of": None},
-        "deployment": None,
+        "predictor": None,
         "revision": None,
         "environment": None,
         "predictions": [{"label": True, "probabilities": {"false": 0.1, "true": 0.9}}],
     }
     wire.expect(
         "POST",
-        "/predictions",
+        "/predict",
         result,
         payload={
-            "model": "tabicl-classifier",
-            "task": "classification",
-            "options": {},
+            "model": "general-forecast/tabicl-v2-classifier",
             "target": "y",
-            "features": ["x"],
             "context": [{"x": 1, "y": False}, {"x": 2, "y": True}],
             "queries": [{"x": 3}],
+            "inputs": ["x"],
         },
     )
     deployed_result = result | {
-        "deployment": "risk",
+        "predictor": "risk",
         "revision": 1,
         "environment": "production",
     }
     wire.expect(
         "POST",
-        "/deployments/risk/environments/production/predict",
+        "/predictors/risk/predict",
         deployed_result,
         payload={"queries": [{"x": 3}]},
     )
+    schema = ContextSpec("history", ("x",), {"y": "number"})
     wire.expect(
         "POST",
-        "/deployments/risk/dev-sessions/dev-test/predict",
-        deployed_result,
-        payload={"queries": [{"x": 4}]},
-    )
-    schema = gf.DatasetSpec("history", ("x",), (("y", "numeric"),))
-    wire.expect(
-        "POST",
-        "/datasets",
+        "/contexts",
         {"name": "history", "sequence": 0},
         payload=schema.to_dict(),
     )
     wire.expect(
         "POST",
-        "/datasets/history/mutations",
-        {"sequence": 1, "write_id": "append-1"},
-        payload={
-            "write_id": "append-1",
-            "operation": "create_features",
-            "records": [{"key": "row1", "features": {"x": 2}}],
-        },
+        "/contexts/history/append",
+        {"context": "history", "sequence": 1, "write_id": "append-1"},
+        payload={"write_id": "append-1", "rows": [{"id": "row1", "x": 2}]},
     )
     wire.expect(
         "POST",
-        "/datasets/history/mutations",
-        {"sequence": 2, "write_id": "label-1"},
+        "/contexts/history/label",
+        {"context": "history", "sequence": 2, "write_id": "label-1"},
         payload={
             "write_id": "label-1",
-            "operation": "attach_labels",
-            "records": [{"key": "row1", "labels": {"y": 1}}],
+            "target": "y",
+            "labels": [{"id": "row1", "value": 1}],
         },
     )
-    reference = gf.DatasetImportRef(
+    reference = ContextImportRef(
         "history", "s3://fixture-bucket/events", "parquet", "secret/reader"
     )
     wire.expect(
         "POST",
-        "/datasets/history/imports",
+        "/contexts/history/imports",
         {"digest": "sha256:" + "a" * 64, "sequence": 3},
         payload=reference.to_dict(),
     )
     wire.expect(
         "POST",
-        "/datasets/history/refresh",
+        "/contexts/history/refresh",
         {"name": "history", "sequence": 3},
         payload={},
     )
-    wire.expect("GET", "/datasets/history", {"name": "history", "sequence": 3})
-    spec = gf.JobSpec(
-        "score",
-        "submit-1",
-        "dataset.snapshot",
-        gf.Snapshot.from_dict({"dataset": "history"}),
-    )
-    wire.expect(
-        "POST", "/jobs", {"name": "score", "state": "queued"}, payload=spec.to_dict()
-    )
-    wire.expect("GET", "/jobs/score", {"name": "score", "state": "running"})
-    wire.expect("GET", "/jobs/score", {"name": "score", "state": "completed"})
-    wire.expect(
-        "GET",
-        "/jobs/score/results?offset=0&limit=100",
-        {"results": [{"row": 1}], "next_offset": None},
-    )
-    wire.expect(
-        "POST",
-        "/jobs/score/cancel",
-        {"name": "score", "state": "cancelled"},
-        payload={},
-    )
-    wire.expect(
-        "GET", "/runtimes", {"runtimes": [{"name": "local", "status": "ready"}]}
-    )
-    wire.expect("GET", "/runtimes/local", {"name": "local", "status": "ready"})
-    for action in ("preflight", "connect", "cleanup"):
-        wire.expect(
-            "POST",
-            "/runtimes/local/" + action,
-            "UnsupportedOperation",
-            payload={},
-            status=501,
-        )
+    wire.expect("GET", "/contexts/history", {"name": "history", "sequence": 3})
 
     async def run():
-        client = (gf.AsyncClient if asynchronous else gf.Client)(
+        client = (AsyncClient if asynchronous else Client)(
             wire.url, project="test", api_key="fixture-key"
         )
         try:
             prediction = await invoke(
                 client.predict,
-                model="tabicl-classifier",
-                target="y",
-                context=context,
-                queries={"x": [3]},
-                features=["x"],
+                "general-forecast/tabicl-v2-classifier",
+                "y",
+                context,
+                {"x": [3]},
+                inputs=["x"],
             )
-            assert isinstance(prediction, gf.PredictionResult)
+            assert isinstance(prediction, PredictionResult)
             assert prediction.to_numpy().shape == (1, 2)
             assert prediction.context.rows == 2
             assert (
-                await invoke(client.deployments.predict, "risk", {"x": [3]})
+                await invoke(client.predictors.predict, "risk", {"x": [3]})
             ).revision == 1
-            assert (
-                await invoke(
-                    client.dev_sessions.predict, "risk", "dev-test", {"x": [4]}
-                )
-            ).revision == 1
-            dataset = await invoke(client.datasets.create, schema)
+            dataset = await invoke(client.contexts.create, schema)
             assert dataset.sequence == 0
             receipt = await invoke(
                 dataset.append,
@@ -381,20 +314,9 @@ def test_predictions_dataset_transactions_jobs_and_runtimes(wire, asynchronous):
                 await invoke(dataset.refresh)
             ).sequence == 3 and dataset.sequence == 0
             assert (await invoke(dataset.status)).sequence == 3
-            job = await invoke(client.jobs.submit, spec)
-            assert (await invoke(job.poll)).state == "running" and job.state == "queued"
-            assert (await invoke(job.wait)).state == "completed"
-            assert (await invoke(job.results))["results"] == [{"row": 1}]
-            assert (await invoke(job.cancel)).state == "cancelled"
-            assert (await invoke(client.runtimes.list))[0].name == "local"
-            assert (await invoke(client.runtimes.get, "local"))["status"] == "ready"
-            for action in ("preflight", "connect", "cleanup"):
-                with pytest.raises(gf.ServiceError) as error:
-                    await invoke(getattr(client.runtimes, action), "local")
-                assert error.value.status == 501
         finally:
             await invoke(
-                client.aclose if isinstance(client, gf.AsyncClient) else client.close
+                client.aclose if isinstance(client, AsyncClient) else client.close
             )
 
     asyncio.run(run())
@@ -403,19 +325,19 @@ def test_predictions_dataset_transactions_jobs_and_runtimes(wire, asynchronous):
 @pytest.mark.parametrize("status", ["failed", "pending", "ready"])
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_wait_never_accepts_failure_or_a_superseded_pointer(wire, status, asynchronous):
-    state = gf.Environment(
+    state = Environment(
         "risk", "production", 2 if status == "ready" else 1, 2, "local", status
     )
-    wire.expect("GET", "/deployments/risk/environments/production", state.to_dict())
+    wire.expect("GET", "/predictors/risk/environments/production", state.to_dict())
 
     async def run():
-        client = (gf.AsyncClient if asynchronous else gf.Client)(
+        client = (AsyncClient if asynchronous else Client)(
             wire.url, project="test", api_key="fixture-key"
         )
         try:
-            with pytest.raises(gf.ServiceError) as error:
+            with pytest.raises(ServiceError) as error:
                 await invoke(
-                    client.deployments.wait,
+                    client.predictors.wait,
                     "risk",
                     revision=1,
                     generation=2,
@@ -423,14 +345,14 @@ def test_wait_never_accepts_failure_or_a_superseded_pointer(wire, status, asynch
                     poll_interval=1,
                 )
             assert error.value.code in {
-                "DeploymentFailed",
+                "EnvironmentFailed",
                 "Conflict",
                 "WaitTimeout",
                 "Timeout",
             }
         finally:
             await invoke(
-                client.aclose if isinstance(client, gf.AsyncClient) else client.close
+                client.aclose if isinstance(client, AsyncClient) else client.close
             )
 
     asyncio.run(run())
@@ -443,16 +365,16 @@ def test_snapshot_receipt_integrity(wire, asynchronous, corruption):
     wire.expect("POST", "/snapshots")
 
     async def run():
-        client = (gf.AsyncClient if asynchronous else gf.Client)(
+        client = (AsyncClient if asynchronous else Client)(
             wire.url, project="test", api_key="fixture-key"
         )
         try:
-            with pytest.raises(gf.ServiceError) as error:
+            with pytest.raises(ServiceError) as error:
                 await invoke(client.upload_snapshot, {"x": [1]})
             assert error.value.code == "ProtocolError"
         finally:
             await invoke(
-                client.aclose if isinstance(client, gf.AsyncClient) else client.close
+                client.aclose if isinstance(client, AsyncClient) else client.close
             )
 
     asyncio.run(run())
@@ -467,27 +389,27 @@ def test_local_file_import_uploads_content_before_logical_transaction(
     source = tmp_path / "data.csv"
     source.write_text("id,x,y\na,1,2\nb,2,3\n")
     digest = table_digest(to_arrow({"id": ["a", "b"], "x": [1, 2], "y": [2, 3]}))
-    reference = gf.DatasetImportRef(
+    reference = ContextImportRef(
         "history", "upload://" + digest, "arrow", digest=digest
     )
     wire.expect("POST", "/snapshots")
     wire.expect(
         "POST",
-        "/datasets/history/imports",
-        {"dataset": "history", "digest": digest, "rows": 2, "sequence": 1},
+        "/contexts/history/imports",
+        {"context": "history", "digest": digest, "rows": 2, "sequence": 1},
         payload=reference.to_dict(),
     )
 
     async def run():
-        client = (gf.AsyncClient if asynchronous else gf.Client)(
+        client = (AsyncClient if asynchronous else Client)(
             wire.url, project="test", api_key="fixture-key"
         )
         try:
-            receipt = await invoke(client.datasets.import_file, "history", source)
+            receipt = await invoke(client.contexts.import_file, "history", source)
             assert receipt.digest == digest and receipt.sequence == 1
         finally:
             await invoke(
-                client.aclose if isinstance(client, gf.AsyncClient) else client.close
+                client.aclose if isinstance(client, AsyncClient) else client.close
             )
 
     asyncio.run(run())

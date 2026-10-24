@@ -122,8 +122,8 @@ class ForecastRequest:
     fingerprint: str
     """SHA-256 of the model and its context, as hex: same context, same table."""
 
-class PackageContext:
-    """A tabular package's context, bound once.
+class PredictorContext:
+    """A tabular predictor's context, bound once.
 
     Its labeled rows encoded as the engine reads them, and the vocabularies
     its queries are encoded against.
@@ -151,18 +151,18 @@ class PackageContext:
         never held is NaN. Raises `RequestError` for a missing column or values of another kind.
         """
 
-def bind_package(
+def bind_predictor(
     schema: bytes,
     task: Literal["classification", "regression"],
     target: str,
     context: bytes,
-) -> PackageContext:
-    """Binds a tabular package's context from its lock's schema and its rows.
+) -> PredictorContext:
+    """Binds a tabular predictor's context from its lock's schema and its rows.
 
     `schema` is the lock's `TableSchema.to_dict()` as JSON, `task` is
     `classification` or `regression`, and `context` is the rows as an Arrow
     IPC stream. Only labeled rows are kept. Raises `RequestError`:
-    `EmptyContext` for no labeled rows, `InvalidPackage` for fewer than two
+    `EmptyContext` for no labeled rows, `InvalidPredictor` for fewer than two
     classes or columns that hold values of another kind.
     """
 
@@ -170,23 +170,17 @@ def parse_inference(
     payload: bytes,
     surface: Surface,
     *,
-    limits: Literal["request", "package"] = "request",
+    limits: Literal["request", "predictor"] = "request",
     levels: list[float] | None = None,
-    admission: Literal["catalog", "trusted"] = "catalog",
-    digest: str | None = None,
 ) -> TabularRequest | ForecastRequest:
     """Parses and validates an inference request's JSON payload, without the GIL.
 
     `surface` decides the gates its model passes, as for `resolve_model`.
-    `limits` is `request` for one Models API request's bounds or `package`
-    for a package's bound context, which its lock bounds instead. `levels`
+    `limits` is `request` for one Models API request's bounds or `predictor`
+    for a predictor's bound context, which its lock bounds instead. `levels`
     are the quantile levels a forecaster outputs, when its weights are
-    loaded; the catalog's declared levels otherwise. `admission` is
-    `catalog` for built-in models alone, or `trusted` for a local caller
-    that also forecasts with its own `module:function` model, at the
-    `levels` it gives; `digest` names that model's code, which the context's
-    fingerprint covers. Raises `RequestError` with the code, message and
-    status the Models API answers.
+    loaded; the catalog's declared levels otherwise. Raises `RequestError`
+    with the code, message and status the Models API answers.
     """
 
 class Strategy:
@@ -623,8 +617,8 @@ class Engine:
     def add_model(self, name: str, spec: str) -> None:
         """Has every worker load a model under `name` from `spec`.
 
-        `spec` is a built-in model's repository id or a `module:function`
-        spec; a worker serving that name already keeps it.
+        `spec` is a built-in model's repository id; a worker serving that
+        name already keeps it.
         """
     def tabular(
         self, model: str, request: TabularRequest

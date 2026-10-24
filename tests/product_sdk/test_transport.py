@@ -12,10 +12,10 @@ from typing import Any, cast
 import httpx
 import pytest
 
-from generalforecast import AsyncClient, Client, Profile, ServiceError
-from generalforecast.deployments.interfaces import InferenceRequest
-from generalforecast.models.catalog import ENTRIES, parse
-from generalforecast.transport import AsyncTransport, Transport, endpoint
+from generalforecast.async_client import AsyncClient
+from generalforecast.client import Client
+from generalforecast.deployments.contracts import ServiceError
+from generalforecast.transport import AsyncTransport, Profile, Transport, endpoint
 
 
 @pytest.mark.parametrize("client_type", [Client, AsyncClient])
@@ -154,16 +154,16 @@ def test_async_native_socket_request_and_scoped_envelope(wire, monkeypatch):
         pytest.fail("async request used synchronous network transport")
 
     monkeypatch.setattr(Transport, "send", forbidden)
-    wire.expect("GET", "/deployments/risk", {"name": "risk"})
+    wire.expect("GET", "/predictors/risk", {"name": "risk"})
 
     async def run():
         async with AsyncClient(
             wire.url, project="test", api_key="fixture-key"
         ) as client:
-            assert (await client.deployments.get("risk")).name == "risk"
+            assert (await client.predictors.get("risk")).name == "risk"
         assert client._transport._http.is_closed
         with pytest.raises(ServiceError) as error:
-            await client.deployments.get("risk")
+            await client.predictors.get("risk")
         assert error.value.code == "ClientClosed"
 
     asyncio.run(run())
@@ -569,49 +569,3 @@ def test_profile_lock_prevents_reproducible_lost_update(tmp_path, monkeypatch, l
         assert stored == {"seed", "p0", "p1"}
     else:
         assert stored < {"seed", "p0", "p1"} and len(stored) == 2
-
-
-@pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize(
-    "model",
-    [
-        "tabicl-classifier@4",
-        "tabicl-classifier@4*2",
-        "tabicl-regressor*2",
-        f"catalog/tabicl-v2-classifier@{ENTRIES['tabicl-v2-classifier'].artifact.digest}@4",
-    ],
-)
-def test_variant_resource_binding_keeps_the_full_reference(
-    monkeypatch, asynchronous, model
-):
-    request: InferenceRequest = {
-        "model": model,
-        "task": "regression" if "regressor" in model else "classification",
-        "target": "y",
-        "features": ["x"],
-        "context": [],
-        "queries": [],
-        "options": {},
-    }
-    captured = []
-    reply = {"outputs": []}
-
-    def post(resource, action, payload):
-        captured.append((resource, action, payload))
-        return reply
-
-    async def async_post(resource, action, payload):
-        return post(resource, action, payload)
-
-    if asynchronous:
-        client = AsyncClient(url="http://localhost", project="local", token="fixture")
-        monkeypatch.setattr(client.models, "_post", async_post)
-        result = asyncio.run(client.models.infer(request))
-    else:
-        client = Client(url="http://localhost", project="local", token="fixture")
-        monkeypatch.setattr(client.models, "_post", post)
-        result = client.models.infer(request)
-    assert result is reply
-    resource, action, payload = captured.pop()
-    assert (resource, action) == (parse(model).name, "infer")
-    assert payload == request and payload is not request

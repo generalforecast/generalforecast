@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Portable canonical JSON shared by content-addressed model and package identities."""
+"""Portable canonical JSON shared by content-addressed model and predictor identities."""
 
 import hashlib
 import json

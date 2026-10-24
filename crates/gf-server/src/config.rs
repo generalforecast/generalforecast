@@ -217,10 +217,10 @@ pub struct RevisionsConfig {
     pub url: String,
     /// The environment variable holding the control plane's service token.
     pub token_env: String,
-    /// Bytes of published packages held at once.
+    /// Bytes of published predictors held at once.
     #[serde(default = "revision_cache_bytes")]
     pub cache_bytes: u64,
-    /// How long a package nobody predicted from is held.
+    /// How long a predictor nobody predicted from is held.
     #[serde(default = "revision_idle_seconds")]
     pub idle_seconds: f64,
     /// How long an environment's revision is trusted before it is asked
@@ -382,7 +382,7 @@ pub struct WorkerConfig {
     /// its cores alone; `worker::CPU_WORKER_CORES` if unset.
     #[serde(default)]
     pub cpu_threads: Option<usize>,
-    /// Model name to spec: a built-in model's repository id, or `module:function`.
+    /// Model name to spec: a built-in model's repository id.
     pub models: BTreeMap<String, String>,
 }
 

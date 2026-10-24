@@ -30,12 +30,10 @@ JsonObject = dict[str, Any]
 ResourceKind = Literal[
     "workspace",
     "project",
-    "dataset",
+    "context",
+    "predictor",
     "source",
     "model",
-    "deployment",
-    "job",
-    "package",
     "operator",
     "api-key",
     "secret",
@@ -125,7 +123,7 @@ class Resource:
     name: str
 
     def __post_init__(self) -> None:
-        """Rejects unknown nouns rather than routing to a legacy resource."""
+        """Rejects unknown nouns rather than routing to a retired resource."""
         require(
             isinstance(self.kind, str) and self.kind in RESOURCE_KINDS,
             "invalid resource kind",
@@ -199,14 +197,24 @@ def success(request: Request, result: JsonObject) -> ResultEnvelope:
     return response
 
 
-def failure(request: Request, error: ServiceError) -> ErrorEnvelope:
-    """Wraps only an explicitly safe ServiceError, never arbitrary exceptions."""
+def failure(
+    request: Request, error: ServiceError, *, typed: bool = False
+) -> ErrorEnvelope:
+    """Wraps only an explicitly safe ServiceError, never arbitrary exceptions.
+
+    API requests carry the OpenAPI `ErrorCode`; a browser session's request
+    (`typed`) keeps the code the console's sign-in and membership flows
+    branch on.
+    """
     return {
         "api_version": VERSION,
         "project": request.scope.project,
         "request_id": request.scope.request_id,
         "resource": asdict(request.resource),
-        "error": {"code": error.code, "message": error.message},
+        "error": {
+            "code": error.code if typed else error.public,
+            "message": error.message,
+        },
     }
 
 

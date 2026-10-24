@@ -16,8 +16,8 @@ from generalforecast.engine import Labeled, LocalEngine
 from generalforecast.models.catalog import parse
 from tests.utils.engine import tabular_request
 
-REF = parse("tabicl-classifier")
-TINY = {"tabicl-classifier": "tests.models.tabicl.tiny:classifier"}
+REF = parse("general-forecast/tabicl-v2-classifier")
+TINY = {"general-forecast/tabicl-v2-classifier": "tests.models.tabicl.tiny:classifier"}
 CALLERS = 8
 
 
@@ -35,7 +35,7 @@ def _request(seed: int, queries: int = 4):
     context = (centers + generator.normal(size=(32, 5))).astype(np.float32)
     labels = [("a", "b", "c")[index % 3] for index in range(32)]
     return tabular_request(
-        "tabicl-classifier",
+        "general-forecast/tabicl-v2-classifier",
         context,
         labels,
         generator.normal(size=(queries, 5)).astype(np.float32),
@@ -70,7 +70,7 @@ def test_a_repeated_context_answers_alike(engine):
 def test_a_digest_pinned_reference_runs_its_spec(engine):
     digest = REF.entry.artifact.digest
     assert digest is not None
-    pinned = parse(f"tabicl-classifier@{digest}")
+    pinned = parse(f"general-forecast/tabicl-v2-classifier@{digest}")
     request = _request(300)
     np.testing.assert_allclose(
         engine.tabular(pinned, request), engine.tabular(REF, request), rtol=1e-5
@@ -97,9 +97,9 @@ def test_a_bound_context_answers_as_its_request_does(engine):
 
 
 def test_a_refused_model_never_reaches_the_workers(engine):
-    with pytest.raises(ValueError, match="only locally"):
+    with pytest.raises(ValueError, match="is not a catalog model id"):
         engine.gated("remote", False).tabular(
-            parse("tests.models.tabicl.tiny:classifier", trusted=True), _request(0)
+            parse("tests.models.tabicl.tiny:classifier"), _request(0)
         )
 
 
@@ -110,7 +110,7 @@ def test_the_engine_process_imports_no_model_code():
         "from generalforecast.models.catalog import parse\n"
         "from tests.test_engine import TINY, _request\n"
         "engine = LocalEngine(models=TINY, cpu_threads=8)\n"
-        "assert engine.tabular(parse('tabicl-classifier'), _request(0)).shape == (4, 3)\n"
+        "assert engine.tabular(parse('general-forecast/tabicl-v2-classifier'), _request(0)).shape == (4, 3)\n"
         "engine.close()\n"
         "loaded = [m for m in sys.modules if m.startswith(('jax', 'generalforecast.models.registry', 'generalforecast.models.tabicl', 'generalforecast.worker'))]\n"
         "assert not loaded, loaded\n"
