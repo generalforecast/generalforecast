@@ -17,7 +17,7 @@ import pytest
 pa = pytest.importorskip("pyarrow")
 flight = pytest.importorskip("pyarrow.flight")
 
-from tests.utils import legacy_client as generalforecast
+from tests.utils import engine_client as generalforecast
 from tests.utils.server import (
     NEAR_A,
     Router,

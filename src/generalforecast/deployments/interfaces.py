@@ -22,9 +22,7 @@ from generalforecast.deployments.boundary import JsonObject, Scope
 if TYPE_CHECKING:
     import pyarrow as pa
 
-    from generalforecast.packages import PackageLock
-    from generalforecast.python_packages.api import Table
-    from generalforecast.python_packages.compiler import PythonRevision
+    from generalforecast.deployments.predictor_runtime.lock import ExecutionLock
 
 WriteOperation = Literal[
     "create_features",
@@ -202,7 +200,7 @@ class DataPort(Protocol):
 
 
 class SourcePort(Protocol):
-    """A: pinned source reader for C, without owning job coordination."""
+    """A: pinned source reader for C, without owning revision coordination."""
 
     def pin(self, scope: Scope, spec: JsonObject) -> SourcePin:
         """Copies bounded regular JSONL/CSV bytes into a private immutable spool."""
@@ -224,29 +222,8 @@ class SourcePort(Protocol):
         ...
 
 
-class InferenceRequest(TypedDict):
-    """B: caller-supplied context and queries, never an ingest operation."""
-
-    model: str
-    task: Literal["classification", "regression", "forecast"]
-    target: str
-    features: list[str]
-    context: list[JsonObject]
-    queries: list[JsonObject]
-    options: JsonObject
-
-
-class InferenceResult(TypedDict):
-    """Scores/forecasts and actual artifact identity, not customer actions."""
-
-    task: Literal["classification", "regression", "forecast"]
-    outputs: list[JsonObject]
-    artifact: JsonObject
-    context_provenance: JsonObject
-
-
 class ModelPort(Protocol):
-    """B: curated catalog and bounded pure request-supplied-context inference."""
+    """B: the curated catalog gf-server serves; predictions go to gf-server."""
 
     def list(self, scope: Scope) -> list[JsonObject]:
         """Lists pins, license, bounds and supported/unconfigured capabilities."""
@@ -256,77 +233,12 @@ class ModelPort(Protocol):
         """Gets one curated model, without downloading or executing it."""
         ...
 
-    def infer(self, scope: Scope, request: InferenceRequest) -> InferenceResult:
-        """Validates task/context/query limits and runs the actual named adapter."""
-        ...
-
-
-class JobsPort(Protocol):
-    """C: durable resumable bounded jobs using DataPort/SourcePort/ModelPort."""
-
-    def submit(self, scope: Scope, spec: JsonObject) -> JsonObject:
-        """Persists validated import/batch/evaluation intent and immutable inputs."""
-        ...
-
-    def list(self, scope: Scope) -> list[JsonObject]:
-        """Lists actual persisted job states and issues, never cosmetic success."""
-        ...
-
-    def get(self, scope: Scope, job: str) -> JsonObject:
-        """Returns checkpoint, source/output manifests and issue report."""
-        ...
-
-    def run(self, scope: Scope, job: str, *, max_records: int = 100) -> JsonObject:
-        """Runs a bounded checkpoint from queued/interrupted state."""
-        ...
-
-    def control(
-        self,
-        scope: Scope,
-        job: str,
-        action: Literal["pause", "resume", "cancel", "retry"],
-    ) -> JsonObject:
-        """Retry of terminal issues creates a NEW LINKED job, not a report rewrite."""
-        ...
-
-
-class PackagePort(Protocol):
-    """D: immutable manifests and isolated execution proof, only if available."""
-
-    def inspect(self, scope: Scope, manifest: JsonObject) -> JsonObject:
-        """Validates manifest/digest/capabilities without importing customer code."""
-        ...
-
-    def register(self, scope: Scope, manifest: JsonObject) -> JsonObject:
-        """Persists a validated immutable manifest, not a running deployment."""
-        ...
-
-    def get(self, scope: Scope, package: str) -> JsonObject:
-        """Returns safe provenance and validation/execution evidence separately."""
-        ...
-
-    def list(self, scope: Scope) -> list[JsonObject]:
-        """Lists immutable package metadata and evidence, never secret values."""
-        ...
-
-    def test(self, scope: Scope, package: str) -> JsonObject:
-        """Runs only in verified isolated OCI, otherwise IsolationUnavailable."""
-        ...
-
 
 class OperatorPort(Protocol):
     """D: local-state lifecycle proof, not hosted placement or recovery."""
 
     def doctor(self, scope: Scope) -> JsonObject:
         """Returns redacted runtime/state/capability checks."""
-        ...
-
-    def backup(self, scope: Scope, spec: JsonObject) -> JsonObject:
-        """Creates a consistent bounded local backup with an immutable manifest."""
-        ...
-
-    def restore_check(self, scope: Scope, manifest: JsonObject) -> JsonObject:
-        """Restores into a NEW sandbox and checks it, never replacing live state."""
         ...
 
 
@@ -400,49 +312,10 @@ class ResourceFree:
 
 
 class NativeExecutor(Protocol):
-    """Trusted curated-model loading; never accepts uploaded Python packages."""
+    """Trusted curated-model loading; never accepts uploaded Python code."""
 
     def prepare(
-        self, lock: "PackageLock", context: "pa.Table | None"
+        self, lock: "ExecutionLock", context: "pa.Table | None"
     ) -> PreparedExecution:
         """Admit a lock, load verified weights and bind any snapshot context."""
-        ...
-
-
-class IsolatedWorker(Protocol):
-    """A started worker behind a verified isolation boundary, never the host."""
-
-    revision: "PythonRevision"
-    trust_boundary: str
-    image_id: str
-    closed: bool
-
-    def predict(self, table: "Table") -> "Table":
-        """Execute one bounded request inside the boundary."""
-        ...
-
-    def close(self) -> None:
-        """Verified teardown; raises when release cannot be confirmed."""
-        ...
-
-
-class OCIBase(Protocol):
-    """Operator-selected, hash-verified Python OCI base image bytes."""
-
-    manifest: bytes
-    config: bytes
-    layers: tuple[bytes, ...]
-
-
-class IsolatedExecutor(Protocol):
-    """Operator-configured isolated Python executor port."""
-
-    base: OCIBase
-
-    def start(self, scope: Scope, revision: "PythonRevision") -> IsolatedWorker:
-        """Start and admit one isolated worker for a verified revision."""
-        ...
-
-    def retry_cleanup(self) -> None:
-        """Retry verified teardown of retained failed starts and workers."""
         ...

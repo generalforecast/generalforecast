@@ -156,9 +156,7 @@ def warm(task: str, widths: Iterable[int]) -> None:
     from generalforecast import Classifier, Regressor
 
     rng = np.random.default_rng(0)
-    estimator = (Classifier if task == "classifier" else Regressor)(
-        allow_downloads=True
-    )
+    estimator = (Classifier if task == "classifier" else Regressor)(download=True)
     for rows in (100, 1000):
         for width in widths:
             data = rng.normal(size=(rows + rows // 10, width))

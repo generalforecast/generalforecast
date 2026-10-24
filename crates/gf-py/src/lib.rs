@@ -13,15 +13,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gf_core::cache::{Eviction, Kind, ModelId, TierConfig};
-use gf_core::catalog::{self, Admission, Surface};
+use gf_core::catalog::{self, Surface};
 use gf_core::categories::CategoryEncoding;
 use gf_core::forecasting::{self, SeriesSpec};
 use gf_core::node::{
     self, CutoffRefit, DEFAULT_FIT_ROWS, EntrySizes, ErrorKind, NodeError, PastCap, RefitPolicy,
     RequestId, StepRows, SummaryScope, TableId, TableSpec, Targets, Task,
 };
-use gf_core::package;
 use gf_core::planner;
+use gf_core::predictor;
 use gf_core::regions::{Rebuild, RebuildWait, RegionSpec};
 use gf_core::request::{self, Inference, Label, Limits, Num, Options};
 use gf_core::table::RowId;
@@ -1713,44 +1713,29 @@ fn forecast_request(py: Python<'_>, parsed: request::Forecast) -> PyResult<Forec
 /// Parses and validates an inference request's JSON payload, without the GIL.
 ///
 /// `surface` decides the gates its model passes, as for `resolve_model`.
-/// `limits` is `request` for one Models API request's bounds or `package`
-/// for a package's bound context, which its lock bounds instead. `levels`
+/// `limits` is `request` for one Models API request's bounds or `predictor`
+/// for a predictor's bound context, which its lock bounds instead. `levels`
 /// are the quantile levels a forecaster outputs, when its weights are
-/// loaded; the catalog's declared levels otherwise. `admission` is
-/// `catalog` for built-in models alone, or `trusted` for a local caller
-/// that also forecasts with its own `module:function` model, at the
-/// `levels` it gives; `digest` names that model's code, which the context's
-/// fingerprint covers. Raises `RequestError` with the code, message and
-/// status the Models API answers.
+/// loaded; the catalog's declared levels otherwise. Raises `RequestError`
+/// with the code, message and status the Models API answers.
 #[pyfunction]
-#[pyo3(signature = (payload, surface, *, limits = "request", levels = None, admission = "catalog", digest = None))]
+#[pyo3(signature = (payload, surface, *, limits = "request", levels = None))]
 fn parse_inference(
     py: Python<'_>,
     payload: &[u8],
     surface: &str,
     limits: &str,
     levels: Option<Vec<f64>>,
-    admission: &str,
-    digest: Option<String>,
 ) -> PyResult<Py<PyAny>> {
-    let admission = match (admission, digest.as_deref()) {
-        ("catalog", None) => Admission::Catalog,
-        ("trusted", Some(digest)) => Admission::Trusted { digest },
-        ("catalog" | "trusted", _) => {
-            return Err(invalid("only a trusted admission names its code's digest"));
-        }
-        _ => return Err(invalid(format!("unknown model admission {admission:?}"))),
-    };
     let limits = match limits {
         "request" => Limits::Request,
-        "package" => Limits::Package,
+        "predictor" => Limits::Predictor,
         _ => return Err(invalid(format!("unknown request limits {limits:?}"))),
     };
     let options = Options {
         surface: self::surface(surface)?,
         limits,
         levels: levels.as_deref(),
-        admission,
     };
     match py
         .detach(|| request::parse(payload, &options))
@@ -1769,15 +1754,15 @@ fn record_batch(payload: &[u8]) -> PyResult<arrow_array::RecordBatch> {
     arrow_select::concat::concat_batches(&schema, &batches).map_err(invalid)
 }
 
-/// A tabular package's context, bound once.
+/// A tabular predictor's context, bound once.
 ///
 /// Its labeled rows encoded as the engine reads them, and the vocabularies
 /// its queries are encoded against.
 #[pyclass(frozen)]
-struct PackageContext(package::Context);
+struct PredictorContext(predictor::Context);
 
 #[pymethods]
-impl PackageContext {
+impl PredictorContext {
     /// The labeled rows' features, `(rows, width)`.
     #[getter]
     fn features(&self, py: Python<'_>) -> PyResult<Py<PyArray2<f32>>> {
@@ -1830,30 +1815,30 @@ impl PackageContext {
     }
 }
 
-/// Binds a tabular package's context from its lock's schema and its rows.
+/// Binds a tabular predictor's context from its lock's schema and its rows.
 ///
 /// `schema` is the lock's `TableSchema.to_dict()` as JSON, `task` is
 /// `classification` or `regression`, and `context` is the rows as an Arrow
 /// IPC stream. Only labeled rows are kept. Raises `RequestError`:
-/// `EmptyContext` for no labeled rows, `InvalidPackage` for fewer than two
+/// `EmptyContext` for no labeled rows, `InvalidPredictor` for fewer than two
 /// classes or columns that hold values of another kind.
 #[pyfunction]
-fn bind_package(
+fn bind_predictor(
     py: Python<'_>,
     schema: &[u8],
     task: &str,
     target: &str,
     context: &[u8],
-) -> PyResult<PackageContext> {
-    let schema: package::Schema = serde_json::from_slice(schema).map_err(invalid)?;
+) -> PyResult<PredictorContext> {
+    let schema: predictor::Schema = serde_json::from_slice(schema).map_err(invalid)?;
     let task = match task {
         "classification" => catalog::Task::Classification,
         "regression" => catalog::Task::Regression,
-        _ => return Err(invalid(format!("a tabular package has no task {task:?}"))),
+        _ => return Err(invalid(format!("a tabular predictor has no task {task:?}"))),
     };
     let rows = record_batch(context)?;
-    py.detach(|| package::bind(&schema, task, target, &rows))
-        .map(PackageContext)
+    py.detach(|| predictor::bind(&schema, task, target, &rows))
+        .map(PredictorContext)
         .map_err(refused)
 }
 
@@ -1863,8 +1848,8 @@ fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(resolve_model, module)?)?;
     module.add_function(wrap_pyfunction!(parse_inference, module)?)?;
     module.add_function(wrap_pyfunction!(quantile_levels, module)?)?;
-    module.add_function(wrap_pyfunction!(bind_package, module)?)?;
-    module.add_class::<PackageContext>()?;
+    module.add_function(wrap_pyfunction!(bind_predictor, module)?)?;
+    module.add_class::<PredictorContext>()?;
     module.add_class::<engine::Engine>()?;
     module.add_class::<engine::BoundTable>()?;
     module.add("RequestError", module.py().get_type::<RequestError>())?;

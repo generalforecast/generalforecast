@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Authenticated package deployment interfaces."""
+"""Authenticated hosted predictor interfaces."""
 
 from generalforecast.deployments.contracts import ServiceError
 

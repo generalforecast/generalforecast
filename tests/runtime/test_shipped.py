@@ -12,7 +12,7 @@ from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from generalforecast.runtime import shipped
 
 IDENTITY = "ec5390d8e4be91b0"
-MODEL = "tabicl-v2-classifier"
+MODEL = "general-forecast/tabicl-v2-classifier"
 
 
 def _raw(key: Ed25519PrivateKey) -> bytes:

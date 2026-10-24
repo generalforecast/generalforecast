@@ -34,14 +34,14 @@ class Published(NamedTuple):
 
 
 PUBLISHED = {
-    "mitra-classifier": Published(
+    "general-forecast/mitra-classifier": Published(
         "autogluon/mitra-classifier", "c425e9fa0910a6be1c494321792e7ba2a1367b1a"
     ),
-    "mitra-regressor": Published(
+    "general-forecast/mitra-regressor": Published(
         "autogluon/mitra-regressor", "5f277aa8f69042d39d6ac3612aed18bb9279bd95"
     ),
     # The upstream revisions the general-forecast mirrors were converted from.
-    "mitra-2-classifier": Published(
+    "general-forecast/mitra-2-classifier": Published(
         "autogluon/mitra-classifier-2", "edada0d20759c58ada8c8605c25f22f6e98ea5f0"
     ),
     "mitra-2-regressor": Published(
@@ -55,21 +55,22 @@ SUPPORTED: dict[str, tuple[Any, ...]] = {"task": ("CLASSIFICATION", "REGRESSION"
 SIZES = ("dim", "dim_output", "n_layers", "n_heads")
 
 
-def mitra_checkpoint(name: str) -> Path:
+def mitra_checkpoint(id: str) -> Path:
     """A Mitra checkpoint directory, converted from the published one if missing.
 
     With `GF_CHECKPOINTS` set, the directory must already be there, as on
     machines without internet. Otherwise it is kept under `~/.cache/generalforecast`.
 
     Args:
-        name: A key of `PUBLISHED`, such as `mitra-classifier`.
+        id: A key of `PUBLISHED`, such as `general-forecast/mitra-classifier`.
 
     Returns:
         A directory with `config.json` and `model.safetensors`.
     """
-    if name in catalog.ENTRIES and catalog.ENTRIES[name].artifact.files:
-        return checkpoint(catalog.ENTRIES[name])
-    published = PUBLISHED[name]
+    if id in catalog.ENTRIES and catalog.ENTRIES[id].artifact.files:
+        return checkpoint(catalog.ENTRIES[id])
+    published = PUBLISHED[id]
+    name = catalog.short_name(id)
 
     def convert(directory: Path) -> None:
         config, weights = (

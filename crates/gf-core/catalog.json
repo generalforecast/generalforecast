@@ -12,64 +12,72 @@
     "max_members": 16
   },
   "names": {
-    "amazon/chronos-2": "chronos-2",
-    "autogluon/mitra-classifier-2": "mitra-2-classifier",
-    "autogluon/mitra-regressor-2": "mitra-2-regressor",
-    "chronos-2": "chronos-2",
-    "general-forecast/chronos-2": "chronos-2",
-    "general-forecast/kumo-tabular-large-classifier": "kumo-tabular-large-classifier",
-    "general-forecast/kumo-tabular-large-regressor": "kumo-tabular-large-regressor",
-    "general-forecast/kumo-tabular-medium-classifier": "kumo-tabular-medium-classifier",
-    "general-forecast/kumo-tabular-medium-regressor": "kumo-tabular-medium-regressor",
-    "general-forecast/kumo-tabular-small-classifier": "kumo-tabular-small-classifier",
-    "general-forecast/kumo-tabular-small-regressor": "kumo-tabular-small-regressor",
-    "general-forecast/limix-2-classifier": "limix-2-classifier",
-    "general-forecast/limix-2-regressor": "limix-2-regressor",
-    "general-forecast/mitra-2-classifier": "mitra-2-classifier",
-    "general-forecast/mitra-2-regressor": "mitra-2-regressor",
-    "general-forecast/mitra-classifier": "mitra-classifier",
     "general-forecast/tabicl-v2-classifier": "tabicl-v2-classifier",
     "general-forecast/tabicl-v2-regressor": "tabicl-v2-regressor",
+    "general-forecast/kumo-tabular-small-classifier": "kumo-tabular-small-classifier",
+    "general-forecast/kumo-tabular-small-regressor": "kumo-tabular-small-regressor",
+    "general-forecast/kumo-tabular-medium-classifier": "kumo-tabular-medium-classifier",
+    "general-forecast/kumo-tabular-medium-regressor": "kumo-tabular-medium-regressor",
+    "general-forecast/kumo-tabular-large-classifier": "kumo-tabular-large-classifier",
+    "general-forecast/kumo-tabular-large-regressor": "kumo-tabular-large-regressor",
     "general-forecast/tabpfn-3-classifier": "tabpfn-3-classifier",
     "general-forecast/tabpfn-3-regressor": "tabpfn-3-regressor",
     "general-forecast/tabpfn-3.5-classifier": "tabpfn-3.5-classifier",
     "general-forecast/tabpfn-3.5-regressor": "tabpfn-3.5-regressor",
-    "general-forecast/timesfm-3": "timesfm-3",
+    "general-forecast/limix-2-classifier": "limix-2-classifier",
+    "general-forecast/limix-2-regressor": "limix-2-regressor",
+    "general-forecast/mitra-classifier": "mitra-classifier",
+    "general-forecast/mitra-2-classifier": "mitra-2-classifier",
+    "general-forecast/mitra-2-regressor": "mitra-2-regressor",
+    "general-forecast/chronos-2": "chronos-2",
     "general-forecast/timestral-209m": "timestral-209m",
     "general-forecast/timestral-209m-unmirrored": "timestral-209m-unmirrored",
     "general-forecast/timestral-28m": "timestral-28m",
     "general-forecast/timestral-28m-unmirrored": "timestral-28m-unmirrored",
-    "kumo-tabular-large-classifier": "kumo-tabular-large-classifier",
-    "kumo-tabular-large-regressor": "kumo-tabular-large-regressor",
-    "kumo-tabular-medium-classifier": "kumo-tabular-medium-classifier",
-    "kumo-tabular-medium-regressor": "kumo-tabular-medium-regressor",
-    "kumo-tabular-small-classifier": "kumo-tabular-small-classifier",
-    "kumo-tabular-small-regressor": "kumo-tabular-small-regressor",
-    "limix-2-classifier": "limix-2-classifier",
-    "limix-2-regressor": "limix-2-regressor",
-    "mistralai/Timestral-209M": "timestral-209m",
-    "mistralai/Timestral-28M": "timestral-28m",
-    "mitra-2-classifier": "mitra-2-classifier",
-    "mitra-2-regressor": "mitra-2-regressor",
-    "mitra-classifier": "mitra-classifier",
-    "tabicl-classifier": "tabicl-v2-classifier",
-    "tabicl-regressor": "tabicl-v2-regressor",
-    "tabicl-v2-classifier": "tabicl-v2-classifier",
-    "tabicl-v2-regressor": "tabicl-v2-regressor",
-    "tabpfn-3-classifier": "tabpfn-3-classifier",
-    "tabpfn-3-regressor": "tabpfn-3-regressor",
-    "tabpfn-3.5-classifier": "tabpfn-3.5-classifier",
-    "tabpfn-3.5-regressor": "tabpfn-3.5-regressor",
-    "timesfm-3": "timesfm-3",
-    "timestral-209m": "timestral-209m",
-    "timestral-209m-unmirrored": "timestral-209m-unmirrored",
-    "timestral-28m": "timestral-28m",
-    "timestral-28m-unmirrored": "timestral-28m-unmirrored"
+    "general-forecast/timesfm-3": "timesfm-3"
+  },
+  "aliases": {
+    "amazon/chronos-2": "general-forecast/chronos-2",
+    "autogluon/mitra-classifier-2": "general-forecast/mitra-2-classifier",
+    "autogluon/mitra-regressor-2": "general-forecast/mitra-2-regressor",
+    "chronos-2": "general-forecast/chronos-2",
+    "kumo-tabular-large-classifier": "general-forecast/kumo-tabular-large-classifier",
+    "kumo-tabular-large-regressor": "general-forecast/kumo-tabular-large-regressor",
+    "kumo-tabular-medium-classifier": "general-forecast/kumo-tabular-medium-classifier",
+    "kumo-tabular-medium-regressor": "general-forecast/kumo-tabular-medium-regressor",
+    "kumo-tabular-small-classifier": "general-forecast/kumo-tabular-small-classifier",
+    "kumo-tabular-small-regressor": "general-forecast/kumo-tabular-small-regressor",
+    "limix-2-classifier": "general-forecast/limix-2-classifier",
+    "limix-2-regressor": "general-forecast/limix-2-regressor",
+    "mistralai/Timestral-209M": "general-forecast/timestral-209m",
+    "mistralai/Timestral-28M": "general-forecast/timestral-28m",
+    "mitra-2-classifier": "general-forecast/mitra-2-classifier",
+    "mitra-2-regressor": "general-forecast/mitra-2-regressor",
+    "mitra-classifier": "general-forecast/mitra-classifier",
+    "tabicl-classifier": "general-forecast/tabicl-v2-classifier",
+    "tabicl-regressor": "general-forecast/tabicl-v2-regressor",
+    "tabicl-v2-classifier": "general-forecast/tabicl-v2-classifier",
+    "tabicl-v2-regressor": "general-forecast/tabicl-v2-regressor",
+    "tabpfn-3-classifier": "general-forecast/tabpfn-3-classifier",
+    "tabpfn-3-regressor": "general-forecast/tabpfn-3-regressor",
+    "tabpfn-3.5-classifier": "general-forecast/tabpfn-3.5-classifier",
+    "tabpfn-3.5-regressor": "general-forecast/tabpfn-3.5-regressor",
+    "timesfm-3": "general-forecast/timesfm-3",
+    "timestral-209m": "general-forecast/timestral-209m",
+    "timestral-209m-unmirrored": "general-forecast/timestral-209m-unmirrored",
+    "timestral-28m": "general-forecast/timestral-28m",
+    "timestral-28m-unmirrored": "general-forecast/timestral-28m-unmirrored"
   },
   "entries": [
     {
+      "id": "general-forecast/tabicl-v2-classifier",
       "name": "tabicl-v2-classifier",
       "task": "classification",
+      "limits": {
+        "context_rows": 60000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:b141070296a7981994afbf7c832e8bf9aa85657ed54baa8f231fcbcbca752b4d",
       "pinned": true,
       "hostable": true,
@@ -79,17 +87,23 @@
         "quantile_step": null
       },
       "gates": {
-        "package": true,
+        "predictor": true,
         "remote": true,
         "variants": [
-          "package",
+          "predictor",
           "remote"
         ]
       }
     },
     {
+      "id": "general-forecast/tabicl-v2-regressor",
       "name": "tabicl-v2-regressor",
       "task": "regression",
+      "limits": {
+        "context_rows": 60000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:1c75c9897514647ecf588e630c3a39e206ae05c7bb4f40138685ea13dae7778e",
       "pinned": true,
       "hostable": true,
@@ -99,17 +113,23 @@
         "quantile_step": 0.001
       },
       "gates": {
-        "package": true,
+        "predictor": true,
         "remote": true,
         "variants": [
-          "package",
+          "predictor",
           "remote"
         ]
       }
     },
     {
+      "id": "general-forecast/kumo-tabular-small-classifier",
       "name": "kumo-tabular-small-classifier",
       "task": "classification",
+      "limits": {
+        "context_rows": 60000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:af83a13ff2d9fcee675b72816d1880566c8958295b8f75d97ab6ca5a08df0ad6",
       "pinned": true,
       "hostable": true,
@@ -119,7 +139,7 @@
         "quantile_step": null
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": true,
         "variants": [
           "remote"
@@ -127,8 +147,14 @@
       }
     },
     {
+      "id": "general-forecast/kumo-tabular-small-regressor",
       "name": "kumo-tabular-small-regressor",
       "task": "regression",
+      "limits": {
+        "context_rows": 60000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:b2104e0bc59c5f3e72837ee575cc53c5eea5fb7195524fed0bc724213a25280b",
       "pinned": true,
       "hostable": true,
@@ -138,7 +164,7 @@
         "quantile_step": 0.001
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": true,
         "variants": [
           "remote"
@@ -146,8 +172,14 @@
       }
     },
     {
+      "id": "general-forecast/kumo-tabular-medium-classifier",
       "name": "kumo-tabular-medium-classifier",
       "task": "classification",
+      "limits": {
+        "context_rows": 60000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:d0f1d0a68c9821eb94a401b593be4c496b7db08bdb72d8d162f1483f6f79ea6a",
       "pinned": true,
       "hostable": true,
@@ -157,7 +189,7 @@
         "quantile_step": null
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": true,
         "variants": [
           "remote"
@@ -165,8 +197,14 @@
       }
     },
     {
+      "id": "general-forecast/kumo-tabular-medium-regressor",
       "name": "kumo-tabular-medium-regressor",
       "task": "regression",
+      "limits": {
+        "context_rows": 60000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:08b46a47a33da7a542f295406d1433a1257e834bbaed85ebe6faf88eef208da7",
       "pinned": true,
       "hostable": true,
@@ -176,7 +214,7 @@
         "quantile_step": 0.001
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": true,
         "variants": [
           "remote"
@@ -184,8 +222,14 @@
       }
     },
     {
+      "id": "general-forecast/kumo-tabular-large-classifier",
       "name": "kumo-tabular-large-classifier",
       "task": "classification",
+      "limits": {
+        "context_rows": 60000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:87dd7bd4bb5776ba023c297f67073a15d26b74272e2a840705cd4191b65b2503",
       "pinned": true,
       "hostable": true,
@@ -195,7 +239,7 @@
         "quantile_step": null
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": true,
         "variants": [
           "remote"
@@ -203,8 +247,14 @@
       }
     },
     {
+      "id": "general-forecast/kumo-tabular-large-regressor",
       "name": "kumo-tabular-large-regressor",
       "task": "regression",
+      "limits": {
+        "context_rows": 60000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:9e115734ca4f903d843f6f308e3fdc632ac757b37c44bfd03fd1a1a4657b9f99",
       "pinned": true,
       "hostable": true,
@@ -214,7 +264,7 @@
         "quantile_step": 0.001
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": true,
         "variants": [
           "remote"
@@ -222,8 +272,14 @@
       }
     },
     {
+      "id": "general-forecast/tabpfn-3-classifier",
       "name": "tabpfn-3-classifier",
       "task": "classification",
+      "limits": {
+        "context_rows": 100000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:92a4e97902b4b1d1a3a97c49ce14d9827e23e9aba51ab9d7b54f78ee4d3c02d1",
       "pinned": true,
       "hostable": false,
@@ -233,14 +289,20 @@
         "quantile_step": null
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": false,
         "variants": []
       }
     },
     {
+      "id": "general-forecast/tabpfn-3-regressor",
       "name": "tabpfn-3-regressor",
       "task": "regression",
+      "limits": {
+        "context_rows": 100000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:617d67e809ca2e0f71f7ab3393742be8d6956e795f16f29f92df5e7856a243eb",
       "pinned": true,
       "hostable": false,
@@ -250,14 +312,20 @@
         "quantile_step": 0.001
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": false,
         "variants": []
       }
     },
     {
+      "id": "general-forecast/tabpfn-3.5-classifier",
       "name": "tabpfn-3.5-classifier",
       "task": "classification",
+      "limits": {
+        "context_rows": 100000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:d77b50e82f8595564acdd0a01ecd1aec32c118643931292661b65d765bc20e53",
       "pinned": true,
       "hostable": false,
@@ -267,14 +335,20 @@
         "quantile_step": null
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": false,
         "variants": []
       }
     },
     {
+      "id": "general-forecast/tabpfn-3.5-regressor",
       "name": "tabpfn-3.5-regressor",
       "task": "regression",
+      "limits": {
+        "context_rows": 100000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:d77b50e82f8595564acdd0a01ecd1aec32c118643931292661b65d765bc20e53",
       "pinned": true,
       "hostable": false,
@@ -284,14 +358,20 @@
         "quantile_step": 0.001
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": false,
         "variants": []
       }
     },
     {
+      "id": "general-forecast/limix-2-classifier",
       "name": "limix-2-classifier",
       "task": "classification",
+      "limits": {
+        "context_rows": 100000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": null,
       "pinned": false,
       "hostable": false,
@@ -301,14 +381,20 @@
         "quantile_step": null
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": false,
         "variants": []
       }
     },
     {
+      "id": "general-forecast/limix-2-regressor",
       "name": "limix-2-regressor",
       "task": "regression",
+      "limits": {
+        "context_rows": 100000,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": null,
       "pinned": false,
       "hostable": false,
@@ -318,14 +404,20 @@
         "quantile_step": 0.001
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": false,
         "variants": []
       }
     },
     {
+      "id": "general-forecast/mitra-classifier",
       "name": "mitra-classifier",
       "task": "classification",
+      "limits": {
+        "context_rows": 512,
+        "queries": 100,
+        "inputs": 16
+      },
       "digest": null,
       "pinned": false,
       "hostable": false,
@@ -335,14 +427,20 @@
         "quantile_step": null
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": false,
         "variants": []
       }
     },
     {
+      "id": "general-forecast/mitra-2-classifier",
       "name": "mitra-2-classifier",
       "task": "classification",
+      "limits": {
+        "context_rows": 5120,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:18942caeea56ce353ff6944fac391cf0832bef2cf4591e65e29ccf406ff41d9c",
       "pinned": true,
       "hostable": true,
@@ -352,7 +450,7 @@
         "quantile_step": null
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": true,
         "variants": [
           "remote"
@@ -360,8 +458,14 @@
       }
     },
     {
+      "id": "general-forecast/mitra-2-regressor",
       "name": "mitra-2-regressor",
       "task": "regression",
+      "limits": {
+        "context_rows": 5120,
+        "queries": 100,
+        "inputs": 32
+      },
       "digest": "sha256:3e8eba463c96c417db410a68c5e65d3a68ca0d84a7daf5c868bc6b4599fc1c04",
       "pinned": true,
       "hostable": true,
@@ -371,7 +475,7 @@
         "quantile_step": 0.001
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": true,
         "variants": [
           "remote"
@@ -379,8 +483,14 @@
       }
     },
     {
+      "id": "general-forecast/chronos-2",
       "name": "chronos-2",
       "task": "forecast",
+      "limits": {
+        "context_rows": 100000,
+        "queries": 8,
+        "inputs": 8
+      },
       "digest": "sha256:f29896cb84d2c1b74cec30fe21c2f811bf50af92e381bf41f4093057a1bcd3a4",
       "pinned": true,
       "hostable": true,
@@ -412,14 +522,20 @@
         "quantile_step": null
       },
       "gates": {
-        "package": true,
+        "predictor": true,
         "remote": true,
         "variants": []
       }
     },
     {
+      "id": "general-forecast/timestral-209m",
       "name": "timestral-209m",
       "task": "forecast",
+      "limits": {
+        "context_rows": 100000,
+        "queries": 8,
+        "inputs": 8
+      },
       "digest": "sha256:bc0a189341ea67114a796198fcef92f3292d6923bff6facb9426a67fba187cb2",
       "pinned": true,
       "hostable": true,
@@ -429,7 +545,7 @@
         "quantile_step": null
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": true,
         "variants": [
           "remote"
@@ -437,8 +553,14 @@
       }
     },
     {
+      "id": "general-forecast/timestral-209m-unmirrored",
       "name": "timestral-209m-unmirrored",
       "task": "forecast",
+      "limits": {
+        "context_rows": 100000,
+        "queries": 8,
+        "inputs": 8
+      },
       "digest": "sha256:bc0a189341ea67114a796198fcef92f3292d6923bff6facb9426a67fba187cb2",
       "pinned": true,
       "hostable": true,
@@ -448,7 +570,7 @@
         "quantile_step": null
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": true,
         "variants": [
           "remote"
@@ -456,8 +578,14 @@
       }
     },
     {
+      "id": "general-forecast/timestral-28m",
       "name": "timestral-28m",
       "task": "forecast",
+      "limits": {
+        "context_rows": 100000,
+        "queries": 8,
+        "inputs": 8
+      },
       "digest": "sha256:107de4d189d000a65be1ec94f8161ea75fee30a64cfc2d11c7db79b7ef43695d",
       "pinned": true,
       "hostable": true,
@@ -467,7 +595,7 @@
         "quantile_step": null
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": true,
         "variants": [
           "remote"
@@ -475,8 +603,14 @@
       }
     },
     {
+      "id": "general-forecast/timestral-28m-unmirrored",
       "name": "timestral-28m-unmirrored",
       "task": "forecast",
+      "limits": {
+        "context_rows": 100000,
+        "queries": 8,
+        "inputs": 8
+      },
       "digest": "sha256:107de4d189d000a65be1ec94f8161ea75fee30a64cfc2d11c7db79b7ef43695d",
       "pinned": true,
       "hostable": true,
@@ -486,7 +620,7 @@
         "quantile_step": null
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": true,
         "variants": [
           "remote"
@@ -494,8 +628,14 @@
       }
     },
     {
+      "id": "general-forecast/timesfm-3",
       "name": "timesfm-3",
       "task": "forecast",
+      "limits": {
+        "context_rows": 100000,
+        "queries": 8,
+        "inputs": 8
+      },
       "digest": "sha256:388f65beaa6feae14530e32eb08da19d4db70d3b7aa1575e7506ffe2d665eaf3",
       "pinned": true,
       "hostable": false,
@@ -505,7 +645,7 @@
         "quantile_step": null
       },
       "gates": {
-        "package": false,
+        "predictor": false,
         "remote": false,
         "variants": []
       }

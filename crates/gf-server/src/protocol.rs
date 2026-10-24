@@ -668,7 +668,7 @@ pub enum WorkerRequest {
         features: usize,
     },
     /// Loads a model the worker did not start with, under `name`, from a
-    /// built-in model's repository id or a `module:function` spec: a control,
+    /// built-in model's repository id: a control,
     /// sent in a `Controls` frame ahead of the first table naming the model.
     AddModel {
         name: String,

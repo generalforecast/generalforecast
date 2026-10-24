@@ -21,7 +21,7 @@ from generalforecast.models.timestral.checkpoint import (
 from generalforecast.models.timestral.model import timestral_functions
 
 # The smaller release, with the larger one's layers and settings.
-NAME = "timestral-28m"
+NAME = "general-forecast/timestral-28m"
 # Two targets, a past-only covariate and a known covariate over 700 steps,
 # which is not whole patches; the same rows crossing zero, forecast without
 # averaging over signs; or one target that starts after 40 unobserved steps.

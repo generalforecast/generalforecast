@@ -266,7 +266,7 @@ pub enum SummaryScope {
     /// and pages cache row representations.
     #[default]
     Table,
-    /// Each context's own rows, as upstream packages fit each context: a unit
+    /// Each context's own rows, as upstream predictors fit each context: a unit
     /// carries its rows' features, and the unit's own state, preprocessing
     /// and column summary, is fit on them, kept beside its rows, and read by
     /// its queries. The worker fits no table and embeds no pages, and drift

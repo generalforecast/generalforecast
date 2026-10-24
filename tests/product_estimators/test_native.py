@@ -10,12 +10,15 @@ from typing import Any
 import numpy as np
 import pyarrow as pa
 import pytest
+import yaml
+from pyarrow import parquet
 from sklearn.model_selection import cross_val_score
 
-import generalforecast
 from generalforecast.engine import LocalEngine
 from generalforecast.estimators import Forecaster, Regressor
-from generalforecast.packages import PackageError
+from generalforecast.predictor import Predictor
+from generalforecast.predictors.validation import PredictorError
+from tests.utils import engine_client as generalforecast
 
 pytestmark = pytest.mark.slow
 
@@ -146,8 +149,8 @@ def test_forecaster_matches_native_grouped_series_and_preserves_context(
             restored.predict_quantiles(future), quantiles, atol=1e-5
         )
         restored.close()
-        with pytest.raises(PackageError, match="custom native"):
-            estimator.to_package(tmp_path / "invalid", name="custom")
+        with pytest.raises(PredictorError, match="custom native"):
+            estimator.save(tmp_path / "invalid", name="custom")
     finally:
         client.drop_table("independent")
         estimator.close()
@@ -161,9 +164,18 @@ def test_verified_catalog_loader_path_executes_real_engine(catalog, tmp_path):
     y = np.array(["a", "b"] * 8)
     estimator = Classifier().fit(X, y)
     assert estimator.predict_proba(X.slice(0, 2)).shape == (2, 2)
-    checked = estimator.to_package(tmp_path / "portable", name="portable")
-    assert checked.validate_queries(X.slice(0, 2)).num_rows == 2
-    assert checked.context_table().num_rows == 16
+    checked = estimator.save(tmp_path / "portable", name="portable")
+    assert isinstance(checked, Predictor) and checked.model.endswith(
+        "tabicl-v2-classifier"
+    )
+    assert len(checked.predict(X.slice(0, 2).to_pandas())) == 2
+    assert parquet.read_table(tmp_path / "portable" / "context.parquet").num_rows == 16
+    assert (
+        yaml.safe_load((tmp_path / "portable" / "gf.lock").read_text())["predictor"][
+            "context"
+        ]["rows"]
+        == 16
+    )
     query = pa.table({"x": [0.0, 1.0], "group": ["north", "south"]})
     expected = estimator.predict_proba(query)
     caller_values[:] = 100
@@ -205,8 +217,9 @@ def test_catalog_forecaster_uses_shared_covariate_rows(catalog, tmp_path, shared
     assert np.isfinite(values).all() and not np.allclose(values, changed)
     np.testing.assert_allclose(values, estimator.predict_quantiles(query))
     assert estimator.context_.to_pylist() == before
-    checked = estimator.to_package(tmp_path / "forecast", name="forecast")
-    assert checked.lock is not None and checked.lock.task == "forecast"
+    checked = estimator.save(tmp_path / "forecast", name="forecast")
+    assert isinstance(checked, Predictor) and checked.task == "forecast"
+    assert (tmp_path / "forecast" / "gf.lock").is_file()
     restored = pickle.loads(pickle.dumps(estimator))
     np.testing.assert_allclose(values, restored.predict_quantiles(query))
     estimator.close()
@@ -219,32 +232,19 @@ def test_local_context_beyond_package_capacity_runs_but_never_exports(
     features = np.random.default_rng(1).normal(size=(1100, 2))
     estimator = Regressor().fit(features, features.sum(axis=1))
     assert np.isfinite(estimator.predict(features[:3])).all()
-    with pytest.raises(PackageError) as error:
-        estimator.to_package(tmp_path / "large", name="large")
+    with pytest.raises(PredictorError) as error:
+        estimator.save(tmp_path / "large", name="large")
     assert error.value.code == "CapacityExceeded"
     assert not (tmp_path / "large").exists()
     estimator.close()
 
 
-def test_a_trusted_spec_is_digested_by_its_module_file_without_importing_it(
-    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import hashlib
-    import sys
+def test_module_function_specs_are_not_catalog_models() -> None:
+    import generalforecast as gf
 
-    from generalforecast.local_models import code_digest
-
-    package = tmp_path / "digested"
-    package.mkdir()
-    (package / "__init__.py").write_text("raise RuntimeError('imported')\n")
-    module = package / "model.py"
-    module.write_text("def forecaster(): ...\n")
-    monkeypatch.syspath_prepend(str(tmp_path))
-
-    first = code_digest("digested.model:forecaster")
-    assert first == "sha256:" + hashlib.sha256(module.read_bytes()).hexdigest()
-    module.write_text("def forecaster(): return 1\n")
-    assert code_digest("digested.model:forecaster") != first
-    assert "digested" not in sys.modules
-    with pytest.raises(PackageError, match="no source file"):
-        code_digest("digested.missing:forecaster")
+    for estimator in (gf.Classifier, gf.Regressor, gf.Forecaster):
+        with pytest.raises(
+            gf.InvalidInput,
+            match="is not a catalog model id; use general-forecast/<name>",
+        ):
+            estimator(model="os.path:join")

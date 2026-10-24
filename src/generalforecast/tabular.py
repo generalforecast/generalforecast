@@ -15,8 +15,12 @@ import pyarrow.compute as _compute
 import pyarrow.json as arrow_json
 from pyarrow import csv, parquet
 
-from generalforecast.packages.spec import PHYSICAL_TYPES
-from generalforecast.packages.validation import PackageError, bytes_digest, ensure
+from generalforecast.predictors.validation import PredictorError, bytes_digest, ensure
+
+PHYSICAL_TYPES = frozenset(
+    {"boolean", "int64", "float64", "string", "binary", "date", "timestamp"}
+)
+DECLARED_TYPES = PHYSICAL_TYPES | {"category", "numeric", "datetime"}
 
 MAX_ROWS = 1_000_000
 MAX_BYTES = 128 * 1024 * 1024
@@ -122,7 +126,7 @@ def physical_type(kind: pa.DataType) -> str:
         return "timestamp"
     if pa.types.is_dictionary(kind):
         return physical_type(kind.value_type)
-    raise PackageError(
+    raise PredictorError(
         "UnsupportedType",
         "nested, null, decimal and other unsupported physical types need explicit conversion",
     )
@@ -146,7 +150,7 @@ def coerce(table: pa.Table, physical_types: Mapping[str, str]) -> pa.Table:
         try:
             values = pc.cast(table.column(index), _ARROW_TYPES[kind], safe=True)
         except (pa.ArrowException, TypeError, ValueError, OverflowError):
-            raise PackageError(
+            raise PredictorError(
                 "SchemaMismatch",
                 "values cannot be represented by declared physical types",
             ) from None
@@ -236,7 +240,7 @@ def to_arrow(
             )
             table = pa.table(dict(data))
         else:
-            raise PackageError(
+            raise PredictorError(
                 "UnsupportedFormat", "expected Arrow, pandas, Polars, NumPy or records"
             )
         ensure(
@@ -269,10 +273,10 @@ def to_arrow(
                 array = pc.if_else(pc.is_nan(array), None, array)
             arrays.append(array)
         return pa.table(arrays, names=table.column_names).combine_chunks()
-    except PackageError:
+    except PredictorError:
         raise
     except (pa.ArrowException, TypeError, ValueError, OverflowError):
-        raise PackageError(
+        raise PredictorError(
             "InvalidTable",
             "tabular conversion failed; convert unsupported or mixed columns explicitly",
         ) from None
@@ -328,7 +332,7 @@ def read_table(
             if format == "feather":
                 ensure(
                     not data.startswith(b"FEA1"),
-                    "legacy Feather V1 cannot be read in bounded batches",
+                    "Feather V1 cannot be read in bounded batches",
                     "UnsupportedFormat",
                 )
             try:
@@ -358,15 +362,15 @@ def read_table(
                 source, source.schema, max_rows=max_rows, max_bytes=max_bytes
             )
         else:
-            raise PackageError(
+            raise PredictorError(
                 "UnsupportedFormat",
                 "supported files are CSV, TSV, Parquet, Arrow, Feather, JSON and JSONL",
             )
         return to_arrow(table, max_rows=max_rows, max_bytes=max_bytes)
-    except PackageError:
+    except PredictorError:
         raise
     except (pa.ArrowException, ValueError, UnicodeError):
-        raise PackageError(
+        raise PredictorError(
             "InvalidTable", "source bytes do not match a supported table format"
         ) from None
 
@@ -388,3 +392,84 @@ def arrow_bytes(data: Any) -> bytes:
 def table_digest(data: Any) -> str:
     """Hashes normalized table content separately from source container bytes."""
     return bytes_digest(arrow_bytes(data))
+
+
+_FRAME_FORMATS = {
+    "csv": "csv",
+    "tsv": "tsv",
+    "parquet": "parquet",
+    "pq": "parquet",
+    "arrow": "arrow",
+    "feather": "feather",
+    "json": "json",
+    "jsonl": "jsonl",
+    "ndjson": "ndjson",
+}
+
+
+def frame(obj: Any, *, columns: list[str] | tuple[str, ...] | None = None) -> pa.Table:
+    """Rows as an Arrow table, however the caller holds them.
+
+    Accepts a pandas or Polars frame, a list of dicts, a dict of columns, an
+    Arrow table or record batch, a NumPy array (columns `columns`, else
+    `f0`, `f1`, ...), or a path or URL to a `.csv`, `.parquet`, `.json`,
+    `.jsonl`, `.arrow` or `.feather` file. Every public method that takes
+    `queries` or `context` reads them through this function.
+
+    Raises:
+        InvalidInput: For a value that is not rows, a file that cannot be read,
+            or rows past the size limits.
+    """
+    from generalforecast.errors import InvalidInput, boundary
+
+    if isinstance(obj, (str, PurePosixPath)) or hasattr(obj, "__fspath__"):
+        return _frame_from_location(str(obj))
+    if obj is None:
+        raise InvalidInput("rows are required: a frame, a list of dicts or a file")
+    if isinstance(obj, Mapping):
+        with boundary():
+            return pa.Table.from_pydict(dict(obj))
+    if isinstance(obj, (list, tuple)) and len(obj) == 0:
+        return pa.table({})
+    with boundary():
+        return to_arrow(obj, columns=columns)
+
+
+def _frame_from_location(location: str) -> pa.Table:
+    from urllib.parse import urlsplit
+
+    from generalforecast.errors import InvalidInput, boundary
+
+    parts = urlsplit(location)
+    if parts.scheme in ("http", "https"):
+        import urllib.request
+
+        try:
+            with urllib.request.urlopen(location, timeout=60) as response:
+                data = response.read(MAX_BYTES + 1)
+        except OSError as exc:
+            raise InvalidInput(f"cannot read {location}: {exc}".rstrip(".")) from None
+        name = parts.path
+    else:
+        import os
+
+        path = os.path.expanduser(location)
+        if not os.path.isfile(path):
+            raise InvalidInput(f"no file at `{location}`")
+        with open(path, "rb") as handle:
+            data = handle.read(MAX_BYTES + 1)
+        name = path
+    suffix = PurePosixPath(name).suffix.lower().lstrip(".")
+    if suffix not in _FRAME_FORMATS:
+        raise InvalidInput(
+            f"`{location}` is not a file this reads",
+            hint="pass a .csv, .parquet, .json, .jsonl, .arrow or .feather file",
+        )
+    if len(data) > MAX_BYTES:
+        raise InvalidInput(
+            f"`{location}` is larger than {MAX_BYTES // (1024 * 1024)} MiB",
+            limit=MAX_BYTES,
+            actual=len(data),
+        )
+    with boundary():
+        return read_table(data, _FRAME_FORMATS[suffix])

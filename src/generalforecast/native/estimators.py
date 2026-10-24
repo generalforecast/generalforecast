@@ -18,35 +18,46 @@ import uuid
 import weakref
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.compute as pc
-from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
-from sklearn.exceptions import NotFittedError
-from sklearn.utils.multiclass import type_of_target
-from sklearn.utils.validation import validate_data
 
 from generalforecast._core import Strategy
 from generalforecast.columns import infer
+from generalforecast.errors import InvalidInput, boundary
+from generalforecast.native import models as registry
 from generalforecast.native.client import Table
 from generalforecast.native.local_client import LocalClient
-from generalforecast.native.package import (
+from generalforecast.native.predictor import (
     admitted_spec,
     context_table,
-    export_package,
+    export_predictor,
     remote_result,
     target_name,
 )
-from generalforecast.packages import Package
-from generalforecast.packages.validation import ensure
+from generalforecast.native.sklearn_shim import (
+    BaseEstimator,
+    ClassifierMixin,
+    NotFittedError,
+    RegressorMixin,
+    public,
+    require_sklearn,
+    type_of_target,
+    validate_data,
+)
+from generalforecast.native.tables import Retrieved
+from generalforecast.predictors.validation import ensure
 from generalforecast.tabular import to_arrow
+
+if TYPE_CHECKING:
+    from generalforecast.predictor import Predictor
 
 
 class _TableClient(Protocol):
     @property
-    def create_table(self) -> Callable[..., Table]: ...
+    def _create_table(self) -> Callable[..., Table]: ...
 
     def drop_table(self, name: str) -> None: ...
 
@@ -55,8 +66,9 @@ _shared: dict[bool, LocalClient] = {}
 _shared_lock = threading.Lock()
 
 
-def _local(allow_downloads: bool = False) -> LocalClient:
+def _local(download: bool = True) -> LocalClient:
     """The local client of estimators given none, one per download gate, on the process's engine."""
+    allow_downloads = bool(download)
     with _shared_lock:
         client = _shared.get(allow_downloads)
         if client is None:
@@ -68,6 +80,32 @@ def _local(allow_downloads: bool = False) -> LocalClient:
 
 _loading: set[tuple[str, bool]] = set()
 _loading_lock = threading.Lock()
+
+
+_noted: set[str] = set()
+
+
+def note_download(model: str, download: bool) -> None:
+    """Prints one stderr line the first time a model's files will download.
+
+    Raises:
+        NotFound: If the model is not cached and downloads are off.
+    """
+    import sys
+
+    if not registry.is_catalog_model(model):
+        return
+    canonical = registry.canonical(model)
+    if registry.is_cached(canonical):
+        return
+    if not download:
+        raise registry.not_cached(canonical)
+    if canonical not in _noted:
+        _noted.add(canonical)
+        print(
+            f"Downloading {canonical} to {registry.cache_path(canonical)}",
+            file=sys.stderr,
+        )
 
 
 def _load_soon(model: str, allow_downloads: bool) -> None:
@@ -189,19 +227,23 @@ class _Estimator(BaseEstimator):
         model: Any,
         *,
         client: _TableClient | None = None,
-        strategy: Strategy | None = None,
+        selection: Retrieved | None = None,
         page_size: int = 128,
         backend: Any = None,
-        allow_downloads: bool = False,
+        download: bool = True,
     ) -> None:
+        require_sklearn()
+        if isinstance(model, str) and client is None:
+            model = registry.canonical(model)
         self.model = model
         self.client = client
-        self.strategy = strategy
+        self.selection = selection
         self.page_size = page_size
         self.backend = backend
-        self.allow_downloads = allow_downloads
+        self.download = download
         if client is None and backend is None and isinstance(model, str):
-            _load_soon(model, allow_downloads)
+            note_download(model, download)
+            _load_soon(model, download)
 
     def set_params(self, **params: Any) -> Any:
         """Updates constructor parameters and invalidates fitted context."""
@@ -264,20 +306,27 @@ class _Estimator(BaseEstimator):
         self._release()
         features = self.context_.drop([self.target_])
         targets = np.array(targets, copy=True)
-        client = (
-            self.client if self.client is not None else _local(self.allow_downloads)
-        )
+        client = self.client if self.client is not None else _local(self.download)
         name = f"estimator-{uuid.uuid4().hex}"
         kinds = getattr(self, "_kinds", None)
-        table = client.create_table(
-            name,
-            model=self._native_model(),
-            features=None if kinds is not None else features.shape[1],
-            columns=kinds,
-            classes=classes,
-            strategy=self.strategy,
-            page_size=self.page_size,
-        )
+        strategy = Strategy.exact()
+        if self.selection is not None:
+            cap = (
+                registry.limits(self.model).context_rows
+                if isinstance(self.model, str)
+                else len(features)
+            )
+            strategy = self.selection.strategy(cap)
+        with boundary():
+            table = client._create_table(
+                name,
+                model=self._native_model(),
+                features=None if kinds is not None else features.shape[1],
+                columns=kinds,
+                classes=classes,
+                strategy=strategy,
+                page_size=self.page_size,
+            )
         self._dropper = weakref.finalize(self, _drop, client, name)
         # A server may be gone at exit; tables there outlive the process anyway.
         self._dropper.atexit = False
@@ -292,10 +341,10 @@ class _Estimator(BaseEstimator):
     def _native_model(self) -> Any:
         if self.client is not None:
             return self.model
-        from generalforecast.local_models import native_model
+        from generalforecast.predictors.models import for_task
 
         task = "classification" if isinstance(self, Classifier) else "regression"
-        return native_model(self.model, task)
+        return for_task(self.model, task)
 
     def _release(self) -> None:
         dropper = getattr(self, "_dropper", None)
@@ -325,13 +374,13 @@ class _Estimator(BaseEstimator):
         )
         context = context_table(rows, y, names, named_target)
         if self.backend is not None:
-            if self.client is not None or self.strategy is not None:
-                raise ValueError(
-                    "backend cannot be combined with native client or strategy"
+            if self.client is not None or self.selection is not None:
+                raise InvalidInput(
+                    "backend cannot be combined with a native client or selection"
                 )
             if not isinstance(self.model, str):
-                raise ValueError("remote backend requires an admitted catalog model")
-            # Package capacity binds remote execution and export, not local paging.
+                raise InvalidInput("a remote backend takes a catalog model id")
+            # Predictor capacity binds remote execution and export, not local paging.
             task = "classification" if isinstance(self, Classifier) else "regression"
             self._spec = admitted_spec(
                 self.model,
@@ -343,21 +392,30 @@ class _Estimator(BaseEstimator):
         self.target_ = named_target
         self.context_ = context
 
-    def to_package(
-        self, path: str | Path, *, name: str, id: str | None = None
-    ) -> Package:
-        """Exports exact fitted context and an offline checked immutable model pin.
+    @public
+    def save(
+        self, path: str | Path, *, name: str | None = None, id: str | None = None
+    ) -> "Predictor":
+        """Writes the fitted estimator as a predictor directory at `path`.
 
-        Custom native weights, context strategies and promoting a feature to an
-        identifier cannot be represented by the declarative package format.
+        The directory holds `gf.yaml`, `gf.lock` and the context snapshot, as
+        `gf.Predictor(...).save` writes them. Custom native weights, context
+        strategies and promoting a feature to an identifier cannot be written.
+
+        Returns:
+            The saved predictor, `gf.Predictor(path)`.
         """
+        from generalforecast.predictor import Predictor
+
         if not self.__sklearn_is_fitted__():
-            raise NotFittedError("call fit before exporting a package")
-        ensure(
-            id is None and self.strategy is None and self.client is None,
-            "estimator settings cannot be represented faithfully",
-            "UnsupportedCapability",
-        )
+            raise NotFittedError("call fit before saving a predictor")
+        if id is not None or self.selection is not None or self.client is not None:
+            raise InvalidInput(
+                "estimator settings cannot be saved as a predictor",
+                hint="save an estimator fit on this process's engine without a selection",
+            )
+        if name is None:
+            name = Path(path).resolve().name
         names = [
             column for column in self.context_.column_names if column != self.target_
         ]
@@ -369,7 +427,9 @@ class _Estimator(BaseEstimator):
             target=self.target_,
             inputs={"include": names},
         )
-        return export_package(path, name=name, spec=spec, context=self.context_)
+        return Predictor(
+            export_predictor(path, name=name, spec=spec, context=self.context_)
+        )
 
     def _remote(
         self, rows: Any, *, quantiles: Sequence[float] | None = None
@@ -415,30 +475,31 @@ class Classifier(ClassifierMixin, _Estimator):
     Args:
         model: A model name or spec, or the model's contract calls and parameters.
         client: Where the table lives; a local client shared by estimators by default.
-        strategy: How each query's context is chosen; exact by default.
+        selection: How each query's context is drawn; the whole fit set by default.
         page_size: Rows per page.
     """
 
     def __init__(
         self,
-        model: Any = "tabicl-classifier",
+        model: Any = "general-forecast/tabicl-v2-classifier",
         *,
         client: _TableClient | None = None,
-        strategy: Strategy | None = None,
+        selection: Retrieved | None = None,
         page_size: int = 128,
         backend: Any = None,
-        allow_downloads: bool = False,
+        download: bool = True,
     ) -> None:
         """Keeps the settings, as sklearn's estimators do; `fit` makes the table."""
         super().__init__(
             model,
             client=client,
-            strategy=strategy,
+            selection=selection,
             page_size=page_size,
             backend=backend,
-            allow_downloads=allow_downloads,
+            download=download,
         )
 
+    @public
     def fit(self, X: Any, y: Any) -> "Classifier":
         """Creates a table of the labeled rows.
 
@@ -479,6 +540,7 @@ class Classifier(ClassifierMixin, _Estimator):
                 raise
         return self
 
+    @public
     def predict_proba(self, X: Any) -> np.ndarray:
         """Probabilities over `classes_`, one row per query."""
         rows = self._rows(X)
@@ -514,11 +576,13 @@ class Classifier(ClassifierMixin, _Estimator):
         )
         return result
 
+    @public
     def predict(self, X: Any) -> np.ndarray:
         """The most probable label for each query."""
         probabilities = self.predict_proba(X)
         return self.classes_[probabilities.argmax(axis=1)]
 
+    @public
     def score(self, X: Any, y: Any, sample_weight: Any = None) -> float:
         """Mean accuracy on the labeled rows, as sklearn scores, with byte labels as text."""
         return super().score(X, _labels(y), sample_weight)
@@ -530,30 +594,31 @@ class Regressor(RegressorMixin, _Estimator):
     Args:
         model: A model name or spec, or the model's contract calls and parameters.
         client: Where the table lives; a local client shared by estimators by default.
-        strategy: How each query's context is chosen; exact by default.
+        selection: How each query's context is drawn; the whole fit set by default.
         page_size: Rows per page.
     """
 
     def __init__(
         self,
-        model: Any = "tabicl-regressor",
+        model: Any = "general-forecast/tabicl-v2-regressor",
         *,
         client: _TableClient | None = None,
-        strategy: Strategy | None = None,
+        selection: Retrieved | None = None,
         page_size: int = 128,
         backend: Any = None,
-        allow_downloads: bool = False,
+        download: bool = True,
     ) -> None:
         """Keeps the settings, as sklearn's estimators do; `fit` makes the table."""
         super().__init__(
             model,
             client=client,
-            strategy=strategy,
+            selection=selection,
             page_size=page_size,
             backend=backend,
-            allow_downloads=allow_downloads,
+            download=download,
         )
 
+    @public
     def fit(self, X: Any, y: Any) -> "Regressor":
         """Creates a table of the rows and their targets.
 
@@ -592,6 +657,7 @@ class Regressor(RegressorMixin, _Estimator):
                 raise
         return self
 
+    @public
     def predict_quantiles(
         self, X: Any, quantiles: Sequence[float] | None = None
     ) -> np.ndarray:
@@ -650,6 +716,7 @@ class Regressor(RegressorMixin, _Estimator):
         )
         return result
 
+    @public
     def predict(self, X: Any) -> np.ndarray:
         """The median for each query."""
         return self.predict_quantiles(X, [0.5])[:, 0]

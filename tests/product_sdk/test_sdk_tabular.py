@@ -13,8 +13,16 @@ import pytest
 from pyarrow import feather, parquet
 
 import generalforecast as gf
-from generalforecast.deployments.sdk import Dataset, prediction_payload, table
-from generalforecast.packages.validation import PackageError
+from generalforecast.contracts import PredictionResult
+from generalforecast.deployments.contracts import ServiceError
+from generalforecast.deployments.sdk import (
+    ContextSpec,
+    LiveContext,
+    Snapshot,
+    prediction_payload,
+    table,
+)
+from generalforecast.predictors.validation import PredictorError
 
 
 @pytest.mark.parametrize(
@@ -48,9 +56,9 @@ def test_local_file_formats_use_foundation_physical_normalization(tmp_path, suff
 def test_numpy_requires_explicit_feature_and_context_column_order():
     queries = np.array([[5, 2], [8, 4]])
     context = np.array([[3, 1, 0], [4, 2, 1]])
-    with pytest.raises(gf.ServiceError, match="explicit feature column order"):
+    with pytest.raises(ServiceError, match="explicit feature column order"):
         prediction_payload(queries)
-    with pytest.raises(gf.ServiceError, match="explicit feature column order"):
+    with pytest.raises(ServiceError, match="explicit feature column order"):
         prediction_payload(queries, features=["b", "a"], context=context)
     payload = prediction_payload(
         queries,
@@ -69,7 +77,7 @@ def test_an_empty_context_list_is_no_records_and_queries_stay_required():
     for empty in ([], ()):
         assert prediction_payload(queries, context=empty)["context"] == []
     assert prediction_payload(queries, context=queries.slice(0, 0))["context"] == []
-    with pytest.raises(PackageError, match="columns must be nonempty"):
+    with pytest.raises(PredictorError, match="columns must be nonempty"):
         prediction_payload([])
 
 
@@ -80,9 +88,9 @@ def test_pandas_polars_lazyframes_and_typed_results():
     polars_data = polars.DataFrame({"x": [2, 1]})
     assert table(pandas_data).equals(table(polars_data))
     assert table(polars_data.lazy()).equals(table(polars_data))
-    with pytest.raises(gf.PackageError):
+    with pytest.raises(PredictorError):
         table(polars.LazyFrame({"x": range(1000001)}))
-    result = gf.PredictionResult(
+    result = PredictionResult(
         pa.table({"value": [0.2, 0.8], "id": ["b", "a"]}), "catalog/model", "regression"
     )
     assert result.to_pandas()["id"].tolist() == ["b", "a"]
@@ -93,31 +101,31 @@ def test_pandas_polars_lazyframes_and_typed_results():
 
 def test_immutable_nested_snapshots_and_specs():
     source = {"nested": {"items": [1, 2]}}
-    snapshot = gf.Snapshot.from_dict(source)
+    snapshot = Snapshot.from_dict(source)
     source["nested"]["items"].append(3)
     snapshot["nested"]["items"].clear()
     assert snapshot.to_dict() == {"nested": {"items": [1, 2]}}
-    dataset = Dataset.from_response(None, "history", {"sequence": 1})
+    dataset = LiveContext.from_response(None, "history", {"sequence": 1})
     with pytest.raises(dataclasses.FrozenInstanceError):
         dataset.name = "new"
     features = ["x"]
     targets = [["y", "numeric"]]
-    spec = gf.DatasetSpec("history", features, targets)
+    spec = ContextSpec("history", features, targets)
     features.append("leaked")
     targets[0][0] = "changed"
-    assert spec.features == ("x",) and spec.targets == (("y", "numeric"),)
+    assert spec.inputs == ("x",) and spec.targets == (("y", "numeric"),)
 
 
 def test_invalid_local_sources_are_safe_and_never_open_pipes(tmp_path):
     path = tmp_path / "pipe.csv"
     os.mkfifo(path)
-    with pytest.raises(gf.ServiceError, match="regular file"):
+    with pytest.raises(ServiceError, match="regular file"):
         table(path)
     link = tmp_path / "link.csv"
     link.symlink_to(path)
-    with pytest.raises(gf.ServiceError):
+    with pytest.raises(ServiceError):
         table(link)
-    with pytest.raises(gf.ServiceError):
+    with pytest.raises(ServiceError):
         table("https://example.com?token=sensitive")
 
 

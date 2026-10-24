@@ -1,40 +1,153 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Models by name: built-in checkpoints, or trusted `module:function` specs.
+"""Models by canonical id: built-in checkpoints.
 
-A built-in model goes by its canonical name, such as `tabicl-v2-classifier`,
-an alias such as `tabicl-classifier`, or its repository id, such as
-`general-forecast/tabicl-v2-classifier`; `generalforecast.models.catalog` holds each one's
-pinned files, capability and qualification. Its checkpoint loads through
-`generalforecast.models.artifacts`, verified against those pins, from `GF_CHECKPOINTS`
-(one subdirectory per model) on machines without internet or else from Hugging
-Face. Mitra-2, Chronos-2 and Timestral load from converted mirrors under
+A built-in model goes by its canonical id alone, such as
+`general-forecast/tabicl-v2-classifier`; `generalforecast.models.catalog` holds
+each one's pinned files, capability, limits and qualification, and the one
+table of old spellings, `catalog.ALIASES`, which `canonical` refuses with the
+canonical id as the hint. A checkpoint loads through
+`generalforecast.models.artifacts`, verified against its pins, from
+`GF_CHECKPOINTS` (one subdirectory per model) on machines without internet or
+else from the Hugging Face cache, which `pull` fills at the pinned revision.
+Mitra-2, Chronos-2 and Timestral load from converted mirrors under
 `general-forecast/`; TimesFM 3, whose license forbids redistribution, converts
 at load from Google's repository into a directory with a verified derived
 manifest.
 
 `@K` and `*N` wrap a classifier or regressor in the existing
-`generalforecast.models.many_class` and `generalforecast.models.ensemble` models, wherever it runs.
+`generalforecast.models.many_class` and `generalforecast.models.ensemble`
+models, wherever it runs.
 """
 
 import dataclasses
 import importlib
 from collections.abc import Callable
+from dataclasses import dataclass
 from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any
 
-from generalforecast.models import catalog
-from generalforecast.models.catalog import ModelEntry, ModelRef, ModelRefError, Surface
+from generalforecast.errors import NotFound
+from generalforecast.models import catalog as _catalog
+from generalforecast.models.catalog import (
+    Limits,
+    ModelEntry,
+    ModelRef,
+    ModelRefError,
+    Surface,
+    Task,
+    canonical,
+    limits,
+    task_of,
+)
 from generalforecast.models.contract import TabularFunctions
 from generalforecast.models.series import SeriesFunctions
 
 TabularModel = tuple[TabularFunctions, Any]
 SeriesModel = tuple[SeriesFunctions, Any]
 Model = TabularModel | SeriesModel
+Progress = Callable[[str, str], None]
 
-ORGANIZATION = catalog.ORGANIZATION
+ORGANIZATION = _catalog.ORGANIZATION
+
+__all__ = [
+    "Limits",
+    "ModelInfo",
+    "canonical",
+    "catalog",
+    "is_cached",
+    "limits",
+    "load",
+    "pull",
+    "task_of",
+]
+
+
+@dataclass(frozen=True)
+class ModelInfo:
+    """What `catalog` says about one model, for a listing or a prompt.
+
+    Attributes:
+        id: The canonical id, `general-forecast/<name>`.
+        task: `classification`, `regression` or `forecast`.
+        context_rows: Most context rows one call binds.
+        queries: Most rows (for a forecaster, series) one call scores.
+        inputs: Most input columns (for a forecaster, covariates).
+        license: The SPDX id of the weights' license, or None if unrecorded.
+        local: Whether it runs on this machine.
+        hosted: Whether a pushed predictor may serve it.
+    """
+
+    id: str
+    task: Task
+    context_rows: int
+    queries: int
+    inputs: int
+    license: str | None
+    local: bool
+    hosted: bool
+
+
+_ref = _catalog.reference
+
+
+def is_cached(ref: str) -> bool:
+    """Whether a model's pinned files are already on this machine."""
+    return _artifacts().cached(_ref(ref).entry)
+
+
+def pull(ref: str, *, progress: Progress | None = None) -> Path:
+    """Downloads a model's pinned files and verifies them.
+
+    Args:
+        ref: The model's canonical id.
+        progress: Receives each status line as `(verb, message)`, such as
+            `("Pulling", "general-forecast/chronos-2  (1.2 GB) to ~/.cache/huggingface")`;
+            by default the line goes to stderr. Nothing is reported when the
+            files are already cached.
+
+    Returns:
+        The verified checkpoint directory.
+
+    Raises:
+        NotFound: If downloads are off (`GF_OFFLINE=1`) and the files are
+            not cached.
+        ArtifactError: If the files differ from their pins or will not download.
+    """
+    artifacts = _artifacts()
+    try:
+        return artifacts.checkpoint(
+            _ref(ref).entry, allow_downloads=True, progress=progress
+        )
+    except artifacts.ArtifactError as error:
+        if error.code == "NotFound":
+            raise NotFound(str(error), hint=error.hint) from None
+        raise
+
+
+def catalog(task: Task | None = None) -> list[ModelInfo]:
+    """The built-in models, the recommended model of each task first.
+
+    Args:
+        task: Only models of this task, or every model.
+    """
+    return [
+        ModelInfo(
+            entry.id,
+            entry.capability.task,
+            entry.limits.context_rows,
+            entry.limits.queries,
+            entry.limits.inputs,
+            entry.artifact.license,
+            entry.allows("local"),
+            entry.hostable and entry.gates.remote,
+        )
+        for entry in _catalog.entries()
+        if task is None or entry.capability.task == task
+    ]
+
 
 # Each family's loader and contract calls, as `module:attribute`.
 _FAMILIES: dict[str, tuple[str, str]] = {
@@ -72,11 +185,11 @@ _FAMILIES: dict[str, tuple[str, str]] = {
     ),
 }
 
-# The pinned revision of each built-in checkpoint, read from the catalog.
+# The pinned revision of each built-in checkpoint, by canonical id.
 REVISIONS: dict[str, str] = {
-    entry.name: entry.artifact.revision
-    for entry in catalog.entries()
-    if entry.artifact.repository == entry.repository_id
+    entry.id: entry.artifact.revision
+    for entry in _catalog.entries()
+    if entry.artifact.repository == entry.id
 }
 
 
@@ -85,9 +198,9 @@ def _attribute(path: str) -> Any:
     return getattr(importlib.import_module(module), name)
 
 
-def _checkpoint(name: str) -> Path:
+def _checkpoint(id: str) -> Path:
     """A built-in checkpoint's verified directory, for trusted local use."""
-    return _artifacts().checkpoint(catalog.ENTRIES[name])
+    return _artifacts().checkpoint(_catalog.ENTRIES[id])
 
 
 def _artifacts() -> Any:
@@ -109,28 +222,26 @@ def _native(entry: ModelEntry, surface: Surface, allow_downloads: bool) -> Model
         from generalforecast.runtime.device import configure, device_settings
 
         parameters = configure(parameters, device_settings(jax.default_backend()))
-    return _trained(
-        entry.name, _traced(entry.name, (_attribute(functions), parameters))
-    )
+    return _trained(entry, _traced(entry.id, (_attribute(functions), parameters)))
 
 
-# Package and remote processes share one verified copy of each model, and one
+# Predictor and remote processes share one verified copy of each model, and one
 # set of wrapped contract calls per variant, which compiles once.
 @lru_cache(maxsize=4)
-def _served(name: str, surface: Surface, allow_downloads: bool) -> Model:
-    return _native(catalog.ENTRIES[name], surface, allow_downloads)
+def _served(id: str, surface: Surface, allow_downloads: bool) -> Model:
+    return _native(_catalog.ENTRIES[id], surface, allow_downloads)
 
 
 @lru_cache(maxsize=16)
 def _variant(
-    name: str,
+    id: str,
     surface: Surface,
     allow_downloads: bool,
     codes: int | None,
     estimators: int | None,
 ) -> Model:
-    functions, parameters = _served(name, surface, allow_downloads)
-    return wrap(functions, parameters, ModelRef(name, codes, estimators))
+    functions, parameters = _served(id, surface, allow_downloads)
+    return wrap(functions, parameters, ModelRef(id, codes, estimators))
 
 
 def load(
@@ -139,29 +250,29 @@ def load(
     """Loads a model's contract calls and parameters.
 
     Args:
-        spec: A built-in model's name, alias or repository id, such as
-            `tabicl-classifier`, or, for local use only, `module:function`
-            naming a function that returns `(functions, parameters)`; then
-            `@K` for K error-correcting code estimators, which serve more
-            classes than the classifier has slots, then `*N` for an ensemble
-            of N estimators: each at most once, in that order. A forecaster
-            takes neither.
-        surface: Where the model runs. Local use trusts `module:function` and
-            checkpoints without recorded hashes; packages and remote serving
+        spec: A built-in model's canonical id, such as
+            `general-forecast/tabicl-v2-classifier`; then `@K` for K error-correcting code
+            estimators, which serve more classes than the classifier has
+            slots, then `*N` for an ensemble of N estimators: each at most
+            once, in that order. A forecaster takes neither.
+        surface: Where the model runs. Local use takes checkpoints without
+            recorded hashes; predictors and remote serving
             need the model's qualification gates, every pinned file and the
             serving policy's bounds on codes and estimators.
-        allow_downloads: Whether missing pinned files may download.
+        allow_downloads: Whether missing pinned files may download; the first
+            download reports one `Pulling` line on stderr.
 
     Returns:
         The model's contract calls and parameters.
 
     Raises:
-        ValueError: If the spec is malformed, names no model or one not
-            qualified where it runs, or puts error-correcting codes on a
-            regressor or estimators on a forecaster.
+        ValueError: If the spec is malformed, names no model or one by an old
+            spelling or one not qualified where it runs, or puts
+            error-correcting codes on a regressor or estimators on a
+            forecaster.
     """
     return load_ref(
-        catalog.parse(spec, trusted=surface == "local"),
+        _catalog.parse(spec),
         surface=surface,
         allow_downloads=allow_downloads,
     )
@@ -171,18 +282,27 @@ def load_ref(
     ref: ModelRef, *, surface: Surface = "local", allow_downloads: bool = True
 ) -> Model:
     """Loads a parsed model reference, as `load` does a spec."""
-    catalog.admit(ref, surface)
-    if ref.trusted:
-        module, function = ref.name.split(":", 1)
-        functions, parameters = getattr(importlib.import_module(module), function)()
-    else:
-        entry = ref.entry
-        if surface != "local":
-            return _variant(
-                entry.name, surface, allow_downloads, ref.codes, ref.estimators
-            )
-        functions, parameters = _native(entry, surface, allow_downloads)
+    _catalog.admit(ref, surface)
+    entry = ref.entry
+    if surface != "local":
+        return _variant(entry.id, surface, allow_downloads, ref.codes, ref.estimators)
+    functions, parameters = _native(entry, surface, allow_downloads)
     return wrap(functions, parameters, ref)
+
+
+def load_engine_spec(spec: str) -> Model:
+    """Loads what the engine's workers were started with, by its loader string.
+
+    The engine is configured with a catalog id per served name, or, for the
+    workers' own built-in and test implementations, a `<module>:<function>`
+    loader naming a function that returns `(functions, parameters)`. Loader
+    strings come from the engine's configuration alone; user model specs go
+    through `load`, which refuses colon-separated code paths.
+    """
+    if ":" not in spec:
+        return load(spec)
+    functions, parameters = _attribute(spec)()
+    return wrap(functions, parameters, ModelRef(spec, None, None, None))
 
 
 def wrap(functions: Any, parameters: Any, ref: ModelRef) -> Model:
@@ -233,21 +353,17 @@ def load_tabular(spec: str) -> TabularModel:
     return functions, parameters
 
 
-# The built-in models, by repository id.
+# The built-in models, by canonical id.
 BUILT_IN: dict[str, Callable[[], Model]] = {
-    entry.repository_id: partial(load, entry.name) for entry in catalog.entries()
+    entry.id: partial(load, entry.id) for entry in _catalog.entries()
 }
 
 
-def _trained(name: str, model: Model) -> Model:
+def _trained(entry: ModelEntry, model: Model) -> Model:
     """A built-in model whose properties say the largest contexts it was trained on."""
-    short = name.removeprefix(f"{ORGANIZATION}/")
     functions, parameters = model
-    known = catalog.ENTRIES.get(short)
-    if known is None or isinstance(functions, SeriesFunctions):
-        return model
-    capability = known.capability
-    if capability.context_rows is None:
+    capability = entry.capability
+    if isinstance(functions, SeriesFunctions) or capability.context_rows is None:
         return model
 
     def properties(parameters: Any) -> Any:
@@ -261,7 +377,7 @@ def _trained(name: str, model: Model) -> Model:
     return functions._replace(properties=properties), parameters
 
 
-def _traced(name: str, model: Model) -> Model:
+def _traced(id: str, model: Model) -> Model:
     """A loaded checkpoint, once its weights trace through every contract call.
 
     Loaders check that every parameter is there, not its shape, so a damaged
@@ -304,6 +420,6 @@ def _traced(name: str, model: Model) -> Model:
         jax.eval_shape(run, parameters)
     except (TypeError, ValueError) as error:
         raise ValueError(
-            f"checkpoint {name!r} has weights that do not fit its settings: {error}"
+            f"checkpoint {id!r} has weights that do not fit its settings: {error}"
         ) from None
     return model
