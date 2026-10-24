@@ -126,7 +126,7 @@ def catalog_forecaster() -> tuple[Any, Chronos2]:
     from generalforecast.models import catalog
     from generalforecast.models.chronos2.model import chronos2_functions
 
-    quantiles = catalog.ENTRIES["chronos-2"].capability.quantiles
+    quantiles = catalog.ENTRIES["general-forecast/chronos-2"].capability.quantiles
     return chronos2_functions, chronos2_from_state(
         *tiny_checkpoint(patch=16, quantiles=quantiles)
     )

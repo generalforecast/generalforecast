@@ -40,10 +40,12 @@ def tracked_files() -> list[Path]:
         if receipt_path.name == "brand.json"
         for name in json.loads(receipt_path.read_text())["files"]
     }
+    generated = {REPOSITORY / "src" / "generalforecast" / "_api.py"}
     return [
         path
         for path in files
         if path not in brand_assets
+        and path not in generated
         and path.suffix in EXTENSIONS
         and path.name != ".terraform.lock.hcl"
     ]

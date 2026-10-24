@@ -125,6 +125,25 @@ fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notif
                         })
                         .frame()
                     }
+                    // The bounded model fits at most 1,024 rows at once, as
+                    // the catalog classifiers do, so a larger context has its
+                    // fit limits measured.
+                    WorkerRequest::Profile { model, .. } if model == "bounded" => {
+                        WorkerReply::Profile(ModelProfile {
+                            bytes_per_row: 64,
+                            representation_bytes: 16,
+                            regression: false,
+                            class_slots: 10,
+                            outputs: 10,
+                            context_rows: None,
+                            state_bytes: 32,
+                            categorical_state_bytes: 64,
+                            column_summary: true,
+                            fit_bound: Some(1024),
+                            ..ModelProfile::default()
+                        })
+                        .frame()
+                    }
                     WorkerRequest::Profile { .. } => WorkerReply::Profile(ModelProfile {
                         bytes_per_row: 64,
                         representation_bytes: 16,
@@ -343,7 +362,11 @@ async fn shard_routed(
     fake_worker(theirs, behaviour.clone(), held.clone());
     let connection = WorkerConnection::fake(
         ours,
-        vec!["tiny".to_string(), "tiny-forecaster".to_string()],
+        vec![
+            "tiny".to_string(),
+            "tiny-forecaster".to_string(),
+            "bounded".to_string(),
+        ],
     )
     .unwrap();
     let metrics = Arc::new(Metrics::default());
@@ -1780,4 +1803,26 @@ async fn a_deferred_request_context_is_planned_again_once_its_program_compiled()
         shard.infer(context("b", 4)).await.unwrap();
         assert_eq!(shard.metrics.steps.get(), 4);
     }
+}
+
+/// Regression: a request context of more rows than the model fits at once
+/// is an ephemeral table, which `measure_fits` looked up among the durable
+/// tables and panicked on (`no entry found for key`), killing the shard.
+#[tokio::test]
+async fn a_request_context_larger_than_the_fit_bound_is_measured_and_answered() {
+    let mut settings = settings();
+    settings.ephemeral.bytes = 16_384 * 28;
+    let shard = shard(settings).await;
+    let rows = 10_000;
+    let bounded = RequestContext {
+        definition: TableDefinition {
+            model: "bounded".to_string(),
+            ..context("big", rows).definition
+        },
+        ..context("big", rows)
+    };
+    shard.infer(bounded).await.unwrap();
+    assert_eq!(shard.metrics.ephemeral_tables.get(), 1);
+    // The shard is still up and answers a second, small context.
+    shard.infer(context("small", 4)).await.unwrap();
 }

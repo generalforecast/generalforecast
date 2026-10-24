@@ -41,10 +41,10 @@ class Published(NamedTuple):
 
 # The upstream revisions the catalog's mirrors were converted from.
 PUBLISHED = {
-    "timestral-209m": Published(
+    "general-forecast/timestral-209m": Published(
         "mistralai/Timestral-209M", "9874d252ab0aae16f7f7c999f98f98d6ad7d8365"
     ),
-    "timestral-28m": Published(
+    "general-forecast/timestral-28m": Published(
         "mistralai/Timestral-28M", "180698bbf5a50dda3516aa6419798437fb03a430"
     ),
 }
@@ -95,7 +95,7 @@ def timestral_checkpoint(name: str) -> Path:
     machines without internet. Otherwise it is kept under `~/.cache/generalforecast`.
 
     Args:
-        name: A catalog name, such as `timestral-209m`.
+        name: A canonical id, such as `general-forecast/timestral-209m`.
 
     Returns:
         A directory with `config.json` and `model.safetensors`.

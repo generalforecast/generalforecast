@@ -14,10 +14,8 @@ from generalforecast._core import ForecastRequest
 from generalforecast.deployments.boundary import JsonObject
 from generalforecast.deployments.catalog_artifacts import artifact
 from generalforecast.deployments.contracts import ServiceError
-from generalforecast.deployments.interfaces import InferenceResult
 from generalforecast.engine import Forecasts
 from generalforecast.models.catalog import ModelEntry, ModelRef, ModelRefError
-from generalforecast.models.outputs import quantile_index
 
 Surface = Literal["local", "remote", "self-hosted"]
 
@@ -82,61 +80,10 @@ def checked(
     levels against those it declares, and the request's against them.
     """
     forecasts = run(ref, request, surface=surface, allow_downloads=allow_downloads)
-    declared = () if ref.trusted else ref.entry.capability.quantiles
+    declared = ref.entry.capability.quantiles
     if declared and forecasts.levels != tuple(declared):
         raise ServiceError(
             "UnsupportedModel", f"{ref.entry.name} checkpoint capabilities changed", 503
         )
     _unsupported(request.levels, forecasts.levels)
     return forecasts
-
-
-def infer(
-    request: ForecastRequest,
-    *,
-    ref: ModelRef,
-    surface: Surface = "remote",
-    allow_downloads: bool = False,
-) -> InferenceResult:
-    """Forecasts a validated request's related targets and shared covariates.
-
-    `gf_core::request` validated and aligned it; what only the loaded weights
-    know, their quantile levels, patch and row limit, is checked here.
-    """
-    try:
-        forecasts, levels = checked(
-            ref, request, surface=surface, allow_downloads=allow_downloads
-        )
-        outputs = []
-        for query, target in zip(request.queries, forecasts, strict=True):
-            outputs.append(
-                {
-                    "key": query.key,
-                    "series": query.series,
-                    "origin": query.origin,
-                    "times": list(query.times),
-                    "quantiles": {
-                        str(level): target[:, quantile_index(level, levels)].tolist()
-                        for level in request.levels
-                    },
-                }
-            )
-    except ServiceError:
-        raise
-    except Exception:  # noqa: BLE001
-        raise ServiceError(
-            "InferenceFailed", "native forecast inference failed", 503
-        ) from None
-    return {
-        "task": "forecast",
-        "outputs": outputs,
-        "artifact": {**provenance(ref.entry), "verified": True},
-        "context_provenance": {
-            "source": "request",
-            "supplied_rows": request.supplied_rows,
-            "usable_observations": request.usable_observations,
-            "persisted": False,
-            "covariate_policy": "shared-within-query-group",
-            "time_axis": request.time_axis,
-        },
-    }

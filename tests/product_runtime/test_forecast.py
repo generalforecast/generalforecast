@@ -10,7 +10,7 @@ import pyarrow as pa
 import pytest
 
 from generalforecast.deployments.contracts import ServiceError
-from generalforecast.deployments.package_runtime import PackageExecutor
+from generalforecast.deployments.predictor_runtime import PredictorExecutor
 from generalforecast.engine import Forecasts
 from generalforecast.models.catalog import CHRONOS2_QUANTILES
 from tests.product_runtime.test_executor import checked
@@ -45,17 +45,17 @@ def engine(tmp_path, context, monkeypatch):
         return Forecasts(values, tuple(CHRONOS2_QUANTILES))
 
     monkeypatch.setattr(fake, "forecast", forecast)
-    package = checked(
+    locked = checked(
         tmp_path,
         context,
-        model="chronos-2",
+        model="general-forecast/chronos-2",
         time="time",
         series=["series"],
         horizon=2,
         future_inputs=["promo"],
         outputs=["value", "quantiles"],
     )
-    return PackageExecutor().prepare(package.lock, context)
+    return PredictorExecutor().prepare(locked, context)
 
 
 def queries():
@@ -80,16 +80,16 @@ def test_overlapping_past_future_covariates_use_native_unique_channel_order(
     tmp_path, context, engine
 ):
     context = context.append_column("zz", pa.array([2.0] * context.num_rows))
-    package = checked(
+    locked = checked(
         tmp_path,
         context,
-        model="chronos-2",
+        model="general-forecast/chronos-2",
         time="time",
         series=["series"],
         horizon=2,
         future_inputs=["promo", "zz"],
     )
-    prepared = PackageExecutor().prepare(package.lock, context)
+    prepared = PredictorExecutor().prepare(locked, context)
     assert prepared._context is not None
     # Isolate runtime ordering from the separately owned manifest role validator.
     overlap = replace(
@@ -143,11 +143,11 @@ def test_irregular_context_and_covariate_disagreement_fail_before_ready(
     tmp_path, context, monkeypatch
 ):
     FakeEngine(CHRONOS2_QUANTILES).install(monkeypatch)
-    package = checked(
+    locked = checked(
         tmp_path,
         context,
-        context="dataset/events",
-        model="chronos-2",
+        context="live/events",
+        model="general-forecast/chronos-2",
         time="time",
         series=["series"],
         horizon=2,
@@ -155,9 +155,9 @@ def test_irregular_context_and_covariate_disagreement_fail_before_ready(
     )
     changed = context.set_column(1, "time", pa.array([0, 1, 2, 4, 0, 1, 2, 3]))
     with pytest.raises(ServiceError) as error:
-        PackageExecutor().prepare(package.lock, changed)
+        PredictorExecutor().prepare(locked, changed)
     assert error.value.code == "AmbiguousFrequency"
     changed = context.set_column(3, "promo", pa.array([0.0] * 4 + [1.0] * 4))
     with pytest.raises(ServiceError) as error:
-        PackageExecutor().prepare(package.lock, changed)
+        PredictorExecutor().prepare(locked, changed)
     assert error.value.code == "UnsupportedCovariates"

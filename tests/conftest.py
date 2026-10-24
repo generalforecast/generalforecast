@@ -32,11 +32,28 @@ SLOW = (
 )
 
 
-def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
-    """Marks the tests under `SLOW` as slow."""
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    """Marks the tests under `SLOW` as slow, and deselects `conformance` tests
+    unless GF_CONFORMANCE_URL names a server to replay against; never skips them.
+    """
     for item in items:
         if item.nodeid.startswith(SLOW):
             item.add_marker(pytest.mark.slow)
+    if os.environ.get("GF_CONFORMANCE_URL"):
+        return
+    marked = [item for item in items if item.get_closest_marker("conformance")]
+    if not marked:
+        return
+    expression = config.getoption("markexpr") or ""
+    if "conformance" in expression and "not conformance" not in expression:
+        raise pytest.UsageError(
+            "-m conformance needs GF_CONFORMANCE_URL to point at a gf serve"
+        )
+    for item in marked:
+        items.remove(item)
+    config.hook.pytest_deselected(items=marked)
 
 
 @pytest.fixture(scope="session")

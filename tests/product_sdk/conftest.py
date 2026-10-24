@@ -20,7 +20,7 @@ from generalforecast.deployments.boundary import (
     Scope,
     success,
 )
-from generalforecast.packages.validation import bytes_digest
+from generalforecast.predictors.validation import bytes_digest
 from generalforecast.tabular import table_digest
 from generalforecast.transport import PLATFORM_PROBE
 
@@ -33,9 +33,7 @@ def wire():
     )
 
     def expect(method, path, result=None, *, payload=None, status=200):
-        expected.append(
-            (method, "/v1alpha1/projects/test" + path, payload, result, status)
-        )
+        expected.append((method, "/v1/projects/test" + path, payload, result, status))
 
     state.expect = expect
 
@@ -73,7 +71,7 @@ def wire():
                 ):
                     request = Request(
                         Scope("test", self.headers["X-GF-Request-ID"]),
-                        Resource("dataset", "snapshots"),
+                        Resource("context", "snapshots"),
                         {},
                     )
                     table = pa.ipc.open_stream(raw).read_all()
@@ -87,10 +85,10 @@ def wire():
                     self.headers.get("Content-Type")
                     == "application/vnd.generalforecast.python-source+tar"
                 ):
-                    deployment = self.path.split("/")[5]
+                    predictor = self.path.split("/")[5]
                     request = Request(
                         Scope("test", self.headers["X-GF-Request-ID"]),
-                        Resource("deployment", deployment),
+                        Resource("predictor", predictor),
                         {},
                     )
                     if payload is not None:
@@ -100,7 +98,7 @@ def wire():
                             "receipt_version": 1,
                             "kind": "python-source",
                             "project": "test",
-                            "deployment": deployment,
+                            "predictor": predictor,
                             "source": bytes_digest(raw),
                             "size": len(raw),
                         }
@@ -114,10 +112,8 @@ def wire():
                     assert not raw
                     parts = self.path.split("/")
                     kind = {
-                        "deployments": "deployment",
-                        "datasets": "dataset",
-                        "jobs": "job",
-                        "runtimes": "operator",
+                        "predictors": "predictor",
+                        "contexts": "context",
                     }[parts[4]]
                     resource = parts[5] if len(parts) > 5 else parts[4]
                     request = Request(

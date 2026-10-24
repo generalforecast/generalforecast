@@ -3,7 +3,7 @@
 
 """How every surface orders classes, spells their keys and reads quantiles.
 
-The local SDK, packages and the Models API all present a model's outputs the
+The local SDK, predictors and the Models API all present a model's outputs the
 same way: classes in one order, keyed by one spelling, and quantile levels read
 from the model's own output grid. Standard library only.
 """

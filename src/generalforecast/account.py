@@ -46,7 +46,7 @@ def login(args: argparse.Namespace, out: Output) -> dict[str, Any]:
 
     server = (getattr(args, "url", None) or server_url()).rstrip("/")
     flow = DeviceLogin(server, timeout=getattr(args, "timeout", 30))
-    out.debug(f"POST {server}/v1alpha1/cli-logins")
+    out.debug(f"POST {server}/v1/cli-logins")
     grant = flow.start(machine_name())
     code, uri = grant["user_code"], grant["verification_uri"]
     complete = grant.get("verification_uri_complete") or uri
@@ -191,7 +191,7 @@ def whoami(args: argparse.Namespace) -> dict[str, Any]:
     # Global routes only need some project header; the key decides the scope.
     status = call(
         server,
-        "/v1alpha1/auth/status",
+        "/v1/auth/status",
         timeout=getattr(args, "timeout", None) or 40,
         token=found.key,
         project=project or "local",

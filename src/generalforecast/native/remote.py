@@ -538,7 +538,7 @@ class RemoteClient:
             )
         return [json.loads(result.body.to_pybytes() or b"null") for result in results]
 
-    def create_table(
+    def _create_table(
         self,
         name: str,
         *,
@@ -573,7 +573,7 @@ class RemoteClient:
                 `columns`.
             columns: The feature columns by name, each with its kind: `numeric`,
                 `categorical` (strings, or codes `0 ..`), `boolean`, `datetime`
-                or `retrieval`; see `LocalClient.create_table`. Names alone make
+                or `retrieval`; see `gf.engine.Table`. Names alone make
                 numeric columns. Or a frame whose column types give the kinds;
                 see `generalforecast.columns.infer`.
             classes: Number of classes, for a classifier's table. A regressor's
@@ -607,26 +607,26 @@ class RemoteClient:
                 `warn` reads it whole and the server logs it once; `clamp` cuts
                 it to that length.
             region_rows: Live rows per region whose queries share a context;
-                see `LocalClient.create_table`.
+                see `gf.engine.Table`.
             rebuild: When a region's context is built again; see
-                `LocalClient.create_table`.
+                `gf.engine.Table`.
             rebuild_wait: How long a context due a rebuild is read stale; see
-                `LocalClient.create_table`.
+                `gf.engine.Table`.
             refit_cutoffs: When a query's cutoff inside the table's history
-                calls for a new state; see `LocalClient.create_table`.
+                calls for a new state; see `gf.engine.Table`.
             scale_rows: Rows the retrieval scaling stays fixed after, once fit
-                on at least that many; see `LocalClient.create_table`.
+                on at least that many; see `gf.engine.Table`.
             summary: What the model's state, preprocessing and column
                 summary, is fit on: `table` fits it once on the table's rows,
                 so row representations are cached per page; `context` fits the
                 unit's own state on each context's rows, as the model's own
-                package does, and embeds that context's queries against it.
+                predictor does, and embeds that context's queries against it.
                 Only models whose state pools over rows, such as TabICL,
                 TabPFN and Kumo Tabular, take `context`. Such a table's units
                 depend on their rows alone, so refit policies and cutoffs
                 refit nothing.
             retrieval_categoricals: How categorical columns place rows for
-                retrieval; see `LocalClient.create_table`.
+                retrieval; see `gf.engine.Table`.
             partitions: Tables to split the table into, through a router, which
                 spreads them over its nodes. Rows go to partitions by their
                 keys, and each query's context is gathered from them all. Such
@@ -700,7 +700,7 @@ class RemoteClient:
                 table = self._known[name] = RemoteTable(self, described)
         return table
 
-    def create_series_table(
+    def _create_series_table(
         self,
         name: str,
         *,
@@ -715,7 +715,7 @@ class RemoteClient:
         horizon: int | None = None,
         times: Times = "integer",
     ) -> RemoteSeriesTable:
-        """Creates a table of series on the server; see `LocalClient.create_series_table`.
+        """Creates a table of series on the server; see `gf.engine.SeriesTable`.
 
         `model` names a forecaster the server's configuration serves.
         """
@@ -1195,17 +1195,17 @@ class AsyncRemoteClient:
         """Closes the client."""
         await self.close()
 
-    async def create_table(self, name: str, **settings: Any) -> AsyncRemoteTable:
-        """Adds an empty table on the server; see `RemoteClient.create_table`."""
-        table = await self._run(lambda: self._client.create_table(name, **settings))
+    async def _create_table(self, name: str, **settings: Any) -> AsyncRemoteTable:
+        """Adds an empty table on the server; see `gf.engine.Table`."""
+        table = await self._run(lambda: self._client._create_table(name, **settings))
         return AsyncRemoteTable(self, table)
 
-    async def create_series_table(
+    async def _create_series_table(
         self, name: str, **settings: Any
     ) -> AsyncRemoteSeriesTable:
-        """Creates a table of series; see `RemoteClient.create_series_table`."""
+        """Creates a table of series; see `gf.engine.SeriesTable`."""
         table = await self._run(
-            lambda: self._client.create_series_table(name, **settings)
+            lambda: self._client._create_series_table(name, **settings)
         )
         return AsyncRemoteSeriesTable(self, table)
 

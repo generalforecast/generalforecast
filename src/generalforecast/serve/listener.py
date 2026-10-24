@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
 from generalforecast.deployments.contracts import ServiceError, require
-from generalforecast.packages.validation import PackageError
+from generalforecast.predictors.validation import PredictorError
 
 if TYPE_CHECKING:
     from generalforecast.term import Output
@@ -33,6 +33,8 @@ API_KEY_ENV = "GF_API_KEY"
 CLIENT_TOKEN_ENV = "GF_TOKEN"
 REPLICATION_TOKEN_ENV = "GF_REPLICATION_TOKEN"
 DEFAULT_PORT = 8000
+# Longest a Models API request may run.
+REQUEST_TIMEOUT_SECONDS = 300.0
 TABLE_PORT = 8815
 SERVER = "gf-server"
 ROUTER = "gf-router"
@@ -46,61 +48,20 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         "target",
         nargs="?",
         default=".",
-        help="Package directory, gf.lock file or catalog model reference",
+        metavar="DIR|MODEL",
+        help="a predictor directory, its gf.lock, or a model id such as "
+        "general-forecast/tabicl-v2-classifier (default: .)",
     )
     parser.add_argument(
-        "--host", default="127.0.0.1", help="Address to listen on (default: 127.0.0.1)"
+        "--host", default="127.0.0.1", help="address to listen on (default: 127.0.0.1)"
     )
     parser.add_argument(
-        "--port",
-        type=int,
-        help=f"Port (default: {DEFAULT_PORT}; {TABLE_PORT} with --node or --init)",
+        "--port", type=int, help=f"port to listen on (default: {DEFAULT_PORT})"
     )
     parser.add_argument(
         "--offline",
         action="store_true",
-        help="Use only cached model weights; never download",
-    )
-    parser.add_argument(
-        "--request-timeout",
-        type=float,
-        default=60.0,
-        metavar="<SECONDS>",
-        help="Longest a Models API request may run (default: 60)",
-    )
-    parser.add_argument(
-        "--upstream",
-        metavar="<URL>",
-        help="Origin, such as http://127.0.0.1:8001, that every route the "
-        "Models API does not own streams to",
-    )
-    parser.add_argument(
-        "--node",
-        action="append",
-        metavar="<ADDRESS>",
-        help="Route live tables across this gf node, such as http://10.0.0.2:8815; "
-        f"repeat for each. Takes the tokens from {CLIENT_TOKEN_ENV} and "
-        f"{REPLICATION_TOKEN_ENV}",
-    )
-    parser.add_argument(
-        "--config",
-        type=Path,
-        metavar="<FILE>",
-        help="Serve a node or router configuration file instead of a target",
-    )
-    parser.add_argument(
-        "--init",
-        type=Path,
-        metavar="<FILE>",
-        help="Write a starter node configuration, or a router's with --node, and exit",
-    )
-    parser.add_argument(
-        "--force", action="store_true", help="Let --init overwrite an existing file"
-    )
-    parser.add_argument(
-        "--check",
-        action="store_true",
-        help="Check the target, configuration or nodes without serving",
+        help="use only cached model weights; never download",
     )
 
 
@@ -169,7 +130,7 @@ def configuration(
 
     Flight listens on loopback under a random token nothing else holds.
     Request contexts live in ephemeral tables; the data directory holds only
-    a snapshot package's table, bound once at startup. Keys are the bearer
+    a snapshot predictor's table, bound once at startup. Keys are the bearer
     key in `GF_API_KEY` unless `keys` names another key store. With
     `upstream`, every route the front does not own streams to it, such as a
     control plane on loopback, and `X-Forwarded-*` headers are kept only from
@@ -223,67 +184,16 @@ def configuration(
 
 
 def run(args: argparse.Namespace) -> dict:
-    """Serves the target, a configuration file or a router over `--node`s.
+    """Checks the target, then execs gf-server in this process.
 
-    Each mode checks what it can, then execs gf-server or gf-router in this
-    process; `--check` and `--init` stop before serving.
+    Nodes and routers are started through `gf admin node` and
+    `gf admin router`, which call `configuration`, `route` and `become`.
     """
-    nodes = args.node or []
     require(1 <= len(args.host) <= 255, "invalid host")
     require(
         args.port is None or (type(args.port) is int and 0 <= args.port <= 65535),
         "invalid port",
     )
-    require(
-        0 < args.request_timeout <= 3600, "request timeout must be within (0, 3600]"
-    )
-    require(args.init is None or not args.check, "--init and --check do not combine")
-    require(args.force is False or args.init is not None, "--force goes with --init")
-    if args.config is not None or args.init is not None:
-        require(
-            args.config is None or args.init is None,
-            "--config and --init do not combine",
-        )
-        require(
-            args.target == ".",
-            "a configuration file names its own models; drop the target",
-        )
-        require(
-            args.upstream is None, "--upstream goes in the configuration's [http] table"
-        )
-    if args.config is not None:
-        require(
-            not nodes, "a router configuration lists its own [[nodes]]; drop --node"
-        )
-        name = ROUTER if _routes(args.config) else SERVER
-        _become(name, "check" if args.check else "run", "--config", str(args.config))
-    if args.init is not None:
-        listen = _address(args.host, TABLE_PORT if args.port is None else args.port)
-        force = ["--force"] if args.force else []
-        if nodes:
-            _become(
-                ROUTER,
-                "init",
-                "--path",
-                str(args.init),
-                "--listen",
-                listen,
-                *_nodes(nodes),
-                *force,
-            )
-        _become(
-            SERVER,
-            "init",
-            "--path",
-            str(args.init),
-            "--listen",
-            listen,
-            "--python",
-            sys.executable,
-            *force,
-        )
-    if nodes:
-        return _route(args, nodes)
     return _serve(args)
 
 
@@ -301,7 +211,7 @@ def _output(args: argparse.Namespace) -> "Output":
     return Output(quiet=getattr(args, "quiet", False) or getattr(args, "json", False))
 
 
-def _route(args: argparse.Namespace, nodes: list[str]) -> dict:
+def route(args: argparse.Namespace, nodes: list[str]) -> dict:
     """Writes a router configuration over `nodes`, then checks it or becomes the router.
 
     The nodes already list the replication token, so both tokens come from
@@ -310,9 +220,7 @@ def _route(args: argparse.Namespace, nodes: list[str]) -> dict:
     require(
         args.target == ".", "a router serves tables, not a target; drop it or --node"
     )
-    require(
-        args.upstream is None, "--upstream is for the Models API; drop it or --node"
-    )
+    check = bool(getattr(args, "check", False))
     missing = [
         v for v in (CLIENT_TOKEN_ENV, REPLICATION_TOKEN_ENV) if not os.environ.get(v)
     ]
@@ -344,61 +252,51 @@ def _route(args: argparse.Namespace, nodes: list[str]) -> dict:
         raise ServiceError(
             "ConfigurationError", written.stderr.strip() or "gf-router init failed", 400
         )
-    if not args.check:
+    if not check:
         _output(args).verb(
             "Routing",
             f"tables on {listen}",
             f"across {len(nodes)} node{'s' * (len(nodes) != 1)}",
         )
-    _become(ROUTER, "check" if args.check else "run", "--config", str(config))
+    _become(ROUTER, "check" if check else "run", "--config", str(config))
 
 
 def _serve(args: argparse.Namespace) -> dict:
     """Checks the target and its weights, then execs gf-server in this process.
 
     The configuration goes to a private directory named for this process,
-    which a later server removes once this one has exited.
+    which a later server removes once this one has exited. gf-server prints
+    the `Loading`, `Compiled` and `Serving` status lines as it starts.
     """
     from generalforecast.serve.models import served
 
     directory = Path(tempfile.mkdtemp(prefix=f"gf-{os.getpid()}-"))
     model = served(args.target, directory, allow_downloads=not args.offline)
-    server = binary()
-    if args.check:
-        shutil.rmtree(directory, ignore_errors=True)
-        return {"target": args.target, "model": model["name"], "server": str(server)}
+    binary()
     (directory / "models.json").write_text(json.dumps([model]))
     address = _address(args.host, DEFAULT_PORT if args.port is None else args.port)
     config = directory / "generalforecast.toml"
     # The configuration holds the Flight token, so only this user reads it.
     descriptor = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w") as file:
-        file.write(
-            configuration(
-                directory,
-                address,
-                args.request_timeout,
-                [model],
-                upstream=args.upstream,
-            )
-        )
+        file.write(configuration(directory, address, REQUEST_TIMEOUT_SECONDS, [model]))
     environment = dict(os.environ, GF_LOG_KEY=secrets.token_hex(32))
     if args.offline:
         environment["HF_HUB_OFFLINE"] = "1"
-    _output(args).verb("Starting", f"{model['name']} on http://{address}")
     _become(SERVER, "run", "--config", str(config), environment=environment)
 
 
 def main(argv: list[str] | None = None) -> None:
     """`python -m generalforecast.serve`."""
     parser = argparse.ArgumentParser(
-        prog="gf serve", description="Serve a catalog model over the Models API."
+        prog="gf serve",
+        description="Serve a predictor or a catalog model on this machine.",
     )
     add_arguments(parser)
     args = parser.parse_args(argv)
     try:
         result = run(args)
-    except (ServiceError, PackageError) as error:
+    except (ServiceError, PredictorError) as error:
         print(
             json.dumps({"error": {"code": error.code, "message": str(error)}}),
             file=sys.stderr,

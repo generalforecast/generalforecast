@@ -5,9 +5,10 @@
 
 A built-in model's files come from `GF_CHECKPOINTS/<name>` when that is set,
 as on machines without internet, or else from the Hugging Face cache, which
-downloads them at their pinned revision when the caller allows it. Either way
+downloads them at their pinned revision unless the caller or `GF_OFFLINE=1`
+forbids it; the first download reports one `Pulling` status line. Either way
 every pinned file is hashed before anything reads it, and a missing pinned
-config or weights file fails rather than passing unchecked. Packages and remote
+config or weights file fails rather than passing unchecked. Predictors and remote
 serving also require every pinned license file.
 
 Families converted at load are hashed as upstream bytes before converting, and
@@ -18,12 +19,16 @@ trusted local use reads a directory without hashes, for models whose catalog
 entry records none, or converted directories written before manifests existed.
 """
 
+import contextlib
 import hashlib
 import json
 import os
 import shutil
+import sys
 import tempfile
-from collections.abc import Mapping
+import threading
+import warnings
+from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -31,17 +36,31 @@ from generalforecast.models.catalog import DERIVED_MANIFEST, ModelEntry, Surface
 
 # The files of a checkpoint without recorded hashes, read as the original
 # registry read them.
-_LEGACY_FILES = ("config.json", "model.safetensors", "LICENSE", "NOTICE")
+_DEFAULT_FILES = ("config.json", "model.safetensors", "LICENSE", "NOTICE")
 _RUNTIME_FILES = ("config.json", "model.safetensors")
+
+# Receives each status line as `(verb, message)`.
+Progress = Callable[[str, str], None]
 
 
 class ArtifactError(ValueError):
     """A checkpoint that is unavailable or differs from its pin, with a code."""
 
-    def __init__(self, code: str, message: str):
-        """Keeps a machine-readable code apart from the message."""
+    def __init__(self, code: str, message: str, *, hint: str | None = None):
+        """Keeps a machine-readable code and the hint apart from the message."""
         self.code = code
+        self.hint = hint
         super().__init__(message)
+
+
+def status(verb: str, message: str) -> None:
+    """Writes one status line to stderr: the verb right-aligned in 12 columns, then the message."""
+    print(f"{verb:>12} {message}", file=sys.stderr, flush=True)
+
+
+def offline() -> bool:
+    """Whether `GF_OFFLINE` forbids downloads on this machine."""
+    return os.environ.get("GF_OFFLINE", "").strip().lower() not in ("", "0", "false")
 
 
 def local_checkpoint(name: str) -> Path | None:
@@ -142,35 +161,45 @@ def verify(
 
 
 def checkpoint(
-    entry: ModelEntry, *, surface: Surface = "local", allow_downloads: bool = True
+    entry: ModelEntry,
+    *,
+    surface: Surface = "local",
+    allow_downloads: bool = True,
+    progress: Progress | None = None,
 ) -> Path:
     """A built-in model's verified checkpoint directory.
 
     Args:
         entry: The model's catalog entry.
-        surface: Where it runs. Packages and remote serving need the entry's
+        surface: Where it runs. Predictors and remote serving need the entry's
             gate, every pinned file including license evidence and, for a
             converted family, a verified derived manifest.
-        allow_downloads: Whether missing files may download at their pins.
+        allow_downloads: Whether missing files may download at their pins;
+            `GF_OFFLINE=1` forbids it whatever the caller says.
+        progress: Receives the `Pulling` status line of a download as
+            `(verb, message)`; by default it goes to stderr.
 
     Returns:
         A directory with the model's `config.json` and `model.safetensors`.
 
     Raises:
-        ArtifactError: If the surface is not qualified, or files are missing
-            or differ from their pins.
+        ArtifactError: If the surface is not qualified, or files differ from
+            their pins; with code `NotFound` and a `gf model pull` hint if
+            they are missing and downloads are off.
     """
     strict = surface != "local"
+    allow_downloads = allow_downloads and not offline()
+    progress = progress or status
     if not entry.allows(surface):
         raise ArtifactError(
-            "UnsupportedModel", f"{entry.name} is not qualified for {surface} use"
+            "UnsupportedModel", f"{entry.id} is not qualified for {surface} use"
         )
     if strict and not entry.artifact.files:
-        raise ArtifactError("UnsupportedModel", f"{entry.name} has no pinned files")
+        raise ArtifactError("UnsupportedModel", f"{entry.id} has no pinned files")
     if entry.artifact.convert:
-        return _converted(entry, strict, allow_downloads)
+        return _converted(entry, strict, allow_downloads, progress)
     directory = local_checkpoint(entry.directory) or _download(
-        entry, strict, allow_downloads
+        entry, strict, allow_downloads, progress
     )
     verify(
         directory,
@@ -181,13 +210,26 @@ def checkpoint(
     return directory
 
 
-def _download(entry: ModelEntry, strict: bool, allow_downloads: bool) -> Path:
+def cached(entry: ModelEntry) -> bool:
+    """Whether a model's files are on this machine, so loading it downloads nothing."""
+    try:
+        checkpoint(entry, allow_downloads=False)
+    except ArtifactError as error:
+        if error.code == "NotFound":
+            return False
+        raise
+    return True
+
+
+def _download(
+    entry: ModelEntry, strict: bool, allow_downloads: bool, progress: Progress
+) -> Path:
     """The pinned upstream files from the Hugging Face cache, downloading if allowed."""
     from huggingface_hub import snapshot_download
     from huggingface_hub.errors import LocalEntryNotFoundError
 
     artifact = entry.artifact
-    patterns = list(artifact.files) or list(_LEGACY_FILES)
+    patterns = list(artifact.files) or list(_DEFAULT_FILES)
     required = (
         list(artifact.files)
         if strict
@@ -205,30 +247,126 @@ def _download(entry: ModelEntry, strict: bool, allow_downloads: bool) -> Path:
         )
 
     unavailable = ArtifactError(
-        "ModelUnavailable",
-        f"pinned {entry.name} checkpoint is not cached; preload it or allow downloads",
+        "NotFound",
+        f"{entry.id} is not cached",
+        hint=f"run `gf model pull {entry.id}`"
+        + (", or unset GF_OFFLINE" if offline() else ""),
     )
-    try:
-        # From the cache without a word; only a real download shows progress.
-        cached = download(True)
+
+    def complete(directory: Path) -> bool:
         # The cache holds a revision's folder once any of its files arrived, so
         # a download cut short leaves one without its weights.
-        if all((cached / name).is_file() for name in required):
-            return cached
-    except LocalEntryNotFoundError:
-        pass
-    except Exception:  # noqa: BLE001
-        raise unavailable from None
+        return all((directory / name).is_file() for name in required)
+
+    def from_cache() -> Path | None:
+        # From the cache without a word; only a real download shows progress.
+        try:
+            cached = download(True)
+        except LocalEntryNotFoundError:
+            return None
+        except Exception:  # noqa: BLE001
+            raise unavailable from None
+        return cached if complete(cached) else None
+
+    if (cached := from_cache()) is not None:
+        return cached
     if not allow_downloads:
         raise unavailable
+    # One thread, and one process, pulls a revision; the others wait for it
+    # and then find it in the cache.
+    from filelock import FileLock
+
+    with _PULLS_LOCK:
+        lock = _PULLS.setdefault(artifact.revision, threading.Lock())
+    cache = _hub_cache()
+    cache.mkdir(parents=True, exist_ok=True)
+    with lock, FileLock(cache / f"gf-pull-{artifact.revision}.lock"):
+        if (cached := from_cache()) is not None:
+            return cached
+        progress("Pulling", _pulling(entry, patterns))
+        try:
+            with _quiet_hub():
+                return download(False)
+        except Exception:  # noqa: BLE001
+            # Hub errors may carry signed URLs or tokens; none of it is surfaced.
+            raise ArtifactError(
+                "ModelUnavailable", f"{entry.id} could not be downloaded"
+            ) from None
+
+
+_PULLS: dict[str, threading.Lock] = {}
+_PULLS_LOCK = threading.Lock()
+
+
+def _hub_cache() -> Path:
+    """The Hugging Face hub cache, `~/.cache/huggingface/hub` unless `HF_HUB_CACHE` says otherwise."""
+    from huggingface_hub.constants import HF_HUB_CACHE
+
+    return Path(HF_HUB_CACHE)
+
+
+@contextlib.contextmanager
+def _quiet_hub() -> Iterator[None]:
+    """Keeps the hub's progress bars and token advice off the terminal; the status line says enough."""
+    import logging
+
+    from huggingface_hub.utils import (
+        are_progress_bars_disabled,
+        disable_progress_bars,
+        enable_progress_bars,
+    )
+
+    logger = logging.getLogger("huggingface_hub")
+    level = logger.level
+    shown = not are_progress_bars_disabled()
+    logger.setLevel(logging.ERROR)
+    disable_progress_bars()
     try:
-        return download(False)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            yield
+    finally:
+        logger.setLevel(level)
+        if shown:
+            enable_progress_bars()
+
+
+def _pulling(entry: ModelEntry, patterns: list[str]) -> str:
+    """The message of the `Pulling` line: the id, the download's size and where it goes."""
+    cache = _hub_cache()
+    if cache.name == "hub":
+        cache = cache.parent
+    try:
+        destination = f"~/{cache.relative_to(Path.home())}"
+    except ValueError:
+        destination = str(cache)
+    size = _size(entry, patterns)
+    return f"{entry.id}  " + (f"({size}) " if size else "") + f"to {destination}"
+
+
+def _size(entry: ModelEntry, patterns: list[str]) -> str | None:
+    """The size of the files to download, such as `1.2 GB`, or None if the hub does not say."""
+    from huggingface_hub import HfApi
+
+    try:
+        info = HfApi().model_info(
+            entry.artifact.repository,
+            revision=entry.artifact.revision,
+            files_metadata=True,
+        )
     except Exception:  # noqa: BLE001
-        # Hub errors may carry signed URLs or tokens; none of it is surfaced.
-        raise ArtifactError(
-            "ModelUnavailable",
-            f"pinned {entry.name} checkpoint could not be downloaded",
-        ) from None
+        return None
+    total = sum(
+        sibling.size or 0
+        for sibling in info.siblings or ()
+        if sibling.rfilename in patterns
+    )
+    if total <= 0:
+        return None
+    for unit, scale in (("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
+        if total >= scale:
+            return f"{total / scale:.1f} {unit}"
+    return f"{total} B"
 
 
 def _cache(entry: ModelEntry) -> Path:
@@ -274,7 +412,7 @@ def _derived(entry: ModelEntry, directory: Path, strict: bool) -> bool:
         if strict:
             raise ArtifactError(
                 "ArtifactMismatch",
-                f"converted {entry.name} checkpoint has no derived manifest",
+                f"converted {entry.id} checkpoint has no derived manifest",
             )
         return False
     try:
@@ -282,20 +420,20 @@ def _derived(entry: ModelEntry, directory: Path, strict: bool) -> bool:
         source, files = manifest["source"], manifest["files"]
     except (ValueError, KeyError, TypeError):
         raise ArtifactError(
-            "ArtifactMismatch", f"converted {entry.name} manifest is unreadable"
+            "ArtifactMismatch", f"converted {entry.id} manifest is unreadable"
         ) from None
     expected = derived_manifest(entry, directory)["source"]
     if source != expected or type(files) is not dict:
         raise ArtifactError(
             "ArtifactMismatch",
-            f"converted {entry.name} checkpoint came from other upstream content",
+            f"converted {entry.id} checkpoint came from other upstream content",
         )
     needed = set(_RUNTIME_FILES)
     if strict:
         needed |= set(entry.artifact.license_files)
     if not needed <= files.keys():
         raise ArtifactError(
-            "ArtifactMismatch", f"converted {entry.name} checkpoint lacks its files"
+            "ArtifactMismatch", f"converted {entry.id} checkpoint lacks its files"
         )
     verify(directory, files)
     return True
@@ -309,7 +447,9 @@ def _usable(entry: ModelEntry, directory: Path, strict: bool) -> bool:
         return False
 
 
-def _converted(entry: ModelEntry, strict: bool, allow_downloads: bool) -> Path:
+def _converted(
+    entry: ModelEntry, strict: bool, allow_downloads: bool, progress: Progress
+) -> Path:
     if (local := local_checkpoint(entry.directory)) is not None:
         _derived(entry, local, strict)
         return local
@@ -326,7 +466,7 @@ def _converted(entry: ModelEntry, strict: bool, allow_downloads: bool) -> Path:
                 return directory
             # A cache this module wrote that no longer verifies converts again.
             shutil.rmtree(directory)
-        raw = _download(entry, True, allow_downloads)
+        raw = _download(entry, True, allow_downloads, progress)
         verify(raw, entry.artifact.files)
         # Written aside and renamed, so an interrupted conversion leaves nothing.
         with tempfile.TemporaryDirectory(dir=directory.parent) as scratch:
@@ -362,7 +502,7 @@ def convert(entry: ModelEntry, raw: Path, directory: Path) -> None:
         architecture, settings, state = read_published(raw / weights)
         if architecture != entry.artifact.convert:
             raise ArtifactError(
-                "ModelUnavailable", f"{entry.name} has an unexpected architecture"
+                "ModelUnavailable", f"{entry.id} has an unexpected architecture"
             )
         regression = entry.capability.task == "regression"
         save_state(directory, architecture, settings, one_task(state, regression))

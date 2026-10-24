@@ -1,0 +1,2672 @@
+openapi: 3.1.0
+info:
+  title: General Forecast API
+  version: gf/v1
+  summary: score rows with a predictor, declared in gf.yaml or sent ad hoc
+  description: |
+    Every request and reply carries the same envelope: `api_version`,
+    `project`, `request_id`, `resource` and either `payload` (request),
+    `result` (success) or `error` (failure). Four words name the data on
+    every route: `context` (rows the model learns from), `queries` (rows to
+    score), `inputs` (columns the model may read) and `target` (the column to
+    predict). Model ids are always `general-forecast/<name>`; a bare name is
+    refused with a hint naming the canonical id.
+
+    `api/generate.py` emits `src/generalforecast/_api.py` and
+    `clients/typescript/src/types.ts` from this file; `tests/conformance`
+    checks every example here against its schema and, with
+    `GF_CONFORMANCE_URL` set, against a running `gf serve`. A request example
+    marked `x-gf-invalid: true` is one the schema itself refuses; its reply
+    example of the same name shows the error.
+servers:
+  - url: https://app.generalforecast.com
+    description: hosted
+  - url: http://127.0.0.1:8000
+    description: gf serve on this machine
+security:
+  - apiKey: []
+tags:
+  - name: predictors
+    description: declared predictors, and the ad hoc predictor
+  - name: models
+    description: the catalog this server can run, with its limits
+  - name: health
+    description: process readiness, outside the envelope
+  - name: hosted
+    description: the hosted control plane the CLI `admin` group and the SDK call
+
+paths:
+  /v1/projects/{project}/predictors/{name}/predict:
+    post:
+      operationId: predictors.predict
+      tags: [predictors]
+      summary: score queries with a declared predictor
+      description: |
+        The predictor's manifest supplies the model, target, inputs and
+        context. The payload carries only `queries`, and `context` when the
+        manifest declares `context: {request: ...}`; otherwise `context` is
+        refused with `param: "context"` and the message `context is declared
+        by the predictor`. `target`, `inputs`, `model` and `task` are refused
+        with `param` naming the field and the message `declared by the
+        predictor`.
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/predictor"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueriesRequest"
+            examples:
+              scored:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-3abb2401f119428db148927c6a0d358c
+                  resource: {kind: predictor, name: churn}
+                  payload:
+                    queries:
+                      - {customer_id: 1041, spend: 82.5, plan: pro}
+                      - {customer_id: 1042, spend: 12.0, plan: free}
+              declared:
+                x-gf-invalid: true
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-8f1b2c3d4e5f60718293a4b5c6d7e8f9
+                  resource: {kind: predictor, name: churn}
+                  payload:
+                    target: churned
+                    queries:
+                      - {customer_id: 1041, spend: 82.5, plan: pro}
+              context:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-0c1d2e3f405162738495a6b7c8d9e0f1
+                  resource: {kind: predictor, name: churn}
+                  payload:
+                    context:
+                      - {customer_id: 7, spend: 10.0, plan: free, churned: 1}
+                    queries:
+                      - {customer_id: 1041, spend: 82.5, plan: pro}
+              missing:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-5a6b7c8d9e0f1a2b3c4d5e6f708192a3
+                  resource: {kind: predictor, name: nothing}
+                  payload:
+                    queries:
+                      - {customer_id: 1041, spend: 82.5, plan: pro}
+      responses:
+        "200":
+          description: one prediction per query, in query order
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResultReply"
+              examples:
+                scored:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-3abb2401f119428db148927c6a0d358c
+                    resource: {kind: predictor, name: churn}
+                    result:
+                      model: general-forecast/tabicl-v2-classifier@sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                      task: classification
+                      context: {kind: snapshot, rows: 1840, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
+                      revision: 7
+                      environment: production
+                      predictions:
+                        - {id: 1041, label: 0, probabilities: {"0": 0.91, "1": 0.09}}
+                        - {id: 1042, label: 1, probabilities: {"0": 0.22, "1": 0.78}}
+        "404":
+          description: no predictor of that name in the project
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorReply"
+              examples:
+                missing:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-5a6b7c8d9e0f1a2b3c4d5e6f708192a3
+                    resource: {kind: predictor, name: nothing}
+                    error:
+                      code: NotFound
+                      message: predictor nothing is not in project acme
+                      param: name
+                      hint: list predictors with `gf status`
+        "422":
+          description: the payload names something the predictor declares
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorReply"
+              examples:
+                declared:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-8f1b2c3d4e5f60718293a4b5c6d7e8f9
+                    resource: {kind: predictor, name: churn}
+                    error:
+                      code: ValidationError
+                      message: declared by the predictor
+                      param: target
+                      hint: remove `target` from the payload; churn predicts `churned`
+                context:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-0c1d2e3f405162738495a6b7c8d9e0f1
+                    resource: {kind: predictor, name: churn}
+                    error:
+                      code: ValidationError
+                      message: context is declared by the predictor
+                      param: context
+                      hint: churn reads its context from the snapshot context.csv
+        "503":
+          $ref: "#/components/responses/NotReady"
+
+  /v1/projects/{project}/predict:
+    post:
+      operationId: predict
+      tags: [predictors]
+      summary: score queries with an ad hoc predictor
+      description: |
+        The payload is a manifest fragment plus rows: `model`, `target`,
+        `context` and `queries` are required; `inputs`, `id`, `time`,
+        `series`, `frequency`, `horizon`, `quantiles`, `outputs` and
+        `selection` take the manifest's names and defaults. There is no `task`
+        (the model determines it) and no `options` object. Every limit error
+        carries `limit` and `actual` and names the model in `message`. A text
+        column where numbers are required names the column, for example
+        `column plan has text values; this route takes numeric inputs` with
+        `param: "inputs.plan"`.
+      parameters:
+        - $ref: "#/components/parameters/project"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ManifestRequest"
+            examples:
+              scored:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-1f2e3d4c5b6a79880716253443526170
+                  resource: {kind: predictor, name: ad-hoc}
+                  payload:
+                    model: general-forecast/tabicl-v2-classifier
+                    target: churned
+                    id: customer_id
+                    inputs: [spend, plan]
+                    context:
+                      - {customer_id: 1, spend: 10.0, plan: free, churned: 1}
+                      - {customer_id: 2, spend: 95.0, plan: pro, churned: 0}
+                      - {customer_id: 3, spend: 40.0, plan: pro, churned: 0}
+                      - {customer_id: 4, spend: 5.0, plan: free, churned: 1}
+                    queries:
+                      - {customer_id: 1041, spend: 82.5, plan: pro}
+              forecast:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-2a3b4c5d6e7f8091a2b3c4d5e6f70819
+                  resource: {kind: predictor, name: ad-hoc}
+                  payload:
+                    model: general-forecast/chronos-2
+                    target: units
+                    time: date
+                    series: [sku]
+                    frequency: 1d
+                    horizon: 2
+                    quantiles: [0.1, 0.5, 0.9]
+                    inputs: {past: [], future: [price]}
+                    context:
+                      - {sku: a, date: "2026-01-01", price: 9.5, units: 12}
+                      - {sku: a, date: "2026-01-02", price: 9.5, units: 14}
+                      - {sku: a, date: "2026-01-03", price: 9.0, units: 15}
+                      - {sku: a, date: "2026-01-04", price: 9.0, units: 17}
+                    queries:
+                      - {sku: a, date: "2026-01-05", price: 8.5}
+                      - {sku: a, date: "2026-01-06", price: 8.5}
+              bare:
+                x-gf-invalid: true
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-3c4d5e6f708192a3b4c5d6e7f8091a2b
+                  resource: {kind: predictor, name: ad-hoc}
+                  payload:
+                    model: tabicl-v2-classifier
+                    target: churned
+                    context:
+                      - {spend: 10.0, churned: 1}
+                      - {spend: 95.0, churned: 0}
+                    queries:
+                      - {spend: 82.5}
+              text:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-4d5e6f708192a3b4c5d6e7f8091a2b3c
+                  resource: {kind: predictor, name: ad-hoc}
+                  payload:
+                    model: general-forecast/tabicl-v2-regressor
+                    target: spend
+                    context:
+                      - {plan: free, spend: 10.0}
+                      - {plan: pro, spend: 95.0}
+                    queries:
+                      - {plan: pro}
+      responses:
+        "200":
+          description: one prediction per query, in query order
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResultReply"
+              examples:
+                scored:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-1f2e3d4c5b6a79880716253443526170
+                    resource: {kind: predictor, name: ad-hoc}
+                    result:
+                      model: general-forecast/tabicl-v2-classifier@sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                      task: classification
+                      context: {kind: request, rows: 4}
+                      predictions:
+                        - {id: 1041, label: 0, probabilities: {"0": 0.83, "1": 0.17}}
+                forecast:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-2a3b4c5d6e7f8091a2b3c4d5e6f70819
+                    resource: {kind: predictor, name: ad-hoc}
+                    result:
+                      model: general-forecast/chronos-2@sha256:0b1c2d3e4f5061728394a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90
+                      task: forecast
+                      context: {kind: request, rows: 4}
+                      predictions:
+                        - {value: 18.2, quantiles: {"0.1": 16.1, "0.5": 18.2, "0.9": 20.4}}
+                        - {value: 19.0, quantiles: {"0.1": 16.0, "0.5": 19.0, "0.9": 22.1}}
+        "422":
+          description: the manifest fragment or the rows are invalid
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorReply"
+              examples:
+                bare:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-3c4d5e6f708192a3b4c5d6e7f8091a2b
+                    resource: {kind: predictor, name: ad-hoc}
+                    error:
+                      code: ValidationError
+                      message: model tabicl-v2-classifier is not a catalog id
+                      param: model
+                      hint: use general-forecast/tabicl-v2-classifier
+                text:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-4d5e6f708192a3b4c5d6e7f8091a2b3c
+                    resource: {kind: predictor, name: ad-hoc}
+                    error:
+                      code: ValidationError
+                      message: column plan has text values; this route takes numeric inputs
+                      param: inputs.plan
+                      hint: encode `plan` as numbers, or use general-forecast/tabicl-v2-classifier
+                capacity:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-6e7f8091a2b3c4d5e6f708192a3b4c5d
+                    resource: {kind: predictor, name: ad-hoc}
+                    error:
+                      code: CapacityExceeded
+                      message: queries exceed the limit for general-forecast/tabicl-v2-classifier
+                      param: queries
+                      hint: split the queries, or push a predictor and call it in batches
+                      limit: 100
+                      actual: 1000
+        "503":
+          $ref: "#/components/responses/NotReady"
+
+  /v1/projects/{project}/predictors:
+    get:
+      operationId: predictors.list
+      tags: [predictors]
+      summary: list the project's predictors
+      parameters:
+        - $ref: "#/components/parameters/project"
+      responses:
+        "200":
+          description: every predictor this server or project knows
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PredictorListReply"
+              examples:
+                listed:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-7f8091a2b3c4d5e6f708192a3b4c5d6e
+                    resource: {kind: predictor, name: predictors}
+                    result:
+                      predictors:
+                        - name: churn
+                          model: general-forecast/tabicl-v2-classifier
+                          model_digest: sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                          task: classification
+                          target: churned
+                          target_type: category
+                          classes: ["0", "1"]
+                          id: customer_id
+                          inputs:
+                            - {name: spend, type: number}
+                            - {name: plan, type: category}
+                            - {name: signups, type: number}
+                          context: {kind: snapshot, rows: 1840, query_rows: 212, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
+                          selection: {core: 1000, neighbors: 3000, kind: stratified}
+                          limits: {context_rows: 100000, queries: 100, inputs: 32}
+                          environments:
+                            - {predictor: churn, name: production, revision: 7, generation: 9, runtime: hosted, status: ready}
+                          serving: {loaded: true, compiled: true, warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]}
+
+  /v1/projects/{project}/predictors/{name}:
+    get:
+      operationId: predictors.get
+      tags: [predictors]
+      summary: show a predictor's resolved manifest, lock digests, context, environments and serving facts
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/predictor"
+      responses:
+        "200":
+          description: the resolution gf check prints, plus what is serving it
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PredictorReply"
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-8091a2b3c4d5e6f708192a3b4c5d6e7f
+                    resource: {kind: predictor, name: churn}
+                    result:
+                      name: churn
+                      model: general-forecast/tabicl-v2-classifier
+                      model_digest: sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                      task: classification
+                      target: churned
+                      target_type: category
+                      classes: ["0", "1"]
+                      id: customer_id
+                      inputs:
+                        - {name: spend, type: number}
+                        - {name: plan, type: category}
+                        - {name: signups, type: number}
+                      context: {kind: snapshot, rows: 1840, query_rows: 212, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
+                      selection: {core: 1000, neighbors: 3000, kind: stratified}
+                      limits: {context_rows: 100000, queries: 100, inputs: 32}
+                      environments:
+                        - {predictor: churn, name: staging, revision: 8, generation: 3, runtime: hosted, status: ready}
+                        - {predictor: churn, name: production, revision: 7, generation: 9, runtime: hosted, status: ready}
+                      serving: {loaded: true, compiled: true, warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]}
+        "404":
+          description: no predictor of that name in the project
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorReply"
+              examples:
+                missing:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-91a2b3c4d5e6f708192a3b4c5d6e7f80
+                    resource: {kind: predictor, name: nothing}
+                    error:
+                      code: NotFound
+                      message: predictor nothing is not in project acme
+                      param: name
+                      hint: list predictors with `gf status`
+
+  /v1/projects/{project}/models:
+    get:
+      operationId: models.list
+      tags: [models]
+      summary: list the catalog with per-model limits
+      parameters:
+        - $ref: "#/components/parameters/project"
+      responses:
+        "200":
+          description: the models this server can run and what each accepts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelListReply"
+              examples:
+                listed:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-a2b3c4d5e6f708192a3b4c5d6e7f8091
+                    resource: {kind: model, name: models}
+                    result:
+                      models:
+                        - model: general-forecast/tabicl-v2-classifier@sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                          name: general-forecast/tabicl-v2-classifier
+                          task: classification
+                          repository: general-forecast/tabicl-v2-classifier
+                          revision: 5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b
+                          license: BSD-3-Clause
+                          runtime: cpu
+                          artifact:
+                            repository: general-forecast/tabicl-v2-classifier
+                            revision: 5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b
+                            digest: sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                            license: BSD-3-Clause
+                            digest_format: sha256-of-sorted-compact-json-file-sha256-map
+                            files: {LICENSE: 4f90c5fa25a2b7883d6235c7f0b11f942a37859b9f89ac36157cc485329913b4, config.json: 7ec2941cc537535e1bd8f37d33fc97cea97953343d69d765a261ee6a1605d937, model.safetensors: 58f5fc1f276744f721974079c19d2f67efacc39083c54483fe3feba52297d253}
+                          artifact_verification: required-before-load
+                          bounds: {context_rows: 100000, query_rows: 100, features: 32, classes: 10, quantile_step: null, codes: 8, estimators: 8, members: 16}
+                          capabilities:
+                            - {name: classification, state: supported}
+                            - {name: request-context, state: supported}
+                          limits: {context_rows: 100000, queries: 100, inputs: 32}
+                          warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]
+
+  /healthz:
+    get:
+      operationId: health
+      tags: [health]
+      security: []
+      summary: 200 once every served model is loaded and compiled
+      description: |
+        Health has no project and so no envelope. Before every served model
+        is loaded and compiled the reply is 503 with
+        `{"error": {"code": "ModelNotReady"}}`; `/predict` answers the same
+        way, so a 200 here means predictions will not wait on a compile.
+      responses:
+        "200":
+          description: every served model is loaded and compiled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+              examples:
+                ready:
+                  value: {status: ok}
+        "503":
+          description: a served model is still loading or compiling
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthError"
+              examples:
+                loading:
+                  value:
+                    error:
+                      code: ModelNotReady
+                      message: general-forecast/tabicl-v2-classifier is compiling 12 programs
+                      hint: poll /healthz until it answers 200
+
+  /readyz:
+    get:
+      operationId: ready
+      tags: [health]
+      security: []
+      summary: alias of /healthz
+      responses:
+        "200":
+          description: every served model is loaded and compiled
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+              examples:
+                ready:
+                  value: {status: ok}
+        "503":
+          description: a served model is still loading or compiling
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthError"
+              examples:
+                loading:
+                  value:
+                    error:
+                      code: ModelNotReady
+                      message: general-forecast/tabicl-v2-classifier is compiling 12 programs
+                      hint: poll /readyz until it answers 200
+
+  # ---------------------------------------------------------------------------
+  # Hosted control plane. These are the resources `gf admin`, `gf push`,
+  # `gf status`, `gf promote`, `gf rollback`, `gf context` and the SDK call.
+  # ---------------------------------------------------------------------------
+
+  /v1/projects:
+    get:
+      operationId: projects.list
+      tags: [hosted]
+      summary: list the projects the caller can use
+      responses:
+        "200":
+          description: projects grouped by organization
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectListReply"
+              examples:
+                listed:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-c4d5e6f708192a3b4c5d6e7f8091a2b3
+                    resource: {kind: project, name: projects}
+                    result:
+                      projects:
+                        - {name: acme, organization: acme-corp}
+                      organizations: [acme-corp]
+    post:
+      operationId: projects.create
+      tags: [hosted]
+      summary: create a project in an organization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectCreateRequest"
+            examples:
+              created:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-d5e6f708192a3b4c5d6e7f8091a2b3c4
+                  resource: {kind: project, name: acme-eu}
+                  payload: {name: acme-eu, organization: acme-corp}
+      responses:
+        "200":
+          description: the new project
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectReply"
+              examples:
+                created:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-d5e6f708192a3b4c5d6e7f8091a2b3c4
+                    resource: {kind: project, name: acme-eu}
+                    result: {name: acme-eu, organization: acme-corp}
+
+  /v1/projects/{project}/keys:
+    get:
+      operationId: keys.list
+      tags: [hosted]
+      summary: list API keys; tokens are never listed
+      parameters:
+        - $ref: "#/components/parameters/project"
+      responses:
+        "200":
+          description: key metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KeyListReply"
+              examples:
+                listed:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-e6f708192a3b4c5d6e7f8091a2b3c4d5
+                    resource: {kind: api-key, name: keys}
+                    result:
+                      keys:
+                        - {id: key-0f1e2d3c4b5a69788796, project: acme, name: ci, permissions: [predictors:predict], created_at: 1761300000.0, expires_at: 1763892000.0, revoked_at: null}
+    post:
+      operationId: keys.create
+      tags: [hosted]
+      summary: create an API key; the token is returned once
+      parameters:
+        - $ref: "#/components/parameters/project"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/KeyCreateRequest"
+            examples:
+              created:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-f708192a3b4c5d6e7f8091a2b3c4d5e6
+                  resource: {kind: api-key, name: new}
+                  payload: {name: ci, permissions: [predictors:predict], expires_in: 2592000}
+      responses:
+        "200":
+          description: the key and its token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KeyReply"
+              examples:
+                created:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-f708192a3b4c5d6e7f8091a2b3c4d5e6
+                    resource: {kind: api-key, name: new}
+                    result: {id: key-0f1e2d3c4b5a69788796, project: acme, name: ci, permissions: [predictors:predict], created_at: 1761300000.0, expires_at: 1763892000.0, revoked_at: null, token: gf_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG}
+
+  /v1/projects/{project}/keys/{key}/revoke:
+    post:
+      operationId: keys.revoke
+      tags: [hosted]
+      summary: revoke a key by its public id
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/key"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/KeyRefRequest"
+            examples:
+              revoked:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-08192a3b4c5d6e7f8091a2b3c4d5e6f7
+                  resource: {kind: api-key, name: key-0f1e2d3c4b5a69788796}
+                  payload: {id: key-0f1e2d3c4b5a69788796}
+      responses:
+        "200":
+          description: the key no longer authenticates
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KeyRevokedReply"
+              examples:
+                revoked:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-08192a3b4c5d6e7f8091a2b3c4d5e6f7
+                    resource: {kind: api-key, name: key-0f1e2d3c4b5a69788796}
+                    result: {id: key-0f1e2d3c4b5a69788796, revoked: true}
+
+  /v1/projects/{project}/keys/{key}/rotate:
+    post:
+      operationId: keys.rotate
+      tags: [hosted]
+      summary: replace a key's token; the old key is revoked
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/key"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/KeyRefRequest"
+            examples:
+              rotated:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-192a3b4c5d6e7f8091a2b3c4d5e6f708
+                  resource: {kind: api-key, name: key-0f1e2d3c4b5a69788796}
+                  payload: {id: key-0f1e2d3c4b5a69788796}
+      responses:
+        "200":
+          description: the replacement key and its token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/KeyReply"
+              examples:
+                rotated:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-192a3b4c5d6e7f8091a2b3c4d5e6f708
+                    resource: {kind: api-key, name: key-0f1e2d3c4b5a69788796}
+                    result: {id: key-1a2b3c4d5e6f70819293, project: acme, name: ci, permissions: [predictors:predict], created_at: 1761400000.0, expires_at: 1763892000.0, revoked_at: null, token: gf_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopq, replaces: key-0f1e2d3c4b5a69788796}
+
+  /v1/projects/{project}/secrets:
+    get:
+      operationId: secrets.list
+      tags: [hosted]
+      summary: list secret metadata; values are never returned
+      parameters:
+        - $ref: "#/components/parameters/project"
+      responses:
+        "200":
+          description: secret metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretListReply"
+              examples:
+                listed:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-2a3b4c5d6e7f8091a2b3c4d5e6f70819
+                    resource: {kind: secret, name: secrets}
+                    result:
+                      secrets:
+                        - {project: acme, name: warehouse, version: 2, created_at: 1761200000.0, updated_at: 1761300000.0}
+    post:
+      operationId: secrets.create
+      tags: [hosted]
+      summary: store a secret value
+      parameters:
+        - $ref: "#/components/parameters/project"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SecretCreateRequest"
+            examples:
+              created:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-3b4c5d6e7f8091a2b3c4d5e6f708192a
+                  resource: {kind: secret, name: warehouse}
+                  payload: {name: warehouse, value: "postgres://reader:...@warehouse.internal/sales"}
+      responses:
+        "200":
+          description: the stored version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretReply"
+              examples:
+                created:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-3b4c5d6e7f8091a2b3c4d5e6f708192a
+                    resource: {kind: secret, name: warehouse}
+                    result: {project: acme, name: warehouse, version: 1, created_at: 1761200000.0, updated_at: 1761200000.0}
+
+  /v1/projects/{project}/secrets/{secret}:
+    get:
+      operationId: secrets.get
+      tags: [hosted]
+      summary: show a secret's metadata
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/secret"
+      responses:
+        "200":
+          description: metadata only
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretReply"
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-4c5d6e7f8091a2b3c4d5e6f708192a3b
+                    resource: {kind: secret, name: warehouse}
+                    result: {project: acme, name: warehouse, version: 2, created_at: 1761200000.0, updated_at: 1761300000.0}
+
+  /v1/projects/{project}/secrets/{secret}/rotate:
+    post:
+      operationId: secrets.rotate
+      tags: [hosted]
+      summary: replace a secret's value under a version guard
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/secret"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SecretRotateRequest"
+            examples:
+              rotated:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-5d6e7f8091a2b3c4d5e6f708192a3b4c
+                  resource: {kind: secret, name: warehouse}
+                  payload: {name: warehouse, value: "postgres://reader:...@warehouse.internal/sales", expected_version: 1}
+      responses:
+        "200":
+          description: the new version
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretReply"
+              examples:
+                rotated:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-5d6e7f8091a2b3c4d5e6f708192a3b4c
+                    resource: {kind: secret, name: warehouse}
+                    result: {project: acme, name: warehouse, version: 2, created_at: 1761200000.0, updated_at: 1761300000.0}
+
+  /v1/projects/{project}/secrets/{secret}/delete:
+    post:
+      operationId: secrets.delete
+      tags: [hosted]
+      summary: delete a secret
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/secret"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SecretRefRequest"
+            examples:
+              deleted:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-6e7f8091a2b3c4d5e6f708192a3b4c5d
+                  resource: {kind: secret, name: warehouse}
+                  payload: {name: warehouse}
+      responses:
+        "200":
+          description: the secret is gone
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SecretDeletedReply"
+              examples:
+                deleted:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-6e7f8091a2b3c4d5e6f708192a3b4c5d
+                    resource: {kind: secret, name: warehouse}
+                    result: {name: warehouse, deleted: true}
+
+  /v1/projects/{project}/predictors/{name}/revisions:
+    get:
+      operationId: revisions.list
+      tags: [hosted]
+      summary: list a predictor's pushed revisions
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/predictor"
+      responses:
+        "200":
+          description: immutable revisions, oldest first
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevisionListReply"
+              examples:
+                listed:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-7f8091a2b3c4d5e6f708192a3b4c5d6e
+                    resource: {kind: predictor, name: churn}
+                    result:
+                      revisions:
+                        - {predictor: churn, number: 7, predictor_digest: sha256:9c0d1e2f30415263748596a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7081, model: general-forecast/tabicl-v2-classifier, created_at: 1761300000.0, status: ready}
+    post:
+      operationId: revisions.register
+      tags: [hosted]
+      summary: register a revision from a checked lock and its uploaded snapshot
+      description: |
+        `gf push` uploads the snapshot bytes first (Arrow IPC, outside this
+        JSON surface), then registers the lock. `snapshot` is the uploaded
+        context digest, or null for `request` and `live` contexts.
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/predictor"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RevisionRegisterRequest"
+            examples:
+              registered:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-8091a2b3c4d5e6f708192a3b4c5d6e7f
+                  resource: {kind: predictor, name: churn}
+                  payload:
+                    lock:
+                      lock_version: 1
+                      predictor:
+                        name: churn
+                        model: general-forecast/tabicl-v2-classifier
+                        model_digest: sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                        task: classification
+                        target: churned
+                        target_type: category
+                        classes: ["0", "1"]
+                        id: customer_id
+                        inputs:
+                          - {name: spend, type: number}
+                          - {name: plan, type: category}
+                        context: {kind: snapshot, rows: 1840, query_rows: 212, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
+                        selection: {core: 1000, neighbors: 3000, kind: stratified}
+                      model:
+                        files: {"model.safetensors": sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0}
+                    snapshot: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e
+      responses:
+        "200":
+          description: the new revision; the same lock registers the same number again
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevisionReply"
+              examples:
+                registered:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-8091a2b3c4d5e6f708192a3b4c5d6e7f
+                    resource: {kind: predictor, name: churn}
+                    result: {predictor: churn, number: 8, predictor_digest: sha256:0d1e2f30415263748596a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f70819c, model: general-forecast/tabicl-v2-classifier, created_at: 1761400000.0, status: pending}
+
+  /v1/projects/{project}/predictors/{name}/revisions/{number}:
+    get:
+      operationId: revisions.get
+      tags: [hosted]
+      summary: show one revision and its lock
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/predictor"
+        - name: number
+          in: path
+          required: true
+          schema: {type: integer, minimum: 1}
+      responses:
+        "200":
+          description: the revision and the exact lock it was pushed from
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RevisionDetailsReply"
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-91a2b3c4d5e6f708192a3b4c5d6e7f80
+                    resource: {kind: predictor, name: churn}
+                    result:
+                      revision: {predictor: churn, number: 7, predictor_digest: sha256:9c0d1e2f30415263748596a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7081, model: general-forecast/tabicl-v2-classifier, created_at: 1761300000.0, status: ready}
+                      lock:
+                        lock_version: 1
+                        predictor:
+                          name: churn
+                          model: general-forecast/tabicl-v2-classifier
+                          model_digest: sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                          task: classification
+                          target: churned
+                          target_type: category
+                          classes: ["0", "1"]
+                          id: customer_id
+                          inputs:
+                            - {name: spend, type: number}
+                            - {name: plan, type: category}
+                          context: {kind: snapshot, rows: 1840, query_rows: 212, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
+                          selection: {core: 1000, neighbors: 3000, kind: stratified}
+                        model:
+                          files: {"model.safetensors": sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0}
+
+  /v1/projects/{project}/predictors/{name}/environments:
+    get:
+      operationId: environments.list
+      tags: [hosted]
+      summary: list a predictor's environments
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/predictor"
+      responses:
+        "200":
+          description: each environment's revision pointer and state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvironmentListReply"
+              examples:
+                listed:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-a2b3c4d5e6f708192a3b4c5d6e7f8091
+                    resource: {kind: predictor, name: churn}
+                    result:
+                      environments:
+                        - {predictor: churn, name: staging, revision: 8, generation: 3, runtime: hosted, status: ready}
+                        - {predictor: churn, name: production, revision: 7, generation: 9, runtime: hosted, status: ready}
+    post:
+      operationId: environments.create
+      tags: [hosted]
+      summary: create an environment pointer on a runtime
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/predictor"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnvironmentCreateRequest"
+            examples:
+              created:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-b3c4d5e6f708192a3b4c5d6e7f8091a2
+                  resource: {kind: predictor, name: churn}
+                  payload: {name: staging, runtime: hosted}
+      responses:
+        "200":
+          description: an empty pointer until the first promote
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvironmentReply"
+              examples:
+                created:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-b3c4d5e6f708192a3b4c5d6e7f8091a2
+                    resource: {kind: predictor, name: churn}
+                    result: {predictor: churn, name: staging, revision: null, generation: 0, runtime: hosted, status: pending}
+
+  /v1/projects/{project}/predictors/{name}/environments/{environment}:
+    get:
+      operationId: environments.get
+      tags: [hosted]
+      summary: show one environment
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/predictor"
+        - $ref: "#/components/parameters/environment"
+      responses:
+        "200":
+          description: the pointer, its generation and its state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvironmentReply"
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-c4d5e6f708192a3b4c5d6e7f8091a2b3
+                    resource: {kind: predictor, name: churn}
+                    result: {predictor: churn, name: production, revision: 7, generation: 9, runtime: hosted, status: ready}
+
+  /v1/projects/{project}/predictors/{name}/environments/{environment}/promote:
+    post:
+      operationId: environments.promote
+      tags: [hosted]
+      summary: point an environment at a revision, guarded by its generation
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/predictor"
+        - $ref: "#/components/parameters/environment"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PromoteRequest"
+            examples:
+              promoted:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-d5e6f708192a3b4c5d6e7f8091a2b3c4
+                  resource: {kind: predictor, name: churn}
+                  payload: {revision: 8, expected_generation: 9}
+      responses:
+        "200":
+          description: the environment now serving the revision
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvironmentReply"
+              examples:
+                promoted:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-d5e6f708192a3b4c5d6e7f8091a2b3c4
+                    resource: {kind: predictor, name: churn}
+                    result: {predictor: churn, name: production, revision: 8, generation: 10, runtime: hosted, status: ready}
+
+  /v1/projects/{project}/predictors/{name}/environments/{environment}/rollback:
+    post:
+      operationId: environments.rollback
+      tags: [hosted]
+      summary: point an environment back at an earlier revision
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/predictor"
+        - $ref: "#/components/parameters/environment"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PromoteRequest"
+            examples:
+              rolled-back:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-e6f708192a3b4c5d6e7f8091a2b3c4d5
+                  resource: {kind: predictor, name: churn}
+                  payload: {revision: 7, expected_generation: 10}
+      responses:
+        "200":
+          description: the environment serving the earlier revision
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvironmentReply"
+              examples:
+                rolled-back:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-e6f708192a3b4c5d6e7f8091a2b3c4d5
+                    resource: {kind: predictor, name: churn}
+                    result: {predictor: churn, name: production, revision: 7, generation: 11, runtime: hosted, status: ready}
+
+  /v1/projects/{project}/predictors/{name}/environments/{environment}/metrics:
+    get:
+      operationId: environments.metrics
+      tags: [hosted]
+      summary: request counts and the context an environment is serving
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/predictor"
+        - $ref: "#/components/parameters/environment"
+      responses:
+        "200":
+          description: serving facts, not accepted-write promises
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MetricsReply"
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-f708192a3b4c5d6e7f8091a2b3c4d5e6
+                    resource: {kind: predictor, name: churn}
+                    result:
+                      status: ready
+                      context: {source: live/churn-history, version: 312, rows: 1840, as_of: 1767225600.0, accepted_version: 312, serving_version: 312, freshness_lag_seconds: 0.0}
+                      accepted_version: 312
+                      serving_version: 312
+                      fresh: true
+                      requests: 1204
+                      errors: 3
+                      mean_latency_seconds: 0.21
+
+  /v1/projects/{project}/predictors/{name}/environments/{environment}/logs:
+    get:
+      operationId: environments.logs
+      tags: [hosted]
+      summary: the last lifecycle events of an environment
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/predictor"
+        - $ref: "#/components/parameters/environment"
+      responses:
+        "200":
+          description: newest first, at most 100
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LogsReply"
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-08192a3b4c5d6e7f8091a2b3c4d5e6f7
+                    resource: {kind: predictor, name: churn}
+                    result:
+                      logs:
+                        - {at: 1761400000.0, code: Promoted}
+                        - {at: 1761300000.0, code: Promoted}
+
+  /v1/projects/{project}/predictors/{name}/delete:
+    post:
+      operationId: predictors.delete
+      tags: [hosted]
+      summary: delete a predictor and stop its environments
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/predictor"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyRequest"
+            examples:
+              deleted:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-192a3b4c5d6e7f8091a2b3c4d5e6f708
+                  resource: {kind: predictor, name: churn}
+                  payload: {}
+      responses:
+        "200":
+          description: the name is retired; revisions stay audited
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PredictorDeletedReply"
+              examples:
+                deleted:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-192a3b4c5d6e7f8091a2b3c4d5e6f708
+                    resource: {kind: predictor, name: churn}
+                    result: {name: churn, deleted: true}
+
+  /v1/projects/{project}/contexts:
+    get:
+      operationId: contexts.list
+      tags: [hosted]
+      summary: list live contexts
+      parameters:
+        - $ref: "#/components/parameters/project"
+      responses:
+        "200":
+          description: each live context's schema and size
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveContextListReply"
+              examples:
+                listed:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-2a3b4c5d6e7f8091a2b3c4d5e6f70819
+                    resource: {kind: context, name: contexts}
+                    result:
+                      contexts:
+                        - {name: customers, inputs: [spend, plan], targets: {churned: category}, max_rows: 100000, rows: 1840, labeled_rows: 1628, sequence: 2312, accepted_at: 1761400000.0}
+    post:
+      operationId: contexts.create
+      tags: [hosted]
+      summary: create a live context
+      parameters:
+        - $ref: "#/components/parameters/project"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LiveContextCreateRequest"
+            examples:
+              created:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-3b4c5d6e7f8091a2b3c4d5e6f708192a
+                  resource: {kind: context, name: customers}
+                  payload: {name: customers, inputs: [spend, plan], targets: {churned: category}, max_rows: 100000}
+      responses:
+        "200":
+          description: the empty live context
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveContextReply"
+              examples:
+                created:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-3b4c5d6e7f8091a2b3c4d5e6f708192a
+                    resource: {kind: context, name: customers}
+                    result: {name: customers, inputs: [spend, plan], targets: {churned: category}, max_rows: 100000, rows: 0, labeled_rows: 0, sequence: 0, accepted_at: null}
+
+  /v1/projects/{project}/contexts/{name}:
+    get:
+      operationId: contexts.show
+      tags: [hosted]
+      summary: show a live context
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/context"
+      responses:
+        "200":
+          description: schema, size and the latest accepted sequence
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LiveContextReply"
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-4c5d6e7f8091a2b3c4d5e6f708192a3b
+                    resource: {kind: context, name: customers}
+                    result: {name: customers, inputs: [spend, plan], targets: {churned: category}, max_rows: 100000, rows: 1840, labeled_rows: 1628, sequence: 2312, accepted_at: 1761400000.0}
+
+  /v1/projects/{project}/contexts/{name}/append:
+    post:
+      operationId: contexts.append
+      tags: [hosted]
+      summary: append rows to a live context
+      description: |
+        `write_id` makes the append idempotent; the same id with the same rows
+        returns the original receipt. Rows carry the context's `id` column
+        and inputs; labels arrive through `label`.
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/context"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LiveContextAppendRequest"
+            examples:
+              appended:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-5d6e7f8091a2b3c4d5e6f708192a3b4c
+                  resource: {kind: context, name: customers}
+                  payload:
+                    write_id: 2026-10-24T05:00:00Z-batch-1
+                    rows:
+                      - {customer_id: 1041, spend: 82.5, plan: pro}
+                      - {customer_id: 1042, spend: 12.0, plan: free}
+      responses:
+        "200":
+          description: durable acceptance, not serving visibility
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReceiptReply"
+              examples:
+                appended:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-5d6e7f8091a2b3c4d5e6f708192a3b4c
+                    resource: {kind: context, name: customers}
+                    result: {context: customers, write_id: 2026-10-24T05:00:00Z-batch-1, operation: append, rows: 2, sequence: 2313, accepted_at: 1761400100.0, durably_accepted: true}
+
+  /v1/projects/{project}/contexts/{name}/label:
+    post:
+      operationId: contexts.label
+      tags: [hosted]
+      summary: attach target values to rows already in a live context
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/context"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LiveContextLabelRequest"
+            examples:
+              labeled:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-6e7f8091a2b3c4d5e6f708192a3b4c5d
+                  resource: {kind: context, name: customers}
+                  payload:
+                    write_id: 2026-10-31T05:00:00Z-labels-1
+                    target: churned
+                    labels:
+                      - {id: 1041, value: 0}
+                      - {id: 1042, value: 1}
+      responses:
+        "200":
+          description: durable acceptance, not serving visibility
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReceiptReply"
+              examples:
+                labeled:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-6e7f8091a2b3c4d5e6f708192a3b4c5d
+                    resource: {kind: context, name: customers}
+                    result: {context: customers, write_id: 2026-10-31T05:00:00Z-labels-1, operation: label, rows: 2, sequence: 2314, accepted_at: 1762000000.0, durably_accepted: true}
+
+components:
+  securitySchemes:
+    apiKey:
+      type: http
+      scheme: bearer
+      description: an API key from `gf admin key create`, or the login token `gf login` stores
+
+  parameters:
+    project:
+      name: project
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/Name"}
+      description: the project; `gf whoami` shows the one in use
+    predictor:
+      name: name
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/Name"}
+      description: the predictor's `name` from gf.yaml
+    environment:
+      name: environment
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/Name"}
+    key:
+      name: key
+      in: path
+      required: true
+      schema: {type: string, pattern: "^key-[0-9a-f]{20,24}$"}
+    secret:
+      name: secret
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/Name"}
+    context:
+      name: name
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/Name"}
+      description: the live context's name
+
+  responses:
+    NotReady:
+      description: a served model is still loading or compiling
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorReply"
+          examples:
+            loading:
+              value:
+                api_version: gf/v1
+                project: acme
+                request_id: r-9e0f1a2b3c4d5e6f708192a3b4c5d6e7
+                resource: {kind: predictor, name: churn}
+                error:
+                  code: ModelNotReady
+                  message: general-forecast/tabicl-v2-classifier is compiling 12 programs
+                  hint: poll /healthz until it answers 200
+
+  schemas:
+    Name:
+      type: string
+      pattern: "^[a-z][a-z0-9-]{0,62}$"
+      description: a resource name
+
+    ModelId:
+      type: string
+      pattern: "^general-forecast/[a-z0-9][a-z0-9.-]*(@[^@\\s]+)?$"
+      description: |
+        a catalog model id, `general-forecast/<name>`, with an optional
+        variant suffix (`@4*2`) or digest pin (`@sha256:<digest>`)
+
+    Digest:
+      type: string
+      pattern: "^sha256:[0-9a-f]{64}$"
+
+    Task:
+      type: string
+      enum: [classification, regression, forecast]
+
+    ResourceKind:
+      type: string
+      enum: [predictor, model, project, api-key, secret, context]
+
+    Resource:
+      type: object
+      description: what the envelope is about; GET lists use the collection name
+      required: [kind, name]
+      additionalProperties: false
+      properties:
+        kind: {$ref: "#/components/schemas/ResourceKind"}
+        name: {type: string, minLength: 1, maxLength: 63}
+
+    Envelope:
+      type: object
+      description: the fields every request and reply carries
+      required: [api_version, project, request_id, resource]
+      properties:
+        api_version: {type: string, const: gf/v1}
+        project: {$ref: "#/components/schemas/Name"}
+        request_id: {type: string, minLength: 1, maxLength: 128, pattern: "^[\\x20-\\x7e]+$"}
+        resource: {$ref: "#/components/schemas/Resource"}
+
+    ErrorCode:
+      type: string
+      enum: [ValidationError, NotFound, Unauthorized, CapacityExceeded, ModelNotReady, Internal, Conflict]
+      description: |
+        ValidationError 422, NotFound 404, Unauthorized 401, CapacityExceeded
+        422, ModelNotReady 503, Internal 500, Conflict 409 (a compare-and-swap
+        on a stale generation)
+
+    Error:
+      type: object
+      description: |
+        `param` names the payload field (`target`, `inputs.plan`, `queries`);
+        every limit error carries `limit` and `actual` and names the model in
+        `message`. The request id is in the envelope.
+      required: [code, message]
+      additionalProperties: false
+      properties:
+        code: {$ref: "#/components/schemas/ErrorCode"}
+        message: {type: string}
+        param: {type: string}
+        hint: {type: string}
+        limit: {type: integer}
+        actual: {type: integer}
+
+    ErrorReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [error]
+          properties:
+            error: {$ref: "#/components/schemas/Error"}
+
+    Row:
+      type: object
+      description: one record; column names are keys, cells are scalars
+      additionalProperties:
+        type: [string, number, boolean, "null"]
+
+    Inputs:
+      type: object
+      description: |
+        inputs by rule rather than by list: `exclude` removes columns from the
+        inferred set, `types` overrides inferred types; forecast predictors
+        use `past` and `future` instead
+      additionalProperties: false
+      properties:
+        exclude: {type: array, items: {type: string}}
+        types:
+          type: object
+          additionalProperties: {$ref: "#/components/schemas/ColumnType"}
+        past: {type: array, items: {type: string}}
+        future: {type: array, items: {type: string}}
+
+    ColumnType:
+      type: string
+      enum: [number, category, text, boolean, date, timestamp]
+
+    Selection:
+      type: object
+      description: |
+        which context rows a query sees; fractions below 1 are of the model's
+        row cap, integers are rows; `core: null` is the whole table
+      additionalProperties: false
+      properties:
+        core: {type: [number, "null"], default: 0.25}
+        neighbors: {type: number, default: 0.75}
+        kind: {type: string, enum: [stratified, random], default: stratified}
+        recent: {type: [integer, "null"]}
+
+    Manifest:
+      type: object
+      description: |
+        the ad hoc predictor: the gf.yaml fields, with `context` and `queries`
+        as rows instead of a context declaration; `name` and `resources` are
+        file-only
+      required: [model, target, context, queries]
+      additionalProperties: false
+      properties:
+        model: {$ref: "#/components/schemas/ModelId"}
+        target: {type: string}
+        id: {type: string}
+        inputs:
+          oneOf:
+            - type: array
+              items: {type: string}
+            - $ref: "#/components/schemas/Inputs"
+        time: {type: string}
+        series: {type: array, items: {type: string}}
+        frequency:
+          oneOf:
+            - {type: string, pattern: "^[1-9][0-9]*(s|min|h|d|w)$"}
+            - {type: number, exclusiveMinimum: 0}
+          description: "`1d`, `1h`, `7d`, or seconds as a number"
+        horizon: {type: integer, minimum: 1}
+        quantiles:
+          type: array
+          items: {type: number, exclusiveMinimum: 0, exclusiveMaximum: 1}
+          default: [0.1, 0.5, 0.9]
+        outputs:
+          type: array
+          items: {type: string, enum: [label, value, probabilities, quantiles]}
+          description: defaults by task; classification label+probabilities, regression value, forecast value+quantiles
+        selection: {$ref: "#/components/schemas/Selection"}
+        context:
+          type: array
+          items: {$ref: "#/components/schemas/Row"}
+        queries:
+          type: array
+          items: {$ref: "#/components/schemas/Row"}
+          minItems: 1
+
+    ManifestRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/Manifest"}
+
+    Queries:
+      type: object
+      description: |
+        the declared predictor payload; `context` only when the manifest
+        declares `context: {request: ...}`
+      required: [queries]
+      additionalProperties: false
+      properties:
+        queries:
+          type: array
+          items: {$ref: "#/components/schemas/Row"}
+          minItems: 1
+        context:
+          type: array
+          items: {$ref: "#/components/schemas/Row"}
+        as_of:
+          type: string
+          format: date-time
+          description: for a live context, score against the rows accepted at or before this instant
+
+    QueriesRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/Queries"}
+
+    ContextKind:
+      type: string
+      enum: [snapshot, request, live]
+
+    ContextInfo:
+      type: object
+      description: the context a prediction actually used
+      required: [kind, rows]
+      additionalProperties: false
+      properties:
+        kind: {$ref: "#/components/schemas/ContextKind"}
+        rows: {type: integer, minimum: 0}
+        digest: {$ref: "#/components/schemas/Digest"}
+        as_of: {type: string, format: date-time}
+
+    Prediction:
+      type: object
+      description: |
+        the query's id under the manifest's id column name when it declares
+        one (omitted when it does not); `label` and `probabilities` for
+        classification, `value` for regression, `value` and `quantiles` for
+        forecasts
+      additionalProperties: {type: [string, integer]}
+      properties:
+        label: {type: [string, integer, boolean]}
+        value: {type: number}
+        probabilities:
+          type: object
+          additionalProperties: {type: number}
+        quantiles:
+          type: object
+          additionalProperties: {type: number}
+
+    Result:
+      type: object
+      required: [model, task, context, predictions]
+      additionalProperties: false
+      properties:
+        model: {$ref: "#/components/schemas/ModelId"}
+        task: {$ref: "#/components/schemas/Task"}
+        context: {$ref: "#/components/schemas/ContextInfo"}
+        revision: {type: integer, minimum: 1}
+        environment: {$ref: "#/components/schemas/Name"}
+        predictions:
+          type: array
+          items: {$ref: "#/components/schemas/Prediction"}
+
+    ResultReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Result"}
+
+    Limits:
+      type: object
+      description: the most a model accepts in one call
+      required: [context_rows, queries, inputs]
+      additionalProperties: false
+      properties:
+        context_rows: {type: integer, minimum: 1}
+        queries: {type: integer, minimum: 1}
+        inputs: {type: integer, minimum: 1}
+
+    Shape:
+      type: object
+      description: a compiled program's shape
+      required: [context_rows, queries, inputs]
+      additionalProperties: false
+      properties:
+        context_rows: {type: integer, minimum: 1}
+        queries: {type: integer, minimum: 1}
+        inputs: {type: integer, minimum: 1}
+        classes: {type: integer, minimum: 2}
+
+    Input:
+      type: object
+      required: [name, type]
+      additionalProperties: false
+      properties:
+        name: {type: string}
+        type: {$ref: "#/components/schemas/ColumnType"}
+
+    ContextLock:
+      type: object
+      description: the context as gf.lock pins it
+      required: [kind]
+      additionalProperties: false
+      properties:
+        kind: {$ref: "#/components/schemas/ContextKind"}
+        rows: {type: integer, minimum: 0}
+        query_rows: {type: integer, minimum: 0}
+        digest: {$ref: "#/components/schemas/Digest"}
+        live: {$ref: "#/components/schemas/Name"}
+        max_rows: {type: integer, minimum: 1}
+
+    ResolvedSelection:
+      type: object
+      description: the selection as gf.lock pins it, in rows
+      required: [core, neighbors, kind]
+      additionalProperties: false
+      properties:
+        core: {type: [integer, "null"]}
+        neighbors: {type: integer, minimum: 0}
+        kind: {type: string, enum: [stratified, random]}
+        recent: {type: [integer, "null"]}
+
+    Resolution:
+      type: object
+      description: the resolved predictor gf check prints and gf.lock pins
+      required: [name, model, model_digest, task, target, target_type, inputs, context, selection]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        model: {$ref: "#/components/schemas/ModelId"}
+        model_digest: {$ref: "#/components/schemas/Digest"}
+        task: {$ref: "#/components/schemas/Task"}
+        target: {type: string}
+        target_type: {$ref: "#/components/schemas/ColumnType"}
+        classes: {type: array, items: {type: string}}
+        id: {type: string}
+        time: {type: string}
+        series: {type: array, items: {type: string}}
+        inputs:
+          type: array
+          items: {$ref: "#/components/schemas/Input"}
+        context: {$ref: "#/components/schemas/ContextLock"}
+        selection: {$ref: "#/components/schemas/ResolvedSelection"}
+
+    Serving:
+      type: object
+      description: whether this server has the predictor's model loaded and compiled
+      required: [loaded, compiled, warm_shapes]
+      additionalProperties: false
+      properties:
+        loaded: {type: boolean}
+        compiled: {type: boolean}
+        warm_shapes:
+          type: array
+          items: {$ref: "#/components/schemas/Shape"}
+
+    Predictor:
+      allOf:
+        - $ref: "#/components/schemas/Resolution"
+        - type: object
+          required: [limits, environments, serving]
+          properties:
+            limits: {$ref: "#/components/schemas/Limits"}
+            environments:
+              type: array
+              items: {$ref: "#/components/schemas/Environment"}
+            serving: {$ref: "#/components/schemas/Serving"}
+
+    PredictorReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Predictor"}
+
+    PredictorList:
+      type: object
+      required: [predictors]
+      additionalProperties: false
+      properties:
+        predictors:
+          type: array
+          items: {$ref: "#/components/schemas/Predictor"}
+
+    PredictorListReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/PredictorList"}
+
+    Model:
+      type: object
+      description: |
+        the catalog's description of a served model: `model` is the resolved
+        id with its content digest, `limits` what one call may send here,
+        `warm_shapes` the shapes compiled at startup
+      required: [model, name, task, artifact, bounds, capabilities, runtime, license, repository, revision, limits, warm_shapes]
+      additionalProperties: false
+      properties:
+        model: {type: string, description: "`general-forecast/<name>@sha256:<digest>`"}
+        name: {$ref: "#/components/schemas/ModelId"}
+        task: {$ref: "#/components/schemas/Task"}
+        repository: {type: string}
+        revision: {type: string}
+        license: {type: string}
+        runtime: {type: string, enum: [cpu, gpu]}
+        artifact: {$ref: "#/components/schemas/Artifact"}
+        artifact_verification: {type: string}
+        bounds:
+          type: object
+          description: the model's own caps, before this server's limits
+          additionalProperties: {type: [integer, number, "null"]}
+        capabilities:
+          type: array
+          items: {$ref: "#/components/schemas/Capability"}
+        limits: {$ref: "#/components/schemas/Limits"}
+        warm_shapes:
+          type: array
+          items: {$ref: "#/components/schemas/Shape"}
+
+    Artifact:
+      type: object
+      required: [repository, revision, digest, license, files]
+      additionalProperties: true
+      properties:
+        repository: {type: string}
+        revision: {type: string}
+        digest: {$ref: "#/components/schemas/Digest"}
+        license: {type: string}
+        digest_format: {type: string}
+        files:
+          type: object
+          additionalProperties: {type: string}
+
+    Capability:
+      type: object
+      required: [name, state]
+      additionalProperties: false
+      properties:
+        name: {type: string}
+        state: {type: string, enum: [supported, unsupported]}
+        code: {type: [string, "null"]}
+        reason: {type: [string, "null"]}
+
+    ModelList:
+      type: object
+      required: [models]
+      additionalProperties: false
+      properties:
+        models:
+          type: array
+          items: {$ref: "#/components/schemas/Model"}
+
+    ModelListReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/ModelList"}
+
+    Health:
+      type: object
+      required: [status]
+      additionalProperties: false
+      properties:
+        status: {type: string, const: ok}
+
+    HealthError:
+      type: object
+      required: [error]
+      additionalProperties: false
+      properties:
+        error: {$ref: "#/components/schemas/Error"}
+
+    # -- hosted control plane ------------------------------------------------
+
+    Empty:
+      type: object
+      additionalProperties: false
+
+    EmptyRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/Empty"}
+
+    Project:
+      type: object
+      required: [name, organization]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        organization: {$ref: "#/components/schemas/Name"}
+
+    ProjectReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Project"}
+
+    ProjectList:
+      type: object
+      required: [projects, organizations]
+      additionalProperties: false
+      properties:
+        projects:
+          type: array
+          items: {$ref: "#/components/schemas/Project"}
+        organizations:
+          type: array
+          items: {$ref: "#/components/schemas/Name"}
+
+    ProjectListReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/ProjectList"}
+
+    ProjectCreate:
+      type: object
+      required: [name, organization]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        organization: {$ref: "#/components/schemas/Name"}
+
+    ProjectCreateRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/ProjectCreate"}
+
+    Permission:
+      type: string
+      enum:
+        - predictors:read
+        - predictors:write
+        - predictors:predict
+        - contexts:read
+        - contexts:write
+        - contexts:history
+        - sources:read
+        - sources:write
+        - models:read
+        - keys:read
+        - keys:write
+        - secrets:read
+        - secrets:write
+
+    Key:
+      type: object
+      description: "`token` is present only in the create and rotate replies"
+      required: [id, project, name, permissions, created_at, expires_at, revoked_at]
+      additionalProperties: false
+      properties:
+        id: {type: string, pattern: "^key-[0-9a-f]{20,24}$"}
+        project: {$ref: "#/components/schemas/Name"}
+        name: {$ref: "#/components/schemas/Name"}
+        permissions:
+          type: array
+          items: {$ref: "#/components/schemas/Permission"}
+        created_at: {type: number}
+        expires_at: {type: number}
+        revoked_at: {type: [number, "null"]}
+        token: {type: string, pattern: "^gf_[A-Za-z0-9_-]{32,}$"}
+        replaces: {type: string, pattern: "^key-[0-9a-f]{20,24}$"}
+
+    KeyReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Key"}
+
+    KeyList:
+      type: object
+      required: [keys]
+      additionalProperties: false
+      properties:
+        keys:
+          type: array
+          items: {$ref: "#/components/schemas/Key"}
+
+    KeyListReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/KeyList"}
+
+    KeyCreate:
+      type: object
+      required: [name, permissions]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        permissions:
+          type: array
+          items: {$ref: "#/components/schemas/Permission"}
+          minItems: 1
+        expires_in:
+          type: number
+          minimum: 60
+          maximum: 7776000
+          default: 2592000
+          description: seconds; 30 days by default, 90 at most
+
+    KeyCreateRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/KeyCreate"}
+
+    KeyRef:
+      type: object
+      required: [id]
+      additionalProperties: false
+      properties:
+        id: {type: string, pattern: "^key-[0-9a-f]{20,24}$"}
+
+    KeyRefRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/KeyRef"}
+
+    KeyRevoked:
+      type: object
+      required: [id, revoked]
+      additionalProperties: false
+      properties:
+        id: {type: string}
+        revoked: {type: boolean, const: true}
+
+    KeyRevokedReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/KeyRevoked"}
+
+    Secret:
+      type: object
+      description: metadata only; a value is never returned
+      required: [project, name, version, created_at, updated_at]
+      additionalProperties: false
+      properties:
+        project: {$ref: "#/components/schemas/Name"}
+        name: {$ref: "#/components/schemas/Name"}
+        version: {type: integer, minimum: 1}
+        created_at: {type: number}
+        updated_at: {type: number}
+
+    SecretReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Secret"}
+
+    SecretList:
+      type: object
+      required: [secrets]
+      additionalProperties: false
+      properties:
+        secrets:
+          type: array
+          items: {$ref: "#/components/schemas/Secret"}
+
+    SecretListReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/SecretList"}
+
+    SecretCreate:
+      type: object
+      required: [name, value]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        value: {type: string, minLength: 1, maxLength: 65536}
+
+    SecretCreateRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/SecretCreate"}
+
+    SecretRotate:
+      type: object
+      required: [name, value, expected_version]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        value: {type: string, minLength: 1, maxLength: 65536}
+        expected_version: {type: integer, minimum: 1}
+
+    SecretRotateRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/SecretRotate"}
+
+    SecretRef:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+
+    SecretRefRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/SecretRef"}
+
+    SecretDeleted:
+      type: object
+      required: [name, deleted]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        deleted: {type: boolean, const: true}
+
+    SecretDeletedReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/SecretDeleted"}
+
+    State:
+      type: string
+      enum: [pending, building, ready, failed, stopped]
+
+    Revision:
+      type: object
+      description: an immutable pushed predictor
+      required: [predictor, number, predictor_digest, model, created_at, status]
+      additionalProperties: false
+      properties:
+        predictor: {$ref: "#/components/schemas/Name"}
+        number: {type: integer, minimum: 1}
+        predictor_digest: {$ref: "#/components/schemas/Digest"}
+        model: {$ref: "#/components/schemas/ModelId"}
+        created_at: {type: number}
+        status: {$ref: "#/components/schemas/State"}
+
+    RevisionReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Revision"}
+
+    RevisionList:
+      type: object
+      required: [revisions]
+      additionalProperties: false
+      properties:
+        revisions:
+          type: array
+          items: {$ref: "#/components/schemas/Revision"}
+
+    RevisionListReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/RevisionList"}
+
+    LockedModel:
+      type: object
+      required: [files]
+      additionalProperties: false
+      properties:
+        files:
+          type: object
+          additionalProperties: {$ref: "#/components/schemas/Digest"}
+
+    Lock:
+      type: object
+      description: gf.lock
+      required: [lock_version, predictor, model]
+      additionalProperties: false
+      properties:
+        lock_version: {type: integer, const: 1}
+        predictor: {$ref: "#/components/schemas/Resolution"}
+        model: {$ref: "#/components/schemas/LockedModel"}
+
+    RevisionRegister:
+      type: object
+      required: [lock, snapshot]
+      additionalProperties: false
+      properties:
+        lock: {$ref: "#/components/schemas/Lock"}
+        snapshot:
+          oneOf:
+            - $ref: "#/components/schemas/Digest"
+            - type: "null"
+
+    RevisionRegisterRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/RevisionRegister"}
+
+    RevisionDetails:
+      type: object
+      required: [revision, lock]
+      additionalProperties: false
+      properties:
+        revision: {$ref: "#/components/schemas/Revision"}
+        lock: {$ref: "#/components/schemas/Lock"}
+
+    RevisionDetailsReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/RevisionDetails"}
+
+    Environment:
+      type: object
+      description: a pointer to a revision; `generation` guards promote and rollback
+      required: [predictor, name, revision, generation, runtime, status]
+      additionalProperties: false
+      properties:
+        predictor: {$ref: "#/components/schemas/Name"}
+        name: {$ref: "#/components/schemas/Name"}
+        revision: {type: [integer, "null"]}
+        generation: {type: integer, minimum: 0}
+        runtime: {$ref: "#/components/schemas/Name"}
+        status: {$ref: "#/components/schemas/State"}
+
+    EnvironmentReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Environment"}
+
+    EnvironmentList:
+      type: object
+      required: [environments]
+      additionalProperties: false
+      properties:
+        environments:
+          type: array
+          items: {$ref: "#/components/schemas/Environment"}
+
+    EnvironmentListReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/EnvironmentList"}
+
+    EnvironmentCreate:
+      type: object
+      required: [name, runtime]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        runtime: {$ref: "#/components/schemas/Name"}
+
+    EnvironmentCreateRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/EnvironmentCreate"}
+
+    Promote:
+      type: object
+      required: [revision, expected_generation]
+      additionalProperties: false
+      properties:
+        revision: {type: integer, minimum: 1}
+        expected_generation: {type: integer, minimum: 0}
+
+    PromoteRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/Promote"}
+
+    Metrics:
+      type: object
+      description: |
+        serving facts: `context` is the context the environment is serving
+        now, `accepted_version`/`serving_version` compare the newest accepted
+        write of a live context with the one being served, `fresh` says
+        whether they agree (null without a context)
+      required: [status, context, accepted_version, serving_version, fresh, requests, errors, mean_latency_seconds]
+      additionalProperties: false
+      properties:
+        status: {$ref: "#/components/schemas/State"}
+        context:
+          oneOf:
+            - $ref: "#/components/schemas/ServingContext"
+            - type: "null"
+        accepted_version: {type: [integer, string, "null"]}
+        serving_version: {type: [integer, string, "null"]}
+        fresh: {type: [boolean, "null"]}
+        requests: {type: integer, minimum: 0}
+        errors: {type: integer, minimum: 0}
+        mean_latency_seconds: {type: [number, "null"]}
+
+    ServingContext:
+      type: object
+      description: |
+        the context an environment serves: `source` is `snapshot`,
+        `request` or `live/<context>`; the version fields and
+        `freshness_lag_seconds` are set for live contexts
+      required: [source, version, rows, as_of, accepted_version, serving_version, freshness_lag_seconds]
+      additionalProperties: true
+      properties:
+        source: {type: string}
+        version: {type: [integer, string, "null"]}
+        rows: {type: integer, minimum: 0}
+        as_of: {type: [number, "null"]}
+        accepted_version: {type: [integer, string, "null"]}
+        serving_version: {type: [integer, string, "null"]}
+        freshness_lag_seconds: {type: [number, "null"]}
+
+    MetricsReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Metrics"}
+
+    LogEntry:
+      type: object
+      required: [at, code]
+      additionalProperties: false
+      properties:
+        at: {type: number}
+        code: {type: string}
+
+    Logs:
+      type: object
+      required: [logs]
+      additionalProperties: false
+      properties:
+        logs:
+          type: array
+          items: {$ref: "#/components/schemas/LogEntry"}
+
+    LogsReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Logs"}
+
+    PredictorDeleted:
+      type: object
+      required: [name, deleted]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        deleted: {type: boolean, const: true}
+
+    PredictorDeletedReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/PredictorDeleted"}
+
+    LiveContext:
+      type: object
+      description: a hosted, appendable context
+      required: [name, inputs, targets, max_rows, rows, labeled_rows, sequence, accepted_at]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        inputs: {type: array, items: {type: string}}
+        targets:
+          type: object
+          additionalProperties: {$ref: "#/components/schemas/ColumnType"}
+        max_rows: {type: integer, minimum: 1}
+        rows: {type: integer, minimum: 0}
+        labeled_rows: {type: integer, minimum: 0}
+        sequence: {type: integer, minimum: 0}
+        accepted_at: {type: [number, "null"]}
+
+    LiveContextReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/LiveContext"}
+
+    LiveContextList:
+      type: object
+      required: [contexts]
+      additionalProperties: false
+      properties:
+        contexts:
+          type: array
+          items: {$ref: "#/components/schemas/LiveContext"}
+
+    LiveContextListReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/LiveContextList"}
+
+    LiveContextCreate:
+      type: object
+      required: [name, inputs, targets]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        inputs: {type: array, items: {type: string}, minItems: 1}
+        targets:
+          type: object
+          additionalProperties: {$ref: "#/components/schemas/ColumnType"}
+          minProperties: 1
+        max_rows: {type: integer, minimum: 1, default: 100000}
+
+    LiveContextCreateRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/LiveContextCreate"}
+
+    LiveContextAppend:
+      type: object
+      required: [write_id, rows]
+      additionalProperties: false
+      properties:
+        write_id: {type: string, minLength: 1, maxLength: 256}
+        rows:
+          type: array
+          items: {$ref: "#/components/schemas/Row"}
+          minItems: 1
+
+    LiveContextAppendRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/LiveContextAppend"}
+
+    Label:
+      type: object
+      required: [id, value]
+      additionalProperties: false
+      properties:
+        id: {type: [string, integer]}
+        value: {type: [string, number, boolean]}
+
+    LiveContextLabel:
+      type: object
+      required: [write_id, target, labels]
+      additionalProperties: false
+      properties:
+        write_id: {type: string, minLength: 1, maxLength: 256}
+        target: {type: string}
+        labels:
+          type: array
+          items: {$ref: "#/components/schemas/Label"}
+          minItems: 1
+
+    LiveContextLabelRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/LiveContextLabel"}
+
+    Receipt:
+      type: object
+      description: durable acceptance of an append or label write
+      required: [context, write_id, operation, rows, sequence, accepted_at, durably_accepted]
+      additionalProperties: false
+      properties:
+        context: {$ref: "#/components/schemas/Name"}
+        write_id: {type: string}
+        operation: {type: string, enum: [append, label]}
+        rows: {type: integer, minimum: 0}
+        sequence: {type: integer, minimum: 0}
+        accepted_at: {type: number}
+        durably_accepted: {type: boolean}
+
+    ReceiptReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Receipt"}

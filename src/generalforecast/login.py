@@ -20,8 +20,8 @@ from typing import Any
 
 from generalforecast.deployments.contracts import ServiceError
 
-START = "/v1alpha1/cli-logins"
-TOKEN = "/v1alpha1/cli-logins/token"
+START = "/v1/cli-logins"
+TOKEN = "/v1/cli-logins/token"
 
 
 def machine_name() -> str:

@@ -1,0 +1,51 @@
+{
+  "request": {
+    "api_version": "gf/v1",
+    "project": "local",
+    "request_id": "request-1",
+    "resource": {"kind": "context", "name": "observations"},
+    "payload": {
+      "write_id": "write-1",
+      "operation": "create_features",
+      "records": [{"key": "row-1", "features": {"amount": 2}}]
+    }
+  },
+  "result": {
+    "api_version": "gf/v1",
+    "project": "local",
+    "request_id": "request-1",
+    "resource": {"kind": "context", "name": "observations"},
+    "result": {
+      "project": "local",
+      "dataset": "observations",
+      "write_id": "write-1",
+      "operation": "create_features",
+      "sequence": 1,
+      "accepted_at": 1700000000.0,
+      "durably_accepted": true,
+      "changes": [{"key": "row-1", "feature_version": 1, "label_versions": {}}],
+      "retry_valid_until": null
+    }
+  },
+  "failure": {
+    "api_version": "gf/v1",
+    "project": "local",
+    "request_id": "request-1",
+    "resource": {"kind": "context", "name": "observations"},
+    "error": {"code": "Conflict", "message": "expected version is stale; nothing changed"}
+  },
+  "capability": {
+    "name": "custom-execution",
+    "state": "unconfigured",
+    "code": "IsolationUnavailable",
+    "reason": "a verified isolated OCI runtime is required"
+  },
+  "effect": {
+    "project": "local",
+    "dataset": "observations",
+    "write_id": "write-1",
+    "sequence": 1,
+    "deployment": "fraud-local",
+    "revision": 2
+  }
+}

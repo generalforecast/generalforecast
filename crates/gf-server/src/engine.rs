@@ -5,7 +5,7 @@
 //!
 //! A request's context becomes an ephemeral table named for its
 //! fingerprint, on the shard the fingerprint routes to, so a repeated
-//! context finds its table and cache; a snapshot package's rows bind once
+//! context finds its table and cache; a snapshot predictor's rows bind once
 //! into a durable table. The Models API and the in-process `_core` engine
 //! both answer through it.
 
@@ -17,7 +17,7 @@ use std::time::Duration;
 use gf_core::columns;
 use gf_core::forecasting::{KNOWN, TARGET};
 use gf_core::node::Targets;
-use gf_core::package::{self, Encoder};
+use gf_core::predictor::{self, Encoder};
 use gf_core::request::{self, AlignedGroup, Forecast, Label, Tabular};
 use gf_core::route;
 use serde_json::json;
@@ -26,13 +26,13 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::http::ApiError;
 use crate::name::TableName;
-use crate::packages::ServedPackage;
+use crate::predictors::ServedPredictor;
 use crate::routes::{Busy, Routes};
 use crate::service::{Charge, RequestBudget};
 use crate::shard::{Asked, Command, Fence, Incoming, Inferred, RequestContext, ServerError, Write};
 use crate::wal::{Rows, TableDefinition, Terms};
 
-/// A snapshot package's rows, bound once into their durable table.
+/// A snapshot predictor's rows, bound once into their durable table.
 pub struct Bound {
     pub table: TableName,
     /// What names the table's shard.
@@ -50,6 +50,9 @@ pub struct Engine {
     routes: Arc<Routes>,
     budget: RequestBudget,
     timeout: Duration,
+    /// The shard every new context goes to, if pinned; startup warming
+    /// pins each shard in turn so every worker compiles the buckets.
+    pinned: Option<usize>,
 }
 
 impl Engine {
@@ -69,6 +72,43 @@ impl Engine {
             routes,
             budget,
             timeout,
+            pinned: None,
+        }
+    }
+
+    /// The same engine sending every new context to shard `shard`.
+    ///
+    /// # Panics
+    ///
+    /// If `shard` is not one of its shards.
+    #[must_use]
+    pub fn pinned(&self, shard: usize) -> Self {
+        assert!(
+            shard < self.shards.len(),
+            "pinned to a shard the engine has"
+        );
+        Self {
+            pinned: Some(shard),
+            ..self.with_timeout(self.timeout)
+        }
+    }
+
+    /// How many shards it routes over.
+    #[must_use]
+    pub fn shards(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// The same engine with another limit on how long one inference may
+    /// take, as startup warming allows a compile that a request would not.
+    #[must_use]
+    pub fn with_timeout(&self, timeout: Duration) -> Self {
+        Self {
+            shards: self.shards.clone(),
+            routes: self.routes.clone(),
+            budget: self.budget.clone(),
+            timeout,
+            pinned: self.pinned,
         }
     }
 
@@ -215,7 +255,10 @@ impl Engine {
         asked: Asked,
         fingerprint: &[u8; 32],
     ) -> Result<Inferred, ApiError> {
-        let shard = self.routes.context(fingerprint);
+        let shard = match self.pinned {
+            Some(shard) => self.routes.shard(shard),
+            None => self.routes.context(fingerprint),
+        };
         let (reply, answer) = oneshot::channel();
         let command = Command::Infer {
             context: Box::new(context),
@@ -226,7 +269,7 @@ impl Engine {
         self.wait(shard, command, answer).await
     }
 
-    /// Predicts encoded queries from a snapshot package's durable table.
+    /// Predicts encoded queries from a snapshot predictor's durable table.
     pub async fn predicted(&self, bound: &Bound, features: Vec<f32>) -> Result<Inferred, ApiError> {
         self.predict_bound(
             &bound.table,
@@ -264,21 +307,25 @@ impl Engine {
         })
     }
 
-    /// Binds a snapshot package's rows through `gf_core::package` and
-    /// writes them, once, into a durable table named for the package's
-    /// digest, which every query of the package then reads.
+    /// Binds a snapshot predictor's rows through `gf_core::predictor` and
+    /// writes them, once, into a durable table named for the predictor's
+    /// digest, which every query of the predictor then reads.
     pub async fn bind_snapshot(
         &self,
         model: &str,
-        package: &ServedPackage,
+        predictor: &ServedPredictor,
     ) -> Result<Bound, ApiError> {
         let failed = || ApiError::new("InternalError", "request failed safely", 500);
-        let rows = crate::http::snapshot_rows(package)?;
-        let target = package.target.as_deref().ok_or_else(|| {
-            ApiError::new("InvalidPackage", "a snapshot package names its target", 422)
+        let rows = crate::http::snapshot_rows(predictor)?;
+        let target = predictor.target.as_deref().ok_or_else(|| {
+            ApiError::new(
+                "InvalidPredictor",
+                "a snapshot predictor names its target",
+                422,
+            )
         })?;
-        let context = package::bind(&package.schema, package.task()?, target, &rows)?;
-        let fingerprint: [u8; 32] = Sha256::digest(package.package_digest.as_bytes()).into();
+        let context = predictor::bind(&predictor.schema, predictor.task()?, target, &rows)?;
+        let fingerprint: [u8; 32] = Sha256::digest(predictor.lock_digest.as_bytes()).into();
         let table =
             TableName::new(format!("pkg-{}", request::hex(&fingerprint))).map_err(|_| failed())?;
         let levels = self

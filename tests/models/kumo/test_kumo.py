@@ -14,7 +14,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import generalforecast
 from generalforecast.models.contract import TabularProperties
 from generalforecast.models.kumo.checkpoint import load_kumo, save_kumo
 from generalforecast.models.kumo.model import kumo_functions
@@ -34,6 +33,7 @@ from tests.models.kumo.tiny import (
     tiny_kumo,
     tiny_kumo_state,
 )
+from tests.utils.engine_client import local
 
 
 def test_properties_come_from_the_parameters() -> None:
@@ -98,7 +98,7 @@ def test_columns_with_more_categories_than_kept_are_flagged_once(
     np.testing.assert_array_equal(ranks[:, 0], features[:, 0] / 3)
     assert bool(snapshot.categories.crowded[0])
 
-    client = generalforecast.local()
+    client = local()
     crowded = client.create_table(
         "crowded",
         model="tests.models.kumo.tiny:classifier",

@@ -297,13 +297,33 @@ def _rebuild_spec(rebuild: Rebuild) -> Any:
 
 
 def _filled(targets: Any, unknown: float) -> Any:
-    """A frame's or Arrow array's targets, its nulls `unknown`: not known yet."""
+    """Targets with each null `unknown`: a label not known yet.
+
+    Nulls are Arrow nulls, pandas missing values, and None or NaN among the
+    values of a list or an object array, such as a frame's object column.
+    """
     if hasattr(targets, "fill_null"):
         return targets.fill_null(unknown)
     if hasattr(targets, "fillna") and hasattr(targets, "isna") and targets.isna().any():
         return targets.astype("float64" if np.isnan(unknown) else "Int64").fillna(
             unknown
         )
+    if isinstance(targets, list | tuple) or (
+        isinstance(targets, np.ndarray) and targets.dtype.kind == "O"
+    ):
+        values = np.asarray(targets, dtype=object).ravel()
+        missing = np.fromiter(
+            (
+                value is None or (isinstance(value, float) and np.isnan(value))
+                for value in values.tolist()
+            ),
+            dtype=bool,
+            count=len(values),
+        )
+        if missing.any():
+            values = values.copy()
+            values[missing] = unknown
+            return values.astype("float64")
     return targets
 
 
@@ -663,6 +683,14 @@ class SeriesTable(abc.ABC):
         self.last_answer: Answer | None = None
         # Each series key as given, by the 64 bits the node knows it by.
         self._names: dict[int, Any] = {}
+
+    def known_series(self) -> list[Any]:
+        """The keys of every series this table has taken observations for, as given.
+
+        The table keeps the keys of the series written through it, in the order
+        it first saw them.
+        """
+        return list(self._names.values())
 
     def _keys(self, series: Any) -> np.ndarray:
         """Series keys as the node knows them: the low 64 bits of each digest."""

@@ -233,7 +233,7 @@ def _mitra_ours(name: str, regression: bool) -> Callable[[Prepared], np.ndarray]
 
 REFERENCES = [
     Reference(
-        "tabicl-v2-classifier",
+        "general-forecast/tabicl-v2-classifier",
         False,
         _tabicl_upstream("tabicl-classifier-v2-20260212.ckpt"),
         _tabicl_ours("tabicl-classifier-v2-20260212.ckpt"),
@@ -287,17 +287,17 @@ REFERENCES = [
             missing=True,
         )
         for name in (
-            "tabpfn-3-classifier",
-            "tabpfn-3-regressor",
-            "tabpfn-3.5-classifier",
-            "tabpfn-3.5-regressor",
+            "general-forecast/tabpfn-3-classifier",
+            "general-forecast/tabpfn-3-regressor",
+            "general-forecast/tabpfn-3.5-classifier",
+            "general-forecast/tabpfn-3.5-regressor",
         )
     ),
     # Through 24 layers, float32 rounding alone moves LimiX's logits by up to
     # 3e-3 from a float64 run, upstream's as much as generalforecast's.
     *(
         Reference(
-            f"limix-2-{task}",
+            f"general-forecast/limix-2-{task}",
             task == "regressor",
             _limix_upstream(task == "regressor"),
             _limix_ours(task == "regressor"),
@@ -317,7 +317,11 @@ REFERENCES = [
             missing=True,
             tolerance=1e-3 if name.endswith("regressor") else 1e-4,
         )
-        for name in ("mitra-classifier", "mitra-2-classifier", "mitra-2-regressor")
+        for name in (
+            "general-forecast/mitra-classifier",
+            "general-forecast/mitra-2-classifier",
+            "general-forecast/mitra-2-regressor",
+        )
     ),
 ]
 

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.utils import legacy_cli as cli
+from tests.utils import engine_cli as cli
 
 pytestmark = pytest.mark.server
 
@@ -78,7 +78,7 @@ def server(binary: Path, tmp_path: Path) -> Iterator[object]:
 def test_bench_measures_a_server_and_leaves_no_table(
     server, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    from tests.utils import legacy_client as generalforecast
+    from tests.utils import engine_client as generalforecast
 
     cli.main(
         [

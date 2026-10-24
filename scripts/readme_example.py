@@ -12,7 +12,7 @@ X_train, X_test, y_train, y_test = train_test_split(X, y, random_state=0)
 
 classifier = gf.Classifier(
     "general-forecast/tabicl-v2-classifier",
-    allow_downloads=True,
+    download=True,
 ).fit(X_train, y_train)
 
 accuracy = classifier.score(X_test, y_test)

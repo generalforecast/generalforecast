@@ -60,7 +60,7 @@ def _upstream() -> torch.nn.Module:
     _cpu_package()
     from model.v2_0.loading import load_from_checkpoint
 
-    published = PUBLISHED["limix-2-classifier"]
+    published = PUBLISHED["general-forecast/limix-2-classifier"]
     path = hf_hub_download(
         published.repository, published.filename, revision=published.revision
     )
@@ -139,7 +139,7 @@ def upstream_outputs(regression: bool, prepared: Any) -> np.ndarray:
 def our_outputs(regression: bool, prepared: Any) -> np.ndarray:
     """generalforecast's network on the same rows and codes, converted from the same file."""
     task = "regressor" if regression else "classifier"
-    model: LimiX = load_limix(limix_checkpoint(f"limix-2-{task}"))
+    model: LimiX = load_limix(limix_checkpoint(f"general-forecast/limix-2-{task}"))
     context = jnp.asarray(prepared.table[: prepared.context_size])
     targets = jnp.asarray(prepared.targets[: prepared.context_size])
     num_classes = 0

@@ -2424,11 +2424,14 @@ impl Shard {
     async fn measure_fits(&mut self) -> bool {
         let tables = self.node.take_unmeasured();
         for &table in &tables {
-            // A scratch table fits as its partition's table does.
+            // A scratch table fits as its partition's table does; a request
+            // context is an ephemeral table, which `tables` does not hold.
             let Some(name) = self.name_of(table) else {
                 continue;
             };
-            let definition = &self.tables[name].definition;
+            let Some(definition) = self.definition(table, name) else {
+                continue;
+            };
             let key = (definition.model.clone(), definition.model_features());
             let limits = if let Some(&limits) = self.fit_limits.get(&key) {
                 limits

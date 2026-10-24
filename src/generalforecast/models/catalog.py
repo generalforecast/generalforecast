@@ -19,8 +19,12 @@ Three things stay apart:
   service changing its bounds never changes an old lock's identity.
 
 `Gates` say, per surface, what the evidence supports. Being in the catalog only
-qualifies a model for trusted local use; packages and remote serving need
+qualifies a model for trusted local use; predictors and remote serving need
 pinned bytes, license evidence and runtime qualification with real weights.
+
+A model goes by its canonical id alone, `general-forecast/<name>`, on every
+surface. `ALIASES` is the one table of old spellings (bare names, upstream
+repository ids); `parse` rejects them with the canonical id as a hint.
 """
 
 import re
@@ -28,10 +32,11 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Literal, overload
 
+from generalforecast.errors import InvalidInput, NotFound
 from generalforecast.serialization import content_digest
 
 Task = Literal["classification", "regression", "forecast"]
-Surface = Literal["local", "package", "remote", "self-hosted"]
+Surface = Literal["local", "predictor", "remote", "self-hosted"]
 
 # The Hugging Face organization that holds the pinned converted checkpoints.
 ORGANIZATION = "general-forecast"
@@ -129,14 +134,14 @@ class Gates:
     """Which surfaces the recorded evidence qualifies a model for.
 
     Attributes:
-        package: Whether packages may lock it.
+        predictor: Whether predictors may lock it.
         remote: Whether remote serving may run it.
         variants: Surfaces beyond local that run its `@K` and `*N` variants,
             qualified with real weights.
         evidence: What the gates rest on, or what is missing.
     """
 
-    package: bool = False
+    predictor: bool = False
     remote: bool = False
     variants: frozenset[Surface] = frozenset()
     evidence: str = ""
@@ -145,7 +150,7 @@ class Gates:
         """Whether a surface may run the model, or one of its variants."""
         if surface == "local":
             return True
-        base = self.package if surface == "package" else self.remote
+        base = self.predictor if surface == "predictor" else self.remote
         return base and (not variant or surface in self.variants)
 
 
@@ -154,14 +159,14 @@ class ServingPolicy:
     """What a service allows, kept apart from what models can do.
 
     Attributes:
-        context_rows: Most context rows a request or package binds.
+        context_rows: Most context rows a request or predictor binds.
         query_rows: Most query rows one Models API request scores.
         features: Most tabular features.
         horizon: Most forecast steps.
         group_series: Most related series forecast together.
         covariates: Most forecast covariates.
-        cpu: CPUs a package revision requests.
-        memory: Memory a package revision requests.
+        cpu: CPUs a predictor revision requests.
+        memory: Memory a predictor revision requests.
         max_codes: Most `@K` error-correcting codes.
         max_estimators: Most `*N` ensemble estimators.
         max_members: Most native estimator runs, codes times estimators.
@@ -208,11 +213,28 @@ V1_POLICY = ServingPolicy(
 
 
 @dataclass(frozen=True)
+class Limits:
+    """What one call may send a model, the numbers every surface checks against.
+
+    Attributes:
+        context_rows: Most context rows one call binds: the rows the model was
+            trained on, under the serving policy's cap.
+        queries: Most rows one call scores; for a forecaster, most series.
+        inputs: Most input columns; for a forecaster, most covariates.
+    """
+
+    context_rows: int
+    queries: int
+    inputs: int
+
+
+@dataclass(frozen=True)
 class ModelEntry:
     """One built-in model: its identity, capability and qualification.
 
     Attributes:
-        name: The canonical name, such as `tabicl-v2-classifier`.
+        name: Its short name, such as `tabicl-v2-classifier`: the checkpoint
+            directory and the name workers serve it by. Users name it by `id`.
         family: The loader family, such as `tabicl`.
         artifact: The content it loads.
         capability: What its weights can do.
@@ -251,9 +273,24 @@ class ModelEntry:
         return not variant and bool(self.artifact.files)
 
     @property
-    def repository_id(self) -> str:
-        """The id the original registry named it by."""
+    def id(self) -> str:
+        """Its canonical id, `general-forecast/<name>`, the one spelling every surface takes."""
         return f"{ORGANIZATION}/{self.name}"
+
+    @property
+    def limits(self) -> "Limits":
+        """What one call may send it; see `Limits`."""
+        policy = V1_POLICY
+        capability = self.capability
+        if not capability.tabular:
+            return Limits(policy.context_rows, policy.group_series, policy.covariates)
+        rows = capability.context_rows or policy.context_rows
+        inputs = capability.context_features or policy.features
+        return Limits(
+            min(rows, policy.context_rows),
+            policy.query_rows,
+            min(inputs, policy.features),
+        )
 
     @property
     def directory(self) -> str:
@@ -270,94 +307,94 @@ class ModelEntry:
 
 # SHA-256 of each pinned file, read from Hugging Face at each pinned revision.
 _FILES: dict[str, dict[str, str]] = {
-    "tabicl-v2-classifier": {
+    "general-forecast/tabicl-v2-classifier": {
         "LICENSE": "4f90c5fa25a2b7883d6235c7f0b11f942a37859b9f89ac36157cc485329913b4",
         "config.json": "7ec2941cc537535e1bd8f37d33fc97cea97953343d69d765a261ee6a1605d937",
         "model.safetensors": "58f5fc1f276744f721974079c19d2f67efacc39083c54483fe3feba52297d253",
     },
-    "tabicl-v2-regressor": {
+    "general-forecast/tabicl-v2-regressor": {
         "LICENSE": "4f90c5fa25a2b7883d6235c7f0b11f942a37859b9f89ac36157cc485329913b4",
         "config.json": "eacc28b62075709af08bc5e7678720e160cbc27881eeeda8b7549245d3695b79",
         "model.safetensors": "b2d384f7ee3e79f971224dddb0fefbe15ba05c49ecae5030028d50a184b9b518",
     },
-    "kumo-tabular-small-classifier": {
+    "general-forecast/kumo-tabular-small-classifier": {
         "LICENSE": "44b43ed7b8e0f987dc5e90fb6cb4b901eccf0b14dc9f17a9033951603851d37d",
         "config.json": "fc08e3f796698d0c2b6854a92972e706521c7dd2f645a70e8b76428e943bb4a0",
         "model.safetensors": "fe55113ae955f991942fe92a595d1bea3dc58176081f8c2bcdd981733c417990",
     },
-    "kumo-tabular-small-regressor": {
+    "general-forecast/kumo-tabular-small-regressor": {
         "LICENSE": "44b43ed7b8e0f987dc5e90fb6cb4b901eccf0b14dc9f17a9033951603851d37d",
         "config.json": "fc08e3f796698d0c2b6854a92972e706521c7dd2f645a70e8b76428e943bb4a0",
         "model.safetensors": "fd77cabc96866b6708231fa53e31da79a46a8902db219078fed2fcc75d5493aa",
     },
-    "kumo-tabular-medium-classifier": {
+    "general-forecast/kumo-tabular-medium-classifier": {
         "LICENSE": "44b43ed7b8e0f987dc5e90fb6cb4b901eccf0b14dc9f17a9033951603851d37d",
         "config.json": "c782566b989023b3a9c24a7ebb88d911f8e2eb7cee3b268e26fb99fe715b8323",
         "model.safetensors": "77359664b29c4f55876f3ecd73a7bc55a4d32a4fe2b2d4f61b873f81dd65301b",
     },
-    "kumo-tabular-medium-regressor": {
+    "general-forecast/kumo-tabular-medium-regressor": {
         "LICENSE": "44b43ed7b8e0f987dc5e90fb6cb4b901eccf0b14dc9f17a9033951603851d37d",
         "config.json": "c782566b989023b3a9c24a7ebb88d911f8e2eb7cee3b268e26fb99fe715b8323",
         "model.safetensors": "ace4bdfa861bb308f708050d3017806d4f8ce2b900012bd37776253239ad6b09",
     },
-    "kumo-tabular-large-classifier": {
+    "general-forecast/kumo-tabular-large-classifier": {
         "LICENSE": "44b43ed7b8e0f987dc5e90fb6cb4b901eccf0b14dc9f17a9033951603851d37d",
         "config.json": "3e38b76af1c915e226acaf51f29511f2eb89f600ac5fe95b673ee1228b5a8466",
         "model.safetensors": "2e398863274d3b8088af5dd6dd5464dfc91a459c515f02872abf03709050386a",
     },
-    "kumo-tabular-large-regressor": {
+    "general-forecast/kumo-tabular-large-regressor": {
         "LICENSE": "44b43ed7b8e0f987dc5e90fb6cb4b901eccf0b14dc9f17a9033951603851d37d",
         "config.json": "3e38b76af1c915e226acaf51f29511f2eb89f600ac5fe95b673ee1228b5a8466",
         "model.safetensors": "ed84296ce00d436847baff6411835a436b61d0490124cf22c9b0943c86b7085e",
     },
     # Upstream files; their licenses forbid hosting a converted copy.
-    "tabpfn-3-classifier": {
+    "general-forecast/tabpfn-3-classifier": {
         "LICENSE": "dca491280b68f471312a15d54add7b8e724adf19fb0e113544b1ef91e060f5d5",
         "tabpfn-v3-classifier-v3_default.ckpt": "d0d865d54dfbc524f5703104be90620182dca7e5fb2c16de72e9959ea18f3988",
     },
-    "tabpfn-3-regressor": {
+    "general-forecast/tabpfn-3-regressor": {
         "LICENSE": "dca491280b68f471312a15d54add7b8e724adf19fb0e113544b1ef91e060f5d5",
         "tabpfn-v3-regressor-v3_default.ckpt": "311ce18d97e9533d8585eaadafe040fbdd8070533209ed8696641dadc97a7301",
     },
-    "tabpfn-3.5-classifier": {
+    "general-forecast/tabpfn-3.5-classifier": {
         "LICENSE": "9570fdd687bb76ed45499412ad57d6ba949848e6d731f1242572bb57f2f73ae1",
         "tabpfn-v3.5-20260909.safetensors": "ece4d67eadfea42eb0e610df5189bea60cb7f31073d81e9c7a019b76eacf0be3",
     },
-    "tabpfn-3.5-regressor": {
+    "general-forecast/tabpfn-3.5-regressor": {
         "LICENSE": "9570fdd687bb76ed45499412ad57d6ba949848e6d731f1242572bb57f2f73ae1",
         "tabpfn-v3.5-20260909.safetensors": "ece4d67eadfea42eb0e610df5189bea60cb7f31073d81e9c7a019b76eacf0be3",
     },
-    "mitra-2-classifier": {
+    "general-forecast/mitra-2-classifier": {
         "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
         "NOTICE": "e10e58970f1c1e7ef200d45f274fb5330533a8d2553dda5a6e2d88c0fdf00fab",
         "config.json": "6fae96bf13a03210f575d519a763dfa3c902e05b391bd7ddabd67002e8b370d2",
         "model.safetensors": "5ffab0e2cf52f61c5b7c7eb1e8542996736d1023a0212190cc09abc2119a1e09",
     },
-    "mitra-2-regressor": {
+    "general-forecast/mitra-2-regressor": {
         "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
         "NOTICE": "7d51fc8c96c5716e2295ae72e540171f0999001c6b0167aa9684630ff45ba79a",
         "config.json": "a4ceb3618fcde95e1b5cc8800fb090d8f8c8549db64e04c72e94802017b2691b",
         "model.safetensors": "8c90b8f281a793f9feb19f8fc3c5529c58ac844dd7ffc690a0fdbb96fae0967c",
     },
-    "chronos-2": {
+    "general-forecast/chronos-2": {
         "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
         "NOTICE": "f244df7a5307a500b53a6675eb4058359509fbf332f37aee9bb490f9829cf3f5",
         "config.json": "4c685ee692bbe94cdf775b8f6d9fa46498078ea1303bec8c2689f39436e60986",
         "model.safetensors": "6d353b01a3a939d324ea3abfb8f11cfba6e817b57db9b30a23b0def70528a087",
     },
-    "timestral-209m": {
+    "general-forecast/timestral-209m": {
         "LICENSE": "648194727930df730890e9f9affdbcc5c930d406d6829559b25ca3d5a973fc8c",
         "NOTICE": "78d9a52a5bfea60302f46146870690591c41926f82804147148a39cdbbdec150",
         "config.json": "d6f74c7e003b9f857b13a752e122797a8b96e19f80ed32d19996196de4d2aa96",
         "model.safetensors": "a3a18ea4f2ea68791f0865542ea8fe4ce2ca5fbdf1cc03ac7fd11dc64d647983",
     },
-    "timestral-28m": {
+    "general-forecast/timestral-28m": {
         "LICENSE": "648194727930df730890e9f9affdbcc5c930d406d6829559b25ca3d5a973fc8c",
         "NOTICE": "ebd4a1dd9913b158c5f6f0187d3c128053b7c2fcdeb13c83921542b76093cf03",
         "config.json": "79ca626795b5093dc1b05b579eb15a422e3ef8229bf5986b7b5481ce6361ba24",
         "model.safetensors": "b82d17044388365e5f47951431501598baa0904fcb0c6e07602ea08ef42ee986",
     },
-    "timesfm-3": {
+    "general-forecast/timesfm-3": {
         "LICENSE": "3e36db7240d23adb6ac6d7d931892dcc5706a14a7d31581f08c35d2f25736dfd",
         "config.json": "ff17bbc07b792c5a904cca265b8468579d736a4fe84981da25eb871b0a125bc6",
         "model.safetensors": "a7592b0a8432baee54483254e5647856911ce69e09d09a9bb65904b2d98f17da",
@@ -374,16 +411,15 @@ class ModelRefError(ValueError):
         super().__init__(message)
 
 
-# An optional `catalog/`, a name, then optionally an `@sha256:` content pin,
-# `@K` error-correcting codes and `*N` estimators, each once, in that order.
+# A canonical id, then optionally an `@sha256:` content pin, `@K`
+# error-correcting codes and `*N` estimators, each once, in that order.
 _REF = re.compile(
-    r"(?:catalog/)?(?P<name>[^@*]+)"
+    r"(?P<name>[^@*]+)"
     r"(?:@(?P<digest>sha256:[0-9a-f]{64}))?"
     r"(?:@(?P<codes>\d+))?"
     r"(?:\*(?P<estimators>\d+))?"
 )
-_TRUSTED = re.compile(r"[A-Za-z_][\w.]*:[A-Za-z_]\w*")
-_BASE = re.compile(r"(?:catalog/)?(?P<name>[^@*]+)(?:[@*].*)?", re.DOTALL)
+_BASE = re.compile(r"(?P<name>[^@*]+)(?:[@*].*)?", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -391,8 +427,8 @@ class ModelRef:
     """A parsed model reference: a model, optionally pinned, with its variant.
 
     Attributes:
-        name: A built-in model's canonical name, or `module:function` for a
-            trusted in-process model.
+        name: A built-in model's canonical id, such as
+            `general-forecast/tabicl-v2-classifier`.
         codes: `@K` error-correcting codes, if any.
         estimators: `*N` ensemble estimators, if any.
         digest: The `@sha256:` artifact digest it is pinned to, if any.
@@ -404,11 +440,6 @@ class ModelRef:
     digest: str | None = None
 
     @property
-    def trusted(self) -> bool:
-        """Whether it names code to import, which only trusted processes run."""
-        return ":" in self.name
-
-    @property
     def variant(self) -> bool:
         """Whether it wraps the model in codes or an ensemble."""
         return self.codes is not None or self.estimators is not None
@@ -416,8 +447,6 @@ class ModelRef:
     @property
     def entry(self) -> ModelEntry:
         """The built-in model it names."""
-        if self.trusted:
-            raise ModelRefError("UntrustedModel", f"{self.name!r} is not built in")
         return ENTRIES[self.name]
 
     @property
@@ -439,16 +468,9 @@ def admit(ref: ModelRef, surface: Surface) -> None:
     """Refuses a reference `surface` may not run, before any of its code loads.
 
     Raises:
-        ModelRefError: If it names code to import beyond local use, a model
-            not qualified for the surface, or a variant past the serving
-            policy's bounds.
+        ModelRefError: If it names a model not qualified for the surface, or
+            a variant past the serving policy's bounds.
     """
-    if ref.trusted:
-        if surface != "local":
-            raise ModelRefError(
-                "UntrustedModel", "module:function models run only locally"
-            )
-        return
     entry = ref.entry
     if not entry.allows(surface, variant=ref.variant):
         raise ModelRefError(
@@ -459,24 +481,23 @@ def admit(ref: ModelRef, surface: Surface) -> None:
         raise ModelRefError("CapacityExceeded", f"serving policy allows {refused}")
 
 
-def parse(spec: str, *, trusted: bool = False) -> ModelRef:
-    """Parses a model reference, resolving aliases and repository ids.
+def parse(spec: str) -> ModelRef:
+    """Parses a model reference, which names a model by its canonical id.
 
     Args:
-        spec: A name, alias or repository id, such as `tabicl-classifier`,
-            `general-forecast/tabicl-v2-classifier` or `catalog/<name>@sha256:...`,
-            or with `trusted`, `module:function`; then optionally `@K` codes
-            and `*N` estimators, each at most once, in that order.
-        trusted: Whether the caller runs `module:function` code in its own
-            process. Packages, locks and servers never pass it, so uploaded
-            text can never name code for them to import.
+        spec: A canonical id such as `general-forecast/tabicl-v2-classifier`,
+            optionally pinned as `general-forecast/<name>@sha256:...`; then
+            optionally `@K` codes and `*N` estimators, each at most once, in
+            that order. A bare name or an upstream id, such as
+            `tabicl-classifier` or `amazon/chronos-2`, is refused with the
+            canonical id as the hint.
 
     Returns:
-        The reference, with the model's canonical name.
+        The reference, naming the model by its canonical id.
 
     Raises:
-        ModelRefError: If the spec is malformed, names no built-in model,
-            names code without `trusted`, pins other content than the catalog
+        ModelRefError: If the spec is malformed, names no built-in model or
+            one by an old spelling, pins other content than the catalog
             holds, or asks a variant the model cannot take.
     """
     match = _REF.fullmatch(spec) if type(spec) is str else None
@@ -500,23 +521,17 @@ def parse(spec: str, *, trusted: bool = False) -> ModelRef:
         digest,
     )
     if ":" in name:
-        if not trusted:
-            raise ModelRefError(
-                "UntrustedModel",
-                "module:function models run only in a trusted local process",
-            )
-        if _TRUSTED.fullmatch(name) is None or digest or spec.startswith("catalog/"):
-            raise ModelRefError(
-                "InvalidModel", f"expected module:function, got {name!r}"
-            )
-        return ref
-    canonical = _NAMES.get(name)
-    if canonical is None:
+        raise ModelRefError(
+            "InvalidModel", not_canonical(name, "general-forecast/<name>")
+        )
+    entry = ENTRIES.get(name)
+    if entry is None:
+        if (canonical := ALIASES.get(name)) is not None:
+            raise ModelRefError("InvalidModel", not_canonical(name, canonical))
         raise ModelRefError(
             "UnknownModel",
             f"unknown model {name!r}; built-in models are {sorted(ENTRIES)}",
         )
-    entry = ENTRIES[canonical]
     if digest is not None and digest != entry.artifact.digest:
         raise ModelRefError("ModelMismatch", "requested model pin differs from catalog")
     if ref.variant and not entry.capability.tabular:
@@ -529,7 +544,85 @@ def parse(spec: str, *, trusted: bool = False) -> ModelRef:
             "UnsupportedCapability",
             f"error-correcting codes need a classifier: {spec!r}",
         )
-    return ModelRef(canonical, ref.codes, ref.estimators, digest)
+    return ref
+
+
+def _base(ref: str) -> str:
+    return re.split(r"[@*]", ref, maxsplit=1)[0]
+
+
+def known_as(ref: str) -> str | None:
+    """The canonical id a bare name or an old spelling stands for, or None.
+
+    `tabicl-v2-classifier` and `tabicl-classifier` both stand for
+    `general-forecast/tabicl-v2-classifier`; a canonical id stands for nothing
+    else, and neither does a name the catalog has never used.
+    """
+    name = _base(ref)
+    if (known := ALIASES.get(name)) is not None:
+        return known
+    if "/" not in name and f"{ORGANIZATION}/{name}" in ENTRIES:
+        return f"{ORGANIZATION}/{name}"
+    return None
+
+
+def not_canonical(name: str, canonical: str) -> str:
+    """The one message a bare name or an old spelling is refused with, everywhere.
+
+    >>> not_canonical("tabicl-v2-classifier", "general-forecast/tabicl-v2-classifier")
+    '`tabicl-v2-classifier` is not a catalog model id; use general-forecast/tabicl-v2-classifier'
+    """
+    return f"`{name}` is not a catalog model id; use {canonical}"
+
+
+def reference(ref: str) -> ModelRef:
+    """A parsed catalog reference, or the error a user is shown for the spelling.
+
+    Raises:
+        InvalidInput: If it is a bare name or an old spelling, with the
+            canonical id as the hint, or is malformed.
+        NotFound: If no catalog model has that id.
+    """
+    try:
+        return parse(ref)
+    except ModelRefError as error:
+        name = _base(ref)
+        if (known := known_as(name)) is not None:
+            raise InvalidInput(not_canonical(name, known), param="model") from None
+        if error.code == "UnknownModel":
+            raise NotFound(
+                f"model `{name}` is not in the catalog",
+                hint="run `gf model list` to see the catalog",
+            ) from None
+        raise InvalidInput(str(error)) from None
+
+
+def canonical(ref: str) -> str:
+    """The canonical id a reference names, with its variant and pin kept.
+
+    Args:
+        ref: `general-forecast/<name>`, optionally with `@K` codes, `*N`
+            estimators or an `@sha256:` pin.
+
+    Returns:
+        The reference as the catalog spells it.
+
+    Raises:
+        InvalidInput: If it is a bare name or an old spelling, with the
+            canonical id as the hint, or is malformed.
+        NotFound: If no catalog model has that id.
+    """
+    return str(reference(ref))
+
+
+def limits(ref: str) -> Limits:
+    """What one call may send a model: context rows, queries and inputs."""
+    return reference(ref).entry.limits
+
+
+def task_of(ref: str) -> Task:
+    """The task a model does: `classification`, `regression` or `forecast`."""
+    return reference(ref).entry.capability.task
 
 
 @overload
@@ -537,17 +630,19 @@ def resource_name(reference: str) -> str: ...
 @overload
 def resource_name(reference: object) -> object: ...
 def resource_name(reference: object) -> object:
-    """The model resource a reference names: its canonical name, without pin or variant.
+    """The model resource a reference names: its short name, without pin or variant.
 
-    Routes and request envelopes name this resource while the request body
-    keeps the full reference, so whatever runs it still admits the pin and
-    variant; an invalid one is never dropped. Unknown names are returned as
-    given, and non-references unchanged, for the caller's own checks to reject.
+    Routes and request envelopes name this resource, which has no `/`, while
+    the request body keeps the full reference, so whatever runs it still
+    admits the pin and variant; an invalid one is never dropped. Unknown ids
+    are returned as given, and non-references unchanged, for the caller's own
+    checks to reject.
     """
     if type(reference) is not str or (match := _BASE.fullmatch(reference)) is None:
         return reference
     name = match.group("name")
-    return _NAMES.get(name, name)
+    entry = ENTRIES.get(name)
+    return name if entry is None else entry.name
 
 
 def entry(spec: str) -> ModelEntry:
@@ -566,9 +661,10 @@ def manifest() -> dict:
     `gf_core::catalog` compiles in the copy checked in at
     `crates/gf-core/catalog.json`, which `python -m generalforecast.models.catalog`
     prints and a test keeps equal to this. It carries what a request is
-    checked against before any weights load: every spelling that resolves to
-    a model, each model's task, content digest, license and pin state, the
-    classes and quantiles it serves, its gates, and the v1 serving policy.
+    checked against before any weights load: each model's canonical id and
+    short name, its task, content digest, license and pin state, the limits
+    of one call, the classes and quantiles it serves, its gates, the old
+    spellings `ALIASES` refuses with a hint, and the v1 serving policy.
     """
     return {
         "max_classes": MAX_CLASSES,
@@ -583,11 +679,18 @@ def manifest() -> dict:
             "max_estimators": V1_POLICY.max_estimators,
             "max_members": V1_POLICY.max_members,
         },
-        "names": dict(sorted(_NAMES.items())),
+        "names": {item.id: item.name for item in _ALL},
+        "aliases": dict(sorted(ALIASES.items())),
         "entries": [
             {
+                "id": item.id,
                 "name": item.name,
                 "task": item.capability.task,
+                "limits": {
+                    "context_rows": item.limits.context_rows,
+                    "queries": item.limits.queries,
+                    "inputs": item.limits.inputs,
+                },
                 "digest": item.artifact.digest,
                 "pinned": bool(item.artifact.files),
                 "hostable": item.hostable,
@@ -597,7 +700,7 @@ def manifest() -> dict:
                     "quantile_step": item.capability.quantile_step,
                 },
                 "gates": {
-                    "package": item.gates.package,
+                    "predictor": item.gates.predictor,
                     "remote": item.gates.remote,
                     "variants": sorted(item.gates.variants),
                 },
@@ -607,19 +710,27 @@ def manifest() -> dict:
     }
 
 
-def _files(name: str) -> MappingProxyType:
-    return MappingProxyType(dict(_FILES.get(name, {})))
+def short_name(id: str) -> str:
+    """The short name of a canonical id, which must carry the organization: its checkpoint directory."""
+    organization, _, name = id.partition("/")
+    if organization != ORGANIZATION or not name:
+        raise AssertionError(f"catalog ids are {ORGANIZATION}/<name>: {id!r}")
+    return name
+
+
+def _files(id: str) -> MappingProxyType:
+    return MappingProxyType(dict(_FILES.get(id, {})))
 
 
 def _pinned(
-    name: str, revision: str, license: str | None, source: str | None
+    id: str, revision: str, license: str | None, source: str | None
 ) -> Artifact:
-    return Artifact(f"{ORGANIZATION}/{name}", revision, _files(name), license, source)
+    return Artifact(id, revision, _files(id), license, source)
 
 
-_TABICL = "pinned config, weights and LICENSE; real-weight package, Models API and @K/*N parity tests"
+_TABICL = "pinned config, weights and LICENSE; real-weight predictor, Models API and @K/*N parity tests"
 _LOCAL = (
-    "pinned config, weights and license files are hashed; package and remote "
+    "pinned config, weights and license files are hashed; predictor and remote "
     "serving await runtime qualification with real weights and license review"
 )
 _LOCAL_GATES = Gates(evidence=_LOCAL)
@@ -630,7 +741,7 @@ _UNHASHED = (
 
 
 def _tabular(
-    name: str,
+    id: str,
     family: str,
     revision: str,
     *,
@@ -642,12 +753,12 @@ def _tabular(
     aliases: tuple[str, ...] = (),
     artifact: Artifact | None = None,
 ) -> ModelEntry:
-    task: Task = "classification" if name.endswith("classifier") else "regression"
+    task: Task = "classification" if id.endswith("classifier") else "regression"
     rows, features, classes = trained
     return ModelEntry(
-        name,
+        short_name(id),
         family,
-        artifact or _pinned(name, revision, license, source if license else None),
+        artifact or _pinned(id, revision, license, source if license else None),
         Capability(
             task,
             class_slots=class_slots if task == "classification" else None,
@@ -662,14 +773,14 @@ def _tabular(
 
 
 def _upstream(
-    name: str,
+    id: str,
     repository: str,
     revision: str,
     convert: str,
     license: str | None,
     source: str | None,
 ) -> Artifact:
-    return Artifact(repository, revision, _files(name), license, source, convert)
+    return Artifact(repository, revision, _files(id), license, source, convert)
 
 
 _HOSTED = (
@@ -678,9 +789,9 @@ _HOSTED = (
 )
 _HOSTED_GATES = Gates(remote=True, variants=frozenset({"remote"}), evidence=_HOSTED)
 _TABICL_GATES = Gates(
-    package=True,
+    predictor=True,
     remote=True,
-    variants=frozenset({"package", "remote"}),
+    variants=frozenset({"predictor", "remote"}),
     evidence=_TABICL,
 )
 _KUMO = {
@@ -696,21 +807,21 @@ _TABPFN_3_5 = ("Prior-Labs/tabpfn_3_5", "06bf2ba35c80a92a3b9abb436b99cf49e7a0365
 # Mirrors converted from the upstream repositories, which stay aliases. Each
 # mirror's NOTICE records its upstream revision.
 _TIMESTRAL = {
-    "timestral-209m": (
+    "general-forecast/timestral-209m": (
         "mistralai/Timestral-209M",
         "37676b196d5e39d76ba7495f5393247e23aa5a4b",
     ),
-    "timestral-28m": (
+    "general-forecast/timestral-28m": (
         "mistralai/Timestral-28M",
         "645062a557cc9c032883031788991f3582c74d5a",
     ),
 }
 _MITRA_2 = {
-    "mitra-2-classifier": (
+    "general-forecast/mitra-2-classifier": (
         "autogluon/mitra-classifier-2",
         "bc87248a2ba873bf623705beecd8c7c9cd9bfa18",
     ),
-    "mitra-2-regressor": (
+    "general-forecast/mitra-2-regressor": (
         "autogluon/mitra-regressor-2",
         "124a99e9a31879ce4f1ef2b7f333b02f716a67be",
     ),
@@ -718,7 +829,7 @@ _MITRA_2 = {
 
 
 def _forecaster(
-    name: str,
+    id: str,
     family: str,
     artifact: Artifact,
     capability: Capability,
@@ -728,13 +839,20 @@ def _forecaster(
     options: tuple[tuple[str, object], ...] = (),
 ) -> ModelEntry:
     return ModelEntry(
-        name, family, artifact, capability, gates, checkpoint, aliases, options
+        short_name(id),
+        family,
+        artifact,
+        capability,
+        gates,
+        checkpoint,
+        aliases,
+        options,
     )
 
 
 _ALL: tuple[ModelEntry, ...] = (
     _tabular(
-        "tabicl-v2-classifier",
+        "general-forecast/tabicl-v2-classifier",
         "tabicl",
         "5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b",
         trained=(60_000, 100, 10),
@@ -743,7 +861,7 @@ _ALL: tuple[ModelEntry, ...] = (
         aliases=("tabicl-classifier",),
     ),
     _tabular(
-        "tabicl-v2-regressor",
+        "general-forecast/tabicl-v2-regressor",
         "tabicl",
         "1466a562be5d04a25ab612940d80c2c2f901c797",
         trained=(60_000, 100, 10),
@@ -753,7 +871,7 @@ _ALL: tuple[ModelEntry, ...] = (
     ),
     *(
         _tabular(
-            f"kumo-tabular-{size}",
+            f"{ORGANIZATION}/kumo-tabular-{size}",
             "kumo",
             revision,
             trained=(60_000, 100, 10),
@@ -777,7 +895,10 @@ _ALL: tuple[ModelEntry, ...] = (
                 "LICENSE",
             ),
         )
-        for name in ("tabpfn-3-classifier", "tabpfn-3-regressor")
+        for name in (
+            "general-forecast/tabpfn-3-classifier",
+            "general-forecast/tabpfn-3-regressor",
+        )
     ),
     *(
         _tabular(
@@ -794,22 +915,25 @@ _ALL: tuple[ModelEntry, ...] = (
                 "LICENSE",
             ),
         )
-        for name in ("tabpfn-3.5-classifier", "tabpfn-3.5-regressor")
+        for name in (
+            "general-forecast/tabpfn-3.5-classifier",
+            "general-forecast/tabpfn-3.5-regressor",
+        )
     ),
     _tabular(
-        "limix-2-classifier",
+        "general-forecast/limix-2-classifier",
         "limix",
         "e3ba7be7c8d6f265844b1c1aabc4bd9e365adc6a",
         gates=Gates(),
     ),
     _tabular(
-        "limix-2-regressor",
+        "general-forecast/limix-2-regressor",
         "limix",
         "ad1d2711a9807bdaf3c315960cb0ae4b1f6514a7",
         gates=Gates(),
     ),
     _tabular(
-        "mitra-classifier",
+        "general-forecast/mitra-classifier",
         "mitra",
         "64bc87614af639ccea79dd71a96f3bbf357fee86",
         trained=(512, 16, None),
@@ -828,10 +952,10 @@ _ALL: tuple[ModelEntry, ...] = (
         for name, (upstream, revision) in _MITRA_2.items()
     ),
     _forecaster(
-        "chronos-2",
+        "general-forecast/chronos-2",
         "chronos2",
         _pinned(
-            "chronos-2",
+            "general-forecast/chronos-2",
             "a287b88beaeef49cf436e6735d9f61e13dfd50f8",
             "Apache-2.0",
             "LICENSE",
@@ -843,36 +967,36 @@ _ALL: tuple[ModelEntry, ...] = (
             future_inputs=True,
         ),
         Gates(
-            package=True,
+            predictor=True,
             remote=True,
             evidence="pinned mirror config, weights, LICENSE and NOTICE, "
-            "byte-identical to the verified conversion; real-weight package "
+            "byte-identical to the verified conversion; real-weight predictor "
             "and Models API grouped forecast tests",
         ),
         aliases=("amazon/chronos-2",),
     ),
     *(
         _forecaster(
-            name + suffix,
+            id + suffix,
             "timestral",
             # The LICENSE files are pinned; the upstream cards say only "other".
-            _pinned(name, revision, "LicenseRef-timestral-license", "LICENSE"),
+            _pinned(id, revision, "LicenseRef-timestral-license", "LICENSE"),
             Capability("forecast"),
             gates=_HOSTED_GATES,
-            checkpoint=name,
+            checkpoint=short_name(id),
             options=(("symmetric", not suffix),),
             aliases=() if suffix else (upstream,),
         )
-        for name, (upstream, revision) in _TIMESTRAL.items()
+        for id, (upstream, revision) in _TIMESTRAL.items()
         # Without its averaging over the group and its negation, which halves
         # the work and the cache at some accuracy.
         for suffix in ("", "-unmirrored")
     ),
     _forecaster(
-        "timesfm-3",
+        "general-forecast/timesfm-3",
         "timesfm3",
         _upstream(
-            "timesfm-3",
+            "general-forecast/timesfm-3",
             "google/timesfm-3.0-pytorch",
             "43046b85ec22d584a13f8098c2ed39c889e129c2",
             "timesfm3",
@@ -884,12 +1008,27 @@ _ALL: tuple[ModelEntry, ...] = (
 )
 if unlicensed := [i.name for i in _ALL if i.gates.remote and not i.hostable]:
     raise AssertionError(f"remote gates need a hosted license: {unlicensed}")
-ENTRIES: MappingProxyType = MappingProxyType({item.name: item for item in _ALL})
-_NAMES: dict[str, str] = {
-    alias: item.name
-    for item in _ALL
-    for alias in (item.name, item.repository_id, *item.aliases)
-}
+# Every built-in model by its canonical id, in catalog order: the recommended
+# model of each task first.
+ENTRIES: MappingProxyType = MappingProxyType({item.id: item for item in _ALL})
+# The one table of old spellings: bare names, upstream repository ids and
+# retired aliases, each to the canonical id a caller is told to use instead.
+ALIASES: MappingProxyType = MappingProxyType(
+    {alias: item.id for item in _ALL for alias in (item.name, *item.aliases)}
+)
+# The model `gf init` picks for a task when none is named: the first row of its
+# selector, and the one `--yes` takes.
+DEFAULTS: MappingProxyType = MappingProxyType(
+    {
+        "classification": f"{ORGANIZATION}/kumo-tabular-medium-classifier",
+        "regression": f"{ORGANIZATION}/kumo-tabular-medium-regressor",
+        "forecast": f"{ORGANIZATION}/timesfm-3",
+    }
+)
+if wrong := [
+    task for task, id in DEFAULTS.items() if ENTRIES[id].capability.task != task
+]:
+    raise AssertionError(f"default models do the wrong task: {wrong}")
 
 
 if __name__ == "__main__":
