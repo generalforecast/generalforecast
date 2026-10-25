@@ -13,7 +13,7 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any, Literal, TypedDict
 
-from generalforecast.deployments.contracts import (
+from generalforecast.service.contracts import (
     VERSION,
     ServiceError,
     fields,
@@ -181,7 +181,7 @@ class ErrorEnvelope(TypedDict):
     project: str
     request_id: str
     resource: JsonObject
-    error: dict[str, str]
+    error: dict[str, Any]
 
 
 def success(request: Request, result: JsonObject) -> ResultEnvelope:
@@ -197,24 +197,18 @@ def success(request: Request, result: JsonObject) -> ResultEnvelope:
     return response
 
 
-def failure(
-    request: Request, error: ServiceError, *, typed: bool = False
-) -> ErrorEnvelope:
+def failure(request: Request, error: ServiceError) -> ErrorEnvelope:
     """Wraps only an explicitly safe ServiceError, never arbitrary exceptions.
 
-    API requests carry the OpenAPI `ErrorCode`; a browser session's request
-    (`typed`) keeps the code the console's sign-in and membership flows
-    branch on.
+    Every envelope carries the OpenAPI `ErrorCode`; a refused browser session
+    adds the `reason` the console's sign-in and membership flows branch on.
     """
     return {
         "api_version": VERSION,
         "project": request.scope.project,
         "request_id": request.scope.request_id,
         "resource": asdict(request.resource),
-        "error": {
-            "code": error.code if typed else error.public,
-            "message": error.message,
-        },
+        "error": error.error(),
     }
 
 
@@ -274,18 +268,18 @@ class Artifact:
 
 @dataclass(frozen=True)
 class ServingEffect:
-    """One data acceptance bound to one desired deployment revision."""
+    """One data acceptance bound to one desired predictor revision."""
 
     project: str
-    dataset: str
+    context: str
     write_id: str
     sequence: int
-    deployment: str
+    predictor: str
     revision: int
 
     def __post_init__(self) -> None:
         """Prevents a global sequence from masquerading as a serving receipt."""
-        for value in (self.project, self.dataset, self.deployment):
+        for value in (self.project, self.context, self.predictor):
             name(value)
         text(self.write_id, "write_id")
         for value in (self.sequence, self.revision):

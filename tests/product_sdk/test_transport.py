@@ -14,7 +14,7 @@ import pytest
 
 from generalforecast.async_client import AsyncClient
 from generalforecast.client import Client
-from generalforecast.deployments.contracts import ServiceError
+from generalforecast.service.contracts import ServiceError
 from generalforecast.transport import AsyncTransport, Profile, Transport, endpoint
 
 

@@ -62,7 +62,7 @@ def _create(server: Server, name: str = "rows") -> None:
 
 def _local(features: np.ndarray, targets: np.ndarray) -> generalforecast.Table:
     table = generalforecast.local().create_table(
-        "rows", model="tests.models.tabicl.tiny:classifier", features=5, classes=3
+        "rows", model="tests/tabicl-classifier", features=5, classes=3
     )
     table.insert(np.arange(len(features)), features, targets)
     return table

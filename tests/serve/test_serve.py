@@ -19,10 +19,10 @@ import pyarrow as pa
 import pytest
 import yaml
 
-from generalforecast.deployments.boundary import Scope
-from generalforecast.deployments.catalog import CatalogService
 from generalforecast.predictors.validation import PredictorError
 from generalforecast.serve.models import served
+from generalforecast.service.boundary import Scope
+from generalforecast.service.catalog import CatalogService
 from generalforecast.tabular import arrow_bytes
 
 ROOT = Path(__file__).resolve().parents[2]

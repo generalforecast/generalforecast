@@ -15,8 +15,8 @@ import pytest
 
 from generalforecast.async_client import AsyncClient
 from generalforecast.client import Client
-from generalforecast.deployments.boundary import Request, Resource, Scope, success
-from generalforecast.deployments.contracts import ServiceError
+from generalforecast.service.boundary import Request, Resource, Scope, success
+from generalforecast.service.contracts import ServiceError
 from generalforecast.transport import (
     PLATFORM_PROBE,
     HostedOnlyError,

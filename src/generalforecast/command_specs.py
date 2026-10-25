@@ -9,7 +9,7 @@ Kept free of heavy imports so `gf --help` and argument errors stay fast.
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from generalforecast.deployments.boundary import ResourceKind
+    from generalforecast.service.boundary import ResourceKind
 
 TAGLINE = "General Forecast: Inference for structured data foundation models"
 CLOSING = "See 'gf help <command>' for more information"
@@ -133,7 +133,7 @@ UNNAMED_ACTIONS = {
     "restore",
 }
 
-# -- SDK routing tables, shared with the deployments test-suite -------------
+# -- SDK routing tables, shared with the hosted test-suite -------------
 
 COLLECTIONS: "dict[str, tuple[ResourceKind, str]]" = {
     "context": ("context", "contexts"),

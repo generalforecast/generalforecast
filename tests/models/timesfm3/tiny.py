@@ -132,7 +132,7 @@ def tiny_timesfm(seed: int = 0) -> TimesFM:
 
 
 def forecaster() -> tuple[Any, TimesFM]:
-    """A tiny TimesFM as a model spec target: `tests.models.timesfm3.tiny:forecaster`."""
+    """A tiny TimesFM registered for the engine as `tests/timesfm3-forecaster`."""
     from generalforecast.models.timesfm3.model import timesfm_functions
 
     return timesfm_functions, tiny_timesfm()

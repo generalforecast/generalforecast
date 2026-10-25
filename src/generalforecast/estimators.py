@@ -9,8 +9,6 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import pyarrow as pa
 
-from generalforecast.deployments.predictor_runtime.plan import ExecutionPlan
-from generalforecast.deployments.predictor_runtime.schema import infer_schema
 from generalforecast.errors import InvalidInput
 from generalforecast.native import models as registry
 from generalforecast.native.estimators import Classifier, Regressor
@@ -32,6 +30,8 @@ from generalforecast.native.sklearn_shim import (
 )
 from generalforecast.predictors import frequency as _frequency
 from generalforecast.predictors.models import describe, for_task
+from generalforecast.predictors.runtime.plan import ExecutionPlan
+from generalforecast.predictors.runtime.schema import infer_schema
 from generalforecast.predictors.validation import ensure
 from generalforecast.tabular import physical_type, to_arrow
 

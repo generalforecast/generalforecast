@@ -297,6 +297,7 @@ class Error(Payload):
 
     code: ErrorCode
     message: str
+    reason: str | None = None
     param: str | None = None
     hint: str | None = None
     limit: int | None = None
@@ -305,6 +306,7 @@ class Error(Payload):
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("code", "code", True, _enum(ErrorCode)),
         Field("message", "message", True, _text),
+        Field("reason", "reason", False, _pattern("^[a-z][a-z0-9_]{0,63}$")),
         Field("param", "param", False, _text),
         Field("hint", "hint", False, _text),
         Field("limit", "limit", False, _integer),

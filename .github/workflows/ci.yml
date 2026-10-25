@@ -57,7 +57,7 @@ jobs:
           rust=true python=true
           if [ "$EVENT" = pull_request ]; then
             files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')
-            grep -qE '^(crates/|Cargo\.|rust-toolchain|tests/product_cli/|\.github/workflows/ci\.yml)|^src/generalforecast/[^/]*$|^src/generalforecast/(deployments|packages)/' <<<"$files" || rust=false
+            grep -qE '^(crates/|Cargo\.|rust-toolchain|tests/product_cli/|\.github/workflows/ci\.yml)|^src/generalforecast/[^/]*$|^src/generalforecast/(service|predictors)/' <<<"$files" || rust=false
           elif [ "$EVENT" = push ]; then
             # A merge whose tree is the PR head's repeats checks that passed.
             pr=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[0].number // empty')

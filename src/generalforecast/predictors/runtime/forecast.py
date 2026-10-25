@@ -9,15 +9,15 @@ from typing import Any
 import numpy as np
 import pyarrow as pa
 
-from generalforecast.deployments.catalog import forecast_request
-from generalforecast.deployments.contracts import ServiceError
-from generalforecast.deployments.predictor_runtime.lock import ExecutionLock
-from generalforecast.deployments.predictor_runtime.schema import TableSchema
 from generalforecast.engine import LocalEngine, ModelOutputError
 from generalforecast.models.catalog import V1_POLICY, ModelRef
 from generalforecast.models.grouping import instant
 from generalforecast.models.outputs import DEFAULT_QUANTILES, quantile_index, quantiles
+from generalforecast.predictors.runtime.lock import ExecutionLock
+from generalforecast.predictors.runtime.schema import TableSchema
 from generalforecast.predictors.validation import ensure
+from generalforecast.service.catalog import forecast_request
+from generalforecast.service.contracts import ServiceError
 
 
 @dataclass(frozen=True)

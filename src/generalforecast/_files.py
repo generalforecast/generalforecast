@@ -16,7 +16,7 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import BinaryIO
 
-from generalforecast.deployments.contracts import ServiceError
+from generalforecast.service.contracts import ServiceError
 
 try:
     import fcntl

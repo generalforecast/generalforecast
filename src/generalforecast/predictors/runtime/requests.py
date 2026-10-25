@@ -5,10 +5,10 @@
 
 import pyarrow as pa
 
-from generalforecast.deployments.contracts import ServiceError, require
-from generalforecast.deployments.predictor_runtime.compile import compile_plan
-from generalforecast.deployments.predictor_runtime.plan import ExecutionPlan
+from generalforecast.predictors.runtime.compile import compile_plan
+from generalforecast.predictors.runtime.plan import ExecutionPlan
 from generalforecast.predictors.validation import PredictorError
+from generalforecast.service.contracts import ServiceError, require
 from generalforecast.tabular import coerce, to_arrow
 
 

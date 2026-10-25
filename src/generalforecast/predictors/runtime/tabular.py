@@ -11,9 +11,6 @@ import numpy as np
 import pyarrow as pa
 
 from generalforecast import _core
-from generalforecast.deployments.contracts import ServiceError
-from generalforecast.deployments.predictor_runtime.lock import ExecutionLock
-from generalforecast.deployments.predictor_runtime.schema import TableSchema
 from generalforecast.engine import Bound, Labeled, LocalEngine, ModelOutputError
 from generalforecast.models.catalog import ModelRef
 from generalforecast.models.outputs import (
@@ -22,7 +19,10 @@ from generalforecast.models.outputs import (
     quantile_index,
     quantiles,
 )
+from generalforecast.predictors.runtime.lock import ExecutionLock
+from generalforecast.predictors.runtime.schema import TableSchema
 from generalforecast.predictors.validation import PredictorError
+from generalforecast.service.contracts import ServiceError
 from generalforecast.tabular import arrow_bytes
 
 

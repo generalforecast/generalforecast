@@ -150,39 +150,17 @@ def catalog(task: Task | None = None) -> list[ModelInfo]:
 
 
 # Each family's loader and contract calls, as `module:attribute`.
-_FAMILIES: dict[str, tuple[str, str]] = {
-    "tabicl": (
-        "generalforecast.models.tabicl.checkpoint:load_tabicl",
-        "generalforecast.models.tabicl.model:tabicl_functions",
-    ),
-    "kumo": (
-        "generalforecast.models.kumo.checkpoint:load_kumo",
-        "generalforecast.models.kumo.model:kumo_functions",
-    ),
-    "tabpfn": (
-        "generalforecast.models.tabpfn.checkpoint:load_tabpfn",
-        "generalforecast.models.tabpfn.model:tabpfn_functions",
-    ),
-    "limix": (
-        "generalforecast.models.limix.checkpoint:load_limix",
-        "generalforecast.models.limix.model:limix_functions",
-    ),
-    "mitra": (
-        "generalforecast.models.mitra.checkpoint:load_mitra",
-        "generalforecast.models.mitra.model:mitra_functions",
-    ),
-    "chronos2": (
-        "generalforecast.models.chronos2.checkpoint:load_chronos2",
-        "generalforecast.models.chronos2.model:chronos2_functions",
-    ),
-    "timestral": (
-        "generalforecast.models.timestral.checkpoint:load_timestral",
-        "generalforecast.models.timestral.model:timestral_functions",
-    ),
-    "timesfm3": (
-        "generalforecast.models.timesfm3.checkpoint:load_timesfm",
-        "generalforecast.models.timesfm3.model:timesfm_functions",
-    ),
+# Each built-in family's package under `generalforecast.models`, its checkpoint
+# loader in `checkpoint` and its contract calls in `model`, imported on first use.
+_FAMILIES: dict[str, tuple[str, str, str]] = {
+    "tabicl": ("tabicl", "load_tabicl", "tabicl_functions"),
+    "kumo": ("kumo", "load_kumo", "kumo_functions"),
+    "tabpfn": ("tabpfn", "load_tabpfn", "tabpfn_functions"),
+    "limix": ("limix", "load_limix", "limix_functions"),
+    "mitra": ("mitra", "load_mitra", "mitra_functions"),
+    "chronos2": ("chronos2", "load_chronos2", "chronos2_functions"),
+    "timestral": ("timestral", "load_timestral", "timestral_functions"),
+    "timesfm3": ("timesfm3", "load_timesfm", "timesfm_functions"),
 }
 
 # The pinned revision of each built-in checkpoint, by canonical id.
@@ -193,9 +171,28 @@ REVISIONS: dict[str, str] = {
 }
 
 
-def _attribute(path: str) -> Any:
-    module, name = path.split(":")
-    return getattr(importlib.import_module(module), name)
+def _family(family: str) -> tuple[Any, Any]:
+    """A family's checkpoint loader and contract calls, imported on first use."""
+    package, loader, functions = _FAMILIES[family]
+    base = f"generalforecast.models.{package}"
+    return (
+        getattr(importlib.import_module(f"{base}.checkpoint"), loader),
+        getattr(importlib.import_module(f"{base}.model"), functions),
+    )
+
+
+IMPLEMENTATIONS: dict[str, Callable[[], tuple[Any, Any]]] = {}
+"""The engine's own implementations by id: each loader returns `(functions, parameters)`.
+
+Worker processes serve these next to the catalog's models; a test's small
+models register here. User model specs never reach this registry: `load`
+resolves catalog ids only.
+"""
+
+
+def register(id: str, loader: Callable[[], tuple[Any, Any]]) -> None:
+    """Registers an engine implementation under `id` for `load_engine_model`."""
+    IMPLEMENTATIONS[id] = loader
 
 
 def _checkpoint(id: str) -> Path:
@@ -211,18 +208,18 @@ def _artifacts() -> Any:
 
 def _native(entry: ModelEntry, surface: Surface, allow_downloads: bool) -> Model:
     """A built-in model's contract calls and verified, traced parameters."""
-    loader, functions = _FAMILIES[entry.family]
+    loader, functions = _family(entry.family)
     directory = _artifacts().checkpoint(
         entry, surface=surface, allow_downloads=allow_downloads
     )
-    parameters = _attribute(loader)(directory, **dict(entry.options))
+    parameters = loader(directory, **dict(entry.options))
     if surface != "local":
         import jax
 
         from generalforecast.runtime.device import configure, device_settings
 
         parameters = configure(parameters, device_settings(jax.default_backend()))
-    return _trained(entry, _traced(entry.id, (_attribute(functions), parameters)))
+    return _trained(entry, _traced(entry.id, (functions, parameters)))
 
 
 # Predictor and remote processes share one verified copy of each model, and one
@@ -290,18 +287,16 @@ def load_ref(
     return wrap(functions, parameters, ref)
 
 
-def load_engine_spec(spec: str) -> Model:
-    """Loads what the engine's workers were started with, by its loader string.
+def load_engine_model(spec: str) -> Model:
+    """Loads what the engine's workers were started with.
 
-    The engine is configured with a catalog id per served name, or, for the
-    workers' own built-in and test implementations, a `<module>:<function>`
-    loader naming a function that returns `(functions, parameters)`. Loader
-    strings come from the engine's configuration alone; user model specs go
-    through `load`, which refuses colon-separated code paths.
+    A spec is a catalog id or a registered implementation's id (see
+    `register`).
     """
-    if ":" not in spec:
+    loader = IMPLEMENTATIONS.get(spec)
+    if loader is None:
         return load(spec)
-    functions, parameters = _attribute(spec)()
+    functions, parameters = loader()
     return wrap(functions, parameters, ModelRef(spec, None, None, None))
 
 

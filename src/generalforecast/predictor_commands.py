@@ -277,7 +277,7 @@ class PredictorCommands:
         self, method: str, predictor: str, suffix: str = "", payload: dict | None = None
     ) -> dict:
         """One request on the predictor's hosted routes."""
-        from generalforecast.deployments.contracts import name
+        from generalforecast.service.contracts import name
 
         return self.client._call(
             method,
@@ -780,7 +780,7 @@ class PredictorCommands:
     def push(self) -> dict:
         """Uploads the locked predictor as a revision and points an environment at it."""
         from generalforecast.contracts import Environment, PromoteRequest, Revision
-        from generalforecast.deployments.contracts import ServiceError
+        from generalforecast.service.contracts import ServiceError
 
         args, out = self.args, self.out
         root = self.root
@@ -913,11 +913,11 @@ class PredictorCommands:
     def status(self) -> dict:
         """The predictor's environments."""
         name, _ = self.reference()
-        deployment = self.call("GET", name)
+        predictor = self.call("GET", name)
         environments = self.call("GET", name, "/environments")
         return {
             "name": name,
-            "deployment": deployment,
+            "predictor": predictor,
             "environments": environments.get("environments", environments),
         }
 
@@ -960,7 +960,7 @@ class PredictorCommands:
 
     def _point(self, name: str, env: str, revision: int, verb: str) -> dict:
         from generalforecast.contracts import Environment, PromoteRequest
-        from generalforecast.deployments.contracts import ServiceError
+        from generalforecast.service.contracts import ServiceError
 
         started = time.perf_counter()
         try:
