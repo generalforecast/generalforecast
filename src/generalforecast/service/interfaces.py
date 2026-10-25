@@ -17,12 +17,12 @@ from typing import (
     runtime_checkable,
 )
 
-from generalforecast.deployments.boundary import JsonObject, Scope
+from generalforecast.service.boundary import JsonObject, Scope
 
 if TYPE_CHECKING:
     import pyarrow as pa
 
-    from generalforecast.deployments.predictor_runtime.lock import ExecutionLock
+    from generalforecast.predictors.runtime.lock import ExecutionLock
 
 WriteOperation = Literal[
     "create_features",
@@ -47,7 +47,7 @@ class ObservationInput(TypedDict):
 
 
 class Mutation(TypedDict):
-    """One bounded atomic ordinary request in the dataset write-ID namespace."""
+    """One bounded atomic ordinary request in the context write-ID namespace."""
 
     write_id: str
     operation: WriteOperation
@@ -66,7 +66,7 @@ class AcceptedWrite(TypedDict):
     """Original durable receipt; no serving readiness assertion."""
 
     project: str
-    dataset: str
+    context: str
     write_id: str
     operation: WriteOperation
     sequence: int
@@ -93,7 +93,7 @@ class ContextSnapshot(TypedDict):
     """A transactionally consistent bounded history view with explicit clocks."""
 
     project: str
-    dataset: str
+    context: str
     target: str
     features: list[str]
     through_sequence: int
@@ -154,25 +154,25 @@ class DataPort(Protocol):
     """A: component admission/history, called by C and integration."""
 
     def create(self, scope: Scope, config: JsonObject) -> JsonObject:
-        """Creates a bounded versioned dataset, never overwriting its schema."""
+        """Creates a bounded versioned context, never overwriting its schema."""
         ...
 
     def list(self, scope: Scope) -> list[JsonObject]:
-        """Lists only datasets in this project."""
+        """Lists only contexts in this project."""
         ...
 
-    def get(self, scope: Scope, dataset: str) -> JsonObject:
+    def get(self, scope: Scope, context: str) -> JsonObject:
         """Returns schema, capacities and separate pending/processing counts."""
         ...
 
-    def mutate(self, scope: Scope, dataset: str, mutation: Mutation) -> AcceptedWrite:
+    def mutate(self, scope: Scope, context: str, mutation: Mutation) -> AcceptedWrite:
         """Atomically accepts all components or replays the original receipt."""
         ...
 
     def snapshot(
         self,
         scope: Scope,
-        dataset: str,
+        context: str,
         *,
         target: str,
         knowledge_at: float | None = None,
@@ -184,7 +184,7 @@ class DataPort(Protocol):
     def import_record(
         self,
         scope: Scope,
-        dataset: str,
+        context: str,
         *,
         write_id: str,
         ordinal: int,
@@ -194,7 +194,7 @@ class DataPort(Protocol):
         """Admits one record atomically; skips never renew versions or deadlines."""
         ...
 
-    def expire(self, scope: Scope, dataset: str) -> int:
+    def expire(self, scope: Scope, context: str) -> int:
         """Durably expires due pending labels using the injected acceptance clock."""
         ...
 

@@ -4,7 +4,7 @@
 """The `gf model`, `gf context` and `gf admin` commands, and the connection plumbing.
 
 Model commands read the catalog registry; context commands call the live
-context (dataset) SDK methods; admin nouns bind to the SDK's identity and
+context SDK methods; admin nouns bind to the SDK's identity and
 collection operations or start a node or router on this machine.
 """
 
@@ -28,9 +28,9 @@ from generalforecast.command_specs import (
     IDENTITY_GROUPS,
     OPERATIONS,
 )
-from generalforecast.deployments.boundary import JsonObject
-from generalforecast.deployments.contracts import ServiceError, name
-from generalforecast.deployments.sdk import Snapshot
+from generalforecast.service.boundary import JsonObject
+from generalforecast.service.contracts import ServiceError, name
+from generalforecast.service.sdk import Snapshot
 from generalforecast.tabular import file_format, read_table, table_digest
 from generalforecast.transport import ConnectionSettings, Profile
 
@@ -56,7 +56,7 @@ def read_object(path: str | None) -> dict:
     """Reads one bounded JSON/YAML object without reflecting input on failure."""
     if path is None:
         return {}
-    from generalforecast.deployments.boundary import MAX_BYTES, json_object
+    from generalforecast.service.boundary import MAX_BYTES, json_object
 
     try:
         with Path(path).open("rb") if path != "-" else _Stdin() as stream:

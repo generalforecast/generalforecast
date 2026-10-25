@@ -10,18 +10,18 @@ import pyarrow as pa
 import pytest
 import yaml
 
-from generalforecast.deployments.contracts import ServiceError
-from generalforecast.deployments.interfaces import PreparedExecution
-from generalforecast.deployments.predictor_runtime import PredictorExecutor
-from generalforecast.deployments.predictor_runtime.compile import (
+from generalforecast.engine import ModelOutputError
+from generalforecast.predictors.models import ModelPin
+from generalforecast.predictors.runtime import PredictorExecutor
+from generalforecast.predictors.runtime.compile import (
     compile_dir,
     compile_plan,
     plan_from_dir,
 )
-from generalforecast.deployments.predictor_runtime.lock import ExecutionLock
-from generalforecast.engine import ModelOutputError
-from generalforecast.predictors.models import ModelPin
+from generalforecast.predictors.runtime.lock import ExecutionLock
 from generalforecast.predictors.validation import digest
+from generalforecast.service.contracts import ServiceError
+from generalforecast.service.interfaces import PreparedExecution
 from generalforecast.tabular import arrow_bytes
 from tests.utils.engine import FakeEngine
 
@@ -290,7 +290,7 @@ def test_bad_native_output_and_private_error_are_typed(
     def private(*args):
         raise RuntimeError("credential=must-not-leak")
 
-    monkeypatch.setattr("generalforecast.deployments.predictor_runtime._load", private)
+    monkeypatch.setattr("generalforecast.predictors.runtime._load", private)
     with pytest.raises(ServiceError) as error:
         PredictorExecutor().prepare(locked, data)
     assert error.value.code == "InferenceFailed" and "credential" not in str(

@@ -9,9 +9,6 @@ import hashlib
 from pathlib import Path
 from typing import Any
 
-from generalforecast.deployments.boundary import Scope
-from generalforecast.deployments.catalog import CatalogService, ServingSurface
-from generalforecast.deployments.contracts import ServiceError, require
 from generalforecast.models.artifacts import ArtifactError, checkpoint
 from generalforecast.models.catalog import (
     ModelRef,
@@ -23,6 +20,9 @@ from generalforecast.models.catalog import (
 from generalforecast.models.outputs import DEFAULT_QUANTILES
 from generalforecast.predictors.models import describe
 from generalforecast.predictors.validation import PredictorError, ensure
+from generalforecast.service.boundary import Scope
+from generalforecast.service.catalog import CatalogService, ServingSurface
+from generalforecast.service.contracts import ServiceError, require
 from generalforecast.tabular import arrow_bytes
 
 ORG = "general-forecast"

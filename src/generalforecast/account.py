@@ -16,7 +16,7 @@ from generalforecast.credentials import (
     key_suffix,
     server_url,
 )
-from generalforecast.deployments.contracts import ServiceError
+from generalforecast.service.contracts import ServiceError
 from generalforecast.term import Output
 
 

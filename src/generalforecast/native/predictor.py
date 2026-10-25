@@ -14,10 +14,10 @@ import numpy as np
 import pyarrow as pa
 
 from generalforecast.contracts import PredictionResult
-from generalforecast.deployments.predictor_runtime.plan import ExecutionPlan
-from generalforecast.deployments.predictor_runtime.schema import infer_schema
 from generalforecast.predictors import frequency as _frequency
 from generalforecast.predictors.models import CatalogResolver
+from generalforecast.predictors.runtime.plan import ExecutionPlan
+from generalforecast.predictors.runtime.schema import infer_schema
 from generalforecast.predictors.validation import ensure
 from generalforecast.tabular import arrow_bytes, read_table, to_arrow
 
@@ -41,10 +41,10 @@ def forecast(
     frequency spelling; times of a calendar alias such as `MS` become the
     ordinals of their periods, which the model steps through one at a time.
     """
-    from generalforecast.deployments.catalog import forecast_request
-    from generalforecast.deployments.catalog_forecast import checked
     from generalforecast.models.catalog import parse
     from generalforecast.models.outputs import quantile_index
+    from generalforecast.service.catalog import forecast_request
+    from generalforecast.service.catalog_forecast import checked
 
     calendar = isinstance(frequency, str) and _frequency.is_calendar(frequency)
     if isinstance(frequency, str) and not calendar:

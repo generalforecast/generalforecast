@@ -13,14 +13,14 @@ from typing import cast
 import pyarrow as pa
 import pytest
 
-from generalforecast.deployments.boundary import (
+from generalforecast.predictors.validation import bytes_digest
+from generalforecast.service.boundary import (
     Request,
     Resource,
     ResourceKind,
     Scope,
     success,
 )
-from generalforecast.predictors.validation import bytes_digest
 from generalforecast.tabular import table_digest
 from generalforecast.transport import PLATFORM_PROBE
 

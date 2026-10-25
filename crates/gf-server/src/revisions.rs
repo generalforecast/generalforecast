@@ -21,7 +21,7 @@ use tokio::sync::mpsc;
 
 use crate::http::{ApiError, ServedModel};
 
-/// What a deployment's predict route names.
+/// What a predictor's predict route names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Selector {
     Environment(String),
@@ -59,7 +59,7 @@ pub enum Published {
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
     pub project: String,
-    pub deployment: String,
+    pub predictor: String,
     pub environment: Option<String>,
     pub revision: u64,
     pub ok: bool,
@@ -79,16 +79,16 @@ pub struct Limits {
     pub timeout: Duration,
 }
 
-/// A held predictor: project, deployment, revision and context version.
+/// A held predictor: project, predictor, revision and context version.
 type Key = (String, String, u64, String);
-/// An environment: project, deployment and name.
+/// An environment: project, predictor and name.
 type Environment = (String, String, String);
 
 struct Entry {
     published: std::sync::Arc<Published>,
     bytes: usize,
     used: Instant,
-    /// When a dataset context, whose rows move under the same version, must
+    /// When a live context, whose rows move under the same version, must
     /// be captured again.
     stale: Option<Instant>,
 }
@@ -230,12 +230,12 @@ impl Revisions {
     pub async fn resolve(
         &self,
         project: &str,
-        deployment: &str,
+        predictor: &str,
         environment: &str,
     ) -> Result<Resolved, ApiError> {
         let key = (
             project.to_string(),
-            deployment.to_string(),
+            predictor.to_string(),
             environment.to_string(),
         );
         let now = Instant::now();
@@ -246,7 +246,7 @@ impl Revisions {
         }
         let resolved: Resolved = self
             .get(&format!(
-                "/internal/v1/projects/{project}/predictors/{deployment}/environments/{environment}:revision"
+                "/internal/v1/projects/{project}/predictors/{predictor}/environments/{environment}:revision"
             ))
             .await?;
         let mut held = self.resolved.lock().expect("resolved");
@@ -268,13 +268,13 @@ impl Revisions {
     pub async fn load(
         &self,
         project: &str,
-        deployment: &str,
+        predictor: &str,
         revision: u64,
         version: Option<&Value>,
     ) -> Result<std::sync::Arc<Published>, ApiError> {
         let key = (
             project.to_string(),
-            deployment.to_string(),
+            predictor.to_string(),
             revision,
             version.map(Value::to_string).unwrap_or_default(),
         );
@@ -288,15 +288,15 @@ impl Revisions {
         }
         let (published, bytes): (Published, usize) = self
             .fetch(&format!(
-                "/internal/v1/projects/{project}/predictors/{deployment}/revisions/{revision}:lock"
+                "/internal/v1/projects/{project}/predictors/{predictor}/revisions/{revision}:lock"
             ))
             .await?;
         self.loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let now = Instant::now();
-        let dataset = matches!(
+        let live = matches!(
             &published,
-            Published::Native { context: Some(context), .. } if context["source"] == "dataset"
+            Published::Native { context: Some(context), .. } if context["source"] == "live"
         );
         let published = std::sync::Arc::new(published);
         self.cache.lock().expect("revision cache").insert(
@@ -305,7 +305,7 @@ impl Revisions {
                 published: published.clone(),
                 bytes,
                 used: now,
-                stale: dataset.then(|| now + self.limits.resolve),
+                stale: live.then(|| now + self.limits.resolve),
             },
             &self.limits,
             now,

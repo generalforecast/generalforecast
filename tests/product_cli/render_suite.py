@@ -493,13 +493,12 @@ class FakePredictor:
 
 
 class FakeClient:
-    """The hosted service's deployment, context and identity routes."""
+    """The hosted service's predictor, context and identity routes."""
 
     def __init__(self, fixtures: Path) -> None:
         self.fixtures = fixtures
         self.generation = 3
         self.next_revision = 8
-        self.datasets = self
         self.contexts = self
         self.identity = self
         self.project = "churn-lab"
@@ -597,13 +596,13 @@ class FakeClient:
             }
         )
 
-    def append(self, dataset: str, data: Any, *, id: str, idempotency_key: str) -> dict:
-        return {"name": dataset, "accepted": data.num_rows, "write_id": idempotency_key}
+    def append(self, context: str, data: Any, *, id: str, idempotency_key: str) -> dict:
+        return {"name": context, "accepted": data.num_rows, "write_id": idempotency_key}
 
     def label(
-        self, dataset: str, data: Any, *, id: str, column: str, idempotency_key: str
+        self, context: str, data: Any, *, id: str, column: str, idempotency_key: str
     ) -> dict:
-        return {"name": dataset, "accepted": data.num_rows, "write_id": idempotency_key}
+        return {"name": context, "accepted": data.num_rows, "write_id": idempotency_key}
 
     def create(self, config: dict) -> Any:
         return _Wire(config)

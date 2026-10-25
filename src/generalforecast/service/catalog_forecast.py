@@ -11,11 +11,11 @@ from collections.abc import Sequence
 from typing import Literal
 
 from generalforecast._core import ForecastRequest
-from generalforecast.deployments.boundary import JsonObject
-from generalforecast.deployments.catalog_artifacts import artifact
-from generalforecast.deployments.contracts import ServiceError
 from generalforecast.engine import Forecasts
 from generalforecast.models.catalog import ModelEntry, ModelRef, ModelRefError
+from generalforecast.service.boundary import JsonObject
+from generalforecast.service.catalog_artifacts import artifact
+from generalforecast.service.contracts import ServiceError
 
 Surface = Literal["local", "remote", "self-hosted"]
 

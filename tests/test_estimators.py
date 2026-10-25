@@ -29,7 +29,7 @@ def _data(rows: int = 32) -> tuple[np.ndarray, np.ndarray]:
 
 def test_classifiers_learn_their_classes_from_the_labels() -> None:
     features, labels = _data()
-    model = "tests.models.tabicl.tiny:classifier"
+    model = "tests/tabicl-classifier"
 
     estimator = generalforecast.Classifier(model).fit(features, labels)
     probabilities = estimator.predict_proba(features[:4])
@@ -115,7 +115,7 @@ def test_frames_keep_their_string_and_datetime_columns() -> None:
     frame = pa.table(
         {"store": stores, "day": days, **{f"x{i}": features[:, i] for i in range(3)}}
     )
-    model = "tests.models.tabicl.tiny:classifier"
+    model = "tests/tabicl-classifier"
 
     estimator = generalforecast.Classifier(model).fit(frame, labels)
     probabilities = estimator.predict_proba(frame.slice(0, 4))

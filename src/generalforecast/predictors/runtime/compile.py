@@ -9,15 +9,15 @@ from typing import Any
 
 import pyarrow as pa
 
-from generalforecast.deployments.predictor_runtime.capabilities import admit
-from generalforecast.deployments.predictor_runtime.lock import ExecutionLock
-from generalforecast.deployments.predictor_runtime.plan import ExecutionPlan, parse_plan
-from generalforecast.deployments.predictor_runtime.schema import (
+from generalforecast.predictors.files import MAX_DATA_BYTES, parse_yaml, read
+from generalforecast.predictors.models import CatalogResolver, ModelPin, ModelResolver
+from generalforecast.predictors.runtime.capabilities import admit
+from generalforecast.predictors.runtime.lock import ExecutionLock
+from generalforecast.predictors.runtime.plan import ExecutionPlan, parse_plan
+from generalforecast.predictors.runtime.schema import (
     infer_schema,
     select_context,
 )
-from generalforecast.predictors.files import MAX_DATA_BYTES, parse_yaml, read
-from generalforecast.predictors.models import CatalogResolver, ModelPin, ModelResolver
 from generalforecast.predictors.validation import digest, ensure
 from generalforecast.tabular import (
     file_format,

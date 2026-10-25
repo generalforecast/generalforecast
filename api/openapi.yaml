@@ -1610,6 +1610,14 @@ components:
       properties:
         code: {$ref: "#/components/schemas/ErrorCode"}
         message: {type: string}
+        reason:
+          type: string
+          pattern: "^[a-z][a-z0-9_]{0,63}$"
+          description: |
+            The finer reason behind `code`, when the service has one. A
+            refused browser session says why with `reauthentication_required`,
+            `link_confirmation_required`, `session_required` or
+            `waitlist_required`.
         param: {type: string}
         hint: {type: string}
         limit: {type: integer}
