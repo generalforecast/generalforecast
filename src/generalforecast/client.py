@@ -18,7 +18,7 @@ from generalforecast.contracts import (
     Revision,
     parse_lock,
 )
-from generalforecast.deployments.boundary import (
+from generalforecast.service.boundary import (
     JsonObject,
     Request,
     Resource,
@@ -26,14 +26,14 @@ from generalforecast.deployments.boundary import (
     Scope,
     json_object,
 )
-from generalforecast.deployments.contracts import ServiceError, name, number, require
-from generalforecast.deployments.interfaces import (
+from generalforecast.service.contracts import ServiceError, name, number, require
+from generalforecast.service.interfaces import (
     AcceptedWrite,
     ContextSnapshot,
     Mutation,
     SourcePin,
 )
-from generalforecast.deployments.sdk import (
+from generalforecast.service.sdk import (
     ContextSpec,
     HostedPredictor,
     ImportReceipt,

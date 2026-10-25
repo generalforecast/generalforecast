@@ -111,7 +111,7 @@ def tiny_chronos2(seed: int = 0) -> Chronos2:
 
 
 def forecaster() -> tuple[Any, Chronos2]:
-    """A tiny Chronos-2 as a model spec target: `tests.models.chronos2.tiny:forecaster`."""
+    """A tiny Chronos-2 registered for the engine as `tests/chronos2-forecaster`."""
     from generalforecast.models.chronos2.model import chronos2_functions
 
     return chronos2_functions, tiny_chronos2()
@@ -120,7 +120,7 @@ def forecaster() -> tuple[Any, Chronos2]:
 def catalog_forecaster() -> tuple[Any, Chronos2]:
     """A tiny Chronos-2 shaped as the catalog's: its patch and quantile levels.
 
-    The model spec target `tests.models.chronos2.tiny:catalog_forecaster`
+    The model spec target `tests/chronos2-catalog-forecaster`
     stands in for `chronos-2`, whose published capabilities it matches.
     """
     from generalforecast.models import catalog

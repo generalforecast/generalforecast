@@ -101,7 +101,7 @@ def test_columns_with_more_categories_than_kept_are_flagged_once(
     client = local()
     crowded = client.create_table(
         "crowded",
-        model="tests.models.kumo.tiny:classifier",
+        model="tests/kumo-classifier",
         columns={"code": "categorical", "x": "numeric"},
         classes=2,
         summary=summary,

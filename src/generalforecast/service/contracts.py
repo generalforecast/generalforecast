@@ -1,19 +1,14 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The alpha deployment contract, independent of runtime provisioning."""
+"""The alpha predictor contract, independent of runtime provisioning."""
 
 import math
 import re
 import threading
 import time
-from dataclasses import asdict, dataclass
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any, Required, TypedDict
-
-import yaml
-
-from generalforecast.models.catalog import V1_POLICY
 
 VERSION = "gf/v1"
 MODEL = "general-forecast/tabicl-v2-classifier"
@@ -25,22 +20,36 @@ class ServiceError(Exception):
     """A public error with no prediction or private runtime details."""
 
     def __init__(self, code: str, message: str, status: int = 400) -> None:
-        """Constructs the safe public error envelope."""
+        """Constructs the safe public error envelope.
+
+        A code outside the OpenAPI enum folds into it on the wire and leaves
+        its own name as the `reason`, in snake case; an enum code has none.
+        """
         super().__init__(message)
         self.code, self.message, self.status = code, message, status
+        self.reason = None if code in WIRE_ERROR_CODES else reason_of(code)
 
     @property
     def public(self) -> str:
         """The wire code, one of the OpenAPI `ErrorCode` enum."""
         return public_code(self.code, self.status)
 
-    def body(self) -> dict[str, Any]:
-        """The console session routes' error envelope, with the typed code."""
-        return {"error": {"code": self.code, "message": self.message}}
+    def details(self) -> dict[str, Any]:
+        """Extra safe fields of the error object, none by default."""
+        return {}
+
+    def error(self) -> dict[str, Any]:
+        """The wire error object: the OpenAPI code, message and safe details."""
+        error: dict[str, Any] = {"code": self.public, "message": self.message}
+        if self.reason is not None:
+            error["reason"] = self.reason
+        return error | self.details()
 
     def public_body(self) -> dict[str, Any]:
         """The API's bare error envelope, with the OpenAPI code."""
-        return {"error": {"code": self.public, "message": self.message}}
+        return {"error": self.error()}
+
+    body = public_body
 
 
 WIRE_ERROR_CODES = frozenset(
@@ -56,6 +65,23 @@ WIRE_ERROR_CODES = frozenset(
 )
 """The OpenAPI `ErrorCode` enum: the only codes a GF service puts on the wire."""
 
+
+def reason_of(code: str) -> str:
+    """A service code's wire `reason`: its name in snake case."""
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", "_", code).lower()
+
+
+SESSION_REASONS = {
+    code: reason_of(code)
+    for code in (
+        "ReauthenticationRequired",
+        "LinkConfirmationRequired",
+        "SessionRequired",
+        "WaitlistRequired",
+    )
+}
+"""Browser-session refusals: `Unauthorized` on the wire, with these reasons."""
+
 _PUBLIC_BY_CODE = {
     **dict.fromkeys(
         (
@@ -66,6 +92,8 @@ _PUBLIC_BY_CODE = {
             "NotLoggedIn",
             "SessionRequired",
             "ReauthenticationRequired",
+            "LinkConfirmationRequired",
+            "WaitlistRequired",
             "CredentialInactive",
             "AuthorizationPending",
         ),
@@ -77,7 +105,6 @@ _PUBLIC_BY_CODE = {
             "WriteConflict",
             "StaleComponent",
             "OperationSuperseded",
-            "LinkConfirmationRequired",
         ),
         "Conflict",
     ),
@@ -194,105 +221,6 @@ class ModelPin:
         return cls(**value)
 
 
-@dataclass(frozen=True)
-class PredictionSpec:
-    """Portable native prediction definition, not a managed resource."""
-
-    api_version: str
-    dataset: str
-    model: ModelPin
-    target: str
-    context: str
-    max_update_lag_seconds: float
-
-    @classmethod
-    def parse(cls, value: Any) -> "PredictionSpec":
-        """Validates the spec without contacting a service or loading weights."""
-        fields(value, set(cls.__dataclass_fields__))
-        require(value["api_version"] == VERSION, "unsupported prediction api_version")
-        name(value["dataset"])
-        name(value["target"])
-        require(value["context"] == "exact", "only exact labeled context is supported")
-        number(value["max_update_lag_seconds"], 0, 86400, "max_update_lag_seconds")
-        return cls(
-            **(
-                value
-                | {
-                    "model": ModelPin.parse(value["model"]),
-                    "max_update_lag_seconds": float(value["max_update_lag_seconds"]),
-                }
-            )
-        )
-
-
-@dataclass(frozen=True)
-class DeploymentConfig:
-    """A versioned desired deployment configuration."""
-
-    api_version: str
-    kind: str
-    name: str
-    prediction: PredictionSpec
-
-    @classmethod
-    def parse(cls, value: Any) -> "DeploymentConfig":
-        """Rejects unknown fields and unsupported versions locally."""
-        fields(value, set(cls.__dataclass_fields__))
-        require(value["api_version"] == VERSION, "unsupported deployment api_version")
-        require(value["kind"] == "deployment", "kind must be deployment")
-        name(value["name"])
-        return cls(
-            **(value | {"prediction": PredictionSpec.parse(value["prediction"])})
-        )
-
-    def to_dict(self) -> dict[str, Any]:
-        """Serializes the same contract all clients submit."""
-        return asdict(self)
-
-    @classmethod
-    def load(cls, path: str | Path) -> "DeploymentConfig":
-        """Reads a YAML or JSON deployment file."""
-        return cls.parse(yaml.safe_load(Path(path).read_text()))
-
-
-@dataclass(frozen=True)
-class DatasetConfig:
-    """Provisional fixture bootstrap only, not the future data API."""
-
-    api_version: str
-    kind: str
-    name: str
-    features: list[str]
-    target: str
-    max_rows: int
-    max_writes: int
-
-    @classmethod
-    def parse(cls, value: Any) -> "DatasetConfig":
-        """Checks the bounded numeric/boolean bootstrap capability."""
-        fields(value, set(cls.__dataclass_fields__))
-        require(value["api_version"] == VERSION, "unsupported dataset api_version")
-        require(value["kind"] == "bootstrap-dataset", "kind must be bootstrap-dataset")
-        name(value["name"])
-        name(value["target"])
-        features = value["features"]
-        require(
-            isinstance(features, list) and 0 < len(features) <= 32,
-            "expected 1..32 features",
-        )
-        for feature in features:
-            name(feature)
-        require(len(set(features)) == len(features), "duplicate features")
-        require(value["target"] not in features, "target cannot be a feature")
-        for field, high in (
-            ("max_rows", V1_POLICY.context_rows),
-            ("max_writes", 10000),
-        ):
-            require(type(value[field]) is int, f"{field} must be an integer")
-            number(value[field], 1, high, field)
-        return cls(**value)
-
-
 class Row(TypedDict, total=False):
     """Immutable feature observation; omitted label is unknown."""
 
@@ -311,15 +239,6 @@ class Label(TypedDict, total=False):
     label_available_at: str
 
 
-class Receipt(TypedDict):
-    """Durable acceptance, explicitly not serving visibility."""
-
-    write_id: str
-    sequence: int
-    accepted_at: float
-    durably_accepted: bool
-
-
 class Freshness(TypedDict):
     """Accepted-update progress, separate from source/context age."""
 
@@ -333,31 +252,14 @@ class Freshness(TypedDict):
     max_label_delay_seconds: float | None
 
 
-class DeploymentStatus(TypedDict):
-    """Desired/effective revisions and current process readiness."""
-
-    name: str
-    desired_revision: int
-    effective_revision: int | None
-    desired_config: dict[str, Any]
-    effective_config: dict[str, Any] | None
-    phase: str
-    ready: bool
-    runtime_ready: bool
-    labeled_rows: int
-    last_error: dict[str, str] | None
-    freshness: Freshness
-    capabilities: dict[str, Any]
-
-
 class Score(TypedDict):
     """A score and provenance, never a business action."""
 
     id: str
     probabilities: dict[str, float]
-    deployment_revision: int
+    predictor_revision: int
     model: dict[str, str]
-    dataset: str
+    context: str
     serving_sequence: int
     freshness: Freshness
 

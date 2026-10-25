@@ -15,6 +15,10 @@ from generalforecast.runtime.device import use_compile_cache
 # float16 rounding would blur on GPUs: run models in float32, with float32
 # matrix multiplies, everywhere, including in servers the tests start.
 os.environ.setdefault("GF_PRECISION", "exact")
+os.environ.setdefault("GF_WORKER_MODULES", "tests.models.implementations")
+
+import tests.models.implementations  # noqa: F401 - registers the suite's small models
+
 jax.config.update("jax_default_matmul_precision", "highest")
 # Compiled programs stay on disk, as workers keep them, so a second run skips
 # most compiles.

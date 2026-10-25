@@ -14,8 +14,8 @@ import generalforecast as gf
 from generalforecast.async_client import AsyncClient, AsyncHostedPredictor
 from generalforecast.client import Client
 from generalforecast.contracts import Environment, PredictionResult
-from generalforecast.deployments.contracts import ServiceError
-from generalforecast.deployments.sdk import HostedPredictor
+from generalforecast.service.contracts import ServiceError
+from generalforecast.service.sdk import HostedPredictor
 from generalforecast.transport import (
     AsyncTransport,
     RelayedError,

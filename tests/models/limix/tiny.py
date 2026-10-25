@@ -226,14 +226,14 @@ def tiny_limix(*, regression: bool, seed: int = 0) -> LimiX:
 
 
 def classifier() -> tuple[Any, LimiX]:
-    """A tiny classifier as a model spec target: `tests.models.limix.tiny:classifier`."""
+    """A tiny classifier registered for the engine as `tests/limix-classifier`."""
     from generalforecast.models.limix.model import limix_functions
 
     return limix_functions, tiny_limix(regression=False)
 
 
 def regressor() -> tuple[Any, LimiX]:
-    """A tiny regressor as a model spec target: `tests.models.limix.tiny:regressor`."""
+    """A tiny regressor registered for the engine as `tests/limix-regressor`."""
     from generalforecast.models.limix.model import limix_functions
 
     return limix_functions, tiny_limix(regression=True)

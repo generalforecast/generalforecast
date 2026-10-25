@@ -8,10 +8,10 @@ from typing import Any, Literal
 
 import yaml
 
-from generalforecast.deployments.predictor_runtime.plan import ExecutionPlan
-from generalforecast.deployments.predictor_runtime.schema import TableSchema
 from generalforecast.predictors.files import atomic_write, parse_yaml, read
 from generalforecast.predictors.models import CatalogResolver, ModelPin, ModelResolver
+from generalforecast.predictors.runtime.plan import ExecutionPlan
+from generalforecast.predictors.runtime.schema import TableSchema
 from generalforecast.predictors.validation import (
     digest,
     ensure,
@@ -82,7 +82,7 @@ class ExecutionLock:
         self, resolver: ModelResolver | None = None, *, offline: bool = True
     ) -> ModelPin:
         """Verifies the model, then the shared capability and policy admission."""
-        from generalforecast.deployments.predictor_runtime.capabilities import admit
+        from generalforecast.predictors.runtime.capabilities import admit
 
         trusted = self.verify_model(resolver, offline=offline)
         admit(self.spec, self.model, self.task, self.outputs)

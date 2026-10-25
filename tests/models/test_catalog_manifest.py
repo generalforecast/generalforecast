@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 
 from generalforecast import _core
-from generalforecast.deployments.boundary import json_bytes
 from generalforecast.models import catalog
+from generalforecast.service.boundary import json_bytes
 
 MANIFEST = Path(__file__).resolve().parents[2] / "crates" / "gf-core" / "catalog.json"
 DIGEST = catalog.ENTRIES["general-forecast/tabicl-v2-classifier"].artifact.digest

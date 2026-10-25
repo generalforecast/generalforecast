@@ -6,9 +6,9 @@
 from dataclasses import asdict
 from pathlib import Path
 
-from generalforecast.deployments.boundary import Artifact, JsonObject
-from generalforecast.deployments.contracts import ServiceError
 from generalforecast.serialization import content_digest
+from generalforecast.service.boundary import Artifact, JsonObject
+from generalforecast.service.contracts import ServiceError
 
 
 def artifact(

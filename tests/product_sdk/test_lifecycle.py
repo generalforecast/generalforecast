@@ -22,9 +22,9 @@ from generalforecast.contracts import (
     PromoteRequest,
     Revision,
 )
-from generalforecast.deployments.contracts import ServiceError
-from generalforecast.deployments.sdk import ContextSpec
 from generalforecast.predictors.lock import read_lock
+from generalforecast.service.contracts import ServiceError
+from generalforecast.service.sdk import ContextSpec
 from generalforecast.tabular import table_digest
 
 
@@ -172,21 +172,21 @@ def test_push_cas_readiness_and_rollback(wire, tmp_path, asynchronous):
                 value for path, value in wire.requests if path.endswith("/snapshots")
             )
             assert uploaded.num_rows == 3 and table_digest(uploaded) == lock.data_digest
-            deployment = await invoke(client.predictors.get, "risk", env="production")
-            assert deployment.revision == 1 and deployment.status == "ready"
+            predictor = await invoke(client.predictors.get, "risk", env="production")
+            assert predictor.revision == 1 and predictor.status == "ready"
             with pytest.raises(dataclasses.FrozenInstanceError):
-                deployment.name = "changed"
+                predictor.name = "changed"
             assert await invoke(client.predictors.revisions, "risk") == (revision,)
             assert (await invoke(client.predictors.revision, "risk", 1)).lock == lock
             assert await invoke(client.predictors.environments, "risk") == (ready,)
-            assert (await invoke(deployment.metrics))["requests"] == 0
-            assert (await invoke(deployment.logs))["logs"] == []
+            assert (await invoke(predictor.metrics))["requests"] == 0
+            assert (await invoke(predictor.logs))["logs"] == []
             with pytest.raises(ServiceError) as error:
-                await invoke(deployment.rollback, revision=1)
+                await invoke(predictor.rollback, revision=1)
             assert error.value.code == "Conflict" and "fixture-key" not in str(
                 error.value
             )
-            assert (await invoke(deployment.delete))["status"] == "stopped"
+            assert (await invoke(predictor.delete))["status"] == "stopped"
         finally:
             await invoke(
                 client.aclose if isinstance(client, AsyncClient) else client.close
@@ -289,10 +289,10 @@ def test_predictions_and_context_transactions(wire, asynchronous):
             assert (
                 await invoke(client.predictors.predict, "risk", {"x": [3]})
             ).revision == 1
-            dataset = await invoke(client.contexts.create, schema)
-            assert dataset.sequence == 0
+            live = await invoke(client.contexts.create, schema)
+            assert live.sequence == 0
             receipt = await invoke(
-                dataset.append,
+                live.append,
                 [{"id": "row1", "x": 2}],
                 id="id",
                 idempotency_key="append-1",
@@ -300,20 +300,18 @@ def test_predictions_and_context_transactions(wire, asynchronous):
             assert receipt.sequence == 1 and receipt.write_id == "append-1"
             assert (
                 await invoke(
-                    dataset.label,
+                    live.label,
                     [{"id": "row1", "y": 1}],
                     id="id",
                     column="y",
                     idempotency_key="label-1",
                 )
             ).sequence == 2
-            assert (await invoke(dataset.import_source, reference)).digest.startswith(
+            assert (await invoke(live.import_source, reference)).digest.startswith(
                 "sha256:"
             )
-            assert (
-                await invoke(dataset.refresh)
-            ).sequence == 3 and dataset.sequence == 0
-            assert (await invoke(dataset.status)).sequence == 3
+            assert (await invoke(live.refresh)).sequence == 3 and live.sequence == 0
+            assert (await invoke(live.status)).sequence == 3
         finally:
             await invoke(
                 client.aclose if isinstance(client, AsyncClient) else client.close

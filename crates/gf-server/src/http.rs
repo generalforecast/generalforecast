@@ -714,7 +714,7 @@ impl Front {
     }
 
     /// Answers only requests whose `Host` is one of `hosts` exactly, and
-    /// none from a browser, as a deployment behind one endpoint does.
+    /// none from a browser, as a predictor behind one endpoint does.
     #[must_use]
     pub fn with_hosts(mut self, hosts: Vec<String>) -> Self {
         self.hosts = hosts;
@@ -2458,7 +2458,7 @@ async fn revision_predict(
     .await;
     revisions.record(Record {
         project: project.to_string(),
-        deployment: predictor.to_string(),
+        predictor: predictor.to_string(),
         environment: Some(environment.to_string()),
         revision,
         ok: scored.is_ok(),
