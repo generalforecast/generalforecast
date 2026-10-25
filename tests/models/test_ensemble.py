@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from generalforecast.models import registry
+from generalforecast.models import catalog
 from generalforecast.models.contract import TabularFunctions
 from generalforecast.models.ensemble import Ensemble, ensemble_functions
 from generalforecast.models.tabicl.model import class_probabilities, tabicl_functions
@@ -113,10 +113,10 @@ def test_ensembles_report_the_width_of_their_predictions() -> None:
     assert np.isfinite(np.asarray(predictions)).all()
 
 
-def test_specs_ending_in_a_count_load_ensembles() -> None:
-    _, model = registry.load("tests.models.tabicl.tiny:classifier*3")
+def test_specs_ending_in_a_count_name_ensembles() -> None:
+    model = "general-forecast/tabicl-v2-classifier"
 
-    assert isinstance(model, Ensemble) and model.estimators == 3
+    assert catalog.parse(f"{model}*3").estimators == 3
     for spec in ("*0", "*2*2", "*2@4"):
         with pytest.raises(ValueError, match="spec"):
-            registry.load(f"tests.models.tabicl.tiny:classifier{spec}")
+            catalog.parse(f"{model}{spec}")

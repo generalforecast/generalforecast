@@ -14,9 +14,7 @@ from generalforecast import Forecaster
 from generalforecast.engine import LocalEngine
 from generalforecast.errors import InvalidInput
 
-CATALOG = {
-    "general-forecast/chronos-2": "tests.models.chronos2.tiny:catalog_forecaster"
-}
+CATALOG = {"general-forecast/chronos-2": "tests/chronos2-catalog-forecaster"}
 
 
 @pytest.fixture(scope="module")

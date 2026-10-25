@@ -48,6 +48,7 @@ export type ErrorCode = (typeof ERROR_CODES)[number];
 export interface ApiError {
   code: ErrorCode;
   message: string;
+  reason?: string;
   param?: string;
   hint?: string;
   limit?: number;

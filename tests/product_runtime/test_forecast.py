@@ -9,10 +9,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from generalforecast.deployments.contracts import ServiceError
-from generalforecast.deployments.predictor_runtime import PredictorExecutor
 from generalforecast.engine import Forecasts
 from generalforecast.models.catalog import CHRONOS2_QUANTILES
+from generalforecast.predictors.runtime import PredictorExecutor
+from generalforecast.service.contracts import ServiceError
 from tests.product_runtime.test_executor import checked
 from tests.utils.engine import FakeEngine
 

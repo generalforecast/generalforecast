@@ -222,14 +222,14 @@ def tiny_tabpfn(*, regression: bool, seed: int = 0, release: str = "3") -> TabPF
 
 
 def classifier() -> tuple[Any, TabPFN]:
-    """A tiny classifier as a model spec target: `tests.models.tabpfn.tiny:classifier`."""
+    """A tiny classifier registered for the engine as `tests/tabpfn-classifier`."""
     from generalforecast.models.tabpfn.model import tabpfn_functions
 
     return tabpfn_functions, tiny_tabpfn(regression=False)
 
 
 def regressor() -> tuple[Any, TabPFN]:
-    """A tiny regressor as a model spec target: `tests.models.tabpfn.tiny:regressor`."""
+    """A tiny regressor registered for the engine as `tests/tabpfn-regressor`."""
     from generalforecast.models.tabpfn.model import tabpfn_functions
 
     return tabpfn_functions, tiny_tabpfn(regression=True)

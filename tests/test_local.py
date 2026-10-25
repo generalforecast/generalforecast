@@ -40,10 +40,10 @@ from tests.utils.predict import predict
 PAGE = 8
 NEAR_A = np.zeros((2, 5), dtype=np.float32)
 NEAR_B = np.full((2, 5), 10.0, dtype=np.float32)
-TABICL = "tests.models.tabicl.tiny:classifier"
-TABICL_REGRESSOR = "tests.models.tabicl.tiny:regressor"
-KUMO = "tests.models.kumo.tiny:classifier"
-LIMIX = "tests.models.limix.tiny:classifier"
+TABICL = "tests/tabicl-classifier"
+TABICL_REGRESSOR = "tests/tabicl-regressor"
+KUMO = "tests/kumo-classifier"
+LIMIX = "tests/limix-classifier"
 
 
 def _clusters(rows: int = 32) -> tuple[np.ndarray, np.ndarray]:
@@ -1865,7 +1865,7 @@ def test_tables_naming_a_model_share_its_weights(monkeypatch) -> None:
 
     for name in ("first", "second"):
         client.create_table(
-            name, model="tests.models.tabicl.tiny:classifier", features=5, classes=3
+            name, model="tests/tabicl-classifier", features=5, classes=3
         )
 
     assert len(loads) == 1
@@ -2087,7 +2087,7 @@ def test_series_tables_forecast_as_the_model_does_on_the_group() -> None:
     client = generalforecast.local()
     sales = client.create_series_table(
         "sales",
-        model="tests.models.timestral.tiny:forecaster",
+        model="tests/timestral-forecaster",
         series="item",
         time="t",
         target="units",
@@ -2153,7 +2153,7 @@ def test_native_series_forecast_continues_past_one_output_patch() -> None:
     client = generalforecast.local()
     series = client.create_series_table(
         "multi-pass",
-        model="tests.models.timesfm3.tiny:forecaster",
+        model="tests/timesfm3-forecaster",
         series="item",
         time="t",
         target="units",
@@ -2183,7 +2183,7 @@ def test_native_series_forecast_continues_past_one_output_patch() -> None:
 
 def test_series_tables_forecast_the_groups_given_them() -> None:
 
-    model = "tests.models.timestral.tiny:forecaster"
+    model = "tests/timestral-forecaster"
     client = generalforecast.local()
 
     def table(name: str, group: generalforecast.GroupStrategy, items: list[str]) -> Any:
@@ -2247,7 +2247,7 @@ def test_series_tables_refuse_groups_past_the_models_rows() -> None:
     client = generalforecast.local()
     client.create_series_table(
         "fits",
-        model="tests.models.timesfm3.tiny:forecaster",
+        model="tests/timesfm3-forecaster",
         series="item",
         time="t",
         target="units",
@@ -2261,7 +2261,7 @@ def test_series_tables_refuse_groups_past_the_models_rows() -> None:
     wide = {f"c{index}": "numeric" for index in range(16)}
     client.create_series_table(
         "alone",
-        model="tests.models.timesfm3.tiny:forecaster",
+        model="tests/timesfm3-forecaster",
         series="item",
         time="t",
         target="units",
@@ -2271,7 +2271,7 @@ def test_series_tables_refuse_groups_past_the_models_rows() -> None:
     with pytest.raises(ValueError, match="per group"):
         client.create_series_table(
             "pair",
-            model="tests.models.timesfm3.tiny:forecaster",
+            model="tests/timesfm3-forecaster",
             series="item",
             time="t",
             target="units",
@@ -2282,7 +2282,7 @@ def test_series_tables_refuse_groups_past_the_models_rows() -> None:
     with pytest.raises(ValueError, match="past what the model serves per group"):
         client.create_series_table(
             "wide",
-            model="tests.models.timesfm3.tiny:forecaster",
+            model="tests/timesfm3-forecaster",
             series="item",
             time="t",
             target="units",
@@ -2295,7 +2295,7 @@ def test_series_tables_refuse_groups_past_the_models_rows() -> None:
 
 def test_series_tables_refuse_what_they_cannot_hold() -> None:
 
-    forecaster: Any = "tests.models.timestral.tiny:forecaster"
+    forecaster: Any = "tests/timestral-forecaster"
     tabular: Any = TABICL_REGRESSOR
     client = generalforecast.local()
     with pytest.raises(ValueError, match="is a forecaster"):

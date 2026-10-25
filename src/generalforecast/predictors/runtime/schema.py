@@ -12,11 +12,11 @@ import pyarrow as pa
 import pyarrow.compute as _compute
 
 from generalforecast.columns import DATETIME_PARTS
-from generalforecast.deployments.predictor_runtime.plan import (
-    ExecutionPlan,
-)
 from generalforecast.predictors import frequency as _frequency_module
 from generalforecast.predictors.models import ModelPin
+from generalforecast.predictors.runtime.plan import (
+    ExecutionPlan,
+)
 from generalforecast.predictors.validation import ensure, fields, text
 from generalforecast.tabular import PHYSICAL_TYPES, physical_type, to_arrow
 

@@ -198,7 +198,7 @@ pub struct HttpConfig {
     /// Peers, as address ranges, whose `X-Forwarded-*` headers are kept.
     #[serde(default)]
     pub trusted_proxies: Vec<String>,
-    /// The exact `Host` names requests must carry, as a deployment behind
+    /// The exact `Host` names requests must carry, as a service behind
     /// one endpoint answers only for it; requests from browsers, which send
     /// `Origin`, are then refused. Empty takes any host.
     #[serde(default)]

@@ -12,7 +12,6 @@ from urllib.parse import urlsplit
 
 import pyarrow as pa
 
-from generalforecast.deployments.boundary import Scope
 from generalforecast.predictors.validation import (
     PredictorError,
     digest,
@@ -23,6 +22,7 @@ from generalforecast.predictors.validation import (
     name,
     text,
 )
+from generalforecast.service.boundary import Scope
 
 API_PREFIX = "/v1"
 STATES = frozenset({"pending", "building", "ready", "failed", "stopped"})
@@ -326,7 +326,7 @@ class ContextVersion(WireValue):
     as_of: float | None = None
 
     def __post_init__(self):
-        """Checks version metadata without fetching a live dataset."""
+        """Checks version metadata without fetching a live context."""
         text(self.source)
         if self.version is not None:
             ensure(type(self.version) in (int, str), "invalid context version")
@@ -389,7 +389,7 @@ class ContextImportRef(WireValue):
                 "azure",
                 "snowflake",
                 "bigquery",
-                "dataset",
+                "context",
                 "upload",
             ),
             "import sources must be cloud or uploaded logical references",

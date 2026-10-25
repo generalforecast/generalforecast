@@ -17,7 +17,7 @@ from generalforecast.models.catalog import parse
 from tests.utils.engine import tabular_request
 
 REF = parse("general-forecast/tabicl-v2-classifier")
-TINY = {"general-forecast/tabicl-v2-classifier": "tests.models.tabicl.tiny:classifier"}
+TINY = {"general-forecast/tabicl-v2-classifier": "tests/tabicl-classifier"}
 CALLERS = 8
 
 
@@ -97,9 +97,9 @@ def test_a_bound_context_answers_as_its_request_does(engine):
 
 
 def test_a_refused_model_never_reaches_the_workers(engine):
-    with pytest.raises(ValueError, match="is not a catalog model id"):
+    with pytest.raises(ValueError, match="unknown model"):
         engine.gated("remote", False).tabular(
-            parse("tests.models.tabicl.tiny:classifier"), _request(0)
+            parse("tests/tabicl-classifier"), _request(0)
         )
 
 

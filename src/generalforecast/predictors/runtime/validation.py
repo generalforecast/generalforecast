@@ -5,14 +5,14 @@
 
 import pyarrow as pa
 
-from generalforecast.deployments.predictor_runtime.compile import validate_queries
-from generalforecast.deployments.predictor_runtime.lock import ExecutionLock
-from generalforecast.deployments.predictor_runtime.schema import (
+from generalforecast.predictors.models import CatalogResolver
+from generalforecast.predictors.runtime.compile import validate_queries
+from generalforecast.predictors.runtime.lock import ExecutionLock
+from generalforecast.predictors.runtime.schema import (
     TableSchema,
     infer_schema,
     select_context,
 )
-from generalforecast.predictors.models import CatalogResolver
 from generalforecast.predictors.validation import ensure
 from generalforecast.tabular import arrow_bytes, physical_type, table_digest, to_arrow
 

@@ -971,7 +971,7 @@ class LocalClient:
         if not isinstance(model, str):
             return model
         if model not in self._loaded:
-            self._loaded[model] = registry.load(model)
+            self._loaded[model] = registry.load_engine_model(model)
         return self._loaded[model]
 
     def _model_id(self, functions: Any, parameters: Any) -> int:

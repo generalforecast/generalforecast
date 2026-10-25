@@ -127,14 +127,14 @@ def tiny_state(*, regression: bool, seed: int = 0) -> tuple[dict, dict]:
 
 
 def classifier() -> tuple[Any, TabICL]:
-    """A tiny classifier as a model spec target: `tests.models.tabicl.tiny:classifier`."""
+    """A tiny classifier registered for the engine as `tests/tabicl-classifier`."""
     from generalforecast.models.tabicl.model import tabicl_functions
 
     return tabicl_functions, tiny_tabicl(regression=False)
 
 
 def regressor() -> tuple[Any, TabICL]:
-    """A tiny regressor as a model spec target: `tests.models.tabicl.tiny:regressor`."""
+    """A tiny regressor registered for the engine as `tests/tabicl-regressor`."""
     from generalforecast.models.tabicl.model import tabicl_functions
 
     return tabicl_functions, tiny_tabicl(regression=True)

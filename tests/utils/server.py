@@ -83,7 +83,7 @@ class Server:
         worker = f"""
 [[workers]]
 command = ["{sys.executable}", "-m", "generalforecast.worker_process"]
-models = {{ tiny = "tests.models.tabicl.tiny:classifier", tiny-regressor = "tests.models.tabicl.tiny:regressor", tiny-forecaster = "tests.models.timestral.tiny:forecaster" }}
+models = {{ tiny = "tests/tabicl-classifier", tiny-regressor = "tests/tabicl-regressor", tiny-forecaster = "tests/timestral-forecaster" }}
 """
         tls_section = ""
         if tls is not None:

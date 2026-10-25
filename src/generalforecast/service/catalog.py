@@ -10,13 +10,6 @@ from typing import Literal, cast
 
 from generalforecast import _core
 from generalforecast._core import ForecastRequest
-from generalforecast.deployments.boundary import (
-    Capability,
-    JsonObject,
-    Scope,
-)
-from generalforecast.deployments.catalog_artifacts import artifact
-from generalforecast.deployments.contracts import ServiceError, require
 from generalforecast.models.catalog import (
     V1_POLICY,
     ModelEntry,
@@ -24,6 +17,13 @@ from generalforecast.models.catalog import (
     entries,
     parse,
 )
+from generalforecast.service.boundary import (
+    Capability,
+    JsonObject,
+    Scope,
+)
+from generalforecast.service.catalog_artifacts import artifact
+from generalforecast.service.contracts import ServiceError, require
 
 MAX_CONTEXT = V1_POLICY.context_rows
 MAX_QUERIES = V1_POLICY.query_rows
