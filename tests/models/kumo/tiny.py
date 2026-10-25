@@ -136,14 +136,14 @@ def tiny_kumo_state(*, regression: bool, seed: int = 0) -> dict[str, np.ndarray]
 
 
 def classifier() -> tuple[Any, KumoTabular]:
-    """A tiny classifier as a model spec target: `tests.models.kumo.tiny:classifier`."""
+    """A tiny classifier registered for the engine as `tests/kumo-classifier`."""
     from generalforecast.models.kumo.model import kumo_functions
 
     return kumo_functions, tiny_kumo(regression=False)
 
 
 def regressor() -> tuple[Any, KumoTabular]:
-    """A tiny regressor as a model spec target: `tests.models.kumo.tiny:regressor`."""
+    """A tiny regressor registered for the engine as `tests/kumo-regressor`."""
     from generalforecast.models.kumo.model import kumo_functions
 
     return kumo_functions, tiny_kumo(regression=True)

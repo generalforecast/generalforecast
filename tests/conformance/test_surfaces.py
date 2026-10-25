@@ -31,14 +31,14 @@ import pytest
 import yaml
 
 from generalforecast.client import Client
-from generalforecast.deployments.boundary import Scope
-from generalforecast.deployments.contracts import ServiceError
-from generalforecast.deployments.predictor_runtime import PredictorExecutor
-from generalforecast.deployments.predictor_runtime.compile import compile_dir
 from generalforecast.engine import LocalEngine
 from generalforecast.predictors import load, resolve, write_lock
+from generalforecast.predictors.runtime import PredictorExecutor
+from generalforecast.predictors.runtime.compile import compile_dir
 from generalforecast.serve import listener
 from generalforecast.serve import models as serve_models
+from generalforecast.service.boundary import Scope
+from generalforecast.service.contracts import ServiceError
 from generalforecast.tabular import arrow_bytes
 from tests.utils.server import build
 
@@ -46,10 +46,10 @@ ROOT = Path(__file__).resolve().parents[2]
 SCOPE = Scope("local", "r-conformance")
 # Each served catalog model, and the tiny model both engines load for it.
 TINY = {
-    "general-forecast/tabicl-v2-classifier": "tests.models.tabicl.tiny:classifier",
-    "general-forecast/tabicl-v2-regressor": "tests.models.tabicl.tiny:regressor",
-    "general-forecast/timestral-28m": "tests.models.timestral.tiny:forecaster",
-    "general-forecast/chronos-2": "tests.models.chronos2.tiny:catalog_forecaster",
+    "general-forecast/tabicl-v2-classifier": "tests/tabicl-classifier",
+    "general-forecast/tabicl-v2-regressor": "tests/tabicl-regressor",
+    "general-forecast/timestral-28m": "tests/timestral-forecaster",
+    "general-forecast/chronos-2": "tests/chronos2-catalog-forecaster",
 }
 RELATIVE, ABSOLUTE = 1e-5, 1e-6
 

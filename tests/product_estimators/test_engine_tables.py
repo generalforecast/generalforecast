@@ -15,8 +15,8 @@ from generalforecast.engine import LocalEngine
 from generalforecast.errors import InvalidInput
 
 CATALOG = {
-    "general-forecast/tabicl-v2-classifier": "tests.models.tabicl.tiny:classifier",
-    "general-forecast/chronos-2": "tests.models.chronos2.tiny:catalog_forecaster",
+    "general-forecast/tabicl-v2-classifier": "tests/tabicl-classifier",
+    "general-forecast/chronos-2": "tests/chronos2-catalog-forecaster",
 }
 
 

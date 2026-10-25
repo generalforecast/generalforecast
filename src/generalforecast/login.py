@@ -18,7 +18,7 @@ import urllib.request
 from collections.abc import Callable
 from typing import Any
 
-from generalforecast.deployments.contracts import ServiceError
+from generalforecast.service.contracts import ServiceError
 
 START = "/v1/cli-logins"
 TOKEN = "/v1/cli-logins/token"

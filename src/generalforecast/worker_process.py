@@ -9,6 +9,7 @@ to the server's socket, and answers each frame until the server goes away.
 
 import argparse
 import contextlib
+import importlib
 import itertools
 import json
 import os
@@ -78,11 +79,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
         budget=budget,
         timers=options.timers,
     )
+    for module in filter(None, os.environ.get("GF_WORKER_MODULES", "").split(",")):
+        importlib.import_module(module)
     names: dict[str, int] = {}
     for entry in options.model or []:
         name, spec = entry.split("=", 1)
         names[name] = len(names)
-        worker.add_model(names[name], *registry.load_engine_spec(spec), spec=spec)
+        worker.add_model(names[name], *registry.load_engine_model(spec), spec=spec)
 
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     connection.connect(options.socket)
@@ -274,7 +277,7 @@ def _control(
         case protocol.AddModel(name, spec):
             if name not in names:
                 worker.add_model(
-                    len(names), *registry.load_engine_spec(spec), spec=spec
+                    len(names), *registry.load_engine_model(spec), spec=spec
                 )
                 names[name] = len(names)
                 if worker.allocated:

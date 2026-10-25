@@ -36,6 +36,7 @@ CONTRACT = {"fit", "predict", "forecast", "forecast_given", "embed", "transform"
 # The registry calls that load a model's weights to run them.
 LOADING = {"load", "load_ref"}
 CONTROL_PLANE = "generalforecast.server"
+HOSTED = "generalforecast.hosted"
 
 
 def _within(module: str, packages: tuple[str, ...]) -> bool:
@@ -115,6 +116,32 @@ def test_only_the_worker_loads_models_to_run_them():
     assert found == []
 
 
+SERVICE = "generalforecast.service"
+
+
+def test_the_public_path_imports_nothing_hosted():
+    """The public wheel ships the SDK, CLI and serve path without `hosted`."""
+    found = [
+        f"{module}:{line} imports {name}"
+        for module, tree in _modules()
+        if not _within(module, (CONTROL_PLANE, HOSTED))
+        for line, name in _imports(module, tree)
+        if name == HOSTED or name.startswith(HOSTED + ".")
+    ]
+    assert found == []
+
+
+def test_the_shared_service_contract_imports_nothing_hosted():
+    found = [
+        f"{module}:{line} imports {name}"
+        for module, tree in _modules()
+        if _within(module, (SERVICE,))
+        for line, name in _imports(module, tree)
+        if name == HOSTED or name.startswith(HOSTED + ".")
+    ]
+    assert found == []
+
+
 def test_only_the_control_plane_serves_http_in_python():
     found = [
         f"{module}:{line} imports {name}"
@@ -131,7 +158,7 @@ def test_the_control_plane_runs_no_inference():
     found = [
         f"{module}:{node.lineno} builds CatalogService"
         for module, tree in _modules()
-        if _within(module, (CONTROL_PLANE, "generalforecast.deployments.runtime"))
+        if _within(module, (CONTROL_PLANE, "generalforecast.hosted.runtime"))
         for node in ast.walk(tree)
         if isinstance(node, ast.Call)
         and isinstance(node.func, ast.Name)

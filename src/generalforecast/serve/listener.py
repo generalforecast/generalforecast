@@ -23,8 +23,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING, NoReturn
 
-from generalforecast.deployments.contracts import ServiceError, require
 from generalforecast.predictors.validation import PredictorError
+from generalforecast.service.contracts import ServiceError, require
 
 if TYPE_CHECKING:
     from generalforecast.term import Output

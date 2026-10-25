@@ -10,10 +10,10 @@ import numpy as np
 import pyarrow as pa
 import pytest
 
-from generalforecast.deployments.predictor_runtime import PredictorExecutor
-from generalforecast.deployments.predictor_runtime.compile import compile_dir
-from generalforecast.deployments.predictor_runtime.forecast import ForecastContext
-from generalforecast.deployments.predictor_runtime.lock import ExecutionLock
+from generalforecast.predictors.runtime import PredictorExecutor
+from generalforecast.predictors.runtime.compile import compile_dir
+from generalforecast.predictors.runtime.forecast import ForecastContext
+from generalforecast.predictors.runtime.lock import ExecutionLock
 from tests.product_runtime.test_executor import checked
 
 pytestmark = pytest.mark.slow

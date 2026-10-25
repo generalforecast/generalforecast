@@ -20,16 +20,16 @@ from generalforecast.contracts import (
     PredictorLock,
     Revision,
 )
-from generalforecast.deployments.boundary import (
+from generalforecast.predictors.lock import read_lock
+from generalforecast.predictors.models import describe
+from generalforecast.service.boundary import (
     JsonObject,
     Request,
     Resource,
     Scope,
     json_object,
 )
-from generalforecast.deployments.contracts import ServiceError, name, require
-from generalforecast.predictors.lock import read_lock
-from generalforecast.predictors.models import describe
+from generalforecast.service.contracts import ServiceError, name, require
 from generalforecast.tabular import file_format, read_table, table_digest, to_arrow
 
 __all__ = ["AsyncClient", "Client", "SuiteClient", "endpoint"]  # noqa: F822

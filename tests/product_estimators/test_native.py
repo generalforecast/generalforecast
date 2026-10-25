@@ -25,9 +25,9 @@ pytestmark = pytest.mark.slow
 # The tiny model the engine's workers load for each catalog model, so catalog
 # tests run its admission, export and native paths without its checkpoint.
 CATALOG = {
-    "tabicl-v2-classifier": "tests.models.tabicl.tiny:classifier",
-    "tabicl-v2-regressor": "tests.models.tabicl.tiny:regressor",
-    "chronos-2": "tests.models.chronos2.tiny:catalog_forecaster",
+    "tabicl-v2-classifier": "tests/tabicl-classifier",
+    "tabicl-v2-regressor": "tests/tabicl-regressor",
+    "chronos-2": "tests/chronos2-catalog-forecaster",
 }
 
 
@@ -54,7 +54,7 @@ def catalog() -> Iterator[None]:
 def test_regressor_cross_validation_uses_fold_local_context():
     features = np.random.default_rng(0).normal(size=(24, 3)).astype(np.float32)
     target = features.sum(axis=1)
-    estimator = Regressor("tests.models.tabicl.tiny:regressor")
+    estimator = Regressor("tests/tabicl-regressor")
     scores = cross_val_score(estimator, features, target, cv=2)
     assert scores.shape == (2,) and np.isfinite(scores).all()
     assert not estimator.__sklearn_is_fitted__()
@@ -68,7 +68,7 @@ def test_byte_string_columns_predict_as_their_text():
         0, "protocol", pa.array(np.char.encode(protocols), pa.binary())
     )
     target = numbers + np.arange(24) % 3
-    model = "tests.models.tabicl.tiny:regressor"
+    model = "tests/tabicl-regressor"
     from_bytes = Regressor(model).fit(raw, target)
     from_text = Regressor(model).fit(text, target)
     np.testing.assert_allclose(
@@ -82,7 +82,7 @@ def test_byte_string_columns_predict_as_their_text():
 def test_forecaster_matches_native_grouped_series_and_preserves_context(
     tmp_path, covariates, shared
 ):
-    model = "tests.models.chronos2.tiny:forecaster"
+    model = "tests/chronos2-forecaster"
     context = pa.table(
         {
             "store": ["a"] * 8 + ["b"] * 8,

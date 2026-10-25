@@ -29,8 +29,8 @@ from urllib.request import (
 import httpx
 
 from generalforecast._files import private_lock, read_private, write_private
-from generalforecast.deployments.boundary import MAX_BYTES, json_object
-from generalforecast.deployments.contracts import (
+from generalforecast.service.boundary import MAX_BYTES, json_object
+from generalforecast.service.contracts import (
     WIRE_ERROR_CODES,
     ServiceError,
     name,
@@ -358,7 +358,7 @@ def retryable(method: str, body: Any) -> bool:
 
 
 _ERROR_KEYS = frozenset(
-    {"code", "message", "param", "hint", "limit", "actual", "request_id"}
+    {"code", "message", "reason", "param", "hint", "limit", "actual", "request_id"}
 )
 
 
@@ -380,7 +380,7 @@ def response_value(status: int, raw: bytes) -> dict[str, Any]:
             or any(type(detail[key]) is not str for key in ("code", "message"))
             or any(
                 type(detail.get(key, "")) is not str
-                for key in ("param", "hint", "request_id")
+                for key in ("reason", "param", "hint", "request_id")
             )
             or any(
                 type(detail.get(key, 0)) not in (int, float)

@@ -1466,11 +1466,8 @@ def _manifest_fields(raw: Mapping[str, Any]) -> dict[str, Any]:
             info = {"kind": "request", **(context["request"] or {})}
         elif context.get("mode") == "snapshot" or "source" in context:
             info = {"kind": "snapshot", "source": context.get("source")}
-        elif context.get("mode") in ("live", "dataset"):
-            info = {
-                "kind": "live",
-                "name": context.get("source") or context.get("dataset"),
-            }
+        elif context.get("mode") == "live":
+            info = {"kind": "live", "name": context.get("source")}
         elif context.get("mode") == "request":
             info = {"kind": "request"}
         elif kinds:

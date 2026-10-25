@@ -7,20 +7,20 @@ from dataclasses import dataclass
 
 import pyarrow as pa
 
-from generalforecast.deployments.contracts import ServiceError
-from generalforecast.deployments.interfaces import ResourceFree
-from generalforecast.deployments.predictor_runtime.forecast import ForecastContext
-from generalforecast.deployments.predictor_runtime.lock import ExecutionLock
-from generalforecast.deployments.predictor_runtime.schema import TableSchema
-from generalforecast.deployments.predictor_runtime.tabular import TabularContext
-from generalforecast.deployments.predictor_runtime.validation import (
+from generalforecast.engine import LocalEngine
+from generalforecast.models.catalog import ModelRef
+from generalforecast.predictors.runtime.forecast import ForecastContext
+from generalforecast.predictors.runtime.lock import ExecutionLock
+from generalforecast.predictors.runtime.schema import TableSchema
+from generalforecast.predictors.runtime.tabular import TabularContext
+from generalforecast.predictors.runtime.validation import (
     admit,
     context_table,
     query_table,
 )
-from generalforecast.engine import LocalEngine
-from generalforecast.models.catalog import ModelRef
 from generalforecast.predictors.validation import PredictorError, ensure
+from generalforecast.service.contracts import ServiceError
+from generalforecast.service.interfaces import ResourceFree
 
 
 def _load(lock: ExecutionLock, allow_downloads: bool) -> tuple[LocalEngine, ModelRef]:

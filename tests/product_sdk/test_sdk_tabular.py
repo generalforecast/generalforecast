@@ -14,15 +14,15 @@ from pyarrow import feather, parquet
 
 import generalforecast as gf
 from generalforecast.contracts import PredictionResult
-from generalforecast.deployments.contracts import ServiceError
-from generalforecast.deployments.sdk import (
+from generalforecast.predictors.validation import PredictorError
+from generalforecast.service.contracts import ServiceError
+from generalforecast.service.sdk import (
     ContextSpec,
     LiveContext,
     Snapshot,
     prediction_payload,
     table,
 )
-from generalforecast.predictors.validation import PredictorError
 
 
 @pytest.mark.parametrize(
@@ -105,9 +105,9 @@ def test_immutable_nested_snapshots_and_specs():
     source["nested"]["items"].append(3)
     snapshot["nested"]["items"].clear()
     assert snapshot.to_dict() == {"nested": {"items": [1, 2]}}
-    dataset = LiveContext.from_response(None, "history", {"sequence": 1})
+    context = LiveContext.from_response(None, "history", {"sequence": 1})
     with pytest.raises(dataclasses.FrozenInstanceError):
-        dataset.name = "new"
+        context.name = "new"
     features = ["x"]
     targets = [["y", "numeric"]]
     spec = ContextSpec("history", features, targets)

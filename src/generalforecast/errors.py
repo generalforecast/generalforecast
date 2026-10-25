@@ -28,6 +28,7 @@ class Error(Exception):
     Attributes:
         code: The stable error code, such as `ValidationError`.
         message: One lowercase line naming the mistake, without a trailing period.
+        reason: The service's finer reason behind `code`, in snake case, if any.
         param: The field or column the error refers to, if any.
         because: The cause, when the message alone does not explain it.
         hint: What to do instead, if there is a short answer.
@@ -46,6 +47,7 @@ class Error(Exception):
         *args: str,
         code: str | None = None,
         message: str | None = None,
+        reason: str | None = None,
         param: str | None = None,
         because: str | None = None,
         hint: str | None = None,
@@ -66,6 +68,7 @@ class Error(Exception):
         if code is not None:
             self.code = _CODES.get(code, code)
         self.message = message or ""
+        self.reason = reason
         self.path = path
         self.param = param
         self.because = because
