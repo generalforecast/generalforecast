@@ -48,7 +48,7 @@ class PredictorLock:
         fields(value, {"lock_version", "predictor", "model"})
         ensure(
             value["lock_version"] == LOCK_VERSION,
-            "unsupported lock version; run `gf check` to write version 2",
+            "unsupported lock version; run `gf check` to write version 1",
             "UnsupportedLockVersion",
         )
         predictor = fields(

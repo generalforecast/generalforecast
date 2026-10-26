@@ -3,7 +3,10 @@
 
 """Request-scoped predictor inputs shared by the hosted API and `gf serve`."""
 
+from collections.abc import Mapping
+
 import pyarrow as pa
+import pyarrow.compute as pc
 
 from generalforecast.predictors.runtime.compile import compile_plan
 from generalforecast.predictors.runtime.plan import ExecutionPlan
@@ -15,17 +18,35 @@ from generalforecast.tabular import coerce, to_arrow
 def request_table(data, lock, *, max_rows):
     """Keeps other input types strict; ISO strings are the JSON temporal encoding."""
     table = to_arrow(data, max_rows=max_rows)
-    try:
-        return coerce(
-            table,
-            {
-                column.name: column.type
-                for column in lock.schema.columns
-                if column.name in table.column_names
-                and column.type in {"date", "timestamp"}
-                and pa.types.is_string(table[column.name].type)
-            },
+    return temporal(table, {column.name: column.type for column in lock.schema.columns})
+
+
+def temporal(table: pa.Table, types: Mapping[str, str]) -> pa.Table:
+    """Restores the date and timestamp columns JSON carried as ISO strings.
+
+    A time without a zone, such as `2026-01-01` or `2026-01-01T05:00:00`,
+    is read as UTC; other declared types are left to the schema check.
+    """
+    declared = {
+        column: kind
+        for column, kind in types.items()
+        if kind in ("date", "timestamp")
+        and column in table.column_names
+        and pa.types.is_string(table[column].type)
+    }
+    for column, kind in declared.items():
+        if kind != "timestamp":
+            continue
+        index = table.column_names.index(column)
+        try:
+            naive = pc.cast(table.column(index), pa.timestamp("us"), safe=True)
+        except (pa.ArrowException, ValueError):
+            continue
+        table = table.set_column(
+            index, table.schema.field(index).with_type(naive.type), naive
         )
+    try:
+        return coerce(table, declared)
     except PredictorError:
         raise ServiceError(
             "ValidationError", "invalid ISO temporal input", 422

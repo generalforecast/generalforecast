@@ -105,7 +105,9 @@ pub async fn traced<T>(
     trace: &Trace,
     call: impl Future<Output = Result<T, Status>>,
 ) -> Result<T, Status> {
-    let span = tracing::info_span!("call", kind, trace = trace.id());
+    // At warn, so a terminal's `warn` filter keeps the span and its trace id
+    // on the warnings logged inside it; nothing prints the span itself.
+    let span = tracing::warn_span!("call", kind, trace = trace.id());
     async move {
         let started = Instant::now();
         let result = call.await;
@@ -128,11 +130,15 @@ pub async fn traced<T>(
 }
 
 /// Logs to stderr: as JSON lines with `GF_LOG_FORMAT=json`, at the levels
-/// `GF_LOG` sets in `RUST_LOG` syntax (`info` by default; `debug` adds a line
-/// per request and per step).
+/// `GF_LOG` sets in `RUST_LOG` syntax. Without `GF_LOG`, a terminal gets
+/// `warn`, so the status lines stand alone; a pipe or a supervisor gets
+/// `info`. `debug` adds a line per request and per step.
 pub fn init_logging() {
-    let filter = tracing_subscriber::EnvFilter::try_from_env("GF_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    use std::io::IsTerminal;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_env("GF_LOG").unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(default_level(std::io::stderr().is_terminal()))
+    });
     let logs = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -144,6 +150,11 @@ pub fn init_logging() {
     }
 }
 
+/// The level logged without `GF_LOG`: `warn` on a terminal, `info` elsewhere.
+pub fn default_level(terminal: bool) -> &'static str {
+    if terminal { "warn" } else { "info" }
+}
+
 /// Makes any panic log and end the process, rather than end one thread and
 /// leave the rest serving without it, so a supervisor starts it again whole.
 pub fn abort_on_panic() {
@@ -153,4 +164,15 @@ pub fn abort_on_panic() {
         report(panic);
         std::process::abort();
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_level;
+
+    #[test]
+    fn a_terminal_logs_warnings_only_and_a_pipe_logs_info() {
+        assert_eq!(default_level(true), "warn");
+        assert_eq!(default_level(false), "info");
+    }
 }

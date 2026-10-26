@@ -659,10 +659,13 @@ class Warmed:
     Attributes:
         compiles: Programs compiled before replying.
         seconds: Seconds they took.
+        compile_cache: Programs loaded from the persistent compile cache,
+            and those compiled, since the worker's last reply that counted them.
     """
 
     compiles: int
     seconds: float
+    compile_cache: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -765,7 +768,7 @@ def predictions(
     results: dict[int, np.ndarray],
     failed: dict[int, str] | None = None,
     seconds: float = 0.0,
-    stages: dict[str, tuple[int, float]] | None = None,
+    stages: dict[str, tuple[int, float, float]] | None = None,
     parts: dict[str, tuple[int, float]] | None = None,
     deferred: dict[int, str] | None = None,
 ) -> tuple[dict[str, Any], list[bytes]]:
@@ -781,7 +784,8 @@ def predictions(
         failed: Each failed table's error.
         deferred: Each table whose part waits for a program, by its key.
         seconds: The time the step took the worker.
-        stages: The step's compiled calls and their seconds, by stage.
+        stages: The step's compiled calls, their seconds and their FLOPs,
+            by stage.
         parts: The step's parts, each run and their seconds; see
             `WorkerStats.parts`.
 
@@ -819,20 +823,23 @@ def predictions(
 
 def timing(
     seconds: float,
-    stages: dict[str, tuple[int, float]] | None = None,
+    stages: dict[str, tuple[int, float, float]] | None = None,
     parts: dict[str, tuple[int, float]] | None = None,
     memory: dict[str, int] | None = None,
+    compile_cache: tuple[int, int] = (0, 0),
 ) -> dict[str, Any]:
     """The fields of a predictions header that say what the step cost; see `predictions`.
 
     `memory` is what the step held, in bytes by kind; see
-    `generalforecast.profiling.memory`.
+    `generalforecast.profiling.memory`. `compile_cache` is the programs the
+    worker loaded from its persistent compile cache, and those it compiled,
+    since its last reply that counted them.
     """
-    found = {
+    found: dict[str, Any] = {
         "seconds": seconds,
         "stages": {
-            stage: {"calls": calls, "seconds": spent}
-            for stage, (calls, spent) in (stages or {}).items()
+            stage: {"calls": calls, "seconds": spent, "flops": flops}
+            for stage, (calls, spent, flops) in (stages or {}).items()
         },
         "parts": {
             part: {"calls": calls, "seconds": spent}
@@ -841,4 +848,6 @@ def timing(
     }
     if memory:
         found["memory"] = memory
+    if any(compile_cache):
+        found["compile_cache"] = {"hits": compile_cache[0], "misses": compile_cache[1]}
     return found

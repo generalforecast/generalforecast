@@ -28,6 +28,7 @@ from generalforecast.predictors.tables import (
     labels,
     read_frame,
     split,
+    to_table,
 )
 
 pc: Any = _compute  # ty cannot see Arrow's generated compute functions
@@ -135,20 +136,24 @@ class Resolution:
 
 def resolve(
     spec: PredictorSpec,
-    root: str | Path,
+    root: str | Path | None = None,
     *,
     online: bool = False,
     upgrade: bool = False,
     locked: bool = False,
+    rows: Any = None,
 ) -> Resolution:
-    """Resolves a manifest in its directory.
+    """Resolves a manifest in its directory, or against the rows of a request.
 
     Args:
         spec: The manifest.
-        root: The predictor directory, where the snapshot and `gf.lock` live.
+        root: The predictor directory, where the snapshot and `gf.lock` live;
+            None for a manifest without one, such as an ad hoc call.
         online: Confirm the model pin against the upstream registry.
         upgrade: Accept a model digest that differs from the previous lock.
         locked: Fail if the result differs from the previous lock.
+        rows: A request context's rows, when the call carries them; types,
+            classes and frequency are then inferred as from a snapshot.
 
     Returns:
         The resolution, with `lock_changes` against any previous `gf.lock`.
@@ -159,7 +164,6 @@ def resolve(
     """
     from generalforecast.predictors import lock
 
-    root = Path(root)
     validate(spec)
     assert spec.target is not None
     inferred: dict[str, str] = {}
@@ -169,7 +173,7 @@ def resolve(
     inferred["task"] = f"{spec.model} is a {task} model"
     pin = _pin(spec, online=online)
     limits = _registry.limits(spec.model)
-    previous = lock.read_lock(root)
+    previous = lock.read_lock(root) if root is not None else None
     digest = _model_digest(spec, pin, previous, upgrade=upgrade)
 
     frame: pa.Table | None = None
@@ -179,7 +183,13 @@ def resolve(
     context_digest = None
     if spec.context.kind == "snapshot":
         assert spec.context.snapshot is not None
-        table = read_frame(root, spec.context.snapshot)
+        if root is None:
+            raise spec.error(
+                f"snapshot `{spec.context.snapshot}` needs the predictor directory",
+                param="context.snapshot",
+                hint="resolve the manifest in its directory",
+            )
+        table = read_frame(Path(root), spec.context.snapshot)
         info = inspect_frame(table, path=spec.context.snapshot)
         _check_columns(spec, info)
         frame, queries = split(table, spec)
@@ -193,6 +203,11 @@ def resolve(
         context_rows, query_rows = frame.num_rows, queries.num_rows
         inferred["queries"] = _query_reason(spec, query_rows)
         context_digest = tabular.table_digest(frame)
+    elif rows is not None:
+        frame = to_table(rows)
+        info = inspect_frame(frame, path="the context")
+        _check_columns(spec, info)
+        context_rows = frame.num_rows
     elif spec.inputs is None:
         raise spec.error(
             f"`inputs` must be listed for a {spec.context.kind} context",
