@@ -417,8 +417,10 @@ def test_report_fallback_replaces_jax_advice(cpu_backend, tmp_path, caplog):
         )
         logger.warning("unrelated advice")
     assert [record.getMessage() for record in caplog.records] == [
-        "A Google TPU may be present on this machine, but either a TPU-enabled "
-        "jaxlib or libtpu is not installed. Falling back to cpu.",
+        (
+            "A Google TPU may be present on this machine, but either a TPU-enabled "
+            "jaxlib or libtpu is not installed. Falling back to cpu."
+        ),
         "unrelated advice",
     ]
     assert len(cpu_backend._advice.held) == 2
