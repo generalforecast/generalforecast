@@ -331,7 +331,10 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
     let replication_tokens = Tokens::new(&config.replication_tokens);
     let mut server = tonic::transport::Server::builder()
         .timeout(Duration::from_secs_f64(config.request_timeout_seconds))
-        .concurrency_limit_per_connection(config.connection_concurrency)
+        // A cap on streams, not a queue for them: a stream waiting its turn would
+        // hold its rows in the connection's flow-control window, which the
+        // rows of the calls it waits on may then not get through.
+        .max_concurrent_streams(u32::try_from(config.connection_concurrency).unwrap_or(u32::MAX))
         .http2_keepalive_interval(Some(Duration::from_secs(20)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
         .tcp_keepalive(Some(Duration::from_secs(60)));

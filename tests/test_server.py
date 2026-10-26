@@ -8,8 +8,9 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+import time
 from collections.abc import Iterator
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 import numpy as np
@@ -194,6 +195,130 @@ def test_tables_whose_rows_are_wider_than_a_slot_are_served(
         )
     finally:
         server.stop()
+
+
+WIDE = [{"name": f"f{index}", "kind": "numeric"} for index in range(64)]
+
+
+def _wide(keys, features=None, targets=None) -> pa.RecordBatch:
+    columns = {"key": pa.array(np.asarray(keys, dtype=np.uint64))}
+    if features is not None:
+        for index in range(features.shape[1]):
+            columns[f"f{index}"] = pa.array(features[:, index])
+        columns["target"] = pa.array(np.asarray(targets, dtype=np.float32))
+    return pa.RecordBatch.from_pydict(columns)
+
+
+def _wide_predict(server: Server, queries: np.ndarray) -> np.ndarray:
+    batch = pa.RecordBatch.from_pydict(
+        {f"f{index}": pa.array(queries[:, index]) for index in range(queries.shape[1])}
+    )
+    descriptor = flight.FlightDescriptor.for_path("predict", "live")
+    writer, reader = server.client.do_exchange(descriptor, server.options())
+    writer.begin(batch.schema)
+    writer.write_batch(batch)
+    writer.done_writing()
+    result = reader.read_all()
+    writer.close()
+    return result.column(0).to_numpy()
+
+
+def _slow_writes(server: Server, features: np.ndarray):
+    """An insert, an update and a delete whose calls are open but whose rows
+    have not arrived, and a function that sends their rows."""
+    batches = [
+        ("insert", _wide([100], features[:1] + 5, [50.0])),
+        ("insert", _wide([101], features[1:2] + 5, [50.0])),
+        ("update", _wide([2], features[2:3], [50.0])),
+        ("delete", _wide([3])),
+    ]
+    opened = []
+    for kind, batch in batches:
+        descriptor = flight.FlightDescriptor.for_path(kind, "live")
+        writer, _ = server.client.do_put(descriptor, batch.schema, server.options())
+        opened.append((writer, batch))
+
+    def land(index: int) -> None:
+        writer, batch = opened[index]
+        writer.write_batch(batch)
+        writer.close()
+
+    return len(opened), land
+
+
+def _live(server: Server) -> np.ndarray:
+    server.action(
+        "create_table",
+        {
+            "name": "live",
+            "model": "tiny-regressor",
+            "columns": WIDE,
+            "classes": 0,
+            "strategy": {"kind": "exact"},
+        },
+    )
+    generator = np.random.default_rng(0)
+    features = generator.normal(size=(64, len(WIDE))).astype(np.float32)
+    batch = _wide(np.arange(64), features, features.sum(axis=1))
+    writer, _ = server.client.do_put(
+        flight.FlightDescriptor.for_path("insert", "live"),
+        batch.schema,
+        server.options(),
+    )
+    writer.write_batch(batch)
+    writer.close()
+    return features
+
+
+def test_writes_whose_rows_are_slow_to_arrive_do_not_stall_predictions(
+    binary: Path, tmp_path: Path
+) -> None:
+    server = Server(binary, tmp_path)
+    # The four writes below are as many calls as the connection may have open.
+    server.config.write_text("connection_concurrency = 4\n" + server.config.read_text())
+    server.start()
+    pool = ThreadPoolExecutor(404)
+    try:
+        features = _live(server)
+        expected = _wide_predict(server, features[:1])
+        writes, land = _slow_writes(server, features)
+        time.sleep(0.5)
+        # Enough queries to fill the connection's flow-control window.
+        predicted = [
+            pool.submit(_wide_predict, server, features[:1]) for _ in range(400)
+        ]
+        time.sleep(1)
+        landed = [pool.submit(land, index) for index in range(writes)]
+
+        _, pending = wait([*predicted, *landed], timeout=30)
+        if pending and server.process is not None:
+            server.process.kill()
+
+        assert not pending, f"{len(pending)} calls still waiting"
+        for call in [*predicted, *landed]:
+            call.result()
+        assert not np.allclose(_wide_predict(server, features[:1]), expected)
+    finally:
+        server.stop()
+        pool.shutdown(cancel_futures=True)
+
+
+def test_predictions_read_the_last_committed_rows_while_a_write_arrives(
+    server: Server,
+) -> None:
+    features = _live(server)
+    expected = _wide_predict(server, features[:1])
+    writes, land = _slow_writes(server, features)
+
+    with ThreadPoolExecutor(32) as pool:
+        answers = list(
+            pool.map(lambda _: _wide_predict(server, features[:1]), range(256))
+        )
+        for answer in answers:
+            np.testing.assert_allclose(answer, expected, atol=1e-5)
+        list(pool.map(land, range(writes)))
+
+    assert not np.allclose(_wide_predict(server, features[:1]), expected)
 
 
 def _exchange(
@@ -635,6 +760,14 @@ def _check_metrics(server: Server) -> None:
     assert answer.schema.metadata[b"generalforecast.epoch"] == b"0"
     assert metrics['gf_worker_stage_calls_total{stage="fit"}'] == "1"
     assert int(metrics['gf_worker_stage_calls_total{stage="decode"}']) >= 2
+    # Every call counts its program's FLOPs, and every compile the cache.
+    assert float(metrics['gf_worker_stage_flops_total{stage="fit"}']) > 0
+    assert float(metrics['gf_worker_stage_flops_total{stage="decode"}']) > 0
+    assert (
+        int(metrics["gf_worker_compile_cache_hits_total"])
+        + int(metrics["gf_worker_compile_cache_misses_total"])
+        > 0
+    )
     assert metrics['gf_table_refits_total{table="rows"}'] == "1"
     assert metrics['gf_table_refit_rows_total{table="rows"}'] == "32"
     assert float(metrics['gf_table_refit_seconds_total{table="rows"}']) == (

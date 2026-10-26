@@ -83,15 +83,24 @@ def binary(name: str = SERVER) -> Path:
     return Path(found)
 
 
-def _become(
-    name: str, *arguments: str, environment: Mapping[str, str] | None = None
-) -> NoReturn:
+def _become(name: str, *arguments: str, environment: Mapping[str, str]) -> NoReturn:
     """Replaces this process with one of the servers, so signals reach it directly."""
     program = binary(name)
     sys.stdout.flush()
     sys.stderr.flush()
-    environ = dict(os.environ if environment is None else environment)
-    os.execve(program, [str(program), *arguments], environ)
+    os.execve(program, [str(program), *arguments], dict(environment))
+
+
+def _environment(args: argparse.Namespace, **extra: str) -> dict[str, str]:
+    """The server's environment: this process's, `extra`, and `GF_LOG=info` under `-v`.
+
+    gf-server logs warnings only on a terminal unless `GF_LOG` says otherwise,
+    so the status lines stand alone; `-v` asks for its progress lines too.
+    """
+    environment = dict(os.environ, **extra)
+    if getattr(args, "verbose", False):
+        environment.setdefault("GF_LOG", "info")
+    return environment
 
 
 def _routes(config: Path) -> bool:
@@ -258,7 +267,13 @@ def route(args: argparse.Namespace, nodes: list[str]) -> dict:
             f"tables on {listen}",
             f"across {len(nodes)} node{'s' * (len(nodes) != 1)}",
         )
-    _become(ROUTER, "check" if check else "run", "--config", str(config))
+    _become(
+        ROUTER,
+        "check" if check else "run",
+        "--config",
+        str(config),
+        environment=_environment(args),
+    )
 
 
 def _serve(args: argparse.Namespace) -> dict:
@@ -280,7 +295,7 @@ def _serve(args: argparse.Namespace) -> dict:
     descriptor = os.open(config, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w") as file:
         file.write(configuration(directory, address, REQUEST_TIMEOUT_SECONDS, [model]))
-    environment = dict(os.environ, GF_LOG_KEY=secrets.token_hex(32))
+    environment = _environment(args, GF_LOG_KEY=secrets.token_hex(32))
     if args.offline:
         environment["HF_HUB_OFFLINE"] = "1"
     _become(SERVER, "run", "--config", str(config), environment=environment)

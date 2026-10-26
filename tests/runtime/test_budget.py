@@ -10,7 +10,14 @@ import numpy as np
 import pytest
 
 from generalforecast.runtime import budget as budget_module
-from generalforecast.runtime.budget import Call, Chunks, MemoryBudget
+from generalforecast.runtime.budget import (
+    Call,
+    Chunks,
+    MemoryBudget,
+    estimated_flops,
+    flops_of,
+    note_compiled,
+)
 
 
 def test_local_clients_and_servers_divide_memory_their_own_ways() -> None:
@@ -94,7 +101,7 @@ def test_a_call_that_runs_out_of_memory_runs_again_in_smaller_calls() -> None:
         return values
 
     counted: list[str] = []
-    chunks = Chunks(lambda stage, seconds: counted.append(stage))
+    chunks = Chunks(lambda stage, seconds, flops: counted.append(stage))
     items = np.ones((6, 4), np.float32)
     budget = 8 * items[0].nbytes
 
@@ -163,7 +170,7 @@ def test_measuring_a_kind_counts_under_the_call_that_reuses_its_program(
 
     monkeypatch.setattr(budget_module, "measured_bytes", measured_slowly)
     counted: list[tuple[str, float]] = []
-    chunks = Chunks(lambda stage, seconds: counted.append((stage, seconds)))
+    chunks = Chunks(lambda stage, seconds, flops: counted.append((stage, seconds)))
     doubled = jax.jit(lambda rows: rows * 2)
     items = np.ones((2, 4), np.float32)
 
@@ -321,3 +328,89 @@ def test_a_count_that_fails_to_compile_on_the_side_starts_again_later() -> None:
     aside[0][1](False)
     run(5)
     assert [padded for padded, _ in aside] == [8, 8]
+
+
+@pytest.mark.parametrize(
+    ("analysis", "flops"),
+    [
+        ({"flops": 8.0, "bytes accessed": 64.0}, 8.0),
+        ([{"flops": 8.0}], 8.0),
+        ([{"flops": 8.0}, {"flops": 2.0}], 10.0),
+        ([], 0.0),
+        ({"bytes accessed": 64.0}, 0.0),
+        ({"flops": -1.0}, 0.0),
+        ({"flops": float("nan")}, 0.0),
+        (None, 0.0),
+    ],
+)
+def test_flops_come_from_xla_cost_analysis_in_either_of_its_shapes(
+    analysis: Any, flops: float
+) -> None:
+    assert flops_of(analysis) == flops
+
+
+def test_a_programs_flops_are_xlas_estimate_for_its_padded_shapes() -> None:
+    multiplied = jax.jit(lambda left, right: left @ right)
+    left, right = np.ones((4, 8, 16), np.float32), np.ones((4, 16, 2), np.float32)
+
+    # Two flops, a multiply and an add, per product term.
+    assert estimated_flops(Call(multiplied, (), (left, right), 4)) == pytest.approx(
+        2 * 4 * 8 * 16 * 2, rel=0.1
+    )
+    assert estimated_flops(Call(lambda rows: rows, (), (left,), 4)) == 0.0
+
+
+def test_each_call_counts_its_programs_flops_read_once_per_padded_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    estimated: list[int] = []
+
+    def estimate(call: Call) -> float:
+        estimated.append(call.padded)
+        return 10.0 * call.padded
+
+    monkeypatch.setattr(budget_module, "estimated_flops", estimate)
+    counted: list[float] = []
+    chunks = Chunks(lambda stage, seconds, flops: counted.append(flops))
+    doubled = jax.jit(lambda rows: rows * 2)
+    items = np.ones((3, 4), np.float32)
+
+    for _ in range(3):
+        _run(chunks, doubled, items, 8 * items[0].nbytes)
+    # Three items pad to a call of four; one item runs at one.
+    _run(chunks, doubled, items[:1], 8 * items[0].nbytes)
+    assert counted == [40.0, 40.0, 40.0, 10.0]
+    assert estimated == [4, 1]
+
+
+def test_a_program_compiled_before_its_first_call_counts_the_flops_its_compile_kept(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def estimate(call: Call) -> float:
+        raise AssertionError("a call read XLA's cost analysis")
+
+    counted: list[float] = []
+    chunks = Chunks(lambda stage, seconds, flops: counted.append(flops))
+    summed = jax.jit(lambda rows: (rows @ rows.T).sum(-1))
+    items = np.ones((2, 8), np.float32)
+    # As a worker's start compiles what earlier processes recorded, and runs it.
+    note_compiled(summed, (items,), summed.lower(items).compile())
+    summed(items)
+    monkeypatch.setattr(budget_module, "estimated_flops", estimate)
+
+    _run(chunks, summed, items, 8 * items[0].nbytes)
+    _run(chunks, summed, items, 8 * items[0].nbytes)
+    assert counted[0] > 0 and counted == [counted[0]] * 2
+
+
+def test_a_program_compiled_unnoted_before_its_first_call_still_counts_its_flops() -> (
+    None
+):
+    counted: list[float] = []
+    chunks = Chunks(lambda stage, seconds, flops: counted.append(flops))
+    summed = jax.jit(lambda rows: (rows @ rows.T).sum(-1) + 1)
+    items = np.ones((2, 8), np.float32)
+    summed(items)
+
+    _run(chunks, summed, items, 8 * items[0].nbytes)
+    assert counted[0] > 0
