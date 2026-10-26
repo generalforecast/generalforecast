@@ -83,6 +83,23 @@ fn worker_stages_report_their_calls_and_seconds() {
 }
 
 #[test]
+fn worker_stages_report_their_flops_and_workers_their_compile_cache() {
+    let metrics = Metrics::default();
+    metrics.stage("decode").flops.add(1.5e18);
+    metrics.stage("decode").flops.add(1.5e18);
+    metrics.stage("decode").flops.add(-1.0);
+    metrics.compile_cache_hits.add(4);
+    metrics.compile_cache_misses.add(1);
+
+    let text = metrics.render();
+
+    assert!(text.contains("# TYPE gf_worker_stage_flops_total counter\n"));
+    assert!(text.contains("gf_worker_stage_flops_total{stage=\"decode\"} 3000000000000000000\n"));
+    assert!(text.contains("gf_worker_compile_cache_hits_total 4\n"));
+    assert!(text.contains("gf_worker_compile_cache_misses_total 1\n"));
+}
+
+#[test]
 fn step_parts_and_request_times_render_beside_the_stages() {
     let metrics = Metrics::default();
     metrics.part("pad").calls.add(2);

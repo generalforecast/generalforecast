@@ -790,6 +790,8 @@ pub enum WorkerReply {
     Warmed {
         compiles: u64,
         seconds: f64,
+        #[serde(default)]
+        compile_cache: CompileCache,
     },
     /// Sent while a step runs, each time the worker finishes compiling a
     /// program, so a long compile is not taken for a hung worker; it
@@ -818,6 +820,8 @@ pub enum WorkerReply {
         parts: BTreeMap<String, StageTime>,
         #[serde(default)]
         memory: BTreeMap<String, u64>,
+        #[serde(default)]
+        compile_cache: CompileCache,
     },
 }
 
@@ -944,6 +948,24 @@ pub struct Deferral {
 pub struct StageTime {
     pub calls: u64,
     pub seconds: f64,
+    /// XLA's estimate for the calls' programs, padding included; parts have none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub flops: f64,
+}
+
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
+/// Programs a worker loaded from its persistent compile cache, and those it
+/// compiled, since its last reply that counted them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompileCache {
+    #[serde(default)]
+    pub hits: u64,
+    #[serde(default)]
+    pub misses: u64,
 }
 
 /// A request's predictions: `rows` by `columns`, row-major, or for a
@@ -980,6 +1002,8 @@ pub struct Outcome {
     /// What the step held in memory, in bytes by kind, when the worker times
     /// its parts; see the worker's `generalforecast.profiling.memory`.
     pub memory: BTreeMap<String, u64>,
+    /// Compile cache hits and misses since the worker's last reply.
+    pub compile_cache: CompileCache,
 }
 
 /// A worker's reply to a step.
@@ -996,6 +1020,7 @@ pub fn outcome_from(frame: &Frame) -> Result<Outcome, FrameError> {
         stages,
         parts,
         memory,
+        compile_cache,
     } = WorkerReply::of(frame)?
     else {
         return Err(FrameError(format!(
@@ -1046,6 +1071,7 @@ pub fn outcome_from(frame: &Frame) -> Result<Outcome, FrameError> {
         stages,
         parts,
         memory,
+        compile_cache,
     })
 }
 

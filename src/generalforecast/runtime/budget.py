@@ -175,6 +175,68 @@ def measured_bytes(call: Call) -> int:
     return total // max(1, call.padded)
 
 
+# FLOPs of the programs compiled or loaded outside a call, by function and shapes.
+_compiled_flops: dict[Hashable, float] = {}
+
+
+def estimated_flops(call: Call) -> float:
+    """Floating-point operations one run of a call's program takes, by XLA's cost analysis; 0 when XLA cannot say.
+
+    The program is the one the call compiled or loaded, which compiling here
+    finds in JAX's caches, as `measured_bytes` does. The count is for the
+    call's padded shapes.
+    """
+    try:
+        jitted = cast(jax.stages.Wrapped, call.function)
+        analysis = jitted.lower(*call.shared, *call.items).compile().cost_analysis()
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return flops_of(analysis)
+
+
+def note_compiled(function: Any, arguments: tuple, compiled: Any) -> None:
+    """Keeps the FLOPs of a program compiled or loaded outside a call, for `Chunks` to count at its calls."""
+    try:
+        flops = flops_of(compiled.cost_analysis())
+    except Exception:  # noqa: BLE001
+        flops = 0.0
+    _compiled_flops[_signature(function, arguments)] = flops
+
+
+def forget_compiled() -> None:
+    """Drops what `note_compiled` kept, as programs are dropped."""
+    _compiled_flops.clear()
+
+
+def _noted_flops(call: Call) -> float:
+    """A call's program's FLOPs as `note_compiled` kept them, or else as `estimated_flops` reads them."""
+    noted = _compiled_flops.get(_signature(call.function, (*call.shared, *call.items)))
+    return estimated_flops(call) if noted is None else noted
+
+
+def _signature(function: Any, arguments: tuple) -> Hashable:
+    """A function with its arguments' shapes and dtypes, which pick its program."""
+    return (
+        function,
+        tuple(
+            (getattr(leaf, "shape", None), str(getattr(leaf, "dtype", type(leaf))))
+            for leaf in jax.tree.leaves(arguments)
+        ),
+    )
+
+
+def flops_of(analysis: Any) -> float:
+    """The `flops` of an XLA cost analysis, a dict or, in older JAX, a list of one per program; 0 when it has none."""
+    if isinstance(analysis, (list, tuple)):
+        return sum(flops_of(part) for part in analysis)
+    if not isinstance(analysis, dict):
+        return 0.0
+    flops = analysis.get("flops")
+    if not isinstance(flops, (int, float)) or not flops > 0:
+        return 0.0
+    return float(flops)
+
+
 def _shapes(tree: Any) -> Any:
     """A tree's leaves as their shapes and dtypes alone."""
     return jax.tree.map(
@@ -206,7 +268,7 @@ class Chunks:
 
     def __init__(
         self,
-        counted: Callable[[str, float], None],
+        counted: Callable[[str, float, float], None],
         compiled: Callable[[str], None] | None = None,
         timed: Callable[[str, float], None] | None = None,
         seen: Callable[[Call], None] | None = None,
@@ -215,7 +277,8 @@ class Chunks:
         """Sets up with nothing measured.
 
         Args:
-            counted: Takes each call's stage and its seconds.
+            counted: Takes each call's stage, its seconds and its program's
+                FLOPs, as `estimated_flops` gives them once per program.
             compiled: Takes the stage of each call whose shape its program had
                 not seen, which compiled, or came from the compile cache.
             timed: Takes each call's seconds until it is handed to the
@@ -242,6 +305,8 @@ class Chunks:
         # Padded counts each kind has run at, and those compiling ahead.
         self._counts: dict[Hashable, set[int]] = {}
         self._compiling: set[tuple[Hashable, int]] = set()
+        # FLOPs of each kind's program at each padded count, read once.
+        self._flops: dict[tuple[Hashable, int], float] = {}
         self._lock = threading.Lock()
 
     def size(self, key: Hashable, budget: int, estimate: Callable[[], int]) -> int:
@@ -341,8 +406,14 @@ class Chunks:
                     self._backoff[key] = 2 * self._backoff.get(key, 1)
                 continue
             finished = time.perf_counter()
-            self._counted(stage, measuring + finished - started)
             compiled = _traces(call.function) > traces
+            flops = self._flops.get((key, padded))
+            if flops is None:
+                # Read once per program: here if this call compiled it, else
+                # where it was compiled ahead or at start.
+                flops = estimated_flops(call) if compiled else _noted_flops(call)
+                self._flops[(key, padded)] = flops
+            self._counted(stage, measuring + finished - started, flops)
             if compiled and self._noted is not None:
                 self._noted(stage, key, call, finished - started)
             if self.timed is not None:

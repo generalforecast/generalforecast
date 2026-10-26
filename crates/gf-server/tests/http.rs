@@ -17,7 +17,7 @@ use gf_core::node::Scheduling;
 use gf_server::http::{Front, KeyStore, Principal, ServedModel, Static, router};
 use gf_server::metrics::Metrics;
 use gf_server::protocol::{
-    Frame, ModelProfile, PredictionsHeader, WorkerReply, WorkerRequest, f32_bytes,
+    CompileCache, Frame, ModelProfile, PredictionsHeader, WorkerReply, WorkerRequest, f32_bytes,
 };
 use gf_server::routes::Routes;
 use gf_server::service::RequestBudget;
@@ -59,6 +59,7 @@ fn fake_worker(mut stream: UnixStream) {
                     stages: BTreeMap::new(),
                     parts: BTreeMap::new(),
                     memory: BTreeMap::new(),
+                    compile_cache: CompileCache::default(),
                 }
                 .frame()
                 .header;

@@ -611,3 +611,17 @@ def test_blank_and_whole_number_targets_count_like_gf_check(tmp_path):
     )
     snapshot = _read_snapshot(served(str(floaty), tmp_path, allow_downloads=True))
     assert snapshot["y"].type == pa.int64() and snapshot["y"].to_pylist() == [0, 1]
+
+
+def test_verbose_asks_gf_server_for_its_progress_lines(monkeypatch):
+    import argparse
+
+    from generalforecast.serve.listener import _environment
+
+    monkeypatch.delenv("GF_LOG", raising=False)
+    quiet = _environment(argparse.Namespace(verbose=False), GF_LOG_KEY="k")
+    assert "GF_LOG" not in quiet
+    assert quiet["GF_LOG_KEY"] == "k"
+    assert _environment(argparse.Namespace(verbose=True))["GF_LOG"] == "info"
+    monkeypatch.setenv("GF_LOG", "debug")
+    assert _environment(argparse.Namespace(verbose=True))["GF_LOG"] == "debug"

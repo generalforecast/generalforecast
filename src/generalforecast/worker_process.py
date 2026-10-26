@@ -31,8 +31,10 @@ from generalforecast.models import registry
 from generalforecast.profiling import memory
 from generalforecast.runtime.budget import MemoryBudget
 from generalforecast.runtime.device import (
+    compile_cache_counts,
     default_settings,
     portable_cpu_programs,
+    report_fallback,
     without_command_buffers,
 )
 from generalforecast.system import pin_cpus
@@ -70,6 +72,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     # Before `default_settings` starts JAX's backend, which reads XLA's flags.
     without_command_buffers()
     portable_cpu_programs()
+    report_fallback()
     budget = MemoryBudget.measure(workers=options.workers)
     worker = Worker(
         default_settings(),
@@ -160,6 +163,22 @@ def main(arguments: Sequence[str] | None = None) -> int:
     return 1 if failed.is_set() else 0
 
 
+# The compile cache's counts as the last reply that carried them read them.
+_compile_cache_replied = (0, 0)
+
+
+def _compile_cache_since_reply() -> tuple[int, int]:
+    """Programs loaded from the compile cache, and those compiled, since the last reply that counted them.
+
+    Programs compiled ahead between steps count in the next reply.
+    """
+    global _compile_cache_replied
+    hits, misses = compile_cache_counts()
+    replied = _compile_cache_replied
+    _compile_cache_replied = (hits, misses)
+    return hits - replied[0], misses - replied[1]
+
+
 def _answer(
     worker: Worker,
     names: dict[str, int],
@@ -210,6 +229,7 @@ def _handled(
                         worker.stats.stages_since(before),
                         worker.stats.parts_since(before),
                         held,
+                        _compile_cache_since_reply(),
                     )
                 )
                 return lambda: frame
@@ -237,9 +257,11 @@ def _handled(
                 # programs earlier workers compiled are ready before them.
                 before = worker.programs.warmed, worker.programs.warm_seconds
                 worker.warm_start(progressed)
+                hits, misses = _compile_cache_since_reply()
                 answer = protocol.Warmed(
                     worker.programs.warmed - before[0],
                     worker.programs.warm_seconds - before[1],
+                    {"hits": hits, "misses": misses},
                 )
             case protocol.Controls(requests):
                 failures = []

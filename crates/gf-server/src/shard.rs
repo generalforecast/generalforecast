@@ -1074,10 +1074,17 @@ impl Shard {
             .worker
             .request_progressing(&frame, self.step_timeout)
             .await?;
-        if let Ok(WorkerReply::Warmed { compiles, seconds }) = WorkerReply::of(&reply) {
+        if let Ok(WorkerReply::Warmed {
+            compiles,
+            seconds,
+            compile_cache,
+        }) = WorkerReply::of(&reply)
+        {
             tracing::info!(compiles, seconds, "worker compiled its recorded programs");
             self.metrics.warm_compiles.add(compiles);
             self.metrics.warm_seconds.add(seconds);
+            self.metrics.compile_cache_hits.add(compile_cache.hits);
+            self.metrics.compile_cache_misses.add(compile_cache.misses);
         }
         Ok(())
     }
@@ -4060,7 +4067,14 @@ impl Shard {
             let stage = self.metrics.stage(name);
             stage.calls.add(time.calls);
             stage.seconds.add(time.seconds);
+            stage.flops.add(time.flops);
         }
+        self.metrics
+            .compile_cache_hits
+            .add(outcome.compile_cache.hits);
+        self.metrics
+            .compile_cache_misses
+            .add(outcome.compile_cache.misses);
         for (name, time) in &outcome.parts {
             let part = self.metrics.part(name);
             part.calls.add(time.calls);

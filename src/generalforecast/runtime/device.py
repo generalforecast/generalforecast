@@ -4,17 +4,20 @@
 import ctypes
 import dataclasses
 import functools
+import logging
 import os
 import platform
 import sys
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import jax
 import jax.numpy as jnp
 
+from generalforecast import term
 from generalforecast.constants import ATTENTION_BLOCK_CHUNK
 from generalforecast.nn.attention import (
     AttentionCache,
@@ -134,6 +137,82 @@ def default_settings() -> DeviceSettings:
             f"GF_CACHE_DTYPE must be one of {sorted(_CACHE_DTYPES)}, not {cache!r}"
         )
     return dataclasses.replace(settings, cache_dtype=_CACHE_DTYPES[cache])
+
+
+# The device files an NVIDIA GPU shows up as, on a host, in a container and under WSL2.
+NVIDIA_DEVICES = ("/dev/nvidia0", "/dev/nvidiactl", "/dev/dxg")
+CUDA_EXTRA = "generalforecast[cuda]"
+# JAX logs its advice about an accelerator it could not use through this logger.
+_BACKEND_LOGGER = logging.getLogger("jax._src.xla_bridge")
+
+
+class _HeldAdvice(logging.Filter):
+    """Holds back JAX's lines about an NVIDIA GPU it could not use, for `report_fallback` to say in the CLI's words.
+
+    Lines about other accelerators pass through as they are.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.held: list[str] = []
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        text = record.getMessage()
+        if "NVIDIA GPU may be present" in text or "CUDA backend failed" in text:
+            self.held.append(text)
+            return False
+        return True
+
+
+_advice = _HeldAdvice()
+_reported = False
+
+
+def nvidia_gpu_visible(devices: Sequence[str] = NVIDIA_DEVICES) -> bool:
+    """Whether an NVIDIA GPU's device file exists, whatever JAX can do with it."""
+    return any(os.path.exists(device) for device in devices)
+
+
+def report_fallback(
+    err: IO[str] | None = None, *, devices: Sequence[str] = NVIDIA_DEVICES
+) -> bool:
+    """Starts JAX's backend and warns once if an NVIDIA GPU is visible but the process runs on the CPU.
+
+    JAX logs its own line about that through `logging`, which prints it bare on
+    stderr when nothing configures logging. This holds that line back and writes
+    the CLI's `warning:` and `hint:` lines instead: install the `cuda` extra, or,
+    when CUDA is installed but failed to start, JAX's reason. Call it before the
+    first JAX call of the process, so the filter is in place when the backend
+    starts.
+
+    Args:
+        err: Where to write; stderr if None.
+        devices: The device files that show an NVIDIA GPU.
+
+    A `JAX_PLATFORMS` setting is a choice, not a fallback, so it draws no warning.
+
+    Returns:
+        Whether a warning was written.
+    """
+    global _reported
+    if _advice not in _BACKEND_LOGGER.filters:
+        _BACKEND_LOGGER.addFilter(_advice)
+    if jax.default_backend() != "cpu" or _reported or not nvidia_gpu_visible(devices):
+        return False
+    if os.environ.get("JAX_PLATFORMS", "").strip():
+        # The caller chose the platform, so the CPU is no fallback.
+        return False
+    _reported = True
+    out = term.Output(err=err)
+    out.warning("an NVIDIA GPU is present, but generalforecast runs on the CPU")
+    failure = next(
+        (text for text in _advice.held if "failed to initialize" in text), None
+    )
+    if failure is None:
+        out.hint(f'install the cuda extra to use it: pip install "{CUDA_EXTRA}"')
+    else:
+        out.hint(f"CUDA failed to start. {failure}")
+    return True
 
 
 def host_memory(cgroup: Path = Path("/sys/fs/cgroup")) -> int:
@@ -290,6 +369,67 @@ def use_compile_cache() -> None:
     # quick program is worth keeping too; JAX keeps only those over a second.
     if "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS" not in os.environ:
         jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+    count_compile_cache()
+
+
+# JAX's events around one program's compile: it looks the program up in the
+# persistent cache, finds it there or not, and ends the compile or load.
+_CACHE_LOOKUP = "/jax/compilation_cache/compile_requests_use_cache"
+_CACHE_HIT = "/jax/compilation_cache/cache_hits"
+_COMPILED = "/jax/core/compile/backend_compile_duration"
+
+
+class _CompileCache(threading.local):
+    """Whether this thread's compile looked its program up and has not found it."""
+
+    looking = False
+
+
+_compile_cache = _CompileCache()
+_cache_lock = threading.Lock()
+_cache_counts = [0, 0]
+_counting_cache = False
+
+
+def count_compile_cache() -> None:
+    """Counts the programs this process loads from JAX's persistent compile cache, and those it compiles; see `compile_cache_counts`.
+
+    Each compile that looks its program up in the cache is a hit when JAX
+    finds it there and a miss when it ends without, so a program XLA
+    compiles without the cache, as with it disabled, counts as neither.
+    Only compiles and loads run this; calls of compiled programs do not.
+    JAX's own `cache_misses` event counts cache writes, which skip programs
+    under its size and compile-time thresholds, so it undercounts misses.
+    """
+    global _counting_cache
+    with _cache_lock:
+        if _counting_cache:
+            return
+        _counting_cache = True
+    jax.monitoring.register_event_listener(_cache_event)
+    jax.monitoring.register_event_duration_secs_listener(_compile_ended)
+
+
+def compile_cache_counts() -> tuple[int, int]:
+    """Programs this process loaded from JAX's persistent compile cache, and those it compiled, since `count_compile_cache`."""
+    with _cache_lock:
+        return _cache_counts[0], _cache_counts[1]
+
+
+def _cache_event(event: str, **_: Any) -> None:
+    if event == _CACHE_LOOKUP:
+        _compile_cache.looking = True
+    elif event == _CACHE_HIT and _compile_cache.looking:
+        _compile_cache.looking = False
+        with _cache_lock:
+            _cache_counts[0] += 1
+
+
+def _compile_ended(event: str, duration_secs: float, **_: Any) -> None:
+    if event == _COMPILED and _compile_cache.looking:
+        _compile_cache.looking = False
+        with _cache_lock:
+            _cache_counts[1] += 1
 
 
 def cache_root() -> Path:

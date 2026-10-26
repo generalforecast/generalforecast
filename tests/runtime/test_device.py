@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -25,6 +26,7 @@ from generalforecast.runtime.device import (
     default_settings,
     device_settings,
     host_memory,
+    report_fallback,
     store_cache,
     to_cache_dtype,
     with_precision,
@@ -285,3 +287,164 @@ def test_cpu_programs_pin_avx2_where_the_cpu_has_it(
     device.portable_cpu_programs()
 
     assert os.environ["XLA_FLAGS"] == expected
+
+
+_COMPILED_TWICE = """
+import sys, threading
+import jax, numpy as np
+from generalforecast.runtime import device
+
+jax.config.update("jax_compilation_cache_dir", sys.argv[1])
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0.0)
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+device.count_compile_cache()
+doubled = jax.jit(lambda rows: rows * 2)
+doubled(np.ones(4, np.float32))
+first = device.compile_cache_counts()
+doubled(np.ones(4, np.float32))
+called = device.compile_cache_counts()
+jax.clear_caches()
+doubled(np.ones(4, np.float32))
+loaded = device.compile_cache_counts()
+compiles = [
+    threading.Thread(
+        target=lambda n=n: doubled.lower(jax.ShapeDtypeStruct((n,), np.float32)).compile()
+    )
+    for n in (5, 6, 7)
+]
+for compile in compiles:
+    compile.start()
+for compile in compiles:
+    compile.join()
+print(first, called, loaded, device.compile_cache_counts())
+"""
+
+
+def test_programs_the_persistent_compile_cache_holds_count_as_hits_and_others_as_misses(
+    tmp_path: Path,
+) -> None:
+    # In a process of its own, since JAX sets its persistent cache up once.
+    found = subprocess.run(
+        [sys.executable, "-c", _COMPILED_TWICE, str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+        env={**os.environ, "JAX_PLATFORMS": "cpu"},
+    ).stdout.split(")")
+    first, called, loaded, threaded = (
+        tuple(int(count) for count in part.strip(" (\n").split(", "))
+        for part in found[:4]
+    )
+    hits, misses = first
+    assert hits == 0 and misses >= 1
+    # A call of a compiled program is no compile.
+    assert called == first
+    # The same program again, once JAX's own caches are cleared, loads from disk.
+    assert loaded == (misses, misses)
+    # Compiles on threads at once each count once, for their own lookups.
+    assert threaded == (misses, misses + 3)
+
+
+@pytest.fixture
+def cpu_backend(monkeypatch):
+    """A process whose JAX backend is the CPU and that has not warned yet."""
+    from generalforecast.runtime import device
+
+    monkeypatch.setattr(device.jax, "default_backend", lambda: "cpu")
+    monkeypatch.setattr(device, "_reported", False)
+    monkeypatch.setattr(device._advice, "held", [])
+    return device
+
+
+def test_report_fallback_warns_once_about_a_visible_gpu(cpu_backend, tmp_path):
+    import io
+
+    gpu = tmp_path / "nvidia0"
+    gpu.touch()
+    err = io.StringIO()
+    assert report_fallback(err, devices=[str(gpu)])
+    lines = err.getvalue().splitlines()
+    assert (
+        lines[0]
+        == "warning: an NVIDIA GPU is present, but generalforecast runs on the CPU"
+    )
+    assert (
+        lines[1]
+        == '  hint: install the cuda extra to use it: pip install "generalforecast[cuda]"'
+    )
+    assert not report_fallback(err, devices=[str(gpu)])
+    assert len(err.getvalue().splitlines()) == 2
+
+
+def test_report_fallback_stays_quiet_without_a_gpu(cpu_backend, tmp_path):
+    import io
+
+    err = io.StringIO()
+    assert not report_fallback(err, devices=[str(tmp_path / "nvidia0")])
+    assert err.getvalue() == ""
+
+
+def test_report_fallback_stays_quiet_on_a_gpu(cpu_backend, monkeypatch, tmp_path):
+    import io
+
+    monkeypatch.setattr(cpu_backend.jax, "default_backend", lambda: "gpu")
+    gpu = tmp_path / "nvidia0"
+    gpu.touch()
+    err = io.StringIO()
+    assert not report_fallback(err, devices=[str(gpu)])
+    assert err.getvalue() == ""
+
+
+def test_report_fallback_replaces_jax_advice(cpu_backend, tmp_path, caplog):
+    import io
+    import logging
+
+    gpu = tmp_path / "nvidia0"
+    gpu.touch()
+    report_fallback(io.StringIO(), devices=[str(gpu)])
+    logger = logging.getLogger("jax._src.xla_bridge")
+    with caplog.at_level(logging.WARNING, logger=logger.name):
+        logger.warning(
+            "An NVIDIA GPU may be present on this machine, but a CUDA-enabled jaxlib "
+            "is not installed. Falling back to cpu."
+        )
+        logger.warning(
+            "CUDA backend failed to initialize: no device. Falling back to cpu."
+        )
+        logger.warning(
+            "A Google TPU may be present on this machine, but either a TPU-enabled "
+            "jaxlib or libtpu is not installed. Falling back to cpu."
+        )
+        logger.warning("unrelated advice")
+    assert [record.getMessage() for record in caplog.records] == [
+        (
+            "A Google TPU may be present on this machine, but either a TPU-enabled "
+            "jaxlib or libtpu is not installed. Falling back to cpu."
+        ),
+        "unrelated advice",
+    ]
+    assert len(cpu_backend._advice.held) == 2
+
+
+def test_report_fallback_gives_the_cuda_failure_as_the_hint(cpu_backend, tmp_path):
+    import io
+
+    gpu = tmp_path / "nvidia0"
+    gpu.touch()
+    cpu_backend._advice.held.append("CUDA backend failed to initialize: no device.")
+    err = io.StringIO()
+    assert report_fallback(err, devices=[str(gpu)])
+    assert err.getvalue().splitlines()[1] == (
+        "  hint: CUDA failed to start. CUDA backend failed to initialize: no device."
+    )
+
+
+def test_report_fallback_respects_a_chosen_platform(cpu_backend, monkeypatch, tmp_path):
+    import io
+
+    monkeypatch.setenv("JAX_PLATFORMS", "cpu")
+    gpu = tmp_path / "nvidia0"
+    gpu.touch()
+    err = io.StringIO()
+    assert not report_fallback(err, devices=[str(gpu)])
+    assert err.getvalue() == ""

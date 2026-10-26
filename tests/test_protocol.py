@@ -120,6 +120,10 @@ def test_series_frames_read_and_write_as_the_server_does() -> None:
     header, _ = protocol.predictions({9: np.zeros((1, 2, 3), dtype="<f4")})
     assert header["results"][0]["horizon"] == 2
     assert header["results"][0]["columns"] == 3
+    assert "compile_cache" not in header
+    timing = protocol.timing(0.5, {"fit": (2, 0.25, 1e9)}, compile_cache=(3, 1))
+    assert timing["stages"] == {"fit": {"calls": 2, "seconds": 0.25, "flops": 1e9}}
+    assert timing["compile_cache"] == {"hits": 3, "misses": 1}
 
     tabular = protocol.Profiled(1, 2, True, 0, 1, None, 0, False)
     assert "series" not in protocol.reply(tabular)

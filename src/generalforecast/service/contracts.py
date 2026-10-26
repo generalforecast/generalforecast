@@ -52,6 +52,33 @@ class ServiceError(Exception):
     body = public_body
 
 
+class InputError(ServiceError):
+    """A request error that names its field and, for a limit, its bound."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status: int = 422,
+        *,
+        param: str | None = None,
+        hint: str | None = None,
+        limit: int | None = None,
+        actual: int | None = None,
+    ) -> None:
+        """Keeps the OpenAPI error object's optional fields; None leaves one out."""
+        super().__init__(code, message, status)
+        self.param, self.hint, self.limit, self.actual = param, hint, limit, actual
+
+    def details(self) -> dict[str, Any]:
+        """`param`, `hint`, `limit` and `actual`, those that are set."""
+        return {
+            key: value
+            for key in ("param", "hint", "limit", "actual")
+            if (value := getattr(self, key)) is not None
+        }
+
+
 WIRE_ERROR_CODES = frozenset(
     [
         "ValidationError",
