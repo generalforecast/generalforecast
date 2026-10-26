@@ -15,8 +15,8 @@ use gf_core::node::{Scheduling, Targets};
 use gf_server::metrics::Metrics;
 use gf_server::name::TableName;
 use gf_server::protocol::{
-    Failure, Frame, ModelProfile, PredictionsHeader, StageTime, WorkerReply, WorkerRequest,
-    f32_bytes,
+    CompileCache, Failure, Frame, ModelProfile, PredictionsHeader, StageTime, WorkerReply,
+    WorkerRequest, f32_bytes,
 };
 use gf_server::routes::Routes;
 use gf_server::service::{Charge, RequestBudget};
@@ -185,6 +185,7 @@ fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notif
                         WorkerReply::Warmed {
                             compiles: 3,
                             seconds: 0.5,
+                            compile_cache: CompileCache { hits: 2, misses: 1 },
                         }
                         .frame()
                     }
@@ -283,6 +284,7 @@ fn predictions(header: &Value, failing: Option<u32>) -> Frame {
         StageTime {
             calls: 1,
             seconds: 0.001,
+            flops: 1000.0,
         },
     )]);
     if header["fits"]
@@ -292,6 +294,7 @@ fn predictions(header: &Value, failing: Option<u32>) -> Frame {
         let fit = StageTime {
             calls: 1,
             seconds: 0.002,
+            flops: 0.0,
         };
         stages.insert("fit".to_string(), fit);
     }
@@ -307,9 +310,11 @@ fn predictions(header: &Value, failing: Option<u32>) -> Frame {
             StageTime {
                 calls: 1,
                 seconds: 0.001,
+                flops: 0.0,
             },
         )]),
         memory: BTreeMap::new(),
+        compile_cache: CompileCache { hits: 0, misses: 1 },
     }
     .frame()
     .header;
@@ -685,6 +690,8 @@ async fn a_workers_compiles_at_start_count_before_its_shard_takes_steps() {
 
     assert_eq!(shard.metrics.warm_compiles.get(), 3);
     assert!((shard.metrics.warm_seconds.get() - 0.5).abs() < 1e-9);
+    assert_eq!(shard.metrics.compile_cache_hits.get(), 2);
+    assert_eq!(shard.metrics.compile_cache_misses.get(), 1);
     assert!(
         shard
             .metrics
@@ -853,6 +860,13 @@ async fn a_shard_splits_the_workers_time_among_tables_and_counts_their_refits() 
         metrics.worker_seconds.get()
     ));
     assert_eq!(metrics.stage("decode").calls.get(), metrics.steps.get());
+    assert!(close(
+        metrics.stage("decode").flops.get(),
+        1000.0 * metrics.steps.get() as f64
+    ));
+    // Each step's reply counts the compile it says missed the cache, beside
+    // the start's one.
+    assert_eq!(metrics.compile_cache_misses.get(), 1 + metrics.steps.get());
     assert_eq!(metrics.part("other").calls.get(), metrics.steps.get());
     assert!(close(
         metrics.part("other").seconds.get(),

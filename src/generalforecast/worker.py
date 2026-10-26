@@ -58,6 +58,7 @@ from generalforecast.runtime.budget import (
     Chunks,
     MemoryBudget,
     _shapes,
+    note_compiled,
     out_of_memory,
 )
 from generalforecast.runtime.decoding import (
@@ -82,6 +83,7 @@ from generalforecast.runtime.device import (
     cpu_flags,
     load_cache,
     portable_cpu_programs,
+    report_fallback,
     store_cache,
     to_cache_dtype,
     use_compile_cache,
@@ -209,6 +211,9 @@ class WorkerStats:
             which compiled, or came from the compile cache.
         seconds: Time in compiled calls per stage, compiling included, since
             each call waits for its results.
+        flops: Floating-point operations in compiled calls per stage, by
+            XLA's estimate for each program, read once as the program
+            compiles or loads for a call; padding to its shape counts.
         parts: Times each part of a step ran, by name. The parts split a
             step's time without overlap: `frame` decodes a server's step
             frame and `reply` converts predictions into its reply, `move`
@@ -247,6 +252,7 @@ class WorkerStats:
     calls: dict[str, int] = field(default_factory=dict)
     compiles: dict[str, int] = field(default_factory=dict)
     seconds: dict[str, float] = field(default_factory=dict)
+    flops: dict[str, float] = field(default_factory=dict)
     parts: dict[str, int] = field(default_factory=dict)
     part_seconds: dict[str, float] = field(default_factory=dict)
     timers: bool = False
@@ -278,13 +284,25 @@ class WorkerStats:
             calls=dict(self.calls),
             compiles=dict(self.compiles),
             seconds=dict(self.seconds),
+            flops=dict(self.flops),
             parts=dict(self.parts),
             part_seconds=dict(self.part_seconds),
         )
 
-    def stages_since(self, before: "WorkerStats") -> dict[str, tuple[int, float]]:
-        """Each stage's compiled calls and their seconds since `before`."""
-        return _since(before.calls, before.seconds, self.calls, self.seconds)
+    def stages_since(
+        self, before: "WorkerStats"
+    ) -> dict[str, tuple[int, float, float]]:
+        """Each stage's compiled calls, their seconds and their FLOPs since `before`."""
+        return {
+            stage: (
+                calls,
+                seconds,
+                self.flops.get(stage, 0.0) - before.flops.get(stage, 0.0),
+            )
+            for stage, (calls, seconds) in _since(
+                before.calls, before.seconds, self.calls, self.seconds
+            ).items()
+        }
 
     def parts_since(self, before: "WorkerStats") -> dict[str, tuple[int, float]]:
         """Each part's runs and their seconds since `before`."""
@@ -424,6 +442,7 @@ class Worker:
         """
         without_command_buffers()
         portable_cpu_programs()
+        report_fallback()
         self._settings, self._minimum = settings, bucket_minimum
         self._slot_bytes = slot_bytes
         # On a CPU a stacked fused call takes as long per unit as one alone,
@@ -649,7 +668,10 @@ class Worker:
                     for count in stacks or counts_up_to(counts):
                         items = abstract(kind.item, count)
                         shared = self._shared(program, kind, items)
-                        function.lower(parameters, *shared, *items).compile()
+                        arguments = (parameters, *shared, *items)
+                        note_compiled(
+                            function, arguments, function.lower(*arguments).compile()
+                        )
                         # A program's first run sets it up on the device, which
                         # would otherwise slow the first step that calls it. One
                         # reading a large table takes as long on zeros as the
@@ -1460,7 +1482,8 @@ class Worker:
                     lambda value, count=count: _stacked_shape(value, count), sliced
                 )
                 jitted = cast(jax.stages.Wrapped, compiled)
-                jitted.lower(self._models[model].parameters, *stacked).compile()
+                arguments = (self._models[model].parameters, *stacked)
+                note_compiled(jitted, arguments, jitted.lower(*arguments).compile())
 
     def _warmed_queries(self) -> list[int]:
         """Padded query counts compiled ahead: `WARMED_QUERIES` buckets above the smallest."""
@@ -1494,13 +1517,14 @@ class Worker:
         """Waits for every compile started in the background."""
         self.programs.wait()
 
-    def _count(self, stage: str, seconds: float) -> None:
-        """Counts a compiled call of a stage, and the seconds it took."""
+    def _count(self, stage: str, seconds: float, flops: float) -> None:
+        """Counts a compiled call of a stage, the seconds it took and its FLOPs."""
         # A fit of the state alone counts as a fit.
         stage = "fit" if stage == "state" else stage
         with _COUNTING:
             self.stats.calls[stage] = self.stats.calls.get(stage, 0) + 1
             self.stats.seconds[stage] = self.stats.seconds.get(stage, 0.0) + seconds
+            self.stats.flops[stage] = self.stats.flops.get(stage, 0.0) + flops
 
     def _compiled(self, stage: str) -> None:
         """Counts a call of a stage whose shape its program had not seen."""
@@ -2091,7 +2115,10 @@ class Worker:
             compiled = self._compiled_stage(*program)
             shared = (self._models[model].parameters,)
             items = _shapes(_stacked([arguments]))
-            cast(jax.stages.Wrapped, compiled).lower(*shared, *items).compile()
+            jitted = cast(jax.stages.Wrapped, compiled)
+            note_compiled(
+                jitted, (*shared, *items), jitted.lower(*shared, *items).compile()
+            )
             self._chunks.mark(key, 1)
             self._seen(Call(compiled, shared, items, 1, program))
         except Exception as error:  # noqa: BLE001

@@ -21,6 +21,7 @@ import jax
 import numpy as np
 
 from generalforecast.constants import COMPILED_SHAPES, RECORDED_KINDS, WARM_QUIET
+from generalforecast.runtime.budget import forget_compiled, note_compiled
 from generalforecast.runtime.device import DeviceSettings, with_precision
 from generalforecast.system import mappings_short
 
@@ -211,6 +212,12 @@ def zeros(tree: Any) -> Any | None:
         return np.zeros(leaf.shape, leaf.dtype)
 
     return jax.tree.unflatten(structure, [zero(leaf) for leaf in leaves])
+
+
+def _compile(function: Callable[..., Any], arguments: tuple) -> None:
+    """Compiles a function for these arguments, or their shapes, keeping its program's FLOPs."""
+    jitted = cast(jax.stages.Wrapped, function)
+    note_compiled(function, arguments, jitted.lower(*arguments).compile())
 
 
 @dataclass(frozen=True)
@@ -507,6 +514,7 @@ class Programs:
         self._compiled.clear()
         self._shapes.clear()
         self._done.clear()
+        forget_compiled()
         self.drops += 1
 
     def first(self, marker: Hashable) -> bool:
@@ -518,9 +526,7 @@ class Programs:
 
     def compile_later(self, function: Callable[..., Any], *arguments: Any) -> None:
         """Compiles a function for these arguments, or their shapes, in a quiet gap."""
-        self.later(
-            lambda: cast(jax.stages.Wrapped, function).lower(*arguments).compile()
-        )
+        self.later(lambda: _compile(function, arguments))
 
     def compile_soon(
         self,
@@ -536,7 +542,7 @@ class Programs:
 
         def compile_it() -> None:
             try:
-                cast(jax.stages.Wrapped, function).lower(*arguments).compile()
+                _compile(function, arguments)
             except Exception as error:  # noqa: BLE001
                 logger.warning("a compile beside steps failed: %s", error)
                 done(False)

@@ -47,6 +47,30 @@ impl Seconds {
     }
 }
 
+/// A sum of floating-point values that only goes up, such as FLOPs, which
+/// would overflow a `Counter` within hours on an accelerator.
+#[derive(Debug, Default)]
+pub struct Total(AtomicU64);
+
+impl Total {
+    /// Adds a value; a negative one adds nothing.
+    pub fn add(&self, value: f64) {
+        if value > 0.0 {
+            let _ = self
+                .0
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |bits| {
+                    Some((f64::from_bits(bits) + value).to_bits())
+                });
+        }
+    }
+
+    /// The sum.
+    #[must_use]
+    pub fn get(&self) -> f64 {
+        f64::from_bits(self.0.load(Ordering::Relaxed))
+    }
+}
+
 /// A value that goes up and down.
 #[derive(Debug, Default)]
 pub struct Gauge(AtomicU64);
@@ -151,11 +175,12 @@ pub struct TableMetrics {
     pub rebuild_overdue_micros: Gauge,
 }
 
-/// A worker stage's compiled calls, and the time they took.
+/// A worker stage's compiled calls, the time they took, and their FLOPs.
 #[derive(Debug, Default)]
 pub struct Stage {
     pub calls: Counter,
     pub seconds: Seconds,
+    pub flops: Total,
 }
 
 /// Everything the server reports.
@@ -198,6 +223,10 @@ pub struct Metrics {
     /// the kinds of call earlier workers recorded, and the time it took.
     pub warm_compiles: Counter,
     pub warm_seconds: Seconds,
+    /// Programs workers loaded from their persistent compile cache, and
+    /// those they compiled because it did not hold them.
+    pub compile_cache_hits: Counter,
+    pub compile_cache_misses: Counter,
     /// Where a prediction or write request's time goes in the service, beside
     /// the shard's queue and plan: decoding its Arrow body, finding its
     /// table's placement and route, waiting for the shard's answer, and
@@ -465,6 +494,18 @@ impl Metrics {
             "# HELP gf_worker_warm_seconds_total Time workers spent compiling as they started.\n# TYPE gf_worker_warm_seconds_total counter\ngf_worker_warm_seconds_total {}\n",
             self.warm_seconds.get()
         );
+        counter(
+            &mut text,
+            "gf_worker_compile_cache_hits_total",
+            "Programs workers loaded from their persistent compile cache instead of compiling.",
+            self.compile_cache_hits.get(),
+        );
+        counter(
+            &mut text,
+            "gf_worker_compile_cache_misses_total",
+            "Programs workers compiled because their persistent compile cache did not hold them.",
+            self.compile_cache_misses.get(),
+        );
         let requests = [
             (
                 "gf_request_decode_seconds",
@@ -538,6 +579,17 @@ impl Metrics {
                 text,
                 "gf_worker_stage_seconds_total{{stage=\"{name}\"}} {}",
                 stage.seconds.get()
+            );
+        }
+        let _ = write!(
+            text,
+            "# HELP gf_worker_stage_flops_total Floating-point operations in workers' compiled calls, by stage, as XLA estimates each program; padding to a program's compiled shape counts.\n# TYPE gf_worker_stage_flops_total counter\n"
+        );
+        for (name, stage) in &stages {
+            let _ = writeln!(
+                text,
+                "gf_worker_stage_flops_total{{stage=\"{name}\"}} {}",
+                stage.flops.get()
             );
         }
         let parts = self
