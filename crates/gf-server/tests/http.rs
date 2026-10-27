@@ -2125,8 +2125,8 @@ async fn a_live_revision_predicts_as_of_a_past_time_from_the_planes_history() {
             .iter()
             .flatten()
             .collect::<Vec<_>>(),
-        ["2026-10-26T08:00:00Z"],
-        "the plane is asked once, in RFC 3339, and the version held"
+        ["2026-10-26T08:00:00Z"; 3],
+        "the plane is asked each time, in RFC 3339, and no as_of package is reused"
     );
     // A time before the history the plane keeps is its refusal, as it came.
     let (status, body) = score_at(

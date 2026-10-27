@@ -30,12 +30,14 @@
 //!   `?as_of=2026-10-27T08:00:00Z`, answers the package of a live-context
 //!   revision with its context as of that time: the rows and `version` of
 //!   the context version that stood then, and that version's `as_of`. A
-//!   time before the history the control plane keeps is refused with 422
-//!   `ValidationError` (param `as_of`), or 409 `Conflict` where that
-//!   version is gone; gf-server answers its caller the same. gf-server asks
-//!   it only for a revision whose context is live: a prediction with
-//!   `as_of` of any other context is refused with 422 `ValidationError`
-//!   (param `as_of`) before the control plane is asked.
+//!   context that is not live, an `as_of` it cannot read, or a time before
+//!   the history it keeps is refused with 422 `ValidationError` (param
+//!   `as_of`), which gf-server answers its caller as it came. gf-server
+//!   asks it only for a revision whose context is live: a prediction with
+//!   `as_of` of any other context is refused the same way before the
+//!   control plane is asked. No other internal route takes a query.
+//!   An `as_of` package is fetched for each prediction and never cached,
+//!   since which version stood at a time is the control plane's answer.
 //! - `POST /internal/v1/predictions:record` takes `{"records": [...]}`, the
 //!   predictions gf-server answered, for the control plane's metrics.
 //!
@@ -374,8 +376,8 @@ impl Revisions {
     }
 
     /// A live-context revision's package with its context as of `as_of`,
-    /// from the control plane's history; see the module's contract. A past
-    /// version never changes, so it is held until it sits idle or is evicted.
+    /// from the control plane's history; see the module's contract. It is
+    /// asked for every time and never taken from or put in the cache.
     ///
     /// # Errors
     ///
@@ -418,11 +420,12 @@ impl Revisions {
             revision,
             version,
         );
-        if let Some(published) = self
-            .cache
-            .lock()
-            .expect("revision cache")
-            .get(&key, Instant::now())
+        if at.is_none()
+            && let Some(published) = self
+                .cache
+                .lock()
+                .expect("revision cache")
+                .get(&key, Instant::now())
         {
             return Ok(published);
         }
@@ -435,11 +438,13 @@ impl Revisions {
         let (published, bytes): (Published, usize) = self.fetch(&path).await?;
         self.loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let now = Instant::now();
-        // A live source's rows move under one version, unless they are the
-        // ones that stood at a past time.
-        let live = at.is_none() && published.live();
         let published = std::sync::Arc::new(published);
+        if at.is_some() {
+            return Ok(published);
+        }
+        let now = Instant::now();
+        // A live source's rows move under one version.
+        let live = published.live();
         self.cache.lock().expect("revision cache").insert(
             key,
             Entry {
