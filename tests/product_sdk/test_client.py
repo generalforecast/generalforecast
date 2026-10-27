@@ -121,3 +121,25 @@ def test_keys_are_listed_never_read_one_at_a_time():
     with pytest.raises(ServiceError) as error:
         client.identity.manage("keys.get", {"id": "key-1"})
     assert error.value.code == "UnsupportedOperation"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize(
+    ("action", "payload"),
+    [
+        ("memberships.list", None),
+        ("memberships.add", {"issuer": "i", "subject": "s", "role": "admin"}),
+        ("memberships.remove", {"issuer": "i", "subject": "s"}),
+    ],
+)
+def test_the_retired_memberships_api_is_refused_before_any_request(
+    asynchronous, action, payload
+):
+    # Workspace members is the only membership API; nothing reaches the wire.
+    def body(client):
+        client._transport.send = None
+        return client.identity.manage(action, payload)
+
+    with pytest.raises(ServiceError) as error:
+        run(asynchronous, "https://service.example", body)
+    assert (error.value.code, error.value.status) == ("UnsupportedOperation", 501)

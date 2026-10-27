@@ -951,52 +951,6 @@ export interface OrganizationListReply extends Envelope {
   result: OrganizationList;
 }
 
-/** the sign-in provider a membership's subject belongs to */
-export type Issuer = "https://accounts.google.com" | "https://login.microsoftonline.com" | "https://github.com";
-
-export interface Membership {
-  issuer: Issuer;
-  subject: string;
-  scope_kind: "account" | "organization" | "project";
-  scope_id: Name;
-  role: "admin" | "editor" | "viewer" | "scorer";
-}
-
-export interface MembershipAddRequest extends Envelope {
-  payload: Membership;
-}
-
-export interface MembershipRef {
-  issuer: Issuer;
-  subject: string;
-  scope_kind: "account" | "organization" | "project";
-  scope_id: Name;
-}
-
-export interface MembershipRemoveRequest extends Envelope {
-  payload: MembershipRef;
-}
-
-export interface MembershipChanged {
-  issuer: Issuer;
-  subject: string;
-  scope_kind: "account" | "organization" | "project";
-  scope_id: Name;
-  removed: boolean;
-}
-
-export interface MembershipChangedReply extends Envelope {
-  result: MembershipChanged;
-}
-
-export interface MembershipList {
-  memberships: Membership[];
-}
-
-export interface MembershipListReply extends Envelope {
-  result: MembershipList;
-}
-
 export interface Sso {
   organization: Name;
   provider: "google";
@@ -1670,9 +1624,6 @@ export const ROUTES = {
   "workspace.get": { method: "GET", path: "/v1/workspace", request: "null", reply: "ProjectListReply", body: null },
   "organizations.list": { method: "GET", path: "/v1/organizations", request: "null", reply: "OrganizationListReply", body: null },
   "organizations.create": { method: "POST", path: "/v1/organizations", request: "OrganizationCreateRequest", reply: "OrganizationReply", body: "application/json" },
-  "memberships.list": { method: "GET", path: "/v1/projects/{project}/memberships", request: "null", reply: "MembershipListReply", body: null },
-  "memberships.add": { method: "POST", path: "/v1/projects/{project}/memberships", request: "MembershipAddRequest", reply: "MembershipChangedReply", body: "application/json" },
-  "memberships.remove": { method: "POST", path: "/v1/projects/{project}/memberships/remove", request: "MembershipRemoveRequest", reply: "MembershipChangedReply", body: "application/json" },
   "sso.get": { method: "GET", path: "/v1/projects/{project}/sso", request: "null", reply: "SsoReply", body: null },
   "sso.configure": { method: "POST", path: "/v1/projects/{project}/sso", request: "SsoConfigureRequest", reply: "SsoReply", body: "application/json" },
   "audit.list": { method: "GET", path: "/v1/projects/{project}/audit", request: "null", reply: "AuditLogReply", body: null },

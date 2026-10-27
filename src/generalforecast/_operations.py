@@ -716,16 +716,7 @@ _SCOPED_OPERATIONS = {
     "secrets": frozenset({"list", "create", "get", "rotate", "delete"}),
 }
 
-_ADMIN_ACTIONS = frozenset(
-    {
-        "memberships.list",
-        "memberships.add",
-        "memberships.remove",
-        "sso.get",
-        "sso.configure",
-        "audit.list",
-    }
-)
+_ADMIN_ACTIONS = frozenset({"sso.get", "sso.configure", "audit.list"})
 
 
 def workspace_request(
@@ -825,7 +816,7 @@ def manage(action: str, payload: JsonObject | None) -> Operation[JsonObject]:
         return (
             yield Call(
                 "GET" if reading else "POST",
-                "/" + domain + (f"/{operation}" if operation == "remove" else ""),
+                "/" + domain,
                 "workspace",
                 domain,
                 None if reading else payload,
