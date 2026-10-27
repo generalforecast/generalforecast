@@ -4,7 +4,6 @@
 //! W3C trace context and logging, so one request's logs join up across the
 //! router, the node and the step its queries ran in.
 
-use std::fmt::Write;
 use std::time::Instant;
 
 use tonic::{Code, Request, Status};
@@ -18,12 +17,7 @@ pub struct Trace {
 }
 
 fn random_hex(bytes: usize) -> String {
-    let mut random = vec![0u8; bytes];
-    getrandom::fill(&mut random).expect("the system has randomness");
-    random.iter().fold(String::new(), |mut hex, byte| {
-        let _ = write!(hex, "{byte:02x}");
-        hex
-    })
+    crate::setup::random_hex(bytes).expect("the system has randomness")
 }
 
 fn valid(id: &str, length: usize) -> bool {
@@ -142,12 +136,23 @@ pub fn init_logging() {
     let logs = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(colour(
+            std::io::stderr().is_terminal(),
+            std::env::var_os("NO_COLOR").as_deref(),
+        ))
         .with_writer(std::io::stderr);
     if std::env::var("GF_LOG_FORMAT").is_ok_and(|format| format == "json") {
         logs.json().init();
     } else {
         logs.init();
     }
+}
+
+/// Whether logs are coloured: on a terminal alone, and not where `NO_COLOR`
+/// holds anything, as no-color.org asks.
+#[must_use]
+pub fn colour(terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    terminal && no_color.is_none_or(std::ffi::OsStr::is_empty)
 }
 
 /// The level logged without `GF_LOG`: `warn` on a terminal, `info` elsewhere.

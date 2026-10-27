@@ -72,6 +72,14 @@ impl Assignment {
             if let Some(&g) = s.holders.iter().find(|&&g| g >= gpus) {
                 return Err(format!("slice {i} is held by GPU {g} of {gpus}"));
             }
+            if let Some((at, &g)) = s
+                .holders
+                .iter()
+                .enumerate()
+                .find(|&(at, g)| s.holders[..at].contains(g))
+            {
+                return Err(format!("slice {i} holds GPU {g} twice, as holder {at}"));
+            }
             if contiguous && i > 0 && s.holders[0] < self.slices[i - 1].holders[0] {
                 return Err(format!("slice {i} breaks the run of GPU {}", s.holders[0]));
             }
@@ -176,6 +184,12 @@ mod tests {
         assert_eq!(
             mixed.check(2, true).unwrap_err(),
             "slice 1 breaks the run of GPU 0"
+        );
+        let mut twice = a.clone();
+        twice.slices[3].holders = vec![1, 0, 1];
+        assert_eq!(
+            twice.check(2, false).unwrap_err(),
+            "slice 3 holds GPU 1 twice, as holder 2"
         );
         let mut empty = a;
         empty.slices[2].holders.clear();

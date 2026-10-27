@@ -76,3 +76,26 @@ fn removing_a_node_moves_only_its_tables() {
         }
     }
 }
+
+#[test]
+fn placement_never_changes_between_releases() {
+    // Routers of different versions must agree on where every table lives.
+    let placement = Placement::new(nodes(5));
+    assert_eq!(placement.ranked("payments"), [1, 2, 3, 0, 4]);
+    assert_eq!(placement.ranked("table-7"), [1, 0, 2, 4, 3]);
+    assert_eq!(placement.ranked("clinic"), [2, 1, 4, 3, 0]);
+}
+
+#[test]
+fn a_keys_partition_never_changes_between_releases() {
+    use gf_router::partitions::of;
+    let keys = [
+        0,
+        1,
+        42,
+        u128::MAX,
+        0x0123_4567_89ab_cdef_fedc_ba98_7654_3210,
+    ];
+    let partitions: Vec<usize> = keys.iter().map(|&key| of(key, 7)).collect();
+    assert_eq!(partitions, [0, 6, 3, 0, 3]);
+}

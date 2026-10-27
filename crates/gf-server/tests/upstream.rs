@@ -12,12 +12,12 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
 use futures::StreamExt;
 use gf_core::catalog::Surface;
-use gf_server::http::{Front, Static, owns, router};
-use gf_server::service::RequestBudget;
+use gf_server::budget::RequestBudget;
+use gf_server::http::{Front, Static, dotted, internal, owns, router};
 use gf_server::upstream::Upstream;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -133,33 +133,127 @@ fn client() -> reqwest::Client {
 
 #[test]
 fn the_fronts_routes_are_owned_however_they_are_spelled() {
-    for path in [
-        "/livez",
-        "/readyz",
-        "/v1/projects/p/models",
-        "/v1/projects/p/models/m/infer",
-        "/v1/projects/p/models/",
-        "//v1//projects/p//models",
-        "/V1/Projects/p/Models/m",
-        "/v1/projects/p/predict",
-        "/v1/projects/p/predictors/x/predict",
-        "/v1/projects/p/%6dodels",
+    for (method, path) in [
+        (Method::GET, "/livez"),
+        (Method::GET, "/readyz"),
+        (Method::GET, "/v1/projects/p/models"),
+        (Method::GET, "/v1/projects/p/models/"),
+        (Method::GET, "//v1//projects/p//models"),
+        (Method::GET, "/V1/Projects/p/Models/m"),
+        (Method::POST, "/v1/projects/p/predict"),
+        (Method::POST, "/v1/projects/p/predictors/x/predict"),
+        (Method::POST, "/v1/projects/p/Predictors/x/PREDICT"),
+        (Method::GET, "/v1/projects/p/%6dodels"),
+        (Method::POST, "/v1/proj%65cts/p/predict"),
     ] {
-        assert!(owns(path), "{path}");
+        assert!(owns(&method, path), "{method} {path}");
     }
+    for (method, path) in [
+        (Method::GET, "/"),
+        (Method::GET, "/console"),
+        (Method::GET, "/auth/callback"),
+        (Method::GET, "/v1/projects"),
+        (Method::GET, "/v1/projects/p"),
+        (Method::POST, "/v1/projects/p/keys"),
+        (Method::GET, "/v1/projects/p/contexts/c"),
+        (Method::GET, "/v1/projects/p/environments/e"),
+        (Method::GET, "/v1/projects/p/predictors"),
+        (Method::GET, "/v1/projects/p/predictors/x"),
+        (Method::POST, "/v1/projects/p/predictors"),
+        (Method::DELETE, "/v1/projects/p/predictors/x"),
+        (Method::GET, "/v1/projects/p/predictors/x/revisions"),
+        (
+            Method::POST,
+            "/v1/projects/p/predictors/x/environments/prod/promote",
+        ),
+        (Method::GET, "/v1/projects/p/predictors/x/metrics"),
+        (Method::GET, "/v1/projects/p/predictors/x/predict"),
+        (Method::POST, "/v1/projects/p/models"),
+        (Method::DELETE, "/v1/projects/p/models/m"),
+    ] {
+        assert!(!owns(&method, path), "{method} {path}");
+    }
+}
+
+#[test]
+fn the_control_planes_internal_routes_are_recognized_however_they_are_spelled() {
     for path in [
-        "/",
-        "/console",
-        "/auth/callback",
-        "/v1/projects",
-        "/v1/projects/p",
-        "/v1/projects/p/keys",
-        "/v1/projects/p/contexts/c",
-        "/v1/projects/p/environments/e",
         "/internal/v1/keys:introspect",
+        "//internal/v1/predictions:record",
+        "/INTERNAL/v1/projects/p/predictors/x/revisions/1:lock",
+        "/%69nternal/v1/keys:introspect",
     ] {
-        assert!(!owns(path), "{path}");
+        assert!(internal(path), "{path}");
     }
+    for path in ["/", "/v1/internal", "/internals", "/console/internal"] {
+        assert!(!internal(path), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn hosted_predictor_routes_go_upstream_and_internal_ones_nowhere() {
+    let (origin, front) = origin_and_front().await;
+    // Every step of a predictor's life the clients take through the front,
+    // as `gf push` and the predictor commands call them.
+    let base = "/v1/projects/p/predictors";
+    for (method, path) in [
+        ("POST", base.to_string()),
+        ("GET", base.to_string()),
+        ("GET", format!("{base}/churn")),
+        ("POST", format!("{base}/churn/revisions")),
+        ("GET", format!("{base}/churn/revisions")),
+        ("GET", format!("{base}/churn/revisions/3")),
+        ("GET", format!("{base}/churn/environments")),
+        ("GET", format!("{base}/churn/environments/production")),
+        (
+            "POST",
+            format!("{base}/churn/environments/production/promote"),
+        ),
+        (
+            "POST",
+            format!("{base}/churn/environments/production/rollback"),
+        ),
+        (
+            "GET",
+            format!("{base}/churn/environments/production/metrics"),
+        ),
+        ("GET", format!("{base}/churn/environments/production/logs")),
+        ("POST", format!("{base}/churn/delete")),
+        ("DELETE", format!("{base}/churn")),
+    ] {
+        let response = client()
+            .request(method.parse().unwrap(), format!("{front}{path}"))
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap();
+        assert!(
+            response.headers().contains_key("x-upstream"),
+            "{method} {path}"
+        );
+        let echo: Value = response.json().await.unwrap();
+        assert_eq!(
+            (&echo["method"], &echo["target"]),
+            (&json!(method), &json!(path)),
+            "forwarded as sent"
+        );
+    }
+    let forwarded = origin.hits.load(Ordering::SeqCst);
+    for path in [
+        "/internal/v1/keys:introspect",
+        "/%69nternal/v1/predictions:record",
+    ] {
+        let response = client()
+            .post(format!("{front}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        let body: Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "NotFound");
+    }
+    assert_eq!(origin.hits.load(Ordering::SeqCst), forwarded);
 }
 
 #[tokio::test]
@@ -321,10 +415,13 @@ async fn inference_routes_are_never_proxied() {
     let (origin, front) = origin_and_front().await;
     for (method, path) in [
         ("GET", "/v1/projects/local/models"),
-        ("POST", "/v1/projects/local/models/m/infer"),
         ("POST", "/v1/projects/local/predict"),
         ("POST", "/v1/projects/local/predictors/x/predict"),
-        ("DELETE", "/v1/projects/local/models/m"),
+        (
+            "POST",
+            "/v1/projects/local/predictors/x/predict?env=staging",
+        ),
+        ("GET", "/v1/projects/local/models/m"),
         ("GET", "/v1/projects/local/models/"),
         ("GET", "/readyz"),
     ] {
@@ -367,4 +464,50 @@ async fn the_upstream_is_ready_only_while_its_readyz_answers_200() {
     )
     .unwrap();
     assert!(!upstream.ready().await);
+}
+
+#[test]
+fn dot_segments_are_recognized_however_they_are_escaped() {
+    for path in [
+        "/./internal/v1/keys:introspect",
+        "/%2e/internal/v1/keys:introspect",
+        "/v1/../internal/v1/keys:introspect",
+        "/v1/projects/p/x/%2E%2e/predict",
+    ] {
+        assert!(dotted(path), "{path}");
+    }
+    for path in [
+        "/v1/projects/p/predict",
+        "/v1/projects/p/.hidden",
+        "/v1/projects/p/a..b",
+    ] {
+        assert!(!dotted(path), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn no_spelling_of_a_route_reaches_the_upstream_as_another() {
+    let (origin, front) = origin_and_front().await;
+    for path in [
+        "/./internal/v1/keys:introspect",
+        "/%2e/internal/v1/keys:introspect",
+        "/v1/../internal/v1/keys:introspect",
+        "/v1/projects/p/x/../predict",
+        "/v1/proj%65cts/p/predict",
+    ] {
+        // Sent as written, without the client resolving its dot segments.
+        let mut stream = tokio::net::TcpStream::connect(front.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).await.unwrap();
+        assert!(!answer.contains("x-upstream"), "{path}: {answer}");
+        assert!(answer.starts_with("HTTP/1.1 4"), "{path}: {answer}");
+    }
+    assert_eq!(origin.hits.load(Ordering::SeqCst), 0);
 }

@@ -3,7 +3,9 @@ name: Release
 # Builds wheels for macOS on Apple silicon and Linux on x86_64 and arm64, with
 # the versioned gf-native client. A v* tag that matches pyproject.toml's version
 # publishes them to PyPI through Trusted Publishing and attaches them to the
-# tag's GitHub release. Actions are pinned by commit.
+# tag's GitHub release. Wheels are built only once every CI check passes on
+# the tagged tree, and nothing is published, attached or uploaded until the
+# tests marked slow pass too. Actions are pinned by commit.
 
 on:
   push:
@@ -11,6 +13,22 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Every job of ci.yml, whatever the tag's commit changed.
+  checks:
+    uses: ./.github/workflows/ci.yml
+    with:
+      everything: true
+    permissions:
+      actions: read
+      contents: read
+      pull-requests: read
+
+  # The tests marked slow, which compile models and start servers.
+  slow:
+    uses: ./.github/workflows/weekly.yml
+    permissions:
+      contents: read
+
   version:
     runs-on: ubuntu-latest
     permissions:
@@ -27,7 +45,7 @@ jobs:
           fi
 
   wheels:
-    needs: version
+    needs: [version, checks]
     strategy:
       fail-fast: false
       matrix:
@@ -93,7 +111,7 @@ jobs:
           if-no-files-found: error
 
   assets:
-    needs: wheels
+    needs: [wheels, slow]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -113,7 +131,7 @@ jobs:
           gh release upload "$GITHUB_REF_NAME" dist/*.whl --clobber --repo "$GITHUB_REPOSITORY"
 
   pypi:
-    needs: wheels
+    needs: [wheels, slow]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     environment:
@@ -134,7 +152,7 @@ jobs:
   # Bundles are keyed by the traced code and JAX, so a release that changes
   # neither finds its bundles already there and builds nothing.
   compiled:
-    needs: wheels
+    needs: [wheels, slow]
     strategy:
       fail-fast: false
       matrix:

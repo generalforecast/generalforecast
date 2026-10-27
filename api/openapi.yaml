@@ -12,6 +12,13 @@ info:
     predict). Model ids are always `general-forecast/<name>`; a bare name is
     refused with a hint naming the canonical id.
 
+    Routes under `/v1` outside a project, such as `/v1/projects`,
+    `/v1/workspaces` and `/v1/auth/status`, still name the client's project:
+    in the envelope, and in an `X-GF-Project` header that must match it. Two
+    hosted routes sit outside the envelope as health does: the CLI login,
+    `x-gf-envelope: false`, and the Arrow upload `POST /snapshots`, whose
+    body is a stream and whose reply is enveloped.
+
     `api/generate.py` emits `src/generalforecast/_api.py` and
     `clients/typescript/src/types.ts` from this file; `tests/conformance`
     checks every example here against its schema and, with
@@ -52,6 +59,14 @@ paths:
       parameters:
         - $ref: "#/components/parameters/project"
         - $ref: "#/components/parameters/predictor"
+        - name: env
+          in: query
+          required: false
+          description: |
+            the environment whose revision scores the queries; `production` when
+            left out. A declared predictor on gf serve has no environments and
+            takes none.
+          schema: {type: string, pattern: "^[a-z][a-z0-9-]{0,62}$", default: production}
       requestBody:
         required: true
         content:
@@ -387,6 +402,45 @@ paths:
                             - {predictor: churn, name: production, revision: 7, generation: 9, runtime: hosted, status: ready}
                           serving: {loaded: true, compiled: true, warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]}
 
+    post:
+      operationId: predictors.create
+      tags: [hosted]
+      summary: create a predictor's name, before any revision
+      description: |
+        Idempotent: creating a name that exists answers as the first create did,
+        and makes no revision and readies no environment. A deleted predictor's
+        name is not made again.
+      parameters:
+        - $ref: "#/components/parameters/project"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PredictorCreateRequest"
+            examples:
+              created:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-9b92cd2a0bbf3740455d8b5c8e7c06b8
+                  resource: {kind: predictor, name: churn}
+                  payload: {name: churn}
+      responses:
+        "200":
+          description: the predictor's name
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PredictorCreatedReply"
+              examples:
+                created:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-9b92cd2a0bbf3740455d8b5c8e7c06b8
+                    resource: {kind: predictor, name: churn}
+                    result: {name: churn}
   /v1/projects/{project}/predictors/{name}:
     get:
       operationId: predictors.get
@@ -493,6 +547,67 @@ paths:
                           limits: {context_rows: 100000, queries: 100, inputs: 32}
                           warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]
 
+  /v1/projects/{project}/models/{model}:
+    get:
+      operationId: models.get
+      tags: [models]
+      summary: show one model of the catalog with its limits
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/model"
+      responses:
+        "200":
+          description: the model, as the catalog lists it
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelReply"
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-b3c4d5e6f708192a3b4c5d6e7f8091a2
+                    resource: {kind: model, name: tabicl-v2-classifier}
+                    result:
+                      model: general-forecast/tabicl-v2-classifier@sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                      name: general-forecast/tabicl-v2-classifier
+                      task: classification
+                      repository: general-forecast/tabicl-v2-classifier
+                      revision: 5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b
+                      license: BSD-3-Clause
+                      runtime: cpu
+                      artifact:
+                        repository: general-forecast/tabicl-v2-classifier
+                        revision: 5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b
+                        digest: sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                        license: BSD-3-Clause
+                        digest_format: sha256-of-sorted-compact-json-file-sha256-map
+                        files: {LICENSE: 4f90c5fa25a2b7883d6235c7f0b11f942a37859b9f89ac36157cc485329913b4, config.json: 7ec2941cc537535e1bd8f37d33fc97cea97953343d69d765a261ee6a1605d937, model.safetensors: 58f5fc1f276744f721974079c19d2f67efacc39083c54483fe3feba52297d253}
+                      artifact_verification: required-before-load
+                      bounds: {context_rows: 100000, query_rows: 100, features: 32, classes: 10, quantile_step: null, codes: 8, estimators: 8, members: 16}
+                      capabilities:
+                        - {name: classification, state: supported}
+                        - {name: request-context, state: supported}
+                      limits: {context_rows: 100000, queries: 100, inputs: 32}
+                      warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]
+        "404":
+          description: the server serves no model of that name
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorReply"
+              examples:
+                missing:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-c4d5e6f708192a3b4c5d6e7f8091a2b3
+                    resource: {kind: model, name: nothing}
+                    error:
+                      code: NotFound
+                      message: model is not served here
+
   /healthz:
     get:
       operationId: health
@@ -557,6 +672,28 @@ paths:
                       code: ModelNotReady
                       message: general-forecast/tabicl-v2-classifier is compiling 12 programs
                       hint: poll /readyz until it answers 200
+
+  /livez:
+    get:
+      operationId: live
+      tags: [health]
+      security: []
+      summary: 200 while the process answers, whether or not its models are ready
+      description: |
+        Liveness has no project and so no envelope. It answers 200 from the
+        moment the server listens, while models still load or compile, so a
+        supervisor restarts a process that stops answering without waiting
+        on one that is only warming up; `/healthz` says when it is ready.
+      responses:
+        "200":
+          description: the process answers
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+              examples:
+                live:
+                  value: {status: ok}
 
   # ---------------------------------------------------------------------------
   # Hosted control plane. These are the resources `gf admin`, `gf push`,
@@ -1486,6 +1623,1806 @@ paths:
                     resource: {kind: context, name: customers}
                     result: {context: customers, write_id: 2026-10-31T05:00:00Z-labels-1, operation: label, rows: 2, sequence: 2314, accepted_at: 1762000000.0, durably_accepted: true}
 
+  /v1/projects/{project}/contexts/{name}/imports:
+    post:
+      operationId: contexts.imports
+      tags: [hosted]
+      summary: bind a cloud or uploaded table to a live context and import it
+      description: |
+        The table replaces the context's rows as one checkpoint, and the binding is
+        kept for `refresh`. `source` is `upload://<digest>` for a table sent to
+        `POST /snapshots`, or a cloud location the operator configured; `mapping`
+        renames source columns to the context's, as `[context column, source
+        column]` pairs. A retry of the same import answers as the first did.
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/context"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContextImportRequest"
+            examples:
+              imported:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-a032cc3b0fe7bf79f57751df525231ae
+                  resource: {kind: context, name: customers}
+                  payload:
+                    context: customers
+                    source: upload://sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e
+                    format: arrow
+                    digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e
+                    mapping: []
+      responses:
+        "200":
+          description: the checkpoint the import wrote
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportReceiptReply"
+              examples:
+                imported:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-a032cc3b0fe7bf79f57751df525231ae
+                    resource: {kind: context, name: customers}
+                    result:
+                      context: customers
+                      digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e
+                      rows: 1840
+                      sequence: 2315
+                      accepted_at: 1762000100.0
+                      receipt: {project: acme, context: customers, write_id: import/r-1, operation: checkpoint, sequence: 2315, accepted_at: 1762000100.0, durably_accepted: true, changes: [], retry_valid_until: null}
+                      mode: explicit-refresh
+                      continuous: false
+
+  /v1/projects/{project}/contexts/{name}/refresh:
+    post:
+      operationId: contexts.refresh
+      tags: [hosted]
+      summary: import a live context's bound source again
+      description: |
+        An explicit refresh of the source `imports` bound, never a poll: the
+        reply says `continuous: false`.
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/context"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyRequest"
+            examples:
+              refreshed:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-b5b56e5480e6d0fc043ebb2d6ad80341
+                  resource: {kind: context, name: customers}
+                  payload: {}
+      responses:
+        "200":
+          description: the checkpoint the refresh wrote
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ImportReceiptReply"
+              examples:
+                refreshed:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-b5b56e5480e6d0fc043ebb2d6ad80341
+                    resource: {kind: context, name: customers}
+                    result:
+                      context: customers
+                      digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e
+                      rows: 1840
+                      sequence: 2315
+                      accepted_at: 1762000100.0
+                      receipt: {project: acme, context: customers, write_id: import/r-1, operation: checkpoint, sequence: 2315, accepted_at: 1762000100.0, durably_accepted: true, changes: [], retry_valid_until: null}
+                      mode: explicit-refresh
+                      continuous: false
+
+  /v1/projects/{project}/contexts/{name}/mutations:
+    post:
+      operationId: contexts.mutate
+      tags: [hosted]
+      summary: write one atomic batch of observation changes to a live context
+      description: |
+        1 to 100 records, all applied or none. A correction names the version it
+        replaces, so a stale one is refused. A retry under the same `write_id`
+        answers with the first receipt; one with other content is a conflict.
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/context"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MutationRequest"
+            examples:
+              corrected:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-2ec31c6a891dad1dfafd61a15da14d70
+                  resource: {kind: context, name: customers}
+                  payload:
+                    write_id: 2026-10-31T06:00:00Z-fix-1
+                    operation: correct_features
+                    records:
+                      - {key: '1041', features: {spend: 85.0}, expected_feature_version: 3}
+      responses:
+        "200":
+          description: durable acceptance, not serving visibility
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AcceptedWriteReply"
+              examples:
+                corrected:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-2ec31c6a891dad1dfafd61a15da14d70
+                    resource: {kind: context, name: customers}
+                    result:
+                      project: acme
+                      context: customers
+                      write_id: 2026-10-31T06:00:00Z-fix-1
+                      operation: correct_features
+                      sequence: 2316
+                      accepted_at: 1762000200.0
+                      durably_accepted: true
+                      changes:
+                        - {key: '1041', feature_version: 4, label_versions: {}}
+                      retry_valid_until: null
+
+  /v1/projects/{project}/contexts/{name}/snapshot:
+    post:
+      operationId: contexts.snapshot
+      tags: [hosted]
+      summary: read a live context's rows for one target as known at an instant
+      description: |
+        Reconstructed from retained component events: `knowledge_at` is when the
+        writes were accepted, now if left out, and `event_before` keeps only rows
+        whose `event_at` precedes it. Rows still waiting on their features count
+        in `source_wait_count`.
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/context"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ContextSnapshotQueryRequest"
+            examples:
+              known:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-3372ecc460d1df65d840161b5c67a2bb
+                  resource: {kind: context, name: customers}
+                  payload: {target: churned, knowledge_at: 1762000000.0}
+      responses:
+        "200":
+          description: the rows as known then
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ContextSnapshotReply"
+              examples:
+                known:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-3372ecc460d1df65d840161b5c67a2bb
+                    resource: {kind: context, name: customers}
+                    result:
+                      project: acme
+                      context: customers
+                      target: churned
+                      features: [spend, plan]
+                      through_sequence: 2314
+                      knowledge_at: 1762000000.0
+                      event_before: null
+                      rows:
+                        - {key: '1041', features: {spend: 82.5}, label: 0, feature_version: 3, label_version: 1, feature_accepted_at: 1761990000.0, label_accepted_at: 1762000000.0, event_at: null}
+                      source_wait_count: 0
+                      pending_processing_count: 0
+                      oldest_unprocessed_at: null
+
+  /v1/projects/{project}/sources:
+    get:
+      operationId: sources.list
+      tags: [hosted]
+      summary: list the project's pinned sources
+      parameters:
+        - $ref: "#/components/parameters/project"
+      responses:
+        "200":
+          description: every pin, without the paths it was read from
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SourceListReply"
+              examples:
+                listed:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-1d92347877ec03ff1e4e7c28292e1a75
+                    resource: {kind: source, name: sources}
+                    result:
+                      sources:
+                        - {source_id: source-8f1b2c3d4e5f60718293a4b5c6d7e8f9, digest: sha256:9a7f6b4c2d1e0f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a, size_bytes: 482113, format: csv, mapping: {key: customer_id, features: {spend: spend, plan: plan}, labels: {churned: churned}, label_types: {churned: boolean}}}
+    post:
+      operationId: sources.pin
+      tags: [hosted]
+      summary: pin a file under the server's import root
+      description: |
+        Copies at most 8 MiB from `path`, relative to the project's directory under
+        the root the operator configured, into durable storage before it answers,
+        so the pin stays readable whatever later happens to the file. It is not an
+        upload of a client-side path. CSV needs a `mapping`; a CSV label needs its
+        type in `mapping.label_types`.
+      parameters:
+        - $ref: "#/components/parameters/project"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SourcePinRequest"
+            examples:
+              pinned:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-533ac5f0006f43b29ff6a25e0cc5d8cc
+                  resource: {kind: source, name: new}
+                  payload: {path: exports/customers.csv, format: csv, mapping: {key: customer_id, features: {spend: spend, plan: plan}, labels: {churned: churned}, label_types: {churned: boolean}}}
+      responses:
+        "200":
+          description: the immutable pin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SourcePinReply"
+              examples:
+                pinned:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-533ac5f0006f43b29ff6a25e0cc5d8cc
+                    resource: {kind: source, name: new}
+                    result: {source_id: source-8f1b2c3d4e5f60718293a4b5c6d7e8f9, digest: sha256:9a7f6b4c2d1e0f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a, size_bytes: 482113, format: csv, mapping: {key: customer_id, features: {spend: spend, plan: plan}, labels: {churned: churned}, label_types: {churned: boolean}}}
+
+  /v1/projects/{project}/sources/{source}:
+    get:
+      operationId: sources.get
+      tags: [hosted]
+      summary: show one pinned source
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/source"
+      responses:
+        "200":
+          description: the pin
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SourcePinReply"
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-476221ed16eb59cbcca3d5380fa0a0ab
+                    resource: {kind: source, name: source-8f1b2c3d4e5f60718293a4b5c6d7e8f9}
+                    result: {source_id: source-8f1b2c3d4e5f60718293a4b5c6d7e8f9, digest: sha256:9a7f6b4c2d1e0f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a, size_bytes: 482113, format: csv, mapping: {key: customer_id, features: {spend: spend, plan: plan}, labels: {churned: churned}, label_types: {churned: boolean}}}
+
+  /v1/projects/{project}/snapshots:
+    post:
+      operationId: snapshots.upload
+      tags: [hosted]
+      summary: upload a table as an Arrow stream, for a context or a revision to name by digest
+      description: |
+        The body is an Arrow IPC stream, not an envelope, so the request id
+        and project ride in headers; the reply is enveloped as any other.
+        At most 100,000 rows and 32 MiB. The digest is of the normalized
+        table, so a client can check it against its own.
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - name: X-GF-Request-ID
+          in: header
+          required: true
+          schema: {type: string, minLength: 1, maxLength: 128}
+        - name: X-GF-Project
+          in: header
+          required: true
+          schema: {$ref: "#/components/schemas/Name"}
+      requestBody:
+        required: true
+        content:
+          application/vnd.apache.arrow.stream:
+            schema: {type: string, format: binary}
+      responses:
+        "200":
+          description: the stored table's digest and row count
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UploadReceiptReply"
+              examples:
+                uploaded:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-1c4524901f88a3b4730006b3bf14c7fc
+                    resource: {kind: context, name: snapshots}
+                    result: {digest: 'sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e', rows: 1840}
+
+  /v1/auth/status:
+    get:
+      operationId: auth.status
+      tags: [hosted]
+      summary: who the credential acts for, and what the server offers
+      description: |
+        The credential's principal, the sign-in providers and capabilities the
+        server has configured, and the permissions keys may be granted. An API key
+        also shows itself, and, for a key `gf login` minted, the email, machine and
+        workspace it was approved for. Like every route under `/v1` outside a
+        project, it names the client's project in the envelope and in
+        `X-GF-Project`.
+      responses:
+        "200":
+          description: the credential and the server
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthStatusReply"
+              examples:
+                signed-in:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-753345f08b0c2044ea63a96b5f4fa2ef
+                    resource: {kind: workspace, name: auth}
+                    result:
+                      authenticated: true
+                      principal: {kind: api-key, id: key-0f1e2d3c4b5a69788796, project: acme}
+                      google: configured
+                      sign_in: [google, github]
+                      secrets: configured
+                      capabilities:
+                        - {name: api-keys, state: supported}
+                        - {name: enterprise-sso, state: unsupported, code: EnterpriseSSOUnavailable, reason: per-company IdP connections are not implemented}
+                      permission_inventory:
+                        - {name: predictors:predict, description: Predict with predictors, enforced: true, roles: [admin, editor, scorer]}
+                        - {name: sso:write, description: Reserved; SSO changes need an account admin, enforced: false, roles: [admin]}
+                      bootstrap: consumed
+                      key: {id: key-0f1e2d3c4b5a69788796, name: cli-tejas-mbp, project: acme, expires_at: 1769076000.0}
+                      email: tejas@example.com
+                      machine: tejas-mbp
+                      workspace: {id: acme-inc, display_name: Acme Inc}
+
+  /v1/auth/logout:
+    post:
+      operationId: auth.logout
+      tags: [hosted]
+      summary: revoke the API key making the call
+      description: |
+        Only an API key logs itself out; a session signs out in the browser.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmptyRequest"
+            examples:
+              revoked:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-572966fc61903ddb46efd58be0032003
+                  resource: {kind: workspace, name: auth}
+                  payload: {}
+      responses:
+        "200":
+          description: the key revoked
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoggedOutReply"
+              examples:
+                revoked:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-572966fc61903ddb46efd58be0032003
+                    resource: {kind: workspace, name: auth}
+                    result: {revoked: key-0f1e2d3c4b5a69788796}
+
+  /v1/workspace:
+    get:
+      operationId: workspace.get
+      tags: [hosted]
+      summary: the projects the credential reaches, and their organizations
+      responses:
+        "200":
+          description: the projects and organizations
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectListReply"
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-290c1c3ee75af7508e86deadeda31e81
+                    resource: {kind: workspace, name: workspace}
+                    result:
+                      projects:
+                        - {name: acme, organization: acme-inc}
+                      organizations: [acme-inc]
+
+  /v1/organizations:
+    get:
+      operationId: organizations.list
+      tags: [hosted]
+      summary: list the organizations of the projects the credential reaches
+      responses:
+        "200":
+          description: the organizations
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrganizationListReply"
+              examples:
+                listed:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-3f8fbc84b8805a5c40bbca36eab6bac2
+                    resource: {kind: workspace, name: organizations}
+                    result:
+                      organizations:
+                        - {name: acme-inc, account: acme-inc}
+    post:
+      operationId: organizations.create
+      tags: [hosted]
+      summary: create an organization in a workspace the caller administers
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OrganizationCreateRequest"
+            examples:
+              created:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-f98750143ca4aeca3da94b0bca2be5f3
+                  resource: {kind: workspace, name: research}
+                  payload: {name: research, account: acme-inc}
+      responses:
+        "200":
+          description: the organization
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrganizationReply"
+              examples:
+                created:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-f98750143ca4aeca3da94b0bca2be5f3
+                    resource: {kind: workspace, name: research}
+                    result: {name: research, account: acme-inc}
+
+  /v1/projects/{project}/memberships:
+    get:
+      operationId: memberships.list
+      tags: [hosted]
+      summary: list who holds a role in the project, its organization or its account
+      parameters:
+        - $ref: "#/components/parameters/project"
+      responses:
+        "200":
+          description: the memberships
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MembershipListReply"
+              examples:
+                listed:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-d0049e7f12a1f447bc46dd944dcf9daf
+                    resource: {kind: workspace, name: memberships}
+                    result:
+                      memberships:
+                        - {issuer: https://accounts.google.com, subject: '108234567890123456789', scope_kind: project, scope_id: acme, role: editor}
+    post:
+      operationId: memberships.add
+      tags: [hosted]
+      summary: grant a role, or change one, in a scope the caller administers
+      parameters:
+        - $ref: "#/components/parameters/project"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MembershipAddRequest"
+            examples:
+              granted:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-62b535ae22f717bbc1f13fd465f8bab5
+                  resource: {kind: workspace, name: memberships}
+                  payload: {issuer: https://accounts.google.com, subject: '108234567890123456789', scope_kind: project, scope_id: acme, role: editor}
+      responses:
+        "200":
+          description: the membership as it stands
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MembershipChangedReply"
+              examples:
+                granted:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-62b535ae22f717bbc1f13fd465f8bab5
+                    resource: {kind: workspace, name: memberships}
+                    result: {issuer: https://accounts.google.com, subject: '108234567890123456789', scope_kind: project, scope_id: acme, removed: false}
+
+  /v1/projects/{project}/memberships/remove:
+    post:
+      operationId: memberships.remove
+      tags: [hosted]
+      summary: remove a membership; an account keeps its last administrator
+      parameters:
+        - $ref: "#/components/parameters/project"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MembershipRemoveRequest"
+            examples:
+              removed:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-3627a77019d30938b7bd08983ffe0019
+                  resource: {kind: workspace, name: memberships}
+                  payload: {issuer: https://accounts.google.com, subject: '108234567890123456789', scope_kind: project, scope_id: acme}
+      responses:
+        "200":
+          description: the membership removed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MembershipChangedReply"
+              examples:
+                removed:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-3627a77019d30938b7bd08983ffe0019
+                    resource: {kind: workspace, name: memberships}
+                    result: {issuer: https://accounts.google.com, subject: '108234567890123456789', scope_kind: project, scope_id: acme, removed: true}
+
+  /v1/projects/{project}/sso:
+    get:
+      operationId: sso.get
+      tags: [hosted]
+      summary: whether the project's organization requires single sign-on
+      parameters:
+        - $ref: "#/components/parameters/project"
+      responses:
+        "200":
+          description: the organization's single sign-on
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SsoReply"
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-a8b219703af3956e876f8a2f377e2548
+                    resource: {kind: workspace, name: sso}
+                    result: {organization: acme-inc, provider: google, providers: [google, github], enabled: true, configured: true, membership_required: true}
+    post:
+      operationId: sso.configure
+      tags: [hosted]
+      summary: require single sign-on for the project's organization, or stop
+      parameters:
+        - $ref: "#/components/parameters/project"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SsoConfigureRequest"
+            examples:
+              enabled:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-2cf9d4ef9cf504e970f5f8d78efb81f6
+                  resource: {kind: workspace, name: sso}
+                  payload: {enabled: true}
+      responses:
+        "200":
+          description: the organization's single sign-on
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SsoReply"
+              examples:
+                enabled:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-2cf9d4ef9cf504e970f5f8d78efb81f6
+                    resource: {kind: workspace, name: sso}
+                    result: {organization: acme-inc, provider: google, providers: [google, github], enabled: true, configured: true, membership_required: true}
+
+  /v1/projects/{project}/audit:
+    get:
+      operationId: audit.list
+      tags: [hosted]
+      summary: read the project's audit log, oldest first
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - name: after
+          in: query
+          required: false
+          description: the last sequence already read
+          schema: {type: integer, minimum: 0, maximum: 9007199254740991, default: 0}
+        - name: limit
+          in: query
+          required: false
+          schema: {type: integer, minimum: 1, maximum: 100, default: 100}
+      responses:
+        "200":
+          description: events after `after`, at most `limit`
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditLogReply"
+              examples:
+                read:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-393b39b55760592e1f8fb2b1a3292ea1
+                    resource: {kind: workspace, name: audit}
+                    result:
+                      events:
+                        - {sequence: 412, at: 1762000000.0, actor: 'api-key:key-0f1e2d3c4b5a69788796', project: acme, action: keys.create, target: key-0a1b2c3d4e5f6a7b8c9d, outcome: allowed}
+
+  /v1/cli-logins:
+    post:
+      operationId: logins.start
+      tags: [hosted]
+      x-gf-envelope: false
+      security: []
+      summary: start a CLI login, to approve in a signed-in browser
+      description: |
+        The device flow of RFC 8628, outside the envelope: no credential, no
+        project. The user opens `verification_uri_complete`, signs in and approves
+        the code, while the CLI polls `/v1/cli-logins/token` every `interval`
+        seconds with `device_code`, the only credential the login has.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CliLoginStart"
+            examples:
+              login:
+                value: {machine: tejas-mbp}
+      responses:
+        "200":
+          description: the next step of the login
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CliLoginGrant"
+              examples:
+                login:
+                  value:
+                    device_code: gf_dc_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG
+                    user_code: WDJB-MJHT
+                    verification_uri: https://app.generalforecast.com/cli
+                    verification_uri_complete: https://app.generalforecast.com/cli?code=WDJB-MJHT
+                    expires_in: 600
+                    interval: 5
+        "429":
+          description: "too many logins are pending; try again shortly"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginErrorReply"
+
+  /v1/cli-logins/token:
+    post:
+      operationId: logins.token
+      tags: [hosted]
+      x-gf-envelope: false
+      security: []
+      summary: redeem an approved CLI login for an API key, once
+      description: |
+        Until the browser decides, a poll answers 400 with the reason
+        `authorization_pending`, or `slow_down` when it comes sooner than
+        `interval` allows, which then grows by 5 seconds. A denied login answers
+        403 with `access_denied`, and an expired or redeemed code 400 with
+        `expired_token`. An approved one answers once with the key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CliLoginPoll"
+            examples:
+              login:
+                value: {device_code: gf_dc_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG}
+      responses:
+        "200":
+          description: the next step of the login
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CliLoginToken"
+              examples:
+                login:
+                  value:
+                    access_token: gf_0123456789abcdefghijklmnopqrstuvwxyzABCDEFG
+                    token_type: bearer
+                    key: {id: key-0f1e2d3c4b5a69788796aabb, name: cli-tejas-mbp, project: acme, expires_at: 1769076000.0}
+                    email: tejas@example.com
+                    workspace: {id: acme-inc, display_name: Acme Inc}
+                    project: acme
+        "400":
+          description: "not yet, too soon, or no longer: the error's reason says which"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LoginErrorReply"
+              examples:
+                refused:
+                  value:
+                    error: {code: Unauthorized, message: waiting for browser approval, reason: authorization_pending}
+
+  /v1/onboarding:
+    get:
+      operationId: onboarding.get
+      tags: [hosted]
+      summary: "where the signed-in person stands: workspaces, joinable workspaces and sign-up"
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      responses:
+        "200":
+          description: "where the signed-in person stands: workspaces, joinable workspaces and sign-up"
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/OnboardingReply"}
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-1d17aaf8488c36092cc82f37faaa0f0a
+                    resource: {kind: workspace, name: onboarding}
+                    result:
+                      state: member
+                      profile: {email: ana@acme.com, email_domain: acme.com, display_name: Ana Silva, personal_domain: false}
+                      workspaces:
+                        - workspace: ws-3f9a1c2b4d5e6f70
+                          display_name: Acme
+                          role: admin
+                          admin: true
+                          default_project: acme
+                          projects: [acme]
+                      discovered: []
+                      requests: []
+                      can_create_workspace: true
+                      signup: open
+                      workspace_name: null
+                      sign_in_url: /auth/google
+  /v1/workspaces:
+    get:
+      operationId: workspaces.list
+      tags: [hosted]
+      summary: list the workspaces the signed-in person belongs to
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      responses:
+        "200":
+          description: list the workspaces the signed-in person belongs to
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WorkspaceListReply"}
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-13e24f64206aa4a088524033a8e60f6e
+                    resource: {kind: workspace, name: workspaces}
+                    result:
+                      workspaces:
+                        - workspace: ws-3f9a1c2b4d5e6f70
+                          display_name: Acme
+                          role: admin
+                          admin: true
+                          default_project: acme
+                          projects: [acme]
+        "401":
+          description: an API key or no session; the reason says which
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorReply"}
+              examples:
+                key:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-9579a3d4260501649746362f1ce8cce0
+                    resource: {kind: workspace, name: workspaces}
+                    error: {code: Unauthorized, message: this operation requires a signed-in browser session, reason: session_required}
+    post:
+      operationId: workspaces.create
+      tags: [hosted]
+      summary: create a workspace with its organization and a first project
+      description: "Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`. The request id makes it idempotent: a retry answers with the same workspace and `created: false`."
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/WorkspaceCreateRequest"}
+            examples:
+              create:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-731e53c80de7ec6efabcec3f76095a38
+                  resource: {kind: workspace, name: new}
+                  payload: {display_name: Acme}
+      responses:
+        "200":
+          description: create a workspace with its organization and a first project
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WorkspaceCreatedReply"}
+              examples:
+                create:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-731e53c80de7ec6efabcec3f76095a38
+                    resource: {kind: workspace, name: new}
+                    result:
+                      workspace:
+                        workspace: ws-3f9a1c2b4d5e6f70
+                        display_name: Acme
+                        role: admin
+                        admin: true
+                        default_project: acme
+                        projects: [acme]
+                      organization: org-8a7b6c5d4e3f2a10
+                      created: true
+  /v1/workspaces/{workspace}:
+    get:
+      operationId: workspaces.get
+      tags: [hosted]
+      summary: show a workspace the caller belongs to
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+      responses:
+        "200":
+          description: show a workspace the caller belongs to
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WorkspaceDetailsReply"}
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-cb1e8206837ed0d49ea0d40fed3790a0
+                    resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                    result:
+                      workspace: ws-3f9a1c2b4d5e6f70
+                      display_name: Acme
+                      role: admin
+                      admin: true
+                      default_project: acme
+                      projects: [acme]
+                      organization: org-8a7b6c5d4e3f2a10
+                      created_at: 1767225600.0
+        "404":
+          description: the caller belongs to no such workspace
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorReply"}
+              examples:
+                missing:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-162922841374d690ee5f3e1fba82e754
+                    resource: {kind: workspace, name: ws-0000000000000000}
+                    error: {code: NotFound, message: workspace not found}
+    post:
+      operationId: workspaces.update
+      tags: [hosted]
+      summary: rename a workspace; admins only
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/WorkspaceRenameRequest"}
+            examples:
+              update:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-ff74c94bedd35592403bdf956a7c3e82
+                  resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                  payload: {workspace: ws-3f9a1c2b4d5e6f70, display_name: Acme Labs}
+      responses:
+        "200":
+          description: rename a workspace; admins only
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WorkspaceSummaryReply"}
+              examples:
+                update:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-ff74c94bedd35592403bdf956a7c3e82
+                    resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                    result:
+                      workspace: ws-3f9a1c2b4d5e6f70
+                      display_name: Acme Labs
+                      role: admin
+                      admin: true
+                      default_project: acme
+                      projects: [acme]
+  /v1/workspaces/{workspace}/join:
+    post:
+      operationId: workspaces.join
+      tags: [hosted]
+      summary: ask to join a workspace that admits the caller's email domain
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/WorkspaceRefRequest"}
+            examples:
+              join:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-9b5a2a4ca04b8e4b22a53047b74bfb26
+                  resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                  payload: {workspace: ws-3f9a1c2b4d5e6f70}
+      responses:
+        "200":
+          description: ask to join a workspace that admits the caller's email domain
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WorkspaceJoinReply"}
+              examples:
+                join:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-9b5a2a4ca04b8e4b22a53047b74bfb26
+                    resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                    result:
+                      status: pending
+                      workspace: null
+                      request: {id: jr-1a2b3c4d5e6f7a8b, workspace: ws-3f9a1c2b4d5e6f70, display_name: Acme, state: pending, created_at: 1767225720.0, decided_at: null}
+  /v1/workspaces/{workspace}/members:
+    get:
+      operationId: workspaces.members
+      tags: [hosted]
+      summary: list the workspace's memberships; admins only
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+      responses:
+        "200":
+          description: list the workspace's memberships; admins only
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WorkspaceMemberListReply"}
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-b9bfe1f1614518229230fc0e4fd8b480
+                    resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                    result:
+                      members:
+                        - {issuer: "https://accounts.google.com", subject: "109876543210987654321", email: ana@acme.com, name: Ana Silva, scope_kind: account, scope_id: ws-3f9a1c2b4d5e6f70, role: admin}
+                        - {issuer: "https://accounts.google.com", subject: "112233445566778899001", email: sam@acme.com, name: Sam Rivera, scope_kind: project, scope_id: acme, role: viewer}
+  /v1/workspaces/{workspace}/members/role:
+    post:
+      operationId: members.update
+      tags: [hosted]
+      summary: change a member's workspace role; admins only, and a workspace keeps one admin
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/MemberRoleChangeRequest"}
+            examples:
+              update:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-8c54324f75cbf7aac8a65a4ed0055039
+                  resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                  payload: {workspace: ws-3f9a1c2b4d5e6f70, issuer: "https://accounts.google.com", subject: "112233445566778899001", role: editor}
+              last:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-5a72187fe651854b89616512d6c55f30
+                  resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                  payload: {workspace: ws-3f9a1c2b4d5e6f70, issuer: "https://accounts.google.com", subject: "109876543210987654321", role: viewer}
+      responses:
+        "200":
+          description: change a member's workspace role; admins only, and a workspace keeps one admin
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MemberRoleChangedReply"}
+              examples:
+                update:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-8c54324f75cbf7aac8a65a4ed0055039
+                    resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                    result:
+                      member: {issuer: "https://accounts.google.com", subject: "112233445566778899001", role: editor}
+        "409":
+          description: a workspace needs at least one admin
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorReply"}
+              examples:
+                last:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-5a72187fe651854b89616512d6c55f30
+                    resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                    error: {code: Conflict, message: a workspace needs at least one admin, reason: last_administrator}
+  /v1/workspaces/{workspace}/members/remove:
+    post:
+      operationId: members.remove
+      tags: [hosted]
+      summary: remove every membership a person holds in the workspace; admins only
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/MemberRemoveRequest"}
+            examples:
+              remove:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-2c5fff1728632e223d4c15349f95272a
+                  resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                  payload: {workspace: ws-3f9a1c2b4d5e6f70, issuer: "https://accounts.google.com", subject: "112233445566778899001"}
+      responses:
+        "200":
+          description: remove every membership a person holds in the workspace; admins only
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/MemberRemovedReply"}
+              examples:
+                remove:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-2c5fff1728632e223d4c15349f95272a
+                    resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                    result:
+                      member: {issuer: "https://accounts.google.com", subject: "112233445566778899001", removed: true}
+  /v1/workspaces/{workspace}/invitations:
+    get:
+      operationId: invitations.list
+      tags: [hosted]
+      summary: list the workspace's invitations, newest first; admins only
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+      responses:
+        "200":
+          description: list the workspace's invitations, newest first; admins only
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/InvitationListReply"}
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-65fdc55d6ee967e7398a48a63db4716b
+                    resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                    result:
+                      invitations:
+                        - {id: inv-0f1e2d3c4b5a6978, workspace: ws-3f9a1c2b4d5e6f70, email: lee@acme.com, role: editor, state: pending, created_at: 1767225900.0, expires_at: 1767830700.0, created_by: "109876543210987654321", accepted_at: null, revoked_at: null}
+    post:
+      operationId: invitations.create
+      tags: [hosted]
+      summary: invite an email to the workspace; admins only
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`. A pending invitation to the same email is revoked and named in `replaces`.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/InvitationCreateRequest"}
+            examples:
+              create:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-3cadbda35c2098d4e137d1e45482a452
+                  resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                  payload: {workspace: ws-3f9a1c2b4d5e6f70, email: lee@acme.com, role: editor}
+      responses:
+        "200":
+          description: invite an email to the workspace; admins only
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/InvitationCreatedReply"}
+              examples:
+                create:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-3cadbda35c2098d4e137d1e45482a452
+                    resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                    result:
+                      invitation: {id: inv-0f1e2d3c4b5a6978, workspace: ws-3f9a1c2b4d5e6f70, email: lee@acme.com, role: editor, state: pending, created_at: 1767225900.0, expires_at: 1767830700.0, created_by: "109876543210987654321", accepted_at: null, revoked_at: null}
+                      delivery: email
+                      replaces: null
+  /v1/workspaces/{workspace}/invitations/{id}/revoke:
+    post:
+      operationId: invitations.revoke
+      tags: [hosted]
+      summary: revoke a pending invitation; admins only
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+        - {$ref: "#/components/parameters/invitation"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/InvitationRevokeRequest"}
+            examples:
+              revoke:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-cf89c94b907b34e5e63e57c0c03d2736
+                  resource: {kind: workspace, name: inv-0f1e2d3c4b5a6978}
+                  payload: {workspace: ws-3f9a1c2b4d5e6f70, id: inv-0f1e2d3c4b5a6978}
+              accepted:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-a93cc2b2a64167e461565c9c49eeb090
+                  resource: {kind: workspace, name: inv-0f1e2d3c4b5a6978}
+                  payload: {workspace: ws-3f9a1c2b4d5e6f70, id: inv-0f1e2d3c4b5a6978}
+      responses:
+        "200":
+          description: revoke a pending invitation; admins only
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/InvitationViewReply"}
+              examples:
+                revoke:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-cf89c94b907b34e5e63e57c0c03d2736
+                    resource: {kind: workspace, name: inv-0f1e2d3c4b5a6978}
+                    result:
+                      invitation: {id: inv-0f1e2d3c4b5a6978, workspace: ws-3f9a1c2b4d5e6f70, email: lee@acme.com, role: editor, state: revoked, created_at: 1767225900.0, expires_at: 1767830700.0, created_by: "109876543210987654321", accepted_at: null, revoked_at: 1767226500.0}
+        "409":
+          description: invitation was already accepted
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorReply"}
+              examples:
+                accepted:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-a93cc2b2a64167e461565c9c49eeb090
+                    resource: {kind: workspace, name: inv-0f1e2d3c4b5a6978}
+                    error: {code: Conflict, message: invitation was already accepted}
+  /v1/workspaces/{workspace}/join-requests:
+    get:
+      operationId: requests.list
+      tags: [hosted]
+      summary: list the workspace's join requests, newest first; admins only
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+        - name: state
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [pending, all]
+            default: pending
+          description: "`pending` alone, or `all` of them"
+      responses:
+        "200":
+          description: list the workspace's join requests, newest first; admins only
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/JoinRequestListReply"}
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-22423a293e46098177bb95b6c74b7fd4
+                    resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                    result:
+                      requests:
+                        - {id: jr-1a2b3c4d5e6f7a8b, workspace: ws-3f9a1c2b4d5e6f70, subject: "112233445566778899001", email: sam@acme.com, name: Sam Rivera, domain: acme.com, state: pending, role: null, created_at: 1767225720.0, decided_at: null, decided_by: null}
+  /v1/workspaces/{workspace}/join-requests/{id}/approve:
+    post:
+      operationId: requests.approve
+      tags: [hosted]
+      summary: admit the person behind a pending join request; admins only
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+        - {$ref: "#/components/parameters/join_request"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/JoinRequestApproveRequest"}
+            examples:
+              approve:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-bb2f2dbdf343675846722b93932cdbe1
+                  resource: {kind: workspace, name: jr-1a2b3c4d5e6f7a8b}
+                  payload: {workspace: ws-3f9a1c2b4d5e6f70, id: jr-1a2b3c4d5e6f7a8b, role: viewer}
+              decided:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-85876bf3967ca0bb06a5dbf8677dbcb5
+                  resource: {kind: workspace, name: jr-1a2b3c4d5e6f7a8b}
+                  payload: {workspace: ws-3f9a1c2b4d5e6f70, id: jr-1a2b3c4d5e6f7a8b}
+      responses:
+        "200":
+          description: admit the person behind a pending join request; admins only
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/JoinRequestApprovedReply"}
+              examples:
+                approve:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-bb2f2dbdf343675846722b93932cdbe1
+                    resource: {kind: workspace, name: jr-1a2b3c4d5e6f7a8b}
+                    result:
+                      request: {id: jr-1a2b3c4d5e6f7a8b, workspace: ws-3f9a1c2b4d5e6f70, subject: "112233445566778899001", email: sam@acme.com, name: Sam Rivera, domain: acme.com, state: approved, role: viewer, created_at: 1767225720.0, decided_at: 1767226800.0, decided_by: "109876543210987654321"}
+                      membership: {issuer: "https://accounts.google.com", subject: "112233445566778899001", scope_kind: account, scope_id: ws-3f9a1c2b4d5e6f70, role: viewer}
+        "409":
+          description: join request is already decided
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorReply"}
+              examples:
+                decided:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-85876bf3967ca0bb06a5dbf8677dbcb5
+                    resource: {kind: workspace, name: jr-1a2b3c4d5e6f7a8b}
+                    error: {code: Conflict, message: join request is already decided}
+  /v1/workspaces/{workspace}/join-requests/{id}/deny:
+    post:
+      operationId: requests.deny
+      tags: [hosted]
+      summary: turn down a pending join request; admins only
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+        - {$ref: "#/components/parameters/join_request"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/JoinRequestDenyRequest"}
+            examples:
+              deny:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-b2f7d27788fd3586c9f7243145239e55
+                  resource: {kind: workspace, name: jr-1a2b3c4d5e6f7a8b}
+                  payload: {workspace: ws-3f9a1c2b4d5e6f70, id: jr-1a2b3c4d5e6f7a8b}
+      responses:
+        "200":
+          description: turn down a pending join request; admins only
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/JoinRequestDeniedReply"}
+              examples:
+                deny:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-b2f7d27788fd3586c9f7243145239e55
+                    resource: {kind: workspace, name: jr-1a2b3c4d5e6f7a8b}
+                    result:
+                      request: {id: jr-1a2b3c4d5e6f7a8b, workspace: ws-3f9a1c2b4d5e6f70, subject: "112233445566778899001", email: sam@acme.com, name: Sam Rivera, domain: acme.com, state: denied, role: null, created_at: 1767225720.0, decided_at: 1767226800.0, decided_by: "109876543210987654321"}
+  /v1/workspaces/{workspace}/domains:
+    get:
+      operationId: domains.list
+      tags: [hosted]
+      summary: list the email domains whose people may ask to join; admins only
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+      responses:
+        "200":
+          description: list the email domains whose people may ask to join; admins only
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/JoinDomainListReply"}
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-8742b52a6684b5545496feb00301a1fa
+                    resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                    result:
+                      domains:
+                        - {workspace: ws-3f9a1c2b4d5e6f70, domain: acme.com, enabled_by: "109876543210987654321", enabled_at: 1767225660.0}
+                      email_domain: acme.com
+    post:
+      operationId: domains.configure
+      tags: [hosted]
+      summary: let the people of an email domain ask to join, or stop them; admins only
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`. Enabling takes only the domain of the admin's own verified email, never a personal one; any admin may disable one.
+      parameters:
+        - {$ref: "#/components/parameters/workspace"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/JoinDomainConfigureRequest"}
+            examples:
+              configure:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-bc8b27e9994579c419deb77159dbe5a4
+                  resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                  payload: {workspace: ws-3f9a1c2b4d5e6f70, domain: acme.com, enabled: true}
+      responses:
+        "200":
+          description: let the people of an email domain ask to join, or stop them; admins only
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/JoinDomainConfiguredReply"}
+              examples:
+                configure:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-bc8b27e9994579c419deb77159dbe5a4
+                    resource: {kind: workspace, name: ws-3f9a1c2b4d5e6f70}
+                    result: {workspace: ws-3f9a1c2b4d5e6f70, domain: acme.com, enabled: true}
+  /v1/invitations/preview:
+    post:
+      operationId: invitations.preview
+      tags: [hosted]
+      summary: show the workspace and role an invitation offers the signed-in person
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/InvitationTokenRequest"}
+            examples:
+              preview:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-0c789fcb0aa787ee3a3598e925e8172c
+                  resource: {kind: workspace, name: invitation}
+                  payload: {token: gf_inv_Zk3q9XmT2bVn7RwL5yHc8JdP4sGf6AeU1oQiNt0Kj_A}
+              unavailable:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-727d8ba60a7f8077ed7498d1bc6424e7
+                  resource: {kind: workspace, name: invitation}
+                  payload: {token: gf_inv_Aa1b9XmT2bVn7RwL5yHc8JdP4sGf6AeU1oQiNt0Kj_A}
+      responses:
+        "200":
+          description: show the workspace and role an invitation offers the signed-in person
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/InvitationPreviewReply"}
+              examples:
+                preview:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-0c789fcb0aa787ee3a3598e925e8172c
+                    resource: {kind: workspace, name: invitation}
+                    result: {workspace: ws-3f9a1c2b4d5e6f70, display_name: Acme, role: editor, expires_at: 1767830700.0}
+        "404":
+          description: invitation is invalid or expired
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorReply"}
+              examples:
+                unavailable:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-727d8ba60a7f8077ed7498d1bc6424e7
+                    resource: {kind: workspace, name: invitation}
+                    error: {code: NotFound, message: invitation is invalid or expired, reason: invitation_unavailable}
+  /v1/invitations/accept:
+    post:
+      operationId: invitations.accept
+      tags: [hosted]
+      summary: accept an invitation issued to the signed-in person's email
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/InvitationTokenRequest"}
+            examples:
+              accept:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-79adba281cc5923a6cdf4e7fe21e530a
+                  resource: {kind: workspace, name: invitation}
+                  payload: {token: gf_inv_Zk3q9XmT2bVn7RwL5yHc8JdP4sGf6AeU1oQiNt0Kj_A}
+      responses:
+        "200":
+          description: accept an invitation issued to the signed-in person's email
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/InvitationAcceptedReply"}
+              examples:
+                accept:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-79adba281cc5923a6cdf4e7fe21e530a
+                    resource: {kind: workspace, name: invitation}
+                    result:
+                      status: joined
+                      workspace:
+                        workspace: ws-3f9a1c2b4d5e6f70
+                        display_name: Acme
+                        role: editor
+                        admin: false
+                        default_project: acme
+                        projects: [acme]
+  /v1/join-requests/{id}/cancel:
+    post:
+      operationId: requests.cancel
+      tags: [hosted]
+      summary: withdraw the caller's own pending join request
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/join_request"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/JoinRequestRefRequest"}
+            examples:
+              cancel:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-688046afd646c6a19ae60ef7d9b4171f
+                  resource: {kind: workspace, name: jr-1a2b3c4d5e6f7a8b}
+                  payload: {id: jr-1a2b3c4d5e6f7a8b}
+              decided:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-23804f3785e92cafa232d182996a5a0e
+                  resource: {kind: workspace, name: jr-1a2b3c4d5e6f7a8b}
+                  payload: {id: jr-1a2b3c4d5e6f7a8b}
+      responses:
+        "200":
+          description: withdraw the caller's own pending join request
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/JoinRequestViewReply"}
+              examples:
+                cancel:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-688046afd646c6a19ae60ef7d9b4171f
+                    resource: {kind: workspace, name: jr-1a2b3c4d5e6f7a8b}
+                    result:
+                      request: {id: jr-1a2b3c4d5e6f7a8b, workspace: ws-3f9a1c2b4d5e6f70, display_name: Acme, state: cancelled, created_at: 1767225720.0, decided_at: 1767225840.0}
+        "409":
+          description: join request is already decided
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/ErrorReply"}
+              examples:
+                decided:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-23804f3785e92cafa232d182996a5a0e
+                    resource: {kind: workspace, name: jr-1a2b3c4d5e6f7a8b}
+                    error: {code: Conflict, message: join request is already decided}
+  /v1/waitlist:
+    post:
+      operationId: waitlist.join
+      tags: [hosted]
+      summary: join the sign-up waitlist, naming the workspace to create
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`. A person already approved, or whose domain is, answers `approved`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/WaitlistJoinRequest"}
+            examples:
+              join:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-5d088e7f0ca092f8a34fadd82ba9ef7f
+                  resource: {kind: workspace, name: waitlist}
+                  payload: {display_name: Example Labs}
+      responses:
+        "200":
+          description: join the sign-up waitlist, naming the workspace to create
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WaitlistStatusReply"}
+              examples:
+                join:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-5d088e7f0ca092f8a34fadd82ba9ef7f
+                    resource: {kind: workspace, name: waitlist}
+                    result: {status: pending, message: You have been added to the waitlist. We've pinged General Forecast and will have you up and running soon. Please email hello@generalforecast.com if you would like to be expedited.}
+  /v1/waitlist/{id}:
+    get:
+      operationId: waitlist.get
+      tags: [hosted]
+      summary: show a waitlist sign-up; General Forecast operators only
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/waitlist_entry"}
+      responses:
+        "200":
+          description: show a waitlist sign-up; General Forecast operators only
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WaitlistEntryViewReply"}
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-8defe527afb745e75b5a75fcacadd825
+                    resource: {kind: workspace, name: wl-5e4d3c2b1a0f9e8d}
+                    result:
+                      entry: {id: wl-5e4d3c2b1a0f9e8d, email: kim@example.org, display_name: Kim Park, state: pending, approves: domain, domain: example.org, created_at: 1767226200.0, decided_at: null, workspace_name: Example Labs}
+  /v1/waitlist/{id}/approve:
+    post:
+      operationId: waitlist.approve
+      tags: [hosted]
+      summary: approve a waitlist sign-up, and its company domain with it; General Forecast operators only
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`.
+      parameters:
+        - {$ref: "#/components/parameters/waitlist_entry"}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/WaitlistRefRequest"}
+            examples:
+              approve:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-2a59e6991783895a31d6a2008f1b579e
+                  resource: {kind: workspace, name: wl-5e4d3c2b1a0f9e8d}
+                  payload: {id: wl-5e4d3c2b1a0f9e8d}
+      responses:
+        "200":
+          description: approve a waitlist sign-up, and its company domain with it; General Forecast operators only
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/WaitlistEntryViewReply"}
+              examples:
+                approve:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-2a59e6991783895a31d6a2008f1b579e
+                    resource: {kind: workspace, name: wl-5e4d3c2b1a0f9e8d}
+                    result:
+                      entry: {id: wl-5e4d3c2b1a0f9e8d, email: kim@example.org, display_name: Kim Park, state: approved, approves: domain, domain: example.org, created_at: 1767226200.0, decided_at: 1767227400.0, workspace_name: Example Labs}
+  /v1/cli-logins/preview:
+    post:
+      operationId: device.preview
+      tags: [hosted]
+      summary: show which machine a `gf login` code is for, and the workspaces it may sign in to
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`. The code is the one `gf login` printed on the machine asking.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CliLoginCodeRequest"}
+            examples:
+              preview:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-80f2a69cce8297126d5882cc98148133
+                  resource: {kind: workspace, name: cli-login}
+                  payload: {user_code: bcdf-ghjk}
+      responses:
+        "200":
+          description: show which machine a `gf login` code is for, and the workspaces it may sign in to
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CliLoginPreviewReply"}
+              examples:
+                preview:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-80f2a69cce8297126d5882cc98148133
+                    resource: {kind: workspace, name: cli-login}
+                    result:
+                      user_code: BCDF-GHJK
+                      machine: ana-mbp
+                      expires_at: 1767226500.0
+                      email: ana@acme.com
+                      workspaces:
+                        - {workspace: ws-3f9a1c2b4d5e6f70, display_name: Acme}
+  /v1/cli-logins/approve:
+    post:
+      operationId: device.approve
+      tags: [hosted]
+      summary: grant a `gf login` code a key for one of the caller's workspaces
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`. The code is the one `gf login` printed on the machine asking. The key takes the CLI's permissions the caller holds in the workspace's default project.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CliLoginApproveRequest"}
+            examples:
+              approve:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-005a2242c4b6a7957399e741431b7242
+                  resource: {kind: workspace, name: cli-login}
+                  payload: {user_code: BCDF-GHJK, workspace: ws-3f9a1c2b4d5e6f70}
+      responses:
+        "200":
+          description: grant a `gf login` code a key for one of the caller's workspaces
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CliLoginApprovedReply"}
+              examples:
+                approve:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-005a2242c4b6a7957399e741431b7242
+                    resource: {kind: workspace, name: cli-login}
+                    result:
+                      user_code: BCDF-GHJK
+                      state: approved
+                      workspace: {id: ws-3f9a1c2b4d5e6f70, display_name: Acme}
+  /v1/cli-logins/deny:
+    post:
+      operationId: device.deny
+      tags: [hosted]
+      summary: refuse a `gf login` code
+      description: Needs a signed-in browser session; an API key is refused with `Unauthorized` and reason `session_required`. The code is the one `gf login` printed on the machine asking.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CliLoginCodeRequest"}
+            examples:
+              deny:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-aec2edfd99ab5e5ec399adf115ce0dfb
+                  resource: {kind: workspace, name: cli-login}
+                  payload: {user_code: BCDF-GHJK}
+      responses:
+        "200":
+          description: refuse a `gf login` code
+          content:
+            application/json:
+              schema: {$ref: "#/components/schemas/CliLoginDeniedReply"}
+              examples:
+                deny:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-aec2edfd99ab5e5ec399adf115ce0dfb
+                    resource: {kind: workspace, name: cli-login}
+                    result: {user_code: BCDF-GHJK, state: denied}
+
 components:
   securitySchemes:
     apiKey:
@@ -1527,6 +3464,42 @@ components:
       required: true
       schema: {$ref: "#/components/schemas/Name"}
       description: the live context's name
+    source:
+      name: source
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/Name"}
+      description: a pin's `source_id`
+    model:
+      name: model
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/Name"}
+      description: |
+        a catalog model's name without its `general-forecast/` prefix, such
+        as `tabicl-v2-classifier`, since a path segment holds no `/`
+
+    workspace:
+      name: workspace
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/Name"}
+      description: the workspace's id, `ws-` and 16 hex digits for one made on sign-up
+    join_request:
+      name: id
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/JoinRequestId"}
+    invitation:
+      name: id
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/InvitationId"}
+    waitlist_entry:
+      name: id
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/WaitlistId"}
 
   responses:
     NotReady:
@@ -1570,7 +3543,7 @@ components:
 
     ResourceKind:
       type: string
-      enum: [predictor, model, project, api-key, secret, context]
+      enum: [predictor, model, project, api-key, secret, context, source, workspace]
 
     Resource:
       type: object
@@ -1889,16 +3862,38 @@ components:
           items: {$ref: "#/components/schemas/Shape"}
 
     Predictor:
-      allOf:
-        - $ref: "#/components/schemas/Resolution"
-        - type: object
-          required: [limits, environments, serving]
-          properties:
-            limits: {$ref: "#/components/schemas/Limits"}
-            environments:
-              type: array
-              items: {$ref: "#/components/schemas/Environment"}
-            serving: {$ref: "#/components/schemas/Serving"}
+      type: object
+      description: |
+        a predictor by name, with its environments. Its resolution (the fields
+        `Resolution` names, `limits` and `serving`) is there once it resolves:
+        always for a predictor gf serve declares, and for a hosted one once it
+        has a revision, from its latest. `created_at` and `latest_revision`
+        come from the hosted journal; a declared predictor has neither.
+      required: [name, environments]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        created_at: {type: number}
+        latest_revision: {type: [integer, "null"], minimum: 1}
+        environments:
+          type: array
+          items: {$ref: "#/components/schemas/Environment"}
+        model: {$ref: "#/components/schemas/ModelId"}
+        model_digest: {$ref: "#/components/schemas/Digest"}
+        task: {$ref: "#/components/schemas/Task"}
+        target: {type: string}
+        target_type: {$ref: "#/components/schemas/ColumnType"}
+        classes: {type: array, items: {type: string}}
+        id: {type: string}
+        time: {type: string}
+        series: {type: array, items: {type: string}}
+        inputs:
+          type: array
+          items: {$ref: "#/components/schemas/Input"}
+        context: {$ref: "#/components/schemas/ContextLock"}
+        selection: {$ref: "#/components/schemas/ResolvedSelection"}
+        limits: {$ref: "#/components/schemas/Limits"}
+        serving: {$ref: "#/components/schemas/Serving"}
 
     PredictorReply:
       allOf:
@@ -1975,7 +3970,7 @@ components:
       additionalProperties: false
       properties:
         name: {type: string}
-        state: {type: string, enum: [supported, unsupported]}
+        state: {type: string, enum: [supported, unsupported, unconfigured]}
         code: {type: [string, "null"]}
         reason: {type: [string, "null"]}
 
@@ -1987,6 +3982,14 @@ components:
         models:
           type: array
           items: {$ref: "#/components/schemas/Model"}
+
+    ModelReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Model"}
 
     ModelListReply:
       allOf:
@@ -2092,6 +4095,14 @@ components:
         - keys:write
         - secrets:read
         - secrets:write
+        - members:read
+        - members:write
+        - sso:read
+        - sso:write
+        - audit:read
+        - operators:read
+        - operators:write
+        - projects:read
 
     Key:
       type: object
@@ -2563,6 +4574,7 @@ components:
         labeled_rows: {type: integer, minimum: 0}
         sequence: {type: integer, minimum: 0}
         accepted_at: {type: [number, "null"]}
+        id: {type: string, description: the column that names each row}
 
     LiveContextReply:
       allOf:
@@ -2601,6 +4613,14 @@ components:
           additionalProperties: {$ref: "#/components/schemas/ColumnType"}
           minProperties: 1
         max_rows: {type: integer, minimum: 1, default: 100000}
+        id: {type: string, description: "the column that names each row; `id` if left out"}
+        types:
+          type: object
+          description: each input's type, `number` if left out
+          additionalProperties: {$ref: "#/components/schemas/ColumnType"}
+        max_writes: {type: integer, minimum: 1, default: 10000, description: write ids a retry may name}
+        max_pending_labels: {type: integer, minimum: 0, default: 0}
+        pending_ttl_seconds: {type: number, exclusiveMinimum: 0, default: 3600}
 
     LiveContextCreateRequest:
       allOf:
@@ -2620,6 +4640,7 @@ components:
           type: array
           items: {$ref: "#/components/schemas/Row"}
           minItems: 1
+          maxItems: 100
 
     LiveContextAppendRequest:
       allOf:
@@ -2648,6 +4669,7 @@ components:
           type: array
           items: {$ref: "#/components/schemas/Label"}
           minItems: 1
+          maxItems: 100
 
     LiveContextLabelRequest:
       allOf:
@@ -2678,3 +4700,1468 @@ components:
           required: [result]
           properties:
             result: {$ref: "#/components/schemas/Receipt"}
+
+    PredictorCreate:
+      type: object
+      required: [name]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+
+    PredictorCreateRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/PredictorCreate"}
+
+    PredictorCreatedReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/PredictorCreate"}
+
+    ContextImport:
+      type: object
+      description: where a live context's rows come from, and how its columns map
+      required: [context, source, format]
+      additionalProperties: false
+      properties:
+        context: {$ref: "#/components/schemas/Name"}
+        source:
+          type: string
+          maxLength: 2048
+          description: "`upload://<digest>`, or `s3://`, `gs://`, `az://`, `azure://`, `snowflake://`, `bigquery://` or `context://` without credentials or query"
+        format: {type: string, enum: [csv, tsv, parquet, arrow, json, jsonl, table]}
+        credential_ref:
+          type: [string, "null"]
+          pattern: "^secret/[a-z][a-z0-9-]{0,62}$"
+          description: the secret the operator's connector reads the source with
+        digest:
+          oneOf:
+            - $ref: "#/components/schemas/Digest"
+            - type: "null"
+        mapping:
+          type: array
+          description: "`[context column, source column]` pairs"
+          items:
+            type: array
+            items: {type: string}
+            minItems: 2
+            maxItems: 2
+          default: []
+
+    ContextImportRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/ContextImport"}
+
+    WriteOperation:
+      type: string
+      enum: [create_features, attach_labels, correct_features, correct_labels, resupply_labels, import_record, checkpoint]
+
+    Observation:
+      type: object
+      description: one observation's components; corrections name the versions they replace
+      required: [key]
+      additionalProperties: false
+      properties:
+        key: {type: string, minLength: 1}
+        features: {type: object, additionalProperties: {type: [string, number, boolean, "null"]}}
+        labels: {type: object, additionalProperties: {type: [string, number, boolean]}}
+        event_at: {type: number}
+        expected_feature_version: {type: integer, minimum: 1}
+        expected_label_versions: {type: object, additionalProperties: {type: integer, minimum: 1}}
+
+    MutationOperation:
+      type: string
+      description: the writes a client makes; imports and checkpoints are the server's
+      enum: [create_features, attach_labels, correct_features, correct_labels, resupply_labels]
+
+    Mutation:
+      type: object
+      required: [write_id, operation, records]
+      additionalProperties: false
+      properties:
+        write_id: {type: string, minLength: 1, maxLength: 256}
+        operation: {$ref: "#/components/schemas/MutationOperation"}
+        records:
+          type: array
+          items: {$ref: "#/components/schemas/Observation"}
+          minItems: 1
+          maxItems: 100
+
+    MutationRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/Mutation"}
+
+    ComponentVersions:
+      type: object
+      required: [key, feature_version, label_versions]
+      additionalProperties: false
+      properties:
+        key: {type: string}
+        feature_version: {type: [integer, "null"]}
+        label_versions: {type: object, additionalProperties: {type: integer}}
+
+    AcceptedWrite:
+      type: object
+      description: a write's durable receipt, the same for every retry of its write id
+      required: [project, context, write_id, operation, sequence, accepted_at, durably_accepted, changes, retry_valid_until]
+      additionalProperties: false
+      properties:
+        project: {$ref: "#/components/schemas/Name"}
+        context: {$ref: "#/components/schemas/Name"}
+        write_id: {type: string}
+        operation: {$ref: "#/components/schemas/WriteOperation"}
+        sequence: {type: integer, minimum: 0}
+        accepted_at: {type: number}
+        durably_accepted: {type: boolean}
+        changes:
+          type: array
+          items: {$ref: "#/components/schemas/ComponentVersions"}
+        retry_valid_until: {type: [number, "null"]}
+
+    AcceptedWriteReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/AcceptedWrite"}
+
+    ImportReceipt:
+      type: object
+      required: [context, digest, rows, sequence, accepted_at, receipt, mode, continuous]
+      additionalProperties: false
+      properties:
+        context: {$ref: "#/components/schemas/Name"}
+        digest: {$ref: "#/components/schemas/Digest"}
+        rows: {type: integer, minimum: 0}
+        sequence: {type: integer, minimum: 0}
+        accepted_at: {type: number}
+        receipt: {$ref: "#/components/schemas/AcceptedWrite"}
+        mode: {type: string, const: explicit-refresh}
+        continuous: {type: boolean, const: false}
+
+    ImportReceiptReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/ImportReceipt"}
+
+    ContextSnapshotQuery:
+      type: object
+      required: [target]
+      additionalProperties: false
+      properties:
+        target: {type: string}
+        knowledge_at: {type: [number, "null"], minimum: 0}
+        event_before: {type: [number, "null"]}
+
+    ContextSnapshotQueryRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/ContextSnapshotQuery"}
+
+    SnapshotRow:
+      type: object
+      required: [key, features, label, feature_version, label_version, feature_accepted_at, label_accepted_at, event_at]
+      additionalProperties: false
+      properties:
+        key: {type: string}
+        features: {type: object, additionalProperties: {type: [string, number, boolean, "null"]}}
+        label: {type: [string, number, boolean]}
+        feature_version: {type: integer}
+        label_version: {type: integer}
+        feature_accepted_at: {type: number}
+        label_accepted_at: {type: number}
+        event_at: {type: [number, "null"]}
+
+    ContextSnapshot:
+      type: object
+      required: [project, context, target, features, through_sequence, knowledge_at, event_before, rows, source_wait_count, pending_processing_count, oldest_unprocessed_at]
+      additionalProperties: false
+      properties:
+        project: {$ref: "#/components/schemas/Name"}
+        context: {$ref: "#/components/schemas/Name"}
+        target: {type: string}
+        features: {type: array, items: {type: string}}
+        through_sequence: {type: integer, minimum: 0}
+        knowledge_at: {type: number}
+        event_before: {type: [number, "null"]}
+        rows:
+          type: array
+          items: {$ref: "#/components/schemas/SnapshotRow"}
+        source_wait_count: {type: integer, minimum: 0}
+        pending_processing_count: {type: integer, minimum: 0}
+        oldest_unprocessed_at: {type: [number, "null"]}
+
+    ContextSnapshotReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/ContextSnapshot"}
+
+    SourceMapping:
+      type: object
+      description: "which columns of a pinned file are an observation's key, features and labels; empty for JSONL already in that shape"
+      additionalProperties: false
+      properties:
+        key: {type: string}
+        features: {type: object, additionalProperties: {type: string}}
+        labels: {type: object, additionalProperties: {type: string}}
+        event_at: {type: string}
+        label_types:
+          type: object
+          additionalProperties: {type: string, enum: [boolean, numeric]}
+
+    SourcePinSpec:
+      type: object
+      required: [path, format, mapping]
+      additionalProperties: false
+      properties:
+        path: {type: string, minLength: 1}
+        format: {type: string, enum: [jsonl, csv]}
+        mapping: {$ref: "#/components/schemas/SourceMapping"}
+
+    SourcePinRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/SourcePinSpec"}
+
+    SourcePin:
+      type: object
+      required: [source_id, digest, size_bytes, format, mapping]
+      additionalProperties: false
+      properties:
+        source_id: {$ref: "#/components/schemas/Name"}
+        digest: {$ref: "#/components/schemas/Digest"}
+        size_bytes: {type: integer, minimum: 0, maximum: 8388608}
+        format: {type: string, enum: [jsonl, csv]}
+        mapping: {$ref: "#/components/schemas/SourceMapping"}
+
+    SourcePinReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/SourcePin"}
+
+    SourceList:
+      type: object
+      required: [sources]
+      additionalProperties: false
+      properties:
+        sources:
+          type: array
+          items: {$ref: "#/components/schemas/SourcePin"}
+
+    SourceListReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/SourceList"}
+
+    UploadReceipt:
+      type: object
+      required: [digest, rows]
+      additionalProperties: false
+      properties:
+        digest: {$ref: "#/components/schemas/Digest"}
+        rows: {type: integer, minimum: 0, maximum: 100000}
+
+    UploadReceiptReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/UploadReceipt"}
+
+    PermissionGrant:
+      type: object
+      description: a permission keys may hold; one that is not enforced authorizes nothing yet
+      required: [name, description, enforced, roles]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Permission"}
+        description: {type: string}
+        enforced: {type: boolean}
+        roles:
+          type: array
+          items: {type: string, enum: [admin, editor, viewer, scorer]}
+
+    KeyIdentity:
+      type: object
+      required: [id, name, project, expires_at]
+      additionalProperties: false
+      properties:
+        id: {type: string, pattern: "^key-[0-9a-f]{20,24}$"}
+        name: {$ref: "#/components/schemas/Name"}
+        project: {$ref: "#/components/schemas/Name"}
+        expires_at: {type: number}
+
+    WorkspaceIdentity:
+      type: object
+      required: [id, display_name]
+      additionalProperties: false
+      properties:
+        id: {type: string}
+        display_name: {type: string}
+
+    Principal:
+      type: object
+      description: the credential's kind and id, with what the server knows of it
+      required: [kind, id]
+      additionalProperties: true
+      properties:
+        kind: {type: string}
+        id: {type: string}
+
+    AuthStatus:
+      type: object
+      required: [authenticated, principal, google, sign_in, secrets, capabilities, permission_inventory, bootstrap]
+      additionalProperties: false
+      properties:
+        authenticated: {type: boolean, const: true}
+        principal: {$ref: "#/components/schemas/Principal"}
+        google: {type: string, enum: [configured, unconfigured]}
+        sign_in:
+          type: array
+          items: {type: string, enum: [google, microsoft, github]}
+        secrets: {type: string, enum: [configured, unconfigured]}
+        capabilities:
+          type: array
+          items: {$ref: "#/components/schemas/Capability"}
+        permission_inventory:
+          type: array
+          items: {$ref: "#/components/schemas/PermissionGrant"}
+        bootstrap: {type: string, enum: [unconfigured, available, consumed]}
+        key: {$ref: "#/components/schemas/KeyIdentity"}
+        email: {type: [string, "null"]}
+        machine: {type: [string, "null"]}
+        workspace:
+          oneOf:
+            - $ref: "#/components/schemas/WorkspaceIdentity"
+            - type: "null"
+
+    AuthStatusReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/AuthStatus"}
+
+    LoggedOut:
+      type: object
+      required: [revoked]
+      additionalProperties: false
+      properties:
+        revoked: {type: string, pattern: "^key-[0-9a-f]{20,24}$"}
+
+    LoggedOutReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/LoggedOut"}
+
+    Organization:
+      type: object
+      required: [name, account]
+      additionalProperties: false
+      properties:
+        name: {$ref: "#/components/schemas/Name"}
+        account: {$ref: "#/components/schemas/Name"}
+
+    OrganizationReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Organization"}
+
+    OrganizationCreateRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/Organization"}
+
+    OrganizationList:
+      type: object
+      required: [organizations]
+      additionalProperties: false
+      properties:
+        organizations:
+          type: array
+          items: {$ref: "#/components/schemas/Organization"}
+
+    OrganizationListReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/OrganizationList"}
+
+    Issuer:
+      type: string
+      description: the sign-in provider a membership's subject belongs to
+      enum: ["https://accounts.google.com", "https://login.microsoftonline.com", "https://github.com"]
+
+    Membership:
+      type: object
+      required: [issuer, subject, scope_kind, scope_id, role]
+      additionalProperties: false
+      properties:
+        issuer: {$ref: "#/components/schemas/Issuer"}
+        subject: {type: string, minLength: 1}
+        scope_kind: {type: string, enum: [account, organization, project]}
+        scope_id: {$ref: "#/components/schemas/Name"}
+        role: {type: string, enum: [admin, editor, viewer, scorer]}
+
+    MembershipAddRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/Membership"}
+
+    MembershipRef:
+      type: object
+      required: [issuer, subject, scope_kind, scope_id]
+      additionalProperties: false
+      properties:
+        issuer: {$ref: "#/components/schemas/Issuer"}
+        subject: {type: string, minLength: 1}
+        scope_kind: {type: string, enum: [account, organization, project]}
+        scope_id: {$ref: "#/components/schemas/Name"}
+
+    MembershipRemoveRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/MembershipRef"}
+
+    MembershipChanged:
+      type: object
+      required: [issuer, subject, scope_kind, scope_id, removed]
+      additionalProperties: false
+      properties:
+        issuer: {$ref: "#/components/schemas/Issuer"}
+        subject: {type: string}
+        scope_kind: {type: string, enum: [account, organization, project]}
+        scope_id: {$ref: "#/components/schemas/Name"}
+        removed: {type: boolean}
+
+    MembershipChangedReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/MembershipChanged"}
+
+    MembershipList:
+      type: object
+      required: [memberships]
+      additionalProperties: false
+      properties:
+        memberships:
+          type: array
+          items: {$ref: "#/components/schemas/Membership"}
+
+    MembershipListReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/MembershipList"}
+
+    Sso:
+      type: object
+      required: [organization, provider, providers, enabled, configured, membership_required]
+      additionalProperties: false
+      properties:
+        organization: {$ref: "#/components/schemas/Name"}
+        provider: {type: string, const: google}
+        providers:
+          type: array
+          items: {type: string, enum: [google, microsoft, github]}
+        enabled: {type: boolean}
+        configured: {type: boolean, description: whether the server can sign anyone in}
+        membership_required: {type: boolean, const: true}
+
+    SsoReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Sso"}
+
+    SsoConfigure:
+      type: object
+      required: [enabled]
+      additionalProperties: false
+      properties:
+        enabled: {type: boolean}
+
+    SsoConfigureRequest:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/SsoConfigure"}
+
+    AuditEvent:
+      type: object
+      required: [sequence, at, actor, project, action, target, outcome]
+      additionalProperties: false
+      properties:
+        sequence: {type: integer, minimum: 1}
+        at: {type: number}
+        actor: {type: string}
+        project: {$ref: "#/components/schemas/Name"}
+        action: {type: string}
+        target: {type: string}
+        outcome: {type: string}
+
+    AuditLog:
+      type: object
+      required: [events]
+      additionalProperties: false
+      properties:
+        events:
+          type: array
+          items: {$ref: "#/components/schemas/AuditEvent"}
+
+    AuditLogReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/AuditLog"}
+
+    CliLoginStart:
+      type: object
+      required: [machine]
+      additionalProperties: false
+      properties:
+        machine: {type: string, description: the machine the key is named after}
+
+    CliLoginGrant:
+      type: object
+      required: [device_code, user_code, verification_uri, verification_uri_complete, expires_in, interval]
+      additionalProperties: false
+      properties:
+        device_code: {type: string, pattern: "^gf_dc_[A-Za-z0-9_-]{43}$"}
+        user_code: {type: string, pattern: "^[A-Z0-9]{4}-[A-Z0-9]{4}$"}
+        verification_uri: {type: string}
+        verification_uri_complete: {type: string}
+        expires_in: {type: integer, minimum: 1}
+        interval: {type: integer, minimum: 1}
+
+    CliLoginPoll:
+      type: object
+      required: [device_code]
+      additionalProperties: false
+      properties:
+        device_code: {type: string, pattern: "^gf_dc_[A-Za-z0-9_-]{43}$"}
+
+    CliLoginToken:
+      type: object
+      required: [access_token, token_type, key, email, workspace, project]
+      additionalProperties: false
+      properties:
+        access_token: {type: string}
+        token_type: {type: string, const: bearer}
+        key: {$ref: "#/components/schemas/KeyIdentity"}
+        email: {type: string}
+        workspace: {$ref: "#/components/schemas/WorkspaceIdentity"}
+        project: {$ref: "#/components/schemas/Name"}
+
+    LoginErrorReply:
+      type: object
+      description: |
+        why a CLI login cannot go on, outside the envelope as the login is.
+        `reason` says which: `authorization_pending` (`Unauthorized`, poll
+        again), `slow_down` (`ValidationError`, poll less often),
+        `expired_token` and `access_denied` (`Unauthorized`, start again) or
+        `rate_limited` (`CapacityExceeded`).
+      required: [error]
+      additionalProperties: false
+      properties:
+        error: {$ref: "#/components/schemas/Error"}
+
+    WorkspaceRole:
+      type: string
+      enum: [admin, editor, viewer, scorer]
+      description: a workspace member's role; `admin` manages the workspace
+    JoinRequestId: {type: string, pattern: "^jr-[0-9a-f]{16}$"}
+    InvitationId: {type: string, pattern: "^inv-[0-9a-f]{16}$"}
+    WaitlistId: {type: string, pattern: "^wl-[0-9a-f]{16}$"}
+    WorkspaceName: {type: string, minLength: 1, maxLength: 80, description: "a workspace's display name, without leading or trailing spaces"}
+    UserCode: {type: string, minLength: 8, maxLength: 16, description: "the code `gf login` prints, `XXXX-XXXX` from BCDFGHJKLMNPQRSTVWXZ, taken in any case and with or without the dash"}
+    WorkspaceSummary:
+      type: object
+      description: "a workspace the caller belongs to: its role there and the projects it may use"
+      required: [workspace, display_name, role, admin, default_project, projects]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        display_name: {type: string}
+        role:
+          oneOf:
+            - {$ref: "#/components/schemas/WorkspaceRole"}
+            - {type: "null"}
+        admin: {type: boolean}
+        default_project:
+          oneOf:
+            - {$ref: "#/components/schemas/Name"}
+            - {type: "null"}
+        projects:
+          type: array
+          items: {$ref: "#/components/schemas/Name"}
+    WorkspaceDetails:
+      allOf:
+        - {$ref: "#/components/schemas/WorkspaceSummary"}
+        - type: object
+          required: [organization, created_at]
+          properties:
+            organization: {$ref: "#/components/schemas/Name"}
+            created_at: {type: number}
+    JoinRequest:
+      type: object
+      description: a request to join a workspace, as the person who asked sees it
+      required: [id, workspace, display_name, state, created_at, decided_at]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/JoinRequestId"}
+        workspace: {$ref: "#/components/schemas/Name"}
+        display_name: {type: string}
+        state:
+          type: string
+          enum: [pending, approved, denied, cancelled]
+        created_at: {type: number}
+        decided_at:
+          type: [number, "null"]
+    JoinRequestAdmin:
+      type: object
+      description: a request to join a workspace, as its admins see it
+      required: [id, workspace, subject, email, name, domain, state, role, created_at, decided_at, decided_by]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/JoinRequestId"}
+        workspace: {$ref: "#/components/schemas/Name"}
+        subject: {type: string}
+        email: {type: string}
+        name:
+          type: [string, "null"]
+        domain: {type: string}
+        state:
+          type: string
+          enum: [pending, approved, denied, cancelled]
+        role:
+          oneOf:
+            - {$ref: "#/components/schemas/WorkspaceRole"}
+            - {type: "null"}
+        created_at: {type: number}
+        decided_at:
+          type: [number, "null"]
+        decided_by:
+          type: [string, "null"]
+    OnboardingProfile:
+      type: object
+      description: the signed-in person's verified email, all null until they sign in again
+      required: [email, email_domain, display_name, personal_domain]
+      additionalProperties: false
+      properties:
+        email:
+          type: [string, "null"]
+        email_domain:
+          type: [string, "null"]
+        display_name:
+          type: [string, "null"]
+        personal_domain:
+          type: [boolean, "null"]
+    DiscoveredWorkspace:
+      type: object
+      description: a workspace the person's email domain may ask to join
+      required: [workspace, display_name, domain, request]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        display_name: {type: string}
+        domain: {type: string}
+        request:
+          oneOf:
+            - {$ref: "#/components/schemas/JoinRequest"}
+            - {type: "null"}
+    Onboarding:
+      type: object
+      description: "where a signed-in person stands: their workspaces, those their domain may join, and whether they may create one"
+      required: [state, profile, workspaces, discovered, requests, can_create_workspace, signup, workspace_name, sign_in_url]
+      additionalProperties: false
+      properties:
+        state:
+          type: string
+          enum: [member, onboarding, reauthentication_required]
+        profile: {$ref: "#/components/schemas/OnboardingProfile"}
+        workspaces:
+          type: array
+          items: {$ref: "#/components/schemas/WorkspaceSummary"}
+        discovered:
+          type: array
+          items: {$ref: "#/components/schemas/DiscoveredWorkspace"}
+        requests:
+          type: array
+          items: {$ref: "#/components/schemas/JoinRequest"}
+        can_create_workspace: {type: boolean}
+        signup:
+          type: string
+          enum: [open, waitlist, pending]
+        workspace_name:
+          type: [string, "null"]
+        sign_in_url: {type: string}
+    WorkspaceList:
+      type: object
+      required: [workspaces]
+      additionalProperties: false
+      properties:
+        workspaces:
+          type: array
+          items: {$ref: "#/components/schemas/WorkspaceSummary"}
+    WorkspaceCreate:
+      type: object
+      required: [display_name]
+      additionalProperties: false
+      properties:
+        display_name: {$ref: "#/components/schemas/WorkspaceName"}
+    WorkspaceCreated:
+      type: object
+      description: "`created` is false when the request id already made this workspace"
+      required: [workspace, organization, created]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/WorkspaceSummary"}
+        organization: {$ref: "#/components/schemas/Name"}
+        created: {type: boolean}
+    WorkspaceRef:
+      type: object
+      required: [workspace]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+    WorkspaceRename:
+      type: object
+      required: [workspace, display_name]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        display_name: {$ref: "#/components/schemas/WorkspaceName"}
+    WorkspaceJoin:
+      type: object
+      description: "`workspace` is set once the caller is a member, `request` while a join request is pending or was denied lately"
+      required: [status, workspace, request]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [already_member, pending, denied]
+        workspace:
+          oneOf:
+            - {$ref: "#/components/schemas/WorkspaceSummary"}
+            - {type: "null"}
+        request:
+          oneOf:
+            - {$ref: "#/components/schemas/JoinRequest"}
+            - {type: "null"}
+    WorkspaceMember:
+      type: object
+      description: one membership in the workspace, its organizations or projects
+      required: [issuer, subject, email, name, scope_kind, scope_id, role]
+      additionalProperties: false
+      properties:
+        issuer: {type: string}
+        subject: {type: string}
+        email:
+          type: [string, "null"]
+        name:
+          type: [string, "null"]
+        scope_kind:
+          type: string
+          enum: [account, organization, project]
+        scope_id: {type: string}
+        role: {$ref: "#/components/schemas/WorkspaceRole"}
+    WorkspaceMemberList:
+      type: object
+      required: [members]
+      additionalProperties: false
+      properties:
+        members:
+          type: array
+          items: {$ref: "#/components/schemas/WorkspaceMember"}
+    MemberRoleChange:
+      type: object
+      required: [workspace, issuer, subject, role]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        issuer: {type: string}
+        subject: {type: string}
+        role: {$ref: "#/components/schemas/WorkspaceRole"}
+    MemberRole:
+      type: object
+      required: [issuer, subject, role]
+      additionalProperties: false
+      properties:
+        issuer: {type: string}
+        subject: {type: string}
+        role: {$ref: "#/components/schemas/WorkspaceRole"}
+    MemberRoleChanged:
+      type: object
+      required: [member]
+      additionalProperties: false
+      properties:
+        member: {$ref: "#/components/schemas/MemberRole"}
+    MemberRemove:
+      type: object
+      required: [workspace, issuer, subject]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        issuer: {type: string}
+        subject: {type: string}
+    MemberGone:
+      type: object
+      required: [issuer, subject, removed]
+      additionalProperties: false
+      properties:
+        issuer: {type: string}
+        subject: {type: string}
+        removed: {type: boolean, const: true}
+    MemberRemoved:
+      type: object
+      required: [member]
+      additionalProperties: false
+      properties:
+        member: {$ref: "#/components/schemas/MemberGone"}
+    Invitation:
+      type: object
+      description: an invitation to a workspace; `state` is `expired` once a pending one lapses
+      required: [id, workspace, email, role, state, created_at, expires_at, created_by, accepted_at, revoked_at]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/InvitationId"}
+        workspace: {$ref: "#/components/schemas/Name"}
+        email: {type: string}
+        role: {$ref: "#/components/schemas/WorkspaceRole"}
+        state:
+          type: string
+          enum: [pending, expired, accepted, revoked]
+        created_at: {type: number}
+        expires_at: {type: number}
+        created_by: {type: string}
+        accepted_at:
+          type: [number, "null"]
+        revoked_at:
+          type: [number, "null"]
+    InvitationList:
+      type: object
+      required: [invitations]
+      additionalProperties: false
+      properties:
+        invitations:
+          type: array
+          items: {$ref: "#/components/schemas/Invitation"}
+    InvitationCreate:
+      type: object
+      description: "`role` is `viewer` and `expires_in` a week unless given"
+      required: [workspace, email]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        email: {type: string, maxLength: 254}
+        role: {$ref: "#/components/schemas/WorkspaceRole"}
+        expires_in: {type: number, minimum: 3600, maximum: 1209600}
+    InvitationCreated:
+      type: object
+      description: "`token` and `invitation_url` only when the server has no mailer and `delivery` is `link`; `replaces` names a pending invitation to the same email it revoked"
+      required: [invitation, delivery, replaces]
+      additionalProperties: false
+      properties:
+        invitation: {$ref: "#/components/schemas/Invitation"}
+        delivery:
+          type: string
+          enum: [email, link]
+        replaces:
+          oneOf:
+            - {$ref: "#/components/schemas/InvitationId"}
+            - {type: "null"}
+        token: {type: string, pattern: "^gf_inv_[A-Za-z0-9_-]{43}$"}
+        invitation_url: {type: string}
+    InvitationRevoke:
+      type: object
+      required: [workspace, id]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        id: {$ref: "#/components/schemas/InvitationId"}
+    InvitationView:
+      type: object
+      required: [invitation]
+      additionalProperties: false
+      properties:
+        invitation: {$ref: "#/components/schemas/Invitation"}
+    InvitationToken:
+      type: object
+      description: the token from the invitation link
+      required: [token]
+      additionalProperties: false
+      properties:
+        token: {type: string, pattern: "^gf_inv_[A-Za-z0-9_-]{43}$"}
+    InvitationPreview:
+      type: object
+      required: [workspace, display_name, role, expires_at]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        display_name: {type: string}
+        role: {$ref: "#/components/schemas/WorkspaceRole"}
+        expires_at: {type: number}
+    InvitationAccepted:
+      type: object
+      required: [status, workspace]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [joined, already_member]
+        workspace: {$ref: "#/components/schemas/WorkspaceSummary"}
+    JoinRequestRef:
+      type: object
+      required: [id]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/JoinRequestId"}
+    JoinRequestView:
+      type: object
+      required: [request]
+      additionalProperties: false
+      properties:
+        request: {$ref: "#/components/schemas/JoinRequest"}
+    JoinRequestList:
+      type: object
+      required: [requests]
+      additionalProperties: false
+      properties:
+        requests:
+          type: array
+          items: {$ref: "#/components/schemas/JoinRequestAdmin"}
+    JoinRequestApprove:
+      type: object
+      description: "`role` is `viewer` unless given"
+      required: [workspace, id]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        id: {$ref: "#/components/schemas/JoinRequestId"}
+        role: {$ref: "#/components/schemas/WorkspaceRole"}
+    JoinRequestDeny:
+      type: object
+      required: [workspace, id]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        id: {$ref: "#/components/schemas/JoinRequestId"}
+    WorkspaceMembership:
+      type: object
+      description: the account membership an approval granted, or the one the person already held
+      required: [issuer, subject, scope_kind, scope_id, role]
+      additionalProperties: false
+      properties:
+        issuer: {type: string}
+        subject: {type: string}
+        scope_kind: {type: string, const: account}
+        scope_id: {$ref: "#/components/schemas/Name"}
+        role: {$ref: "#/components/schemas/WorkspaceRole"}
+    JoinRequestApproved:
+      type: object
+      required: [request, membership]
+      additionalProperties: false
+      properties:
+        request: {$ref: "#/components/schemas/JoinRequestAdmin"}
+        membership: {$ref: "#/components/schemas/WorkspaceMembership"}
+    JoinRequestDenied:
+      type: object
+      required: [request]
+      additionalProperties: false
+      properties:
+        request: {$ref: "#/components/schemas/JoinRequestAdmin"}
+    JoinDomain:
+      type: object
+      description: an email domain whose people may ask to join the workspace
+      required: [workspace, domain, enabled_by, enabled_at]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        domain: {type: string}
+        enabled_by: {type: string}
+        enabled_at: {type: number}
+    JoinDomainList:
+      type: object
+      description: "`email_domain` is the caller's own company domain, the one it may enable; null for a personal one"
+      required: [domains, email_domain]
+      additionalProperties: false
+      properties:
+        domains:
+          type: array
+          items: {$ref: "#/components/schemas/JoinDomain"}
+        email_domain:
+          type: [string, "null"]
+    JoinDomainConfigure:
+      type: object
+      description: enabling takes only the domain of the admin's own verified email
+      required: [workspace, domain, enabled]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        domain: {type: string, maxLength: 236}
+        enabled: {type: boolean}
+    JoinDomainConfigured:
+      type: object
+      required: [workspace, domain, enabled]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        domain: {type: string}
+        enabled: {type: boolean}
+    WaitlistJoin:
+      type: object
+      description: "`display_name` is the workspace the person means to create"
+      required: []
+      additionalProperties: false
+      properties:
+        display_name: {$ref: "#/components/schemas/WorkspaceName"}
+    WaitlistStatus:
+      type: object
+      required: [status, message]
+      additionalProperties: false
+      properties:
+        status:
+          type: string
+          enum: [approved, pending]
+        message:
+          type: [string, "null"]
+    WaitlistEntry:
+      type: object
+      description: a waitlist sign-up; approving one from a company domain approves the whole domain
+      required: [id, email, display_name, state, approves, domain, created_at, decided_at, workspace_name]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/WaitlistId"}
+        email: {type: string}
+        display_name:
+          type: [string, "null"]
+        state:
+          type: string
+          enum: [pending, approved]
+        approves:
+          type: string
+          enum: [person, domain]
+        domain: {type: string}
+        created_at: {type: number}
+        decided_at:
+          type: [number, "null"]
+        workspace_name:
+          type: [string, "null"]
+    WaitlistRef:
+      type: object
+      required: [id]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/WaitlistId"}
+    WaitlistEntryView:
+      type: object
+      required: [entry]
+      additionalProperties: false
+      properties:
+        entry: {$ref: "#/components/schemas/WaitlistEntry"}
+    CliLoginCode:
+      type: object
+      required: [user_code]
+      additionalProperties: false
+      properties:
+        user_code: {$ref: "#/components/schemas/UserCode"}
+    CliLoginWorkspace:
+      type: object
+      required: [workspace, display_name]
+      additionalProperties: false
+      properties:
+        workspace: {$ref: "#/components/schemas/Name"}
+        display_name: {type: string}
+    CliLoginPreview:
+      type: object
+      description: "what the sign-in page confirms: the machine asking and the workspaces with a project the key may serve"
+      required: [user_code, machine, expires_at, email, workspaces]
+      additionalProperties: false
+      properties:
+        user_code: {type: string, pattern: "^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$"}
+        machine: {type: string}
+        expires_at: {type: number}
+        email: {type: string}
+        workspaces:
+          type: array
+          items: {$ref: "#/components/schemas/CliLoginWorkspace"}
+    CliLoginApprove:
+      type: object
+      required: [user_code, workspace]
+      additionalProperties: false
+      properties:
+        user_code: {$ref: "#/components/schemas/UserCode"}
+        workspace: {$ref: "#/components/schemas/Name"}
+    CliLoginGranted:
+      type: object
+      required: [id, display_name]
+      additionalProperties: false
+      properties:
+        id: {$ref: "#/components/schemas/Name"}
+        display_name: {type: string}
+    CliLoginApproved:
+      type: object
+      required: [user_code, state, workspace]
+      additionalProperties: false
+      properties:
+        user_code: {type: string, pattern: "^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$"}
+        state: {type: string, const: approved}
+        workspace: {$ref: "#/components/schemas/CliLoginGranted"}
+    CliLoginDenied:
+      type: object
+      required: [user_code, state]
+      additionalProperties: false
+      properties:
+        user_code: {type: string, pattern: "^[BCDFGHJKLMNPQRSTVWXZ]{4}-[BCDFGHJKLMNPQRSTVWXZ]{4}$"}
+        state: {type: string, const: denied}
+    CliLoginApproveRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/CliLoginApprove"}
+    CliLoginCodeRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/CliLoginCode"}
+    InvitationCreateRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/InvitationCreate"}
+    InvitationRevokeRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/InvitationRevoke"}
+    InvitationTokenRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/InvitationToken"}
+    JoinDomainConfigureRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/JoinDomainConfigure"}
+    JoinRequestApproveRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/JoinRequestApprove"}
+    JoinRequestDenyRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/JoinRequestDeny"}
+    JoinRequestRefRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/JoinRequestRef"}
+    MemberRemoveRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/MemberRemove"}
+    MemberRoleChangeRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/MemberRoleChange"}
+    WaitlistJoinRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/WaitlistJoin"}
+    WaitlistRefRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/WaitlistRef"}
+    WorkspaceCreateRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/WorkspaceCreate"}
+    WorkspaceRefRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/WorkspaceRef"}
+    WorkspaceRenameRequest:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [payload]
+          properties:
+            payload: {$ref: "#/components/schemas/WorkspaceRename"}
+    CliLoginApprovedReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/CliLoginApproved"}
+    CliLoginDeniedReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/CliLoginDenied"}
+    CliLoginPreviewReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/CliLoginPreview"}
+    InvitationAcceptedReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/InvitationAccepted"}
+    InvitationCreatedReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/InvitationCreated"}
+    InvitationListReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/InvitationList"}
+    InvitationPreviewReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/InvitationPreview"}
+    InvitationViewReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/InvitationView"}
+    JoinDomainConfiguredReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/JoinDomainConfigured"}
+    JoinDomainListReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/JoinDomainList"}
+    JoinRequestApprovedReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/JoinRequestApproved"}
+    JoinRequestDeniedReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/JoinRequestDenied"}
+    JoinRequestListReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/JoinRequestList"}
+    JoinRequestViewReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/JoinRequestView"}
+    MemberRemovedReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/MemberRemoved"}
+    MemberRoleChangedReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/MemberRoleChanged"}
+    OnboardingReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Onboarding"}
+    WaitlistEntryViewReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/WaitlistEntryView"}
+    WaitlistStatusReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/WaitlistStatus"}
+    WorkspaceCreatedReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/WorkspaceCreated"}
+    WorkspaceDetailsReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/WorkspaceDetails"}
+    WorkspaceJoinReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/WorkspaceJoin"}
+    WorkspaceListReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/WorkspaceList"}
+    WorkspaceMemberListReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/WorkspaceMemberList"}
+    WorkspaceSummaryReply:
+      allOf:
+        - {$ref: "#/components/schemas/Envelope"}
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/WorkspaceSummary"}

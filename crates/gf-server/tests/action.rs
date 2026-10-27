@@ -131,3 +131,26 @@ fn a_worker_profile_needs_every_table_and_stays_under_the_profiling_directory() 
         );
     }
 }
+
+#[test]
+fn actions_on_every_table_need_an_unscoped_token() {
+    let scoped = Scope::Tables(vec!["tenant-a*".to_string()]);
+    for (kind, body) in [
+        ("rebalance", json!({})),
+        ("profile_workers", json!({"directory": "run"})),
+    ] {
+        let parsed = FlightAction::parse(&action(kind, body)).unwrap();
+        assert!(parsed.needs_every_table(), "{kind}");
+        assert_eq!(
+            parsed.check_scope(&scoped).unwrap_err().code(),
+            Code::PermissionDenied,
+            "{kind}"
+        );
+        assert!(parsed.check_scope(&Scope::All).is_ok(), "{kind}");
+    }
+    // A table's own actions stay within the scope that reaches the table.
+    let moved = action("move_table", json!({"table": "tenant-a-rows", "shard": 1}));
+    let parsed = FlightAction::parse(&moved).unwrap();
+    assert!(!parsed.needs_every_table());
+    assert!(parsed.check_scope(&scoped).is_ok());
+}

@@ -54,6 +54,8 @@ def test_example_shows_the_full_envelope(example):
     if "health" in example.tags:
         assert set(example.value) in ({"status"}, {"error"})
         return
+    if not example.envelope:
+        return
     body = (
         "payload"
         if example.section == "request"
@@ -144,7 +146,8 @@ def test_routes_table_matches_the_spec():
     }
     assert public <= expected
     for route in _api.ROUTES:
-        assert (route.request is None) == (route.method == "GET"), route.name
+        assert (route.body is None) == (route.method == "GET"), route.name
+        assert (route.request is None) == (route.body != "application/json"), route.name
         assert issubclass(route.reply, _api.Payload)
 
 
@@ -155,10 +158,8 @@ def test_generated_module_round_trips(example):
         cls = route.request
     elif example.status < 400:
         cls = route.reply
-    elif "health" in example.tags:
-        cls = _api.HealthError
     else:
-        cls = _api.ErrorReply
+        cls = getattr(_api, example.schema["$ref"].rsplit("/", 1)[-1])
     assert cls is not None
     if example.invalid:
         reply = REPLIES[(example.operation, example.name)]
