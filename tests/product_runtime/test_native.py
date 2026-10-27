@@ -202,7 +202,7 @@ def test_real_forecast_date_axis_preserves_out_of_order_rows(tmp_path):
         {"time": [datetime.date(2026, 1, 18), datetime.date(2026, 1, 17)]}
     )
     output = prepared.predict(queries)
-    assert output.column_names == ["value"] and output.num_rows == 2
+    assert output.column_names == ["value", "quantiles"] and output.num_rows == 2
     assert np.isfinite(output["value"].to_numpy()).all()
     chronological = prepared.predict(queries.take(pa.array([1, 0])))
     assert output["value"].to_pylist() == chronological["value"].to_pylist()[::-1]

@@ -160,7 +160,8 @@ def test_times_are_read_in_utc_on_every_machine(monkeypatch) -> None:
 def test_calendar_times_step_through_period_ordinals() -> None:
     months = [datetime.date(2023, m, 1) for m in range(1, 13)]
     places = [frequency.coordinate(month, "MS") for month in months]
-    assert places == list(range(places[0], places[0] + 12))
+    first = int(places[0])
+    assert places == list(range(first, first + 12))
     assert frequency.step("MS") == 1 and frequency.step("3MS") == 3
     assert frequency.step("1d") == 86400 and frequency.step(7) == 7
     assert frequency.calendar_unit("2QE") == "Q"

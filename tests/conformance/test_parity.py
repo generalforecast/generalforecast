@@ -191,15 +191,16 @@ def _cli(root: Path, queries: pa.Table, monkeypatch: Any) -> pd.DataFrame:
         root.parent / f"{root.name}-out.parquet",
     )
     pq.write_table(queries, source)
+    errors = io.StringIO()
     monkeypatch.setattr(sys, "stdout", io.StringIO())
-    monkeypatch.setattr(sys, "stderr", io.StringIO())
+    monkeypatch.setattr(sys, "stderr", errors)
     monkeypatch.setenv("NO_COLOR", "1")
     try:
         cli.main(
             ["predict", str(root), "--queries", str(source), "--output", str(output)]
         )
     except SystemExit as error:
-        assert not error.code, sys.stderr.getvalue()
+        assert not error.code, errors.getvalue()
     return pd.read_parquet(output)
 
 

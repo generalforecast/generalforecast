@@ -12,7 +12,7 @@ import ast
 import inspect
 from pathlib import Path
 
-import generalforecast.hosting as hosting
+from generalforecast import hosting
 
 SOURCE = Path(__file__).resolve().parents[2] / "src" / "generalforecast"
 

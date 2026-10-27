@@ -129,9 +129,7 @@ def test_served_calls_go_through_the_sdk_transport_with_project_and_key(monkeypa
     )
     frame = predictor.predict([{"id": 7, "spend": 1.0}])
     assert frame["label"].tolist() == [1]
-    method, path, body, headers, defaults = next(
-        item for item in sent if item[0] == "POST"
-    )
+    _, path, body, headers, defaults = next(item for item in sent if item[0] == "POST")
     assert path == "/v1/projects/team-a/predictors/churn/predict"
     assert body["project"] == "team-a" and headers["X-GF-Project"] == "team-a"
     assert defaults["Authorization"] == "Bearer k-1"
@@ -141,7 +139,7 @@ def test_push_passes_the_runtime(tmp_path):
     root = directory(tmp_path / "churn", rows(), name="churn", id="id")
     client = Recorder()
     gf.Predictor(root, client=client).push("staging", runtime="hosted")
-    [(_, args, kwargs)] = [call for call in client.calls if call[0] == "push"]
+    [(_, _, kwargs)] = [call for call in client.calls if call[0] == "push"]
     assert kwargs == {"env": "staging", "runtime": "hosted"}
 
 

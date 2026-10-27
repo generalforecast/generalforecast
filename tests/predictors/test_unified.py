@@ -426,3 +426,15 @@ def test_the_lock_document_round_trips_through_yaml(tmp_path):
     root = directory(tmp_path / "churn", churn(), id="id")
     value = yaml.safe_load((root / "gf.lock").read_text())
     assert value == document(resolve(load(root), root))
+
+
+def test_serving_refuses_a_lock_pinned_to_another_artifact(tmp_path):
+    from generalforecast.predictors.lock import lock_digest
+
+    root = directory(tmp_path / "churn", churn(), id="id")
+    value = yaml.safe_load((root / "gf.lock").read_text())
+    value["predictor"]["model_digest"] = "sha256:" + "1" * 64
+    value["digest"] = lock_digest(value)
+    with pytest.raises(PredictorError) as caught:
+        compile_lock(value, served_context(value, churn()))
+    assert caught.value.code == "ModelMismatch"
