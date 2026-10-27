@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // The General Forecast API client. Dependency-free: `fetch` from Node 20+ or
 // the browser, the envelope every route carries, and typed errors.
 

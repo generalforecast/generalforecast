@@ -4,7 +4,6 @@
 """Check and add SPDX headers to tracked source files."""
 
 import argparse
-import json
 import os
 import re
 import subprocess
@@ -14,17 +13,11 @@ COMMENT_PREFIXES = {
     ".py": "# ",
     ".pyi": "# ",
     ".sh": "# ",
-    ".tf": "# ",
-    ".hcl": "# ",
     ".rs": "// ",
     ".js": "// ",
     ".mjs": "// ",
+    ".ts": "// ",
 }
-CSS_HEADER = (
-    b"/* SPDX-FileCopyrightText: General Forecast, Inc. */",
-    b"/* SPDX-License-Identifier: Apache-2.0 */",
-)
-EXTENSIONS = {*COMMENT_PREFIXES, ".css"}
 REPOSITORY = Path(__file__).resolve().parents[1]
 
 
@@ -34,33 +27,16 @@ def tracked_files() -> list[Path]:
         b"\0"
     )
     files = [REPOSITORY / os.fsdecode(path) for path in paths if path]
-    brand_assets = {
-        receipt_path.parent / name
-        for receipt_path in files
-        if receipt_path.name == "brand.json"
-        for name in json.loads(receipt_path.read_text())["files"]
-    }
-    generated = {REPOSITORY / "src" / "generalforecast" / "_api.py"}
-    return [
-        path
-        for path in files
-        if path not in brand_assets
-        and path not in generated
-        and path.suffix in EXTENSIONS
-        and path.name != ".terraform.lock.hcl"
-    ]
+    return [path for path in files if path.suffix in COMMENT_PREFIXES]
 
 
 def header_for(path: Path, newline: bytes) -> bytes:
     """Return the two comment lines for a source file."""
-    if path.suffix == ".css":
-        lines = CSS_HEADER
-    else:
-        prefix = COMMENT_PREFIXES[path.suffix].encode()
-        lines = (
-            prefix + b"SPDX-FileCopyrightText: General Forecast, Inc.",
-            prefix + b"SPDX-License-Identifier: Apache-2.0",
-        )
+    prefix = COMMENT_PREFIXES[path.suffix].encode()
+    lines = (
+        prefix + b"SPDX-FileCopyrightText: General Forecast, Inc.",
+        prefix + b"SPDX-License-Identifier: Apache-2.0",
+    )
     return newline.join(lines) + newline
 
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: General Forecast, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 // The HTTP API's request and reply types, generated from
 // api/openapi.yaml by api/generate.py. Do not edit.
 
