@@ -3387,7 +3387,7 @@ components:
       name: model
       in: path
       required: true
-      schema: {$ref: "#/components/schemas/Name"}
+      schema: {$ref: "#/components/schemas/ModelName"}
       description: |
         a catalog model's name without its `general-forecast/` prefix, such
         as `tabicl-v2-classifier`, since a path segment holds no `/`
@@ -3439,9 +3439,17 @@ components:
       pattern: "^[a-z][a-z0-9-]{0,62}$"
       description: a resource name
 
+    ModelName:
+      type: string
+      pattern: "^[a-z0-9][a-z0-9.-]{0,62}$"
+      description: |
+        a catalog model's name, its id without `general-forecast/`, such as
+        `tabpfn-3.5-classifier`; unlike a chosen resource name it may start
+        with a digit and hold dots
+
     ModelId:
       type: string
-      pattern: "^general-forecast/[a-z0-9][a-z0-9.-]*(@[^@\\s]+)?$"
+      pattern: "^general-forecast/[a-z0-9][a-z0-9.-]{0,62}(@[^@\\s]+)?$"
       description: |
         a catalog model id, `general-forecast/<name>`, with an optional
         variant suffix (`@4*2`) or digest pin (`@sha256:<digest>`)

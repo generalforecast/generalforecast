@@ -220,9 +220,13 @@ Name = str
 _decode_Name: Decoder = _pattern("^[a-z][a-z0-9-]{0,62}$")
 
 
+ModelName = str
+_decode_ModelName: Decoder = _pattern("^[a-z0-9][a-z0-9.-]{0,62}$")
+
+
 ModelId = str
 _decode_ModelId: Decoder = _pattern(
-    "^general-forecast/[a-z0-9][a-z0-9.-]*(@[^@\\s]+)?$",
+    "^general-forecast/[a-z0-9][a-z0-9.-]{0,62}(@[^@\\s]+)?$",
 )
 
 

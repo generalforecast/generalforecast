@@ -393,3 +393,16 @@ def test_every_example_lock_is_one_the_sdk_accepts() -> None:
     assert locks
     for lock in locks:
         assert parse_lock(lock).digest == lock["digest"]
+
+
+def test_model_ids_have_one_grammar() -> None:
+    from generalforecast.service.contracts import MODEL_ID, MODEL_NAME_PATTERN
+
+    schemas = SPEC["components"]["schemas"]
+    assert schemas["ModelName"]["pattern"] == f"^{MODEL_NAME_PATTERN}$"
+    assert schemas["ModelId"]["pattern"].startswith(
+        f"^general-forecast/{MODEL_NAME_PATTERN}"
+    )
+    parameter = SPEC["components"]["parameters"]["model"]["schema"]
+    assert parameter == {"$ref": "#/components/schemas/ModelName"}
+    assert MODEL_ID.fullmatch("general-forecast/tabpfn-3.5-classifier")

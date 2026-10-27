@@ -48,6 +48,7 @@ from generalforecast.service.boundary import (
     json_object,
 )
 from generalforecast.service.contracts import (
+    MODEL_NAME_PATTERN,
     InputError,
     ServiceError,
     name,
@@ -262,7 +263,7 @@ def got(kind: ResourceKind, collection: str, resource: str) -> Operation[JsonObj
 
 
 # A catalog model id, `general-forecast/<name>`, with an optional variant.
-_MODEL_ID = re.compile(r"general-forecast/([a-z0-9][a-z0-9.-]{0,62})(?:@\S+)?")
+_MODEL_ID = re.compile(rf"general-forecast/({MODEL_NAME_PATTERN})(?:@\S+)?")
 
 
 def model_got(model: str) -> Operation[JsonObject]:
@@ -282,7 +283,8 @@ def model_got(model: str) -> Operation[JsonObject]:
             if bare
             else "model ids are general-forecast/<name>",
         )
-    return (yield from got("model", "models", found.group(1)))
+    model_name = found.group(1)
+    return (yield Call("GET", f"/models/{model_name}", "model", model_name))
 
 
 def posted(

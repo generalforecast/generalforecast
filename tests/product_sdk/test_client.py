@@ -374,3 +374,23 @@ def test_a_model_is_read_by_its_canonical_id(wire, asynchronous):
         run(asynchronous, wire.url, lambda c: c.models.get("tabicl-v2-classifier"))
     assert refused.value.param == "model"
     assert refused.value.hint == "use general-forecast/tabicl-v2-classifier"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_dotted_catalog_id_is_read_by_its_name(wire, asynchronous):
+    from generalforecast.service.boundary import Resource
+
+    wire.expect(
+        "GET", "/models/tabpfn-3.5-classifier", {"name": "tabpfn-3.5-classifier"}
+    )
+    model = run(
+        asynchronous,
+        wire.url,
+        lambda c: c.models.get("general-forecast/tabpfn-3.5-classifier"),
+    )
+    assert model == {"name": "tabpfn-3.5-classifier"}
+    # Model names hold dots; chosen names keep the strict rule.
+    assert Resource("model", "tabpfn-3.5-classifier").name == "tabpfn-3.5-classifier"
+    for kind in ("predictor", "context"):
+        with pytest.raises(ServiceError):
+            Resource(kind, "tabpfn-3.5")

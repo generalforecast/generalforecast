@@ -7,6 +7,13 @@ export const VERSION = "gf/v1";
 export type Name = string;
 
 /**
+ * a catalog model's name, its id without `general-forecast/`, such as
+ * `tabpfn-3.5-classifier`; unlike a chosen resource name it may start with a digit and
+ * hold dots
+ */
+export type ModelName = string;
+
+/**
  * a catalog model id, `general-forecast/<name>`, with an optional variant suffix
  * (`@4*2`) or digest pin (`@sha256:<digest>`)
  */
