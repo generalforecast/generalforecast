@@ -3,12 +3,12 @@
 
 """The test suite on an NVIDIA L4 on Modal, with the TabICL v2 checkpoints.
 
-Run with `uvx --from modal==1.6.2 modal run .github/gpu.py` (CI installs the
-SDK by hash from .github/modal-requirements.txt). Only files git
-tracks are uploaded, so a local worktree, state file, key or build output never
-reaches the image. The base is a pinned Rust image, and uv installs by hash. Checkpoints come from `checkpoints/` when it has them, or
-else from Hugging Face with `HF_TOKEN`; without either, the tests that need
-them skip.
+Run with `modal run .github/gpu.py`, the Modal SDK installed by hash from
+.github/modal-requirements.txt, which pins its version. Only files git
+tracks are uploaded, so a local worktree, state file, key or build output
+never reaches the image. The base is a pinned Rust image, and uv installs by
+hash. Checkpoints come from `checkpoints/` when it has them, or else from
+Hugging Face with `HF_TOKEN`; without either, the tests that need them skip.
 """
 
 import os
