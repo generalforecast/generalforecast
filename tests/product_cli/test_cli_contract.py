@@ -917,3 +917,29 @@ def test_init_defaults_follow_the_task(monkeypatch, tmp_path):
     code, _, stderr = gf("init", "--yes", str(regression), monkeypatch=monkeypatch)
     assert code == 0, stderr
     assert _manifest(regression)["target"] == "y"
+
+
+def test_a_json_output_file_is_the_text_json_stdout_carries(tmp_path):
+    import datetime
+    import json
+
+    import pandas as pd
+
+    from generalforecast.predictor_commands import _write_frame
+    from generalforecast.render import dumps
+
+    frame = pd.DataFrame(
+        {
+            "sku": ["a"],
+            "date": [datetime.date(2026, 1, 5)],
+            "value": [18.123456789012345],
+            "q_0.1": [float("nan")],
+        }
+    )
+    path = tmp_path / "out.json"
+    _write_frame(frame, path)
+    written = json.loads(path.read_text())
+    assert written == json.loads(dumps(frame))
+    assert written == [
+        {"sku": "a", "date": "2026-01-05", "value": 18.123456789012345, "q_0.1": None}
+    ]

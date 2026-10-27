@@ -92,10 +92,19 @@ def redact(value: Any) -> Any:
     return value
 
 
+def dumps(value: Any) -> str:
+    """A result as the CLI writes JSON everywhere, on stdout and to files.
+
+    Dates and times are ISO 8601 text, floats keep every digit, and a
+    missing value is null.
+    """
+    return json.dumps(jsonable(value), allow_nan=False, ensure_ascii=False)
+
+
 def emit(value: dict, *, error: bool = False) -> None:
     """One JSON object on stdout (results) or stderr (errors)."""
     print(
-        json.dumps(redact(jsonable(value)), allow_nan=False, ensure_ascii=False),
+        dumps(redact(jsonable(value))),
         file=sys.stderr if error else sys.stdout,
         flush=True,
     )

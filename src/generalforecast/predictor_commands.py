@@ -248,7 +248,11 @@ def _write_frame(frame: Any, path: Path) -> None:
         if path.suffix == ".parquet":
             frame.to_parquet(temporary, index=False)
         elif path.suffix == ".json":
-            frame.to_json(temporary, orient="records")
+            from generalforecast.render import dumps
+
+            # The encoder --json writes stdout with, so a file and stdout
+            # carry the same text: ISO times and every float digit.
+            Path(temporary).write_text(dumps(frame) + "\n", encoding="utf-8")
         else:
             frame.to_csv(temporary, index=False)
         os.chmod(temporary, _mode(path))
