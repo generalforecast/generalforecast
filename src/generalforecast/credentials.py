@@ -19,6 +19,9 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from generalforecast._files import private_lock, read_private, write_private
+from generalforecast.service.contracts import ServiceError
+
 DEFAULT_SERVER = "https://app.generalforecast.com"
 KEYCHAIN_SERVICE = "generalforecast"
 ENV_KEY = "GF_API_KEY"
@@ -27,6 +30,8 @@ SEEN: set[str] = set()
 # The server and credential source the current command uses, for diagnostics.
 CONNECTION: dict[str, str] = {}
 PROFILE_FLAGS = ("url", "profile", "key_env", "base_url")
+# The largest credentials file read.
+_CREDENTIALS_LIMIT = 65536
 
 
 def server_url(environ: dict[str, str] | None = None) -> str:
@@ -92,8 +97,32 @@ def key_suffix(key: str | None) -> str:
     return f"{key[:3]}...{key[-4:]}" if key and len(key) > 12 else "unknown"
 
 
-def _toml_string(value: str) -> str:
-    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+_TOML_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def toml_string(value: str) -> str:
+    """A TOML basic string holding `value` exactly, every control character escaped."""
+    return (
+        '"'
+        + "".join(
+            _TOML_ESCAPES.get(character)
+            or (
+                f"\\u{ord(character):04X}"
+                if ord(character) < 0x20 or ord(character) == 0x7F
+                else character
+            )
+            for character in value
+        )
+        + '"'
+    )
 
 
 class CredentialStore:
@@ -112,32 +141,43 @@ class CredentialStore:
 
     def _read(self) -> dict[str, dict]:
         try:
-            data = tomllib.loads(self.path.read_text())
-        except FileNotFoundError:
+            raw = read_private(self.path, limit=_CREDENTIALS_LIMIT, missing_ok=True)
+        except ServiceError as error:
+            raise ServiceError(
+                error.code,
+                f"{_home(self.path)}: {error.message}",
+                error.status,
+                hint=f"make it private with `chmod 600 {_home(self.path)}`, "
+                "or remove it and run `gf login` again",
+            ) from error
+        if raw is None:
             return {}
+        try:
+            data = tomllib.loads(raw.decode())
+        except (UnicodeError, tomllib.TOMLDecodeError):
+            raise ServiceError(
+                "ValidationError",
+                f"{_home(self.path)} is not valid TOML",
+                422,
+                hint="fix it, or remove it and run `gf login` again",
+            ) from None
         servers = data.get("servers", {})
         return servers if isinstance(servers, dict) else {}
 
     def _write(self, servers: dict[str, dict]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         lines = [
             "# Written by gf login. Keys here are secrets; keep this file private.",
             "",
         ]
         for server, values in sorted(servers.items()):
-            lines.append(f"[servers.{_toml_string(server)}]")
+            lines.append(f"[servers.{toml_string(server)}]")
             lines += [
-                f"{k} = {_toml_string(str(v))}"
+                f"{k} = {toml_string(str(v))}"
                 for k, v in values.items()
                 if v is not None
             ]
             lines.append("")
-        temporary = self.path.with_suffix(".tmp")
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(descriptor, "w") as stream:
-            stream.write("\n".join(lines))
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, self.path)
+        write_private(self.path, "\n".join(lines).encode())
 
     def load(self, server: str) -> Login | None:
         """The stored login for a server, with its key when readable."""
@@ -163,22 +203,24 @@ class CredentialStore:
         login.store = (
             "keychain" if self.keychain() and self._keychain_write(login) else "file"
         )
-        servers = self._read()
         values = {k: v for k, v in asdict(login).items() if k not in {"server", "key"}}
         if login.store == "file":
             values["key"] = login.key
-        servers[login.server] = values
-        self._write(servers)
+        with private_lock(self.path):
+            servers = self._read()
+            servers[login.server] = values
+            self._write(servers)
         return login
 
     def remove(self, server: str) -> bool:
         """Forgets a server's login; True when something was removed."""
-        servers = self._read()
-        found = servers.pop(server, None)
-        if found is not None:
-            self._write(servers)
-            if found.get("store") == "keychain":
-                self._keychain_delete(server)
+        with private_lock(self.path):
+            servers = self._read()
+            found = servers.pop(server, None)
+            if found is not None:
+                self._write(servers)
+        if found is not None and found.get("store") == "keychain":
+            self._keychain_delete(server)
         return found is not None
 
     def location(self, login: Login) -> str:
@@ -186,9 +228,17 @@ class CredentialStore:
         return "macOS keychain" if login.store == "keychain" else _home(self.path)
 
     def resolve(self, server: str) -> Credential | None:
-        """GF_API_KEY first, then the stored login for this server."""
+        """GF_API_KEY first, then the stored login for this server.
+
+        The environment's key needs no file: a stored login only adds its
+        metadata, and an unreadable credentials file leaves that out.
+        """
         if self.env.get(ENV_KEY):
-            return Credential(self.env[ENV_KEY], ENV_KEY, self.load(server))
+            try:
+                login = self.load(server)
+            except ServiceError:
+                login = None
+            return Credential(self.env[ENV_KEY], ENV_KEY, login)
         login = self.load(server)
         if login is None or not login.key:
             return None

@@ -9,9 +9,11 @@ locks, instead of silently persisting state with weaker guarantees.
 """
 
 import contextlib
+import errno
 import os
 import secrets
 import stat
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import BinaryIO
@@ -27,6 +29,8 @@ _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _DIRECTORY = getattr(os, "O_DIRECTORY", 0)
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
+# How often a lock file's creation is retried after a racing creator's ENOENT.
+_CREATE_ATTEMPTS = 50
 
 
 def secure_persistence_supported() -> bool:
@@ -61,6 +65,27 @@ def _private(info: os.stat_result) -> None:
         )
 
 
+def _unopenable(error: OSError) -> ServiceError:
+    """The error for a private file that cannot be opened, naming its errno.
+
+    A link refused by `O_NOFOLLOW` is not a private regular file; any other
+    failure says what the system reported.
+    """
+    code = errno.errorcode.get(error.errno or 0, "unknown")
+    if error.errno in (errno.ELOOP, errno.EMLINK):
+        return ServiceError(
+            "ValidationError",
+            "requires a private regular file owned by the current user, "
+            f"not a link ({code})",
+            422,
+        )
+    return ServiceError(
+        "ValidationError",
+        f"private file cannot be opened: {os.strerror(error.errno or 0).lower()} ({code})",
+        422,
+    )
+
+
 def _directory(path: Path) -> int:
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     return os.open(path.parent, os.O_RDONLY | _DIRECTORY | _CLOEXEC)
@@ -79,12 +104,8 @@ def read_private(
         raise ServiceError(
             "ValidationError", "private file is unavailable", 422
         ) from None
-    except OSError:
-        raise ServiceError(
-            "ValidationError",
-            "requires a private regular file owned by the current user",
-            422,
-        ) from None
+    except OSError as error:
+        raise _unopenable(error) from error
     try:
         _private(os.fstat(fd))
         chunks, size = [], 0
@@ -176,23 +197,37 @@ def private_lock(path: str | os.PathLike[str]) -> Iterator[None]:
     target = Path(path)
     directory = _directory(target)
     try:
-        fd = os.open(
-            target.name + ".lock",
-            os.O_RDWR | os.O_CREAT | _NOFOLLOW | _CLOEXEC,
-            0o600,
-            dir_fd=directory,
-        )
-    except OSError:
+        fd = _open_lock(target.name + ".lock", directory)
+    except OSError as error:
+        raise _unopenable(error) from error
+    finally:
         os.close(directory)
-        raise ServiceError(
-            "ValidationError",
-            "requires a private regular file owned by the current user",
-            422,
-        ) from None
-    os.close(directory)
     try:
         _private(os.fstat(fd))
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
     finally:
         os.close(fd)
+
+
+def _open_lock(name: str, directory: int) -> int:
+    """Opens or creates a lock file, retrying a create that lost a race.
+
+    On macOS, when several processes or threads create the same new file at
+    once with `O_CREAT`, the losers can fail with ENOENT although the file
+    exists a moment later; opening it again succeeds. Any other errno, or
+    ENOENT that persists, is raised as it is.
+    """
+    for attempt in range(_CREATE_ATTEMPTS):
+        try:
+            return os.open(
+                name,
+                os.O_RDWR | os.O_CREAT | _NOFOLLOW | _CLOEXEC,
+                0o600,
+                dir_fd=directory,
+            )
+        except FileNotFoundError:
+            if attempt == _CREATE_ATTEMPTS - 1:
+                raise
+            time.sleep(0.001 * (attempt + 1))
+    raise AssertionError("unreachable")

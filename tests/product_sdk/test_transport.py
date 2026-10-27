@@ -4,7 +4,9 @@
 import asyncio
 import inspect
 import json
+import os
 import ssl
+import stat
 import time
 from dataclasses import FrozenInstanceError
 from typing import Any, cast
@@ -517,21 +519,132 @@ def test_concurrent_profile_saves_never_lose_updates(tmp_path):
 
     config = tmp_path / "profiles.json"
     barrier = threading.Barrier(8)
+    failures: list[BaseException] = []
 
     def save(index):
         barrier.wait()
-        for round_ in range(5):
-            Profile(project=f"p{index}-{round_}").save(f"profile-{index}", config)
+        try:
+            for round_ in range(5):
+                Profile(project=f"p{index}-{round_}").save(f"profile-{index}", config)
+        except BaseException as error:  # noqa: BLE001 - reported below
+            failures.append(error)
 
     threads = [threading.Thread(target=save, args=(i,)) for i in range(8)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
+    assert not failures, failures
     profiles = Profile.load_all(config)
     assert {name: value["project"] for name, value in profiles.items()} == {
         f"profile-{i}": f"p{i}-4" for i in range(8)
     }
+
+
+def test_a_lock_created_while_another_creator_races_is_opened_again(
+    tmp_path, monkeypatch
+):
+    import errno
+
+    from generalforecast import _files
+
+    real_open = os.open
+    raced = []
+
+    def racing_open(path, flags, *args, **kwargs):
+        # macOS answers a losing O_CREAT racer with ENOENT, deterministically here.
+        if str(path).endswith(".lock") and len(raced) < 3:
+            raced.append(path)
+            raise FileNotFoundError(errno.ENOENT, "No such file or directory")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(_files.os, "open", racing_open)
+    Profile(project="raced").save("default", tmp_path / "profiles.json")
+    assert len(raced) == 3
+    assert Profile.load_all(tmp_path / "profiles.json")["default"]["project"] == "raced"
+
+
+def test_a_lock_that_cannot_be_opened_names_the_real_errno(tmp_path, monkeypatch):
+    import errno
+
+    from generalforecast import _files
+
+    real_open = os.open
+
+    def refused(path, flags, *args, **kwargs):
+        if str(path).endswith(".lock"):
+            raise PermissionError(errno.EACCES, "Permission denied")
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(_files.os, "open", refused)
+    with pytest.raises(ServiceError) as error:
+        Profile().save("default", tmp_path / "profiles.json")
+    assert (
+        "EACCES" in error.value.message and "permission denied" in error.value.message
+    )
+    assert isinstance(error.value.__cause__, PermissionError)
+
+
+def test_credentials_round_trip_every_control_character_in_a_private_file(tmp_path):
+    from generalforecast.credentials import CredentialStore, Login
+
+    environ = {
+        "GF_CONFIG_PATH": str(tmp_path / "gf" / "profiles.json"),
+        "GF_KEYCHAIN": "0",
+    }
+    store = CredentialStore(environ)
+    workspace = 'Acme\nCorp\t"quoted" \\ \x00\x1f\x7f\u2028 caf\u00e9'
+    store.save(
+        Login(
+            "https://a.example",
+            "k1",
+            None,
+            workspace,
+            "w1",
+            "p",
+            "file",
+            key="gf_k1234567890",
+        )
+    )
+    store.save(
+        Login(
+            "https://b.example",
+            "k2",
+            None,
+            "plain",
+            "w2",
+            "p",
+            "file",
+            key="gf_k0987654321",
+        )
+    )
+    loaded, resolved = (
+        store.load("https://a.example"),
+        store.resolve("https://b.example"),
+    )
+    assert loaded is not None and loaded.workspace == workspace
+    assert resolved is not None and resolved.key == "gf_k0987654321"
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+    assert store.remove("https://a.example") and store.load("https://a.example") is None
+
+
+def test_a_corrupt_credentials_file_is_a_typed_error(tmp_path):
+    from generalforecast.credentials import CredentialStore
+
+    environ = {
+        "GF_CONFIG_PATH": str(tmp_path / "gf" / "profiles.json"),
+        "GF_KEYCHAIN": "0",
+    }
+    store = CredentialStore(environ)
+    store.path.parent.mkdir(parents=True)
+    store.path.write_text('[servers."x"]\nworkspace = "a\nb"\n')
+    store.path.chmod(0o600)
+    with pytest.raises(ServiceError) as error:
+        store.load("x")
+    assert (
+        error.value.code == "ValidationError"
+        and "not valid TOML" in error.value.message
+    )
 
 
 @pytest.mark.parametrize("locked", [False, True])
@@ -569,3 +682,124 @@ def test_profile_lock_prevents_reproducible_lost_update(tmp_path, monkeypatch, l
         assert stored == {"seed", "p0", "p1"}
     else:
         assert stored < {"seed", "p0", "p1"} and len(stored) == 2
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_every_post_states_its_content_length(asynchronous):
+    # gf-server refuses a POST body that states no length with 411.
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *_args):
+            pass
+
+        def do_POST(self):
+            length = self.headers.get("Content-Length")
+            body = self.rfile.read(int(length or 0))
+            seen.append((length, self.headers.get("Transfer-Encoding"), len(body)))
+            data = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    url = f"http://127.0.0.1:{server.server_port}"
+    bodies = [{"payload": {"x": 1}}, b"arrow-stream-bytes"]
+
+    async def run():
+        transport = (AsyncTransport if asynchronous else Transport)(url)
+        try:
+            for body in bodies:
+                value = transport.send("POST", "/v1/projects/p/predict", body)
+                assert (await value if inspect.isawaitable(value) else value) == {}
+        finally:
+            closing = (
+                transport.aclose()
+                if isinstance(transport, AsyncTransport)
+                else transport.close()
+            )
+            if inspect.isawaitable(closing):
+                await closing
+
+    try:
+        asyncio.run(run())
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()
+    assert [(int(length), chunked) for length, chunked, _size in seen] == [
+        (size, None) for _length, _chunked, size in seen
+    ]
+    assert len(seen) == 2
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_download_past_its_limit_is_capacity_exceeded(asynchronous):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import generalforecast as gf
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *_args):
+            pass
+
+        def do_GET(self):
+            data = b"x" * 100
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    url = f"http://127.0.0.1:{server.server_port}"
+
+    async def download(limit: int) -> bytes:
+        if not asynchronous:
+            return Transport(url).download("/rows.csv", limit=limit)
+        transport = AsyncTransport(url)
+        try:
+            return await transport.download("/rows.csv", limit=limit)
+        finally:
+            await transport.aclose()
+
+    try:
+        assert asyncio.run(download(100)) == b"x" * 100
+        with pytest.raises(gf.CapacityExceeded) as error:
+            asyncio.run(download(10))
+        assert error.value.limit == 10
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()
+
+
+def test_an_environment_key_needs_no_readable_credentials_file(tmp_path):
+    from generalforecast.credentials import CredentialStore
+
+    config = tmp_path / "gf" / "profiles.json"
+    shared = CredentialStore({"GF_CONFIG_PATH": str(config), "GF_KEYCHAIN": "0"})
+    shared.path.parent.mkdir(parents=True)
+    shared.path.write_text('[servers."https://a.example"]\nkey_id = "k1"\n')
+    shared.path.chmod(0o644)
+    with_key = CredentialStore(
+        {
+            "GF_CONFIG_PATH": str(config),
+            "GF_KEYCHAIN": "0",
+            "GF_API_KEY": "gf_envkey1234",
+        }
+    )
+    found = with_key.resolve("https://a.example")
+    assert found is not None and (found.key, found.login) == ("gf_envkey1234", None)
+    with pytest.raises(ServiceError) as error:
+        shared.resolve("https://a.example")
+    assert "credentials.toml" in error.value.message
+    assert error.value.hint is not None and "chmod 600" in error.value.hint

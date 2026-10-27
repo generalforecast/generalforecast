@@ -707,7 +707,7 @@ class Predictor:
         download: bool = True,
     ) -> None:
         """Resolves the reference; nothing runs until `predict` or `eval`."""
-        self._kind, self._where = resolve_reference(ref)
+        self._kind, self._where = resolve_reference(ref, env=env)
         self._client_given = client
         self._download = download
         self._as_of: Any = None
@@ -1333,12 +1333,15 @@ def _frame_of_result(result: Any, id_name: str | None) -> Any:
     return pd.DataFrame(rows)
 
 
-def resolve_reference(ref: Any) -> tuple[str, Any]:
+def resolve_reference(ref: Any, *, env: str | None = None) -> tuple[str, Any]:
     """What a reference names: `("local", path)`, `("catalog", id)`, `("served", (base, name))` or `("hosted", name)`.
+
+    An environment names a hosted predictor, so a bare name with one is hosted
+    even where a directory of that name holds a `gf.yaml`.
 
     Raises:
         AmbiguousReference: When a bare name is both a directory with
-            `gf.yaml` and so a hosted name.
+            `gf.yaml` and so a hosted name, and no environment says which.
     """
     if isinstance(ref, os.PathLike):
         return "local", _local_root(os.fspath(ref))
@@ -1363,7 +1366,7 @@ def resolve_reference(ref: Any) -> tuple[str, Any]:
     is_dir = (Path(text) / "gf.yaml").is_file()
     if has_separator:
         return "local", _local_root(text)
-    if is_dir:
+    if is_dir and env is None:
         raise AmbiguousReference(
             f"`{text}` is both a directory with gf.yaml and a hosted predictor name",
             hint=f"pass ./{text} for the local predictor, or env= for the hosted one",

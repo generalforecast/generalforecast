@@ -2,10 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import numpy as np
+import pytest
 
 from generalforecast.profiling import memory
 
 
+@pytest.mark.skipif(
+    not memory._CLEAR_REFS.exists(),
+    reason="only Linux resets a process's peak memory, so only it reports one",
+)
 def test_a_reset_starts_the_host_peak_from_what_the_process_holds() -> None:
     held = np.ones(256 << 20, dtype=np.uint8)
     before = memory.reading()["host_peak"]
