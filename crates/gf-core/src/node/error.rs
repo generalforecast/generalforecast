@@ -146,6 +146,7 @@ impl NodeError {
                 IndexError::Duplicate(_)
                 | IndexError::Unknown(_)
                 | IndexError::UnknownPage(_)
+                | IndexError::PageNumber(_)
                 | IndexError::Rows(_) => ErrorKind::Internal,
             },
             Self::Cache(_)

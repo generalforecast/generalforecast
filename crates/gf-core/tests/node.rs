@@ -5060,3 +5060,60 @@ fn a_timed_adaptive_table_leans_its_neighbors_to_the_newest_rows() {
     ));
     assert_eq!(unit_rows(&mut node, table, &A), 8);
 }
+
+#[test]
+fn requests_wait_out_a_restore_rather_than_read_its_first_records() {
+    let mut original = node(64);
+    let table = original.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(48);
+    original.insert(table, &keys, &features, targets).unwrap();
+    let compaction = original.compaction(table).unwrap();
+
+    let mut copy = node(64);
+    let restored = copy.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(8);
+    copy.insert(restored, &keys, &features, targets).unwrap();
+    let request = copy.submit(restored, &A).unwrap();
+    // A first record without rows leaves the table empty until the rest.
+    let (rows, layout) = part(&compaction, 0, 0);
+    copy.restore(restored, &rows, &layout, Some(&compaction.table))
+        .unwrap();
+    assert!(copy.schedule().unwrap().is_none());
+    assert!(copy.take_refused().is_empty());
+    let (rows, layout) = part(&compaction, 0, compaction.rows.keys.len());
+    copy.restore(restored, &rows, &layout, None).unwrap();
+
+    let step = run(&mut copy);
+    assert_eq!(step.queries()[0].request, request);
+}
+
+#[test]
+fn a_layout_that_does_not_fit_the_table_is_refused_before_it_is_read() {
+    let mut original = node(64);
+    let table = original.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(48);
+    original.insert(table, &keys, &features, targets).unwrap();
+    original.submit(table, &A).unwrap();
+    run(&mut original);
+    let compaction = original.compaction(table).unwrap();
+    let (rows, layout) = part(&compaction, 0, compaction.rows.keys.len());
+
+    let mut narrow = compaction.table.clone();
+    narrow.fitted.as_mut().expect("fit above").deviations.pop();
+    let mut copy = node(64);
+    let restored = copy.create_table(spec(NEAREST)).unwrap();
+    assert!(matches!(
+        copy.restore(restored, &rows, &layout, Some(&narrow)),
+        Err(NodeError::Restore(_))
+    ));
+
+    // Pages numbered past the next id would take an id a new page takes.
+    let mut renumbered = compaction.table.clone();
+    renumbered.index.next_page = 0;
+    let mut copy = node(64);
+    let restored = copy.create_table(spec(NEAREST)).unwrap();
+    assert!(matches!(
+        copy.restore(restored, &rows, &layout, Some(&renumbered)),
+        Err(NodeError::Index(gf_core::pages::IndexError::PageNumber(_)))
+    ));
+}

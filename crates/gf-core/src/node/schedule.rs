@@ -238,8 +238,9 @@ impl Node {
     pub fn schedule(&mut self) -> Result<Option<Step>, NodeError> {
         self.parts = PlanParts::new(self.parts.timed);
         let since = self.parts.start();
+        // A table being restored is judged once its last row is back.
         for (&id, state) in &mut self.tables {
-            if !state.pending.is_empty() {
+            if !state.pending.is_empty() && state.restoring.is_none() {
                 self.refused.extend(state.take_empty(id));
             }
         }

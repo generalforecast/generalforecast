@@ -309,7 +309,13 @@ impl Node {
         }
         if let Some(layout) = table_layout {
             let width = state.spec.model_features();
-            if layout.column_sums.len() != width || layout.column_counts.len() != width {
+            let fitted = layout.fitted.as_ref().map_or([width; 2], |fitted| {
+                [fitted.means.len(), fitted.deviations.len()]
+            });
+            if layout.column_sums.len() != width
+                || layout.column_counts.len() != width
+                || fitted != [width; 2]
+            {
                 return Err(NodeError::Restore(
                     "a layout's columns differ from the table's",
                 ));

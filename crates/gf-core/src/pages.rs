@@ -53,6 +53,8 @@ pub enum IndexError {
     Unknown(RowId),
     /// A restored layout naming a page it does not hold, or leaving one out of every cell.
     UnknownPage(PageId),
+    /// A restored layout holding a page at or past the id it gives its next.
+    PageNumber(PageId),
     /// A row's values that could not be read to place it.
     Rows(RowsError),
 }
@@ -93,6 +95,11 @@ impl fmt::Display for IndexError {
                     page.0
                 )
             }
+            Self::PageNumber(page) => write!(
+                formatter,
+                "a restored layout holds page {} at or past its next page id",
+                page.0
+            ),
             Self::Rows(error) => error.fmt(formatter),
         }
     }
@@ -619,8 +626,9 @@ impl PageIndex {
     ///
     /// # Errors
     ///
-    /// If a row is in two pages, a page's sum has the wrong length, or the
-    /// layout names a page it does not hold.
+    /// If a row is in two pages, a page's sum has the wrong length, the
+    /// layout names a page it does not hold, or a page's id is not below the
+    /// layout's next.
     pub fn restore(
         dimensions: NonZeroUsize,
         page_size: NonZeroUsize,
@@ -669,6 +677,10 @@ impl PageIndex {
         }
         if let Some(&page) = index.ids.iter().find(|id| !index.cell_of.contains_key(id)) {
             return Err(IndexError::UnknownPage(page));
+        }
+        // New pages take ids from `next_page` on, so no page may hold one.
+        if let Some(&page) = index.ids.last().filter(|page| page.0 >= layout.next_page) {
+            return Err(IndexError::PageNumber(page));
         }
         index.next_page = layout.next_page;
         index.reach = layout.reach;
