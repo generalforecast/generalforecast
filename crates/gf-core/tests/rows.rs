@@ -200,3 +200,23 @@ fn reserved_rows_take_values_in_any_order() {
     assert_eq!(keys, [20, 0, 70]);
     assert_eq!(read[2].features, [7.0]);
 }
+
+#[test]
+fn a_snapshot_reads_rows_as_they_were_across_a_clear() {
+    let memory = RowMemory::bounded(0);
+    let mut store = RowStore::on_disk(&memory, 2, &path("cleared"), Arc::new(Bound)).unwrap();
+    let (features, targets, keys) = rows(2);
+    store.push(&features, &targets, &keys).unwrap();
+    let before = store.snapshot();
+
+    // A renumbering clears the store and writes rows again from id 0.
+    store.clear().unwrap();
+    store
+        .push(&[9.0, 9.0, 8.0, 8.0], &[1, 1], &[99, 88])
+        .unwrap();
+
+    let read = before.rows(&ids(0..2)).unwrap();
+    assert_eq!(read[0].key, keys[0]);
+    assert_eq!(read[1].features, [1.0, -1.0]);
+    assert_eq!(store.rows(&ids(0..1)).unwrap()[0].key, 99);
+}
