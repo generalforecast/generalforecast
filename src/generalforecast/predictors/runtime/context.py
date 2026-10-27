@@ -133,6 +133,66 @@ def served_context(lock: Any, table: pa.Table | None) -> pa.Table | None:
     )
 
 
+def live_context(lock: Any, snapshot: Any) -> tuple[pa.Table, Any]:
+    """A live context's rows as a predictor binds them, and the version they read.
+
+    Args:
+        lock: A `contracts.PredictorLock`, or a version 2 lock document, of a
+            live-context predictor.
+        snapshot: The `service.interfaces.ContextSnapshot` its data port
+            answered: each row's key, features and label.
+
+    Returns:
+        The served context, `served_context` of the rows with the lock's id
+        column holding each row's key, and the `contracts.ContextVersion`
+        they are: the live source by name, its sequence, rows and time.
+
+    Raises:
+        PredictorError: `EmptyContext` for no labeled rows, or `SchemaChanged`
+            for keys or values the lock's kinds cannot hold.
+    """
+    from generalforecast.contracts import ContextVersion
+
+    document = lock.to_dict() if hasattr(lock, "to_dict") else lock
+    predictor = document["predictor"]
+    context = predictor["context"]
+    ensure(context["kind"] == "live", "only a live predictor reads a live context")
+    target, identity = predictor["target"], predictor.get("id")
+    whole = predictor.get("id_type") in ("int", "0/1")
+    records = []
+    for row in snapshot["rows"]:
+        record = {**row["features"], target: row["label"]}
+        if identity is not None:
+            try:
+                record[identity] = int(row["key"]) if whole else row["key"]
+            except ValueError:
+                raise PredictorError(
+                    "SchemaChanged", "live context ids differ from the lock"
+                ) from None
+        records.append(record)
+    ensure(bool(records), "live context has no labeled rows", "EmptyContext")
+    rows = served_context(document, to_arrow(records))
+    assert rows is not None
+    return rows, ContextVersion(
+        "live",
+        snapshot["through_sequence"],
+        rows.num_rows,
+        snapshot["knowledge_at"],
+        name=context["name"],
+    )
+
+
+def json_rows(table: pa.Table) -> list[dict[str, Any]]:
+    """Context rows as JSON objects, dates and times in ISO 8601, as gf-server reads them."""
+
+    def plain(value: Any) -> Any:
+        return value.isoformat() if hasattr(value, "isoformat") else value
+
+    return [
+        {key: plain(value) for key, value in row.items()} for row in table.to_pylist()
+    ]
+
+
 def typed(table: pa.Table, predictor: dict[str, Any]) -> pa.Table:
     """Live or request rows in the storage a lock's kinds take.
 
@@ -178,6 +238,8 @@ def _timestamps(values: Any) -> Any:
 
 __all__ = [
     "context_columns",
+    "json_rows",
+    "live_context",
     "project",
     "served_context",
     "snapshot_context",
