@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import NamedTuple
 
 import jax
@@ -94,6 +94,48 @@ def compress_streamed(
     )
     n_keys = rows if length is None else length
     return attention_block_streamed(parameters.compress, inducing, keys, steps, n_keys)
+
+
+def compress_layers(
+    blocks: Sequence[InducedAttentionParameters],
+    context: Callable[
+        [Array, int, tuple[Array, ...]], Float[Array, " batch size model"]
+    ],
+    rows: int,
+    chunk: int,
+    length: Int[Array, " batch"] | None = None,
+) -> tuple[Float[Array, " batch inducing model"], ...]:
+    """Each block's inducing points, from context rows made at most `chunk` at a time.
+
+    A block's inducing points read every row as the blocks before it leave
+    it, so for each block, each chunk of rows runs through those blocks
+    again, and the points gather over the chunks by a running softmax.
+
+    Args:
+        blocks: The induced attention blocks, in order.
+        context: Makes `size` context rows from row `start` as the blocks
+            before one leave them, given those blocks' inducing points, as
+            `context(start, size, earlier)`.
+        rows: Context rows in all.
+        chunk: Most rows a step makes.
+        length: Real rows at the start of each batch row, or None for all rows.
+
+    Returns:
+        Each block's inducing points.
+    """
+    states: list[Array] = []
+    for block in blocks:
+        earlier = tuple(states)
+        states.append(
+            compress_streamed(
+                block,
+                lambda start, size, earlier=earlier: context(start, size, earlier),
+                rows,
+                chunk,
+                length,
+            )
+        )
+    return tuple(states)
 
 
 def expand(
