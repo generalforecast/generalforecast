@@ -146,6 +146,12 @@ pub(super) fn schedule_table(
 /// context not fit this epoch, its plan reads one context of every row, and
 /// the context and the queries waiting stay within the rows a fit embeds
 /// with its state.
+///
+/// A fused answer is within 1e-6 of the same context's later, unfused
+/// answers (about 3e-7 seen), not bitwise alike, because one call orders the
+/// same float32 arithmetic differently from separate encode and decode
+/// calls; `test_a_fused_first_answer_is_within_float32_of_its_repeats`
+/// holds it to that bound.
 pub(super) fn fuses(state: &TableState, snapshot: &Snapshot, planned: &Plan) -> bool {
     let most = state
         .spec

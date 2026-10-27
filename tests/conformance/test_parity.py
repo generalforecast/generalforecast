@@ -69,6 +69,16 @@ def classifier_rows() -> pa.Table:
     )
 
 
+def dated_rows() -> pa.Table:
+    """The classifier's rows with a time of day input, which JSON carries as ISO text."""
+    start = datetime.datetime(2025, 3, 1, 8, tzinfo=datetime.UTC)
+    seen = [
+        (start + datetime.timedelta(hours=7 * row)).replace(tzinfo=None)
+        for row in range(24)
+    ]
+    return classifier_rows().append_column("seen", pa.array(seen, pa.timestamp("us")))
+
+
 def regressor_rows() -> pa.Table:
     return pa.table(
         {
@@ -203,6 +213,18 @@ CASES = {
             "frequency": "1d",
             "horizon": 3,
             "inputs": {"past": ["footfall"], "future": ["promo"]},
+            "context": {"request": {}},
+        },
+    ),
+    # A request-context classifier checked without rows records no kind for
+    # `seen`: every path reads its ISO text as UTC timestamps, not as text.
+    "request-classifier-dt": (
+        dated_rows,
+        {
+            "model": "general-forecast/tabicl-v2-classifier",
+            "target": "churned",
+            "id": "id",
+            "inputs": ["spend", "plan", "seen"],
             "context": {"request": {}},
         },
     ),
@@ -389,7 +411,7 @@ def test_every_path_predicts_the_same_and_knows_the_same_lock(
     if case == "many":
         assert len(queries) == 1500
         assert len({row["date"] for row in queries.to_pylist()}) == 5
-    if case not in ("forecaster", "request", "many", "grouped"):
+    if case in ("classifier", "regressor"):
         assert plan.spec.selection is not None
         assert plan.spec.selection.strategy == "retrieved"
         assert published["predictor"]["strategy"] == plan.spec.selection.strategy_spec()

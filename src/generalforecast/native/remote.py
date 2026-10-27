@@ -26,6 +26,7 @@ from generalforecast.columns import (
     Column,
     arrow_columns,
     columns_of,
+    pick,
     prepare,
 )
 from generalforecast.keys import Key, Keys, key_of_spec, keys_of, spec_of_key
@@ -391,8 +392,9 @@ class RemoteSeriesTable(SeriesTable):
         before: Any = None,
         *,
         quantiles: Sequence[float] | None = None,
+        future: Any = None,
     ) -> np.ndarray:
-        return self._forecast(series, None, horizon, before, quantiles)
+        return self._forecast(series, None, horizon, before, quantiles, future)
 
     @override
     def forecast_given(
@@ -403,8 +405,9 @@ class RemoteSeriesTable(SeriesTable):
         before: Any = None,
         *,
         quantiles: Sequence[float] | None = None,
+        future: Any = None,
     ) -> np.ndarray:
-        return self._forecast(series, groups, horizon, before, quantiles)
+        return self._forecast(series, groups, horizon, before, quantiles, future)
 
     def _forecast(
         self,
@@ -413,8 +416,13 @@ class RemoteSeriesTable(SeriesTable):
         horizon: int | None,
         before: Any,
         quantiles: Sequence[float] | None,
+        future: Any = None,
     ) -> np.ndarray:
-        """Forecasts series through the server's forecast exchange, each series' group in a `group` column if given."""
+        """Forecasts series through the server's forecast exchange.
+
+        Each series' group goes in a `group` column if given, and its known
+        future in a `future` column of its rows.
+        """
         import pyarrow as pa
         from pyarrow import flight
 
@@ -439,6 +447,8 @@ class RemoteSeriesTable(SeriesTable):
             columns["group"] = pa.ListArray.from_arrays(
                 pa.array(offsets, pa.int32()), pa.array(values, type=pa.uint64())
             )
+        if future is not None:
+            columns["future"] = self._future(digests, future)
         batch = pa.RecordBatch.from_pydict(columns)
         headers = [*self._client._headers, (b"gf-horizon", str(horizon).encode())]
         if levels is not None:
@@ -458,6 +468,48 @@ class RemoteSeriesTable(SeriesTable):
             ]
         )
         return values.reshape(len(digests), horizon, -1).astype(np.float32)
+
+    def _future(self, digests: np.ndarray, rows: Any) -> Any:
+        """Known future rows as a list of rows per forecast series, in `digests`' order.
+
+        Each row carries its time and every covariate column, as a write's
+        rows do: a column the rows leave out, such as a past covariate's,
+        is null throughout.
+
+        Raises:
+            ValueError: If a row's series is not one forecast.
+        """
+        import pyarrow as pa
+
+        from generalforecast import tabular
+
+        table = tabular.frame(rows)
+        (series, times), count = pick(table, (self.series, self.time))
+        stamps = _times(times, count, self.times)
+        assert stamps is not None
+        nulls = {"categorical": pa.string(), "datetime": pa.timestamp("ms")}
+        for column in self.columns:
+            if column.name not in table.column_names:
+                kind = nulls.get(column.kind, pa.float64())
+                table = table.append_column(column.name, pa.nulls(count, kind))
+        prepared, _ = prepare(table, self.columns)
+        fields = {"time": pa.array(stamps), **arrow_columns(prepared, self.columns)}
+        rows_of = self._keys(series)
+        first = {int(digest): at for at, digest in reversed(list(enumerate(digests)))}
+        unasked = [int(digest) for digest in rows_of if int(digest) not in first]
+        if unasked:
+            named = self._names.get(unasked[0], unasked[0])
+            raise ValueError(
+                f"a future row is of series {named!r}, which is not forecast"
+            )
+        place = np.array([first[int(digest)] for digest in rows_of], dtype=np.int64)
+        order = np.argsort(place, kind="stable")
+        counts = np.bincount(place, minlength=len(digests))
+        offsets = np.concatenate([[0], np.cumsum(counts)]).astype(np.int32)
+        values = pa.StructArray.from_arrays(
+            list(fields.values()), names=list(fields)
+        ).take(pa.array(order))
+        return pa.ListArray.from_arrays(pa.array(offsets, pa.int32()), values)
 
     @override
     def vocabularies(self) -> dict[str, list[str]]:

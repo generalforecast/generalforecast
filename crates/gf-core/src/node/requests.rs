@@ -113,12 +113,14 @@ impl Node {
 
     /// Queues forecasts of a series table's series, each from its cutoff, or
     /// from the table's latest time plus a step without one, over `horizon`
-    /// steps.
+    /// steps, reading `future`'s known values past the cutoffs in place of
+    /// any rows the table holds there.
     ///
     /// # Errors
     ///
     /// If the table does not exist or holds no series, no series is named, or
-    /// there is not one cutoff per series.
+    /// there is not one cutoff per series; a future is checked as the
+    /// forecasts are planned.
     pub fn submit_forecast(
         &mut self,
         table: TableId,
@@ -126,6 +128,7 @@ impl Node {
         cutoffs: Option<&[i64]>,
         horizon: NonZeroUsize,
         groups: Option<&[Vec<u64>]>,
+        future: Vec<FutureRow>,
     ) -> Result<RequestId, NodeError> {
         let request = RequestId(self.next_request);
         let state = self.state(table)?;
@@ -180,6 +183,7 @@ impl Node {
                 cutoffs,
                 horizon,
                 groups,
+                future,
             },
         ));
         self.next_request += 1;

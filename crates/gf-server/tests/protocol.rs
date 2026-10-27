@@ -308,6 +308,7 @@ fn a_steps_series_units_and_forecasts_travel_as_grids() {
             Some(&[130]),
             NonZeroUsize::new(2).unwrap(),
             None,
+            Vec::new(),
         )
         .unwrap();
     let step = node.schedule().unwrap().expect("a step");

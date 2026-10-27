@@ -545,12 +545,9 @@ def test_series_predict_never_replaces_an_observation(catalog) -> None:
             {"item": ["shoes"] * 3, "t": [19, 20, 21], "price": 3.0}
         )
 
-        with pytest.raises(InvalidInput, match="holds a row at a time") as caught:
+        with pytest.raises(InvalidInput, match="'shoes' has observed time 19 already"):
             table.predict(overlapping)
 
-        assert (
-            caught.value.hint == "give only times after each series' latest observation"
-        )
         assert len(table) == 20
         pd.testing.assert_frame_equal(table.forecast(), before)
     finally:
@@ -564,11 +561,32 @@ def test_a_failed_series_predict_leaves_the_table_as_it_was(catalog) -> None:
         before = table.forecast()
         unknown = pd.DataFrame({"item": ["boots"] * 3, "t": [20, 21, 22], "price": 3.0})
 
-        with pytest.raises(InvalidInput, match="holds no series 'boots'"):
+        with pytest.raises(InvalidInput, match="'boots' has no observed value"):
             table.predict(unknown)
+        unbounded = pd.DataFrame(
+            {"item": ["shoes"] * 3, "t": [20, 21, 22], "price": [3.0, np.inf, 3.0]}
+        )
+        with pytest.raises(InvalidInput, match="infinite values are not supported"):
+            table.predict(unbounded)
 
         assert len(table) == 20
+        assert table._table is not None
+        assert table._table.known_series() == ["shoes"]
         pd.testing.assert_frame_equal(table.forecast(), before)
+    finally:
+        table.drop()
+
+
+def test_series_whose_rows_are_all_deleted_are_not_known(catalog) -> None:
+    table = _future_table("deleted")
+    try:
+        table.insert(_observations("shoes", 0, 1))
+        table.insert(_observations("socks", 0, 2))
+        assert table._table is not None
+        table._table.delete(_observations("socks", 0, 2))
+
+        assert table._table.known_series() == ["shoes"]
+        assert table.forecast()["item"].unique().tolist() == ["shoes"]
     finally:
         table.drop()
 

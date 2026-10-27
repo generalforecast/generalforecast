@@ -67,6 +67,41 @@ def test_a_repeated_context_answers_alike(engine):
     np.testing.assert_allclose(first.sum(axis=1), 1, atol=1e-5)
 
 
+@pytest.mark.parametrize(
+    ("model", "labels"),
+    [
+        (
+            "general-forecast/tabicl-v2-classifier",
+            [("a", "b", "c")[row % 3] for row in range(300)],
+        ),
+        ("general-forecast/tabicl-v2-regressor", list(np.linspace(0, 1, 300))),
+    ],
+    ids=["classifier", "regressor"],
+)
+def test_a_fused_first_answer_is_within_float32_of_its_repeats(model, labels):
+    """A single-use context's first call fuses its fit, encode and decode; repeats do not.
+
+    The two order the same float32 arithmetic differently, so they answer
+    within 1e-6 of each other (about 3e-7 seen), not bitwise alike.
+    """
+    models = {**TINY, "general-forecast/tabicl-v2-regressor": "tests/tabicl-regressor"}
+    engine = LocalEngine(models=models, cpu_threads=2)
+    try:
+        generator = np.random.default_rng(0)
+        request = tabular_request(
+            model,
+            generator.normal(size=(300, 5)).astype(np.float32),
+            labels,
+            generator.normal(size=(6, 5)).astype(np.float32),
+        )
+        first = engine.tabular(parse(model), request)
+        for _ in range(2):
+            repeat = engine.tabular(parse(model), request)
+            assert float(np.max(np.abs(repeat - first))) <= 1e-6
+    finally:
+        engine.close()
+
+
 def test_a_digest_pinned_reference_runs_its_spec(engine):
     digest = REF.entry.artifact.digest
     assert digest is not None
