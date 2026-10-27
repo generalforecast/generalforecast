@@ -1967,3 +1967,38 @@ async fn a_model_is_found_by_its_bare_name_however_the_server_names_it() {
         );
     }
 }
+
+#[tokio::test]
+async fn a_binding_whose_log_does_not_restore_is_set_aside_and_bound_again() {
+    let snapshot = snapshot_file();
+    let directory = fresh_directory();
+    let models = || vec![predictor_model("churn", "snapshot", Some(&snapshot))];
+    let (front, shards, _) = restarted(models(), &directory).await;
+    stop(&shards).await;
+    drop(front);
+    // The binding's head is lost, so its log no longer opens.
+    let (table, _) = gf_server::engine::bound_table("sha256:churn").unwrap();
+    std::fs::remove_file(directory.join(format!("{table}.head"))).unwrap();
+
+    let (front, shards, _) = restarted(models(), &directory).await;
+    let payload = predictor_payload("churn", json!([]), json!([{"id": "q", "x": 1.5}]));
+    let (status, _, body) = call(
+        &front,
+        "POST",
+        "/v1/projects/local/predictors/churn/predict",
+        Some(&predictor_envelope("churn", &payload)),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        directory.join(format!("{table}.log")).exists(),
+        "bound again"
+    );
+    assert!(
+        directory.join(format!("{table}.log.unrestorable")).exists(),
+        "the old log is kept aside"
+    );
+    stop(&shards).await;
+    std::fs::remove_file(snapshot).unwrap();
+}
