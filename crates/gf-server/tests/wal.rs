@@ -75,6 +75,7 @@ fn definition() -> TableDefinition {
         created: CreationId::parse("0123456789abcdef"),
         times: TimeKind::Integer,
         route_by: None,
+        roles: None,
         durability: Default::default(),
     }
 }
@@ -149,6 +150,28 @@ fn records() -> Vec<Record> {
         },
         Record::Refit,
     ]
+}
+
+#[test]
+fn strategy_records_replay_as_written() {
+    let directory = tempdir();
+    let path = directory.join("payments.log");
+    let strategies = [
+        Record::Strategy(StrategySpec::Adaptive),
+        Record::Strategy(StrategySpec::Neighbors { rows: 2 }),
+        Record::Strategy(StrategySpec::of(
+            gf_core::planner::Strategy::Adaptive.resolve(100, std::num::NonZeroU64::new(8), true),
+        )),
+    ];
+    let log = written(&path, &strategies);
+    assert_eq!(log.length(), 1 + strategies.len() as u64);
+    drop(log);
+    let (_, replayed, _) = open(&path, &keys(7)).unwrap();
+    assert!(same(&replayed, &strategies));
+    for record in &strategies {
+        assert!(record.keys().is_empty());
+        assert_eq!(record.write_id(), None);
+    }
 }
 
 fn same(left: &[Record], right: &[Record]) -> bool {
@@ -937,6 +960,7 @@ fn a_compactions_layout_comes_back_to_the_bit() {
                 deviations: vec![0.0, 1e-9],
             }),
             changed: 2,
+            strategy: Some(StrategySpec::Neighbors { rows: 2 }.strategy()),
         })),
     });
 

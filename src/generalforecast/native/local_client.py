@@ -8,7 +8,7 @@ import uuid
 from typing import Any, Literal, Self, override
 
 from generalforecast import engine
-from generalforecast.models.catalog import ModelRefError, entries, parse
+from generalforecast.models.catalog import ModelRefError, entries, parse, reference
 from generalforecast.native.remote import RemoteClient, RemoteSeriesTable, RemoteTable
 
 LocalTable = RemoteTable
@@ -119,13 +119,23 @@ class LocalClient(RemoteClient):
 
     @override
     def _model_ref(self, model: str) -> str:
-        """Loads a model spec in the engine's workers: the name they serve it by."""
+        """Loads a model spec in the engine's workers: the name they serve it by.
+
+        The workers load a catalog model's checkpoint or a custom model's
+        `module:attribute`; a model object has no spec for them.
+        """
         if not isinstance(model, str):
-            raise TypeError(
-                "LocalClient runs models in the engine's workers; give a model "
-                "spec, such as 'general-forecast/tabicl-v2-classifier'"
-            )
-        return self._engine.load(parse(model))
+            reference(model)
+        try:
+            ref = parse(model)
+        except ModelRefError as unknown:
+            # A registered implementation (a test's or a tool's own model) has
+            # no catalog entry; the workers know it by its registered name.
+            try:
+                return self._engine.load_registered(model)
+            except ModelRefError:
+                raise unknown from None
+        return self._engine.load(ref)
 
 
 def local(**options: Any) -> LocalClient:

@@ -167,6 +167,38 @@ def test_string_labels_are_coded_on_the_server_and_survive_restarts(
     np.testing.assert_allclose(reopened.predict(NEAR_A), expected, atol=1e-5)
 
 
+def test_a_strategy_set_on_a_table_survives_a_restart(server: Server) -> None:
+    features, targets = _clusters()
+    adaptive = generalforecast.Strategy.adaptive()
+    remote = _connect(server).create_table(
+        "chosen", model="tiny-capped", features=5, classes=3, strategy=adaptive
+    )
+    remote.insert(np.arange(32), features, targets)
+    # The tiny-capped model says 16-row contexts: 32 rows resolve to retrieval.
+    described = remote.describe()
+    assert described.strategy == adaptive
+    assert described.resolved_strategy == adaptive.resolve(32, 16, False)
+    assert remote.predict(NEAR_A).shape == (len(NEAR_A), 3)
+
+    chosen = generalforecast.Strategy.neighbors(4)
+    remote.set_strategy(chosen)
+    described = remote.describe()
+    assert (described.strategy, described.resolved_strategy) == (chosen, chosen)
+    # The log carries the strategy, through a compaction and a restart.
+    remote.compact()
+    server.stop()
+    server.start()
+    reopened = _connect(server).table("chosen")
+    assert reopened.describe().strategy == chosen
+    assert reopened.predict(NEAR_A).shape == (len(NEAR_A), 3)
+
+    reopened.set_strategy(adaptive)
+    assert reopened.describe().resolved_strategy == adaptive.resolve(32, 16, False)
+    server.stop()
+    server.start()
+    assert _connect(server).table("chosen").describe().strategy == adaptive
+
+
 def test_retrieval_columns_place_rows_as_a_local_tables_do(server: Server) -> None:
     features, targets = _clusters()
     columns = {**{f"f{index}": "numeric" for index in range(5)}, "r": "retrieval"}

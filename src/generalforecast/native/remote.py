@@ -37,6 +37,7 @@ from generalforecast.native.client import (
     RebuildWait,
     RefitCutoffs,
     RetrievalCategoricals,
+    Roles,
     SeriesDefinition,
     SeriesTable,
     Summary,
@@ -233,6 +234,13 @@ class RemoteTable(Table):
     @override
     def refit(self) -> None:
         self._client._action("refit", {"table": self.name})
+
+    @override
+    def set_strategy(self, strategy: Strategy) -> None:
+        self._client._action(
+            "set_strategy",
+            {"table": self.name, "strategy": json.loads(strategy.spec())},
+        )
 
     @override
     def compact(self) -> None:
@@ -563,6 +571,7 @@ class RemoteClient:
         retrieval_categoricals: RetrievalCategoricals = "codes",
         partitions: int = 1,
         route_by: Mapping[str, Any] | None = None,
+        roles: Roles | None = None,
     ) -> RemoteTable:
         """Adds an empty table on the server.
 
@@ -639,14 +648,13 @@ class RemoteClient:
                 regions, and labels rows through `update`. The value places
                 a row, so it cannot change for a key once the row is written.
                 Delete the row and insert it again with the new value.
+            roles: The frame columns the rows carry besides the feature
+                columns, and a classifier's class values, which the server
+                keeps and describes so `gf.engine.Table` opens the table again.
 
         Returns:
             The table.
         """
-        if not isinstance(model, str):
-            raise TypeError(
-                "a server serves the models its configuration names; give a model name"
-            )
         made = columns_of(features, columns)
         _check_times(times)
         _check_classes(classes)
@@ -691,6 +699,7 @@ class RemoteClient:
                 # Only a router splits a table; servers refuse the field.
                 **({"partitions": partitions} if partitions != 1 else {}),
                 **({"route_by": dict(route_by)} if route_by is not None else {}),
+                **({"roles": roles.spec()} if roles is not None else {}),
             },
         )
         described = self._describe(name)
@@ -719,10 +728,6 @@ class RemoteClient:
 
         `model` names a forecaster the server's configuration serves.
         """
-        if not isinstance(model, str):
-            raise TypeError(
-                "a server serves the models its configuration names; give a model name"
-            )
         _check_times(times)
         fixed = (series, time, target)
         made = () if columns is None else columns_of(None, columns)
@@ -826,6 +831,10 @@ class RemoteClient:
 
     def _model_ref(self, model: str) -> str:
         """The name the server knows a table's model by."""
+        if not isinstance(model, str):
+            raise TypeError(
+                "a server serves the models its configuration names; give a model name"
+            )
         return model
 
     def _wire(self, name: str) -> str:
@@ -1068,6 +1077,10 @@ class AsyncRemoteTable:
     async def refit(self) -> None:
         """`RemoteTable.refit`, awaited off the event loop."""
         await self._client._run(self._table.refit)
+
+    async def set_strategy(self, strategy: Strategy) -> None:
+        """`RemoteTable.set_strategy`, awaited off the event loop."""
+        await self._client._run(self._table.set_strategy, strategy)
 
     async def compact(self) -> None:
         """`RemoteTable.compact`, awaited off the event loop."""

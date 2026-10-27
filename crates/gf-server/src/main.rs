@@ -23,6 +23,7 @@ use gf_server::auth::Tokens;
 use gf_server::config::{Config, HttpConfig, KeysConfig};
 use gf_server::http::{Front, Introspect, KeyStore, Principal, ServedModel, Static};
 use gf_server::metrics::Metrics;
+use gf_server::progress::{Compiling, Progress};
 use gf_server::revisions::{Limits as RevisionLimits, Revisions};
 use gf_server::runtime;
 use gf_server::service::{Placement, RequestBudget, SeriesPlacement, Service};
@@ -30,7 +31,7 @@ use gf_server::setup;
 use gf_server::shard::Command;
 use gf_server::upstream::{Cidr, Upstream};
 use gf_server::worker::{Private, shared_parent};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 #[derive(Parser)]
@@ -193,6 +194,23 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
     // the drain deadline are cut off, since every write is already on disk.
     let (stop, stopped) = watch::channel(false);
     let draining = Arc::new(AtomicBool::new(false));
+    let drain = Duration::from_secs_f64(config.drain_seconds);
+    let began = std::time::Instant::now();
+    tokio::spawn({
+        let draining = draining.clone();
+        async move {
+            shutdown().await;
+            draining.store(true, Ordering::SeqCst);
+            let _ = stop.send(true);
+            tokio::time::sleep(drain).await;
+            tracing::warn!(
+                "calls still open after {} seconds; exiting",
+                drain.as_secs()
+            );
+            std::process::exit(0);
+        }
+    });
+    let mut interrupted = stopped.clone();
     // The Models API listens before the workers load, so liveness answers
     // and readiness says when inference starts.
     let front = match &config.http {
@@ -214,13 +232,28 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
         None => Metrics::default(),
     });
 
+    let names = front
+        .as_ref()
+        .map_or_else(String::new, |(front, _, _)| served_names(front));
+    let mut live = Live::default();
     let seats = runtime::seats(&config.workers);
-    let (shards, routes) = runtime::start(&config, &seats, &key, &tables, &cache, &metrics)
-        .await
-        .map_err(|error| -> Box<dyn Error> { error })?;
+    // Dropping a start that is under way kills the workers it started.
+    let started = tokio::select! {
+        started = runtime::start(&config, &seats, &key, &tables, &cache, &metrics) => started,
+        () = live.follow(&metrics.compiling) => unreachable!("the progress line never ends"),
+        _ = interrupted.wait_for(|stop| *stop) => {
+            live.clear();
+            stopped_status(front.as_ref().map(|(_, url, _)| url.as_str()), &names, began.elapsed());
+            return Ok(());
+        }
+    };
+    let (shards, routes) = started.map_err(|error| -> Box<dyn Error> { error })?;
 
     let mut placement = HashMap::new();
     for (index, path) in setup::table_logs(&tables)?.iter().enumerate() {
+        if *interrupted.borrow() {
+            break;
+        }
         // A log under a key the server lacks refuses the start, rather than
         // leave its table out until a start that has the key.
         let Some(replay) =
@@ -271,21 +304,16 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
         placement.insert(name, placed);
     }
 
-    let drain = Duration::from_secs_f64(config.drain_seconds);
-    tokio::spawn({
-        let draining = draining.clone();
-        async move {
-            shutdown().await;
-            draining.store(true, Ordering::SeqCst);
-            let _ = stop.send(true);
-            tokio::time::sleep(drain).await;
-            tracing::warn!(
-                "calls still open after {} seconds; exiting",
-                drain.as_secs()
-            );
-            std::process::exit(0);
-        }
-    });
+    // Ctrl-C while the tables restored: the workers are up, so stop them.
+    if *interrupted.borrow() {
+        stop_shards(&shards).await;
+        stopped_status(
+            front.as_ref().map(|(_, url, _)| url.as_str()),
+            &names,
+            began.elapsed(),
+        );
+        return Ok(());
+    }
 
     if let Some(address) = &config.metrics_listen {
         let listener = tokio::net::TcpListener::bind(address).await?;
@@ -354,15 +382,21 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
     if let Some((front, url, _)) = &front {
         front.start(shards.clone(), routes.clone()).await?;
         let started = std::time::Instant::now();
-        let buckets = front.warm().await;
+        let buckets = tokio::select! {
+            buckets = front.warm(&metrics.compiling) => buckets,
+            () = live.follow(&metrics.compiling) => unreachable!("the progress line never ends"),
+            _ = interrupted.wait_for(|stop| *stop) => {
+                live.clear();
+                stop_shards(&shards).await;
+                stopped_status(Some(url), &names, began.elapsed());
+                return Ok(());
+            }
+        };
+        live.clear();
         let programs = metrics.warm_compiles.get() + buckets as u64;
-        compiled(programs, started.elapsed().as_secs_f64());
-        let names: Vec<&str> = front
-            .models()
-            .iter()
-            .map(|served| served.name.as_str())
-            .collect();
-        ready(&names.join(", "), url);
+        let cached = programs > 0 && metrics.compile_cache_misses.get() == 0;
+        compiled(programs, started.elapsed().as_secs_f64(), cached);
+        ready(&names, url);
     }
     let mut service = Service::new(shards.clone(), placement, metrics)
         .with_request_budget(config.request_bytes_in_flight)
@@ -390,20 +424,47 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
             let _ = stopped.wait_for(|stop| *stop).await;
         })
         .await?;
-    // Every write is synced already; saving the heads lets the next start
-    // check the log's whole length.
-    for shard in &shards {
+    stop_shards(&shards).await;
+    let url = match front {
+        Some((_, url, served)) => {
+            let _ = served.await;
+            Some(url)
+        }
+        None => None,
+    };
+    stopped_status(url.as_deref(), &names, began.elapsed());
+    tracing::info!("drained");
+    Ok(())
+}
+
+/// Saves every shard's log heads, then stops its worker. Every write is
+/// synced already; the heads let the next start check each log's whole
+/// length. A worker still running after its deadline is killed, so none
+/// outlives the server.
+async fn stop_shards(shards: &[mpsc::Sender<Command>]) {
+    for shard in shards {
         let (reply, answer) = oneshot::channel();
         if shard.send(Command::SaveHeads { reply }).await.is_ok() {
             let _ = answer.await;
         }
     }
-    if let Some((_, url, served)) = front {
-        let _ = served.await;
-        event(&serde_json::json!({"event": "stopped", "url": url}));
-    }
-    tracing::info!("drained");
-    Ok(())
+    let stopping = shards.iter().map(|shard| async move {
+        let (reply, answer) = oneshot::channel();
+        if shard.send(Command::Shutdown { reply }).await.is_ok() {
+            let _ = answer.await;
+        }
+    });
+    futures::future::join_all(stopping).await;
+}
+
+/// The models the front serves, joined for the `Serving` and `Stopped` lines.
+fn served_names(front: &Front) -> String {
+    front
+        .models()
+        .iter()
+        .map(|served| served.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Writes one NDJSON event on stdout, as `gf serve` reports its progress.
@@ -421,18 +482,147 @@ fn ready(names: &str, url: &str) {
 }
 
 /// The `Compiled N programs in Xs` line, once the workers' recorded programs
-/// and the warm shape buckets are compiled.
-fn compiled(programs: u64, seconds: f64) {
+/// and the warm shape buckets are compiled; `cached` when every one loaded
+/// from the compile cache, which is why it took no time.
+fn compiled(programs: u64, seconds: f64, cached: bool) {
     if !std::io::stdout().is_terminal() {
-        event(&serde_json::json!({"event": "compiled", "programs": programs, "seconds": seconds}));
+        event(&serde_json::json!({
+            "event": "compiled", "programs": programs, "seconds": seconds, "cached": cached,
+        }));
         return;
     }
-    let noun = if programs == 1 { "program" } else { "programs" };
     status(
         "Compiled",
-        &format!("{} {noun} in {seconds:.1}s", thousands(programs)),
-        None,
+        &compiled_message(programs, seconds),
+        cached.then_some("(cached)"),
     );
+}
+
+fn compiled_message(programs: u64, seconds: f64) -> String {
+    format!("{} in {seconds:.1}s", programs_noun(programs))
+}
+
+fn programs_noun(programs: u64) -> String {
+    let noun = if programs == 1 { "program" } else { "programs" };
+    format!("{} {noun}", thousands(programs))
+}
+
+/// Says the server has stopped, once its workers have exited: the `Stopped
+/// <models> after <uptime>` line on a terminal, else a `stopped` event for
+/// the Models API at `url`, if one was served.
+fn stopped_status(url: Option<&str>, names: &str, uptime: Duration) {
+    if !std::io::stdout().is_terminal() {
+        if let Some(url) = url {
+            event(&serde_json::json!({"event": "stopped", "url": url}));
+        }
+        return;
+    }
+    status("Stopped", &stopped_message(names, uptime), None);
+}
+
+fn stopped_message(names: &str, uptime: Duration) -> String {
+    if names.is_empty() {
+        format!("after {}", elapsed(uptime))
+    } else {
+        format!("{names} after {}", elapsed(uptime))
+    }
+}
+
+/// A duration as a person reads it: `14s`, `2m 14s`, `1h 2m`.
+fn elapsed(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match (seconds / 3600, seconds / 60 % 60, seconds % 60) {
+        (0, 0, s) => format!("{s}s"),
+        (0, m, s) => format!("{m}m {s}s"),
+        (h, m, _) => format!("{h}h {m}m"),
+    }
+}
+
+/// The `Compiling 3/12 programs` line a terminal rewrites in place while
+/// the workers and the warm-up compile; piped, a few `compiling` events.
+#[derive(Default)]
+struct Live {
+    /// Columns the terminal line last drawn took, to blank it.
+    drawn: usize,
+    /// The total and the quarter of it the last `compiling` event reported.
+    reported: Option<(u64, u64)>,
+}
+
+impl Live {
+    /// Shows each change in `compiling`; never returns, so it goes in a
+    /// `select!` beside what it follows.
+    async fn follow(&mut self, compiling: &Compiling) {
+        let mut changes = compiling.changes();
+        loop {
+            let progress = *changes.borrow_and_update();
+            if progress.total > 0 {
+                self.show(progress);
+            }
+            if changes.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+
+    fn show(&mut self, progress: Progress) {
+        use std::io::Write;
+        let mut stdout = std::io::stdout().lock();
+        if !stdout.is_terminal() {
+            if !self.event_due(progress) {
+                return;
+            }
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({
+                    "event": "compiling", "done": progress.done, "total": progress.total,
+                })
+            );
+            let _ = stdout.flush();
+            return;
+        }
+        let line = status_line("Compiling", &compiling_message(progress), None, colour());
+        let shown = line.chars().count();
+        let pad = self.drawn.saturating_sub(shown);
+        let _ = write!(stdout, "\r{line}{:pad$}", "");
+        let _ = stdout.flush();
+        self.drawn = shown.max(self.drawn);
+    }
+
+    /// Whether a piped `compiling` event is due: one as each quarter of the
+    /// programs is done, counted afresh when the total grows (the warm-up's
+    /// shape buckets join once the workers have compiled their programs).
+    fn event_due(&mut self, progress: Progress) -> bool {
+        let quarter = (progress.done * 4) / progress.total.max(1);
+        if self
+            .reported
+            .is_some_and(|(total, last)| total == progress.total && quarter <= last)
+        {
+            return false;
+        }
+        self.reported = Some((progress.total, quarter));
+        true
+    }
+
+    /// Blanks the line, so the next status line takes its place.
+    fn clear(&mut self) {
+        use std::io::Write;
+        if self.drawn == 0 {
+            return;
+        }
+        let mut stdout = std::io::stdout().lock();
+        let _ = write!(stdout, "\r{:width$}\r", "", width = self.drawn);
+        let _ = stdout.flush();
+        self.drawn = 0;
+    }
+}
+
+fn compiling_message(progress: Progress) -> String {
+    format!(
+        "{}/{}",
+        thousands(progress.done),
+        programs_noun(progress.total)
+    )
 }
 
 /// The `Loading <model>` line for each model the front serves.
@@ -448,17 +638,24 @@ fn loading(models: &[ServedModel]) {
 /// A status line: the past-tense verb right-aligned in twelve columns, a
 /// space, the message, and a quiet trailer if any.
 fn status(verb: &str, message: &str, trailer: Option<&str>) {
+    println!("{}", status_line(verb, message, trailer, colour()));
+}
+
+fn colour() -> bool {
+    std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty())
+}
+
+fn status_line(verb: &str, message: &str, trailer: Option<&str>, colour: bool) -> String {
     let verb = format!("{verb:>12}");
-    let colour = std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty());
     let trailer = match (trailer, colour) {
         (Some(trailer), true) => format!(" \x1b[2m{trailer}\x1b[0m"),
         (Some(trailer), false) => format!(" {trailer}"),
         (None, _) => String::new(),
     };
     if colour {
-        println!("\x1b[1;32m{verb}\x1b[0m {message}{trailer}");
+        format!("\x1b[1;32m{verb}\x1b[0m {message}{trailer}")
     } else {
-        println!("{verb} {message}{trailer}");
+        format!("{verb} {message}{trailer}")
     }
 }
 
@@ -614,4 +811,100 @@ async fn shutdown() {
         _ = terminate.recv() => {}
     }
     tracing::info!("draining");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_lines_right_align_the_verb_in_twelve_columns() {
+        assert_eq!(
+            status_line(
+                "Compiling",
+                &compiling_message(Progress { done: 3, total: 12 }),
+                None,
+                false
+            ),
+            "   Compiling 3/12 programs"
+        );
+        assert_eq!(
+            status_line("Compiled", &compiled_message(12, 6.8), None, false),
+            "    Compiled 12 programs in 6.8s"
+        );
+        assert_eq!(
+            status_line(
+                "Compiled",
+                &compiled_message(1, 0.02),
+                Some("(cached)"),
+                false
+            ),
+            "    Compiled 1 program in 0.0s (cached)"
+        );
+        assert_eq!(
+            status_line(
+                "Stopped",
+                &stopped_message("wine", Duration::from_secs(134)),
+                None,
+                false
+            ),
+            "     Stopped wine after 2m 14s"
+        );
+        assert_eq!(
+            status_line(
+                "Stopped",
+                &stopped_message("", Duration::from_secs(9)),
+                None,
+                false
+            ),
+            "     Stopped after 9s"
+        );
+    }
+
+    #[test]
+    fn status_lines_colour_the_verb_and_dim_the_trailer() {
+        assert_eq!(
+            status_line("Compiled", "12 programs in 0.0s", Some("(cached)"), true),
+            "\x1b[1;32m    Compiled\x1b[0m 12 programs in 0.0s \x1b[2m(cached)\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn compiling_counts_programs_with_thousands_separators() {
+        assert_eq!(
+            compiling_message(Progress {
+                done: 1_000,
+                total: 2_500
+            }),
+            "1,000/2,500 programs"
+        );
+        assert_eq!(
+            compiling_message(Progress { done: 0, total: 1 }),
+            "0/1 program"
+        );
+    }
+
+    #[test]
+    fn piped_compiling_events_come_once_a_quarter_and_again_when_the_total_grows() {
+        let mut live = Live::default();
+        let at = |done, total| Progress { done, total };
+        let due: Vec<bool> = [at(1, 12), at(2, 12), at(3, 12), at(6, 12), at(12, 12)]
+            .into_iter()
+            .map(|progress| live.event_due(progress))
+            .collect();
+        assert_eq!(due, [true, false, true, true, true]);
+        assert!(live.event_due(at(12, 18)));
+        assert!(!live.event_due(at(13, 18)));
+        assert!(live.event_due(at(14, 18)));
+        assert!(live.event_due(at(18, 18)));
+        assert!(!live.event_due(at(18, 18)));
+    }
+
+    #[test]
+    fn elapsed_reads_as_seconds_minutes_or_hours() {
+        assert_eq!(elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(elapsed(Duration::from_secs(59)), "59s");
+        assert_eq!(elapsed(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(elapsed(Duration::from_secs(3_720)), "1h 2m");
+    }
 }

@@ -194,6 +194,18 @@ class Strategy:
     def exact() -> Strategy:
         """Every live row, for every query."""
     @staticmethod
+    def adaptive() -> Strategy:
+        """What fits the table's size, resolved from its live rows at each plan:
+        exact up to the model's context cap, and past it a stratified core of
+        a quarter of the cap plus the nearest rows that fill the rest, the
+        neighbors leaning to the newest rows when the table has times.
+        """
+    def resolve(self, rows: int, cap: int | None, timed: bool = False) -> Strategy:
+        """The strategy a table of `rows` live rows plans with under a cap of
+        `cap` context rows (None for no cap), with times when `timed`: an
+        adaptive strategy resolved by the server's rule, any other itself.
+        """
+    @staticmethod
     def subsample(rows: int, seed: int = 0, kind: CoreKind = "random") -> Strategy:
         """The same deterministic sample of rows for every query: a core alone.
 
@@ -580,6 +592,12 @@ class Node:
         """Refits a table's state and retrieval scaling.
 
         Returns drops of old entries nothing reads.
+        """
+    def set_strategy(self, table: int, strategy: Strategy) -> None:
+        """Changes how a table chooses contexts from here on; see `Node.strategy`."""
+    def strategy(self, table: int) -> Strategy:
+        """The strategy a table's next plan chooses contexts with: its adaptive
+        strategy resolved against its live rows, or the one it was given.
         """
 
 class BoundTable:

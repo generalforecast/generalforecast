@@ -14,6 +14,7 @@ import itertools
 import json
 import os
 import queue
+import signal
 import socket
 import sys
 import threading
@@ -47,6 +48,9 @@ BACKEND_COMPILE = "/jax/core/compile/backend_compile_duration"
 
 def main(arguments: Sequence[str] | None = None) -> int:
     """Runs a worker until its server disconnects; returns its exit status."""
+    # A terminal's Ctrl-C reaches the server and every worker; the server
+    # stops the workers once it has drained, so the signal means nothing here.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--socket", required=True)
     parser.add_argument("--model", action="append", help="NAME=SPEC, repeated")
@@ -143,8 +147,11 @@ def main(arguments: Sequence[str] | None = None) -> int:
     writer = threading.Thread(target=write, daemon=True)
     writer.start()
 
-    def progressed() -> None:
-        replies.put(lambda: (progress, []))
+    def progressed(done: int | None = None, total: int | None = None) -> None:
+        frame = progress
+        if done is not None:
+            frame = protocol.reply(protocol.Progress(done, total))
+        replies.put(lambda: (frame, []))
 
     def announced(keys: list[str]) -> None:
         frame = protocol.reply(protocol.Compiled(keys))
@@ -182,13 +189,14 @@ def _compile_cache_since_reply() -> tuple[int, int]:
 def _answer(
     worker: Worker,
     names: dict[str, int],
-    progressed: Callable[[], None],
+    progressed: Callable[..., None],
     header: dict[str, Any],
     buffers: list[memoryview],
 ) -> Callable[[], Frame]:
     """Handles one frame; returns what formats its reply, for the writer to call.
 
-    `progressed` tells the server a long answer is moving, before its reply.
+    `progressed` tells the server a long answer is moving, before its reply,
+    and how far a warm-up has got.
     """
     tracing = _tracing
     if tracing is None or header.get("kind") != "step":
@@ -200,7 +208,7 @@ def _answer(
 def _handled(
     worker: Worker,
     names: dict[str, int],
-    progressed: Callable[[], None],
+    progressed: Callable[..., None],
     header: dict[str, Any],
     buffers: list[memoryview],
 ) -> Callable[[], Frame]:
@@ -288,7 +296,7 @@ def _control(
     | protocol.AddTable
     | protocol.RemoveTable
     | protocol.Apply,
-    progressed: Callable[[], None],
+    progressed: Callable[..., None],
 ) -> None:
     """Loads a model, adds or removes a table, or applies tiers' copies and drops.
 

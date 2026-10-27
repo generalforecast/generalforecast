@@ -227,6 +227,9 @@ pub struct Metrics {
     /// those they compiled because it did not hold them.
     pub compile_cache_hits: Counter,
     pub compile_cache_misses: Counter,
+    /// How far the workers and the warm-up are through compiling programs
+    /// as the server starts.
+    pub compiling: crate::progress::Compiling,
     /// Where a prediction or write request's time goes in the service, beside
     /// the shard's queue and plan: decoding its Arrow body, finding its
     /// table's placement and route, waiting for the shard's answer, and

@@ -2909,6 +2909,36 @@ def test_an_untimed_step_reports_no_parts_and_predicts_as_a_timed_one(
         )
 
 
+def test_timed_parts_wait_for_the_device_work_they_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast import worker as worker_module
+    from generalforecast import worker_process
+
+    client = node_harness.local()
+    rows = _table(client)
+    rows.insert(np.arange(32), *_clusters())
+    node, worker = client._node, client._worker
+    node.submit(client._tables["t"]._id, NEAR_A, None)
+    step = _as_frame(node.schedule())
+    monkeypatch.setattr(protocol, "request", lambda header, buffers: step)
+    waited: list[object] = []
+    monkeypatch.setattr(worker_module, "_block", waited.append)
+
+    worker.timers = True
+    timed, _ = worker_process._answer(worker, {}, lambda: None, {"kind": "step"}, [])()
+    # The context's store and the queries' dispatch each wait for the device.
+    assert len(waited) >= 2
+    waited.clear()
+    worker.timers = False
+    untimed, _ = worker_process._answer(
+        worker, {}, lambda: None, {"kind": "step"}, []
+    )()
+
+    assert not waited
+    assert untimed["results"] == timed["results"]
+
+
 def _stacks(path: Path) -> dict[tuple[str, ...], int]:
     """A collapsed stacks file, each stack's frames to its samples."""
     found: dict[tuple[str, ...], int] = {}

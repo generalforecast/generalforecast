@@ -854,6 +854,31 @@ class TypeScriptEmitter:
             return f"Record<string, {inner}>"
         return "unknown"
 
+    def index_signature(self, definition: Record) -> str:
+        """The type of a record's index signature.
+
+        TypeScript requires every named property to be assignable to it, so
+        the extra type widens to the named property types, and `undefined`
+        when a property is optional.
+        """
+        extra = definition.extra
+        if isinstance(extra, bool):
+            return "unknown"
+        members = self.annotation(extra).split(" | ")
+        fields = [
+            field
+            for base in (*definition.extends, definition.name)
+            if isinstance(record := self.spec.definitions[base], Record)
+            for field in record.fields
+        ]
+        for field in fields:
+            for member in self.annotation(field.schema).split(" | "):
+                if member not in members:
+                    members.append(member)
+        if any(not field.required for field in fields) and "undefined" not in members:
+            members.append("undefined")
+        return " | ".join(members)
+
     def comment(self, text: str) -> list[str]:
         """A JSDoc comment for a description, if there is one."""
         text = " ".join(text.split())
@@ -906,12 +931,7 @@ class TypeScriptEmitter:
                         f"  {ts_key(field.key)}{optional}: {self.annotation(field.schema)};"
                     )
                 if definition.extra is not False:
-                    inner = (
-                        "unknown"
-                        if definition.extra is True
-                        else self.annotation(definition.extra)
-                    )
-                    out.append(f"  [key: string]: {inner};")
+                    out.append(f"  [key: string]: {self.index_signature(definition)};")
                 out.append("}")
             elif definition.name in ENUM_CLASSES:
                 values = ", ".join(ts_literal(v) for v in definition.schema["enum"])

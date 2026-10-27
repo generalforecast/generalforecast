@@ -19,6 +19,7 @@ use tonic::Status;
 
 use crate::auth::Scope;
 use crate::name::TableName;
+use crate::protocol::StrategySpec;
 use crate::wal::{CreationId, TableDefinition, Terms};
 
 /// The longest a client's write id may be.
@@ -40,6 +41,11 @@ pub enum FlightAction {
     Delete(DeleteAction),
     Truncate(TableName),
     Refit(TableName),
+    /// Changes how a table chooses contexts from here on.
+    SetStrategy {
+        table: TableName,
+        strategy: StrategySpec,
+    },
     Compact(TableName),
     DropTable(TableName),
     /// Every table's log length, terms and creation.
@@ -131,6 +137,12 @@ struct Table {
 }
 
 #[derive(Deserialize)]
+struct SetStrategy {
+    table: TableName,
+    strategy: StrategySpec,
+}
+
+#[derive(Deserialize)]
 struct Describe {
     table: TableName,
     /// Whether to send each categorical column's words, which may be many; a
@@ -186,6 +198,10 @@ impl FlightAction {
             "delete" => Self::Delete(body(action)?),
             "truncate" => Self::Truncate(body::<Table>(action)?.table),
             "refit" => Self::Refit(body::<Table>(action)?.table),
+            "set_strategy" => {
+                let SetStrategy { table, strategy } = body(action)?;
+                Self::SetStrategy { table, strategy }
+            }
             "compact" => Self::Compact(body::<Table>(action)?.table),
             "drop_table" => Self::DropTable(body::<Table>(action)?.table),
             "placements" => Self::Placements,
@@ -253,6 +269,7 @@ impl FlightAction {
             Self::Delete(_) => "delete",
             Self::Truncate(_) => "truncate",
             Self::Refit(_) => "refit",
+            Self::SetStrategy { .. } => "set_strategy",
             Self::Compact(_) => "compact",
             Self::DropTable(_) => "drop_table",
             Self::LogLengths => "log_lengths",
@@ -276,6 +293,7 @@ impl FlightAction {
             | Self::Describe { table, .. }
             | Self::Truncate(table)
             | Self::Refit(table)
+            | Self::SetStrategy { table, .. }
             | Self::Compact(table)
             | Self::DropTable(table)
             | Self::Release { table, .. }
@@ -310,6 +328,7 @@ impl FlightAction {
                 | Self::Delete(_)
                 | Self::Truncate(_)
                 | Self::Refit(_)
+                | Self::SetStrategy { .. }
                 | Self::Compact(_)
                 | Self::DropTable(_)
         )

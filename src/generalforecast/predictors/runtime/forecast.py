@@ -98,7 +98,7 @@ class ForecastContext:
             },
         }
         request = {
-            "model": lock.model.name,
+            "model": lock.model.resolved,
             "task": "forecast",
             "target": spec.target,
             "features": [],

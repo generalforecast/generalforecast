@@ -44,7 +44,13 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 
 import numpy as np
 
-from generalforecast.models.catalog import ModelRef, Surface, admit, parse
+from generalforecast.models.catalog import (
+    ModelRef,
+    ModelRefError,
+    Surface,
+    admit,
+    parse,
+)
 from generalforecast.system import usable_cpus
 
 if TYPE_CHECKING:
@@ -270,20 +276,47 @@ class LocalEngine:
         """
         return self._shared.shards.serve()
 
+    def load_registered(self, name: str) -> str:
+        """Has every worker load an implementation registered under `name`.
+
+        Registered implementations (`generalforecast.models.registry.register`)
+        are a test's or a tool's own models; they pass no catalog gate.
+
+        Returns:
+            The name the workers serve it by.
+        """
+        from generalforecast import _core
+
+        with self._shared.loading:
+            if name not in self._shared.loaded:
+                try:
+                    self._shared.shards.add_model(name, name)
+                except _core.RequestError as error:
+                    code, message, _ = error.args
+                    raise ModelRefError(code, message) from None
+                self._shared.loaded.add(name)
+        return name
+
     def load(self, ref: ModelRef) -> str:
         """Admits a reference for this engine's surface and has every worker load it.
 
         Returns:
             The name the workers serve it by.
 
+        A custom model loads from the user's code in the workers, which check
+        it against its contract; its files are theirs to find.
+
         Raises:
-            ModelRefError: If the surface may not run the model.
+            ModelRefError: If the surface may not run the model, or the
+                workers cannot load it.
             ArtifactError: If its files are missing or do not match their pins.
         """
+        from generalforecast import _core
+
         admit(ref, self.surface)
         name = _unpinned(ref)
         spec = self._shared.specs.get(name)
-        if spec is None:
+        if spec is None and not ref.custom:
             from generalforecast.models.artifacts import checkpoint
 
             checkpoint(
@@ -291,7 +324,11 @@ class LocalEngine:
             )
         with self._shared.loading:
             if name not in self._shared.loaded:
-                self._shared.shards.add_model(name, spec or name)
+                try:
+                    self._shared.shards.add_model(name, spec or name)
+                except _core.RequestError as error:
+                    code, message, _ = error.args
+                    raise ModelRefError(code, message) from None
                 self._shared.loaded.add(name)
         return name
 

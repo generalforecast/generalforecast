@@ -50,7 +50,7 @@ class CatalogRegistry:
     """The built-in catalog."""
 
     def canonical(self, ref: str) -> str:
-        return catalog.canonical(ref)
+        return catalog.canonical(ref, "predictor")
 
     def task_of(self, ref: str) -> Task:
         return catalog.task_of(ref)

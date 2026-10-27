@@ -102,6 +102,7 @@ pub async fn start(
                 secrets: config.key_envs(),
                 shared_fallback: cache.to_path_buf(),
                 timers: config.timers(),
+                compiling: metrics.compiling.clone(),
             })
             .await?;
             let memory = ShardSettings {

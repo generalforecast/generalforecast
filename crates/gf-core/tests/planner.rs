@@ -468,3 +468,57 @@ fn a_ranking_kept_through_changes_matches_one_made_afresh() {
     assert_eq!(kept, Ranking::new(7, &rows(&[0, 2, 4, 5, 9]), &Kept));
     assert_ne!(kept, Ranking::new(8, &rows(&[0, 2, 4, 5, 9]), &Kept));
 }
+
+#[test]
+fn an_adaptive_strategy_resolves_from_the_rows_and_the_cap() {
+    use gf_core::planner::ADAPTIVE_SEED;
+    use std::num::NonZeroU64;
+
+    let retrieved = |cap: u64, timed: bool| {
+        let core = ((cap as f64) * 0.25).round_ties_even() as u64;
+        let neighbors = (cap - core) as usize;
+        Strategy::Retrieved {
+            core: (core > 0).then_some(Core {
+                rows: core,
+                seed: ADAPTIVE_SEED,
+                kind: CoreKind::Stratified,
+            }),
+            neighbors,
+            among: timed.then_some(neighbors * 4),
+            recency: None,
+        }
+    };
+    for cap in [2u64, 3, 7, 8, 10, 100, 1_000, 100_000] {
+        for rows in [0, 1, cap - 1, cap, cap + 1, 2 * cap, 50 * cap] {
+            for timed in [false, true] {
+                let resolved = Strategy::Adaptive.resolve(rows, NonZeroU64::new(cap), timed);
+                let expected = if rows <= cap {
+                    Strategy::Exact
+                } else {
+                    retrieved(cap, timed)
+                };
+                assert_eq!(resolved, expected, "rows {rows}, cap {cap}, timed {timed}");
+                assert!(resolved.check().is_ok());
+                assert_eq!(
+                    resolved.resolve(rows, NonZeroU64::new(cap), timed),
+                    resolved
+                );
+            }
+        }
+    }
+    // Without a cap every table reads whole, and a given strategy is itself.
+    assert_eq!(
+        Strategy::Adaptive.resolve(1 << 40, None, true),
+        Strategy::Exact
+    );
+    let given = Strategy::neighbors(3);
+    assert_eq!(given.resolve(1 << 40, NonZeroU64::new(2), true), given);
+    assert_eq!(Strategy::Adaptive.capped(8), Strategy::Adaptive);
+    assert_eq!(Strategy::Adaptive.seed(), Some(ADAPTIVE_SEED));
+    assert_eq!(
+        Strategy::Adaptive
+            .resolve(100, NonZeroU64::new(10), false)
+            .seed(),
+        Some(ADAPTIVE_SEED)
+    );
+}

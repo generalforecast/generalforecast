@@ -35,10 +35,13 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::config::WorkerConfig;
+use crate::progress::Compiling;
 use crate::protocol::{Frame, PROTOCOL_VERSION, WorkerReply, WorkerRequest};
 
 /// How long a worker may take to load its models and connect.
 const STARTUP: Duration = Duration::from_secs(600);
+/// How long a worker told to exit gets before it is killed.
+const EXIT: Duration = Duration::from_secs(5);
 
 /// A worker's reply to one frame, or why there is none.
 pub type Reply = Result<Frame, String>;
@@ -201,9 +204,10 @@ pub struct Pipeline {
 
 impl Pipeline {
     /// A pipeline over a connected stream, reading replies on its own task.
-    /// Shared frames go to `fallback` once shared memory runs out.
+    /// Shared frames go to `fallback` once shared memory runs out, and the
+    /// worker's warm-up progress goes to `warming`.
     #[must_use]
-    pub fn new(stream: UnixStream, fallback: PathBuf) -> Self {
+    pub fn new(stream: UnixStream, fallback: PathBuf, warming: Compiling) -> Self {
         let (mut reader, mut writer) = stream.into_split();
         let stopper = Stopper {
             queue: Arc::default(),
@@ -232,6 +236,8 @@ impl Pipeline {
         let compiled: Arc<(Mutex<Vec<String>>, Notify)> = Arc::default();
         let compiling = Arc::clone(&compiled);
         let reader = tokio::spawn(async move {
+            // The worker's last warm-up report, so each counts once.
+            let mut reported = (0, 0);
             loop {
                 let frame = match Frame::read_from(&mut reader).await {
                     Ok(frame) => frame,
@@ -240,9 +246,14 @@ impl Pipeline {
                         break;
                     }
                 };
-                if matches!(WorkerReply::of(&frame), Ok(WorkerReply::Progress)) {
+                if let Ok(WorkerReply::Progress { done, total }) = WorkerReply::of(&frame) {
                     *progressing.lock().unwrap_or_else(PoisonError::into_inner) =
                         Some(Instant::now());
+                    if let (Some(done), Some(total)) = (done, total) {
+                        warming.expect(total.saturating_sub(reported.1));
+                        warming.advance(done.saturating_sub(reported.0));
+                        reported = (done.max(reported.0), total.max(reported.1));
+                    }
                     continue;
                 }
                 if let Ok(WorkerReply::Compiled { keys }) = WorkerReply::of(&frame) {
@@ -496,6 +507,15 @@ pub struct Launch {
     pub shared_fallback: PathBuf,
     /// Times each part of a step.
     pub timers: bool,
+    /// Where the worker's warm-up progress is counted.
+    pub compiling: Compiling,
+}
+
+/// How a worker is made to exit.
+enum Stop {
+    /// SIGTERM, then SIGKILL if it is still running after `EXIT`.
+    Terminate,
+    Kill,
 }
 
 /// A running worker and the models it loaded.
@@ -504,8 +524,8 @@ pub struct WorkerConnection {
     pub launch: Launch,
     /// Waits for the worker to exit, then stops the pipeline; aborting it kills the worker.
     exited: JoinHandle<()>,
-    /// Asks that task to kill the worker and wait for it to exit.
-    kill: Option<oneshot::Sender<()>>,
+    /// Asks that task to stop the worker and wait for it to exit.
+    stop: Option<oneshot::Sender<Stop>>,
     /// Holds the socket; dropped after the pipeline.
     _directory: Private,
     /// Model names, in the order the worker numbers them.
@@ -612,6 +632,7 @@ impl WorkerConnection {
             secrets,
             shared_fallback,
             timers,
+            compiling,
         } = &launch;
         let (program, arguments) = config
             .command
@@ -635,6 +656,16 @@ impl WorkerConnection {
             .arg(workers.to_string())
             .stdin(Stdio::null())
             .kill_on_drop(true);
+        // A terminal's Ctrl-C reaches the worker along with the server, which
+        // stops it once drained; ignored before exec, the signal cannot
+        // interrupt Python's start-up either, before the worker's own handler.
+        // SAFETY: `signal` only sets a disposition, which is async-signal-safe.
+        unsafe {
+            command.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_IGN);
+                Ok(())
+            });
+        }
         for (name, spec) in &config.models {
             command.arg("--model").arg(format!("{name}={spec}"));
         }
@@ -692,15 +723,26 @@ impl WorkerConnection {
                  run the worker from the generalforecast the server came with"
             ));
         }
-        let pipeline = Pipeline::new(stream, shared_fallback.clone());
+        let pipeline = Pipeline::new(stream, shared_fallback.clone(), compiling.clone());
         let stopper = pipeline.stopper.clone();
-        let (kill, killed) = oneshot::channel::<()>();
+        let (stop, stopping) = oneshot::channel::<Stop>();
         let exited = tokio::spawn(async move {
             let status = tokio::select! {
                 status = child.wait() => status,
-                _ = killed => {
-                    let _ = child.start_kill();
-                    child.wait().await
+                stop = stopping => match stop {
+                    Ok(Stop::Terminate) if terminate(&child) => {
+                        match tokio::time::timeout(EXIT, child.wait()).await {
+                            Ok(status) => status,
+                            Err(_) => {
+                                let _ = child.start_kill();
+                                child.wait().await
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = child.start_kill();
+                        child.wait().await
+                    }
                 }
             };
             let status = status.map_or_else(|error| error.to_string(), |status| status.to_string());
@@ -710,7 +752,7 @@ impl WorkerConnection {
             pipeline,
             launch,
             exited,
-            kill: Some(kill),
+            stop: Some(stop),
             _directory: directory,
             models,
             device_memory,
@@ -729,11 +771,11 @@ impl WorkerConnection {
     /// If a directory for the connection cannot be made.
     pub fn fake(stream: UnixStream, models: Vec<String>) -> Result<Self, String> {
         let directory = Private::new(&std::env::temp_dir()).map_err(|error| error.to_string())?;
-        let pipeline = Pipeline::new(stream, std::env::temp_dir());
+        let pipeline = Pipeline::new(stream, std::env::temp_dir(), Compiling::default());
         let stopper = pipeline.stopper.clone();
-        let (kill, killed) = oneshot::channel::<()>();
+        let (stop, stopping) = oneshot::channel::<Stop>();
         let exited = tokio::spawn(async move {
-            let _ = killed.await;
+            let _ = stopping.await;
             stopper.stop("the worker exited (killed)");
         });
         Ok(Self {
@@ -755,9 +797,10 @@ impl WorkerConnection {
                 secrets: Vec::new(),
                 shared_fallback: std::env::temp_dir(),
                 timers: false,
+                compiling: Compiling::default(),
             },
             exited,
-            kill: Some(kill),
+            stop: Some(stop),
             _directory: directory,
             models,
             device_memory: 1 << 30,
@@ -770,8 +813,18 @@ impl WorkerConnection {
     /// Kills the worker, if it is still running, and waits for it to exit,
     /// so its device memory and disk file are free for the next one.
     pub async fn kill(&mut self) {
-        if let Some(kill) = self.kill.take() {
-            let _ = kill.send(());
+        self.stop(Stop::Kill).await;
+    }
+
+    /// Tells the worker to exit, as the server does once it has drained,
+    /// and waits for it; one still running after `EXIT` is killed.
+    pub async fn terminate(&mut self) {
+        self.stop(Stop::Terminate).await;
+    }
+
+    async fn stop(&mut self, how: Stop) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(how);
         }
         if !self.exited.is_finished() {
             let _ = (&mut self.exited).await;
@@ -846,6 +899,15 @@ impl WorkerConnection {
     pub async fn request(&mut self, frame: &Frame) -> Reply {
         self.pipeline.request(frame).await
     }
+}
+
+/// Sends SIGTERM to `child`; false if it has no process id, as after it exited.
+fn terminate(child: &tokio::process::Child) -> bool {
+    let Some(pid) = child.id().and_then(|id| i32::try_from(id).ok()) else {
+        return false;
+    };
+    // SAFETY: kill(2) takes a process id and a signal, and touches no memory.
+    unsafe { libc::kill(pid, libc::SIGTERM) == 0 }
 }
 
 impl Drop for WorkerConnection {

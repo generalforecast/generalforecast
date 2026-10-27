@@ -670,8 +670,9 @@ def test_a_replica_down_during_compaction_catches_up_from_the_snapshot(
         generalforecast.Strategy.subsample(16, 0),
         generalforecast.Strategy.neighbors(8),
         generalforecast.Strategy.retrieved(4, core=8, kind="stratified"),
+        generalforecast.Strategy.adaptive(),
     ],
-    ids=["exact", "subsample", "neighbors", "retrieved"],
+    ids=["exact", "subsample", "neighbors", "retrieved", "adaptive"],
 )
 def test_a_table_split_into_partitions_serves_as_one(
     cluster: tuple[Router, list[Server]], strategy: generalforecast.Strategy
@@ -682,6 +683,7 @@ def test_a_table_split_into_partitions_serves_as_one(
     whole = client.create_table(
         "whole", model="tiny", features=5, classes=3, strategy=strategy, page_size=4
     )
+    adaptive = strategy.spec() == generalforecast.Strategy.adaptive().spec()
     split = client.create_table(
         "split",
         model="tiny",
@@ -690,9 +692,21 @@ def test_a_table_split_into_partitions_serves_as_one(
         strategy=strategy,
         page_size=4,
         partitions=4,
+        # An adaptive strategy stays within the model's cap, so the clamp
+        # that a gathered context otherwise refuses has nothing to cut.
+        past_cap="clamp" if adaptive else "warn",
     )
     for table in (whole, split):
         table.insert(np.arange(32), features, targets)
+    if adaptive:
+        # The tiny model has no cap: 32 rows over the partitions read whole.
+        described = split.describe()
+        assert described.strategy == strategy
+        assert described.resolved_strategy == generalforecast.Strategy.exact()
+        # Under the clamp, only an adaptive strategy gathers.
+        with pytest.raises(ValueError, match="clamp"):
+            split.set_strategy(generalforecast.Strategy.neighbors(4))
+        assert split.describe().strategy == strategy
     # Every partition holds some of the rows, and none holds them all.
     held = [
         client._action("describe", {"table": f"split--part-{index}-of-4"})[0]["rows"]
@@ -703,7 +717,7 @@ def test_a_table_split_into_partitions_serves_as_one(
 
     assert predicted.shape == (len(NEAR_A), 3)
     np.testing.assert_allclose(predicted.sum(axis=1), 1.0, atol=1e-5)
-    if strategy.spec() == generalforecast.Strategy.exact().spec():
+    if adaptive or strategy.spec() == generalforecast.Strategy.exact().spec():
         # Every row, gathered from every partition, as the whole table holds them.
         np.testing.assert_allclose(predicted, whole.predict(NEAR_A), atol=1e-4)
     assert split.name == "split"

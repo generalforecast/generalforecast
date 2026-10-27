@@ -85,6 +85,55 @@ _REBUILD_WAIT = RebuildWait()
 
 
 @dataclass(frozen=True)
+class Roles:
+    """The frame columns a table's rows carry besides the feature columns.
+
+    `gf.engine.Table` reads the target, and the id and time if the frame has
+    them, from these columns and keeps them with the table so it opens again.
+
+    Attributes:
+        target: The column the target comes from.
+        id: The column holding each row's id, if the frame has one.
+        time: The column holding each row's time, if the frame has one.
+        classes: A classifier's class values in code order, as the target
+            column holds them; empty for a regressor's table.
+    """
+
+    target: str
+    id: str | None = None
+    time: str | None = None
+    classes: tuple[Any, ...] = ()
+
+    def spec(self) -> dict[str, Any]:
+        """The roles as a server's `create_table` takes them."""
+        spec: dict[str, Any] = {"target": self.target}
+        if self.id is not None:
+            spec["id"] = self.id
+        if self.time is not None:
+            spec["time"] = self.time
+        if self.classes:
+            spec["classes"] = [_plain(value) for value in self.classes]
+        return spec
+
+    @classmethod
+    def of(cls, spec: Mapping[str, Any] | None) -> Self | None:
+        """The roles a server describes, or None for a table made without them."""
+        if not spec:
+            return None
+        return cls(
+            target=str(spec["target"]),
+            id=spec.get("id"),
+            time=spec.get("time"),
+            classes=tuple(spec.get("classes") or ()),
+        )
+
+
+def _plain(value: Any) -> Any:
+    """A class value as JSON carries it: a NumPy scalar as its Python value."""
+    return value.item() if hasattr(value, "item") else value
+
+
+@dataclass(frozen=True)
 class Definition:
     """What a table is, as it was made.
 
@@ -124,6 +173,8 @@ class Definition:
             on: the table's rows, `table`, or each context's own, `context`.
         quantile_levels: The level of each of a regressor's prediction
             columns, increasing, or None for a classifier's table.
+        roles: The frame columns around the feature columns, for a table
+            `gf.engine.Table` made; None for one made without them.
     """
 
     name: str
@@ -148,6 +199,9 @@ class Definition:
     rebuild_wait: RebuildWait = _REBUILD_WAIT
     summary: Summary = "table"
     quantile_levels: tuple[float, ...] | None = None
+    roles: Roles | None = None
+    partitions: int = 1
+    route_by: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -156,6 +210,9 @@ class Described(Definition):
 
     Attributes:
         rows: Number of live rows.
+        resolved_strategy: The strategy the next prediction chooses contexts
+            with: an adaptive `strategy` resolved against the live rows, any
+            other as given.
         effective_fit_rows: The most rows the table's state is fit on: its
             `fit_rows`, or fewer where the worker's call budget takes fewer at
             the table's width. A table holding more fits on a seeded sample.
@@ -171,6 +228,7 @@ class Described(Definition):
     """
 
     rows: int = 0
+    resolved_strategy: Strategy = field(default_factory=Strategy.exact)
     effective_fit_rows: int | None = None
     vocabularies: dict[str, list[str]] = field(default_factory=dict)
     labels: list[str] | None = None
@@ -228,7 +286,15 @@ class Described(Definition):
                 region_stats=reply.get("region_stats"),
                 summary=summary,
                 quantile_levels=levels,
+                roles=Roles.of(reply.get("roles")),
+                partitions=int(reply.get("partitions") or 1),
+                route_by=reply.get("route_by"),
                 rows=int(reply["rows"]),
+                resolved_strategy=_strategy_of(
+                    reply.get("resolved_strategy")
+                    or reply.get("strategy")
+                    or {"kind": "exact"}
+                ),
                 effective_fit_rows=reply.get("effective_fit_rows"),
                 vocabularies=dict(reply.get("vocabularies", {})),
                 labels=list(reply.get("labels") or []) or None,
@@ -246,6 +312,8 @@ def _strategy_of(spec: Mapping[str, Any]) -> Strategy:
     match spec.get("kind"):
         case "exact":
             return Strategy.exact()
+        case "adaptive":
+            return Strategy.adaptive()
         case "subsample":
             return Strategy.subsample(int(spec["rows"]), int(spec.get("seed", 0)))
         case "neighbors":
@@ -583,6 +651,15 @@ class Table(abc.ABC):
     @abc.abstractmethod
     def refit(self) -> None:
         """Refits the table's state on its live rows at the next prediction."""
+
+    @abc.abstractmethod
+    def set_strategy(self, strategy: Strategy) -> None:
+        """Changes how each query's context is chosen from here on.
+
+        Logged like a write, so the table keeps it across restarts. The
+        ranking, cores and regions drawn for the old strategy are drawn anew
+        at the next prediction; cached encodings stay.
+        """
 
     @abc.abstractmethod
     def compact(self) -> None:

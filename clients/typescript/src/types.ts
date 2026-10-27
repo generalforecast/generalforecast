@@ -144,7 +144,7 @@ export interface Prediction {
   value?: number;
   probabilities?: Record<string, number>;
   quantiles?: Record<string, number>;
-  [key: string]: string | number;
+  [key: string]: string | number | boolean | Record<string, number> | undefined;
 }
 
 export interface Result {
