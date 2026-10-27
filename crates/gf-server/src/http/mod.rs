@@ -592,6 +592,25 @@ pub fn router(front: Arc<Front>) -> Router {
     Router::new().fallback(handle).with_state(front)
 }
 
+/// The catalog model a spelling names, as the catalog's references resolve
+/// it: a reference with its pin and variant, a canonical id, a short name,
+/// or an old alias of one.
+fn catalog_entry(spelling: &str) -> Option<&'static catalog::Entry> {
+    let catalog = catalog::catalog();
+    catalog::parse(spelling)
+        .ok()
+        .map(|model| model.entry)
+        .or_else(|| catalog.entry(spelling))
+        .or_else(|| catalog.named(spelling))
+        .or_else(|| catalog.named(&format!("{}/{spelling}", catalog::ORG)))
+        .or_else(|| {
+            catalog
+                .aliases
+                .get(spelling)
+                .and_then(|canonical| catalog.named(canonical))
+        })
+}
+
 /// The reply while a served model is still loading or compiling.
 fn not_ready() -> ApiError {
     ApiError::new(
@@ -861,17 +880,22 @@ async fn answer(
 }
 
 impl Front {
-    /// The served model a request names, by its resource name or any
-    /// reference the catalog resolves to it.
+    /// The served model a request names: by its resource name, or by any
+    /// spelling the catalog knows its model by, its short name, canonical
+    /// id or an old alias, whichever of them the server's own entry names.
     fn served(&self, model: &str) -> Result<&ServedModel, ApiError> {
-        let canonical = catalog::resolve(Some(model), self.surface)
-            .ok()
-            .map(|resolved| resolved.entry.name.to_string());
+        let wanted = catalog_entry(model).map(|entry| entry.id.as_str());
         self.models
             .iter()
             .filter(|served| served.predictor.is_none())
             .find(|served| {
-                served.name == model || canonical.as_deref() == Some(served.name.as_str())
+                served.name == model
+                    || wanted.is_some_and(|wanted| {
+                        [served.reference.as_str(), served.name.as_str()]
+                            .into_iter()
+                            .filter_map(catalog_entry)
+                            .any(|entry| entry.id == wanted)
+                    })
             })
             .ok_or_else(ApiError::not_served)
     }

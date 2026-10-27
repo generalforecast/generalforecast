@@ -1911,3 +1911,59 @@ async fn a_body_that_states_no_length_is_refused_before_it_is_read() {
     let response = router(front).oneshot(request).await.unwrap();
     assert_eq!(response.status().as_u16(), 411);
 }
+
+#[tokio::test]
+async fn a_model_is_found_by_its_bare_name_however_the_server_names_it() {
+    for (name, reference) in [
+        ("tabicl-v2-classifier", "tabicl-v2-classifier"),
+        (
+            "tabicl-v2-classifier",
+            "general-forecast/tabicl-v2-classifier",
+        ),
+        (
+            "general-forecast/tabicl-v2-classifier",
+            "general-forecast/tabicl-v2-classifier",
+        ),
+    ] {
+        let model = ServedModel {
+            name: name.to_string(),
+            reference: reference.to_string(),
+            ..served()
+        };
+        let front = Arc::new(Front::new(
+            vec![model],
+            Box::new(Static::new(None)),
+            Surface::SelfHosted,
+            true,
+            RequestBudget::new(1 << 30),
+            Duration::from_secs(30),
+            Arc::new(AtomicBool::new(false)),
+        ));
+        front
+            .start(vec![shard().await], Arc::new(Routes::new(1, 4)))
+            .await
+            .unwrap();
+        let (status, _, body) = call(
+            &front,
+            "GET",
+            "/v1/projects/local/models/tabicl-v2-classifier",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name} {reference}: {body}");
+        let (status, _, _) = call(
+            &front,
+            "GET",
+            "/v1/projects/local/models/tabicl-v2-regressor",
+            None,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "another model is not this one"
+        );
+    }
+}
