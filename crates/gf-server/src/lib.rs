@@ -15,6 +15,7 @@ pub mod error;
 pub mod http;
 pub mod metrics;
 pub mod name;
+pub mod parent;
 pub mod partition;
 pub mod predictors;
 pub mod private;
