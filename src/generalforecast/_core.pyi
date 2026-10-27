@@ -665,11 +665,14 @@ class Engine:
         features: npt.NDArray[np.float32],
         targets: npt.NDArray[np.int32] | npt.NDArray[np.float32],
         classes: int,
+        strategy: str | None = None,
     ) -> BoundTable:
         """Binds labeled rows once as a durable table.
 
         `features` is `(rows, columns)`; `targets` holds class codes (int32)
-        when `classes` is positive, else values (float32).
+        when `classes` is positive, else values (float32). `strategy` is the
+        selection each query's context is drawn by, as `Strategy.spec()`
+        spells it; exact when None.
         """
     def predict(
         self, bound: BoundTable, features: npt.NDArray[np.float32]

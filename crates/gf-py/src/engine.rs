@@ -315,7 +315,10 @@ impl Engine {
     /// Binds labeled rows once as a durable table.
     ///
     /// `features` is `(rows, columns)`; `targets` holds class codes (int32)
-    /// when `classes` is positive, else values (float32).
+    /// when `classes` is positive, else values (float32). `strategy` is the
+    /// selection each query's context is drawn by, as `Strategy.spec()`
+    /// spells it; exact when None.
+    #[pyo3(signature = (model, features, targets, classes, strategy=None))]
     fn bind(
         &self,
         py: Python<'_>,
@@ -323,8 +326,13 @@ impl Engine {
         features: PyReadonlyArray2<'_, f32>,
         targets: &Bound<'_, PyAny>,
         classes: usize,
+        strategy: Option<&str>,
     ) -> PyResult<BoundTable> {
         let running = self.running()?;
+        let strategy: Option<serde_json::Value> = strategy
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|_| PyValueError::new_err("strategy is not a strategy spec"))?;
         let (features, count, width) = rows(&features);
         let targets = if classes > 0 {
             Targets::Classes(
@@ -355,6 +363,7 @@ impl Engine {
                     features,
                     targets,
                     count,
+                    strategy.as_ref(),
                 ))
             })
             .map_err(answered)?;

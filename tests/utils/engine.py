@@ -68,6 +68,7 @@ class FakeEngine:
         )
         self.loads: list[tuple[str, str]] = []
         self.contexts: list[np.ndarray] = []
+        self.strategies: list[str | None] = []
         self.forecasts: list[ForecastRequest] = []
         self.delay = 0.0
         self.surface = "local"
@@ -110,8 +111,11 @@ class FakeEngine:
         shape = (queries, horizon, len(self.properties.quantiles))
         return np.arange(np.prod(shape), dtype=float).reshape(shape)
 
-    def bind(self, ref: ModelRef, context: Labeled) -> Bound:
+    def bind(
+        self, ref: ModelRef, context: Labeled, strategy: str | None = None
+    ) -> Bound:
         self.contexts.append(context.context.copy())
+        self.strategies.append(strategy)
         return Bound(ref, context, "fake")
 
     def predict(self, bound: Bound, queries: np.ndarray) -> np.ndarray:

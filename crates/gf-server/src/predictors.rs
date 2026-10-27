@@ -77,6 +77,14 @@ pub struct ServedPredictor {
     /// A forecast predictor's series layout, as its lock's spec gives it.
     #[serde(default)]
     pub forecast: Option<ForecastPredictor>,
+    /// The engine strategy each query's context rows are drawn by, as
+    /// `SelectionInfo.strategy_spec` spells the lock's selection; exact
+    /// when None.
+    #[serde(default)]
+    pub strategy: Option<Value>,
+    /// The most context rows one request may carry, for a request context.
+    #[serde(default)]
+    pub max_rows: Option<usize>,
 }
 
 /// How a forecast predictor's rows form its related series.
@@ -97,6 +105,11 @@ pub struct ForecastPredictor {
     pub frequency: Option<f64>,
     /// The time between rows the spec declares, in time units.
     pub declared: Option<f64>,
+    /// For a calendar frequency, the period times count in: `M`, `Q`, `Y`
+    /// or `W-<DAY>`, as `frequency.calendar_unit` names it. Times are then
+    /// period ordinals and `frequency` a count of periods.
+    #[serde(default)]
+    pub calendar: Option<String>,
 }
 
 /// A forecast predictor's context, aligned as its lock lays it out: its
@@ -207,16 +220,74 @@ fn seconds(array: &ArrayRef) -> Result<Vec<Value>, RequestError> {
         .collect())
 }
 
-/// A time column's instants: periods as numbers, dates and times as UTC
-/// seconds, as `grouping.instant` reads them.
-fn instants(array: &ArrayRef) -> Result<Vec<Value>, RequestError> {
+/// A time column's places on its frequency's axis: periods as numbers,
+/// dates and times as UTC seconds, as `frequency.instant` reads them, or as
+/// the ordinals of their UTC calendar periods, as `frequency.ordinal`
+/// counts them, when the frequency steps by the calendar.
+fn instants(array: &ArrayRef, calendar: Option<&str>) -> Result<Vec<Value>, RequestError> {
     let data_type = array.data_type();
     if data_type.is_integer() || data_type.is_floating() {
+        if calendar.is_some() {
+            return Err(refused("a calendar frequency needs dates or timestamps"));
+        }
         cells(array)
     } else if data_type.is_temporal() || matches!(data_type, DataType::Utf8 | DataType::LargeUtf8) {
-        seconds(array)
+        let times = seconds(array)?;
+        match calendar {
+            None => Ok(times),
+            Some(unit) => times
+                .into_iter()
+                .map(|time| match time.as_f64() {
+                    Some(at) => ordinal(at, unit).map(|period| json!(period)),
+                    None => Ok(Value::Null),
+                })
+                .collect(),
+        }
     } else {
         Err(refused("forecast time must be numeric, date or timestamp"))
+    }
+}
+
+/// The civil date of a day counted from 1970-01-01.
+fn civil(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let of_era = shifted.rem_euclid(146_097);
+    let year_of_era = (of_era - of_era / 1460 + of_era / 36_524 - of_era / 146_096) / 365;
+    let of_year = of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * of_year + 2) / 153;
+    let day = of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+/// Which UTC calendar period an instant falls in, counted from 1970, as
+/// `frequency.ordinal` counts it: months, quarters, years, or weeks
+/// anchored on a day from that day's first occurrence on or after
+/// 1970-01-01.
+fn ordinal(seconds: f64, unit: &str) -> Result<i64, RequestError> {
+    #[allow(clippy::cast_possible_truncation)]
+    let days = (seconds / 86_400.0).floor() as i64;
+    let (year, month, _) = civil(days);
+    match unit {
+        "M" => Ok((year - 1970) * 12 + month - 1),
+        "Q" => Ok((year - 1970) * 4 + (month - 1) / 3),
+        "Y" => Ok(year - 1970),
+        _ => {
+            const DAYS: [&str; 7] = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"];
+            let day = unit
+                .strip_prefix("W-")
+                .and_then(|day| DAYS.iter().position(|known| *known == day))
+                .ok_or_else(|| refused("unknown calendar frequency"))?;
+            // 1970-01-01 was a Thursday, index 3.
+            let anchor = (i64::try_from(day).unwrap_or_default() - 3).rem_euclid(7);
+            Ok((days - anchor).div_euclid(7))
+        }
     }
 }
 
@@ -270,7 +341,7 @@ impl ForecastPredictor {
             .iter()
             .map(|name| cells(column(name)?))
             .collect::<Result<Vec<_>, _>>()?;
-        let times = instants(column(&self.time)?)?;
+        let times = instants(column(&self.time)?, self.calendar.as_deref())?;
         let targets = cells(column(target)?)?;
         let inputs: Vec<&String> = self.past_inputs.iter().chain(&self.future_inputs).collect();
         let covariates = inputs
@@ -473,7 +544,7 @@ impl ForecastPredictor {
             .iter()
             .map(|name| cells(column(name)?))
             .collect::<Result<Vec<_>, _>>()?;
-        let times = instants(column(&self.time)?)?;
+        let times = instants(column(&self.time)?, self.calendar.as_deref())?;
         let inputs = self
             .future_inputs
             .iter()
@@ -705,4 +776,34 @@ pub fn read_snapshot(path: &Path) -> Result<RecordBatch, String> {
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| failed(&error))?;
     arrow_select::concat::concat_batches(&schema, &batches).map_err(|error| failed(&error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{civil, ordinal};
+
+    #[test]
+    fn civil_dates_follow_the_proleptic_calendar() {
+        assert_eq!(civil(0), (1970, 1, 1));
+        assert_eq!(civil(-1), (1969, 12, 31));
+        assert_eq!(civil(19_782), (2024, 2, 29));
+        assert_eq!(civil(19_783), (2024, 3, 1));
+    }
+
+    #[test]
+    fn ordinals_count_utc_calendar_periods_as_frequency_ordinal_does() {
+        let day = 86_400.0;
+        // 2024-01-01 and 2024-02-01, then 2024-04-01 and 2024-12-31.
+        assert_eq!(ordinal(19_723.0 * day, "M").unwrap(), 648);
+        assert_eq!(ordinal(19_754.0 * day, "M").unwrap(), 649);
+        assert_eq!(ordinal(19_814.0 * day, "Q").unwrap(), 217);
+        assert_eq!(ordinal(20_088.0 * day, "Y").unwrap(), 54);
+        // Mondays: 1970-01-05 is the first, 1969-12-29 the one before.
+        assert_eq!(ordinal(4.0 * day, "W-MON").unwrap(), 0);
+        assert_eq!(ordinal(11.0 * day, "W-MON").unwrap(), 1);
+        assert_eq!(ordinal(-3.0 * day, "W-MON").unwrap(), -1);
+        // A time of day keeps its day.
+        assert_eq!(ordinal(19_754.0 * day + 3_600.0, "M").unwrap(), 649);
+        assert!(ordinal(0.0, "W-XYZ").is_err());
+    }
 }

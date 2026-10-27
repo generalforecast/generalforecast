@@ -2144,6 +2144,10 @@ async fn served_predict(
                 !context.is_empty() && context.len() <= MAX_CONTEXT_ROWS,
                 "context must contain 1..100000 rows",
             )?;
+            require(
+                predictor.max_rows.is_none_or(|most| context.len() <= most),
+                "context exceeds the predictor's max_rows",
+            )?;
             let schema = if schema_free {
                 predictors::inferred(&features, &target, context)
             } else {
@@ -2167,6 +2171,7 @@ async fn served_predict(
                 bound.features,
                 bound.targets,
                 bound.rows,
+                predictor.strategy.as_ref(),
             )?;
             let inferred = front
                 .engine()?
@@ -2255,6 +2260,10 @@ async fn series_predict(
             require(
                 !context.is_empty() && context.len() <= MAX_CONTEXT_ROWS,
                 "context must contain 1..100000 rows",
+            )?;
+            require(
+                predictor.max_rows.is_none_or(|most| context.len() <= most),
+                "context exceeds the predictor's max_rows",
             )?;
             let schema = if predictor.schema_free() {
                 predictors::inferred(&forecast.context_columns(), target, context)

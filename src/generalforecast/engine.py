@@ -114,8 +114,14 @@ class Engine(Protocol):
         """Forecasts each query's series over the model's own quantile levels."""
         ...
 
-    def bind(self, ref: ModelRef, context: Labeled) -> Bound:
-        """Binds a context many requests read as a durable table."""
+    def bind(
+        self, ref: ModelRef, context: Labeled, strategy: str | None = None
+    ) -> Bound:
+        """Binds a context many requests read as a durable table.
+
+        `strategy` is the selection each query's context is drawn by, as
+        `Strategy.spec()` spells it; exact when None.
+        """
         ...
 
     def predict(self, bound: Bound, queries: np.ndarray) -> np.ndarray:
@@ -348,7 +354,9 @@ class LocalEngine:
         result.setflags(write=False)
         return Forecasts(result, tuple(levels))
 
-    def bind(self, ref: ModelRef, context: Labeled) -> Bound:  # noqa: D102
+    def bind(  # noqa: D102
+        self, ref: ModelRef, context: Labeled, strategy: str | None = None
+    ) -> Bound:
         shards = self._shared.shards
         targets = (
             np.ascontiguousarray(context.targets, np.int32)
@@ -360,6 +368,7 @@ class LocalEngine:
             np.ascontiguousarray(context.context, np.float32),
             targets,
             len(context.classes),
+            strategy,
         )
         bound = Bound(ref, context, table)
         dropper = weakref.finalize(bound, _unbind, shards, table)
