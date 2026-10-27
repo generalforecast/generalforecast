@@ -47,7 +47,7 @@ SCOPE = Scope("local", "r-conformance")
 TINY = {
     "general-forecast/tabicl-v2-classifier": "tests/tabicl-classifier",
     "general-forecast/tabicl-v2-regressor": "tests/tabicl-regressor",
-    "general-forecast/timestral-28m": "tests/timestral-forecaster",
+    "general-forecast/timestral-28m": "tests/timestral-catalog-forecaster",
     "general-forecast/chronos-2": "tests/chronos2-catalog-forecaster",
 }
 RELATIVE, ABSOLUTE = 1e-5, 1e-6
