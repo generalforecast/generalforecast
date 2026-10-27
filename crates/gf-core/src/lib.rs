@@ -11,6 +11,7 @@
 pub mod cache;
 pub mod catalog;
 pub mod categories;
+pub mod civil;
 pub mod columns;
 pub mod context;
 mod distance;

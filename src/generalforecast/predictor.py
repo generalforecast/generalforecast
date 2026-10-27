@@ -1198,7 +1198,9 @@ class Predictor:
                 return run_local(request, download=self._download)
         if self._kind == "served":
             payload = PredictRequest.declared_payload(
-                queries, context=context, as_of=as_of or self._as_of
+                queries,
+                context=context,
+                as_of=as_of if as_of is not None else self._as_of,
             )
             value = self._served_post(f"/predictors/{self.name}/predict", payload)
             return _frame_of_result(value, self._id_name())

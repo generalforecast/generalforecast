@@ -41,7 +41,8 @@ def test_a_date_is_its_midnight_in_utc_and_fractions_are_kept():
 
 
 @pytest.mark.parametrize(
-    "given", ["yesterday", "", True, float("nan"), float("inf"), -1, [MOMENT]]
+    "given",
+    ["yesterday", "", "2026-10-27", True, float("nan"), float("inf"), -1, [MOMENT]],
 )
 def test_anything_else_is_a_validation_error_naming_as_of(given):
     with pytest.raises(ServiceError) as refused:
@@ -70,3 +71,19 @@ def test_a_prediction_context_has_one_shape():
     assert context_version(
         {"kind": "live", "name": "events", "rows": 6, "as_of": MOMENT}
     ) == ContextVersion("live", None, 6, MOMENT, name="events")
+
+
+def test_requests_read_as_the_fixture_gf_server_shares_says():
+    import json
+    from pathlib import Path
+
+    fixture = Path(__file__).resolve().parents[2] / "crates/gf-server/tests/fixtures"
+    cases = json.loads((fixture / "as_of.json").read_text())["cases"]
+    for given, expected in cases:
+        if expected is None:
+            with pytest.raises(ServiceError):
+                as_of.micros(given)
+        else:
+            assert as_of.micros(given) == expected, given
+            # Written back, it reads as the same microsecond.
+            assert as_of.micros(as_of.wire(given)) == expected, given

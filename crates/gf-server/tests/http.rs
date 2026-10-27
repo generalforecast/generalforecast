@@ -1200,7 +1200,7 @@ async fn plane(state: Arc<Plane>) -> String {
                     // History is kept from 2026 on.
                     Some(at) if at.starts_with("2025") => answer(
                         422,
-                        json!({"error": {"code": "ValidationError", "message": "as_of precedes the context's history", "param": "as_of"}}),
+                        json!({"error": {"code": "ValidationError", "reason": "before_history", "message": "as_of precedes the context's history", "param": "as_of"}}),
                     ),
                     // The version that stood then: three of today's four rows.
                     Some(at) => {
@@ -2182,9 +2182,41 @@ async fn a_live_revision_predicts_as_of_a_past_time_from_the_planes_history() {
     .await;
     assert_eq!(status.as_u16(), 422, "{body}");
     assert_eq!(
-        (&body["error"]["code"], &body["error"]["param"]),
-        (&json!("ValidationError"), &json!("as_of"))
+        (
+            &body["error"]["code"],
+            &body["error"]["param"],
+            &body["error"]["reason"]
+        ),
+        (
+            &json!("ValidationError"),
+            &json!("as_of"),
+            &json!("before_history")
+        )
     );
+    // Microseconds go to the plane and back exactly; digits past them are
+    // dropped, so a time never reads after the instant it names.
+    for (given, asked) in [
+        (
+            json!("2026-10-26T08:00:00.866500Z"),
+            "2026-10-26T08:00:00.866500Z",
+        ),
+        (
+            json!("2026-10-26T08:00:00.866999Z"),
+            "2026-10-26T08:00:00.866999Z",
+        ),
+        (
+            json!("2026-10-26T08:00:00.8669999Z"),
+            "2026-10-26T08:00:00.866999Z",
+        ),
+        (json!(1_793_001_600.866_5), "2026-10-26T08:00:00.866500Z"),
+        (json!(1_793_001_600.000_001), "2026-10-26T08:00:00.000001Z"),
+    ] {
+        let (status, body) = score_at(&front, route, SCORER, &queries(given.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{given}: {body}");
+        assert_eq!(body["result"]["context"]["as_of"], asked, "{given}");
+        let last = state.as_ofs.lock().unwrap().last().cloned().flatten();
+        assert_eq!(last.as_deref(), Some(asked), "{given}");
+    }
     // A time that is not one is refused before the plane is asked.
     let asked = state.as_ofs.lock().unwrap().len();
     let (status, body) = score_at(&front, route, SCORER, &queries(json!("yesterday"))).await;

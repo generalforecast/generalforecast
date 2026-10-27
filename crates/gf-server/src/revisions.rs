@@ -505,11 +505,19 @@ impl Revisions {
             let error = &refused["error"];
             return match (error["code"].as_str(), error["message"].as_str()) {
                 (Some(code), Some(message)) if (400..600).contains(&status) && status != 401 => {
-                    let refused = ApiError::new(code, message, status);
-                    Err(match error["param"].as_str() {
-                        Some(param) => refused.param(param),
-                        None => refused,
-                    })
+                    // The plane's refusal as it came: its code, reason, field
+                    // and hint, for gf-server to answer its caller with.
+                    let mut refused = ApiError::new(code, message, status);
+                    if let Some(reason) = error["reason"].as_str() {
+                        refused = refused.reason(reason);
+                    }
+                    if let Some(param) = error["param"].as_str() {
+                        refused = refused.param(param);
+                    }
+                    if let Some(hint) = error["hint"].as_str() {
+                        refused = refused.hint(hint);
+                    }
+                    Err(refused)
                 }
                 _ => {
                     tracing::warn!(status, "control plane refused gf-server");

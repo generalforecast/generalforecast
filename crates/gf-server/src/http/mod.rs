@@ -187,6 +187,13 @@ impl ApiError {
         self
     }
 
+    /// Carries the finer reason behind the code, as a service relayed gave it.
+    #[must_use]
+    pub fn reason(mut self, reason: impl Into<String>) -> Self {
+        self.detail_mut().reason = Some(reason.into());
+        self
+    }
+
     /// Malformed input, as the hosted API's `require` refuses it.
     #[must_use]
     pub fn validation(message: impl Into<String>) -> Self {
@@ -205,6 +212,7 @@ impl ApiError {
         let mut error = json!({"code": self.code, "message": self.message});
         if let Some(detail) = &self.detail {
             let fields = [
+                ("reason", detail.reason.as_ref().map(|value| json!(value))),
                 ("param", detail.param.as_ref().map(|value| json!(value))),
                 ("hint", detail.hint.as_ref().map(|value| json!(value))),
                 ("limit", detail.limit.map(|value| json!(value))),

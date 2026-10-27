@@ -51,9 +51,13 @@ pub struct RequestError {
     pub detail: Option<Box<ErrorDetail>>,
 }
 
-/// The optional fields of an error object: `param`, `hint`, `limit`, `actual`.
+/// The optional fields of an error object: `reason`, `param`, `hint`,
+/// `limit`, `actual`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ErrorDetail {
+    /// The finer reason behind the code, in snake case, as another service
+    /// gave it.
+    pub reason: Option<String>,
     /// The request field at fault, as a dotted path (`inputs.plan`).
     pub param: Option<String>,
     /// What to do instead.

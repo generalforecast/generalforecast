@@ -1,94 +1,148 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""`as_of` on the wire: the one parser and formatter every surface uses.
+"""`as_of` on the wire: the one parser and formatter every Python surface uses.
 
-A request's `as_of` is an RFC 3339 time, read as UTC when it names no
-offset, or a number of seconds since the epoch. A reply's `as_of` is always
-an RFC 3339 UTC string such as `2026-10-27T08:00:00Z`, or null. Anything
-else is a `ValidationError` naming the parameter `as_of`. gf serve, the
-hosting API and the SDK parse and format through these two functions, and
-gf-server follows the same rules.
+A request's `as_of` is an RFC 3339 date-time, `2026-10-27T08:00:00Z`, read
+as UTC when it names no offset, or a number of seconds since the epoch, at
+least 0. A date alone, an hour alone, an ISO week or a negative number is
+refused as a `ValidationError` naming the parameter `as_of`. Python callers
+may also pass a `datetime`, `date` or pandas `Timestamp`.
+
+Instants are kept to the microsecond: digits past it are dropped, never
+rounded up, so an `as_of` never reads a write after the time it names; a
+number is read from its shortest decimal spelling, as JSON carries it. A
+reply's `as_of` is RFC 3339 UTC, whole seconds or six fractional digits,
+or null. gf-server's `as_of.rs` reads and writes by the same rules, and the
+fixture `crates/gf-server/tests/fixtures/as_of.json` pins both.
 """
 
 from __future__ import annotations
 
 import datetime
+import decimal
 import math
+import re
 from typing import Any
 
 from generalforecast.service.contracts import InputError
 
 # The parameter an invalid time is reported against.
 PARAM = "as_of"
-# The latest instant accepted, in seconds: the last second of year 9999.
-_LAST = 253402300799.0
+# The latest instant accepted, in microseconds: the end of year 9999.
+_LAST = 253_402_300_799_999_999
+# An RFC 3339 date-time: date, separator, time to the second, an optional
+# fraction of one to nine digits, and an optional offset.
+_RFC3339 = re.compile(
+    r"(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?"
+    r"(?:([Zz])|([+-])(\d{2}):(\d{2}))?"
+)
+_EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC)
 
 
 def _refused(message: str) -> InputError:
     return InputError("ValidationError", message, 422, param=PARAM)
 
 
-def parse(value: Any) -> float | None:
-    """A request's `as_of` as UTC seconds since the epoch, or None when absent.
-
-    Accepts an RFC 3339 string (no offset means UTC), a number of seconds,
-    or a `datetime`, `date` or pandas `Timestamp`, as Python callers hold
-    times.
+def micros(value: Any) -> int | None:
+    """A request's `as_of` as whole UTC microseconds since the epoch, or None when absent.
 
     Raises:
-        InputError: `ValidationError` with param `as_of` for anything else.
+        InputError: `ValidationError` with param `as_of` for anything the
+            rules above refuse.
     """
     if value is None:
         return None
     if isinstance(value, bool):
         raise _refused("as_of is an RFC 3339 time or epoch seconds, not a boolean")
     if isinstance(value, (int, float)):
-        seconds = float(value)
-        if not math.isfinite(seconds) or not 0 <= seconds <= _LAST:
+        if not math.isfinite(value):
             raise _refused("as_of seconds must be a finite time after the epoch")
-        return seconds
+        # The shortest decimal spelling, as JSON carries the number.
+        exact = decimal.Decimal(repr(value)) * 1_000_000
+        return _checked(int(exact.to_integral_value(rounding=decimal.ROUND_FLOOR)))
     if isinstance(value, str):
-        try:
-            moment = datetime.datetime.fromisoformat(value.strip())
-        except ValueError:
+        match = _RFC3339.fullmatch(value)
+        if match is None:
             raise _refused(
                 "as_of is an RFC 3339 time such as 2026-10-27T08:00:00Z, "
                 "or epoch seconds"
+            )
+        year, month, day, hour, minute, second = map(int, match.groups()[:6])
+        fraction, _zulu, sign, offset_hours, offset_minutes = match.groups()[6:]
+        try:
+            moment = datetime.datetime(
+                year, month, day, hour, minute, second, tzinfo=datetime.UTC
+            )
+        except ValueError:
+            raise _refused(
+                "as_of names a date or time the calendar does not have"
             ) from None
-        return _seconds(moment)
+        offset = 0
+        if sign is not None:
+            if int(offset_hours) >= 24 or int(offset_minutes) >= 60:
+                raise _refused("as_of names an offset past 23:59")
+            offset = (int(offset_hours) * 60 + int(offset_minutes)) * 60_000_000
+            offset = offset if sign == "+" else -offset
+        whole = (moment - _EPOCH) // datetime.timedelta(microseconds=1)
+        return _checked(whole + int((fraction or "0")[:6].ljust(6, "0")) - offset)
     if isinstance(value, datetime.datetime):
-        return _seconds(value)
+        return _checked(_moment_micros(value))
     if isinstance(value, datetime.date):
-        return _seconds(
-            datetime.datetime(value.year, value.month, value.day, tzinfo=datetime.UTC)
+        return _checked(
+            _moment_micros(
+                datetime.datetime(
+                    value.year, value.month, value.day, tzinfo=datetime.UTC
+                )
+            )
         )
     to_datetime = getattr(value, "to_pydatetime", None)
     if callable(to_datetime):
-        return _seconds(to_datetime())
+        return _checked(_moment_micros(to_datetime()))
     raise _refused(
         f"as_of is an RFC 3339 time or epoch seconds, not {type(value).__name__}"
     )
 
 
-def _seconds(moment: datetime.datetime) -> float:
+def _moment_micros(moment: datetime.datetime) -> int:
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=datetime.UTC)
-    seconds = moment.timestamp()
-    if not 0 <= seconds <= _LAST:
+    return (moment - _EPOCH) // datetime.timedelta(microseconds=1)
+
+
+def _checked(value: int) -> int:
+    if not 0 <= value <= _LAST:
         raise _refused("as_of must be a time after the epoch")
-    return seconds
+    return value
+
+
+def parse(value: Any) -> float | None:
+    """A request's `as_of` as UTC seconds since the epoch, or None when absent.
+
+    The seconds are `micros(value) / 1e6`, which `format` writes back to the
+    same microsecond.
+
+    Raises:
+        InputError: `ValidationError` with param `as_of`, as `micros` does.
+    """
+    found = micros(value)
+    return None if found is None else found / 1_000_000
 
 
 def format(seconds: float | None) -> str | None:
     """UTC seconds as a reply's RFC 3339 `as_of`, `2026-10-27T08:00:00Z`; None stays None.
 
-    Fractions of a second are kept, to the microsecond.
+    Fractions of a second are written to the microsecond, six digits.
     """
-    checked = parse(seconds)
-    if checked is None:
+    if seconds is None:
         return None
-    moment = datetime.datetime.fromtimestamp(checked, datetime.UTC)
+    if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
+        raise _refused("as_of seconds must be a number")
+    return _written(_checked(round(seconds * 1_000_000)))
+
+
+def _written(whole: int) -> str:
+    moment = _EPOCH + datetime.timedelta(microseconds=whole)
     text = moment.isoformat(
         timespec="microseconds" if moment.microsecond else "seconds"
     )
@@ -97,4 +151,5 @@ def format(seconds: float | None) -> str | None:
 
 def wire(value: Any) -> str | None:
     """Any accepted `as_of` as the RFC 3339 UTC string a request sends."""
-    return format(parse(value))
+    found = micros(value)
+    return None if found is None else _written(found)
