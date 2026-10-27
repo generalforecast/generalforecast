@@ -229,7 +229,7 @@ impl Shard {
     /// Counts a failed step against a table, and quarantines it once it has
     /// failed `FAILURES` steps running: its queued requests fail, and later
     /// ones are refused.
-    pub(super) fn count_failure(&mut self, table: TableId, reason: &str) {
+    fn count_failure(&mut self, table: TableId, reason: &str) {
         let failures = self.failures.entry(table).or_default();
         *failures += 1;
         if *failures < FAILURES || self.quarantined.contains_key(&table) {
@@ -276,7 +276,7 @@ impl Shard {
     /// context rows each newly encoded, those shared split evenly among the
     /// requests reading them. A table with no requests in the step, as in a
     /// region rebuild's, keeps its cost as rebuild seconds.
-    pub(super) fn count_costs(&self, step: &Step, outcome: &Outcome) -> HashMap<RequestId, Share> {
+    fn count_costs(&self, step: &Step, outcome: &Outcome) -> HashMap<RequestId, Share> {
         self.metrics.worker_seconds.add(outcome.seconds);
         for (name, time) in &outcome.stages {
             let stage = self.metrics.stage(name);
@@ -518,12 +518,7 @@ impl Shard {
     }
 
     /// Fails a step's requests that are still waiting, for one table or all.
-    pub(super) fn fail_requests(
-        &mut self,
-        step: &Step,
-        table: Option<TableId>,
-        error: &ServerError,
-    ) {
+    fn fail_requests(&mut self, step: &Step, table: Option<TableId>, error: &ServerError) {
         let requests = step
             .queries()
             .iter()
@@ -562,7 +557,7 @@ impl Shard {
         });
     }
 
-    pub(super) fn fail_all(&mut self, error: &ServerError) {
+    fn fail_all(&mut self, error: &ServerError) {
         self.queued_bytes = 0;
         let now = Instant::now();
         for (_, pending) in self.pending.drain() {

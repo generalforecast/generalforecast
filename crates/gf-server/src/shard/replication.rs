@@ -50,7 +50,7 @@ impl Shard {
     }
 
     /// Stages a shipment's records in order, applying snapshots as they come.
-    pub(super) async fn stage_shipment(
+    async fn stage_shipment(
         &mut self,
         table: &str,
         id: TableId,
@@ -121,7 +121,7 @@ impl Shard {
 
     /// Syncs a shipment's staged records, then applies them in order: the
     /// primary checked them, so they apply as they did there.
-    pub(super) async fn apply_staged(
+    async fn apply_staged(
         &mut self,
         id: TableId,
         staged: Vec<(Record, u64)>,

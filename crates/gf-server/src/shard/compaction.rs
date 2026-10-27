@@ -170,7 +170,7 @@ pub(super) fn apply_compacted(node: &mut Node, id: TableId, rows: Rows) -> Resul
 /// it began: the snapshot first, with the table's layout, its words, its
 /// series' keys and its clients' recent writes, then the rest as inserts
 /// that continue it.
-pub(super) fn write_compaction(
+fn write_compaction(
     mut compactor: Compactor,
     source: &CompactionSource,
     mut words: Vec<Words>,

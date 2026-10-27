@@ -105,7 +105,7 @@ impl Shard {
     }
 
     /// Sizes the worker's pools and serves it every table.
-    pub(super) async fn configure(&mut self) -> Result<(), String> {
+    async fn configure(&mut self) -> Result<(), String> {
         self.allocate().await?;
         for entry in self.tables.values() {
             self.worker

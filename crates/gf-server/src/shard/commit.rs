@@ -142,7 +142,7 @@ impl Shard {
     }
 
     /// Commits a prefix of the batch and returns the rest.
-    pub(super) async fn commit_some(&mut self, batch: Vec<Queued>) -> Vec<Queued> {
+    async fn commit_some(&mut self, batch: Vec<Queued>) -> Vec<Queued> {
         let mut staged: Vec<Staged> = Vec::new();
         let mut touched: HashMap<TableName, HashSet<u128>> = HashMap::new();
         // Tables whose vocabularies a staged write extends; a later write with
@@ -302,7 +302,7 @@ impl Shard {
 
     /// Resolves a write into the record to log, or the answer for one the
     /// table already applied under its client id.
-    pub(super) fn prepare(
+    fn prepare(
         &mut self,
         table: &str,
         write: Write,
@@ -428,7 +428,7 @@ impl Shard {
     /// Compacts a log that has grown past `COMPACT_FACTOR` times its live
     /// rows, once enough records have followed its last compaction, or its
     /// last failed try.
-    pub(super) async fn compact_if_large(&mut self, table: &str) {
+    async fn compact_if_large(&mut self, table: &str) {
         let Some(entry) = self.tables.get(table) else {
             return;
         };
@@ -479,7 +479,7 @@ impl Shard {
 
 /// Syncs the logs of `names`, each on a thread of its own when there are
 /// several, so a batch across tables waits for the slowest sync, not their sum.
-pub(super) fn sync_logs(
+fn sync_logs(
     tables: &mut HashMap<TableName, Entry>,
     names: &HashSet<&str>,
 ) -> HashMap<TableName, Result<(), ServerError>> {
