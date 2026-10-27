@@ -667,7 +667,26 @@ class PredictorCommands:
         rows = []
         if resolution.id is not None:
             rows.append(["id", resolution.id, _from(declared, "id")])
-        rows.append(["inputs", ", ".join(resolution.input_names), chosen])
+        if resolution.task == "forecast":
+            # A forecaster's covariates by role, as gf.lock records them: the
+            # ones `inputs.future` lists bring values ahead; every other input
+            # is a past covariate, known only up to each series' origin.
+            by_role = dict(
+                zip(resolution.input_names, resolution.input_roles, strict=True)
+            )
+            past = [name for name, role in by_role.items() if role == "past"]
+            future = [name for name, role in by_role.items() if role == "future"]
+            listed = f"listed in {MANIFEST}" if spec.past else chosen
+            rows.append(["past", ", ".join(past) or "none", listed if past else ""])
+            rows.append(
+                [
+                    "future",
+                    ", ".join(future) or "none",
+                    f"listed in {MANIFEST}" if future else "",
+                ]
+            )
+        else:
+            rows.append(["inputs", ", ".join(resolution.input_names), chosen])
         rows.append(["target", resolution.target, _from(declared, "target")])
         rows.append(
             ["context", f"{term.count(resolution.context.rows or 0)} rows", where]

@@ -10,6 +10,7 @@ import pyarrow as pa
 from generalforecast.predictors.models import CatalogResolver
 from generalforecast.predictors.runtime.compile import validate_queries
 from generalforecast.predictors.runtime.compiled import CompiledPlan
+from generalforecast.predictors.runtime.context import conform
 from generalforecast.predictors.runtime.schema import (
     TableSchema,
     infer_schema,
@@ -134,10 +135,16 @@ def query_table(lock: CompiledPlan, schema: TableSchema, queries: pa.Table) -> p
         required <= set(table.column_names) <= expected.keys(),
         "forecast query columns differ from locked roles",
     )
-    for field, values in zip(table.schema, table.columns, strict=True):
+    for index, (field, values) in enumerate(
+        zip(table.schema, table.columns, strict=True)
+    ):
+        column = expected[field.name]
+        values = conform(values, column.type)
         ensure(
-            physical_type(field.type) == expected[field.name].type,
-            "query physical type differs from lock",
+            values is not None,
+            f"query column {field.name!r} is {physical_type(field.type)}; "
+            f"the lock reads {column.type}",
         )
+        table = table.set_column(index, field.name, values)
         ensure(not values.null_count, "forecast queries cannot contain missing values")
     return table

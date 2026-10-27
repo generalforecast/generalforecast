@@ -636,3 +636,89 @@ def test_check_locked_needs_a_current_version_2_lock(tmp_path):
         cli.main(["check", "--locked", "-q", str(root)])
     assert exited.value.code != 0
     assert not (root / "gf.lock").exists()
+
+
+def test_queries_widen_whole_numbers_and_read_iso_times_on_every_task(tmp_path):
+    from generalforecast.predictors.runtime.compile import validate_queries
+    from generalforecast.predictors.runtime.validation import query_table
+    from tests.utils.locks import compiled
+
+    plan = compiled(
+        tmp_path / "sales",
+        sales(),
+        model=FORECASTER,
+        target="units",
+        time="date",
+        series=["store"],
+        horizon=2,
+        inputs={"future": ["promo"]},
+    )
+    queries = pa.table(
+        {
+            "store": ["north", "north"],
+            "date": ["2025-01-13", "2025-01-14"],
+            "promo": [1, 0],
+        }
+    )
+    read = query_table(plan, plan.schema, queries)
+    assert read["promo"].type == pa.float64()
+    assert read["date"].to_pylist() == [
+        datetime.date(2025, 1, 13),
+        datetime.date(2025, 1, 14),
+    ]
+    with pytest.raises(PredictorError, match="query column 'promo' is string"):
+        query_table(
+            plan, plan.schema, queries.set_column(2, "promo", pa.array(["a", "b"]))
+        )
+    plan = compiled(tmp_path / "churn", churn(), id="id")
+    read = validate_queries(
+        plan, pa.table({"id": [20], "day": ["2025-09-10"], "spend": [3], "note": ["n"]})
+    )
+    assert read["spend"].type == pa.float64()
+
+
+def test_request_contexts_leave_unlabeled_rows_out(tmp_path):
+    root = directory(
+        tmp_path / "scorer",
+        pa.table({"x": [1.0, 2.0], "y": ["a", "b"]}),
+        context="request",
+    )
+    lock = lock_of(root)
+    rows = pa.table({"x": [1, 2, 3, 4], "y": ["a", "", None, "b"]})
+    bound = served_context(lock, rows)
+    assert bound is not None
+    assert bound["y"].to_pylist() == ["a", "b"]
+    # An input checked without rows reads its numbers as float64 on every path.
+    assert bound["x"].type == pa.float64()
+
+
+def test_column_names_and_labels_are_data_not_references(tmp_path):
+    rows = pa.table(
+        {
+            "is_vip?": [float(i) for i in range(12)],
+            "item #": [i % 3 for i in range(12)],
+            "{{y}}": [("a?", "b#")[i % 2] for i in range(12)],
+        }
+    )
+    root = directory(tmp_path / "odd", rows, target="{{y}}")
+    names = [column["name"] for column in lock_of(root).predictor["inputs"]]
+    assert names == ["is_vip?", "item #"]
+    assert lock_of(root).predictor["classes"] == ["a?", "b#"]
+    with pytest.raises(InvalidInput, match="control characters"):
+        name_rows = pa.table({"a\tb": [1.0] * 4, "y": [0, 1] * 2})
+        compile_lock(ad_hoc(name_rows, model=CLASSIFIER, target="y"), name_rows)
+
+
+def test_a_text_covariate_is_refused_by_name(tmp_path):
+    rows = sales().append_column("weather", pa.array(["sun", "rain"] * 12))
+    with pytest.raises(InvalidInput, match="input 'weather' is string"):
+        directory(
+            tmp_path / "w",
+            rows,
+            model=FORECASTER,
+            target="units",
+            time="date",
+            series=["store"],
+            horizon=2,
+            inputs={"past": ["weather"]},
+        )

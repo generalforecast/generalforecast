@@ -16,7 +16,8 @@ from generalforecast.predictors.models import ModelPin
 from generalforecast.predictors.runtime.plan import (
     ExecutionPlan,
 )
-from generalforecast.predictors.validation import PredictorError, ensure, fields, text
+from generalforecast.predictors.validation import PredictorError, ensure, fields
+from generalforecast.predictors.validation import column as column_name
 from generalforecast.tabular import PHYSICAL_TYPES, physical_type, to_arrow
 
 pc: Any = _compute
@@ -77,7 +78,7 @@ class TableSchema:
         columns = []
         for column in value["columns"]:
             fields(column, {"name", "type", "nullable", "role", "semantic"})
-            text(column["name"])
+            column_name(column["name"])
             ensure(
                 type(column["type"]) is str and column["type"] in PHYSICAL_TYPES,
                 "invalid physical type",
@@ -330,7 +331,7 @@ def infer_schema(
         )
     columns = []
     for column, physical, nullable in source:
-        text(column)
+        column_name(column)
         role = roles.get(
             column,
             "input"
@@ -344,15 +345,21 @@ def infer_schema(
             else None
         )
         if role in ("input", "past", "future"):
+            accepted = ", ".join(sorted(pin.input_types))
             ensure(
                 physical in pin.input_types,
-                "model does not support an input physical type",
+                f"input {column!r} is {physical}; the model reads {accepted}"
+                + (
+                    " (a forecaster's covariates are numbers or booleans)"
+                    if role in ("past", "future")
+                    else ""
+                ),
                 "UnsupportedCapability",
             )
             ensure(
                 not nullable
                 or (pin.missing_values and spec.inputs.missing_values == "allow"),
-                "missing inputs are not supported by this contract",
+                f"input {column!r} has missing values, which this model does not read",
                 "MissingValues",
             )
         columns.append(ColumnSchema(column, physical, nullable, role, declared))
@@ -399,7 +406,7 @@ def infer_schema(
                 classes = tuple(sorted(pc.unique(labels).to_pylist()))
                 for label in classes:
                     if type(label) is str:
-                        text(label)
+                        column_name(label)
         elif table is not None:
             ensure(
                 len(table[spec.target].drop_null()) > 0,

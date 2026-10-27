@@ -709,3 +709,43 @@ def test_served_predictions_echo_the_id_column(monkeypatch) -> None:
     assert list(frame.columns) == ["id", "label", "p_0", "p_1"]
     assert frame["id"].tolist() == [1297]
     assert posted == ["/predictors/churn/predict"]
+
+
+def test_forecast_eval_scales_each_series_by_its_own_history(monkeypatch) -> None:
+    import datetime as dt
+
+    import generalforecast.predictor as predictor_module
+
+    def fake_run(request: PredictRequest, *, download: bool = True) -> pd.DataFrame:
+        return pd.DataFrame({"value": [0.0] * len(request.queries)})
+
+    monkeypatch.setattr(predictor_module, "run_local", fake_run)
+    day = dt.date(2025, 1, 1)
+    # Two series share the first series column's value; their history
+    # arrives out of time order. Each steps by 1 (east) or 4 (west) a day.
+    context = [
+        {
+            "region": "r",
+            "store": store,
+            "date": day + dt.timedelta(days=d),
+            "y": step * d,
+        }
+        for store, step in (("west", 4.0), ("east", 1.0))
+        for d in (3, 0, 2, 1)
+    ]
+    held = [
+        {"region": "r", "store": store, "date": day + dt.timedelta(days=d), "y": 8.0}
+        for store in ("east", "west")
+        for d in (4, 5)
+    ]
+    predictor = gf.Predictor(
+        "general-forecast/chronos-2",
+        target="y",
+        time="date",
+        series=["region", "store"],
+        horizon=2,
+        context=context,
+    )
+    scores = predictor.eval(held).metrics["general-forecast/chronos-2"]
+    # |8 - 0| over each series' naive error: 8 for east, 2 for west.
+    assert scores["mase"] == pytest.approx((8 + 8 + 2 + 2) / 4)

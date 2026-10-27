@@ -58,6 +58,7 @@ from generalforecast.predictors.validation import (
     name,
     text,
 )
+from generalforecast.predictors.validation import column as column_name
 
 LOCK = "gf.lock"
 LOCK_VERSION = 2
@@ -233,12 +234,12 @@ def validate(value: Any) -> dict[str, Any]:
     )
     hash_value(predictor["model_digest"])
     ensure(predictor["task"] in TASKS, "invalid predictor task")
-    text(predictor["target"])
+    column_name(predictor["target"])
     _kind(predictor["target_type"])
     task = predictor["task"]
     for key in ("id", "time"):
         if key in predictor:
-            text(predictor[key])
+            column_name(predictor[key])
             ensure(
                 f"{key}_type" in predictor,
                 f"a lock with an {key} records its {key}_type",
@@ -264,7 +265,7 @@ def validate(value: Any) -> dict[str, Any]:
         for column, kind in zip(
             predictor["series"], predictor["series_types"], strict=True
         ):
-            text(column)
+            column_name(column)
             _kind(kind)
     if task == "forecast":
         ensure(
@@ -317,7 +318,7 @@ def validate(value: Any) -> dict[str, Any]:
     )
     for column in inputs:
         fields(column, {"name", "type", "role"})
-        text(column["name"])
+        column_name(column["name"])
         if column["type"] is not None:
             _kind(column["type"])
         ensure(

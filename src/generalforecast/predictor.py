@@ -603,6 +603,16 @@ def _pinball(y: np.ndarray, q: np.ndarray, level: float) -> float:
     return float(np.mean(np.where(diff >= 0, level * diff, (level - 1) * diff)))
 
 
+def _when(moment: Any) -> Any:
+    """A time as it sorts: an instant for dates and datetimes, else itself."""
+    from generalforecast.predictors.frequency import instant
+
+    try:
+        return instant(moment)
+    except TypeError:
+        return moment
+
+
 def forecast_metrics(
     truth: Sequence[float],
     quantiles: Mapping[float, Sequence[float]],
@@ -1283,24 +1293,33 @@ class Predictor:
         }
         if request.task == "regression":
             return regression_metrics(truth, frame["value"].tolist(), quantiles or None)
-        series_column = request.series[0] if request.series else None
-        history: dict[Any, list[float]] = {}
+
+        # Each series is keyed by every series column, and its history is
+        # in time order, so the naive error scaling MASE is each series' own.
+        def keys(table: pa.Table) -> list[tuple]:
+            columns = [table.column(name).to_pylist() for name in request.series]
+            return list(zip(*columns, strict=True)) if columns else [()] * len(table)
+
         context = request.context
-        keys = (
-            context.column(series_column).to_pylist()
-            if series_column is not None
-            else [None] * len(context)
+        times = (
+            context.column(request.time).to_pylist()
+            if request.time
+            else list(range(len(context)))
         )
-        for key, value in zip(
-            keys, context.column(request.target).to_pylist(), strict=True
+        ordered: dict[tuple, list[tuple[Any, float]]] = {}
+        for key, moment, value in zip(
+            keys(context),
+            times,
+            context.column(request.target).to_pylist(),
+            strict=True,
         ):
             if value is not None:
-                history.setdefault(key, []).append(float(value))
-        held_keys = (
-            held.column(series_column).to_pylist()
-            if series_column is not None
-            else [None] * len(held)
-        )
+                ordered.setdefault(key, []).append((_when(moment), float(value)))
+        history = {
+            key: [value for _, value in sorted(values, key=lambda item: item[0])]
+            for key, values in ordered.items()
+        }
+        held_keys = keys(held)
         if not quantiles:
             quantiles = {0.5: frame["value"].tolist()}
         return forecast_metrics(truth, quantiles, history=history, series=held_keys)

@@ -55,6 +55,20 @@ def text(value: Any) -> str:
     return value
 
 
+def column(value: Any) -> str:
+    """Checks a column name or a class label: any printable text a CSV header or cell holds.
+
+    Unlike `text`, which guards references a service resolves, a column or
+    label is data: `is_vip?`, `item #` and `{{x}}` are fine names.
+    """
+    ensure(
+        type(value) is str and 0 < len(value) <= 512,
+        "column names and labels are 1 to 512 characters",
+    )
+    ensure(not any(ord(c) < 32 for c in value), "control characters are not allowed")
+    return value
+
+
 # The one rule for the names people choose: predictors, live contexts and
 # environments. `gf.yaml`, `gf.lock`, the SDK and every service route check it.
 NAME = re.compile(r"[a-z][a-z0-9-]{0,62}")
@@ -84,7 +98,7 @@ def identifier(value: Any) -> str:
 def names(value: Any) -> tuple[str, ...]:
     """Copies unique ordered column names into an immutable tuple."""
     ensure(type(value) is list, "expected a list of columns")
-    result = tuple(text(item) for item in value)
+    result = tuple(column(item) for item in value)
     ensure(len(set(result)) == len(result), "columns must be unique")
     return result
 
