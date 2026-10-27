@@ -247,6 +247,76 @@ def describe(requested: str) -> ModelPin:
     return project(ref.entry, ref, V1_POLICY)
 
 
+@dataclass(frozen=True)
+class Qualification:
+    """Where a predictor's model may run: what `gf check` reports and every command holds to.
+
+    Every catalog model runs in process (`gf.Predictor`, `gf eval`, `gf
+    predict` on a directory). `gf serve` runs those the catalog qualifies
+    for a self-hosted server; `gf push` and hosted serving those it
+    qualifies for hosted predictors.
+
+    Attributes:
+        model: The model reference, as the lock records it.
+        serve: Whether `gf serve` may serve it.
+        push: Whether `gf push` may push it, for hosted serving.
+        evidence: What the catalog's qualification rests on, or what is missing.
+    """
+
+    model: str
+    serve: bool
+    push: bool
+    evidence: str
+
+    def describe(self) -> str:
+        """One line for `gf check`: where it runs, and why not elsewhere."""
+        if self.push:
+            return "gf.Predictor, gf serve and gf push"
+        where = "gf.Predictor and gf serve" if self.serve else "gf.Predictor only"
+        missing = "gf push" if self.serve else "gf serve or gf push"
+        return f"{where}; not qualified for {missing}: {self.evidence}"
+
+    def to_dict(self) -> dict[str, Any]:
+        """The `--json` form: each command and whether it runs the model."""
+        return {"local": True, "serve": self.serve, "push": self.push}
+
+    def refusal(self, command: Literal["serve", "push"]) -> PredictorError:
+        """The error `gf serve` or `gf push` raises for a model it may not run."""
+        surface = (
+            "a self-hosted server (gf serve)"
+            if command == "serve"
+            else "hosted predictors (gf push)"
+        )
+        return PredictorError(
+            "ModelResolutionRequired",
+            f"{self.model} is not qualified for {surface}: {self.evidence}; "
+            "`gf check` reports where a predictor runs",
+        )
+
+
+def qualification(model: str) -> Qualification:
+    """Where a catalog model may run; see `Qualification`.
+
+    Raises:
+        PredictorError: For a reference that names no catalog model.
+    """
+    from generalforecast.models.catalog import ModelRefError, parse
+
+    try:
+        ref = parse(model)
+    except ModelRefError as error:
+        raise PredictorError(error.code, str(error)) from None
+    if ref.custom:
+        return Qualification(model, False, False, "custom models run in process")
+    entry = ref.entry
+    return Qualification(
+        model,
+        entry.allows("self-hosted", variant=ref.variant),
+        entry.gates.allows("predictor", variant=ref.variant),
+        entry.gates.evidence or "no qualification evidence is recorded",
+    )
+
+
 class ModelResolver(Protocol):
     """A capability resolver must honor offline and return a content-addressed pin."""
 

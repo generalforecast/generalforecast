@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from typing import Any
 
 import jax.numpy as jnp
@@ -24,11 +25,14 @@ SCHEDULE = ("time", "time_variate")
 QUANTILES = (0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
 
 
-def tiny_checkpoint(seed: int = 0) -> tuple[dict[str, Any], dict[str, Any]]:
+def tiny_checkpoint(
+    seed: int = 0, quantiles: Sequence[float] = QUANTILES
+) -> tuple[dict[str, Any], dict[str, Any]]:
     """A small random checkpoint, as Mistral publishes them.
 
     Args:
         seed: Seed for the weights.
+        quantiles: Quantile levels it forecasts.
 
     Returns:
         The state dict and settings.
@@ -63,7 +67,7 @@ def tiny_checkpoint(seed: int = 0) -> tuple[dict[str, Any], dict[str, Any]]:
         linear(f"{prefix}.mlp.w12", 2 * HIDDEN, EMBED)
         linear(f"{prefix}.mlp.w3", EMBED, HIDDEN)
     arrays["transformer.out_norm.scale"] = 1 + 0.1 * rng.normal(size=EMBED)
-    residual_block("head.projection", EMBED, PATCH * len(QUANTILES), False)
+    residual_block("head.projection", EMBED, PATCH * len(quantiles), False)
     state = {key: jnp.asarray(value, jnp.float32) for key, value in arrays.items()}
     settings = {
         "patch_size": PATCH,
@@ -71,7 +75,7 @@ def tiny_checkpoint(seed: int = 0) -> tuple[dict[str, Any], dict[str, Any]]:
         "num_heads": HEADS,
         "mlp_hidden_dim": HIDDEN,
         "block_schedule": list(SCHEDULE),
-        "quantile_knots": list(QUANTILES),
+        "quantile_knots": list(quantiles),
         "block_size": BLOCK_SIZE,
         "context_length": CONTEXT,
         "rope_theta": 10000.0,
@@ -110,3 +114,19 @@ def forecaster() -> tuple[Any, Timestral]:
     from generalforecast.models.timestral.model import timestral_functions
 
     return timestral_functions, tiny_timestral()
+
+
+def catalog_forecaster() -> tuple[Any, Timestral]:
+    """A small random Timestral with the catalog's quantile levels.
+
+    The model spec target `tests/timestral-catalog-forecaster` stands in for
+    `timestral-28m`, whose published levels it matches, so `gf check` and
+    the bind-time check agree on what the tiny model serves.
+    """
+    from generalforecast.models import catalog
+    from generalforecast.models.timestral.model import timestral_functions
+
+    quantiles = catalog.ENTRIES["general-forecast/timestral-28m"].capability.quantiles
+    return timestral_functions, timestral_from_state(
+        *tiny_checkpoint(quantiles=quantiles), True
+    )

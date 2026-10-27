@@ -186,6 +186,12 @@ def _predictor(path: Path, directory: Path, *, allow_downloads: bool) -> dict[st
             "LockRequired",
         )
     lock = read_lock(lock_path)
+    predictor = lock["predictor"]
+    from generalforecast.predictors.models import qualification
+
+    runs = qualification(predictor["model"])
+    if not runs.serve:
+        raise runs.refusal("serve")
     if (root / "gf.yaml").is_file():
         try:
             verified(load(root), root)
@@ -194,7 +200,6 @@ def _predictor(path: Path, directory: Path, *, allow_downloads: bool) -> dict[st
             if error.reason == "snapshot_changed":
                 code = "SnapshotMismatch"
             raise PredictorError(code, error.message) from None
-    predictor = lock["predictor"]
     ref = canonical(predictor["model"])
     _verified(ref, allow_downloads=allow_downloads)
     rows = None

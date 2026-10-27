@@ -321,22 +321,35 @@ def test_check_admits_quantiles_as_the_runtime_does(tmp_path, monkeypatch):
         "horizon": 2,
         "quantiles": [0.123],
     }
-    # A model whose catalog entry declares its levels is held to them at check.
-    with pytest.raises(InvalidInput) as caught:
-        directory(tmp_path / "chronos", rows, model=FORECASTER, **manifest)
-    assert "quantile" in caught.value.message
-    # One that publishes them only in its weights is held to them at bind.
+    # Every catalog forecaster declares its levels, so check refuses others
+    # up front rather than leaving it to the first prediction.
+    for model in (
+        FORECASTER,
+        "general-forecast/timesfm-3",
+        "general-forecast/timestral-28m",
+    ):
+        with pytest.raises(InvalidInput) as caught:
+            directory(tmp_path / model.split("/")[1], rows, model=model, **manifest)
+        assert "quantile" in caught.value.message
+    # Binding still holds the loaded weights to the declared levels.
     root = directory(
-        tmp_path / "timesfm", rows, model="general-forecast/timesfm-3", **manifest
+        tmp_path / "deciles",
+        rows,
+        model="general-forecast/timesfm-3",
+        target="units",
+        time="date",
+        series=["store"],
+        horizon=2,
+        quantiles=[0.2, 0.8],
     )
-    FakeEngine((0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)).install(monkeypatch)
+    FakeEngine((0.25, 0.5, 0.75)).install(monkeypatch)
     lock = lock_of(root)
     from generalforecast.predictors.models import CatalogResolver
 
     plan = compile_lock(
         lock, served_context(lock, rows), resolver=CatalogResolver("local")
     )
-    with pytest.raises(Exception, match=r"does not output quantile 0\.123"):
+    with pytest.raises(Exception, match="pinned model capabilities changed"):
         PredictorExecutor(surface="local").prepare(plan, served_context(lock, rows))
 
 
