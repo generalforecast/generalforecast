@@ -171,10 +171,23 @@ class Client:
         params: Mapping[str, Any] | None = None,
         deadline: float | None = None,
     ) -> JsonObject:
-        """Sends one versioned request and returns its unwrapped result."""
-        return self._step(
-            Call(method, path, kind, resource, payload, global_route, params, deadline)
+        """Sends one versioned request and returns its unwrapped result.
+
+        Every operation's calls go through here, so this one method sends
+        each versioned request a client makes.
+        """
+        prepared = ops.prepare(
+            self.project,
+            Call(method, path, kind, resource, payload, global_route, params, deadline),
         )
+        value = self._transport.send(
+            prepared.method,
+            prepared.path,
+            prepared.body,
+            prepared.headers,
+            deadline=prepared.deadline,
+        )
+        return ops.answer(prepared, value)
 
     def _run[T](self, operation: Operation[T]) -> T:
         """Runs an operation's steps in this thread, throwing failures back into it."""
@@ -201,13 +214,20 @@ class Client:
         if isinstance(step, Pause):
             time.sleep(step.seconds)
             return None
+        if isinstance(step, Call):
+            return self._call(
+                step.method,
+                step.path,
+                step.kind,
+                step.resource,
+                step.payload,
+                global_route=step.global_route,
+                params=step.params,
+                deadline=step.deadline,
+            )
         prepared = ops.prepare(self.project, step)
         value = self._transport.send(
-            prepared.method,
-            prepared.path,
-            prepared.body,
-            prepared.headers,
-            deadline=prepared.deadline,
+            prepared.method, prepared.path, prepared.body, prepared.headers
         )
         return ops.answer(prepared, value)
 

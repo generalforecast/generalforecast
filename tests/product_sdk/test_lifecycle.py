@@ -224,10 +224,10 @@ def test_predictions_and_context_transactions(wire, asynchronous):
         "revision": 1,
         "environment": "production",
     }
-    # The profile's environment is sent explicitly, never left to the server.
+    # Production, the services' default, is named by omission.
     wire.expect(
         "POST",
-        "/predictors/risk/predict?env=production",
+        "/predictors/risk/predict",
         deployed_result,
         payload={"queries": [{"x": 3}]},
     )

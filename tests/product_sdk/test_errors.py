@@ -167,3 +167,27 @@ def test_the_boundary_maps_by_code_and_cause_and_leaves_bugs_alone():
     assert isinstance(framed, gf.NotFound) and framed.message == 'table "x"'
     with pytest.raises(gf.NotFound), errors.boundary():
         Path("/nonexistent/rows.csv").read_bytes()
+
+
+def test_a_service_code_is_kept_as_raised_and_client_only_codes_are_not_believed():
+    named = ServiceError("InvalidInput", "bad", 422)
+    assert (named.code, named.reason, named.public) == (
+        "InvalidInput",
+        "invalid_input",
+        "ValidationError",
+    )
+    assert gf.InvalidInput("bad", code="InvalidInput").code == "ValidationError"
+    with pytest.raises(ServiceError) as claimed:
+        response_value(
+            400,
+            json.dumps(
+                {"error": {"code": "TransportError", "message": "not a transport"}}
+            ).encode(),
+        )
+    assert claimed.value.code == "RemoteError"
+    assert claimed.value.reason == "remote_error"
+    assert not isinstance(claimed.value, gf.Unavailable)
+    with pytest.raises(ServiceError) as garbled:
+        response_value(200, b"<html>")
+    assert (garbled.value.code, garbled.value.status) == ("ProtocolError", 502)
+    assert isinstance(garbled.value, gf.Internal)

@@ -173,3 +173,10 @@ def test_ambient_proxies_are_ignored_and_plain_http_is_loopback_only(monkeypatch
     with pytest.raises(ServiceError) as error:
         call("http://login.example", "/v1/auth/status", timeout=5, token="gf_key")
     assert error.value.code == "ValidationError"
+
+
+def test_a_long_flag_timeout_is_bounded_like_every_request():
+    with server(deque([(200, {"ok": True})]), []) as url:
+        assert call(url, "/v1/auth/status", timeout=600, token="gf_k" * 4) == {
+            "ok": True
+        }

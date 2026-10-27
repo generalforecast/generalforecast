@@ -682,3 +682,124 @@ def test_profile_lock_prevents_reproducible_lost_update(tmp_path, monkeypatch, l
         assert stored == {"seed", "p0", "p1"}
     else:
         assert stored < {"seed", "p0", "p1"} and len(stored) == 2
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_every_post_states_its_content_length(asynchronous):
+    # gf-server refuses a POST body that states no length with 411.
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *_args):
+            pass
+
+        def do_POST(self):
+            length = self.headers.get("Content-Length")
+            body = self.rfile.read(int(length or 0))
+            seen.append((length, self.headers.get("Transfer-Encoding"), len(body)))
+            data = b"{}"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    url = f"http://127.0.0.1:{server.server_port}"
+    bodies = [{"payload": {"x": 1}}, b"arrow-stream-bytes"]
+
+    async def run():
+        transport = (AsyncTransport if asynchronous else Transport)(url)
+        try:
+            for body in bodies:
+                value = transport.send("POST", "/v1/projects/p/predict", body)
+                assert (await value if inspect.isawaitable(value) else value) == {}
+        finally:
+            closing = (
+                transport.aclose()
+                if isinstance(transport, AsyncTransport)
+                else transport.close()
+            )
+            if inspect.isawaitable(closing):
+                await closing
+
+    try:
+        asyncio.run(run())
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()
+    assert [(int(length), chunked) for length, chunked, _size in seen] == [
+        (size, None) for _length, _chunked, size in seen
+    ]
+    assert len(seen) == 2
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_download_past_its_limit_is_capacity_exceeded(asynchronous):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    import generalforecast as gf
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *_args):
+            pass
+
+        def do_GET(self):
+            data = b"x" * 100
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    url = f"http://127.0.0.1:{server.server_port}"
+
+    async def download(limit: int) -> bytes:
+        if not asynchronous:
+            return Transport(url).download("/rows.csv", limit=limit)
+        transport = AsyncTransport(url)
+        try:
+            return await transport.download("/rows.csv", limit=limit)
+        finally:
+            await transport.aclose()
+
+    try:
+        assert asyncio.run(download(100)) == b"x" * 100
+        with pytest.raises(gf.CapacityExceeded) as error:
+            asyncio.run(download(10))
+        assert error.value.limit == 10
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()
+
+
+def test_an_environment_key_needs_no_readable_credentials_file(tmp_path):
+    from generalforecast.credentials import CredentialStore
+
+    config = tmp_path / "gf" / "profiles.json"
+    shared = CredentialStore({"GF_CONFIG_PATH": str(config), "GF_KEYCHAIN": "0"})
+    shared.path.parent.mkdir(parents=True)
+    shared.path.write_text('[servers."https://a.example"]\nkey_id = "k1"\n')
+    shared.path.chmod(0o644)
+    with_key = CredentialStore(
+        {
+            "GF_CONFIG_PATH": str(config),
+            "GF_KEYCHAIN": "0",
+            "GF_API_KEY": "gf_envkey1234",
+        }
+    )
+    found = with_key.resolve("https://a.example")
+    assert found is not None and (found.key, found.login) == ("gf_envkey1234", None)
+    with pytest.raises(ServiceError) as error:
+        shared.resolve("https://a.example")
+    assert "credentials.toml" in error.value.message
+    assert error.value.hint is not None and "chmod 600" in error.value.hint

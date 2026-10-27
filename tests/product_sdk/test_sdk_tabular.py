@@ -204,3 +204,10 @@ def test_remote_rows_are_read_only_over_the_hardened_transport(monkeypatch):
     with pytest.raises(gf.InvalidInput) as plain:
         tabular.frame("http://rows.example/rows.csv?sig=SECRET")
     assert "SECRET" not in str(plain.value) and "HTTPS" in plain.value.message
+
+
+def test_empty_rows_are_an_empty_table_in_every_container():
+    from generalforecast import tabular
+
+    for empty in ([], (), {}):
+        assert tabular.frame(empty).num_columns == 0

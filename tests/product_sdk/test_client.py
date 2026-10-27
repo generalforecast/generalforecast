@@ -43,25 +43,27 @@ def run(asynchronous: bool, url: str, body, *, environment: str = "production"):
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_predict_uses_the_profile_environment(wire, asynchronous):
-    wire.expect(
-        "POST",
-        "/predictors/risk/predict?env=staging",
-        PREDICTION,
-        payload={"queries": [{"x": 3}]},
-    )
-    wire.expect(
-        "POST",
-        "/predictors/risk/predict?env=production",
-        PREDICTION,
-        payload={"queries": [{"x": 3}]},
-    )
+    for path in ("?env=staging", "", ""):
+        wire.expect(
+            "POST",
+            "/predictors/risk/predict" + path,
+            PREDICTION,
+            payload={"queries": [{"x": 3}]},
+        )
 
     async def body(client):
+        # The profile's staging, then production by name; production, the
+        # services' default, is named by omission.
         for env in (None, "production"):
             value = client.predictors.predict("risk", {"x": [3]}, env=env)
             await value if inspect.isawaitable(value) else value
 
     run(asynchronous, wire.url, body, environment="staging")
+    run(
+        asynchronous,
+        wire.url,
+        lambda c: c.predictors.predict("risk", {"x": [3]}),
+    )
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])

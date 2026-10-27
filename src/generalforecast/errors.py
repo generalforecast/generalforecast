@@ -139,9 +139,14 @@ def public_code(code: str, status: int | None) -> str:
 # Category names that are spelled differently as codes.
 _CODE_ALIASES = {"InvalidInput": "ValidationError"}
 
-# Codes that are their own reason: the wire codes, and a remote code that was
-# not repeated.
-_UNREASONED = WIRE_ERROR_CODES | {"RemoteError"}
+# Codes that are their own reason: the wire codes.
+_UNREASONED = WIRE_ERROR_CODES
+
+# Codes only a client raises about its own side of the wire; a server that
+# sends one is not believed.
+_CLIENT_ONLY = frozenset(
+    {"TransportError", "ClientClosed", "RedirectRefused", "ModelOutputError"}
+)
 
 
 def known_code(code: str) -> bool:
@@ -231,7 +236,15 @@ class Error(Exception):
             message = args[0]
         elif args:
             raise TypeError("Error takes a message, a code and a message, and a status")
-        self.code = type(self).code if code is None else _CODE_ALIASES.get(code, code)
+        self.code = (
+            type(self).code
+            if code is None
+            # A category's name is spelled as its code; a service's own code
+            # stays as it was raised.
+            else _CODE_ALIASES.get(code, code)
+            if type(self) is Error or type(self)._category
+            else code
+        )
         self.message = "" if message is None else message
         self.reason = (
             reason
@@ -507,7 +520,9 @@ def wire_fields(
     code = detail["code"]
     message = detail["message"]
     fields: dict[str, Any] = {
-        "code": code if known_code(code) else "RemoteError",
+        "code": code
+        if known_code(code) and code not in _CLIENT_ONLY
+        else "RemoteError",
         "message": printable(message) if len(message) <= MAX_MESSAGE else "",
         "status": status,
         "request_id": detail.get("request_id") or request_id,

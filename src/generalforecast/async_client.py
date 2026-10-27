@@ -231,10 +231,23 @@ class AsyncClient:
         params: Mapping[str, Any] | None = None,
         deadline: float | None = None,
     ) -> JsonObject:
-        """Sends one versioned request and returns its unwrapped result."""
-        return await self._step(
-            Call(method, path, kind, resource, payload, global_route, params, deadline)
+        """Sends one versioned request and returns its unwrapped result.
+
+        Every operation's calls go through here, so this one method sends
+        each versioned request a client makes.
+        """
+        prepared = ops.prepare(
+            self.project,
+            Call(method, path, kind, resource, payload, global_route, params, deadline),
         )
+        value = await self._transport.send(
+            prepared.method,
+            prepared.path,
+            prepared.body,
+            prepared.headers,
+            deadline=prepared.deadline,
+        )
+        return ops.answer(prepared, value)
 
     async def _run[T](self, operation: Operation[T]) -> T:
         """Awaits an operation's steps, throwing failures back into it."""
@@ -261,13 +274,20 @@ class AsyncClient:
         if isinstance(step, Pause):
             await asyncio.sleep(step.seconds)
             return None
+        if isinstance(step, Call):
+            return await self._call(
+                step.method,
+                step.path,
+                step.kind,
+                step.resource,
+                step.payload,
+                global_route=step.global_route,
+                params=step.params,
+                deadline=step.deadline,
+            )
         prepared = ops.prepare(self.project, step)
         value = await self._transport.send(
-            prepared.method,
-            prepared.path,
-            prepared.body,
-            prepared.headers,
-            deadline=prepared.deadline,
+            prepared.method, prepared.path, prepared.body, prepared.headers
         )
         return ops.answer(prepared, value)
 

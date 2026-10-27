@@ -436,7 +436,7 @@ def frame(obj: Any, *, columns: list[str] | tuple[str, ...] | None = None) -> pa
         return _frame_from_location(str(obj))
     if obj is None:
         raise InvalidInput("rows are required: a frame, a list of dicts or a file")
-    if isinstance(obj, (list, tuple)) and len(obj) == 0:
+    if isinstance(obj, (list, tuple, Mapping)) and len(obj) == 0:
         return pa.table({})
     with boundary():
         return to_arrow(obj, columns=columns)

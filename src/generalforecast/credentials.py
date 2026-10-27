@@ -140,7 +140,16 @@ class CredentialStore:
         return sys.platform == "darwin" and shutil.which("security") is not None
 
     def _read(self) -> dict[str, dict]:
-        raw = read_private(self.path, limit=_CREDENTIALS_LIMIT, missing_ok=True)
+        try:
+            raw = read_private(self.path, limit=_CREDENTIALS_LIMIT, missing_ok=True)
+        except ServiceError as error:
+            raise ServiceError(
+                error.code,
+                f"{_home(self.path)}: {error.message}",
+                error.status,
+                hint=f"make it private with `chmod 600 {_home(self.path)}`, "
+                "or remove it and run `gf login` again",
+            ) from error
         if raw is None:
             return {}
         try:
@@ -219,9 +228,17 @@ class CredentialStore:
         return "macOS keychain" if login.store == "keychain" else _home(self.path)
 
     def resolve(self, server: str) -> Credential | None:
-        """GF_API_KEY first, then the stored login for this server."""
+        """GF_API_KEY first, then the stored login for this server.
+
+        The environment's key needs no file: a stored login only adds its
+        metadata, and an unreadable credentials file leaves that out.
+        """
         if self.env.get(ENV_KEY):
-            return Credential(self.env[ENV_KEY], ENV_KEY, self.load(server))
+            try:
+                login = self.load(server)
+            except ServiceError:
+                login = None
+            return Credential(self.env[ENV_KEY], ENV_KEY, login)
         login = self.load(server)
         if login is None or not login.key:
             return None

@@ -3,11 +3,11 @@
 
 """Bounded HTTPS transport with explicit, independent credential layers.
 
-`Transport` and `AsyncTransport` are the one HTTP stack every SDK surface
-uses: the clients, `gf login`, served predictors and remote table reads. They
-send no cookies, follow no redirects, read no proxy settings from the
-environment and require HTTPS except on loopback, so a credential reaches
-only the origin it was given for.
+`Transport` and `AsyncTransport` are the SDK's HTTP stack: the clients,
+`gf login` and remote table reads use them, and `send` and `download` are
+public for any other caller. They send no cookies, follow no redirects, read
+no proxy settings from the environment and require HTTPS except on loopback,
+so a credential reaches only the origin it was given for.
 """
 
 import asyncio
@@ -49,6 +49,10 @@ from generalforecast.service.contracts import (
 )
 
 DEFAULT_KEY_ENV = "GF_API_KEY"
+# The environment a service scores when a request names none.
+DEFAULT_ENVIRONMENT = "production"
+# The bounds of one request's timeout, in seconds.
+MIN_TIMEOUT, MAX_TIMEOUT = 0.01, 300
 PROFILE_FIELDS = ("url", "project", "environment", "runtime", "key_env")
 _PROFILE_LIMIT = 65536
 _KEY_ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
@@ -68,7 +72,7 @@ class Profile:
 
     url: str = "http://127.0.0.1:8000"
     project: str = "local"
-    environment: str = "production"
+    environment: str = DEFAULT_ENVIRONMENT
     runtime: str | None = None
     key_env: str | None = DEFAULT_KEY_ENV
 
@@ -176,7 +180,7 @@ class Profile:
             "project": self.project,
             "key_env": self.key_env,
         }
-        if self.environment != "production":
+        if self.environment != DEFAULT_ENVIRONMENT:
             value["environment"] = self.environment
         if self.runtime is not None:
             value["runtime"] = self.runtime
@@ -345,9 +349,26 @@ def route_missing(error: ServiceError) -> bool:
     return error.status == 404 and error.code in ("NotFound", "ProtocolError")
 
 
-def platform_from_probe(error: ServiceError | None) -> bool:
-    """Any probe answer other than a missing route identifies the hosted platform."""
-    return error is None or not route_missing(error)
+def platform_from_probe(error: ServiceError | None) -> bool | None:
+    """What a probe's answer says the server is: hosted, a model server, or unknown.
+
+    A missing route is a model server; any other HTTP answer is the hosted
+    platform; a probe that got no answer, or no readable one, says nothing,
+    so the next missing route probes again.
+    """
+    if error is None:
+        return True
+    if route_missing(error):
+        return False
+    if error.code in _NO_ANSWER:
+        return None
+    return True
+
+
+# Probe failures that carry no answer from the server.
+_NO_ANSWER = frozenset(
+    {"TransportError", "Timeout", "ProtocolError", "RedirectRefused"}
+)
 
 
 def retryable(method: str, body: Any) -> bool:
@@ -366,8 +387,11 @@ def response_value(status: int, raw: bytes) -> dict[str, Any]:
         require(len(raw) <= MAX_BYTES, "response too large")
         value = json_object(json.loads(raw))
     except (ValueError, UnicodeError, ServiceError):
+        # A refusal keeps its status, so a bare 404 is still a missing route; a
+        # success that is not JSON is the service's fault.
+        failed = 502 if 200 <= status < 300 else status
         raise ServiceError(
-            "ProtocolError", "invalid service response", status
+            "ProtocolError", "invalid service response", failed
         ) from None
     if not 200 <= status < 300:
         raise _failure(status, value.get("error"))
@@ -484,8 +508,21 @@ def _compressed() -> ServiceError:
     )
 
 
+class _Oversized(Exception):
+    """A response past the limit its caller set; each caller names its error."""
+
+
 def _too_large() -> ServiceError:
     return ServiceError("ProtocolError", "invalid service response", 502)
+
+
+def _download_too_large(limit: int) -> ServiceError:
+    return ServiceError(
+        "CapacityExceeded",
+        f"the resource is larger than {limit:,} bytes",
+        413,
+        limit=limit,
+    )
 
 
 def _checked_path(path: str) -> str:
@@ -545,7 +582,7 @@ class _Policy:
         substituted for canonical GF authorization.
         """
         self.url = endpoint(url)
-        number(timeout, 0.01, 300, "timeout")
+        number(timeout, MIN_TIMEOUT, MAX_TIMEOUT, "timeout")
         self.timeout = timeout
         require(type(retries) is int and 0 <= retries <= 5, "invalid retries")
         number(retry_delay, 0, 5, "retry_delay")
@@ -674,6 +711,8 @@ class Transport(_Policy):
                 method, path, body, dict(headers or {}), deadline, MAX_BYTES
             )
             value = response_value(status, raw)
+        except _Oversized:
+            raise _too_large() from None
         except ServiceError as error:
             if self._probe_needed(method, path, error):
                 try:
@@ -694,10 +733,13 @@ class Transport(_Policy):
     def download(
         self, path: str, *, limit: int, deadline: float | None = None
     ) -> bytes:
-        """GETs a resource's bytes, at most `limit` of them."""
-        status, raw = self._exchange(
-            "GET", path, None, {"Accept": "*/*"}, deadline, limit
-        )
+        """GETs a resource's bytes; more than `limit` of them is `CapacityExceeded`."""
+        try:
+            status, raw = self._exchange(
+                "GET", path, None, {"Accept": "*/*"}, deadline, limit
+            )
+        except _Oversized:
+            raise _download_too_large(limit) from None
         if not 200 <= status < 300:
             raise _download_failure(status, raw)
         return raw
@@ -796,7 +838,7 @@ class Transport(_Policy):
             except (OSError, HTTPException):
                 raise _transport_failure("response interrupted") from None
         if len(raw) > limit:
-            raise _too_large()
+            raise _Oversized
         if time.monotonic() > end:
             raise _timeout()
         return status, bytes(raw)
@@ -853,6 +895,8 @@ class AsyncTransport(_Policy):
                 method, path, body, dict(headers or {}), deadline, MAX_BYTES
             )
             value = response_value(status, raw)
+        except _Oversized:
+            raise _too_large() from None
         except ServiceError as error:
             if self._probe_needed(method, path, error):
                 try:
@@ -873,10 +917,13 @@ class AsyncTransport(_Policy):
     async def download(
         self, path: str, *, limit: int, deadline: float | None = None
     ) -> bytes:
-        """GETs a resource's bytes, at most `limit` of them."""
-        status, raw = await self._exchange(
-            "GET", path, None, {"Accept": "*/*"}, deadline, limit
-        )
+        """GETs a resource's bytes; more than `limit` of them is `CapacityExceeded`."""
+        try:
+            status, raw = await self._exchange(
+                "GET", path, None, {"Accept": "*/*"}, deadline, limit
+            )
+        except _Oversized:
+            raise _download_too_large(limit) from None
         if not 200 <= status < 300:
             raise _download_failure(status, raw)
         return raw
@@ -942,7 +989,7 @@ class AsyncTransport(_Policy):
                 raw = bytearray()
                 async for chunk in response.aiter_bytes(chunk_size=65536):
                     if len(raw) + len(chunk) > limit:
-                        raise _too_large()
+                        raise _Oversized
                     raw.extend(chunk)
                 return response.status_code, bytes(raw)
         except httpx.TimeoutException:

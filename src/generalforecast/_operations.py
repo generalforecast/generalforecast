@@ -475,21 +475,28 @@ def predictor_predict(
     as_of: Any,
     env: str | None,
 ) -> Operation[PredictionResult]:
-    """Predicts with a declared predictor in an environment, the profile's by default."""
+    """Predicts with a declared predictor in an environment, the profile's by default.
+
+    Services score `production` when a request names no environment, so
+    production is named by omission; a standalone `gf serve`, whose
+    predictors have no environments, refuses any other.
+    """
     from generalforecast.predictor import PredictRequest
+    from generalforecast.transport import DEFAULT_ENVIRONMENT
 
     payload = yield Work(
         PredictRequest.declared_payload,
         (queries,),
         {"context": context, "as_of": as_of},
     )
+    selected = environment_name(env, client.profile.environment)
     result = yield Call(
         "POST",
         _predictor(predictor, "/predict"),
         "predictor",
         predictor,
         payload,
-        params={"env": environment_name(env, client.profile.environment)},
+        params=None if selected == DEFAULT_ENVIRONMENT else {"env": selected},
     )
     return inference_result(result)
 

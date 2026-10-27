@@ -70,12 +70,14 @@ def call(
         ServiceError: The server's error, with its wire code and `reason`;
             a refused redirect or a plain-HTTP server off loopback.
     """
-    from generalforecast.transport import Transport
+    from generalforecast.transport import MAX_TIMEOUT, MIN_TIMEOUT, Transport
 
     headers = {"X-GF-Request-ID": "r-" + os.urandom(16).hex()}
     if project:
         headers["X-GF-Project"] = project
-    transport = Transport(server, token=token, timeout=timeout)
+    # One request is bounded as every SDK request is, whatever a flag asks.
+    bounded = min(max(timeout, MIN_TIMEOUT), MAX_TIMEOUT)
+    transport = Transport(server, token=token, timeout=bounded)
     try:
         return transport.send(
             "GET" if payload is None else "POST", path, payload, headers
