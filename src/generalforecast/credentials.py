@@ -9,7 +9,6 @@ workspace, project, key id) always lives in that file. GF_API_KEY overrides
 everything for CI.
 """
 
-import json
 import os
 import shutil
 import subprocess
@@ -21,15 +20,14 @@ from pathlib import Path
 
 from generalforecast._files import private_lock, read_private, write_private
 from generalforecast.service.contracts import ServiceError
+from generalforecast.transport import DEFAULT_SERVER, profiles_in_use
 
-DEFAULT_SERVER = "https://app.generalforecast.com"
 KEYCHAIN_SERVICE = "generalforecast"
 ENV_KEY = "GF_API_KEY"
 # Credential values seen this process, redacted from every output.
 SEEN: set[str] = set()
 # The server and credential source the current command uses, for diagnostics.
 CONNECTION: dict[str, str] = {}
-PROFILE_FLAGS = ("url", "profile", "key_env", "base_url")
 # The largest credentials file read.
 _CREDENTIALS_LIMIT = 65536
 
@@ -40,19 +38,14 @@ def server_url(environ: dict[str, str] | None = None) -> str:
     return (env.get("GF_URL") or DEFAULT_SERVER).rstrip("/")
 
 
-def uses_profiles(args: object, environ: Mapping[str, str] | None = None) -> bool:
-    """Explicit endpoint flags, GF_PROFILE/GF_TOKEN or a saved default profile."""
-    env = os.environ if environ is None else environ
-    if any(getattr(args, flag, None) is not None for flag in PROFILE_FLAGS):
-        return True
-    if env.get("GF_PROFILE") or env.get("GF_TOKEN"):
-        return True
-    path = Path(env.get("GF_CONFIG_PATH") or config_dir(env) / "profiles.json")
-    try:
-        profiles = json.loads(path.expanduser().read_text())
-    except (OSError, ValueError):
-        return False
-    return isinstance(profiles, dict) and "default" in profiles
+def uses_profiles(
+    _args: object = None, environ: Mapping[str, str] | None = None
+) -> bool:
+    """Whether a profile, not the `gf login` store, configures the connection.
+
+    See `transport.profiles_in_use`; the CLI and the SDK resolve alike.
+    """
+    return profiles_in_use(environ=environ)
 
 
 def config_dir(environ: Mapping[str, str] | None = None) -> Path:

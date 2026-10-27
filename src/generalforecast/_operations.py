@@ -191,11 +191,31 @@ def decoded[T](decode: Callable[[Any], T], value: Any, what: str) -> T:
         ) from None
 
 
+# A key whose project is not configured is asked for it once, on a global
+# route; that request names a placeholder project, and the key decides.
+UNSCOPED = "local"
+KEY_SCOPE = Call("GET", "/auth/status", "workspace", "auth", global_route=True)
+
+
+def key_project(status: JsonObject) -> str:
+    """The project an `auth.status` reply says the key is scoped to."""
+    scoped = status.get("key")
+    project = scoped.get("project") if isinstance(scoped, dict) else None
+    if not isinstance(project, str):
+        raise InputError(
+            "ValidationError",
+            "this API key is scoped to no project",
+            param="project",
+            hint="set GF_PROJECT, or pass project=",
+        )
+    return name(project)
+
+
 class Context(Protocol):
     """What operations read from their client: the project, profile and handle types."""
 
     @property
-    def project(self) -> str: ...
+    def project(self) -> str | None: ...
 
     profile: Profile
     _hosted_predictor: Any
