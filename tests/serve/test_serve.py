@@ -10,6 +10,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -149,7 +150,13 @@ def test_serve_requires_its_key_and_keeps_the_api_errors(server):
     url, _ = server
     status, body = call(url, "/v1/projects/local/models")
     assert (status, body["error"]["message"]) == (401, "application bearer required")
-    status, body = call(url, "/v1/projects/local/models/other", key=KEY)
+    # An error keeps the envelope, with the request id the caller sent.
+    status, body = call(
+        url,
+        "/v1/projects/local/models/other",
+        key=KEY,
+        headers={"X-GF-Request-Id": "r-test"},
+    )
     assert (status, body["error"]["code"]) == (404, "NotFound")
     assert body["request_id"] == "r-test"
 
@@ -166,8 +173,12 @@ def adhoc_payload(**changes):
 
 
 def predict(url, payload):
+    # The ad hoc route's resource is the predictor `ad-hoc`, as the SDK names it.
     return call(
-        url, "/v1/projects/local/predict", envelope("predict", payload), key=KEY
+        url,
+        "/v1/projects/local/predict",
+        envelope("ad-hoc", payload, kind="predictor"),
+        key=KEY,
     )
 
 
@@ -253,6 +264,13 @@ def test_ctrl_c_stops_the_server_and_its_workers_quietly():
     stderr = process.stderr.read()
     assert "Traceback" not in stderr and "KeyboardInterrupt" not in stderr, stderr
     _assert_exited(workers)
+    # Each server removed its workers' socket directories as it stopped.
+    left = [
+        entry.name
+        for entry in Path(tempfile.gettempdir()).iterdir()
+        if any(entry.name.startswith(f"gf-{pid}-") for pid in workers)
+    ]
+    assert left == [], left
 
 
 @pytest.mark.slow
@@ -426,13 +444,14 @@ def test_snapshot_predictor_binds_once_and_answers_predictions(predictor_dir):
         assert result["context"]["rows"] == 4
         assert result["context"]["digest"] == "sha256:history"
         assert result["model"].startswith(f"{MODEL}@sha256:")
+        # The retired infer route is no route at all.
         status, body = call(
             url,
             "/v1/projects/local/models/churn/infer",
             envelope("churn", predictor_payload()),
             key=KEY,
         )
-        assert status == 422 and body["error"]["code"] == "ValidationError"
+        assert (status, body["error"]["code"]) == (404, "NotFound")
         for change, param in [
             ({"target": "z"}, "target"),
             ({"inputs": ["x", "w"]}, "inputs"),
