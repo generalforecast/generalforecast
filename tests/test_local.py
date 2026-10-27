@@ -371,7 +371,7 @@ def test_writes_after_a_fit_reembed_pages_without_compiling() -> None:
         features, targets = _clusters()
         rows.insert(np.arange(24), features[:24], targets[:24])
         rows.predict(NEAR_A)
-        client._worker.wait_warm()
+        client._worker.programs.wait()
         compiled.clear()
         # Rows that fill and split pages, then a change to rows of two pages.
         rows.insert(np.arange(24, 32), features[24:], targets[24:])
@@ -426,7 +426,7 @@ def test_steps_of_more_queries_after_a_decode_compile_no_decode() -> None:
         features, targets = _clusters()
         rows.insert(np.arange(32), features, targets)
         rows.predict(NEAR_A)
-        client._worker.wait_warm()
+        client._worker.programs.wait()
         compiled.clear()
         # As a step merging many callers' requests would decode.
         rows.predict(np.repeat(NEAR_A, 10, axis=0))
@@ -453,7 +453,7 @@ def test_a_new_number_of_queries_in_a_bucket_compiles_nothing() -> None:
         features, targets = _clusters()
         rows.insert(np.arange(32), features, targets)
         rows.predict(np.repeat(NEAR_A, 9, axis=0))
-        client._worker.wait_warm()
+        client._worker.programs.wait()
         compiled.clear()
         # Backtests ask a few more or fewer queries at each cutoff.
         rows.predict(np.repeat(NEAR_A, 11, axis=0))
@@ -481,7 +481,7 @@ def test_a_new_number_of_tables_in_a_step_compiles_nothing_per_state_leaf() -> N
         for rows in tables:
             rows.insert(np.arange(32), features, targets)
             rows.predict(NEAR_A)
-        client._worker.wait_warm()
+        client._worker.programs.wait()
         compiled.clear()
         # One step for three tables stacks their states and queries into
         # one call of each stage, for a number of items not seen before.
@@ -1271,7 +1271,7 @@ def test_small_tables_run_together_in_one_compiled_call() -> None:
     # Every table pads to 32 rows, so each stage runs once for all six.
     assert client.stats.calls == {"fit": 1, "embed": 1, "encode": 1, "decode": 1}
     # Warming compiles larger sizes once the worker is idle; let it finish.
-    client._worker.wait_warm()
+    client._worker.programs.wait()
     traces.clear()
     client.predict({name: NEAR_B for name in list(tables)[:5]})
     # Five tables pad to the same batch of eight as six, so nothing compiles again.
@@ -2427,7 +2427,7 @@ def test_a_page_written_once_embeds_its_row_with_a_warmed_program() -> None:
         features, targets = _clusters()
         rows.insert(np.arange(32), features, targets)
         rows.predict(NEAR_A)
-        client._worker.wait_warm()
+        client._worker.programs.wait()
         compiled.clear()
         # One row of the page changes, so the page embeds that row alone,
         # padded to the smallest bucket, which the warm compiled too.
@@ -2675,7 +2675,7 @@ def test_a_new_fused_shape_defers_its_table_until_its_program_is_ready() -> None
     predictions, failed = worker.run_apart(step)
     assert predictions == {} and failed == {}
     deferred = worker.deferred[0]
-    worker.wait_warm()
+    worker.programs.wait()
     assert announced == [[deferred]]
     predictions, failed = worker.run_apart(step)
     assert worker.deferred == {} and failed == {} and list(predictions) == [0]
@@ -2716,7 +2716,7 @@ def test_a_fused_shape_that_cannot_be_readied_beside_steps_compiles_in_its_step(
     predictions, failed = worker.run_apart(step)
     assert predictions == {} and failed == {}
     deferred = worker.deferred[0]
-    worker.wait_warm()
+    worker.programs.wait()
     # Announced all the same, so the server plans the table again, and the
     # step that takes it compiles its program itself.
     assert announced == [[deferred]]
@@ -2778,7 +2778,7 @@ def test_stacked_fused_units_compile_a_new_count_on_the_side() -> None:
         # The first call compiles stacks of one in the step, and the other
         # buckets on the side.
         assert len(compiled) == 1 and 1 in counts()
-        worker.wait_warm()
+        worker.programs.wait()
         assert counts() == set(FUSED_STACKS)
         together = worker.run(step([0, 1, 2]))
         again = worker.run(step([0, 1, 2]))
@@ -3197,3 +3197,20 @@ def test_public_tables_take_frames_and_answer_frames(monkeypatch) -> None:
         np.testing.assert_array_equal(scored["value"], scored["q_0.5"])
     finally:
         regressor.drop()
+
+
+def test_gated_local_clients_keep_their_tables_until_the_last_closes() -> None:
+    from generalforecast.native.remote import RemoteClient
+
+    first = generalforecast.LocalClient(allow_downloads=False)
+    second = first.gated(True)
+    first.create_table("kept", model="tests/tabicl-classifier", features=2, classes=2)
+    wired = first._wire("kept")
+    engine = RemoteClient(*first._engine.serve())
+
+    first.close()
+
+    assert second.tables() == ["kept"]
+    second.close()
+    assert wired not in engine.tables()
+    engine.close()

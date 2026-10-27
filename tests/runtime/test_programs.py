@@ -10,11 +10,12 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 
-from generalforecast.constants import RECORDED_KINDS
+from generalforecast.constants import RECORDED_PROGRAMS, RECORDED_SECONDS
 from generalforecast.runtime.programs import (
     Kind,
     Manifest,
     Programs,
+    Recorded,
     abstract,
     counts_up_to,
     ladder,
@@ -154,20 +155,51 @@ def test_manifests_keep_kinds_and_widths_for_later_processes(tmp_path) -> None:
     )
 
 
-def test_manifests_keep_only_the_latest_kinds(tmp_path) -> None:
+def test_manifests_keep_only_the_latest_used_programs(tmp_path) -> None:
     manifest = Manifest(tmp_path / "model.pickle")
     kinds = [
         Kind(("embed", None, 2, index), signature(()), signature(()))
-        for index in range(RECORDED_KINDS + 1)
+        for index in range(RECORDED_PROGRAMS + 1)
     ]
     for kind in kinds:
         manifest.add(kind, 1)
+    # A use moves a kind last, so it outlives those used before.
     manifest.add(kinds[1], 2)
 
-    recorded = manifest.read().kinds
-    assert len(recorded) == RECORDED_KINDS
-    assert kinds[0] not in recorded
-    assert list(recorded)[-1] == kinds[1]
+    recorded = manifest.read()
+    assert sum(recorded.programs(kind) for kind in recorded.kinds) <= RECORDED_PROGRAMS
+    assert kinds[0] not in recorded.kinds and kinds[2] not in recorded.kinds
+    assert list(recorded.kinds)[-1] == kinds[1]
+    assert recorded.by_use()[0] == (kinds[1], {1, 2})
+
+
+def test_manifests_forget_kinds_no_worker_used_for_a_while(tmp_path) -> None:
+    now = [0.0]
+    manifest = Manifest(tmp_path / "model.pickle", clock=lambda: now[0])
+    old, recent = (
+        Kind(("embed", None, 2, index), signature(()), signature(()))
+        for index in range(2)
+    )
+    manifest.add(old, 1)
+    now[0] = RECORDED_SECONDS / 2
+    manifest.add(recent, 1)
+    now[0] = RECORDED_SECONDS + 1
+    manifest.add(recent, 2)
+
+    assert list(manifest.read().kinds) == [recent]
+
+
+def test_a_manifest_an_older_version_wrote_reads_its_kinds(tmp_path) -> None:
+    import json
+
+    from generalforecast.runtime.programs import encoded
+
+    kind = Kind(("embed", None, 2, 0), signature(()), signature(()))
+    written = encoded(Recorded({kind: {1}}, {}))
+    del written["fields"]["used"]
+    (tmp_path / "model.pickle").write_text(json.dumps(written))
+
+    assert Manifest(tmp_path / "model.pickle").read().kinds == {kind: {1}}
 
 
 def test_an_unreadable_manifest_reads_as_empty(tmp_path) -> None:
@@ -329,3 +361,41 @@ def test_most_rows_is_a_signatures_longest_first_axis() -> None:
     table = (jnp.zeros((16384, 31)), jnp.zeros(16384, jnp.int32), 3)
     assert most_rows(signature(table)) == 16384
     assert most_rows(signature((jnp.float32(1),))) == 0
+
+
+def test_waiting_takes_in_the_compiles_ahead_a_compile_ahead_queues() -> None:
+    programs = Programs(None, lambda: False, clock=lambda: 1e9)
+    programs.quiet = 0.0
+    events: list[str] = []
+
+    def outer() -> None:
+        events.append("outer")
+        programs.later(lambda: events.append("inner"))
+
+    programs.later(outer)
+    programs.wait()
+
+    assert events == ["outer", "inner"]
+
+
+def test_a_drop_ends_the_compiles_ahead_a_dropped_one_queues() -> None:
+    now = [0.0]
+    programs = Programs(None, lambda: False, clock=lambda: now[0])
+    events: list[str] = []
+    queued = threading.Event()
+    release = threading.Event()
+
+    def outer() -> None:
+        programs.later(lambda: events.append("inner"))
+        queued.set()
+        assert release.wait(5)
+
+    programs.later(outer)
+    now[0] = programs.quiet
+    assert queued.wait(5)
+    threading.Timer(0.1, release.set).start()
+    programs.drop()
+    programs.wait()
+
+    # Queued under the dropped generation, the inner compile never runs.
+    assert events == []

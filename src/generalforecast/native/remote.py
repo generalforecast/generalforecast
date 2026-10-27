@@ -75,11 +75,13 @@ def _errors() -> Iterator[None]:
         raise PermissionError(str(error)) from error
 
 
-# How a server refuses a write adding a key it holds: gf-core's
-# `TableError::DuplicateKey`, which leaves the table unchanged. The key is a
-# number or digest, or the key as given, quoted, once named.
+# How a server refuses a write adding a key it holds, which leaves the table
+# unchanged: gf-core's `TableError::DuplicateKey` for a table of rows, and
+# `SeriesError::Taken` for a series' time. A key or series is a number or
+# digest, or as given, quoted, once named.
+_NAMED = r"(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|\S+)"
 _DUPLICATE = re.compile(
-    r"row key (?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|\S+) already exists"
+    rf"row key {_NAMED} already exists|series {_NAMED} already has time -?\d+"
 )
 
 

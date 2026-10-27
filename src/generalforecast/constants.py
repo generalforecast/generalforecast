@@ -95,6 +95,16 @@ WARM_QUIET = 0.5
 # Kinds of call a model's manifest keeps, the latest used last: each table
 # shape compiles about a kind per stage, so this keeps `COMPILED_SHAPES`'s.
 RECORDED_KINDS = 8 * COMPILED_SHAPES
+# Programs a model's manifest keeps, the least recently used going first: each
+# compiles at every later start, on a CPU about a third of a second, so the
+# programs of `COMPILED_SHAPES` shapes' usual stages and counts, no more.
+RECORDED_PROGRAMS = 4 * COMPILED_SHAPES
+# Seconds a recorded kind of call is kept without a worker using it: a table
+# shape or model no longer served stops costing later starts after a month.
+RECORDED_SECONDS = 30 * 24 * 3600
+# Programs of each model a worker compiles at start, the most recently used,
+# before it takes steps; it compiles the rest ahead while it serves.
+STARTED_PROGRAMS = 16
 
 # --- Paging ---
 

@@ -13,10 +13,12 @@ the `Retrieved` selection (how each query's context is drawn), `TimeOptions`
 from __future__ import annotations
 
 import abc
+import contextlib
 import datetime
 import json
 import math
-from collections.abc import Callable, Iterable, Mapping, Sequence
+import threading
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, Literal, Self, override
 
@@ -744,8 +746,10 @@ class Table(_Held[_NativeTable]):
             tuple(schema.inputs) if schema.inputs is not None else None
         )
         self._classes: list[Any] = []
-        # The least id a row inserted without the `id` role may take.
+        # The least id a row inserted without the `id` role may take, which
+        # one insert at a time moves on.
         self._next_id = 0
+        self._ids = threading.Lock()
 
     @classmethod
     @override
@@ -799,7 +803,8 @@ class Table(_Held[_NativeTable]):
             self._classes = list(described.labels or range(described.classes))
         # The rows it holds are as many as its least unused id at most; an
         # insert moves past the ids rows deleted before leave held.
-        self._next_id = described.rows
+        with self._ids:
+            self._next_id = described.rows
         self._attach(handle)
 
     @override
@@ -1041,11 +1046,15 @@ class Table(_Held[_NativeTable]):
     ) -> None:
         """Inserts rows without the `id` role under the next integers no row holds.
 
-        The ids follow those of the rows inserted through this table. One
-        attached to a table the engine held knows only how many rows it
-        holds, so its ids start there; rows deleted before leave later ids
-        held, which the engine refuses whole rather than overwrite, so the
-        ids move past them, each move twice the last, until they are free.
+        The ids follow those of the rows inserted through this table, one
+        insert at a time however many threads share it. One attached to a
+        table the engine held knows only how many rows it holds, so its ids
+        start there; rows deleted before, or inserted through another table
+        object, leave later ids held, which the engine refuses whole rather
+        than overwrite, so the ids move past them: by the rows inserted at
+        first, then each move twice the last, so they pass a held run in a
+        few tries and land at most twice its length past it.
+
         A router writes a partitioned table's partitions one after another,
         so a refusal there may follow rows already written, which ids moved
         on would write twice; such a table refuses the rows instead. A table
@@ -1067,26 +1076,27 @@ class Table(_Held[_NativeTable]):
                 hint="give the rows an id column with Schema(id=...)",
             )
         count = len(inputs)
-        move = max(count, self._next_id, 1)
-        while self._next_id + count <= _LAST_ID:
-            ids = np.arange(self._next_id, self._next_id + count, dtype=np.int64)
-            with boundary():
-                try:
-                    handle.insert(ids, inputs, targets, times)
-                except DuplicateKey as error:
-                    if self.ops.partitions > 1:
-                        raise InvalidInput(
-                            f"table {self.name} holds rows under the ids rows "
-                            f"without an id take ({error})",
-                            because="a partitioned table's partitions may have "
-                            "taken some of the rows before one refused them",
-                            hint="give the rows an id column with Schema(id=...)",
-                        ) from error
-                    self._next_id += move
-                    move *= 2
-                    continue
-            self._next_id += count
-            return
+        with self._ids:
+            move = max(count, 1)
+            while self._next_id + count <= _LAST_ID:
+                ids = np.arange(self._next_id, self._next_id + count, dtype=np.int64)
+                with boundary():
+                    try:
+                        handle.insert(ids, inputs, targets, times)
+                    except DuplicateKey as error:
+                        if self.ops.partitions > 1:
+                            raise InvalidInput(
+                                f"table {self.name} holds rows under the ids rows "
+                                f"without an id take ({error})",
+                                because="a partitioned table's partitions may have "
+                                "taken some of the rows before one refused them",
+                                hint="give the rows an id column with Schema(id=...)",
+                            ) from error
+                        self._next_id += move
+                        move *= 2
+                        continue
+                self._next_id += count
+                return
         raise InvalidInput(
             f"table {self.name} has no free run of {count:,} row ids left",
             hint="give the rows an id column with Schema(id=...)",
@@ -1128,7 +1138,8 @@ class Table(_Held[_NativeTable]):
         if self._table is not None:
             with boundary():
                 self._table.truncate()
-        self._next_id = 0
+        with self._ids:
+            self._next_id = 0
 
     def refit(self) -> None:
         """Fits the model's state again on the rows now in the table."""
@@ -1196,7 +1207,8 @@ class Table(_Held[_NativeTable]):
     @override
     def drop(self) -> None:
         super().drop()
-        self._next_id = 0
+        with self._ids:
+            self._next_id = 0
 
 
 # The most an id of a row inserted without the `id` role reaches: ids are int64.
@@ -1464,26 +1476,77 @@ class SeriesTable(_Held[_NativeSeriesTable]):
         """Forecasts the future rows: a time grid with known covariates.
 
         Rows carry the series and time columns, and the known covariates'
-        future values; their target may be left out, as it is not known yet.
-        Those rows are inserted ahead of the series, unobserved, so the
-        forecast reads the known covariates over its horizon, and stay in the
-        table until observations at their times replace them. The forecast
-        covers the steps the rows span.
+        future values; their target may be left out, or empty, as it is not
+        known yet. The forecast covers the steps the rows span.
+
+        A table with known covariates reads their future from its own rows,
+        so the future rows are written for the forecast, unobserved, and
+        taken out again once it answers, or fails: a prediction leaves the
+        table as it found it. They are inserted, never upserted, so a future
+        row at a time a series holds is refused rather than replacing what
+        the table holds there.
+
+        Raises:
+            InvalidInput: If a future row gives a time its series holds a
+                row at already.
         """
-        table = tabular.frame(rows)
         schema = self.schema
+        table = tabular.frame(_pending_target(rows, schema.target))
         handle = self._ready()
-        if schema.known:
-            self.insert(_unobserved(table, schema.target))
         keys_column = _column(table, schema.series[0], "series")
         keys = list(dict.fromkeys(keys_column.to_pylist()))
         counts = {key: 0 for key in keys}
         for key in keys_column.to_pylist():
             counts[key] += 1
         horizon = max(counts.values())
-        with boundary():
+        with self._future(handle, keys, table if schema.known else None), boundary():
             outputs = handle.forecast(keys, horizon, as_of, quantiles=self.quantiles)
         return self._result(keys, np.asarray(outputs))
+
+    @contextlib.contextmanager
+    def _future(
+        self, handle: _NativeSeriesTable, series: Sequence[Any], rows: pa.Table | None
+    ) -> Iterator[None]:
+        """Holds future rows of `series` in the table, unobserved, for the block alone; nothing for None.
+
+        A series the table does not hold is refused before anything is
+        written: the server keeps the key of every series a row was written
+        for, so one written for a typo would stay among the series every
+        forecast reads.
+
+        Raises:
+            InvalidInput: If a series is one the table does not hold, or a
+                row gives a time its series holds a row at.
+        """
+        if rows is None or len(rows) == 0:
+            yield
+            return
+        with boundary():
+            held = set(handle.known_series())
+        unknown = [key for key in series if key not in held]
+        if unknown:
+            raise InvalidInput(
+                f"table {self.name} holds no series {', '.join(map(repr, unknown))}",
+                param=self.schema.series[0],
+                hint="predict the series the table holds observations of",
+            )
+        future = _unobserved(rows, self.schema.target)
+        with boundary():
+            try:
+                handle.insert(future)
+            except DuplicateKey as error:
+                raise InvalidInput(
+                    f"table {self.name} holds a row at a time the future rows "
+                    f"give ({error})",
+                    because="future rows are written beside the observations "
+                    "for the forecast alone, and never replace one",
+                    hint="give only times after each series' latest observation",
+                ) from error
+        try:
+            yield
+        finally:
+            with boundary():
+                handle.delete(future, missing_ok=True)
 
     def _all_series(self, handle: _NativeSeriesTable) -> list[Any]:
         with boundary():
@@ -1513,10 +1576,13 @@ class SeriesTable(_Held[_NativeSeriesTable]):
 
 
 def _unobserved(table: pa.Table, target: str) -> pa.Table:
-    """Future rows with an unobserved target where they carry none."""
-    if target in table.column_names:
-        return table
-    return table.append_column(target, pa.nulls(len(table), pa.float64()))
+    """Future rows with an unobserved target where they carry none, or only nulls of no type."""
+    if target not in table.column_names:
+        return table.append_column(target, pa.nulls(len(table), pa.float64()))
+    if pa.types.is_null(table.schema.field(target).type):
+        index = table.column_names.index(target)
+        return table.set_column(index, target, pa.nulls(len(table), pa.float64()))
+    return table
 
 
 def _series_schema_of(definition: SeriesDefinition) -> SeriesSchema:

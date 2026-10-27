@@ -49,16 +49,20 @@ const DEFER: u8 = 5;
 const DEFER_EARLY: u8 = 6;
 
 /// Answers every frame the shard sends, in order; steps as `behaviour` says.
-/// Each step's units' actions go to `actions`, in the order sent.
+/// Each step's units' actions go to `actions`, in the order sent. Models load
+/// beside the steps, as the worker loads them: `AddModel` is answered at
+/// once, and the model reported loaded later.
 fn fake_worker(
-    mut stream: UnixStream,
+    stream: UnixStream,
     behaviour: Arc<AtomicU8>,
     held: Arc<Notify>,
     actions: Arc<std::sync::Mutex<Vec<String>>>,
 ) {
+    let (mut reader, writer) = stream.into_split();
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
     tokio::spawn(async move {
         let mut deferred_once: HashSet<u64> = HashSet::new();
-        while let Ok(frame) = Frame::read_from(&mut stream).await {
+        while let Ok(frame) = Frame::read_from(&mut reader).await {
             let reply = if frame.kind() == "step" {
                 actions.lock().unwrap().extend(
                     frame.header["units"]
@@ -81,18 +85,21 @@ fn fake_worker(
                         } else {
                             let keys = tables.iter().map(|table| format!("k{table}")).collect();
                             let compiled = WorkerReply::Compiled { keys }.frame();
-                            if mode == DEFER_EARLY && compiled.write_to(&mut stream).await.is_err()
+                            if mode == DEFER_EARLY
+                                && compiled.write_to(&mut *writer.lock().await).await.is_err()
                             {
                                 return;
                             }
                             if deferring(&frame.header, &tables)
-                                .write_to(&mut stream)
+                                .write_to(&mut *writer.lock().await)
                                 .await
                                 .is_err()
                             {
                                 return;
                             }
-                            if mode == DEFER && compiled.write_to(&mut stream).await.is_err() {
+                            if mode == DEFER
+                                && compiled.write_to(&mut *writer.lock().await).await.is_err()
+                            {
                                 return;
                             }
                             continue;
@@ -111,7 +118,12 @@ fn fake_worker(
                                 done: None,
                                 total: None,
                             };
-                            if progress.frame().write_to(&mut stream).await.is_err() {
+                            if progress
+                                .frame()
+                                .write_to(&mut *writer.lock().await)
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -197,24 +209,22 @@ fn fake_worker(
                         message: "ValueError: seven classes".to_string(),
                     }
                     .frame(),
-                    // The fake worker loads model "slow" once released, and
-                    // never answers loading model "stuck".
-                    WorkerRequest::Controls { requests }
-                        if matches!(
-                            requests.as_slice(),
-                            [WorkerRequest::AddModel { name, .. }] if name == "slow"
-                        ) =>
-                    {
-                        held.notified().await;
-                        WorkerReply::Ok.frame()
-                    }
-                    WorkerRequest::Controls { requests }
-                        if matches!(
-                            requests.as_slice(),
-                            [WorkerRequest::AddModel { name, .. }] if name == "stuck"
-                        ) =>
-                    {
-                        continue;
+                    // The fake worker never answers loading model "stuck",
+                    // loads "slow" once released and refuses "broken", each
+                    // beside its steps once it answered.
+                    WorkerRequest::AddModel { name, .. } if name == "stuck" => continue,
+                    WorkerRequest::AddModel { name, .. } => {
+                        let (writer, held) = (writer.clone(), held.clone());
+                        tokio::spawn(async move {
+                            if name == "slow" {
+                                held.notified().await;
+                            }
+                            let failure =
+                                (name == "broken").then(|| "OSError: no weights".to_string());
+                            let loaded = WorkerReply::Loaded { name, failure }.frame();
+                            let _ = loaded.write_to(&mut *writer.lock().await).await;
+                        });
+                        WorkerReply::Loading.frame()
                     }
                     // The fake worker compiles three recorded programs as it
                     // starts, reporting progress after each.
@@ -224,7 +234,12 @@ fn fake_worker(
                                 done: None,
                                 total: None,
                             };
-                            if progress.frame().write_to(&mut stream).await.is_err() {
+                            if progress
+                                .frame()
+                                .write_to(&mut *writer.lock().await)
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -238,7 +253,7 @@ fn fake_worker(
                     _ => WorkerReply::Ok.frame(),
                 }
             };
-            if reply.write_to(&mut stream).await.is_err() {
+            if reply.write_to(&mut *writer.lock().await).await.is_err() {
                 break;
             }
         }
@@ -1050,6 +1065,58 @@ async fn a_worker_that_hangs_loading_a_model_is_started_again_and_the_load_fails
     );
     assert_eq!(shard.metrics.workers_down.get(), 1);
     assert!(!shard.models().await.contains(&"stuck".to_string()));
+}
+
+#[tokio::test]
+async fn steps_for_served_models_run_while_another_model_loads() {
+    let mut settings = settings();
+    settings.step_timeout = Duration::from_millis(200);
+    let shard = shard(settings).await;
+    shard.create(3).await.unwrap();
+    shard.insert(&[1, 2, 3, 4]).await;
+    let loading = tokio::spawn(shard.add_model("slow"));
+
+    // The worker acknowledged the load and loads it beside its steps: the
+    // served model's queries answer, and the load, past the step timeout,
+    // is no hang.
+    let predicted = tokio::time::timeout(Duration::from_secs(5), shard.predict()).await;
+    assert!(predicted.expect("answered while the model loads").is_ok());
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(!loading.is_finished());
+    assert_eq!(shard.metrics.workers_down.get(), 0);
+
+    shard.held.notify_one();
+    let loaded = tokio::time::timeout(Duration::from_secs(5), loading).await;
+    assert_eq!(loaded.expect("loaded").unwrap(), Ok(()));
+    assert!(shard.models().await.contains(&"slow".to_string()));
+}
+
+#[tokio::test]
+async fn a_model_the_worker_cannot_load_fails_with_its_reason() {
+    let shard = shard(settings()).await;
+
+    let failed = tokio::time::timeout(Duration::from_secs(5), shard.add_model("broken")).await;
+
+    assert_eq!(failed.expect("answered"), Err(Code::InvalidArgument));
+    assert!(!shard.models().await.contains(&"broken".to_string()));
+}
+
+#[tokio::test]
+async fn a_load_under_way_fails_when_the_worker_starts_again() {
+    let mut settings = settings();
+    settings.step_timeout = Duration::from_millis(200);
+    let shard = shard(settings).await;
+    shard.create(3).await.unwrap();
+    shard.insert(&[1, 2, 3, 4]).await;
+    let loading = tokio::spawn(shard.add_model("slow"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    shard.behaviour.store(HANG, Ordering::Relaxed);
+
+    let _ = tokio::time::timeout(Duration::from_secs(10), shard.predict()).await;
+    let failed = tokio::time::timeout(Duration::from_secs(5), loading).await;
+
+    assert_eq!(failed.expect("answered").unwrap(), Err(Code::Internal));
+    assert_eq!(shard.metrics.workers_down.get(), 1);
 }
 
 #[tokio::test]

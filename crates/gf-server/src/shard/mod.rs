@@ -892,8 +892,11 @@ pub struct ShardSettings {
 enum Event {
     /// The worker compiled programs that steps deferred tables for.
     Compiled,
-    /// The worker's answer to the oldest model it was told to load.
+    /// The worker's answer to the oldest model it was told to load, which
+    /// it loads beside its steps once it acknowledged it.
     Added(worker::Reply),
+    /// The worker reported models it loaded beside its steps.
+    Loaded,
     Command(Option<Box<Command>>),
     /// A log rewritten in the background, ready to install.
     Compacted(Box<Finished>),
@@ -1144,10 +1147,14 @@ impl Shard {
             let deadline = self.deadline();
             let expiry = self.ephemeral.expiry();
             let next = self.in_flight.front_mut().map(|step| &mut step.reply);
-            let adding = self.adding.front_mut().map(|adding| &mut adding.reply);
             let up = self.down.is_none();
             let stopped = self.worker.pipeline.stopped();
             let compiled = self.worker.pipeline.compiled();
+            let loaded = self.worker.pipeline.loaded();
+            let adding = self
+                .adding
+                .iter_mut()
+                .find_map(|adding| adding.reply.as_mut());
             let retry = self
                 .down
                 .as_ref()
@@ -1167,6 +1174,7 @@ impl Shard {
                 }
                 () = stopped, if up => Event::Stopped,
                 () = compiled, if up => Event::Compiled,
+                () = loaded, if up => Event::Loaded,
                 () = tokio::time::sleep_until(deadline.unwrap_or_else(Instant::now)),
                     if deadline.is_some() => Event::Hung,
                 command = commands.recv() => Event::Command(command.map(Box::new)),
@@ -1195,7 +1203,8 @@ impl Shard {
                 Event::Stopped | Event::Hung if self.stopping => break,
                 Event::Compacted(finished) => self.finish_compaction(*finished).await,
                 Event::Reply(reply) => self.finish(reply).await,
-                Event::Added(answer) => self.added(answer),
+                Event::Added(answer) => self.acknowledged(answer),
+                Event::Loaded => self.loaded(),
                 Event::Stopped => self.restart("the worker stopped").await,
                 Event::Hung if self.overdue() => self.restart(&self.hung()).await,
                 // The worker reported progress since the deadline was set.

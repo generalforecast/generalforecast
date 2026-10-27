@@ -501,28 +501,74 @@ def test_tables_made_under_one_download_gate_open_under_the_other(catalog) -> No
         table.drop()
 
 
-def test_series_predict_takes_future_rows_without_the_target(catalog) -> None:
+def _future_table(name: str) -> engine.SeriesTable:
     schema = engine.SeriesSchema(
         target="units", time="t", series="item", frequency=1, known=["price"]
     )
-    table = engine.SeriesTable(
-        "future",
+    return engine.SeriesTable(
+        name,
         model="general-forecast/chronos-2",
         schema=schema,
         horizon=3,
         download=False,
     )
+
+
+def test_series_predict_takes_future_rows_without_the_target(catalog) -> None:
+    table = _future_table("future")
     try:
         table.insert(_observations("shoes", 0, 1))
+        before = table.forecast()
         future = pd.DataFrame({"item": ["shoes"] * 3, "t": [20, 21, 22], "price": 3.0})
         forecast = table.predict(future)
         assert forecast["item"].tolist() == ["shoes"] * 3
         assert forecast["step"].tolist() == [1, 2, 3]
         assert np.isfinite(forecast["value"]).all()
-        # The future rows wait unobserved for the observations that replace them.
-        assert len(table) == 23
-        table.insert(_observations("shoes", 20, 2).head(1))
-        assert len(table) == 23
+        # A target of nulls with no type reads as unobserved too.
+        pd.testing.assert_frame_equal(
+            table.predict(future.assign(units=None)), forecast
+        )
+        # The future rows serve the prediction alone: the table is as it was.
+        assert len(table) == 20
+        pd.testing.assert_frame_equal(table.forecast(), before)
+        pd.testing.assert_frame_equal(table.predict(future), forecast)
+    finally:
+        table.drop()
+
+
+def test_series_predict_never_replaces_an_observation(catalog) -> None:
+    table = _future_table("observed")
+    try:
+        table.insert(_observations("shoes", 0, 1))
+        before = table.forecast()
+        overlapping = pd.DataFrame(
+            {"item": ["shoes"] * 3, "t": [19, 20, 21], "price": 3.0}
+        )
+
+        with pytest.raises(InvalidInput, match="holds a row at a time") as caught:
+            table.predict(overlapping)
+
+        assert (
+            caught.value.hint == "give only times after each series' latest observation"
+        )
+        assert len(table) == 20
+        pd.testing.assert_frame_equal(table.forecast(), before)
+    finally:
+        table.drop()
+
+
+def test_a_failed_series_predict_leaves_the_table_as_it_was(catalog) -> None:
+    table = _future_table("unknown")
+    try:
+        table.insert(_observations("shoes", 0, 1))
+        before = table.forecast()
+        unknown = pd.DataFrame({"item": ["boots"] * 3, "t": [20, 21, 22], "price": 3.0})
+
+        with pytest.raises(InvalidInput, match="holds no series 'boots'"):
+            table.predict(unknown)
+
+        assert len(table) == 20
+        pd.testing.assert_frame_equal(table.forecast(), before)
     finally:
         table.drop()
 
@@ -688,6 +734,61 @@ def test_rows_without_ids_refuse_a_collision_on_a_partitioned_table() -> None:
     # Ids moved on would write again the rows earlier partitions took.
     assert handle.inserted == 1
     assert caught.value.hint == "give the rows an id column with Schema(id=...)"
+
+
+def test_threads_sharing_a_table_insert_rows_without_ids_in_turn(catalog) -> None:
+    import threading
+
+    table = engine.Table(
+        "threads",
+        model="general-forecast/tabicl-v2-classifier",
+        target="y",
+        download=False,
+    )
+    try:
+        table.insert(_unkeyed(10, seed=0))
+        errors: list[BaseException] = []
+
+        def insert(seed: int) -> None:
+            try:
+                for offset in range(10):
+                    table.insert(_unkeyed(3, seed=seed + offset))
+            except BaseException as error:  # noqa: BLE001
+                errors.append(error)
+
+        threads = [threading.Thread(target=insert, args=(seed,)) for seed in (1, 50)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert errors == []
+        assert len(table) == 70
+        assert table._next_id == 70
+    finally:
+        table.drop()
+
+
+def test_writers_on_one_table_move_their_ids_past_each_other_closely(catalog) -> None:
+    table = engine.Table(
+        "writers",
+        model="general-forecast/tabicl-v2-classifier",
+        target="y",
+        download=False,
+    )
+    try:
+        table.insert(_unkeyed(10, seed=0))
+        first = engine.Table.open("writers", download=False)
+        second = engine.Table.open("writers", download=False)
+        for index in range(100):
+            (first if index % 2 else second).insert(_unkeyed(1, seed=index))
+
+        assert len(table) == 110
+        # Each collision moves by the rows inserted, doubling only within one
+        # insert, so ids stay near the rows the table holds.
+        assert max(first._next_id, second._next_id) < 2 * len(table)
+    finally:
+        table.drop()
 
 
 def test_rows_without_ids_are_refused_on_a_routed_table() -> None:
