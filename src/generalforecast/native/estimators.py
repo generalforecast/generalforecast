@@ -43,7 +43,6 @@ from generalforecast.native.sklearn_shim import (
     NotFittedError,
     RegressorMixin,
     public,
-    require_sklearn,
     type_of_target,
     validate_data,
 )
@@ -239,7 +238,6 @@ class _Estimator(BaseEstimator):
         backend: Any = None,
         download: bool = True,
     ) -> None:
-        require_sklearn()
         if isinstance(model, str) and client is None:
             model = registry.canonical(model)
         self.model = model

@@ -591,17 +591,7 @@ def test_local_predictors_read_the_manifest_and_split_the_snapshot(
     assert caught.value.message == "gf.yaml has no `target`"
 
 
-def test_estimators_use_canonical_ids_and_the_sklearn_hint(monkeypatch) -> None:
-    from generalforecast.native import sklearn_shim
-
-    monkeypatch.setattr(sklearn_shim, "MISSING", ImportError("no sklearn"))
-    with pytest.raises(gf.InvalidInput) as caught:
-        gf.Classifier()
-    assert str(caught.value) == (
-        "error: the estimators need scikit-learn, which is not installed\n"
-        '  hint: pip install "generalforecast[sklearn]"'
-    )
-    monkeypatch.setattr(sklearn_shim, "MISSING", None)
+def test_estimators_use_canonical_ids(monkeypatch) -> None:
     with pytest.raises(gf.InvalidInput) as caught:
         gf.Regressor("tabicl-regressor")
     assert caught.value.message == (

@@ -27,7 +27,6 @@ from generalforecast.native.sklearn_shim import (
     NotFittedError,
     RegressorMixin,
     public,
-    require_sklearn,
 )
 from generalforecast.predictors import frequency as _frequency
 from generalforecast.predictors.models import describe, for_task
@@ -87,7 +86,6 @@ class Forecaster(RegressorMixin, BaseEstimator):
         download: bool = True,
     ) -> None:
         """Stores cloneable settings; local checkpoints are cache-only by default."""
-        require_sklearn()
         self.model = _forecaster_model(model, download)
         self.target = target
         self.time = time

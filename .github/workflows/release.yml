@@ -101,7 +101,7 @@ jobs:
       # The README's example, end to end on the wheel's own engine.
       - name: Fit and predict with the wheel
         run: |
-          uv pip install --python smoke/bin/python "$(ls dist/*.whl)[sklearn]"
+          uv pip install --python smoke/bin/python "$(ls dist/*.whl)"
           smoke/bin/python scripts/readme_example.py
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -180,7 +180,7 @@ jobs:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           uv venv --python 3.12 compiled
-          uv pip install --python compiled/bin/python "$(ls dist/*.whl)[sklearn]"
+          uv pip install --python compiled/bin/python "$(ls dist/*.whl)"
           compiled/bin/python -m generalforecast.runtime.shipped bundles
       - if: startsWith(github.ref, 'refs/tags/v') && hashFiles('bundles/**') != ''
         name: Upload the bundles

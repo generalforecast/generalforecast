@@ -6,8 +6,7 @@
 Exports `Predictor`, the estimators `Classifier`, `Regressor` and
 `Forecaster`, the hosted `Client` and `AsyncClient`, the error classes, and
 the `engine`, `errors` and `predictors` submodules.
-Everything loads on first use, so `import generalforecast` stays cheap and
-never needs the optional sklearn extra.
+Everything loads on first use, so `import generalforecast` stays cheap.
 """
 
 import importlib
