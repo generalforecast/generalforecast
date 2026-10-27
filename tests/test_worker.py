@@ -154,3 +154,34 @@ def test_dropping_every_program_forgets_the_counts_each_kind_compiled_for() -> N
 
     assert not any(worker._chunks._counts.values())
     assert list(worker.run(step([0]))) == [0]
+
+
+def test_a_drop_ends_the_page_embeds_a_table_has_not_compiled_yet() -> None:
+    import time
+
+    worker = Worker(slot_bytes=4096)
+    data, step = _fused(worker, 1)
+    worker.run(step([0]))
+    table = worker._tables[0]
+    features = np.asarray(data.features)[:16]
+    targets = np.asarray(data.targets)[:16]
+    compiled: list[str] = []
+
+    def compile_event(event: str, duration_secs: float, **details: Any) -> None:
+        if event == "/jax/core/compile/backend_compile_duration":
+            compiled.append(details.get("fun_name", ""))
+
+    # No quiet gap comes, so every queued compile waits.
+    worker.programs.quiet = 3600.0
+    jax.config.update("jax_enable_compilation_cache", False)
+    jax.monitoring.register_event_duration_secs_listener(compile_event)
+    try:
+        worker._compile_embeds(0, table.num_classes, (table.state, features, targets))
+        assert compiled == []
+        started = time.perf_counter()
+        worker.programs.drop()
+        assert time.perf_counter() - started < 5
+    finally:
+        jax.monitoring.unregister_event_duration_listener(compile_event)
+        jax.config.update("jax_enable_compilation_cache", True)
+    assert compiled == []

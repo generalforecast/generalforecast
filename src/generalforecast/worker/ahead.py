@@ -250,32 +250,34 @@ class Ahead:
     def _compile_embeds(
         self: "Worker", model: int, num_classes: int, arguments: tuple
     ) -> None:
-        """Compiles page embeds for each row bucket up to the page size and the first `WARMED_PAGES` page counts, without running one.
+        """Queues page embeds to compile for each row bucket up to the page size and the first `WARMED_PAGES` page counts, without running one.
 
         A page with sources embeds only its own rows, padded to their bucket,
         so a step meets the buckets below the page size too. Compiling from
         shapes alone leaves the device to the step thread, so a warm never
-        runs beside a step.
+        runs beside a step. Each program compiles in a task of its own, so a
+        drop of every program ends those not compiled yet.
         """
         key = ("embed", model, num_classes, _signature(arguments))
         estimate = self._estimate("embed", model, num_classes, arguments)
         size = self._chunks.size(key, self._call_bytes, estimate)
         compiled = self._compiled_stage("embed", model, num_classes, len(arguments))
+        parameters = self._models[model].parameters
         state, features, targets = arguments
         page = len(features)
         below = [
             rows for rows in ladder(self._minimum, page.bit_length()) if rows < page
         ]
+        counts = sorted(
+            {bucket_size(min(items, size), 1) for items in ladder(1, WARMED_PAGES)}
+        )
         for rows in [*below, page]:
             sliced = (state, features[:rows], targets[:rows])
-            for items in ladder(1, WARMED_PAGES):
-                count = bucket_size(min(items, size), 1)
+            for count in counts:
                 stacked = jax.tree.map(
                     lambda value, count=count: _stacked_shape(value, count), sliced
                 )
-                jitted = cast(jax.stages.Wrapped, compiled)
-                arguments = (self._models[model].parameters, *stacked)
-                note_compiled(jitted, arguments, jitted.lower(*arguments).compile())
+                self.programs.compile_later(compiled, parameters, *stacked)
 
     def _warmed_queries(self: "Worker") -> list[int]:
         """Padded query counts compiled ahead: `WARMED_QUERIES` buckets above the smallest."""
