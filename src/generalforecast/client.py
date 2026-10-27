@@ -17,6 +17,7 @@ from generalforecast._operations import (
     WORKSPACE_ACTIONS,
     Call,
     Operation,
+    PartialWrite,
     Pause,
     Work,
     workspace_request,
@@ -45,7 +46,7 @@ from generalforecast.service.sdk import (
 )
 from generalforecast.transport import Profile, Transport, connection
 
-__all__ = ["WORKSPACE_ACTIONS", "Client", "workspace_request"]
+__all__ = ["WORKSPACE_ACTIONS", "Client", "PartialWrite", "workspace_request"]
 
 
 class Client:
@@ -272,7 +273,12 @@ class Contexts(Collection):
     def append(
         self, context: str, data: Any, *, id: str, idempotency_key: str
     ) -> WriteReceipt:
-        """Appends rows under a durable write id."""
+        """Appends rows under a durable write id.
+
+        More rows than one call takes go in chunks, each under a write id
+        derived from `idempotency_key`; a chunk that fails after others were
+        accepted raises `PartialWrite`, and retrying with the same key resumes.
+        """
         return self.client._run(
             ops.context_append(context, data, id=id, idempotency_key=idempotency_key)
         )
@@ -280,7 +286,10 @@ class Contexts(Collection):
     def label(
         self, context: str, data: Any, *, id: str, column: str, idempotency_key: str
     ) -> WriteReceipt:
-        """Attaches one target's values to rows already in the context."""
+        """Attaches one target's values to rows already in the context.
+
+        Chunked as `append` is, with the same `PartialWrite` on a failure.
+        """
         return self.client._run(
             ops.context_label(
                 context, data, id=id, column=column, idempotency_key=idempotency_key

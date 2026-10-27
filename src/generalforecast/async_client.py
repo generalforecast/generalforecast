@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Self
 
 from generalforecast import _operations as ops
-from generalforecast._operations import Call, Operation, Pause, Work
+from generalforecast._operations import Call, Operation, PartialWrite, Pause, Work
 from generalforecast.contracts import (
     ContextImportRef,
     Environment,
@@ -43,7 +43,7 @@ from generalforecast.service.sdk import (
 )
 from generalforecast.transport import AsyncTransport, Profile, connection
 
-__all__ = ["AsyncClient", "AsyncHostedPredictor", "AsyncLiveContext"]
+__all__ = ["AsyncClient", "AsyncHostedPredictor", "AsyncLiveContext", "PartialWrite"]
 
 
 @dataclass(frozen=True, eq=False)
@@ -332,7 +332,12 @@ class Contexts(Collection):
     async def append(
         self, context: str, data: Any, *, id: str, idempotency_key: str
     ) -> WriteReceipt:
-        """Appends rows under a durable write id."""
+        """Appends rows under a durable write id.
+
+        More rows than one call takes go in chunks, each under a write id
+        derived from `idempotency_key`; a chunk that fails after others were
+        accepted raises `PartialWrite`, and retrying with the same key resumes.
+        """
         return await self.client._run(
             ops.context_append(context, data, id=id, idempotency_key=idempotency_key)
         )
@@ -340,7 +345,10 @@ class Contexts(Collection):
     async def label(
         self, context: str, data: Any, *, id: str, column: str, idempotency_key: str
     ) -> WriteReceipt:
-        """Attaches one target's values to rows already in the context."""
+        """Attaches one target's values to rows already in the context.
+
+        Chunked as `append` is, with the same `PartialWrite` on a failure.
+        """
         return await self.client._run(
             ops.context_label(
                 context, data, id=id, column=column, idempotency_key=idempotency_key

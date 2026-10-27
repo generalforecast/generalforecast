@@ -120,19 +120,27 @@ def _toml(value: object) -> str:
 
 
 def configuration(
-    directory: Path, address: str, timeout: float, models: list[dict]
+    directory: Path,
+    address: str,
+    timeout: float,
+    models: list[dict],
+    *,
+    metrics: str | None = None,
 ) -> str:
     """gf-server's configuration for the models served on this machine.
 
     Flight listens on loopback under a random token nothing else holds.
     Request contexts live in ephemeral tables; the data directory holds only
     a snapshot predictor's table, bound once at startup. Keys are the bearer
-    key in `GF_API_KEY`.
+    key in `GF_API_KEY`. With `metrics`, a `host:port`, gf-server also serves
+    `/metrics`, `/healthz` and `/readyz` there once its workers start; they
+    take no token, so it belongs on loopback or a private network.
     """
     command = [sys.executable, "-m", "generalforecast.worker_process"]
     return "\n".join(
         [
             'listen = "127.0.0.1:0"',
+            *([] if metrics is None else [f"metrics_listen = {_toml(metrics)}"]),
             f"data = {_toml(str(directory / 'data'))}",
             f"tokens = [{_toml(secrets.token_hex(32))}]",
             'encryption_key_env = "GF_LOG_KEY"',

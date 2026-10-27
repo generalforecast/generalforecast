@@ -22,6 +22,7 @@ import pyarrow.compute as _compute
 import pyarrow.json as arrow_json
 from pyarrow import csv, parquet
 
+from generalforecast import ipc
 from generalforecast.predictors.validation import PredictorError, bytes_digest, ensure
 
 PHYSICAL_TYPES = frozenset(
@@ -72,6 +73,41 @@ def _batch_table(
         )
         accepted.append(batch)
     return pa.Table.from_batches(accepted, schema=schema)
+
+
+def _expanded_nbytes(table: pa.Table) -> int:
+    """The table's bytes once each dictionary column is replaced by its values.
+
+    A few bytes of dictionary can stand for any amount of data, so each index
+    is costed at its value's length. Only the lengths are gathered, at four
+    bytes a row; no value is copied.
+    """
+    total = 0
+    for field, column in zip(table.schema, table.columns, strict=True):
+        kind = field.type
+        if not pa.types.is_dictionary(kind):
+            total += column.nbytes
+            continue
+        values = kind.value_type
+        if pa.types.is_string(values) or pa.types.is_binary(values):
+            offsets = 4
+        elif pa.types.is_large_string(values) or pa.types.is_large_binary(values):
+            offsets = 8
+        else:
+            offsets = 0
+        for chunk in column.chunks:
+            total += (len(chunk) + 7) // 8
+            if offsets:
+                lengths = pc.take(pc.binary_length(chunk.dictionary), chunk.indices)
+                total += (pc.sum(lengths).as_py() or 0) + offsets * (len(chunk) + 1)
+                continue
+            try:
+                total += (len(chunk) * values.bit_width + 7) // 8
+            except ValueError:
+                # Nested values are refused by `physical_type` before any
+                # expansion; count what is held.
+                total += chunk.nbytes
+    return total
 
 
 def _json_records(data: bytes, *, max_rows: int) -> list[dict[str, Any]]:
@@ -251,7 +287,7 @@ def to_arrow(
                 "UnsupportedFormat", "expected Arrow, pandas, Polars, NumPy or records"
             )
         ensure(
-            table.num_rows <= max_rows and table.nbytes <= max_bytes,
+            table.num_rows <= max_rows and _expanded_nbytes(table) <= max_bytes,
             "table exceeds row or byte limit",
             "CapacityExceeded",
         )
@@ -294,8 +330,10 @@ def read_table(
 ) -> pa.Table:
     """Parses local bytes with incremental row and decoded-byte checks.
 
-    A single Arrow batch (or JSON record) can still allocate before its size is
-    checked. This is a budget, not isolation of the underlying decoder.
+    Arrow IPC is bounded from its metadata before anything is decompressed,
+    and Parquet from its row-group sizes. A single CSV block or JSON record can
+    still allocate before its size is checked: this is a budget, not isolation
+    of the underlying decoder.
     """
     _limits(max_rows, max_bytes)
     ensure(len(data) <= max_bytes, "source exceeds byte limit", "CapacityExceeded")
@@ -342,18 +380,22 @@ def read_table(
                     "Feather V1 cannot be read in bounded batches",
                     "UnsupportedFormat",
                 )
-            try:
-                source = pa.ipc.open_stream(stream) if format != "feather" else None
-            except pa.ArrowInvalid:
-                source = None
-            if source is not None:
-                batches = iter(source)
-            else:
-                stream.seek(0)
+            # Nothing is decompressed until the metadata bounds the decoded
+            # size; `to_arrow` then bounds what dictionaries expand to.
+            ipc.check(data, max_rows=max_rows, max_bytes=max_bytes, dictionaries=True)
+            if data.startswith(ipc.MAGIC):
                 source = pa.ipc.open_file(stream)
                 batches = (
                     source.get_batch(i) for i in range(source.num_record_batches)
                 )
+            else:
+                ensure(
+                    format != "feather",
+                    "source bytes do not match a supported table format",
+                    "InvalidTable",
+                )
+                source = pa.ipc.open_stream(stream)
+                batches = iter(source)
             table = _batch_table(
                 batches, source.schema, max_rows=max_rows, max_bytes=max_bytes
             )
@@ -376,7 +418,8 @@ def read_table(
         return to_arrow(table, max_rows=max_rows, max_bytes=max_bytes)
     except PredictorError:
         raise
-    except (pa.ArrowException, ValueError, UnicodeError):
+    except (pa.ArrowException, OSError, ValueError, UnicodeError):
+        # A corrupt compressed buffer fails to decompress as an OSError.
         raise PredictorError(
             "InvalidTable", "source bytes do not match a supported table format"
         ) from None

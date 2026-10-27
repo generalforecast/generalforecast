@@ -20,6 +20,7 @@ operation, which may handle it, as `push` handles a missing predictor.
 
 from __future__ import annotations
 
+import hashlib
 import time
 import uuid
 from collections.abc import Callable, Generator, Mapping, Sequence
@@ -73,6 +74,11 @@ if TYPE_CHECKING:
     from generalforecast.transport import Profile
 
 ARROW_STREAM = "application/vnd.apache.arrow.stream"
+# The most rows an append, or labels a label, the service takes in one call;
+# a larger write is sent in chunks of as many. See `LiveContextAppend`.
+WRITE_CHUNK = 100
+# The longest write id the service takes.
+WRITE_ID_LENGTH = 256
 
 
 @dataclass(frozen=True)
@@ -254,28 +260,138 @@ def context_get(client: Context, resource: str) -> Operation[Any]:
     return client._live_context.from_response(client, resource, result)
 
 
+class PartialWrite(ServiceError):
+    """A chunked append or label that failed after the service accepted some chunks.
+
+    It is the failed chunk's error, with its code and status, so `except
+    gf.CapacityExceeded` still catches a rate limit; the message and
+    `because` say which chunks were accepted. Retrying with the same idempotency key is safe:
+    the accepted chunks replay their receipts and the rest are sent.
+
+    Attributes:
+        accepted: The receipts of the accepted chunks, in order.
+        chunks: How many chunks the write was sent in.
+    """
+
+    def __init__(
+        self,
+        failure: ServiceError,
+        action: str,
+        accepted: Sequence[WriteReceipt],
+        chunks: int,
+        records: int,
+    ) -> None:
+        """Wraps the failed chunk's error, naming what was accepted before it."""
+        noun = "rows" if action == "append" else "labels"
+        taken = min(len(accepted) * WRITE_CHUNK, records)
+        ids = [receipt.write_id for receipt in accepted]
+        named = f"`{ids[0]}`" if len(ids) == 1 else f"`{ids[0]}` to `{ids[-1]}`"
+        super().__init__(
+            failure.code,
+            f"{action} failed at chunk {len(accepted) + 1} of {chunks}: "
+            f"{failure.message}",
+            failure.status,
+            reason=failure.reason,
+            param=failure.param,
+            because=f"chunks 1 to {len(accepted)} of {chunks}, {taken} of "
+            f"{records} {noun}, were accepted as write ids {named}",
+            hint="retry with the same idempotency_key: accepted chunks replay "
+            "their receipts and the rest are sent",
+            limit=failure.limit,
+            actual=failure.actual,
+            request_id=failure.request_id,
+        )
+        self.accepted = tuple(accepted)
+        self.chunks = chunks
+
+
+def chunk_write_id(key: str, index: int) -> str:
+    """The write id of the `index`th chunk, from 0, of a write under `key`.
+
+    `key#1`, `key#2` and on: a retry under the same key sends the same ids,
+    so the service replays each chunk it already accepted. A key too long to
+    take the suffix within `WRITE_ID_LENGTH` is replaced by its digest.
+    """
+    suffix = f"#{index + 1}"
+    if len(key) + len(suffix) > WRITE_ID_LENGTH:
+        key = "sha256-" + hashlib.sha256(key.encode()).hexdigest()
+    return key + suffix
+
+
+def _context_write(
+    context: str, action: str, payload: JsonObject, field: str, key: str
+) -> Operation[WriteReceipt]:
+    """Posts an append or label, in chunks of `WRITE_CHUNK` records when it has more.
+
+    A write that fits one call is sent as it is, under `key`. A larger one
+    is sent chunk by chunk under `chunk_write_id`s; its receipt is the last
+    chunk's, under `key`, with every chunk's rows and receipts.
+
+    Raises:
+        PartialWrite: When a chunk fails after earlier chunks were accepted.
+    """
+    records = payload[field]
+    if len(records) <= WRITE_CHUNK:
+        result = yield from posted("context", "contexts", context, action, payload)
+        return decoded(WriteReceipt.from_dict, result, "write receipt")
+    chunks = -(-len(records) // WRITE_CHUNK)
+    accepted: list[WriteReceipt] = []
+    for index in range(chunks):
+        part = payload | {
+            "write_id": chunk_write_id(key, index),
+            field: records[index * WRITE_CHUNK : (index + 1) * WRITE_CHUNK],
+        }
+        try:
+            result = yield from posted("context", "contexts", context, action, part)
+            accepted.append(decoded(WriteReceipt.from_dict, result, "write receipt"))
+        except ServiceError as failure:
+            if not accepted:
+                raise
+            raise PartialWrite(
+                failure, action, accepted, chunks, len(records)
+            ) from failure
+    receipts = [receipt.to_dict() for receipt in accepted]
+
+    def combined(receipts: list[JsonObject]) -> WriteReceipt:
+        return WriteReceipt.from_dict(
+            receipts[-1]
+            | {
+                "write_id": key,
+                "rows": sum(receipt["rows"] for receipt in receipts),
+                "durably_accepted": all(
+                    receipt["durably_accepted"] for receipt in receipts
+                ),
+                "chunks": receipts,
+            }
+        )
+
+    return decoded(combined, receipts, "write receipt")
+
+
 def context_append(
     context: str, data: Any, *, id: str, idempotency_key: str
 ) -> Operation[WriteReceipt]:
-    """Appends rows under a durable write id."""
+    """Appends rows under a durable write id, in chunks the service accepts."""
     payload = yield Work(
         append_payload, (data,), {"id": id, "write_id": idempotency_key}
     )
-    result = yield from posted("context", "contexts", context, "append", payload)
-    return decoded(WriteReceipt.from_dict, result, "write receipt")
+    return (
+        yield from _context_write(context, "append", payload, "rows", idempotency_key)
+    )
 
 
 def context_label(
     context: str, data: Any, *, id: str, column: str, idempotency_key: str
 ) -> Operation[WriteReceipt]:
-    """Attaches one target's values to rows already in the context."""
+    """Attaches one target's values to rows already in the context, in chunks the service accepts."""
     payload = yield Work(
         label_payload,
         (data,),
         {"id": id, "column": column, "write_id": idempotency_key},
     )
-    result = yield from posted("context", "contexts", context, "label", payload)
-    return decoded(WriteReceipt.from_dict, result, "write receipt")
+    return (
+        yield from _context_write(context, "label", payload, "labels", idempotency_key)
+    )
 
 
 def context_import(reference: ContextImportRef) -> Operation[ImportReceipt]:
@@ -705,16 +821,7 @@ _SCOPED_OPERATIONS = {
     "secrets": frozenset({"list", "create", "get", "rotate", "delete"}),
 }
 
-_ADMIN_ACTIONS = frozenset(
-    {
-        "memberships.list",
-        "memberships.add",
-        "memberships.remove",
-        "sso.get",
-        "sso.configure",
-        "audit.list",
-    }
-)
+_ADMIN_ACTIONS = frozenset({"sso.get", "sso.configure", "audit.list"})
 
 
 def workspace_request(
@@ -814,7 +921,7 @@ def manage(action: str, payload: JsonObject | None) -> Operation[JsonObject]:
         return (
             yield Call(
                 "GET" if reading else "POST",
-                "/" + domain + (f"/{operation}" if operation == "remove" else ""),
+                "/" + domain,
                 "workspace",
                 domain,
                 None if reading else payload,

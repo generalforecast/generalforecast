@@ -116,13 +116,6 @@ ADMIN_ACTIONS: dict[str, tuple[AdminAction, ...]] = {
         AdminAction("list", "List organizations"),
         AdminAction("create", "Create an organization from --file", body=True),
     ),
-    "membership": (
-        AdminAction("list", "List members"),
-        AdminAction("add", "Add a member from --file", body=True),
-        AdminAction(
-            "remove", "Remove a member named in --file", body=True, destructive=True
-        ),
-    ),
     "sso": (
         AdminAction("get", "Show the single sign-on settings"),
         AdminAction("configure", "Configure single sign-on from --file", body=True),
@@ -161,7 +154,6 @@ ADMIN_HELP = {
     "workspace": "The current workspace",
     "project": "Projects",
     "organization": "Organizations",
-    "membership": "Workspace members",
     "sso": "Single sign-on settings",
     "audit": "Audit log",
     "operator": "Operator diagnostics",
@@ -195,7 +187,6 @@ COLLECTIONS: "dict[str, tuple[ResourceKind, str]]" = {
     "workspace": ("workspace", "workspace"),
     "organization": ("workspace", "organizations"),
     "project": ("project", "projects"),
-    "membership": ("workspace", "memberships"),
     "sso": ("workspace", "sso"),
     "audit": ("workspace", "audit"),
 }
@@ -212,7 +203,6 @@ OPERATIONS: dict[str, set[str]] = {
     "workspace": {"get"},
     "organization": {"list", "create"},
     "project": {"list", "create"},
-    "membership": {"list", "add", "remove"},
     "sso": {"get", "configure"},
     "audit": {"list"},
 }
@@ -224,7 +214,6 @@ IDENTITY_GROUPS = {
     "workspace": "workspace",
     "organization": "organizations",
     "project": "projects",
-    "membership": "memberships",
     "sso": "sso",
     "audit": "audit",
 }

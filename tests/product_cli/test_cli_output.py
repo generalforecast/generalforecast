@@ -90,7 +90,6 @@ def test_admin_lists_every_noun_and_nothing_is_hidden(monkeypatch):
         "workspace",
         "project",
         "organization",
-        "membership",
         "sso",
         "audit",
         "operator",
@@ -111,6 +110,13 @@ def test_retired_flags_and_commands_are_gone(monkeypatch):
     ):
         code, _, stderr = gf(*argv, monkeypatch=monkeypatch)
         assert code == 2 and stderr.startswith("error: unexpected argument '--")
+    code, stdout, stderr = gf(
+        "--json", "admin", "membership", "list", monkeypatch=monkeypatch
+    )
+    assert code == 2 and not stdout
+    assert json.loads(stderr)["error"]["message"] == (
+        "unknown noun `membership` for `gf admin`"
+    )
     for command in ("dataset", "datasets", "bench", "run"):
         code, stdout, stderr = gf("--json", command, monkeypatch=monkeypatch)
         assert code == 2 and not stdout

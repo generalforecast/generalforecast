@@ -140,10 +140,42 @@ def test_a_closed_pipe_ends_the_command_quietly():
 def test_ctrl_c_exits_130_with_an_interrupted_error(monkeypatch):
     _raises(monkeypatch, KeyboardInterrupt())
     code, stdout, stderr = gf("--json", "model", "list", monkeypatch=monkeypatch)
-    assert code == cli.INTERRUPTED_EXIT and not stdout
-    assert json.loads(stderr)["error"]["reason"] == "interrupted"
+    assert code == cli.INTERRUPTED_EXIT == 130 and not stdout
+    assert json.loads(stderr) == {
+        "error": {
+            "code": "ValidationError",
+            "reason": "interrupted",
+            "message": "interrupted",
+        }
+    }
     code, _, stderr = gf("model", "list", monkeypatch=monkeypatch)
     assert code == cli.INTERRUPTED_EXIT and stderr == "\nerror: interrupted\n"
+
+
+def test_ctrl_c_at_a_question_is_an_interruption_not_a_declined_one(monkeypatch):
+    class Interrupting(io.StringIO):
+        def readline(self, *_args):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(sys, "stdin", Interrupting())
+    code, stdout, stderr = gf(
+        "--json", "admin", "delete", "churn", monkeypatch=monkeypatch
+    )
+    assert code == cli.INTERRUPTED_EXIT and not stdout
+    assert json.loads(stderr.splitlines()[-1])["error"]["reason"] == "interrupted"
+
+
+def test_the_exit_codes_are_documented_where_failures_are_presented():
+    doc = cli.__doc__ or ""
+    for exit_code, reason in (
+        (cli.USAGE_EXIT, "usage_error"),
+        (cli.ABORTED_EXIT, "aborted"),
+        (cli.INTERRUPTED_EXIT, "interrupted"),
+    ):
+        assert f"\n    {exit_code} " in doc and f"reason `{reason}`" in doc
+    assert f"\n    {cli.BROKEN_PIPE_EXIT}  " in doc
+    # The reasons the docstring names are the ones the errors carry.
+    assert cli.error_object(term.Aborted("cancelled"))["error"]["reason"] == "aborted"
 
 
 # -- errors -----------------------------------------------------------------
@@ -262,7 +294,7 @@ def test_a_declined_or_unanswered_question_says_so(monkeypatch):
     code, stdout, stderr = gf(
         "--json", "admin", "delete", "churn", monkeypatch=monkeypatch
     )
-    assert code == 1 and not stdout
+    assert code == cli.ABORTED_EXIT == 2 and not stdout
     error = json.loads(stderr.splitlines()[-1])["error"]
     assert error == {
         "code": "ValidationError",
@@ -272,7 +304,7 @@ def test_a_declined_or_unanswered_question_says_so(monkeypatch):
     }
     monkeypatch.setattr(sys, "stdin", io.StringIO("n\n"))
     code, _, stderr = gf("admin", "delete", "churn", monkeypatch=monkeypatch)
-    assert code == 1
+    assert code == cli.ABORTED_EXIT
     assert stderr == (
         "Delete churn and its environments? [y/N] "
         "error: cancelled; nothing was changed\n"
@@ -299,7 +331,8 @@ def test_admin_actions_bind_name_and_file_and_confirm_what_they_destroy(
     monkeypatch.setattr("generalforecast.commands.client_for", lambda args: client)
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
     code, _, stderr = gf("admin", "key", "revoke", "k-2f91", monkeypatch=monkeypatch)
-    assert code == 1 and "needs an answer" in stderr and not client.calls
+    assert code == cli.ABORTED_EXIT and "needs an answer" in stderr
+    assert not client.calls
     code, _, _ = gf(
         "admin", "key", "revoke", "k-2f91", "--yes", monkeypatch=monkeypatch
     )

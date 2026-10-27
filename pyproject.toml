@@ -44,7 +44,7 @@ gf = "generalforecast.cli:main"
 polars = ["polars>=1.30,<2"]
 # NVIDIA GPUs: JAX's CUDA 13 plugin, with CUDA and cuDNN from pip, the CUDA
 # PyTorch's default build uses, so both can share one environment.
-cuda = ["jax[cuda13]>=0.11.0"]
+cuda = ["jax[cuda13]>=0.12"]
 
 [dependency-groups]
 dev = [

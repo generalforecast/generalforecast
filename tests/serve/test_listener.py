@@ -12,6 +12,8 @@ import sys
 import tempfile
 import textwrap
 import time
+import tomllib
+import urllib.request
 from pathlib import Path
 
 import pytest
@@ -234,6 +236,42 @@ def test_serving_a_node_or_router_becomes_its_server(monkeypatch, tmp_path):
     assert node_args[1:] == router_args[1:] == ["run", "--config", str(config)]
     assert node_env["HF_HUB_OFFLINE"] == node_env["GF_OFFLINE"] == "1"
     assert "GF_OFFLINE" not in router_env
+
+
+def test_metrics_are_configured_only_when_asked_for(tmp_path):
+    model = {"worker": "tabicl", "reference": "general-forecast/tabicl-v2-classifier"}
+    plain = tomllib.loads(
+        listener.configuration(tmp_path, "127.0.0.1:8000", 30.0, [model])
+    )
+    assert "metrics_listen" not in plain
+    config = tomllib.loads(
+        listener.configuration(
+            tmp_path, "127.0.0.1:8000", 30.0, [model], metrics="127.0.0.1:9090"
+        )
+    )
+    # A server setting, not one of the Models API's under [http].
+    assert config["metrics_listen"] == "127.0.0.1:9090"
+    assert "metrics_listen" not in config["http"]
+    assert {
+        k: v for k, v in config.items() if k not in ("metrics_listen", "tokens")
+    } == {k: v for k, v in plain.items() if k != "tokens"}
+
+
+@pytest.mark.slow
+@pytest.mark.server
+def test_a_server_configured_with_metrics_serves_them_there():
+    from tests.conformance.test_surfaces import Served, _port
+    from tests.utils.server import build
+
+    metrics = f"127.0.0.1:{_port()}"
+    served = Served(build(), "general-forecast/tabicl-v2-classifier", metrics=metrics)
+    try:
+        for path, expected in (("/healthz", "ok"), ("/metrics", "gf_")):
+            with urllib.request.urlopen(f"http://{metrics}{path}", timeout=30) as reply:
+                assert reply.status == 200
+                assert expected in reply.read().decode()
+    finally:
+        served.stop()
 
 
 def test_offline_shapes_the_servers_environment(monkeypatch):

@@ -82,7 +82,9 @@ def _port() -> int:
 class Served:
     """gf-server as `gf serve` configures it, for one target, on the tiny models."""
 
-    def __init__(self, binary: Path, target: str) -> None:
+    def __init__(
+        self, binary: Path, target: str, *, metrics: str | None = None
+    ) -> None:
         self.directory = Path(tempfile.mkdtemp(prefix="gf-conformance-"))
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(serve_models, "checkpoint", lambda *_, **__: None)
@@ -96,6 +98,7 @@ class Served:
                 self.url.removeprefix("http://"),
                 120.0,
                 [model | {"reference": TINY[model["worker"]]}],
+                metrics=metrics,
             )
         )
         config.chmod(0o600)

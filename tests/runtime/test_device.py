@@ -6,12 +6,15 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 from generalforecast.nn.attention import (
     AttentionCache,
@@ -217,6 +220,24 @@ def test_command_buffers_are_off_unless_xla_flags_set_them(
     monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_enable_command_buffer=FUSION")
     without_command_buffers()
     assert os.environ["XLA_FLAGS"] == "--xla_gpu_enable_command_buffer=FUSION"
+
+
+def test_the_cuda_extra_needs_a_jaxlib_that_warms_cudnn_off_the_compute_stream() -> (
+    None
+):
+    # Before jaxlib 0.12, cuDNN's warmup captured the compute stream, so loading
+    # a cached program beside a running step failed; see test_cudnn_capture.py.
+    root = Path(__file__).resolve().parents[2]
+    project = tomllib.loads((root / "pyproject.toml").read_text())
+    (cuda,) = map(Requirement, project["project"]["optional-dependencies"]["cuda"])
+    assert cuda.name == "jax" and cuda.extras == {"cuda13"}
+    assert not cuda.specifier.contains("0.11.2") and cuda.specifier.contains("0.12")
+    lock = tomllib.loads((root / "uv.lock").read_text())
+    locked = {
+        package["name"]: Version(package["version"]) for package in lock["package"]
+    }
+    for name in ("jax", "jaxlib", "jax-cuda13-plugin", "jax-cuda13-pjrt"):
+        assert locked[name] >= Version("0.12"), name
 
 
 def test_available_memory_is_what_a_container_or_machine_has_free(
