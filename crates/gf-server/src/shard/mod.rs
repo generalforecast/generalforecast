@@ -821,6 +821,13 @@ pub struct RequestContext {
     pub targets: Targets,
     /// Each row's time, for a context of series.
     pub times: Option<Vec<Option<i64>>>,
+    /// Whether many requests bring this context, as every prediction of a
+    /// hosted revision brings its snapshot's rows: its state is fit and
+    /// kept, and queries embed against it, as for a durable table, so its
+    /// predictions are the ones the same rows bound durably answer, bit for
+    /// bit, from the first request on. Otherwise the context is one
+    /// request's, fit and decoded in one fused call.
+    pub shared: bool,
 }
 
 /// What a request asks of its context: predictions of query rows, or
@@ -1842,6 +1849,7 @@ impl Shard {
             features,
             targets,
             times,
+            shared,
         } = context;
         if definition.durability != Durability::Ephemeral {
             return Err(ServerError::Invalid(
@@ -1864,6 +1872,7 @@ impl Shard {
                     &features,
                     targets,
                     times.as_deref(),
+                    shared,
                 )
                 .await?
             }
@@ -1887,7 +1896,9 @@ impl Shard {
         Ok((submitted, levels))
     }
 
-    /// Serves an ephemeral table in memory, without a log, and adds its rows.
+    /// Serves an ephemeral table in memory, without a log, and adds its rows;
+    /// see `RequestContext::shared`.
+    #[allow(clippy::too_many_arguments)]
     async fn make_ephemeral(
         &mut self,
         fingerprint: [u8; 32],
@@ -1896,10 +1907,13 @@ impl Shard {
         features: &[f32],
         targets: Targets,
         times: Option<&[Option<i64>]>,
+        shared: bool,
     ) -> Result<TableId, ServerError> {
         let (spec, _, levels) = self.spec(&definition, false).await?;
         let id = self.node.create_table(spec)?;
-        self.node.set_single_use(id)?;
+        if !shared {
+            self.node.set_single_use(id)?;
+        }
         self.send_to_worker(id, &definition);
         let rows = targets.len() as u64;
         if let Err(error) = self.node.insert_at(id, keys, features, targets, times) {

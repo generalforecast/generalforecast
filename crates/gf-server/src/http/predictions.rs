@@ -252,7 +252,7 @@ async fn predictor_predict(
         return Err(not_live(&served.name, predictor.context.kind()));
     }
     let call = declared_call(predictor, payload, || Ok(json!([])))?;
-    served_predict(front, served, predictor, &call, charge).await
+    served_predict(front, served, predictor, &call, charge, false).await
 }
 
 /// The ad hoc route's body: a manifest fragment (`model`, `target`, and
@@ -643,12 +643,15 @@ fn prediction_result(model: &str, task: &str, used: &Used, predictions: Vec<Valu
 /// then the queries encoded by the binder and predicted from the
 /// snapshot's durable table, or from the ephemeral table of the request's
 /// own bound context.
+/// A request-context predictor's rows bind as `shared` says, which
+/// `RequestContext::shared` explains.
 async fn served_predict(
     front: &Front,
     served: &ServedModel,
     predictor: &ServedPredictor,
     payload: &Value,
     charge: Charge,
+    shared: bool,
 ) -> Result<Value, ApiError> {
     let body = fields(payload, &["target", "inputs", "context", "queries"], &[])?;
     let features: Vec<String> = body["inputs"]
@@ -740,7 +743,7 @@ async fn served_predict(
             let encoded = bound
                 .encoder
                 .encode(&predictors::records(&schema.columns, queries)?)?;
-            let fingerprint = bound_fingerprint(served, &bound);
+            let fingerprint = bound_fingerprint(served, &bound, shared);
             let context = engine::rows_context(
                 &served.worker,
                 &fingerprint,
@@ -750,6 +753,7 @@ async fn served_predict(
                 bound.targets,
                 bound.rows,
                 predictor.strategy.as_ref(),
+                shared,
             )?;
             let inferred = front
                 .engine()?
@@ -985,9 +989,15 @@ async fn series_predict(
 /// A bound request context's fingerprint: its model and its rows as the
 /// binder encoded them, which is all its table holds, so contexts that
 /// encode alike share one table and one fit.
-fn bound_fingerprint(served: &ServedModel, bound: &predictor::Context) -> [u8; 32] {
+/// What names a bound context's ephemeral table: a shared one is another
+/// table than one request's of the same rows, since it is fit apart.
+fn bound_fingerprint(served: &ServedModel, bound: &predictor::Context, shared: bool) -> [u8; 32] {
     let mut hasher = Sha256::new();
-    hasher.update(b"predictor\0");
+    hasher.update(if shared {
+        b"shared\0".as_slice()
+    } else {
+        b"predictor\0".as_slice()
+    });
     hasher.update(served.worker.as_bytes());
     hasher.update([0]);
     hasher.update((bound.encoder.width() as u64).to_le_bytes());
@@ -1096,7 +1106,9 @@ async fn native_predict(
                 503,
             )
         })?;
-    // A revision's snapshot rows come with it, so they bind with each request.
+    // A revision's snapshot or live rows come with it, so they bind with
+    // each request, shared, so every prediction is the one gf serve's
+    // durable binding of the same rows answers.
     let call = declared_call(predictor, payload, || {
         rows.map(|rows| Value::Array(rows.to_vec()))
             .ok_or_else(failed)
@@ -1107,7 +1119,8 @@ async fn native_predict(
     bound.context = ContextMode::Request;
     bound.snapshot = None;
     ephemeral.predictor = Some(bound.clone());
-    let mut result = served_predict(front, &ephemeral, &bound, &call, charge).await?;
+    let shared = predictor.context != ContextMode::Request;
+    let mut result = served_predict(front, &ephemeral, &bound, &call, charge, shared).await?;
     if predictor.context == ContextMode::Snapshot
         && let Some(captured) = captured
     {

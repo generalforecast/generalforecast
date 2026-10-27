@@ -131,6 +131,7 @@ impl Engine {
             request.targets.clone(),
             request.usable_rows(),
             None,
+            false,
         )?;
         let answered = self
             .ask(
@@ -225,6 +226,7 @@ impl Engine {
             features: Vec::with_capacity(rows * covariates.len()),
             targets: Targets::Values(Vec::with_capacity(rows)),
             times: Some(Vec::with_capacity(rows)),
+            shared: false,
         };
         let mut values = Vec::with_capacity(rows);
         for (series, &target) in targets.iter().enumerate() {
@@ -633,6 +635,7 @@ pub fn bound_shard(fingerprint: &[u8; 32], shards: usize) -> usize {
 
 /// A tabular context in the ephemeral table its fingerprint names, drawn
 /// per query by `strategy` when a predictor's lock selects; exact when None.
+/// `shared` as `RequestContext::shared` has it.
 #[allow(clippy::too_many_arguments)]
 pub fn rows_context(
     model: &str,
@@ -643,6 +646,7 @@ pub fn rows_context(
     targets: Targets,
     rows: usize,
     strategy: Option<&Value>,
+    shared: bool,
 ) -> Result<RequestContext, ApiError> {
     let name = format!("ctx-{}", request::hex(fingerprint));
     let definition: TableDefinition = serde_json::from_value(definition(
@@ -661,5 +665,6 @@ pub fn rows_context(
         features,
         targets,
         times: None,
+        shared,
     })
 }

@@ -49,11 +49,24 @@ const DEFER: u8 = 5;
 const DEFER_EARLY: u8 = 6;
 
 /// Answers every frame the shard sends, in order; steps as `behaviour` says.
-fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notify>) {
+/// Each step's units' actions go to `actions`, in the order sent.
+fn fake_worker(
+    mut stream: UnixStream,
+    behaviour: Arc<AtomicU8>,
+    held: Arc<Notify>,
+    actions: Arc<std::sync::Mutex<Vec<String>>>,
+) {
     tokio::spawn(async move {
         let mut deferred_once: HashSet<u64> = HashSet::new();
         while let Ok(frame) = Frame::read_from(&mut stream).await {
             let reply = if frame.kind() == "step" {
+                actions.lock().unwrap().extend(
+                    frame.header["units"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|unit| unit["action"].as_str().map(str::to_string)),
+                );
                 match behaviour.load(Ordering::Relaxed) {
                     mode @ (DEFER | DEFER_EARLY) => {
                         let tables: Vec<u64> = frame.header["queries"]
@@ -360,6 +373,8 @@ struct Harness {
     behaviour: Arc<AtomicU8>,
     held: Arc<Notify>,
     directory: std::path::PathBuf,
+    /// The actions of every unit the shard's steps sent the worker.
+    actions: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 fn name(text: &str) -> TableName {
@@ -394,7 +409,8 @@ async fn shard_routed(
     let (ours, theirs) = UnixStream::pair().unwrap();
     let behaviour = Arc::new(AtomicU8::new(OK));
     let held = Arc::new(Notify::new());
-    fake_worker(theirs, behaviour.clone(), held.clone());
+    let actions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    fake_worker(theirs, behaviour.clone(), held.clone(), actions.clone());
     let connection = WorkerConnection::fake(
         ours,
         vec![
@@ -423,6 +439,7 @@ async fn shard_routed(
         behaviour,
         held,
         directory,
+        actions,
     }
 }
 
@@ -1909,6 +1926,7 @@ fn context(fingerprint: &str, rows: u128) -> RequestContext {
         features: (0..rows).flat_map(|row| [row as f32, 0.0]).collect(),
         targets: Targets::Classes((0..rows).map(|row| (row % 3) as i32).collect()),
         times: None,
+        shared: false,
     }
 }
 
@@ -1946,6 +1964,34 @@ async fn a_request_context_is_kept_in_memory_and_read_again_by_its_fingerprint()
         .map(|entry| entry.file_name())
         .collect();
     assert!(written.is_empty(), "{written:?}");
+}
+
+#[tokio::test]
+async fn a_shared_context_is_fit_and_kept_as_a_durable_table_is_and_never_fused() {
+    let shard = shard(settings()).await;
+    shard.infer(context("one", 4)).await.unwrap();
+    let fused = |actions: &[String]| actions.iter().filter(|action| *action == "fuse").count();
+    assert_eq!(
+        fused(&shard.actions.lock().unwrap()),
+        1,
+        "one request's context fits and decodes in one call"
+    );
+    shard.actions.lock().unwrap().clear();
+    let shared = || RequestContext {
+        shared: true,
+        ..context("revision", 4)
+    };
+    for _ in 0..3 {
+        let answered = shard.infer(shared()).await.unwrap();
+        assert_eq!(answered.predictions.rows, 2);
+    }
+    let actions = shard.actions.lock().unwrap().clone();
+    assert_eq!(fused(&actions), 0, "{actions:?}");
+    assert!(
+        !actions.is_empty(),
+        "the shared context's rows were encoded"
+    );
+    assert_eq!(shard.metrics.ephemeral_tables.get(), 2);
 }
 
 #[tokio::test]
