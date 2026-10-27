@@ -5,10 +5,22 @@
 
 Fifteen commands in three groups. Commands print status lines on stderr and
 return their result; `generalforecast.render` alone writes results on
-stdout, for a person or, under `--json`, as one JSON object. Every failure,
-including one while writing the result, goes through `present`, which
-prints it in one of the three error shapes or as a JSON error object. Help
-and version print without importing the SDK.
+stdout, for a person or, under `--json`, as one JSON object. Help and version
+print without importing the SDK.
+
+Every failure, including one while writing the result, goes through
+`present`, which prints it in one of the three error shapes or, under
+`--json`, as the service's error object: `code` is one of the contract's wire
+codes and `reason` the finer name, so a local failure reads as a service
+reply does. The exit code says how the command ended:
+
+    0    it succeeded
+    1    it failed; the error says why
+    2    nothing was done: the command line was refused (`ValidationError`,
+         reason `usage_error`), or a question was declined or left unanswered
+         (`ValidationError`, reason `aborted`)
+    130  Ctrl-C interrupted it (`ValidationError`, reason `interrupted`)
+    141  the reader of stdout closed the pipe; nothing more is printed
 """
 
 from __future__ import annotations
@@ -48,9 +60,9 @@ from generalforecast.command_specs import (
 from generalforecast.errors import Error
 
 DEFAULT_TIMEOUT = 40.0
-# The exit code of a command line the parser rejected, and of one cut short
-# by Ctrl-C or by a reader that closed its end of the pipe.
+# The exit codes the module docstring lists, besides 0 and 1.
 USAGE_EXIT = 2
+ABORTED_EXIT = USAGE_EXIT
 INTERRUPTED_EXIT = 130
 BROKEN_PIPE_EXIT = 141
 
@@ -973,7 +985,12 @@ def present(
     json: bool = False,
     root: Path = Path("."),
 ) -> int:
-    """Prints any failure in the contract's grammar and returns the exit code."""
+    """Prints any failure in the contract's grammar and returns its exit code.
+
+    The module docstring lists the exit codes and the wire codes and reasons
+    of the failures that are not errors of their own: a usage error, a
+    declined question and Ctrl-C.
+    """
     from generalforecast.render import emit, redact
 
     if isinstance(error, BrokenPipeError):
@@ -982,10 +999,13 @@ def present(
     exit_code = 1
     if isinstance(error, KeyboardInterrupt):
         error, exit_code = Error("interrupted", code="Interrupted"), INTERRUPTED_EXIT
-        if not json:
-            out.say(force=True)
+        # Ctrl-C cuts a line short, such as a question's: the error, or its
+        # JSON object, starts a line of its own.
+        out.say(force=True)
     elif isinstance(error, Usage):
         exit_code = USAGE_EXIT
+    elif isinstance(error, term.Aborted):
+        exit_code = ABORTED_EXIT
     elif isinstance(error, OSError) and not _known(error):
         error = _oserror(error)
     if not _known(error):
