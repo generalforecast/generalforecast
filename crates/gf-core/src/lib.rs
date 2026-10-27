@@ -13,6 +13,7 @@ pub mod catalog;
 pub mod categories;
 pub mod columns;
 pub mod context;
+mod distance;
 pub mod forecasting;
 pub mod node;
 pub mod pages;
