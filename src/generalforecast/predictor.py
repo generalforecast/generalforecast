@@ -865,7 +865,17 @@ class Predictor:
             self.task = "?"
             self._facts: dict[str, Any] | None = None
 
-    # -- resolution ---------------------------------------------------------
+    @classmethod
+    def local(cls, path: str | os.PathLike[str]) -> Predictor:
+        """The local predictor in directory `path`, never a hosted, catalog or served one.
+
+        A bare name such as `churn` is the directory `churn` here, so
+        commands given a directory never read it as a hosted name.
+
+        Raises:
+            NotFound: If `path` is no directory or holds no `gf.yaml`.
+        """
+        return cls(Path(os.fspath(path)))
 
     def _load_local(self) -> None:
         """Resolves `gf.yaml` as `gf check` does, without writing `gf.lock`."""
