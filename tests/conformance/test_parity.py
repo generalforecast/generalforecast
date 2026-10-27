@@ -542,3 +542,10 @@ def test_any_number_of_series_and_queries_predict_alike_past_one_call(tmp_path, 
     expected = _outputs(local)
     _same(_outputs(hosted.reset_index(drop=True)), expected, "hosted")
     _same(_outputs(served), expected, "served")
+    # A served forecast's frame is a local one: its series and time lead it.
+    assert list(served.columns) == list(local.columns)
+    assert list(local.columns[:2]) == ["sku", "date"]
+    for name in ("sku", "date"):
+        assert [str(value) for value in served[name]] == [
+            str(value) for value in local[name]
+        ], name

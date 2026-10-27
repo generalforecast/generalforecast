@@ -461,20 +461,33 @@ def _query_rows(plan: Any, queries: pa.Table) -> pa.Table:
 
 def _frame_of_predictions(plan: Any, queries: pa.Table, table: pa.Table) -> Any:
     """The executor's predictions as a frame: id, a forecast's series and time, then outputs."""
-    import pandas as pd
-
     spec = plan.spec
     frame = _frame_of_result({"predictions": table.to_pylist()}, spec.id)
     if plan.task == "forecast":
-        keys = pd.DataFrame(
-            {
-                name: queries.column(name).to_pylist()
-                for name in (*spec.series, spec.time)
-            }
-        )
-        frame = pd.concat([keys, frame.drop(columns=["id"], errors="ignore")], axis=1)
-        if spec.id is not None and spec.id in queries.column_names:
-            frame.insert(0, "id", queries.column(spec.id).to_pylist())
+        assert spec.time is not None
+        frame = _with_forecast_keys(frame, queries, spec.series, spec.time, spec.id)
+    return frame
+
+
+def _with_forecast_keys(
+    frame: Any, queries: pa.Table, series: Sequence[str], time: str, id: str | None
+) -> Any:
+    """A forecast frame led by its queries' id (if any), series and time, one row per query.
+
+    Every path, in process, the CLI, gf serve and hosted serving, gives a
+    forecaster's predictions this shape.
+    """
+    import pandas as pd
+
+    keys = pd.DataFrame(
+        {name: queries.column(name).to_pylist() for name in (*series, time)}
+    )
+    frame = pd.concat(
+        [keys, frame.drop(columns=["id"], errors="ignore").reset_index(drop=True)],
+        axis=1,
+    )
+    if id is not None and id in queries.column_names:
+        frame.insert(0, "id", queries.column(id).to_pylist())
     return frame
 
 
@@ -1203,7 +1216,7 @@ class Predictor:
                 as_of=as_of if as_of is not None else self._as_of,
             )
             value = self._served_post(f"/predictors/{self.name}/predict", payload)
-            return _frame_of_result(value, self._id_name())
+            return self._keyed(_frame_of_result(value, self._id_name()), queries)
         with boundary():
             result = self._client().predictors.predict(
                 self.name,
@@ -1212,7 +1225,21 @@ class Predictor:
                 as_of=as_of if as_of is not None else self._as_of,
                 env=self._env,
             )
-        return _frame_of_result(result, self._id_name())
+        return self._keyed(_frame_of_result(result, self._id_name()), queries)
+
+    def _keyed(self, frame: Any, queries: Any) -> Any:
+        """A served or hosted forecast's frame with the series and time of its queries, as local frames have them.
+
+        The wire reply carries each prediction in query order, so the keys
+        come from the queries themselves.
+        """
+        facts = self._hosted_facts()
+        if facts.get("task") != "forecast" or not facts.get("time"):
+            return frame
+        series = tuple(facts.get("series") or ())
+        return _with_forecast_keys(
+            frame, tabular.frame(queries), series, facts["time"], self._id_name()
+        )
 
     def _with_as_of(self, ts: Any) -> Predictor:
         clone = Predictor.__new__(Predictor)
