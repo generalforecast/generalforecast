@@ -13,7 +13,8 @@ The flow, for one revision:
 
 1. `parse_lock` the pushed document; `pin(lock.model).digest` must equal
    the lock's `model_digest`, and an uploaded snapshot's digest the lock's
-   `data_digest`. A stored version 1 lock is rewritten with `upgrade_lock`.
+   `data_digest`. A stored version 1 lock is rewritten with `upgrade_lock`,
+   which raises `PredictorError` for any malformed document.
 2. Gather its rows: the uploaded snapshot for a snapshot context,
    `live_context(lock, snapshot)` for a live one, none for a request one.
 3. `served_context(lock, table)` gives the exact rows every path binds:
@@ -27,10 +28,67 @@ The flow, for one revision:
    gf serve binds them. `lock.digest` is the revision's identity and
    gf-server's fingerprint.
 4. A request carries `PredictionRequest` fields: queries, a request
-   context's rows, and `as_of` for a live context.
+   context's rows, and `as_of` for a live context, read by `parse_as_of`.
+   A reply's `context` is a `ContextVersion`'s `to_dict()`, its `as_of`
+   written by `format_as_of`; gf-server reads and writes both the same way.
 
 An ad hoc call resolves its manifest fragment with `ad_hoc_lock(manifest,
 rows)` and runs the same way, its rows as a request context.
+
+`as_of` through gf-server: when a prediction for a live-context predictor
+carries `as_of`, gf-server asks the control plane for the context as of
+that time through the internal revision lock route, passing `as_of` in
+RFC 3339 (`format_as_of`); the plane answers with that version's rows, or a
+422 (or 409) when the time precedes the history it retains. A prediction
+for a snapshot or request context that carries `as_of` is refused with a
+422 `ValidationError`, `param` `as_of`.
+
+An offline image runs `python -m generalforecast.hosting prefetch` (or
+`prefetch_catalog()`) once, to download, convert and verify every model a
+hosted plane may serve.
+
+Exports:
+
+    Locks and revisions
+        PredictorLock, parse_lock, lock_digest, lock_name, upgrade_lock:
+            a pushed version 2 lock, read and identified; a stored version 1
+            lock rewritten.
+        Revision, Environment, PromoteRequest: a predictor's revisions and
+            the environments that serve them.
+        ContextImportRef, ContextVersion, context_version: a live context's
+            import source, and the context a prediction read (its wire form
+            and the decoder of current and stored forms).
+        PredictionRequest, PredictionResult: a prediction call and reply.
+        parse_as_of, format_as_of: `as_of` as requests carry it and replies
+            write it (contract C1).
+    Compiling and predicting
+        compile_lock, CompiledPlan: a lock and its rows, compiled.
+        served_context, live_context, bound_rows, json_rows: the rows a
+            revision binds, and how gf-server takes them.
+        PredictorExecutor: in-process prediction of a compiled plan.
+        CONTEXT_ROWS_KEY: the prediction table's schema metadata key holding
+            how many context rows the call read.
+        ad_hoc_lock: an ad hoc call's lock.
+        published_entry, catalog_model, configuration, binary: gf-server's
+            models file entries, its configuration and its executables.
+        request_table, to_arrow, coerce, read_table, arrow_bytes,
+            table_digest, bytes_digest, PHYSICAL_TYPES: rows in and out of
+            Arrow, and their digests.
+    Models
+        pin, limits, entries, parse_model, resource_name, ALIASES,
+            ModelRefError, V1_POLICY, CatalogService, prefetch_catalog: the
+            catalog, its pins and bounds, and the serving policy.
+    Service plumbing
+        Request, Resource, ResourceKind, Scope, Capability, RateLimit,
+            JsonObject, VERSION, parse_body, success, failure, json_object,
+            unique_object: the request envelope and reply.
+        Error, ServiceError, InputError, PredictorError: errors with codes.
+        fields, require, name, text, number, model_id: field checks with
+            the same rules gf applies.
+        ModelPort, NativeExecutor, PreparedExecution, AcceptedWrite,
+            ImportOutcome, Mutation, ObservationInput, SnapshotRow,
+            SourcePin, SourceRecord: the ports and records a plane
+            implements or passes through.
 
 Compatibility: these names, their signatures and the `gf.lock` version 2
 format are stable within a minor version of `generalforecast`; a change to
@@ -38,10 +96,10 @@ any of them is a minor-version change with a migration note, and the
 recorded surface (`tests/conformance/test_hosting.py`) changes with it.
 """
 
+import sys
 from typing import Any
 
 from generalforecast.contracts import (
-    LOCK_VERSION,
     ContextImportRef,
     ContextVersion,
     Environment,
@@ -50,10 +108,11 @@ from generalforecast.contracts import (
     PredictorLock,
     PromoteRequest,
     Revision,
-    RuntimePlan,
     context_version,
+    format_as_of,
     lock_digest,
     lock_name,
+    parse_as_of,
     parse_lock,
 )
 from generalforecast.errors import Error
@@ -67,7 +126,7 @@ from generalforecast.models.catalog import (
 from generalforecast.models.catalog import parse as parse_model
 from generalforecast.predictors.lock import upgrade as upgrade_lock
 from generalforecast.predictors.models import CatalogResolver, ModelPin
-from generalforecast.predictors.runtime import PredictorExecutor, PreparedPredictor
+from generalforecast.predictors.runtime import CONTEXT_ROWS_KEY, PredictorExecutor
 from generalforecast.predictors.runtime.compile import compile_lock
 from generalforecast.predictors.runtime.compiled import CompiledPlan
 from generalforecast.predictors.runtime.context import (
@@ -75,12 +134,7 @@ from generalforecast.predictors.runtime.context import (
     live_context,
     served_context,
 )
-from generalforecast.predictors.runtime.plan import ExecutionPlan
-from generalforecast.predictors.runtime.requests import (
-    bind_request,
-    request_table,
-    temporal,
-)
+from generalforecast.predictors.runtime.requests import request_table
 from generalforecast.predictors.runtime.tabular import bound_order as bound_rows
 from generalforecast.predictors.spec import PredictorSpec
 from generalforecast.predictors.validation import PredictorError, bytes_digest
@@ -114,7 +168,6 @@ from generalforecast.service.contracts import (
 )
 from generalforecast.service.interfaces import (
     AcceptedWrite,
-    ContextSnapshot,
     ImportOutcome,
     ModelPort,
     Mutation,
@@ -145,13 +198,6 @@ def pin(model: str) -> ModelPin:
     return CatalogResolver("predictor").resolve(model)
 
 
-def task_of(model: str) -> str:
-    """`classification`, `regression` or `forecast`, for a catalog model id."""
-    from generalforecast.predictors import _registry
-
-    return _registry.task_of(model)
-
-
 def limits(model: str) -> Any:
     """A catalog model's per-call bounds: `context_rows`, `queries` and `inputs`."""
     from generalforecast.predictors import _registry
@@ -180,9 +226,24 @@ def ad_hoc_lock(manifest: dict[str, Any], rows: Any) -> PredictorLock:
     return PredictorLock.from_dict(lock.document(resolve(spec, rows=to_arrow(rows))))
 
 
+def prefetch_catalog() -> None:
+    """Downloads, converts and verifies every model a hosted plane may serve.
+
+    An offline image runs this once at build time, as `python -m
+    generalforecast.hosting prefetch`; afterwards the plane serves with
+    downloads off.
+
+    Raises:
+        ServiceError: For a download or a file that does not match its pin.
+    """
+    from generalforecast.service.catalog_artifacts import preload
+
+    preload()
+
+
 __all__ = [
     "ALIASES",
-    "LOCK_VERSION",
+    "CONTEXT_ROWS_KEY",
     "PHYSICAL_TYPES",
     "V1_POLICY",
     "VERSION",
@@ -191,15 +252,12 @@ __all__ = [
     "CatalogService",
     "CompiledPlan",
     "ContextImportRef",
-    "ContextSnapshot",
     "ContextVersion",
     "Environment",
     "Error",
-    "ExecutionPlan",
     "ImportOutcome",
     "InputError",
     "JsonObject",
-    "ModelPin",
     "ModelPort",
     "ModelRefError",
     "Mutation",
@@ -211,14 +269,12 @@ __all__ = [
     "PredictorExecutor",
     "PredictorLock",
     "PreparedExecution",
-    "PreparedPredictor",
     "PromoteRequest",
     "RateLimit",
     "Request",
     "Resource",
     "ResourceKind",
     "Revision",
-    "RuntimePlan",
     "Scope",
     "ServiceError",
     "SnapshotRow",
@@ -227,7 +283,6 @@ __all__ = [
     "ad_hoc_lock",
     "arrow_bytes",
     "binary",
-    "bind_request",
     "bound_rows",
     "bytes_digest",
     "catalog_model",
@@ -238,6 +293,7 @@ __all__ = [
     "entries",
     "failure",
     "fields",
+    "format_as_of",
     "json_object",
     "json_rows",
     "limits",
@@ -247,10 +303,12 @@ __all__ = [
     "model_id",
     "name",
     "number",
+    "parse_as_of",
     "parse_body",
     "parse_lock",
     "parse_model",
     "pin",
+    "prefetch_catalog",
     "published_entry",
     "read_table",
     "request_table",
@@ -259,10 +317,21 @@ __all__ = [
     "served_context",
     "success",
     "table_digest",
-    "task_of",
-    "temporal",
     "text",
     "to_arrow",
     "unique_object",
     "upgrade_lock",
 ]
+
+
+def _main(argv: list[str]) -> int:
+    """`python -m generalforecast.hosting prefetch`: the image build's model download."""
+    if argv != ["prefetch"]:
+        print("usage: python -m generalforecast.hosting prefetch", file=sys.stderr)
+        return 2
+    prefetch_catalog()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main(sys.argv[1:]))
