@@ -409,7 +409,7 @@ def test_context_versions_name_a_live_context_apart_from_its_kind():
         "version": 3,
         "digest": None,
         "rows": 10,
-        "as_of": None,
+        "as_of": "2025-10-27T08:00:00Z",
     }
     assert ContextVersion.from_dict(version.to_dict()) == version
     assert context_version({"source": "live/events", "version": 3}) == ContextVersion(
