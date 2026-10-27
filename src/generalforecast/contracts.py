@@ -6,7 +6,7 @@
 import datetime
 from dataclasses import MISSING, asdict, dataclass, is_dataclass, replace
 from dataclasses import fields as dataclass_fields
-from typing import Any, Protocol, Self
+from typing import Any, Self
 from urllib.parse import urlsplit
 
 import pyarrow as pa
@@ -23,7 +23,6 @@ from generalforecast.predictors.validation import (
     name,
     text,
 )
-from generalforecast.service.boundary import Scope
 
 API_PREFIX = "/v1"
 STATES = frozenset({"pending", "building", "ready", "failed", "stopped"})
@@ -539,32 +538,6 @@ class RuntimePlan(WireValue):
                 "UnsupportedCapability",
             )
 
-    @classmethod
-    def for_lock(
-        cls,
-        lock: "PredictorLock",
-        *,
-        runtime: str,
-        environment: str,
-        secret_refs: tuple[str, ...] = (),
-    ) -> "RuntimePlan":
-        """Compiles portable placement without creating infrastructure or identities."""
-        lock = parse_lock(lock.to_dict())
-        return cls(
-            runtime,
-            environment,
-            lock.digest,
-            lock.predictor["model_digest"],
-            lock.data_digest,
-            None,
-            (),
-            1,
-            "2Gi",
-            1,
-            1,
-            secret_refs,
-        )
-
 
 @dataclass(frozen=True)
 class PredictionResult:
@@ -683,24 +656,3 @@ class PredictionResult:
         if body.get("context") is not None:
             body["context"] = context_version(body["context"])
         return cls(**body)
-
-
-class RevisionStore(Protocol):
-    """Durable scoped revision and environment port implemented by the API owner."""
-
-    def create(
-        self,
-        scope: Scope,
-        predictor: str,
-        lock: "PredictorLock",
-        *,
-        snapshot: str | None = None,
-    ) -> Revision:
-        """Persists immutable revision identity and authenticated snapshot binding."""
-        ...
-
-    def promote(
-        self, scope: Scope, predictor: str, environment: str, request: PromoteRequest
-    ) -> Environment:
-        """Atomically updates one pointer after authorization and runtime admission."""
-        ...

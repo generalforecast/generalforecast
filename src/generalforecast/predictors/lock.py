@@ -666,11 +666,13 @@ def _flatten(value: dict[str, Any], prefix: str = "") -> dict[str, Any]:
 def load_lock(root: str | Path, spec: PredictorSpec | None = None) -> Resolution:
     """The resolution a `gf.lock` records, without touching the context.
 
-    This is what `gf check --frozen`, `gf.Predictor` and `gf serve` read. The
-    lock must describe the manifest beside it exactly: it records the
-    digest of the normalized `gf.yaml`, so any edit that could change a
-    prediction (inputs, types, split, selection and its seed, frequency,
-    quantiles, resources) makes it stale.
+    This is what `gf check --frozen` reads. (`gf.Predictor` resolves the
+    manifest again and compares; `gf serve` and `gf push` validate the
+    document and its manifest digest themselves.) The lock must describe
+    the manifest beside it exactly: it records the digest of the
+    normalized `gf.yaml`, so any edit that could change a prediction
+    (inputs, types, split, selection and its seed, frequency, quantiles,
+    resources) makes it stale.
 
     Raises:
         InvalidInput: If there is no lock, it is not a version 2 lock, or it

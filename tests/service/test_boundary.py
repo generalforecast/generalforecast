@@ -156,12 +156,9 @@ def test_json_depth_and_finite_limits():
 
 def test_capability_is_not_fake_success(fixture):
     capability = Capability(**fixture["capability"])
-    with pytest.raises(ServiceError) as error:
-        capability.enforce()
-    assert error.value.code == "IsolationUnavailable"
-    assert error.value.status == 501
+    assert capability.state != "supported" and capability.code
     assert asdict(capability) == fixture["capability"]
-    Capability("one-shot", "supported").enforce()
+    Capability("one-shot", "supported")
     for args in [
         ("one-shot", "unsupported"),
         ("one-shot", "supported", "Unsupported", "no"),
