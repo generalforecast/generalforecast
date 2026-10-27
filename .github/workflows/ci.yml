@@ -32,17 +32,20 @@ on:
         default: true
 
 # A newer run for the same PR or branch cancels the older one; adding any
-# other label gets a group of its own, so it cannot cancel a real run.
+# other label gets a group of its own, so it cannot cancel a real run, and
+# so does a release's run, which a push to its branch must not cancel.
 concurrency:
   group: >-
-    ${{ github.event.action == 'labeled' && github.event.label.name != 'ci' &&
-    github.run_id || format('ci-{0}', github.event.pull_request.number || github.ref) }}
+    ${{ (inputs.everything ||
+    (github.event.action == 'labeled' && github.event.label.name != 'ci')) &&
+    format('ci-run-{0}', github.run_id) ||
+    format('ci-{0}', github.event.pull_request.number || github.ref) }}
   cancel-in-progress: true
 
 jobs:
   # Decides which jobs run, from the API alone so it needs no checkout.
   changes:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 3
     if: >-
       github.event_name != 'pull_request' ||
@@ -111,7 +114,7 @@ jobs:
   rust:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -136,7 +139,7 @@ jobs:
   python:
     needs: changes
     if: needs.changes.outputs.python == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -164,7 +167,7 @@ jobs:
   serving:
     needs: changes
     if: needs.changes.outputs.serving == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -179,10 +182,49 @@ jobs:
       - run: cargo build -p gf-server -p gf-router
       - run: uv run pytest -m "(server or router) and slow" -n auto
 
+  # Replays api/openapi.yaml's examples, and checks real predictions'
+  # meaning, against a gf serve stack on the tiny test models, so a reply
+  # that drifts from the spec fails here rather than in a client.
+  conformance:
+    needs: changes
+    if: needs.changes.outputs.serving == 'true' || needs.changes.outputs.typescript == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.8.0"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: cargo build -p gf-server
+      # The stack prints one JSON line once it answers /readyz, after its
+      # worker compiles; the suite runs against it, then it is stopped.
+      - name: Replay the spec against gf serve
+        run: |
+          uv run python scripts/conformance_server.py --binary target/debug/gf-server >server.json &
+          stack=$!
+          until [ -s server.json ]; do
+            kill -0 "$stack" || exit 1
+            sleep 2
+          done
+          GF_CONFORMANCE_URL=$(jq -r .url server.json)
+          GF_CONFORMANCE_TOKEN=$(jq -r .token server.json)
+          GF_CONFORMANCE_PROJECT=$(jq -r .project server.json)
+          export GF_CONFORMANCE_URL GF_CONFORMANCE_TOKEN GF_CONFORMANCE_PROJECT
+          status=0
+          uv run pytest -m conformance tests/conformance || status=$?
+          kill "$stack"
+          wait "$stack" || true
+          exit "$status"
+
   typescript:
     needs: changes
     if: needs.changes.outputs.typescript == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     defaults:
       run:
@@ -191,7 +233,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
-          node-version: "22"
+          node-version: "22.23.3"
       - run: npm ci
       # Builds the client, then checks it against the spec's examples.
       - run: npm test
