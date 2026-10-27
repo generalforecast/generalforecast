@@ -762,13 +762,10 @@ impl WorkerConnection {
 
     /// A connection to a worker on the other end of `stream`, for tests that
     /// stand in for the worker process. Killing it closes the pipeline as an
-    /// exit would; starting it again fails, since there is no command.
-    ///
-    /// # Errors
-    ///
-    /// If a directory for the connection cannot be made.
-    pub fn fake(stream: UnixStream, models: Vec<String>) -> Result<Self, String> {
-        let directory = Private::new(&std::env::temp_dir()).map_err(|error| error.to_string())?;
+    /// exit would; starting it again fails, since there is no command. It
+    /// has no socket, so no directory of its own.
+    #[must_use]
+    pub fn fake(stream: UnixStream, models: Vec<String>) -> Self {
         let pipeline = Pipeline::new(stream, std::env::temp_dir(), Compiling::default());
         let stopper = pipeline.stopper.clone();
         let (stop, stopping) = oneshot::channel::<Stop>();
@@ -776,7 +773,7 @@ impl WorkerConnection {
             let _ = stopping.await;
             stopper.stop("the worker exited (killed)");
         });
-        Ok(Self {
+        Self {
             pipeline,
             launch: Launch {
                 index: 0,
@@ -799,13 +796,13 @@ impl WorkerConnection {
             },
             exited,
             stop: Some(stop),
-            directory: Some(directory),
+            directory: None,
             models,
             device_memory: 1 << 30,
             device_bytes: 1 << 29,
             host_bytes: 1 << 28,
             row_memory_bytes: 1 << 28,
-        })
+        }
     }
 
     /// Kills the worker, if it is still running, and waits for it to exit,

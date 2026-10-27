@@ -313,12 +313,6 @@ impl Table {
         self.keys.get(key).ok_or(TableError::UnknownKey(key))
     }
 
-    /// How many more rows can be inserted, since row ids are never reused.
-    #[must_use]
-    pub fn ids_left(&self) -> u64 {
-        ROW_IDS.saturating_sub(self.ids_used())
-    }
-
     /// How many row ids rows have taken, live or since deleted.
     #[must_use]
     pub fn ids_used(&self) -> u64 {

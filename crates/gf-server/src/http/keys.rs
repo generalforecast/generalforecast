@@ -163,7 +163,8 @@ struct Introspected {
 
 impl Introspect {
     /// Checks keys against the control plane at `base`, such as
-    /// `https://api.generalforecast.com`, under `token`.
+    /// `https://app.generalforecast.com` or one on loopback behind the
+    /// front, under `token`.
     ///
     /// # Errors
     ///

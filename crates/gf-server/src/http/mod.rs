@@ -34,6 +34,7 @@ use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+use crate::as_of::{self, AsOf};
 use crate::auth::digest;
 use crate::budget::{Charge, RequestBudget};
 use crate::engine::{self, Bound, Engine};
@@ -42,7 +43,7 @@ use crate::name::TableName;
 use crate::predictors::{self, ContextMode, ForecastPredictor, ServedPredictor};
 use crate::progress::Compiling;
 use crate::quantiles::quantile_values;
-use crate::revisions::{Published, Record, Revisions};
+use crate::revisions::{ContextSource, Published, Record, Revisions, SourceKind};
 use crate::routes::Routes;
 use crate::setup::random_hex;
 use crate::shard::{Asked, Command, Inferred};
@@ -54,10 +55,10 @@ mod incoming;
 mod keys;
 mod predictions;
 
+pub use incoming::{ambiguous, internal, owns};
 use incoming::{
     check_endpoint, check_headers, check_origin, environment, names_match, parse_envelope, resolve,
 };
-pub use incoming::{dotted, internal, owns};
 pub use keys::{Introspect, KeyStore, Principal, Static};
 pub(crate) use predictions::snapshot_rows;
 use predictions::{adhoc_predict_with, dispatch};
@@ -568,10 +569,9 @@ impl Front {
         self.keys.auth()
     }
 
-    /// The served models' names.
-    #[must_use]
     /// What this server serves, predictors by name and catalog models by
     /// canonical id.
+    #[must_use]
     pub fn names(&self) -> Vec<String> {
         self.models
             .iter()
@@ -658,7 +658,7 @@ fn failure(scope: Option<&Scope>, error: &ApiError) -> Response {
 }
 
 async fn handle(State(front): State<Arc<Front>>, request: Request) -> Response {
-    if dotted(request.uri().path()) {
+    if ambiguous(request.uri().path()) {
         return failure(None, &ApiError::validation("invalid request target"));
     }
     if internal(request.uri().path()) {
@@ -944,8 +944,10 @@ impl Front {
         description
     }
 
-    /// A predictor's `GET predictors/{name}` entry: its resolved manifest,
-    /// lock digests, context kind and size, and what it answers.
+    /// A predictor's `GET predictors/{name}` entry, as the API's `Predictor`
+    /// resource has it: its model, task, target and inputs, a forecaster's
+    /// time and series, its context as the lock pins it, and its lock's
+    /// digest. A predictor served from its lock has no environments.
     fn predictor_description(&self, served: &ServedModel, predictor: &ServedPredictor) -> Value {
         let rows = match predictor.context {
             ContextMode::Snapshot => self
@@ -961,22 +963,33 @@ impl Front {
                 }),
             ContextMode::Request => None,
         };
-        json!({
+        let mut context = json!({"kind": predictor.context.kind()});
+        if let Some(rows) = rows {
+            context["rows"] = json!(rows);
+        }
+        if let Some(digest) = &predictor.context_digest {
+            context["digest"] = json!(digest);
+        }
+        let mut described = json!({
             "name": served.name,
+            "environments": [],
             "model": served.resolved,
             "task": predictor.task,
-            "target": predictor.target,
-            "inputs": predictor.inputs,
-            "id": predictor.id,
-            "context": {
-                "kind": predictor.context.kind(),
-                "rows": rows,
-                "digest": predictor.context_digest,
-            },
+            "inputs": predictor.described_inputs(),
+            "context": context,
             "lock_digest": predictor.lock_digest,
-            "outputs": served.outputs,
-            "quantiles": predictor.quantiles,
-        })
+        });
+        if let Some(target) = &predictor.target {
+            described["target"] = json!(target);
+        }
+        if let Some(id) = &predictor.id {
+            described["id"] = json!(id);
+        }
+        if let Some(forecast) = &predictor.forecast {
+            described["time"] = json!(forecast.time);
+            described["series"] = json!(forecast.series);
+        }
+        described
     }
 
     /// The catalog model served as exactly this reference, variant and all.
@@ -996,8 +1009,7 @@ impl Front {
             .ok_or_else(ApiError::not_served)
     }
 
-    /// Admits a payload's model only if it is exactly the reference served,
-    /// variant and all.
+    /// The engine inference runs through, once the shards are up.
     fn engine(&self) -> Result<&Engine, ApiError> {
         self.engine.get().ok_or_else(not_ready)
     }

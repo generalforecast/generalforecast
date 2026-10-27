@@ -3,6 +3,8 @@
 
 //! A node: many tables, one queue, one cache.
 
+mod scratch;
+
 use std::collections::HashSet;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::sync::Arc;
@@ -19,6 +21,7 @@ use gf_core::planner::{CoreKind, Recency, Strategy, StrategyError};
 use gf_core::regions::{Rebuild, RebuildWait, RegionSpec};
 use gf_core::rows::{RowMemory, Sealer};
 use gf_core::table::{RowId, RowKey, TableError};
+use scratch::Scratch;
 
 const FEATURES: usize = 2;
 
@@ -1818,8 +1821,8 @@ impl Sealer for Plain {
 
 #[test]
 fn a_table_whose_rows_spill_to_disk_holds_what_one_in_memory_does() {
-    let directory = std::env::temp_dir().join(format!("gf-node-rows-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
+    let scratch = Scratch::new("node-rows");
+    let directory = scratch.path();
     let mut in_memory = node(64);
     let mut spilling = node(64).with_row_memory(RowMemory::bounded(0));
     let kept = in_memory.create_table(spec(NEAREST)).unwrap();
@@ -5120,21 +5123,22 @@ impl Sealer for Flaky {
     }
 }
 
-/// A node whose rows all spill, and a table on `sealer`'s file there.
-fn spilling(spec: TableSpec, sealer: Arc<Flaky>, name: &str) -> (Node, TableId) {
-    let directory = std::env::temp_dir().join(format!("gf-node-flaky-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
+/// A node whose rows all spill, and a table on `sealer`'s file there, in a
+/// directory the returned guard removes.
+fn spilling(spec: TableSpec, sealer: Arc<Flaky>, name: &str) -> (Node, TableId, Scratch) {
+    let scratch = Scratch::new("node-flaky");
+    let directory = scratch.path();
     let mut node = node(64).with_row_memory(RowMemory::bounded(0));
     let table = node
         .create_table_on_disk(spec, &directory.join(name), sealer)
         .unwrap();
-    (node, table)
+    (node, table, scratch)
 }
 
 #[test]
 fn a_page_whose_rows_fail_to_read_is_embedded_by_the_next_step() {
     let flaky = Flaky::new();
-    let (mut node, table) = spilling(spec(Strategy::Exact), flaky.clone(), "pages.rows");
+    let (mut node, table, _scratch) = spilling(spec(Strategy::Exact), flaky.clone(), "pages.rows");
     let (keys, features, targets) = rows(32);
     node.insert(table, &keys, &features, targets).unwrap();
     node.submit(table, &A).unwrap();
@@ -5144,9 +5148,18 @@ fn a_page_whose_rows_fail_to_read_is_embedded_by_the_next_step() {
         .unwrap();
     node.submit(table, &A).unwrap();
 
+    // The table's request is refused with the read's error, and asked again.
     flaky.fail_after(0);
-    assert!(matches!(node.schedule(), Err(NodeError::Rows(_))));
+    let request = node.submit(table, &A).unwrap();
+    assert!(matches!(node.schedule(), Ok(None)));
+    let refused = node.take_refused();
+    assert!(
+        refused
+            .iter()
+            .any(|(id, error)| *id == request && matches!(error, NodeError::Rows(_)))
+    );
     flaky.heal();
+    node.submit(table, &A).unwrap();
     let step = run(&mut node);
 
     let page = step
@@ -5161,16 +5174,19 @@ fn a_page_whose_rows_fail_to_read_is_embedded_by_the_next_step() {
 #[test]
 fn a_fused_fit_whose_rows_fail_to_read_is_fit_again() {
     let flaky = Flaky::new();
-    let (mut node, table) = spilling(spec(Strategy::Exact), flaky.clone(), "fused.rows");
+    let (mut node, table, _scratch) = spilling(spec(Strategy::Exact), flaky.clone(), "fused.rows");
     let (keys, features, targets) = rows(32);
     node.insert(table, &keys, &features, targets).unwrap();
     node.set_single_use(table).unwrap();
     node.submit(table, &A).unwrap();
 
-    // The fit reads the rows, then the unit fails to read them again.
+    // The fit reads the rows, then the unit fails to read them again; the
+    // request is refused with the read's error, and asked again.
     flaky.fail_after(1);
-    assert!(matches!(node.schedule(), Err(NodeError::Rows(_))));
+    assert!(matches!(node.schedule(), Ok(None)));
+    assert!(matches!(node.take_refused()[..], [(_, NodeError::Rows(_))]));
     flaky.heal();
+    node.submit(table, &A).unwrap();
     let step = run(&mut node);
 
     assert_eq!(actions(&step), [Action::Fuse]);
@@ -5181,8 +5197,8 @@ fn a_rebuild_step_that_fails_to_plan_leaves_nothing_behind() {
     let flaky = Flaky::new();
     let mut node = node(64).with_row_memory(RowMemory::bounded(0));
     let kept = node.create_table(regioned(Rebuild::Always)).unwrap();
-    let directory = std::env::temp_dir().join(format!("gf-node-flaky-{}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
+    let scratch = Scratch::new("node-flaky");
+    let directory = scratch.path();
     let spilled = node
         .create_table_on_disk(
             regioned(Rebuild::Always),
@@ -5514,4 +5530,60 @@ fn a_tables_row_id_cap_refuses_the_insert_past_it() {
     // No cap reaches past the most ids any table assigns.
     node.set_row_ids(table, NonZeroU64::MAX).unwrap();
     assert_eq!(node.ids_left(table).unwrap(), ROW_IDS - 12);
+}
+
+#[test]
+fn a_table_whose_rows_cannot_be_read_fails_its_own_requests_alone() {
+    let flaky = Flaky::new();
+    let (mut node, failing, _scratch) =
+        spilling(spec(Strategy::Exact), flaky.clone(), "failing.rows");
+    let kept = node.create_table(spec(Strategy::Exact)).unwrap();
+    for table in [failing, kept] {
+        let (keys, features, targets) = rows(32);
+        node.insert(table, &keys, &features, targets).unwrap();
+    }
+    // The failing table's rows never read again.
+    flaky.fail_after(0);
+    let lost = node.submit(failing, &A).unwrap();
+    node.submit(kept, &A).unwrap();
+
+    let step = node.schedule().unwrap().expect("the kept table's step");
+    assert!(step.queries().iter().all(|batch| batch.table == kept));
+    assert!(matches!(node.take_refused()[..], [(id, NodeError::Rows(_))] if id == lost));
+    // Nothing of the failing table stays queued to fail the next schedule.
+    node.fail(&step);
+    node.submit(kept, &A).unwrap();
+    assert!(node.schedule().unwrap().is_some());
+    assert!(node.take_refused().is_empty());
+}
+
+#[test]
+fn a_fit_unwound_with_its_step_leaves_drift_measured_against_the_last_one() {
+    let flaky = Flaky::new();
+    let (mut node, table, _scratch) =
+        spilling(spec(Strategy::Exact), flaky.clone(), "baseline.rows");
+    let (keys, features, targets) = rows(32);
+    node.insert(table, &keys, &features, targets).unwrap();
+    node.set_single_use(table).unwrap();
+    node.submit(table, &A).unwrap();
+    run(&mut node);
+    node.update(
+        table,
+        &[0, 1],
+        &[0.5, 0.5, 0.25, 0.25],
+        Targets::Classes(vec![1, 1]),
+    )
+    .unwrap();
+    node.refit(table).unwrap();
+    let before = node.compaction_source(table).unwrap().table;
+
+    // The fused fit reads the rows, then its unit fails to, so the step unwinds.
+    flaky.fail_after(1);
+    node.submit(table, &A).unwrap();
+    assert!(matches!(node.schedule(), Ok(None)));
+    flaky.heal();
+
+    let after = node.compaction_source(table).unwrap().table;
+    assert_eq!(after.changed, before.changed);
+    assert_eq!(after.fitted, before.fitted);
 }

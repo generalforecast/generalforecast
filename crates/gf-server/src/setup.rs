@@ -33,19 +33,7 @@ pub struct Starter {
 pub fn random_hex(bytes: usize) -> Result<String, String> {
     let mut buffer = vec![0u8; bytes];
     getrandom::fill(&mut buffer).map_err(|error| error.to_string())?;
-    Ok(hex(&buffer))
-}
-
-/// Bytes as lowercase hex.
-#[must_use]
-pub fn hex(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    bytes
-        .iter()
-        .fold(String::with_capacity(bytes.len() * 2), |mut hex, byte| {
-            let _ = write!(hex, "{byte:02x}");
-            hex
-        })
+    Ok(gf_core::request::hex(&buffer))
 }
 
 /// Writes a file only its owner may read, as a configuration holding tokens is.
@@ -391,14 +379,8 @@ mod tests {
         }
     }
 
-    fn tempdir() -> PathBuf {
-        let directory = std::env::temp_dir().join(format!(
-            "gf-setup-{}-{}",
-            std::process::id(),
-            random_hex(4).unwrap()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        directory
+    fn tempdir() -> crate::scratch::Scratch {
+        crate::scratch::Scratch::new("setup")
     }
 
     #[test]

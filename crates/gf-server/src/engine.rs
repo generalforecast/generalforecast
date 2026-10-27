@@ -131,6 +131,7 @@ impl Engine {
             request.targets.clone(),
             request.usable_rows(),
             None,
+            false,
         )?;
         let answered = self
             .ask(
@@ -225,6 +226,7 @@ impl Engine {
             features: Vec::with_capacity(rows * covariates.len()),
             targets: Targets::Values(Vec::with_capacity(rows)),
             times: Some(Vec::with_capacity(rows)),
+            shared: false,
         };
         let mut values = Vec::with_capacity(rows);
         for (series, &target) in targets.iter().enumerate() {
@@ -526,13 +528,25 @@ impl Engine {
 
     /// Sends a shard a command and waits, within the request timeout, for
     /// its answer, counted in the shard's load until then.
+    ///
+    /// The tables a call reaches are the engine's own, a request's context
+    /// or a predictor's binding, which the shard may have just evicted,
+    /// dropped with a restarted worker, or not yet restored; one it does not
+    /// find is gone for now, not a resource the caller named, so the call is
+    /// answered as one to retry rather than as not found.
     async fn wait<T>(
         &self,
         busy: Busy<'_>,
         command: Command,
         answer: oneshot::Receiver<Result<T, ServerError>>,
     ) -> Result<T, ApiError> {
-        Ok(self.answered(busy, command, answer).await??)
+        Ok(self
+            .answered(busy, command, answer)
+            .await?
+            .map_err(|error| match error {
+                ServerError::NotFound(message) => ServerError::Unavailable(message),
+                error => error,
+            })?)
     }
 
     /// The shard's answer to a command, or why there is none: it stopped, or
@@ -621,6 +635,7 @@ pub fn bound_shard(fingerprint: &[u8; 32], shards: usize) -> usize {
 
 /// A tabular context in the ephemeral table its fingerprint names, drawn
 /// per query by `strategy` when a predictor's lock selects; exact when None.
+/// `shared` as `RequestContext::shared` has it.
 #[allow(clippy::too_many_arguments)]
 pub fn rows_context(
     model: &str,
@@ -631,6 +646,7 @@ pub fn rows_context(
     targets: Targets,
     rows: usize,
     strategy: Option<&Value>,
+    shared: bool,
 ) -> Result<RequestContext, ApiError> {
     let name = format!("ctx-{}", request::hex(fingerprint));
     let definition: TableDefinition = serde_json::from_value(definition(
@@ -649,5 +665,6 @@ pub fn rows_context(
         features,
         targets,
         times: None,
+        shared,
     })
 }

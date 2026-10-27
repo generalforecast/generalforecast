@@ -119,7 +119,7 @@ impl EncryptionKey {
     /// message sealed under it, as hex.
     #[must_use]
     pub fn id(&self) -> String {
-        crate::setup::hex(&self.id_bytes())
+        gf_core::request::hex(&self.id_bytes())
     }
 
     /// The key's id, as a log's header names it.
@@ -1040,7 +1040,7 @@ impl Replay {
         }
         let id: [u8; KEY_ID] = header[MAGIC.len() + 2..].try_into().expect("sized");
         let (key, current) = keys.find(&id).ok_or_else(|| LogError::Key {
-            id: crate::setup::hex(&id),
+            id: gf_core::request::hex(&id),
         })?;
         let head = read_head(path, &table, keys)?;
         let mut entries = Entries {
@@ -1732,9 +1732,7 @@ mod tests {
 
     #[test]
     fn a_table_with_a_retired_strategy_is_not_served_and_keeps_its_log() {
-        let directory = std::env::temp_dir().join(format!("gf-retired-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = crate::scratch::Scratch::new("retired");
         let path = directory.join("payments.log");
         let key = EncryptionKey::from_hex(&"07".repeat(32)).unwrap();
         log_with_strategy(
@@ -1756,6 +1754,5 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), log);
         assert_eq!(std::fs::read(head_path(&path)).unwrap(), head);
         assert!(!directory.join("payments.log.unreadable").exists());
-        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

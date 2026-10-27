@@ -86,6 +86,8 @@ impl Node {
                 state.fitted = mark.fitted;
                 state.horizon = mark.horizon;
                 state.fitted_latest = mark.fitted_latest;
+                state.fitted_columns = mark.fitted_columns;
+                state.changed = mark.changed;
             }
         }
         for (key, table, region) in rebuilds {
