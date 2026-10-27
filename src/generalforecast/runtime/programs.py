@@ -408,6 +408,9 @@ class Programs:
         self._running = False
         self._idle_since = clock()
         self._generation = 0
+        # The generation of the task this thread runs, which the tasks it
+        # queues keep, so a drop ends them too.
+        self._running_generation = threading.local()
         # Whether the last drop for memory mappings left them short, so the
         # programs were not what held them.
         self._mappings_futile = False
@@ -622,31 +625,49 @@ class Programs:
         """
         if not self._ahead:
             return
-        with self._steps:
-            generation = self._generation
+        generation = getattr(self._running_generation, "value", None)
+        if generation is None:
+            with self._steps:
+                generation = self._generation
 
         def run() -> None:
             if not self._wait_quiet(generation):
                 return
+            self._running_generation.value = generation
             try:
                 task()
             except Exception:  # noqa: BLE001
                 return
+            finally:
+                self._running_generation.value = None
 
         with self._lock:
             self._later = [future for future in self._later if not future.done()]
             self._later.append(self._thread.submit(run))
 
     def wait(self, tasks: Iterable[Future] | None = None) -> None:
-        """Waits for every task started in the background, or for `tasks` and those steps wait on.
+        """Waits for every task started in the background, those they start too, or for `tasks` and those steps wait on.
 
         A task cancelled before it started is not waited for.
         """
-        with self._lock:
-            pending = [*self._pending, *(self._later if tasks is None else tasks)]
-        for future in pending:
-            if not future.cancelled():
-                future.result()
+        waited: set[Future] = set()
+        chosen = None if tasks is None else list(tasks)
+        while True:
+            with self._lock:
+                pending = [
+                    future
+                    for future in [
+                        *self._pending,
+                        *(self._later if chosen is None else chosen),
+                    ]
+                    if future not in waited
+                ]
+            if not pending:
+                return
+            for future in pending:
+                waited.add(future)
+                if not future.cancelled():
+                    future.result()
 
     @contextmanager
     def step(self) -> Iterator[None]:

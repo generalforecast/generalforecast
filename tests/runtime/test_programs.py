@@ -329,3 +329,41 @@ def test_most_rows_is_a_signatures_longest_first_axis() -> None:
     table = (jnp.zeros((16384, 31)), jnp.zeros(16384, jnp.int32), 3)
     assert most_rows(signature(table)) == 16384
     assert most_rows(signature((jnp.float32(1),))) == 0
+
+
+def test_waiting_takes_in_the_compiles_ahead_a_compile_ahead_queues() -> None:
+    programs = Programs(None, lambda: False, clock=lambda: 1e9)
+    programs.quiet = 0.0
+    events: list[str] = []
+
+    def outer() -> None:
+        events.append("outer")
+        programs.later(lambda: events.append("inner"))
+
+    programs.later(outer)
+    programs.wait()
+
+    assert events == ["outer", "inner"]
+
+
+def test_a_drop_ends_the_compiles_ahead_a_dropped_one_queues() -> None:
+    now = [0.0]
+    programs = Programs(None, lambda: False, clock=lambda: now[0])
+    events: list[str] = []
+    queued = threading.Event()
+    release = threading.Event()
+
+    def outer() -> None:
+        programs.later(lambda: events.append("inner"))
+        queued.set()
+        assert release.wait(5)
+
+    programs.later(outer)
+    now[0] = programs.quiet
+    assert queued.wait(5)
+    threading.Timer(0.1, release.set).start()
+    programs.drop()
+    programs.wait()
+
+    # Queued under the dropped generation, the inner compile never runs.
+    assert events == []
