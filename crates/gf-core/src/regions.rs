@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use crate::cache::Epoch;
 use crate::context::{Context, Fingerprint, mix};
+use crate::distance::squared32;
 use crate::pages::Vectors;
 use crate::planner::{hash, smallest};
 use crate::rows::RowsError;
@@ -455,7 +456,7 @@ fn k_means(points: &[Vec<f32>], count: usize, seed: u64, dimensions: usize) -> V
     };
     let mut centers = vec![first.clone()];
     let mut nearest_distance: Vec<f32> =
-        points.iter().map(|point| distance(point, first)).collect();
+        points.iter().map(|point| squared32(point, first)).collect();
     while centers.len() < count.min(points.len()) {
         let total: f64 = nearest_distance
             .iter()
@@ -476,7 +477,7 @@ fn k_means(points: &[Vec<f32>], count: usize, seed: u64, dimensions: usize) -> V
             .unwrap_or(points.len() - 1);
         let center = points[chosen].clone();
         for (held, point) in nearest_distance.iter_mut().zip(points) {
-            *held = held.min(distance(point, &center));
+            *held = held.min(squared32(point, &center));
         }
         centers.push(center);
     }
@@ -507,20 +508,12 @@ fn k_means(points: &[Vec<f32>], count: usize, seed: u64, dimensions: usize) -> V
 fn nearest(centers: &[Vec<f32>], vector: &[f32]) -> usize {
     let mut best = (f32::INFINITY, 0);
     for (index, center) in centers.iter().enumerate() {
-        let distance = distance(center, vector);
+        let distance = squared32(center, vector);
         if distance < best.0 {
             best = (distance, index);
         }
     }
     best.1
-}
-
-/// The squared distance between two vectors.
-fn distance(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(&left, &right)| (left - right) * (left - right))
-        .sum()
 }
 
 #[cfg(test)]

@@ -22,6 +22,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 
 use crate::context::{Context, Fingerprint, mix};
+use crate::distance::squared;
 use crate::pages::{IndexError, PageIndex, Vectors};
 use crate::table::{Keys, RowId, Snapshot};
 use crate::time_index::TimeIndex;
@@ -818,11 +819,7 @@ fn farthest(
             if nearest[index] == f64::NEG_INFINITY {
                 continue;
             }
-            let distance: f64 = point
-                .iter()
-                .zip(&points[next])
-                .map(|(&value, &other)| (f64::from(value) - f64::from(other)).powi(2))
-                .sum();
+            let distance = squared(point, &points[next]);
             nearest[index] = nearest[index].min(distance);
             let ahead = nearest[index]
                 .total_cmp(&farthest.0)

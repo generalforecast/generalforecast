@@ -473,12 +473,7 @@ impl Node {
                 None => nearest,
             };
             for row in nearest.iter() {
-                let score = scaled
-                    .vector(row)?
-                    .iter()
-                    .zip(vector)
-                    .map(|(&value, &target)| (f64::from(value) - f64::from(target)).powi(2))
-                    .sum();
+                let score = squared(&scaled.vector(row)?, vector);
                 offered.push(Candidate {
                     query: Some(query as u32),
                     row,

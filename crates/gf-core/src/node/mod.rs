@@ -21,6 +21,7 @@ use crate::cache::{
 };
 use crate::categories::{CategoryEncoding, Lookup};
 use crate::context::{Context, Fingerprint};
+use crate::distance::squared;
 use crate::forecasting::{self, Forecast, ForecastError, SeriesRequest, SeriesSpec, SeriesUnit};
 use crate::pages::{Bucket, IndexError, IndexLayout, PageId, PageIndex, PageLayout, Vectors};
 use crate::planner::{
