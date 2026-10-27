@@ -39,11 +39,10 @@ def test_init_transcript(suite):
         "       Found context.csv  2,052 rows, 5 columns",
         "",
         "Target",
-        "  > churned        0/1",
-        "    customer_id    int",
-        "    spend          float",
-        "    plan           category",
-        "    signups        int",
+        "  > churned    0/1",
+        "    plan       category",
+        "    signups    int",
+        "    spend      float",
     ]
     assert lines(suite, "init") == [
         "       Found context.csv  2,052 rows, 5 columns",
@@ -281,7 +280,8 @@ def test_init_asks_nothing_it_cannot_offer_and_takes_only_good_values(suite):
         "Model        general-forecast/chronos-2",
     ]
     assert "Inputs       none" in forecast
-    assert "Until        2025-01-30  2 rows" in forecast
+    # Each of the two series holds out its horizon of five days.
+    assert "Until        2025-01-26  10 rows" in forecast
     assert forecast[-1] == " Initialized predictor sales in ./gf.yaml"
     holdout = lines(suite, "init-holdout")
     assert "Holdout      0.03  62 rows" in holdout

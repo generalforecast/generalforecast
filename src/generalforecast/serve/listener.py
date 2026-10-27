@@ -37,9 +37,12 @@ API_KEY_ENV = "GF_API_KEY"
 REQUEST_TIMEOUT_SECONDS = 300.0
 SERVER = "gf-server"
 ROUTER = "gf-router"
+# The variables that name a server program explicitly, ahead of any search.
+OVERRIDES = {SERVER: "GF_SERVER_BIN", ROUTER: "GF_ROUTER_BIN"}
 # Whether this platform runs the servers: Linux and macOS do, Windows does not.
 POSIX = os.name == "posix"
 # Release wheels carry the servers here, off PATH, so `gf` is the one command.
+# `binary` documents the order the servers are looked for in.
 BIN = Path(__file__).resolve().parents[1] / "bin"
 # Removes the directory named by argv[1] once every holder of the pipe whose
 # read end is fd argv[2] has exited: the server, and every worker it started.
@@ -66,20 +69,58 @@ def supported() -> None:
         )
 
 
-def binary(name: str = SERVER) -> Path:
-    """One of the servers the wheel carries inside the package, else the first on PATH.
+def _checkout() -> Path | None:
+    """The source checkout this package runs from, or None for an installed one."""
+    root = Path(__file__).resolve().parents[3]
+    return (
+        root if (root / "Cargo.toml").is_file() and (root / "crates").is_dir() else None
+    )
 
-    Images and older wheels install them beside Python instead.
+
+def _stale(program: Path, checkout: Path) -> bool:
+    """Whether a staged server predates the Rust sources it was built from."""
+    built = program.stat().st_mtime
+    sources = [checkout / "Cargo.lock", *checkout.glob("crates/*/Cargo.toml")]
+    sources += checkout.glob("crates/*/src/**/*.rs")
+    return any(source.stat().st_mtime > built for source in sources)
+
+
+def binary(name: str = SERVER) -> Path:
+    """The server program `name` runs, found in this order.
+
+    1. `GF_SERVER_BIN` for gf-server, `GF_ROUTER_BIN` for gf-router: a path,
+       used as given.
+    2. The package's own `bin`, where release wheels stage the servers off
+       PATH. In a source checkout a staged server older than the Rust sources
+       is stale and skipped, so it never shadows a fresh build.
+    3. The scripts directory beside Python, where images and older wheels
+       install them.
+    4. PATH, where a source checkout's `target/release` or `target/debug`
+       goes.
     """
-    for directory in (BIN, Path(sysconfig.get_path("scripts"))):
-        if (directory / name).is_file():
-            return directory / name
+    override = os.environ.get(OVERRIDES[name])
+    if override:
+        program = Path(override).expanduser()
+        if not (program.is_file() and os.access(program, os.X_OK)):
+            raise Error(
+                f"{OVERRIDES[name]} names no program: {program}",
+                code="ConfigurationError",
+                hint=f"point {OVERRIDES[name]} at a built {name}, or unset it",
+            )
+        return program
+    staged = BIN / name
+    checkout = _checkout()
+    if staged.is_file() and (checkout is None or not _stale(staged, checkout)):
+        return staged
+    scripts = Path(sysconfig.get_path("scripts")) / name
+    if scripts.is_file():
+        return scripts
     found = shutil.which(name)
     if found is None:
         raise Error(
             f"{name} is not installed with gf",
             code="ConfigurationError",
-            hint="reinstall generalforecast",
+            hint=f"reinstall generalforecast, or set {OVERRIDES[name]}",
         )
     return Path(found)
 
@@ -256,6 +297,11 @@ def serve(args: argparse.Namespace) -> NoReturn:
 
     supported()
     listen = address(args.host, args.port)
+    if not Path(args.target).expanduser().exists():
+        # Not a predictor here, so a catalog model: named as the CLI names one.
+        from generalforecast.commands import model_registry
+
+        model_registry().canonical(args.target)
     program = binary(SERVER)
     directory, holder = private_directory()
     try:

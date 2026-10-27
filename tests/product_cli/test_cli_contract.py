@@ -33,9 +33,6 @@ def _raises(monkeypatch, error):
     monkeypatch.setattr("generalforecast.commands.execute", execute)
 
 
-# -- flags ------------------------------------------------------------------
-
-
 def test_flags_are_never_abbreviated(monkeypatch):
     _returns(monkeypatch, {"models": []})
     code, stdout, stderr = gf("model", "list", "--js", monkeypatch=monkeypatch)
@@ -85,9 +82,6 @@ def test_model_pull_reports_the_download_through_the_status_lines(monkeypatch):
     ]
     _, _, stderr = gf("-q", "model", "pull", TABICL, monkeypatch=monkeypatch)
     assert stderr == ""
-
-
-# -- results ----------------------------------------------------------------
 
 
 def test_json_results_turn_values_json_lacks_into_null(monkeypatch):
@@ -176,9 +170,6 @@ def test_the_exit_codes_are_documented_where_failures_are_presented():
     assert f"\n    {cli.BROKEN_PIPE_EXIT}  " in doc
     # The reasons the docstring names are the ones the errors carry.
     assert cli.error_object(term.Aborted("cancelled"))["error"]["reason"] == "aborted"
-
-
-# -- errors -----------------------------------------------------------------
 
 
 def _folded(status: int, envelope: dict) -> BaseException:
@@ -311,9 +302,6 @@ def test_a_declined_or_unanswered_question_says_so(monkeypatch):
     )
 
 
-# -- admin ------------------------------------------------------------------
-
-
 class _Identity:
     def __init__(self):
         self.calls = []
@@ -361,14 +349,16 @@ def test_admin_actions_bind_name_and_file_and_confirm_what_they_destroy(
     assert code == 0 and client.calls.pop() == ("audit.list", {"after": 0, "limit": 5})
 
 
-# -- predict and eval -------------------------------------------------------
-
-
 class _Recorder:
     made: ClassVar[list] = []
 
     def __init__(self, reference, **options):
         self.made.append((reference, options))
+
+    @classmethod
+    def local(cls, path):
+        cls.made.append(("local", Path(path).resolve()))
+        return object.__new__(cls)
 
     def predict(self, queries, context=None):
         import pandas as pd
@@ -420,21 +410,22 @@ def test_predict_on_a_catalog_model_takes_its_flags(monkeypatch, tmp_path, recor
     assert stdout == "id,label,p_1\n1,0,0.25\n2,1,0.75\n"
 
 
-def test_predict_names_a_directory_and_a_hosted_name_apart(
+def test_a_bare_name_is_hosted_and_a_path_is_local_everywhere(
     monkeypatch, tmp_path, recorder
 ):
     churn = tmp_path / "churn"
     churn.mkdir()
-    (churn / "gf.yaml").write_text("name: churn\n")
+    (churn / "gf.yaml").write_text(f"name: churn\nmodel: {TABICL}\ntarget: y\n")
     monkeypatch.chdir(tmp_path)
     code, _, stderr = gf(
         "predict", "churn", "--queries", "q.csv", monkeypatch=monkeypatch
     )
-    assert code == 1
-    assert stderr == (
-        "error: `churn` is both a directory with gf.yaml and a hosted predictor name\n"
-        "  hint: pass ./churn for the local predictor, "
-        "or --env production for the hosted one\n"
+    assert code == 0 and recorder.made[-1] == (
+        "churn",
+        {"env": "production", "target": None, "inputs": None},
+    )
+    assert stderr.startswith(
+        "warning: `churn` is the hosted predictor; pass ./churn for the directory here\n"
     )
     code, _, _ = gf(
         "predict",
@@ -443,16 +434,38 @@ def test_predict_names_a_directory_and_a_hosted_name_apart(
         "q.csv",
         "--env",
         "staging",
+        "-q",
         monkeypatch=monkeypatch,
     )
     assert code == 0 and recorder.made[-1][1]["env"] == "staging"
-    code, _, _ = gf(
-        "predict", "elsewhere", "--queries", "q.csv", monkeypatch=monkeypatch
+    for reference in ("./churn", str(churn)):
+        code, _, stderr = gf(
+            "predict", reference, "--queries", "q.csv", monkeypatch=monkeypatch
+        )
+        assert code == 0, stderr
+        assert recorder.made[-1] == ("local", Path(reference).resolve())
+    code, _, stderr = gf(
+        "predict",
+        "./churn",
+        "--queries",
+        "q.csv",
+        "--env",
+        "staging",
+        monkeypatch=monkeypatch,
     )
-    assert code == 0 and recorder.made[-1] == (
-        "elsewhere",
-        {"env": "production", "target": None, "inputs": None},
+    assert code == 1 and stderr.startswith(
+        "error: --env does not apply to a local predictor\n"
     )
+    from generalforecast.predictor_commands import is_local
+
+    assert [is_local(r) for r in ("churn", ".", "./churn", "~/churn", "a/b")] == [
+        False,
+        True,
+        True,
+        True,
+        True,
+    ]
+    assert not is_local("http://127.0.0.1:8000/churn")
 
 
 def test_predict_checks_its_output_before_scoring(monkeypatch, tmp_path, recorder):
@@ -518,9 +531,6 @@ def test_push_waits_for_readiness_by_wait_not_timeout():
         commands.wait(Starting())
     assert raised.value.message == "environment production is not ready yet"
     assert "'--wait'" in (raised.value.hint or "")
-
-
-# -- prompts ----------------------------------------------------------------
 
 
 def test_typed_answers_are_checked_before_they_are_used(monkeypatch, tmp_path):
@@ -700,3 +710,210 @@ def test_node_models_are_named_before_gf_server_runs(monkeypatch, tmp_path):
     )
     assert code == 1
     assert stderr.startswith("error: --model takes NAME=MODEL, not `bad`\n")
+
+
+def test_eval_reads_a_relative_directory_as_local(monkeypatch, tmp_path, recorder):
+    (tmp_path / "cls2").mkdir()
+    (tmp_path / "cls2" / "gf.yaml").write_text("name: cls2\n")
+    monkeypatch.chdir(tmp_path)
+    gf("eval", "./cls2", monkeypatch=monkeypatch)
+    assert recorder.made[0] == ("local", (tmp_path / "cls2").resolve())
+
+
+def test_predict_to_a_file_keeps_the_rows_off_stdout(monkeypatch, tmp_path, recorder):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "q.csv").write_text("id\n1\n")
+    code, stdout, _ = gf(
+        "--json",
+        "predict",
+        "elsewhere",
+        "--queries",
+        "q.csv",
+        "--output",
+        "o.csv",
+        monkeypatch=monkeypatch,
+    )
+    assert code == 0 and json.loads(stdout) == {"rows": 2, "output": "o.csv"}
+    code, stdout, _ = gf(
+        "--json", "predict", "elsewhere", "--queries", "q.csv", monkeypatch=monkeypatch
+    )
+    assert json.loads(stdout)["predictions"][1] == {"id": 2, "label": 1, "p_1": 0.75}
+
+
+def test_server_text_never_reaches_the_terminal_with_its_escapes(monkeypatch):
+    out = term.Output(err=io.StringIO(), environ={"FORCE_COLOR": "1"})
+    link = out.link("https://x.test/\x1b]8;;evil\x1b\\", "code\x1b[2J")
+    # Only the link's own two OSC 8 sequences remain.
+    assert "[2J" not in link and link.count("\x1b") == 4
+    _returns(
+        monkeypatch,
+        {"name": "ctx\x1b[31mred", "lines": ["\x1b]0;title\x07x"]},
+    )
+    _, stdout, _ = gf("context", "show", "ctx", monkeypatch=monkeypatch)
+    assert "\x1b" not in stdout and "ctx[31mred" not in stdout
+
+
+def test_login_shows_the_servers_words_without_their_escapes(monkeypatch, tmp_path):
+    from generalforecast import account, login
+
+    class Flow:
+        def __init__(self, server, *, timeout):
+            pass
+
+        def start(self, machine):
+            return {
+                "user_code": "AB\x1b[2JCD",
+                "verification_uri": "https://x.test/\x1b]8;;https://evil\x1b\\",
+                "expires_in": 600,
+            }
+
+        def wait(self, grant):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(login, "DeviceLogin", Flow)
+    monkeypatch.setattr(login, "browser_unavailable", lambda: "GF_NO_BROWSER is set")
+    monkeypatch.delenv("GF_API_KEY", raising=False)
+    monkeypatch.setattr(account.CredentialStore, "resolve", lambda self, s: None)
+    code, _, stderr = gf("login", monkeypatch=monkeypatch)
+    assert code == cli.INTERRUPTED_EXIT
+    assert "ABCD" in stderr and "\x1b" not in stderr
+
+
+def test_logout_forgets_the_key_even_when_the_server_cannot_revoke_it(monkeypatch):
+    from generalforecast import account, client
+    from generalforecast.credentials import Login
+    from generalforecast.service.contracts import ServiceError
+
+    removed = []
+
+    class Store:
+        def load(self, server):
+            return Login(server, "k-1", None, None, None, "p", "file", key="gfk_x1234")
+
+        def remove(self, server):
+            removed.append(server)
+            return True
+
+        def location(self, saved):
+            return "/tmp/credentials"
+
+    class Unreachable:
+        def __init__(self, **_):
+            self.identity = self
+
+        def manage(self, action, payload=None):
+            raise ServiceError("TransportError", "request failed", 503)
+
+    monkeypatch.setattr(account, "CredentialStore", Store)
+    monkeypatch.setattr(client, "Client", Unreachable)
+    code, stdout, stderr = gf("--json", "logout", monkeypatch=monkeypatch)
+    assert code == 0 and removed
+    result = json.loads(stdout)
+    assert result["revoked"] is False and result["revoke_error"] == "request failed"
+    _, _, stderr = gf("logout", monkeypatch=monkeypatch)
+    assert "could not revoke key" in stderr and "stays valid there" in stderr
+
+
+def test_a_quiet_init_prints_no_summary(monkeypatch, tmp_path):
+    _write_rows(tmp_path / "rows.csv")
+    code, stdout, stderr = gf(
+        "-q", "init", "--yes", str(tmp_path), monkeypatch=monkeypatch
+    )
+    assert code == 0 and stdout == "" and stderr == ""
+    (tmp_path / "gf.yaml").unlink()
+    code, stdout, stderr = gf(
+        "--json", "init", "--yes", str(tmp_path), monkeypatch=monkeypatch
+    )
+    assert code == 0 and stderr == "" and json.loads(stdout)["name"]
+
+
+def test_a_port_out_of_range_is_a_usage_error(monkeypatch):
+    code, _, stderr = gf("serve", "--port", "99999", monkeypatch=monkeypatch)
+    assert code == 2
+    assert stderr.startswith(
+        "error: invalid value '99999' for '--port': expected a port from 0 to 65535\n"
+    )
+
+
+def test_serving_an_unknown_model_names_the_catalog_as_the_cli_does(monkeypatch):
+    code, _, stderr = gf("serve", "nosuch-model", monkeypatch=monkeypatch)
+    assert code == 1 and stderr == (
+        "error: model `nosuch-model` is not in the catalog\n"
+        "  hint: run `gf model list` to see the catalog\n"
+    )
+
+
+def test_verbose_shows_every_request(monkeypatch):
+    monkeypatch.setenv("GF_API_KEY", "gfk_" + "a" * 40)
+    monkeypatch.setenv("GF_URL", "http://127.0.0.1:9")
+    monkeypatch.delenv("GF_PROFILE", raising=False)
+    monkeypatch.delenv("GF_TOKEN", raising=False)
+    code, _, stderr = gf("-v", "whoami", "--timeout", "2", monkeypatch=monkeypatch)
+    assert code == 1
+    shown = [line for line in stderr.splitlines() if "/v1/auth/status" in line]
+    assert shown and shown[0].startswith("GET http://127.0.0.1:9/v1/auth/status ")
+    assert shown[0].split()[-1].startswith("r-")
+    _, _, stderr = gf("whoami", "--timeout", "2", monkeypatch=monkeypatch)
+    assert "/v1/auth/status" not in stderr
+
+
+def test_a_quiet_locked_check_says_which_changes_it_would_make(monkeypatch, tmp_path):
+    from generalforecast.predictors import _registry
+    from tests.product_cli import render_suite
+
+    render_suite.write_fixtures(tmp_path)
+    _registry.use(render_suite.FakeRegistry())
+    try:
+        code, _, stderr = gf(
+            "--json",
+            "check",
+            "--locked",
+            str(tmp_path / "orders-stale"),
+            monkeypatch=monkeypatch,
+        )
+    finally:
+        _registry.use(None)
+    assert code == 1
+    because = json.loads(stderr)["error"]["because"]
+    assert because.splitlines() == [
+        "+ input      signup_source",
+        "~ selection  core 1,000 → 1,500, neighbors 3,000 → 4,500",
+    ]
+
+
+def _sales(path: Path) -> None:
+    rows = ["date,store,sales"]
+    for store in ("s1", "s2", "s3"):
+        for day in range(1, 31):
+            rows.append(
+                f"2024-01-{day:02d},{store},{10 + (day * 7 + len(store)) % 5}.5"
+            )
+    path.write_text("\n".join(rows) + "\n")
+
+
+def test_init_defaults_follow_the_task(monkeypatch, tmp_path):
+    from tests.product_cli.test_cli_output import _manifest
+
+    _sales(tmp_path / "sales.csv")
+    code, _, stderr = gf(
+        "init", "--task", "forecast", "--yes", str(tmp_path), monkeypatch=monkeypatch
+    )
+    assert code == 0, stderr
+    manifest = _manifest(tmp_path)
+    assert (manifest["target"], manifest["time"], manifest["series"]) == (
+        "sales",
+        "date",
+        ["store"],
+    )
+    # Seven days of each of the three stores are held out: the default horizon.
+    assert manifest["context"]["until"] == "2024-01-24"
+    assert "Until        2024-01-24  21 rows" in stderr
+    regression = tmp_path / "regression"
+    regression.mkdir()
+    (regression / "data.csv").write_text(
+        "row,x,y\n"
+        + "".join(f"{i},{i * 0.37 % 3:.3f},{i * 1.9 % 7:.3f}\n" for i in range(60))
+    )
+    code, _, stderr = gf("init", "--yes", str(regression), monkeypatch=monkeypatch)
+    assert code == 0, stderr
+    assert _manifest(regression)["target"] == "y"
