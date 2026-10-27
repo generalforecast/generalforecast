@@ -41,7 +41,7 @@ from typing import Any
 
 import yaml
 
-from generalforecast.errors import InvalidInput
+from generalforecast.errors import Error, InvalidInput
 from generalforecast.predictors import files
 from generalforecast.predictors.resolution import (
     ContextInfo,
@@ -407,14 +407,31 @@ def upgrade(value: Any) -> dict[str, Any]:
     exact; the seed is 0.
 
     Raises:
-        PredictorError: For a document that is not a version 1 lock.
+        PredictorError: `UnsupportedLockVersion` for a document that is not a
+            version 1 lock, `InvalidPredictor` for any version 1 lock out of
+            shape. Nothing else escapes, so a store upgrading many locks
+            can set aside each one that fails.
     """
     ensure(
         type(value) is dict and value.get("lock_version") == 1,
         "only a version 1 lock upgrades",
         "UnsupportedLockVersion",
     )
+    try:
+        return _upgraded(value)
+    except PredictorError:
+        raise
+    except (KeyError, TypeError, AttributeError, ValueError, RecursionError, Error):
+        # A version 1 field out of shape fails wherever it is first read.
+        raise PredictorError(
+            "InvalidPredictor", "the version 1 lock is out of shape"
+        ) from None
+
+
+def _upgraded(value: dict[str, Any]) -> dict[str, Any]:
     old = fields(value, {"lock_version", "predictor", "model"})
+    ensure(type(old["predictor"]) is dict, "the lock's predictor must be an object")
+    ensure(type(old["model"]) is dict, "the lock's model must be an object")
     source = dict(old["predictor"])
     task = source["task"]
     predictor: dict[str, Any] = {
