@@ -262,6 +262,69 @@ def test_programs_drop_at_a_new_shape_when_mappings_are_short() -> None:
     assert mine._cache_size() == 0
 
 
+def test_a_drop_leaves_mappings_alone_once_it_shows_programs_do_not_hold_them() -> None:
+    mappings = [True]
+    programs = Programs(None, lambda: False, short_of_mappings=lambda: mappings[0])
+    programs.limit = 3
+
+    programs.add_shape(0)
+    for shape in (1, 2):
+        programs.add_shape(shape)
+    # The first drop left mappings short, so the next waits for `limit` shapes.
+    assert programs.drops == 1
+    programs.add_shape(3)
+    assert programs.drops == 2
+    programs.add_shape(4)
+    assert programs.drops == 2
+
+    # Once mappings free up, running short again drops at the next shape.
+    mappings[0] = False
+    programs.add_shape(5)
+    mappings[0] = True
+    programs.add_shape(6)
+    assert programs.drops == 3
+
+
+def test_a_drop_cancels_the_compiles_ahead_still_waiting() -> None:
+    events: list[str] = []
+    dropped: list[bool] = []
+    # The clock never moves, so no quiet gap comes and the compile waits.
+    programs = Programs(
+        None, lambda: False, clock=lambda: 0.0, dropped=lambda: dropped.append(True)
+    )
+    with programs.step():
+        programs.compile_later(_Program(events))
+    done = threading.Event()
+
+    def drop() -> None:
+        programs.drop()
+        done.set()
+
+    threading.Thread(target=drop, daemon=True).start()
+
+    assert done.wait(5), "the drop waited for a compile ahead it drops"
+    assert events == []
+    assert dropped == [True]
+    programs.wait()
+    assert events == []
+
+
+def test_a_drop_waits_for_what_steps_wait_on() -> None:
+    programs = Programs(None, lambda: False)
+    release = threading.Event()
+    finished: list[bool] = []
+
+    def task() -> None:
+        assert release.wait(5)
+        finished.append(True)
+
+    programs.soon(task)
+    threading.Timer(0.1, release.set).start()
+    programs.drop()
+
+    assert finished == [True]
+
+
 def test_most_rows_is_a_signatures_longest_first_axis() -> None:
     table = (jnp.zeros((16384, 31)), jnp.zeros(16384, jnp.int32), 3)
     assert most_rows(signature(table)) == 16384

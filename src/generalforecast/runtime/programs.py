@@ -359,6 +359,7 @@ class Programs:
         ahead: bool = True,
         manifests: Path | None = None,
         short_of_mappings: Callable[[], bool] = mappings_short,
+        dropped: Callable[[], None] | None = None,
     ) -> None:
         """Sets up with nothing compiled.
 
@@ -373,11 +374,14 @@ class Programs:
                 kinds of call it compiles for are recorded in, if any.
             short_of_mappings: Whether the process holds most of the memory
                 mappings it may, asked at each new shape.
+            dropped: Called once every program is dropped, to forget what
+                held for them, such as the counts a kind has programs for.
         """
         self._settings = settings
         self._short_of_memory = short_of_memory
         self._short_of_mappings = short_of_mappings
         self._helpers = tuple(helpers)
+        self._dropped = dropped
         self._clock = clock
         self._ahead = ahead
         # Table shapes kept compiled while memory is short, and seconds
@@ -393,12 +397,20 @@ class Programs:
         self._done: set[Hashable] = set()
         self._thread = ThreadPoolExecutor(1, thread_name_prefix="gf-warm")
         self._soon = ThreadPoolExecutor(1, thread_name_prefix="gf-soon")
+        # Tasks that only save time, which a drop cancels, and tasks steps
+        # wait on, which it never does.
+        self._later: list[Future] = []
         self._pending: list[Future] = []
         self._lock = threading.Lock()
-        # Whether a step runs, and when the last ended; compiles ahead wait on them.
+        # Whether a step runs, and when the last ended; compiles ahead wait on
+        # them. A drop moves the generation on, so those queued before it end.
         self._steps = threading.Condition()
         self._running = False
         self._idle_since = clock()
+        self._generation = 0
+        # Whether the last drop for memory mappings left them short, so the
+        # programs were not what held them.
+        self._mappings_futile = False
         self._manifests = manifests
         # Kinds and counts recorded by this process, which need no rewrite.
         self._recorded: set[tuple[str, Hashable, int]] = set()
@@ -441,9 +453,8 @@ class Programs:
     def remember(self, model: str, kind: Kind, count: int) -> None:
         """Records that a model's kind of call compiled for `count` items, for later processes to compile at start."""
         manifest = self.manifest(model)
-        if manifest is None or (model, kind, count) in self._recorded:
+        if manifest is None or not self._record((model, kind, count)):
             return
-        self._recorded.add((model, kind, count))
         try:
             manifest.add(kind, count)
         except OSError as error:
@@ -452,13 +463,20 @@ class Programs:
     def remember_measure(self, model: str, measure: tuple) -> None:
         """Records that a model measured something by compiling, which later processes measure at start."""
         manifest = self.manifest(model)
-        if manifest is None or (model, measure, 0) in self._recorded:
+        if manifest is None or not self._record((model, measure, 0)):
             return
-        self._recorded.add((model, measure, 0))
         try:
             manifest.add_measure(measure)
         except OSError as error:
             logger.warning("cannot record a measure: %s", error)
+
+    def _record(self, entry: tuple[str, Hashable, int]) -> bool:
+        """Whether `entry` is new to this process's records; it is not after this."""
+        with self._lock:
+            if entry in self._recorded:
+                return False
+            self._recorded.add(entry)
+            return True
 
     def measured(self, model: str, key: Hashable, measure: Callable[[], Any]) -> Any:
         """What `measure` returns for a model's `key`, kept on disk for later processes.
@@ -493,36 +511,73 @@ class Programs:
         return Recorded({}, {}) if manifest is None else manifest.read()
 
     def add_shape(self, shape: Hashable) -> None:
-        """Counts a table shape, dropping every program first if memory is short past `limit`, or mappings are."""
-        if shape not in self._shapes and (
-            self._short_of_mappings()
-            or (len(self._shapes) >= self.limit and self._short_of_memory())
+        """Counts a table shape, dropping every program first if memory is short past `limit`, or mappings are.
+
+        Short of mappings, a new shape drops the programs whatever their
+        count, since the next compile would fail. A drop that leaves them
+        short shows the programs were not what held them, so until mappings
+        free up, they drop for mappings only past `limit` shapes, as for
+        memory, rather than at every new shape.
+        """
+        with self._lock:
+            if shape in self._shapes:
+                return
+            crowded = len(self._shapes) >= self.limit
+        mappings = self._short_of_mappings()
+        if not mappings:
+            self._mappings_futile = False
+        if (mappings and (crowded or not self._mappings_futile)) or (
+            crowded and self._short_of_memory()
         ):
             self.drop()
-        self._shapes.add(shape)
+            if mappings:
+                futile = self._short_of_mappings()
+                if futile and not self._mappings_futile:
+                    logger.warning(
+                        "dropping compiled programs left the process short of "
+                        "memory mappings, so they drop again only past %d table "
+                        "shapes; raise vm.max_map_count to compile more",
+                        self.limit,
+                    )
+                self._mappings_futile = futile
+        with self._lock:
+            self._shapes.add(shape)
 
     def drop(self) -> None:
-        """Drops every compiled program, once compiles ahead finish.
+        """Drops every compiled program, once the compiles under way finish.
 
         Only these functions' programs go, not those of other JAX code in the
         process. Each compiles again when next called, and is compiled ahead
-        again as it was before.
+        again as it was before. Compiles ahead not started yet are dropped
+        with them rather than compiled for nothing; those steps wait on are
+        let finish.
         """
-        self.wait()
+        with self._steps:
+            self._generation += 1
+            self._steps.notify_all()
+        with self._lock:
+            later, self._later = self._later, []
+        for future in later:
+            future.cancel()
+        self.wait(later)
         for function in (*self._compiled.values(), *self._helpers):
             cast(Any, function).clear_cache()
-        self._compiled.clear()
-        self._shapes.clear()
-        self._done.clear()
+        with self._lock:
+            self._compiled.clear()
+            self._shapes.clear()
+            self._done.clear()
         forget_compiled()
         self.drops += 1
+        if self._dropped is not None:
+            self._dropped()
 
     def first(self, marker: Hashable) -> bool:
         """Whether `marker` is new since programs were last dropped; it is not after this."""
-        if marker in self._done:
-            return False
-        self._done.add(marker)
-        return True
+        with self._lock:
+            if marker in self._done:
+                return False
+            self._done.add(marker)
+            return True
 
     def compile_later(self, function: Callable[..., Any], *arguments: Any) -> None:
         """Compiles a function for these arguments, or their shapes, in a quiet gap."""
@@ -562,28 +617,36 @@ class Programs:
 
         A task that fails is dropped: the call that needs what it compiles
         compiles it again, and reports the failure. Nothing runs if the
-        programs compile nothing ahead.
+        programs compile nothing ahead, and a task still waiting when every
+        program drops never runs.
         """
         if not self._ahead:
             return
+        with self._steps:
+            generation = self._generation
 
         def run() -> None:
-            self._wait_quiet()
+            if not self._wait_quiet(generation):
+                return
             try:
                 task()
             except Exception:  # noqa: BLE001
                 return
 
         with self._lock:
-            self._pending = [future for future in self._pending if not future.done()]
-            self._pending.append(self._thread.submit(run))
+            self._later = [future for future in self._later if not future.done()]
+            self._later.append(self._thread.submit(run))
 
-    def wait(self) -> None:
-        """Waits for every task started in the background."""
+    def wait(self, tasks: Iterable[Future] | None = None) -> None:
+        """Waits for every task started in the background, or for `tasks` and those steps wait on.
+
+        A task cancelled before it started is not waited for.
+        """
         with self._lock:
-            pending = list(self._pending)
+            pending = [*self._pending, *(self._later if tasks is None else tasks)]
         for future in pending:
-            future.result()
+            if not future.cancelled():
+                future.result()
 
     @contextmanager
     def step(self) -> Iterator[None]:
@@ -598,11 +661,13 @@ class Programs:
                 self._idle_since = self._clock()
                 self._steps.notify_all()
 
-    def _wait_quiet(self) -> None:
-        """Waits until no step has run for `quiet` seconds."""
+    def _wait_quiet(self, generation: int) -> bool:
+        """Waits until no step has run for `quiet` seconds; False if programs dropped since `generation`."""
         with self._steps:
             while True:
+                if self._generation != generation:
+                    return False
                 left = self._idle_since + self.quiet - self._clock()
                 if not self._running and left <= 0:
-                    return
+                    return True
                 self._steps.wait(None if self._running else left)
