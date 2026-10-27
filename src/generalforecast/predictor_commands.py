@@ -192,11 +192,14 @@ def _tables_in(root: Path) -> list[Path]:
     )
 
 
-def _output_path(text: str | None, *inputs: str | None) -> Path | None:
+def _output_path(
+    text: str | None, *inputs: str | Path | None, predictor: Path | None = None
+) -> Path | None:
     """The `--output` file, checked before any scoring.
 
     Its directory must exist, and it must be none of the files the command
-    reads, which writing it would destroy.
+    reads, which writing it would destroy: the queries and context it was
+    given, and a local predictor's manifest, lock and snapshot.
     """
     if text is None:
         return None
@@ -206,7 +209,15 @@ def _output_path(text: str | None, *inputs: str | None) -> Path | None:
             f"cannot write `{text}`: directory `{path.parent}` does not exist",
             param="output",
         )
-    for given in inputs:
+    if path.is_dir():
+        raise InvalidInput(f"cannot write `{text}`: it is a directory", param="output")
+    read = list(inputs)
+    if predictor is not None:
+        read += [predictor / MANIFEST, predictor / LOCK]
+        snapshot = predictors().load(predictor).context.snapshot
+        if snapshot is not None:
+            read.append(predictor / snapshot)
+    for given in read:
         if given is not None and Path(given).expanduser().resolve() == path.resolve():
             raise InvalidInput(
                 f"--output `{text}` is also an input; it would be overwritten",
@@ -681,7 +692,7 @@ class PredictorCommands:
     def eval(self) -> dict:
         """Scores the query rows with the predictor; returns the metrics."""
         args, out = self.args, self.out
-        output = _output_path(args.output, args.queries)
+        output = _output_path(args.output, args.queries, predictor=self.root)
         predictor = predictor_class()(str(self.root))
         resolution = predictor.explain()
         context = resolution.context
@@ -710,9 +721,8 @@ class PredictorCommands:
 
         args, out = self.args, self.out
         reference = args.target
-        output = _output_path(args.output, args.queries, args.context)
         try:
-            kind, _ = resolve_reference(reference, env=args.env)
+            kind, where = resolve_reference(reference, env=args.env)
         except AmbiguousReference:
             raise AmbiguousReference(
                 f"`{reference}` is both a directory with gf.yaml and a hosted predictor name",
@@ -731,6 +741,12 @@ class PredictorCommands:
                 hint="pass '--context FILE' with rows whose target is known",
                 param="context",
             )
+        output = _output_path(
+            args.output,
+            args.queries,
+            args.context,
+            predictor=where if kind == "local" else None,
+        )
         predictor = predictor_class()(
             reference,
             env=(args.env or DEFAULT_ENV) if kind == "hosted" else args.env,
@@ -1056,7 +1072,9 @@ def _fraction_problem(text: str) -> str | None:
 def _horizon_problem(text: str) -> str | None:
     """What is wrong with a typed horizon, or None."""
     return (
-        None if text.isdigit() and int(text) >= 1 else "must be a whole number of steps"
+        None
+        if text.isascii() and text.isdigit() and int(text) >= 1
+        else "must be a whole number of steps"
     )
 
 

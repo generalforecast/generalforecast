@@ -248,6 +248,8 @@ def _api(args: argparse.Namespace, out: term.Output) -> dict:
         )
         payload[field] = resource
     if noun == "audit":
+        require(args.after >= 0, "--after must be 0 or more")
+        require(1 <= args.limit <= 100, "--limit must be from 1 to 100")
         payload = {"after": args.after, "limit": args.limit}
     if spec.destructive:
         words = [spec.name.capitalize(), noun, resource]

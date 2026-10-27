@@ -294,6 +294,15 @@ def admin(noun: str, args: argparse.Namespace, out: "Output") -> dict:
         )
     arguments = ["init", "--path", str(path), "--listen", address(args.host, args.port)]
     if noun == "node":
+        for model in args.model:
+            served, _, reference = model.partition("=")
+            if not served or not reference:
+                raise InvalidInput(
+                    f"--model takes NAME=MODEL, not `{model}`",
+                    hint="name the model as clients will, like "
+                    "tabicl=general-forecast/tabicl-v2-classifier",
+                    param="model",
+                )
         arguments += ["--data", str(args.data), "--python", sys.executable]
         arguments += [part for model in args.model for part in ("--model", model)]
     else:

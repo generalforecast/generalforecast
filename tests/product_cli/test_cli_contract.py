@@ -579,3 +579,91 @@ def test_frames_fit_the_terminal_whatever_the_characters():
     assert term.clip("日本語", 5) == "日本"
     assert term.clip("\x1b[2mabcdef\x1b[0m", 3) == "\x1b[2mabc\x1b[0m"
     assert term.pad("日", 4) == "日  "
+
+
+def test_output_never_overwrites_what_the_predictor_reads(
+    monkeypatch, tmp_path, recorder
+):
+    root = tmp_path / "churn"
+    root.mkdir()
+    _write_rows(root / "rows.csv")
+    (root / "gf.yaml").write_text(
+        f"name: churn\nmodel: {TABICL}\ntarget: y\ncontext:\n  snapshot: rows.csv\n"
+    )
+    before = (root / "rows.csv").read_text()
+    for argv in (
+        ("eval", str(root), "--output", str(root / "rows.csv")),
+        (
+            "predict",
+            str(root),
+            "--queries",
+            "q.csv",
+            "--output",
+            str(root / "rows.csv"),
+        ),
+        ("predict", str(root), "--queries", "q.csv", "--output", str(root / "gf.yaml")),
+        ("predict", str(root), "--queries", "q.csv", "--output", str(tmp_path)),
+    ):
+        code, _, stderr = gf(*argv, monkeypatch=monkeypatch)
+        assert code == 1, argv
+        assert "is also an input" in stderr or "is a directory" in stderr, stderr
+    assert (root / "rows.csv").read_text() == before
+    assert not recorder.made
+
+
+def test_json_errors_keep_why_and_the_near_miss(monkeypatch):
+    from generalforecast.errors import InvalidInput
+
+    _raises(monkeypatch, InvalidInput("gf.lock would change", because="2 changes"))
+    _, _, stderr = gf("--json", "model", "list", monkeypatch=monkeypatch)
+    assert json.loads(stderr)["error"]["because"] == "2 changes"
+    code, _, stderr = gf(
+        "--json", "admin", "key", "list", "--jso", monkeypatch=monkeypatch
+    )
+    assert code == 2
+    assert json.loads(stderr)["error"]["tip"] == "a similar argument exists: '--json'"
+
+
+def test_an_unknown_admin_noun_is_called_a_noun(monkeypatch):
+    code, _, stderr = gf("admin", "keys", monkeypatch=monkeypatch)
+    assert code == 2
+    assert stderr == (
+        "error: unknown noun `keys` for `gf admin`\n"
+        "  tip: a similar noun exists: 'key'\n"
+    )
+
+
+def test_only_ascii_digits_make_a_horizon():
+    from generalforecast.predictor_commands import _horizon_problem
+
+    assert _horizon_problem("7") is None
+    assert _horizon_problem("²") == _horizon_problem("0") == _horizon_problem("")
+    assert _horizon_problem("²") == "must be a whole number of steps"
+
+
+def test_audit_pages_are_checked_before_the_request(monkeypatch):
+    client = _Identity()
+    monkeypatch.setattr("generalforecast.commands.client_for", lambda args: client)
+    code, _, stderr = gf(
+        "admin", "audit", "list", "--limit", "500", monkeypatch=monkeypatch
+    )
+    assert code == 1 and stderr.startswith("error: --limit must be from 1 to 100")
+    assert not client.calls
+
+
+def test_node_models_are_named_before_gf_server_runs(monkeypatch, tmp_path):
+    from generalforecast.serve import listener
+
+    monkeypatch.setattr(listener, "binary", lambda name: tmp_path / "absent")
+    code, _, stderr = gf(
+        "admin",
+        "node",
+        "init",
+        "--path",
+        str(tmp_path / "n.toml"),
+        "--model",
+        "bad",
+        monkeypatch=monkeypatch,
+    )
+    assert code == 1
+    assert stderr.startswith("error: --model takes NAME=MODEL, not `bad`\n")

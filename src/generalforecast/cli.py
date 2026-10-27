@@ -786,7 +786,14 @@ def _usage_problem(
             )
         match = term.suggest(word, names)
         shown = word if re.fullmatch(r"[\w.-]{1,40}", word) else "..."
-        noun = "command" if p.prog == "gf" else "action"
+        subs = _subparsers(p)
+        noun = (
+            "command"
+            if p.prog == "gf"
+            else "noun"
+            if subs is not None and subs.metavar == "<NOUN>"
+            else "action"
+        )
         text = (
             f"unknown {noun} `{shown}`"
             if p.prog == "gf"
@@ -901,7 +908,7 @@ def error_object(error: BaseException) -> dict[str, Any]:
     body: dict[str, Any] = {"code": code, "message": message}
     if reason is not None:
         body["reason"] = reason
-    for field in ("param", "hint", "limit", "actual", "request_id"):
+    for field in ("param", "because", "hint", "tip", "limit", "actual", "request_id"):
         value = getattr(error, field, None)
         if value is not None:
             body[field] = value
@@ -1013,6 +1020,9 @@ def present(
         )
     except BrokenPipeError:
         return BROKEN_PIPE_EXIT
+    except (OSError, AttributeError):
+        # stderr is closed or gone; the exit code still says what happened.
+        pass
     return exit_code
 
 

@@ -177,9 +177,12 @@ def test_json_errors_print_only_the_error_object(monkeypatch, tmp_path):
     assert "hint" not in body["error"]
     assert set(body["error"]) <= {
         "code",
+        "reason",
         "message",
         "param",
+        "because",
         "hint",
+        "tip",
         "limit",
         "actual",
         "request_id",
