@@ -38,15 +38,17 @@ use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
 use crate::auth::digest;
+use crate::budget::{Charge, RequestBudget};
 use crate::engine::{self, Bound, Engine};
+use crate::error::ServerError;
 use crate::name::TableName;
 use crate::predictors::{self, ContextMode, ForecastPredictor, ServedPredictor};
 use crate::progress::Compiling;
+use crate::quantiles::quantile_values;
 use crate::revisions::{Published, Record, Revisions};
 use crate::routes::Routes;
-use crate::service::{Charge, RequestBudget, quantile_values};
 use crate::setup::random_hex;
-use crate::shard::{Asked, Command, Inferred, ServerError};
+use crate::shard::{Asked, Command, Inferred};
 use crate::upstream::Upstream;
 use arrow_array::RecordBatch;
 use gf_core::predictor;
@@ -220,19 +222,11 @@ impl From<RequestError> for ApiError {
 
 impl From<ServerError> for ApiError {
     fn from(error: ServerError) -> Self {
-        match error {
-            ServerError::Busy(message) => Self::new("CapacityExceeded", message, 503),
-            ServerError::Invalid(message) => Self::new("InvalidContext", message, 422),
-            ServerError::Unavailable(_) => Self::new(
-                "ModelUnavailable",
-                "the model is restarting; retry shortly",
-                503,
-            ),
-            error => {
-                tracing::error!("inference failed: {error}");
-                Self::new("InferenceFailed", "native inference failed", 503)
-            }
+        let (status, code, message) = error.http();
+        if status >= 500 && !matches!(error, ServerError::Busy(_)) {
+            tracing::error!("inference failed: {error}");
         }
+        Self::new(code, message, status)
     }
 }
 

@@ -44,7 +44,6 @@
 //! against the tables it fit, since a fit is the likeliest cause.
 
 use std::collections::{HashMap, HashSet};
-use std::fmt;
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -55,8 +54,8 @@ use tokio::time::Instant;
 use gf_core::cache::{Eviction, ModelId, Movement, Tier, TierConfig};
 use gf_core::forecasting::{self, HORIZON_PASSES, Neighbors, SeriesSpec, horizon_limit};
 use gf_core::node::{
-    CompactionSource, EntrySizes, ErrorKind, Node, NodeError, RequestId, Scheduling, SummaryScope,
-    TableId, TableRows, TableSpec, Task,
+    CompactionSource, EntrySizes, Node, NodeError, RequestId, Scheduling, SummaryScope, TableId,
+    TableRows, TableSpec, Task,
 };
 use gf_core::planner::Strategy;
 use gf_core::rows::RowMemory;
@@ -67,7 +66,9 @@ use gf_core::node::{Action, Step, StepUnit, Targets, UNLABELED};
 use gf_core::regions::RegionStats;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::budget::Charge;
 use crate::ephemeral::{Ephemeral, EphemeralTables};
+use crate::error::ServerError;
 use crate::metrics::{Metrics, TableMetrics, Timing};
 use crate::name::TableName;
 use crate::partition::{self, Given, ModelRows, Offer};
@@ -76,10 +77,9 @@ use crate::protocol::{
     outcome_from, step_frame,
 };
 use crate::routes::Routes;
-use crate::service::Charge;
 use crate::wal::{
-    self, Compacted, Compactor, CreationId, Durability, EncryptionKey, Log, LogEntry, LogError,
-    PastWrite, Record, Replay, RowSealer, Rows, TableDefinition, Terms, decode,
+    self, Compacted, Compactor, CreationId, Durability, EncryptionKey, Log, LogEntry, PastWrite,
+    Record, Replay, RowSealer, Rows, TableDefinition, Terms, decode,
 };
 use crate::worker::{self, WorkerConnection};
 use gf_core::columns::{self, Strings, Vocabulary, Words};
@@ -227,60 +227,6 @@ struct Pending {
     table: TableId,
     bytes: u64,
     arrived: Instant,
-}
-
-/// Why a request failed, mapped to a Flight status by the service.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ServerError {
-    NotFound(String),
-    Exists(String),
-    Invalid(String),
-    /// A replicated entry skips ahead of the log.
-    Gap(String),
-    /// A write arrived without this node's lease, or under another term.
-    Fenced(String),
-    /// The shard holds as many queries as it may; retry shortly.
-    Busy(String),
-    /// The worker is starting again; retry shortly.
-    Unavailable(String),
-    Internal(String),
-}
-
-impl fmt::Display for ServerError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound(message)
-            | Self::Exists(message)
-            | Self::Invalid(message)
-            | Self::Gap(message)
-            | Self::Fenced(message)
-            | Self::Busy(message)
-            | Self::Unavailable(message)
-            | Self::Internal(message) => formatter.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for ServerError {}
-
-impl From<NodeError> for ServerError {
-    fn from(error: NodeError) -> Self {
-        let message = error.to_string();
-        match error.kind() {
-            ErrorKind::NotFound => Self::NotFound(message),
-            ErrorKind::Invalid => Self::Invalid(message),
-            ErrorKind::Internal => Self::Internal(message),
-        }
-    }
-}
-
-impl From<LogError> for ServerError {
-    fn from(error: LogError) -> Self {
-        match error {
-            LogError::Beyond { .. } => Self::Invalid(error.to_string()),
-            error => Self::Internal(format!("write-ahead log: {error}")),
-        }
-    }
 }
 
 /// A change to a table's rows, or to its fitted state.

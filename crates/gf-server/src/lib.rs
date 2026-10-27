@@ -5,9 +5,11 @@
 
 pub mod action;
 pub mod auth;
+pub mod budget;
 pub mod config;
 pub mod engine;
 pub mod ephemeral;
+pub mod error;
 pub mod http;
 pub mod metrics;
 pub mod name;
@@ -16,6 +18,7 @@ pub mod predictors;
 pub mod private;
 pub mod progress;
 pub mod protocol;
+pub mod quantiles;
 pub mod revisions;
 pub mod routes;
 pub mod runtime;

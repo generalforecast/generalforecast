@@ -4,142 +4,24 @@
 //! The Models API front: routes, envelopes, headers, errors and keys, with
 //! inference through a shard driven by a fake worker.
 
-use std::collections::BTreeMap;
+mod common;
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use gf_core::cache::Eviction;
+use common::{fresh_directory, shard, shard_in};
 use gf_core::catalog::Surface;
-use gf_core::node::Scheduling;
+use gf_server::budget::RequestBudget;
 use gf_server::http::{Front, KeyStore, Principal, ServedModel, Static, router};
-use gf_server::metrics::Metrics;
-use gf_server::protocol::{
-    CompileCache, Frame, ModelProfile, PredictionsHeader, WorkerReply, WorkerRequest, f32_bytes,
-};
 use gf_server::routes::Routes;
-use gf_server::service::RequestBudget;
-use gf_server::shard::{EphemeralLimits, Shard, ShardSettings};
 use gf_server::wal::EncryptionKey;
-use gf_server::worker::WorkerConnection;
 use serde_json::{Value, json};
-use tokio::net::UnixStream;
 use tower::ServiceExt;
 
 const KEY: &str = "gf-serve-test-key";
-
-/// Answers profiles as a ten-class classifier, and every query with 0.25.
-fn fake_worker(mut stream: UnixStream) {
-    tokio::spawn(async move {
-        while let Ok(frame) = Frame::read_from(&mut stream).await {
-            let reply = if frame.kind() == "step" {
-                let mut reply = Frame::header(Value::Null);
-                let results: Vec<PredictionsHeader> = frame.header["queries"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|batch| {
-                        let rows = batch["count"].as_u64().unwrap_or(0) as usize;
-                        PredictionsHeader {
-                            request: batch["request"].as_u64().unwrap_or(0),
-                            rows,
-                            columns: 10,
-                            buffer: reply.push(f32_bytes(&vec![0.25; rows * 10])),
-                            horizon: None,
-                        }
-                    })
-                    .collect();
-                reply.header = WorkerReply::Predictions {
-                    results,
-                    failures: Vec::new(),
-                    deferred: Vec::new(),
-                    seconds: 0.001,
-                    stages: BTreeMap::new(),
-                    parts: BTreeMap::new(),
-                    memory: BTreeMap::new(),
-                    compile_cache: CompileCache::default(),
-                }
-                .frame()
-                .header;
-                reply
-            } else {
-                match WorkerRequest::of(&frame).expect("the shard sends requests") {
-                    WorkerRequest::Profile { .. } => WorkerReply::Profile(ModelProfile {
-                        bytes_per_row: 64,
-                        representation_bytes: 16,
-                        regression: false,
-                        class_slots: 10,
-                        outputs: 10,
-                        state_bytes: 32,
-                        ..ModelProfile::default()
-                    })
-                    .frame(),
-                    _ => WorkerReply::Ok.frame(),
-                }
-            };
-            if reply.write_to(&mut stream).await.is_err() {
-                break;
-            }
-        }
-    });
-}
-
-/// A directory of its own for each shard a test starts.
-fn fresh_directory() -> std::path::PathBuf {
-    static SHARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let shard = SHARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let directory =
-        std::env::temp_dir().join(format!("gf-http-test-{}-{shard}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
-    directory
-}
-
-async fn shard() -> tokio::sync::mpsc::Sender<gf_server::shard::Command> {
-    shard_in(fresh_directory()).await
-}
-
-/// A shard over a fake worker, logging its tables under `directory`.
-async fn shard_in(
-    directory: std::path::PathBuf,
-) -> tokio::sync::mpsc::Sender<gf_server::shard::Command> {
-    let (ours, theirs) = UnixStream::pair().unwrap();
-    fake_worker(theirs);
-    let connection = WorkerConnection::fake(ours, vec!["tiny".to_string()]).unwrap();
-    let settings = ShardSettings {
-        device_bytes: 64 << 20,
-        host_bytes: 64 << 20,
-        row_memory_bytes: 64 << 20,
-        disk_bytes: 0,
-        slot_bytes: 1 << 20,
-        bucket_minimum: 8,
-        step_bytes: None,
-        scheduling: Scheduling::Turns,
-        eviction: Eviction::Gdsf,
-        step_timeout: Duration::from_secs(60),
-        queue_bytes: 1 << 20,
-        snapshot_bytes: 1 << 30,
-        timers: false,
-        ephemeral: EphemeralLimits {
-            tables: 4,
-            bytes: 1 << 20,
-            idle: Duration::from_secs(300),
-        },
-    };
-    std::fs::create_dir_all(&directory).unwrap();
-    let key = EncryptionKey::from_hex(&"ab".repeat(32)).unwrap();
-    let mut shard = Shard::new(
-        connection,
-        settings,
-        key,
-        directory,
-        Arc::new(Metrics::default()),
-    )
-    .unwrap();
-    shard.allocate().await.unwrap();
-    shard.spawn().unwrap()
-}
 
 fn served() -> ServedModel {
     ServedModel {

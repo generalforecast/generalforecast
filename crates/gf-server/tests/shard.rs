@@ -12,6 +12,7 @@ use std::time::Duration;
 use gf_core::cache::Eviction;
 use gf_core::columns::{Column, ColumnKind};
 use gf_core::node::{Scheduling, Targets};
+use gf_server::budget::{Charge, RequestBudget};
 use gf_server::metrics::Metrics;
 use gf_server::name::TableName;
 use gf_server::protocol::{
@@ -19,7 +20,6 @@ use gf_server::protocol::{
     WorkerRequest, f32_bytes,
 };
 use gf_server::routes::Routes;
-use gf_server::service::{Charge, RequestBudget};
 use gf_server::shard::{
     Asked, Command, EphemeralLimits, Fence, Incoming, Inferred, Lease, RequestContext, Shard,
     ShardSettings, Write,
@@ -685,18 +685,8 @@ impl Harness {
 }
 
 /// The Flight status code a shard error maps to, as the service maps it.
-fn status(error: &gf_server::shard::ServerError) -> Code {
-    use gf_server::shard::ServerError;
-    match error {
-        ServerError::NotFound(_) => Code::NotFound,
-        ServerError::Exists(_) => Code::AlreadyExists,
-        ServerError::Invalid(_) => Code::InvalidArgument,
-        ServerError::Gap(_) => Code::OutOfRange,
-        ServerError::Fenced(_) => Code::FailedPrecondition,
-        ServerError::Busy(_) => Code::ResourceExhausted,
-        ServerError::Unavailable(_) => Code::Unavailable,
-        ServerError::Internal(_) => Code::Internal,
-    }
+fn status(error: &gf_server::error::ServerError) -> Code {
+    error.code()
 }
 
 #[tokio::test]

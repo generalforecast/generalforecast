@@ -340,19 +340,27 @@ impl FlightAction {
         matches!(self, Self::Delete(_) | Self::Truncate(_))
     }
 
+    /// Whether it acts on every table of the server at once, as moving
+    /// tables by load or profiling the workers does, so only a token whose
+    /// scope reaches every table may make it.
+    #[must_use]
+    pub fn needs_every_table(&self) -> bool {
+        matches!(self, Self::Rebalance | Self::ProfileWorkers { .. })
+    }
+
     /// Refuses the action if a token's scope does not reach its table, or
     /// every table for an action on the whole server.
     ///
     /// # Errors
     ///
     /// As `Scope::check` and `Scope::check_create`, and `PERMISSION_DENIED`
-    /// for `profile_workers` under any scope but the unscoped one.
+    /// for an action on every table under any scope but the unscoped one.
     pub fn check_scope(&self, scope: &Scope) -> Result<(), Status> {
         match self {
             Self::CreateTable(definition) => scope.check_create(&definition.name),
-            Self::ProfileWorkers { .. } if *scope != Scope::All => Err(Status::permission_denied(
-                "profile_workers needs an unscoped token",
-            )),
+            action if action.needs_every_table() && *scope != Scope::All => Err(
+                Status::permission_denied(format!("{} needs an unscoped token", action.name())),
+            ),
             other => other.table().map_or(Ok(()), |table| scope.check(table)),
         }
     }

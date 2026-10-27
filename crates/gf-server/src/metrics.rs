@@ -357,6 +357,15 @@ impl Metrics {
             .clone()
     }
 
+    /// A table's metrics, if it has made any and was not dropped since.
+    pub fn existing_table(&self, name: &str) -> Option<Arc<TableMetrics>> {
+        self.by_table
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .cloned()
+    }
+
     /// Stops reporting a table, once it is dropped or released.
     pub fn forget(&self, name: &str) {
         self.by_table

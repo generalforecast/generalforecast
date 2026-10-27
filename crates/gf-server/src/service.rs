@@ -41,7 +41,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -75,14 +74,18 @@ use crate::action::{
 use crate::auth::{
     CREATED, MISSING_OK, QUANTILES, SHIPMENT, Scope, TERM, TERMS, Tokens, WRITE_ID, bearer,
 };
+use crate::budget::Charge;
+/// Where the budget was before it served the Models API too, kept for the
+/// crates that embed this server.
+pub use crate::budget::RequestBudget;
 use crate::config::{Assign, PlacementConfig};
+use crate::error::{ServerError, exists};
 use crate::metrics::{Histogram, Metrics};
 use crate::name::TableName;
 use crate::partition;
 use crate::protocol::{Predictions, StrategySpec};
-use crate::shard::{
-    Command, Description, Fence, Incoming, Lease, Lineage, LogLength, ServerError, Write,
-};
+use crate::quantiles::{self, quantile_values};
+use crate::shard::{Command, Description, Fence, Incoming, Lease, Lineage, LogLength, Write};
 use crate::trace::{Trace, traced};
 use crate::wal::{CreationId, Durability, LogEntry, Rows, TableDefinition, Terms, decode};
 use gf_core::columns::{self, Cells, Column, ColumnKind, Strings};
@@ -101,89 +104,6 @@ const ENTRY_BYTES: usize = u32::MAX as usize;
 
 /// The most bytes of Arrow data one write or prediction request carries.
 const REQUEST_BYTES: usize = 256 << 20;
-
-/// Bytes of client calls held in memory at once, across every connection.
-///
-/// Each call charges what it reads as it reads it, and gives it back when it
-/// finishes, so a flood of large requests is refused rather than buffered.
-#[derive(Clone, Debug)]
-pub struct RequestBudget {
-    held: Arc<AtomicU64>,
-    limit: u64,
-}
-
-impl RequestBudget {
-    /// A budget of `limit` bytes.
-    #[must_use]
-    pub fn new(limit: u64) -> Self {
-        Self {
-            held: Arc::default(),
-            limit,
-        }
-    }
-
-    /// An empty charge against the budget, to grow as a call reads.
-    #[must_use]
-    pub fn charge(&self) -> Charge {
-        Charge {
-            held: self.held.clone(),
-            limit: self.limit,
-            bytes: 0,
-        }
-    }
-}
-
-/// What one call holds of the budget; given back when dropped. The default
-/// holds nothing, of a budget of its own.
-#[derive(Debug)]
-pub struct Charge {
-    held: Arc<AtomicU64>,
-    limit: u64,
-    bytes: u64,
-}
-
-impl Charge {
-    /// Takes `bytes` more of the budget.
-    ///
-    /// # Errors
-    ///
-    /// `RESOURCE_EXHAUSTED` if the budget is spent; nothing more is taken then.
-    pub fn grow(&mut self, bytes: u64) -> Result<(), Status> {
-        let before = self.held.fetch_add(bytes, Ordering::Relaxed);
-        if before + bytes > self.limit {
-            self.held.fetch_sub(bytes, Ordering::Relaxed);
-            return Err(Status::resource_exhausted(format!(
-                "the server holds {} MiB of requests already; retry shortly",
-                self.limit >> 20
-            )));
-        }
-        self.bytes += bytes;
-        Ok(())
-    }
-
-    /// Another charge against the same budget, holding nothing yet; each
-    /// gives back what it took when it is dropped.
-    #[must_use]
-    pub fn split(&self) -> Self {
-        Self {
-            held: self.held.clone(),
-            limit: self.limit,
-            bytes: 0,
-        }
-    }
-}
-
-impl Default for Charge {
-    fn default() -> Self {
-        RequestBudget::new(u64::MAX).charge()
-    }
-}
-
-impl Drop for Charge {
-    fn drop(&mut self) {
-        self.held.fetch_sub(self.bytes, Ordering::Relaxed);
-    }
-}
 
 /// Where a table lives, its columns, and how its predictions are labeled.
 #[derive(Clone, Debug)]
@@ -581,7 +501,10 @@ impl Service {
         {
             let mut seen = mover.seen.lock().unwrap_or_else(PoisonError::into_inner);
             for (name, _, rows) in &placed {
-                let now = self.metrics.table(name).gpu_seconds.get();
+                let now = self
+                    .metrics
+                    .existing_table(name)
+                    .map_or(0.0, |counts| counts.gpu_seconds.get());
                 let before = seen.insert(name.to_string(), now).unwrap_or(0.0);
                 let load = if now >= before { now - before } else { now } / elapsed.max(1e-9);
                 loads.push(gf_assign::SliceLoad {
@@ -731,7 +654,7 @@ impl Service {
         self.lease
             .as_ref()
             .map_or(Ok(()), Lease::check)
-            .map_err(status)
+            .map_err(ServerError::status)
     }
 
     /// What a client write must still hold when it is logged: the lease, and
@@ -806,7 +729,7 @@ impl Service {
         answer
             .await
             .map_err(|_| Status::unavailable("the shard has stopped"))?
-            .map_err(status)
+            .map_err(ServerError::status)
     }
 
     async fn create(&self, definition: TableDefinition, terms: Terms) -> Result<(), Status> {
@@ -831,6 +754,19 @@ impl Service {
                 let mut creating = self.creating.lock().unwrap_or_else(PoisonError::into_inner);
                 if placement.contains_key(&name) {
                     return Err(exists(format!("table {:?} exists", name.as_str())));
+                }
+                // Logs are files named for their tables, which a filesystem
+                // that ignores case would take for one another.
+                if let Some(other) = placement
+                    .keys()
+                    .chain(creating.keys())
+                    .find(|other| other.as_str().eq_ignore_ascii_case(name.as_str()))
+                    .filter(|other| **other != name)
+                {
+                    return Err(exists(format!(
+                        "table {:?} exists, and names may not differ only by case",
+                        other.as_str()
+                    )));
                 }
                 if let Some((_, placed)) = creating.get(&name) {
                     placed.clone()
@@ -985,11 +921,11 @@ impl Service {
                 let Sequenced { sequence, last } = serde_json::from_slice(&message.app_metadata)
                     .map_err(|error| invalid(format!("bad replication metadata: {error}")))?;
                 let held = partial.as_ref().map_or(0, |(_, bytes)| bytes.len());
-                if (held + message.data_body.len()) as u64 > self.budget.limit {
+                if (held + message.data_body.len()) as u64 > self.budget.limit() {
                     return Err(Status::resource_exhausted(format!(
                         "a log entry is larger than the {} MiB of requests this node holds \
                          at once; raise its request_bytes_in_flight",
-                        self.budget.limit >> 20
+                        self.budget.limit() >> 20
                     )));
                 }
                 charge.grow(message.data_body.len() as u64)?;
@@ -1142,21 +1078,6 @@ impl Service {
         })
         .await
         .map_err(|error| Status::internal(format!("dropping the table: {error}")))?
-    }
-}
-
-fn status(error: ServerError) -> Status {
-    match error {
-        ServerError::NotFound(message) => Status::not_found(message),
-        ServerError::Exists(message) => exists(message),
-        ServerError::Invalid(message) => Status::invalid_argument(message),
-        // Apart, so a router restarts a shipment that skipped ahead, and
-        // retries a fenced write only once it learns the table's term.
-        ServerError::Gap(message) => Status::out_of_range(message),
-        ServerError::Fenced(message) => Status::failed_precondition(message),
-        ServerError::Busy(message) => Status::resource_exhausted(message),
-        ServerError::Unavailable(message) => Status::unavailable(message),
-        ServerError::Internal(message) => Status::internal(message),
     }
 }
 
@@ -1615,51 +1536,13 @@ fn quantile_levels<T>(request: &Request<T>) -> Result<Option<Vec<f64>>, Status> 
     let Some(given) = request.metadata().get(QUANTILES) else {
         return Ok(None);
     };
-    let refused = || invalid(format!("{QUANTILES} lists levels strictly between 0 and 1"));
-    let levels = given
+    given
         .to_str()
-        .map_err(|_| refused())?
-        .split(',')
-        .map(|level| level.trim().parse::<f64>().map_err(|_| refused()))
-        .collect::<Result<Vec<f64>, Status>>()?;
-    if levels.is_empty() || levels.iter().any(|level| !(*level > 0.0 && *level < 1.0)) {
-        return Err(refused());
-    }
-    Ok(Some(levels))
-}
-
-/// Predictions at `levels`, a column per level, each linearly between the
-/// two of the table's `known` levels around it; one beyond the outermost
-/// known level takes that level. Clients compute the same. `values` are
-/// row-major with `known.len()` columns; None if they are not.
-#[must_use]
-pub fn quantile_values(values: &[f32], known: &[f64], levels: &[f64]) -> Option<Vec<Vec<f32>>> {
-    let columns = known.len();
-    if columns == 0 || !values.len().is_multiple_of(columns) {
-        return None;
-    }
-    let rows = values.len() / columns;
-    Some(
-        levels
-            .iter()
-            .map(|&level| {
-                let upper = known.partition_point(|&at| at < level).min(columns - 1);
-                let lower = upper.saturating_sub(1);
-                let span = known[upper] - known[lower];
-                let weight = if span > 0.0 {
-                    ((level - known[lower]) / span).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                (0..rows)
-                    .map(|row| {
-                        let at = |column: usize| f64::from(values[row * columns + column]);
-                        (at(lower) * (1.0 - weight) + at(upper) * weight) as f32
-                    })
-                    .collect()
-            })
-            .collect(),
-    )
+        .map_err(|_| invalid(format!("{QUANTILES} is a comma-separated list")))
+        .and_then(|given| {
+            quantiles::parse_levels(given).map_err(|error| invalid(format!("{QUANTILES}: {error}")))
+        })
+        .map(Some)
 }
 
 /// The quantile columns of predictions at `levels`, as `quantile_values`
@@ -1990,18 +1873,6 @@ fn creation_id() -> Result<CreationId, Status> {
     Ok(CreationId::new(millis, bytes))
 }
 
-/// `ALREADY_EXISTS`, which Arrow clients raise as invalid input: pyarrow has
-/// no error of its own for it, so the Arrow status code rides along in the
-/// trailer Arrow Flight reads it from.
-pub fn exists(message: impl Into<String>) -> Status {
-    let mut metadata = tonic::metadata::MetadataMap::new();
-    metadata.insert(
-        "x-arrow-status",
-        tonic::metadata::MetadataValue::from_static("4"),
-    );
-    Status::with_metadata(tonic::Code::AlreadyExists, message, metadata)
-}
-
 /// What a write changed, and the creation of the table it changed.
 fn answer(written: &crate::shard::Written, placement: &Placement) -> serde_json::Value {
     json!(Answer {
@@ -2067,9 +1938,11 @@ impl Service {
             PutCommand::Replicate => unreachable!("shipments are applied above"),
         };
         let decode = laps.lap();
-        let counts = self.metrics.table(&table);
-        // The shard command must not cross a move; the upload above may.
+        // The shard command must not cross a move; the upload above may. The
+        // table's counts are taken under its route, which a drop waits for,
+        // so a drop never finds them made again behind it.
         let (placement, _routed) = self.routed(&table).await?;
+        let counts = self.metrics.table(&table);
         route += laps.lap();
         laps.observe(&self.metrics.request_route_seconds, route);
         laps.observe(&self.metrics.request_decode_seconds, decode);
@@ -2154,8 +2027,8 @@ impl Service {
             ));
         }
         let decode = laps.lap();
-        let counts = self.metrics.table(&table);
         let (placement, _routed) = self.routed(&table).await?;
+        let counts = self.metrics.table(&table);
         route += laps.lap();
         laps.observe(&self.metrics.request_route_seconds, route);
         laps.observe(&self.metrics.request_decode_seconds, decode);
@@ -2215,8 +2088,8 @@ impl Service {
         let before = times(&batches, "before")?;
         let groups = groups_column(&batches)?;
         let decode = laps.lap();
-        let counts = self.metrics.table(table);
         let (placement, _routed) = self.routed(table).await?;
+        let counts = self.metrics.table(table);
         route += laps.lap();
         laps.observe(&self.metrics.request_route_seconds, route);
         laps.observe(&self.metrics.request_decode_seconds, decode);
@@ -2402,8 +2275,8 @@ impl Service {
         let (batches, _charge) = batches(stream, self.budget.charge()).await?;
         let rows = partition::read_rows(&batches, &placement.columns).map_err(invalid)?;
         let decode = laps.lap();
-        let counts = self.metrics.table(table);
         let (placement, _routed) = self.routed(table).await?;
+        let counts = self.metrics.table(table);
         route += laps.lap();
         laps.observe(&self.metrics.request_route_seconds, route);
         laps.observe(&self.metrics.request_decode_seconds, decode);
@@ -2582,6 +2455,9 @@ impl Service {
                 missing_ok,
                 write_id,
             }) => {
+                // The keys are held until the shard answers, as a put's rows are.
+                let mut charge = self.budget.charge();
+                charge.grow((keys.len() * std::mem::size_of::<u128>()) as u64)?;
                 let (placement, _routed) = self.routed(&table).await?;
                 let counts = self.metrics.table(&table);
                 let written = self
@@ -2593,7 +2469,7 @@ impl Service {
                             id: write_id,
                         },
                         fence,
-                        charge: Charge::default(),
+                        charge,
                         reply,
                     })
                     .await?;
@@ -2950,7 +2826,7 @@ mod tests {
 
     use futures::{StreamExt, executor, stream};
 
-    use super::{RequestBudget, Timed};
+    use super::Timed;
 
     /// The times a `Timed` stream recorded.
     type Recorded = Arc<Mutex<Vec<Duration>>>;
@@ -3002,23 +2878,5 @@ mod tests {
         drop(stream);
         assert_eq!(pulled.load(Ordering::SeqCst), 1);
         assert_eq!(recorded.lock().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn charges_share_one_budget_and_give_it_back_when_dropped() {
-        let budget = RequestBudget::new(100);
-        let mut first = budget.charge();
-        let mut second = budget.charge();
-
-        first.grow(60).unwrap();
-        let refused = second.grow(50);
-        second.grow(40).unwrap();
-        drop(first);
-        let after = second.grow(50);
-
-        assert_eq!(refused.unwrap_err().code(), tonic::Code::ResourceExhausted);
-        assert!(after.is_ok());
-        drop(second);
-        assert!(budget.charge().grow(100).is_ok());
     }
 }

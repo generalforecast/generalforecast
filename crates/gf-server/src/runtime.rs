@@ -17,12 +17,13 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::{Config, WorkerConfig};
 use crate::engine;
+use crate::error::ServerError;
 use crate::metrics::Metrics;
 use crate::name::TableName;
 use crate::routes::Routes;
 use crate::service::{Placement, SeriesPlacement};
 use crate::setup;
-use crate::shard::{Command, ServerError, Shard, ShardSettings};
+use crate::shard::{Command, Shard, ShardSettings};
 use crate::wal::{EncryptionKey, Keys};
 use crate::worker::{
     CPU_WORKER_CORES, Launch, WorkerConnection, allowed_cpus, cpu_groups, visible_gpus,

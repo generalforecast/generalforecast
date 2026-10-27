@@ -24,12 +24,13 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::budget::{Charge, RequestBudget};
+use crate::error::ServerError;
 use crate::http::ApiError;
 use crate::name::TableName;
 use crate::predictors::ServedPredictor;
 use crate::routes::{Busy, Routes};
-use crate::service::{Charge, RequestBudget};
-use crate::shard::{Asked, Command, Fence, Incoming, Inferred, RequestContext, ServerError, Write};
+use crate::shard::{Asked, Command, Fence, Incoming, Inferred, RequestContext, Write};
 use crate::wal::{Rows, TableDefinition, Terms};
 
 /// A snapshot predictor's rows, bound once into their durable table.
