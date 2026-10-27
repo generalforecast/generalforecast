@@ -119,8 +119,12 @@ class BoundSnapshot(Snapshot):
 
 
 @dataclass(frozen=True, eq=False)
-class HostedPredictor(BoundSnapshot):
-    """A hosted predictor's facts with explicit environment operations."""
+class PredictorHandle(BoundSnapshot):
+    """A hosted predictor's facts, and an environment if one was selected.
+
+    `HostedPredictor` and `AsyncHostedPredictor` add the same operations,
+    run synchronously or awaited.
+    """
 
     environment: Environment | None = None
 
@@ -139,52 +143,71 @@ class HostedPredictor(BoundSnapshot):
 
     @property
     def revision(self) -> int | None:
-        """Returns the selected environment revision, never desired-as-serving state."""
-        return self.environment.revision if self.environment else self.get("revision")
+        """The selected environment's revision, else the latest registered one."""
+        if self.environment is not None:
+            return self.environment.revision
+        return self.get("latest_revision")
 
     @property
     def status(self) -> str | None:
-        """Returns reported lifecycle status, preserving pending/error states."""
-        return self.environment.status if self.environment else self.get("status")
+        """The selected environment's reported status; None without one."""
+        return self.environment.status if self.environment is not None else None
+
+    @property
+    def environments(self) -> tuple[Environment, ...]:
+        """Every environment the predictor has, as the service reported them."""
+        return tuple(
+            Environment.from_dict(value) for value in self.get("environments") or ()
+        )
+
+    def _selected(self, options: dict[str, Any], **captured: bool) -> dict[str, Any]:
+        """Options with this handle's environment, pointer or CAS guard filled in."""
+        captured_environment(self.environment, options, **captured)
+        return options
+
+    def _refresh_env(self) -> str | None:
+        return self.environment.name if self.environment is not None else None
+
+
+@dataclass(frozen=True, eq=False)
+class HostedPredictor(PredictorHandle):
+    """A hosted predictor's facts with explicit environment operations."""
 
     def refresh(self) -> "HostedPredictor":
         """Fetches a new snapshot without modifying this handle."""
-        return self._client.predictors.get(
-            self.name, env=self.environment.name if self.environment else None
-        )
+        return self._client.predictors.get(self.name, env=self._refresh_env())
 
     def predict(self, queries: Any, **options: Any) -> PredictionResult:
         """Uses the captured environment selection, not a mutable global default."""
-        captured_environment(self.environment, options)
-        return self._client.predictors.predict(self.name, queries, **options)
+        return self._client.predictors.predict(
+            self.name, queries, **self._selected(options)
+        )
 
     def wait(self, **options: Any) -> Environment:
         """Waits for the captured pointer by default."""
-        captured_environment(self.environment, options, pointer=True)
-        return self._client.predictors.wait(self.name, **options)
+        return self._client.predictors.wait(
+            self.name, **self._selected(options, pointer=True)
+        )
 
     def promote(self, *, revision: int, **options: Any) -> Environment:
         """Promotes under this snapshot's generation when an environment was selected."""
-        self._guard(options)
-        return self._client.predictors.promote(self.name, revision=revision, **options)
+        return self._client.predictors.promote(
+            self.name, revision=revision, **self._selected(options, guard=True)
+        )
 
     def rollback(self, *, revision: int, **options: Any) -> Environment:
         """Rolls back under this snapshot's generation."""
-        self._guard(options)
-        return self._client.predictors.rollback(self.name, revision=revision, **options)
-
-    def _guard(self, options):
-        captured_environment(self.environment, options, guard=True)
+        return self._client.predictors.rollback(
+            self.name, revision=revision, **self._selected(options, guard=True)
+        )
 
     def metrics(self, **options: Any) -> Snapshot:
         """Fetches actual metrics for the selected environment."""
-        captured_environment(self.environment, options)
-        return self._client.predictors.metrics(self.name, **options)
+        return self._client.predictors.metrics(self.name, **self._selected(options))
 
     def logs(self, **options: Any) -> Snapshot:
         """Fetches bounded runtime logs for the selected environment."""
-        captured_environment(self.environment, options)
-        return self._client.predictors.logs(self.name, **options)
+        return self._client.predictors.logs(self.name, **self._selected(options))
 
     def delete(self) -> Snapshot:
         """Requests deletion; the server owns authorization and cleanup."""
@@ -192,8 +215,8 @@ class HostedPredictor(BoundSnapshot):
 
 
 @dataclass(frozen=True, eq=False)
-class LiveContext(BoundSnapshot):
-    """A live context's facts and explicit append/label/import/refresh actions."""
+class ContextHandle(BoundSnapshot):
+    """A live context's facts; `LiveContext` and `AsyncLiveContext` add its writes."""
 
     @property
     def sequence(self) -> int | None:
@@ -204,6 +227,16 @@ class LiveContext(BoundSnapshot):
     def rows(self) -> int | None:
         """Rows the context holds."""
         return self.get("rows")
+
+    def _owned(self, reference) -> Any:
+        """The import reference, once it names this handle's context."""
+        require(reference.context == self.name, "import context differs from handle")
+        return reference
+
+
+@dataclass(frozen=True, eq=False)
+class LiveContext(ContextHandle):
+    """A live context's facts and explicit append/label/import/refresh actions."""
 
     def append(self, data: Any, *, id: str, idempotency_key: str) -> WriteReceipt:
         """Appends rows without mutating this state snapshot."""
@@ -221,10 +254,9 @@ class LiveContext(BoundSnapshot):
 
     def import_source(self, reference) -> ImportReceipt:
         """Binds an import only when its live context matches this handle."""
-        require(reference.context == self.name, "import context differs from handle")
-        return self._client.contexts.import_source(reference)
+        return self._client.contexts.import_source(self._owned(reference))
 
-    def refresh(self) -> "LiveContext":
+    def refresh(self) -> ImportReceipt:
         """Explicitly requests provider refresh rather than polling source silently."""
         return self._client.contexts.refresh(self.name)
 

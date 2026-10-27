@@ -1,32 +1,33 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Project-scoped versioned SDK. The server authorizes every operation."""
+"""Project-scoped versioned SDK. The server authorizes every operation.
+
+Every operation is defined once, in `generalforecast._operations`; this client
+runs its steps in the calling thread, and `AsyncClient` awaits the same steps.
+"""
 
 import time
-import uuid
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Self, cast
-from urllib.parse import urlencode
+from typing import Any, Self
 
+from generalforecast import _operations as ops
+from generalforecast._operations import (
+    WORKSPACE_ACTIONS,
+    Call,
+    Operation,
+    Pause,
+    Work,
+    workspace_request,
+)
 from generalforecast.contracts import (
     ContextImportRef,
     Environment,
     PredictionResult,
-    PromoteRequest,
     Revision,
-    parse_lock,
 )
-from generalforecast.service.boundary import (
-    JsonObject,
-    Request,
-    Resource,
-    ResourceKind,
-    Scope,
-    json_object,
-)
-from generalforecast.service.contracts import ServiceError, name, number, require
+from generalforecast.service.boundary import JsonObject, ResourceKind
 from generalforecast.service.interfaces import (
     AcceptedWrite,
     ContextSnapshot,
@@ -41,99 +42,10 @@ from generalforecast.service.sdk import (
     RevisionDetails,
     Snapshot,
     WriteReceipt,
-    append_payload,
-    environment_name,
-    inference_result,
-    label_payload,
-    pushed,
-    table,
-    unwrap,
 )
-from generalforecast.tabular import arrow_bytes, table_digest
 from generalforecast.transport import Profile, Transport, connection
 
-# Session-only onboarding and workspace-admin actions. The server checks the
-# signed-in Google session and live workspace role on every call; project API
-# keys receive its typed SessionRequired denial, never a local short-circuit.
-WORKSPACE_ACTIONS: dict[str, tuple[str, str, str]] = {
-    "onboarding.get": ("GET", "/onboarding", "onboarding"),
-    "workspaces.list": ("GET", "/workspaces", "workspaces"),
-    "workspaces.create": ("POST", "/workspaces", "new"),
-    "workspaces.get": ("GET", "/workspaces/{workspace}", "{workspace}"),
-    "workspaces.update": ("POST", "/workspaces/{workspace}", "{workspace}"),
-    "workspaces.join": ("POST", "/workspaces/{workspace}/join", "{workspace}"),
-    "workspaces.members": ("GET", "/workspaces/{workspace}/members", "{workspace}"),
-    "members.update": (
-        "POST",
-        "/workspaces/{workspace}/members/role",
-        "{workspace}",
-    ),
-    "members.remove": (
-        "POST",
-        "/workspaces/{workspace}/members/remove",
-        "{workspace}",
-    ),
-    "invitations.preview": ("POST", "/invitations/preview", "invitation"),
-    "device.preview": ("POST", "/cli-logins/preview", "cli-login"),
-    "device.approve": ("POST", "/cli-logins/approve", "cli-login"),
-    "device.deny": ("POST", "/cli-logins/deny", "cli-login"),
-    "invitations.accept": ("POST", "/invitations/accept", "invitation"),
-    "invitations.list": ("GET", "/workspaces/{workspace}/invitations", "{workspace}"),
-    "invitations.create": (
-        "POST",
-        "/workspaces/{workspace}/invitations",
-        "{workspace}",
-    ),
-    "invitations.revoke": (
-        "POST",
-        "/workspaces/{workspace}/invitations/{id}/revoke",
-        "{id}",
-    ),
-    "requests.list": ("GET", "/workspaces/{workspace}/join-requests", "{workspace}"),
-    "requests.approve": (
-        "POST",
-        "/workspaces/{workspace}/join-requests/{id}/approve",
-        "{id}",
-    ),
-    "requests.deny": (
-        "POST",
-        "/workspaces/{workspace}/join-requests/{id}/deny",
-        "{id}",
-    ),
-    "requests.cancel": ("POST", "/join-requests/{id}/cancel", "{id}"),
-    "waitlist.join": ("POST", "/waitlist", "waitlist"),
-    "waitlist.get": ("GET", "/waitlist/{id}", "{id}"),
-    "waitlist.approve": ("POST", "/waitlist/{id}/approve", "{id}"),
-    "domains.list": ("GET", "/workspaces/{workspace}/domains", "{workspace}"),
-    "domains.configure": ("POST", "/workspaces/{workspace}/domains", "{workspace}"),
-}
-
-
-def workspace_request(
-    action: str, payload: JsonObject
-) -> tuple[str, str, str, JsonObject | None, JsonObject | None]:
-    """Binds one workspace action to (method, path, resource, body, query).
-
-    Path identities are repeated in POST bodies so the server can check them;
-    GET identities move into the path and only join requests accept `state`.
-    """
-    method, path, resource = WORKSPACE_ACTIONS[action]
-    keys = [k for k in ("workspace", "id") if "{" + k + "}" in path]
-    values = {k: name(payload.get(k)) for k in keys}
-    path = path.format(**values)
-    resource = resource.format(**values)
-    if method == "POST":
-        return method, path, resource, payload, None
-    extra = set(payload) - set(keys)
-    require(
-        not extra or (action == "requests.list" and extra == {"state"}),
-        "GET operation accepts only path identities",
-    )
-    params = None
-    if "state" in extra:
-        require(payload["state"] in ("pending", "all"), "invalid join request state")
-        params = {"state": payload["state"]}
-    return method, path, resource, None, params
+__all__ = ["WORKSPACE_ACTIONS", "Client", "workspace_request"]
 
 
 class Client:
@@ -141,7 +53,12 @@ class Client:
 
     Uses only versioned routes. Request IDs correlate; callers must preserve
     write_id/submission_id on retries. No automatic retries or cookie login.
+    Errors are `ServiceError`s of the `gf.Error` category their code names,
+    so `except gf.NotFound` catches a missing resource.
     """
+
+    _hosted_predictor = HostedPredictor
+    _live_context = LiveContext
 
     def __init__(
         self,
@@ -182,7 +99,7 @@ class Client:
         self.close()
 
     def close(self) -> None:
-        """Closes the transport; snapshots remain immutable and readable."""
+        """Closes the transport; later calls raise `ClientClosed`."""
         self._transport.close()
 
     def predict(
@@ -219,53 +136,28 @@ class Client:
             outputs: Which outputs to return; the model's default if None.
             selection: How each query's context is drawn: core, neighbors, kind.
         """
-        from generalforecast.predictor import PredictRequest
-
-        request = PredictRequest.build(
-            model=model,
-            target=target,
-            context=context,
-            queries=queries,
-            inputs=inputs,
-            id=id,
-            time=time,
-            series=series,
-            frequency=frequency,
-            horizon=horizon,
-            quantiles=quantiles,
-            outputs=outputs,
-            selection=selection,
-        )
-        return inference_result(
-            self._call("POST", "/predict", "predictor", "ad-hoc", request.payload())
+        return self._run(
+            ops.predict(
+                self,
+                model=model,
+                target=target,
+                context=context,
+                queries=queries,
+                inputs=inputs,
+                id=id,
+                time=time,
+                series=series,
+                frequency=frequency,
+                horizon=horizon,
+                quantiles=quantiles,
+                outputs=outputs,
+                selection=selection,
+            )
         )
 
     def upload_snapshot(self, data: Any) -> JsonObject:
         """Uploads the full normalized Arrow snapshot and verifies the returned digest."""
-        normalized = table(data)
-        request_id = "r-" + uuid.uuid4().hex
-        value = self._transport.send(
-            "POST",
-            f"/v1/projects/{self.project}/snapshots",
-            arrow_bytes(normalized),
-            {
-                "Content-Type": "application/vnd.apache.arrow.stream",
-                "X-GF-Project": self.project,
-                "X-GF-Request-ID": request_id,
-            },
-        )
-        request = Request(
-            Scope(self.project, request_id), Resource("context", "snapshots"), {}
-        )
-        receipt = unwrap(value, request)
-        if type(receipt.get("rows")) is not int or receipt != {
-            "digest": table_digest(normalized),
-            "rows": normalized.num_rows,
-        }:
-            raise ServiceError(
-                "ProtocolError", "snapshot receipt does not match uploaded content", 502
-            )
-        return receipt
+        return self._run(ops.upload_snapshot(self, data))
 
     def _call(
         self,
@@ -276,34 +168,52 @@ class Client:
         payload: JsonObject | None = None,
         *,
         global_route: bool = False,
-        params: JsonObject | None = None,
+        params: Mapping[str, Any] | None = None,
         deadline: float | None = None,
     ) -> JsonObject:
-        request = Request.parse(
-            Request(
-                Scope(self.project, "r-" + uuid.uuid4().hex),
-                Resource(kind, resource),
-                {} if payload is None else payload,
-            ).to_dict()
+        """Sends one versioned request and returns its unwrapped result."""
+        return self._step(
+            Call(method, path, kind, resource, payload, global_route, params, deadline)
         )
-        prefix = "/v1" if global_route else f"/v1/projects/{self.project}"
-        query = "?" + urlencode(params) if params else ""
-        options = {} if deadline is None else {"deadline": deadline}
+
+    def _run[T](self, operation: Operation[T]) -> T:
+        """Runs an operation's steps in this thread, throwing failures back into it."""
+        result: Any = None
+        failure: Exception | None = None
+        while True:
+            try:
+                step = (
+                    operation.send(result)
+                    if failure is None
+                    else operation.throw(failure)
+                )
+            except StopIteration as stop:
+                return stop.value
+            result, failure = None, None
+            try:
+                result = self._step(step)
+            except Exception as error:  # noqa: BLE001 - thrown into the operation
+                failure = error
+
+    def _step(self, step: ops.Step) -> Any:
+        if isinstance(step, Work):
+            return step.function(*step.args, **step.kwargs)
+        if isinstance(step, Pause):
+            time.sleep(step.seconds)
+            return None
+        prepared = ops.prepare(self.project, step)
         value = self._transport.send(
-            method,
-            prefix + path + query,
-            request.to_dict() if method == "POST" else None,
-            {
-                "X-GF-Request-ID": request.scope.request_id,
-                "X-GF-Project": self.project,
-            },
-            **options,
+            prepared.method,
+            prepared.path,
+            prepared.body,
+            prepared.headers,
+            deadline=prepared.deadline,
         )
-        return unwrap(value, request)
+        return ops.answer(prepared, value)
 
 
-class Collection:
-    """Common bounded list/get operations, never arbitrary remote dispatch."""
+class Listing:
+    """Lists one collection of the project's resources."""
 
     kind: ResourceKind
     collection: str
@@ -314,30 +224,15 @@ class Collection:
 
     def list(self) -> list[JsonObject]:
         """Returns this project's actual resource metadata."""
-        result = self.client._call(
-            "GET", f"/{self.collection}", self.kind, self.collection
-        )
-        value = result.get(self.collection)
-        if type(value) is not list or any(type(item) is not dict for item in value):
-            raise ServiceError("ProtocolError", "invalid collection response", 502)
-        return value
+        return self.client._run(ops.listed(self.kind, self.collection))
+
+
+class Collection(Listing):
+    """A listed collection whose resources are also read one at a time."""
 
     def get(self, resource: str) -> Mapping[str, Any]:
         """Gets one project-qualified resource."""
-        return self.client._call(
-            "GET", f"/{self.collection}/{name(resource)}", self.kind, resource
-        )
-
-    def _post(self, resource: str, action: str, payload: JsonObject) -> JsonObject:
-        suffix = f"/{name(resource)}" + (f"/{action}" if action else "")
-        return self.client._call(
-            "POST", f"/{self.collection}{suffix}", self.kind, resource, payload
-        )
-
-    def _create(self, resource: str, payload: JsonObject) -> JsonObject:
-        return self.client._call(
-            "POST", f"/{self.collection}", self.kind, resource, payload
-        )
+        return self.client._run(ops.got(self.kind, self.collection, resource))
 
 
 class Contexts(Collection):
@@ -346,66 +241,47 @@ class Contexts(Collection):
     kind: ResourceKind = "context"
     collection = "contexts"
 
-    def create(self, config: JsonObject | ContextSpec) -> "LiveContext":
+    def create(self, config: JsonObject | ContextSpec) -> LiveContext:
         """Creates a live context from its schema."""
-        value = config.to_dict() if isinstance(config, ContextSpec) else config
-        return LiveContext.from_response(
-            self.client, value["name"], self._create(value["name"], value)
-        )
+        return self.client._run(ops.context_create(self.client, config))
 
-    def get(self, resource: str) -> "LiveContext":
+    def get(self, resource: str) -> LiveContext:
         """Returns a detached live-context snapshot with typed write methods."""
-        return LiveContext.from_response(self.client, resource, super().get(resource))
+        return self.client._run(ops.context_get(self.client, resource))
 
     def append(
         self, context: str, data: Any, *, id: str, idempotency_key: str
-    ) -> "WriteReceipt":
+    ) -> WriteReceipt:
         """Appends rows under a durable write id."""
-        return WriteReceipt.from_dict(
-            self._post(
-                context, "append", append_payload(data, id=id, write_id=idempotency_key)
-            )
+        return self.client._run(
+            ops.context_append(context, data, id=id, idempotency_key=idempotency_key)
         )
 
     def label(
         self, context: str, data: Any, *, id: str, column: str, idempotency_key: str
-    ) -> "WriteReceipt":
+    ) -> WriteReceipt:
         """Attaches one target's values to rows already in the context."""
-        return WriteReceipt.from_dict(
-            self._post(
-                context,
-                "label",
-                label_payload(data, id=id, column=column, write_id=idempotency_key),
+        return self.client._run(
+            ops.context_label(
+                context, data, id=id, column=column, idempotency_key=idempotency_key
             )
         )
 
-    def import_source(self, reference: ContextImportRef) -> "ImportReceipt":
+    def import_source(self, reference: ContextImportRef) -> ImportReceipt:
         """Binds a cloud or uploaded table to an existing live context."""
-        return ImportReceipt.from_dict(
-            self._post(reference.context, "imports", reference.to_dict())
-        )
+        return self.client._run(ops.context_import(reference))
 
-    def import_file(self, context: str, data: Any) -> "ImportReceipt":
+    def import_file(self, context: str, data: Any) -> ImportReceipt:
         """Uploads a local bounded table before binding it to a live context."""
-        receipt = self.client.upload_snapshot(data)
-        return self.import_source(
-            ContextImportRef(
-                context,
-                "upload://" + receipt["digest"],
-                "arrow",
-                digest=receipt["digest"],
-            )
-        )
+        return self.client._run(ops.context_import_file(self.client, context, data))
 
-    def refresh(self, context: str) -> "LiveContext":
+    def refresh(self, context: str) -> ImportReceipt:
         """Requests an explicit provider refresh; unsupported adapters fail visibly."""
-        return LiveContext.from_response(
-            self.client, context, self._post(context, "refresh", {})
-        )
+        return self.client._run(ops.context_refresh(context))
 
     def mutate(self, context: str, mutation: Mutation) -> AcceptedWrite:
         """Accepts an atomic write, not serving readiness. Preserve write_id."""
-        return cast(AcceptedWrite, self._post(context, "mutations", dict(mutation)))
+        return self.client._run(ops.context_mutate(context, mutation))
 
     def snapshot(
         self,
@@ -416,17 +292,13 @@ class Contexts(Collection):
         event_before: float | None = None,
     ) -> ContextSnapshot:
         """Keeps knowledge/acceptance time independent from event time."""
-        return cast(
-            ContextSnapshot,
-            self._post(
+        return self.client._run(
+            ops.context_snapshot(
                 context,
-                "snapshot",
-                {
-                    "target": target,
-                    "knowledge_at": knowledge_at,
-                    "event_before": event_before,
-                },
-            ),
+                target=target,
+                knowledge_at=knowledge_at,
+                event_before=event_before,
+            )
         )
 
 
@@ -438,7 +310,7 @@ class Sources(Collection):
 
     def pin(self, spec: JsonObject) -> SourcePin:
         """Pins server-relative bytes; this does not upload a client-side path."""
-        return cast(SourcePin, self._create("new", spec))
+        return self.client._run(ops.source_pin(spec))
 
 
 class Models(Collection):
@@ -454,75 +326,40 @@ class Predictors(Collection):
     kind: ResourceKind = "predictor"
     collection = "predictors"
 
-    def get(self, resource: str, *, env: str | None = None) -> "HostedPredictor":
+    def get(self, resource: str, *, env: str | None = None) -> HostedPredictor:
         """Returns the predictor's facts and optional environment state."""
-        state = super().get(resource)
-        environment = self.environment(resource, env) if env is not None else None
-        return HostedPredictor.from_response(self.client, resource, state, environment)
+        return self.client._run(ops.predictor_get(self.client, resource, env))
 
-    def create(self, predictor: str) -> "HostedPredictor":
+    def create(self, predictor: str) -> HostedPredictor:
         """Creates only the predictor name, not serving readiness."""
-        return HostedPredictor.from_response(
-            self.client,
-            predictor,
-            self._create(predictor, {"name": name(predictor)}),
-        )
+        return self.client._run(ops.predictor_create(self.client, predictor))
 
     def revisions(self, predictor: str) -> tuple[Revision, ...]:
         """Lists immutable revisions without inferring environment readiness."""
-        value = self.client._call(
-            "GET", f"/predictors/{name(predictor)}/revisions", self.kind, predictor
-        )
-        return tuple(Revision.from_dict(row) for row in value["revisions"])
+        return self.client._run(ops.predictor_revisions(predictor))
 
-    def revision(self, predictor: str, number: int) -> "RevisionDetails":
+    def revision(self, predictor: str, number: int) -> RevisionDetails:
         """Reads the exact immutable compiled lock for a revision."""
-        require(type(number) is int and number > 0, "invalid revision")
-        value = self.client._call(
-            "GET",
-            f"/predictors/{name(predictor)}/revisions/{number}",
-            self.kind,
-            predictor,
-        )
-        return RevisionDetails(
-            Revision.from_dict(value["revision"]), parse_lock(value["lock"])
-        )
+        return self.client._run(ops.predictor_revision(predictor, number))
 
     def environments(self, predictor: str) -> tuple[Environment, ...]:
         """Lists runtime-bound environment pointers and their actual states."""
-        value = self.client._call(
-            "GET",
-            f"/predictors/{name(predictor)}/environments",
-            self.kind,
-            predictor,
-        )
-        return tuple(Environment.from_dict(row) for row in value["environments"])
+        return self.client._run(ops.predictor_environments(predictor))
 
     def environment(
         self, predictor: str, env: str | None = None, *, deadline: float | None = None
     ) -> Environment:
         """Gets one environment with revision and CAS generation."""
-        selected = environment_name(env, self.client.profile.environment)
-        return Environment.from_dict(
-            self.client._call(
-                "GET",
-                f"/predictors/{name(predictor)}/environments/{selected}",
-                self.kind,
-                predictor,
-                deadline=deadline,
-            )
+        return self.client._run(
+            ops.predictor_environment(self.client, predictor, env, deadline)
         )
 
     def create_environment(
         self, predictor: str, *, env: str, runtime: str
     ) -> Environment:
         """Binds a runtime separately from predictor content and authentication."""
-        return Environment.from_dict(
-            self._post(
-                predictor,
-                "environments",
-                {"name": name(env), "runtime": name(runtime)},
-            )
+        return self.client._run(
+            ops.predictor_create_environment(predictor, env, runtime)
         )
 
     def promote(
@@ -534,17 +371,14 @@ class Predictors(Collection):
         expected_generation: int | None = None,
     ) -> Environment:
         """CAS-promotes an explicit revision; races remain visible conflicts."""
-        selected = environment_name(env, self.client.profile.environment)
-        generation = (
-            self.environment(predictor, selected).generation
-            if expected_generation is None
-            else expected_generation
-        )
-        return Environment.from_dict(
-            self._post(
+        return self.client._run(
+            ops.predictor_move(
+                self.client,
                 predictor,
-                f"environments/{name(selected)}/promote",
-                PromoteRequest(revision, generation).to_dict(),
+                "promote",
+                revision=revision,
+                env=env,
+                expected_generation=expected_generation,
             )
         )
 
@@ -557,17 +391,14 @@ class Predictors(Collection):
         expected_generation: int | None = None,
     ) -> Environment:
         """Rolls back to an explicit immutable revision under the same CAS guard."""
-        selected = environment_name(env, self.client.profile.environment)
-        generation = (
-            self.environment(predictor, selected).generation
-            if expected_generation is None
-            else expected_generation
-        )
-        return Environment.from_dict(
-            self._post(
+        return self.client._run(
+            ops.predictor_move(
+                self.client,
                 predictor,
-                f"environments/{name(selected)}/rollback",
-                PromoteRequest(revision, generation).to_dict(),
+                "rollback",
+                revision=revision,
+                env=env,
+                expected_generation=expected_generation,
             )
         )
 
@@ -588,22 +419,11 @@ class Predictors(Collection):
             context: Rows the model learns from; only for a predictor whose
                 context kind is `request`.
             as_of: The time the context is read as of, for a live context.
-            env: The environment; the profile's, else `production`.
+            env: The environment; the profile's (`production` by default).
         """
-        from generalforecast.predictor import PredictRequest
-
-        payload = PredictRequest.declared_payload(queries, context=context, as_of=as_of)
-        params = (
-            {"env": environment_name(env, "production")} if env is not None else None
-        )
-        return inference_result(
-            self.client._call(
-                "POST",
-                f"/{self.collection}/{predictor}/predict",
-                "predictor",
-                predictor,
-                payload,
-                params=params,
+        return self.client._run(
+            ops.predictor_predict(
+                self.client, predictor, queries, context=context, as_of=as_of, env=env
             )
         )
 
@@ -617,58 +437,16 @@ class Predictors(Collection):
         timeout: float = 120,
     ) -> Revision:
         """Pushes a checked predictor: registers a revision and points an environment at it."""
-        checked = pushed(predictor)
-        lock = checked.lock
-        predictor, selected = (
-            checked.name,
-            environment_name(env, self.client.profile.environment),
-        )
-        try:
-            self.get(predictor)
-        except ServiceError as error:
-            if error.status != 404:
-                raise
-            self.create(predictor)
-        snapshot = None
-        if checked.snapshot is not None:
-            snapshot = self.client.upload_snapshot(checked.snapshot)["digest"]
-            require(snapshot == lock.data_digest, "snapshot differs from gf.lock")
-        revision = Revision.from_dict(
-            self._post(
-                predictor, "revisions", {"lock": lock.to_dict(), "snapshot": snapshot}
-            )
-        )
-        try:
-            environment = self.environment(predictor, selected)
-            if runtime is not None:
-                require(
-                    environment.runtime == runtime,
-                    "environment is bound to a different runtime",
-                )
-        except ServiceError as error:
-            if error.status != 404:
-                raise
-            chosen = self.client.profile.runtime if runtime is None else runtime
-            require(chosen is not None, "runtime is required for a new environment")
-            assert chosen is not None
-            environment = self.create_environment(
-                predictor, env=selected, runtime=chosen
-            )
-        promoted = self.promote(
-            predictor,
-            revision=revision.number,
-            env=selected,
-            expected_generation=environment.generation,
-        )
-        if wait:
-            self.wait(
+        return self.client._run(
+            ops.predictor_push(
+                self.client,
                 predictor,
-                env=selected,
-                revision=revision.number,
-                generation=promoted.generation,
+                env=env,
+                runtime=runtime,
+                wait=wait,
                 timeout=timeout,
             )
-        return revision
+        )
 
     def wait(
         self,
@@ -680,56 +458,38 @@ class Predictors(Collection):
         timeout: float = 120,
         poll_interval: float = 0.2,
     ) -> Environment:
-        """Polls an exact environment pointer; superseded and failed states never succeed."""
-        number(timeout, 0, 86400, "timeout")
-        number(poll_interval, 0.001, 30, "poll_interval")
-        deadline = time.monotonic() + timeout
-        while True:
-            state = self.environment(predictor, env, deadline=deadline)
-            if (revision is not None and state.revision != revision) or (
-                generation is not None and state.generation != generation
-            ):
-                raise ServiceError(
-                    "Conflict", "environment pointer changed while waiting", 409
-                )
-            revision, generation = state.revision, state.generation
-            if state.status == "ready":
-                return state
-            if state.status in {"failed", "stopped"}:
-                raise ServiceError(
-                    "EnvironmentFailed", "environment did not become ready", 409
-                )
-            if time.monotonic() >= deadline:
-                raise ServiceError(
-                    "WaitTimeout", "environment readiness timed out", 504
-                )
-            time.sleep(min(poll_interval, max(0, deadline - time.monotonic())))
+        """Polls an exact environment pointer; superseded and failed states never succeed.
+
+        Raises `WaitTimeout` when `timeout` seconds pass first; a `timeout`
+        of 0 checks once.
+        """
+        return self.client._run(
+            ops.predictor_wait(
+                self.client,
+                predictor,
+                env=env,
+                revision=revision,
+                generation=generation,
+                timeout=timeout,
+                poll_interval=poll_interval,
+            )
+        )
 
     def metrics(self, predictor: str, *, env: str | None = None) -> Snapshot:
         """Gets reported metrics without fabricating missing samples."""
-        return Snapshot.from_dict(
-            self.client._call(
-                "GET",
-                f"/predictors/{name(predictor)}/environments/{environment_name(env, self.client.profile.environment)}/metrics",
-                self.kind,
-                predictor,
-            )
+        return self.client._run(
+            ops.predictor_report(self.client, predictor, env, "metrics")
         )
 
     def logs(self, predictor: str, *, env: str | None = None) -> Snapshot:
         """Gets bounded safe runtime logs."""
-        return Snapshot.from_dict(
-            self.client._call(
-                "GET",
-                f"/predictors/{name(predictor)}/environments/{environment_name(env, self.client.profile.environment)}/logs",
-                self.kind,
-                predictor,
-            )
+        return self.client._run(
+            ops.predictor_report(self.client, predictor, env, "logs")
         )
 
     def delete(self, predictor: str) -> Snapshot:
         """Requests explicit stop/delete, never treating unsupported cleanup as success."""
-        return Snapshot.from_dict(self._post(predictor, "delete", {}))
+        return self.client._run(ops.predictor_delete(predictor))
 
 
 class Identity:
@@ -741,111 +501,15 @@ class Identity:
 
     def manage(self, action: str, payload: JsonObject | None = None) -> JsonObject:
         """Calls concrete identity actions, not a user-selected server method."""
-        payload = {} if payload is None else json_object(payload)
-        if action in WORKSPACE_ACTIONS:
-            method, path, resource, body, params = workspace_request(action, payload)
-            return self.client._call(
-                method,
-                path,
-                "workspace",
-                resource,
-                body,
-                global_route=True,
-                params=params,
-            )
-        globals_ = {
-            "workspace.get": ("workspace", "/workspace", "workspace"),
-            "auth.status": ("workspace", "/auth/status", "auth"),
-            "auth.logout": ("workspace", "/auth/logout", "auth"),
-            "organizations.list": ("workspace", "/organizations", "organizations"),
-            "organizations.create": (
-                "workspace",
-                "/organizations",
-                payload.get("name", "new"),
-            ),
-            "projects.list": ("project", "/projects", "projects"),
-            "projects.create": ("project", "/projects", payload.get("name", "new")),
-        }
-        if action in globals_:
-            post = action.endswith("create") or action == "auth.logout"
-            require(
-                action.endswith("create") or not payload,
-                "GET operation requires empty payload",
-            )
-            kind, path, resource = globals_[action]
-            return self.client._call(
-                "POST" if post else "GET",
-                path,
-                cast(ResourceKind, kind),
-                resource,
-                payload,
-                global_route=True,
-            )
-        domain, _, operation = action.partition(".")
-        if domain in ("keys", "secrets") and operation in (
-            {"list", "create", "rotate", "revoke"}
-            if domain == "keys"
-            else {"list", "create", "get", "rotate", "delete"}
-        ):
-            if operation == "list":
-                require(not payload, "GET operation requires empty payload")
-            resource = (
-                domain
-                if operation == "list"
-                else (
-                    "new"
-                    if domain == "keys" and operation == "create"
-                    else payload.get("id" if domain == "keys" else "name", "")
-                )
-            )
-            path = f"/{domain}"
-            if operation not in ("list", "create"):
-                path += f"/{name(resource)}" + (
-                    "" if operation == "get" else f"/{operation}"
-                )
-            return self.client._call(
-                "GET" if operation in ("list", "get") else "POST",
-                path,
-                "api-key" if domain == "keys" else "secret",
-                resource,
-                payload,
-            )
-        if action in (
-            "memberships.list",
-            "memberships.add",
-            "memberships.remove",
-            "sso.get",
-            "sso.configure",
-            "audit.list",
-        ):
-            params = None
-            if action == "audit.list":
-                require(set(payload) <= {"after", "limit"}, "invalid audit parameters")
-                after, limit = payload.get("after", 0), payload.get("limit", 100)
-                require(
-                    type(after) is int and 0 <= after <= 2**53 - 1,
-                    "invalid audit cursor",
-                )
-                require(type(limit) is int and 1 <= limit <= 100, "invalid audit limit")
-                params = {"after": after, "limit": limit}
-            elif operation in ("get", "list"):
-                require(not payload, "GET operation requires empty payload")
-            path = "/" + domain + (f"/{operation}" if operation == "remove" else "")
-            return self.client._call(
-                "GET" if operation in ("get", "list") else "POST",
-                path,
-                "workspace",
-                domain,
-                payload if operation not in ("get", "list") else None,
-                params=params,
-            )
-        raise ServiceError(
-            "UnsupportedOperation", "identity action is not supported", 501
-        )
+        return self.client._run(ops.manage(action, payload))
 
 
-class Keys(Collection):
-    """Revocable API keys; create/rotate return the token once."""
+class Keys(Listing):
+    """Revocable API keys; create/rotate return the token once.
+
+    Keys are listed, never read one at a time: the service has no
+    `GET /keys/{id}`.
+    """
 
     kind: ResourceKind = "api-key"
     collection = "keys"
@@ -854,18 +518,17 @@ class Keys(Collection):
         self, *, name: str, permissions: list[str], expires_in: float | None = None
     ) -> JsonObject:
         """Creates only the permissions the server allows the caller to grant."""
-        payload: JsonObject = {"name": name, "permissions": permissions}
-        if expires_in is not None:
-            payload["expires_in"] = expires_in
-        return self.client.identity.manage("keys.create", payload)
+        return self.client._run(
+            ops.key_create(name=name, permissions=permissions, expires_in=expires_in)
+        )
 
     def revoke(self, key: str) -> JsonObject:
         """Revokes a key by public identifier, not by supplying its token."""
-        return self.client.identity.manage("keys.revoke", {"id": key})
+        return self.client._run(ops.manage("keys.revoke", {"id": key}))
 
     def rotate(self, key: str) -> JsonObject:
         """Returns a replacement token once; does not persist it locally."""
-        return self.client.identity.manage("keys.rotate", {"id": key})
+        return self.client._run(ops.manage("keys.rotate", {"id": key}))
 
 
 class Secrets(Collection):
@@ -876,17 +539,19 @@ class Secrets(Collection):
 
     def create(self, *, name: str, value: str) -> JsonObject:
         """Sends secret material only in an authenticated TLS request body."""
-        return self.client.identity.manage(
-            "secrets.create", {"name": name, "value": value}
+        return self.client._run(
+            ops.manage("secrets.create", {"name": name, "value": value})
         )
 
     def rotate(self, *, name: str, value: str, expected_version: int) -> JsonObject:
         """Uses an explicit version guard instead of blindly overwriting."""
-        return self.client.identity.manage(
-            "secrets.rotate",
-            {"name": name, "value": value, "expected_version": expected_version},
+        return self.client._run(
+            ops.manage(
+                "secrets.rotate",
+                {"name": name, "value": value, "expected_version": expected_version},
+            )
         )
 
     def delete(self, secret: str) -> JsonObject:
         """Deletes by public name; it never returns the previous value."""
-        return self.client.identity.manage("secrets.delete", {"name": secret})
+        return self.client._run(ops.manage("secrets.delete", {"name": secret}))
