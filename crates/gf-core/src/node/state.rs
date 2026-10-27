@@ -680,6 +680,34 @@ impl TableState {
         self.rows.push(&features, &targets.bits(), &keys)?;
         self.table = table;
         self.times = times;
+        // Given contexts name rows by id, so they follow their rows to the
+        // ids the renumbering gave them, in key order.
+        let ids: HashMap<RowId, RowId> = rows
+            .iter()
+            .enumerate()
+            .map(|(renumbered, &row)| {
+                let renumbered = u32::try_from(renumbered).expect("row ids are u32");
+                (row, RowId(renumbered))
+            })
+            .collect();
+        let follow = |context: &mut Context| {
+            *context = context
+                .iter()
+                .filter_map(|row| ids.get(&row).copied())
+                .collect();
+        };
+        let queued = self.givens.iter_mut().flat_map(|(_, _, given)| given);
+        let scheduled = self
+            .scheduled
+            .given
+            .iter_mut()
+            .flat_map(|(_, _, given)| given);
+        self.given
+            .iter_mut()
+            .flatten()
+            .chain(queued)
+            .chain(scheduled)
+            .for_each(follow);
         self.reprint();
         if self.spec.series.is_some() {
             // A table of series places no rows in pages.
