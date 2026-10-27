@@ -879,22 +879,20 @@ class Predictor:
 
     def _load_local(self) -> None:
         """Resolves `gf.yaml` as `gf check` does, without writing `gf.lock`."""
-        from generalforecast.predictors import lock, resolve
+        from generalforecast.predictors import lock, resolve, verified
         from generalforecast.predictors.spec import load
 
         assert self._root is not None
         with boundary():
             spec = load(self._root)
-            resolution = resolve(spec, self._root)
-        if lock.read_lock(self._root) is not None and resolution.lock_changes:
             # A gf.lock beside the manifest is what gf serve and gf push run;
-            # predicting from anything else would answer differently.
-            raise InvalidInput(
-                f"gf.lock in {self._root} is out of date",
-                because="gf.yaml or its snapshot changed since `gf check` wrote it",
-                hint="run `gf check` to update it",
-                param="lock",
-            )
+            # predicting from anything else would answer differently, so it
+            # must be exactly the lock gf check writes now. Without one, the
+            # manifest resolves as gf check would resolve it.
+            if (self._root / lock.LOCK).exists():
+                resolution = verified(spec, self._root)
+            else:
+                resolution = resolve(spec, self._root)
         self._spec, self._resolution = spec, resolution
         self._lock = lock.document(resolution)
         self.name = spec.name

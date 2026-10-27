@@ -604,20 +604,15 @@ class PredictorCommands:
         started = time.perf_counter()
         root = self.root
         spec = self.library.load(root)
-        frozen = args.frozen
-        if frozen:
-            from generalforecast.predictors.lock import load_lock
-
-            if not (root / LOCK).is_file():
-                raise Error(
-                    "InvalidInput",
-                    f"no {LOCK} in {_shown(root)}",
-                    hint="run `gf check` without --frozen to write one",
-                )
-            # Without resolving the context, the lock must still be a valid
-            # version 2 lock for exactly this gf.yaml.
-            load_lock(root, spec)
-            out.status("Trusted", f"{LOCK} in {_shown(root)}")
+        if args.frozen:
+            # The lock must be exactly what check would write now, as every
+            # other reader of it requires; nothing is printed or written.
+            self.library.verified(spec, root, online=args.online)
+            out.status(
+                "Verified",
+                f"{LOCK} in {_shown(root)}",
+                seconds=time.perf_counter() - started,
+            )
             return {"name": spec.name, "frozen": True}
         resolution = self.library.resolve(
             spec,
@@ -629,6 +624,12 @@ class PredictorCommands:
         out.table(self.roles(resolution, spec), indent=2)
         changes = _shown_changes(resolution.lock_changes, resolution.model)
         out.changes(changes)
+        if args.locked:
+            from generalforecast.predictors.lock import lock_document
+
+            # No lock, another version or a digest that does not match the
+            # content: nothing to compare with, so the lock would change.
+            lock_document(root)
         if args.locked and changes:
             raise Error(
                 "InvalidInput",

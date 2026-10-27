@@ -344,7 +344,9 @@ def parser() -> _Parser:
     directory(p)
     p.add_argument("--locked", action="store_true", help="Fail if gf.lock would change")
     p.add_argument(
-        "--frozen", action="store_true", help="Trust gf.lock without resolving"
+        "--frozen",
+        action="store_true",
+        help="Fail unless gf.lock is current, printing only the verdict",
     )
     p.add_argument(
         "--online",

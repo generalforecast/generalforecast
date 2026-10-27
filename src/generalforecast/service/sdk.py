@@ -530,30 +530,23 @@ def pushed(predictor: "str | Path") -> Pushed:
             `SnapshotMismatch` for a snapshot that changed since `gf check`.
     """
     from generalforecast.errors import Error
-    from generalforecast.predictors.lock import lock_document, manifest_digest
+    from generalforecast.predictors.lock import lock_document
+    from generalforecast.predictors.resolution import verified
     from generalforecast.predictors.runtime.context import served_context
     from generalforecast.predictors.spec import load
     from generalforecast.predictors.tables import read_frame
 
     root = Path(predictor)
     try:
+        # The lock must be exactly what gf check writes now, as gf serve and
+        # gf.Predictor require; a forged or stale one never leaves.
+        verified(load(root), root)
         document = lock_document(root)
-        if (root / "gf.yaml").is_file() and document["manifest"] != manifest_digest(
-            load(root)
-        ):
-            raise ServiceError(
-                "LockRequired",
-                f"gf.lock in {root} was written for another gf.yaml; run `gf check` first",
-                422,
-            )
-    except ServiceError:
-        raise
     except Error as error:
-        raise ServiceError(
-            "LockRequired" if error.param == "lock" else error.code,
-            error.message,
-            422,
-        ) from None
+        code = "LockRequired" if error.param == "lock" else error.code
+        if error.reason == "snapshot_changed":
+            code = "SnapshotMismatch"
+        raise ServiceError(code, error.message, 422) from None
     lock = PredictorLock.from_dict(document)
     snapshot = None
     if lock.context_kind == "snapshot":

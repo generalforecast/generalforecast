@@ -331,6 +331,10 @@ def resolve(
     )
     _admitted(spec, resolution, frame)
     changes = lock.changes(previous, lock.document(resolution))
+    if locked and root is not None and (Path(root) / lock.LOCK).is_file():
+        # A lock of another version or whose digest does not match its
+        # content is never current, however its fields compare.
+        lock.lock_document(root)
     if locked and (changes or previous is None):
         raise InvalidInput(
             message="gf.lock is out of date"
@@ -340,6 +344,54 @@ def resolve(
             hint="run `gf check` without '--locked' to write it",
         )
     return dataclasses.replace(resolution, lock_changes=changes)
+
+
+def verified(
+    spec: PredictorSpec, root: str | Path, *, online: bool = False
+) -> Resolution:
+    """The resolution of a predictor directory whose `gf.lock` is exactly what `gf check` writes now.
+
+    Every entry point that reads a directory's lock calls this: `gf check
+    --locked` and `--frozen`, `gf.Predictor`, `gf serve` and `gf push`. So
+    each refuses the same locks: none, one of another version, one whose
+    digest does not match its content, one written for another `gf.yaml`,
+    and one edited by hand into anything `gf check` would not write for
+    this manifest, these rows and this catalog, its digest recomputed or
+    not.
+
+    Raises:
+        InvalidInput: With `param="lock"` for a missing, unreadable, stale or
+            forged lock; any refusal `resolve` raises.
+    """
+    from generalforecast.predictors import lock
+
+    document = lock.lock_document(root)
+    if document["manifest"] != lock.manifest_digest(spec):
+        raise InvalidInput(
+            message="gf.lock was written for another gf.yaml",
+            param="lock",
+            because="gf.yaml changed since `gf check` wrote gf.lock",
+            hint="run `gf check` to update it",
+        )
+    resolution = resolve(spec, root, online=online)
+    if resolution.lock_changes:
+        keys = sorted({key for _, key, _, _ in resolution.lock_changes})
+        if all(key.startswith("context.") for key in keys):
+            raise InvalidInput(
+                message="snapshot rows differ from gf.lock",
+                param="lock",
+                reason="snapshot_changed",
+                because=f"the context's {', '.join(k.removeprefix('context.') for k in keys)} changed",
+                hint="run `gf check` again",
+            )
+        shown = ", ".join(keys[:4]) + (", ..." if len(keys) > 4 else "")
+        raise InvalidInput(
+            message="gf.lock is out of date",
+            param="lock",
+            because=f"gf check would now write a different {shown}",
+            hint="run `gf check` to update it",
+        )
+    return resolution
 
 
 def _resources(spec: PredictorSpec) -> dict[str, Any]:
@@ -681,4 +733,4 @@ def _query_reason(spec: PredictorSpec, query_rows: int) -> str:
     return "no rows; every row has a target and no split is declared"
 
 
-__all__ = ["ContextInfo", "Resolution", "SelectionInfo", "resolve"]
+__all__ = ["ContextInfo", "Resolution", "SelectionInfo", "resolve", "verified"]

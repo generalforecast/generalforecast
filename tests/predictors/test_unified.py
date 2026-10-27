@@ -508,7 +508,7 @@ def test_frozen_checks_and_local_predictors_refuse_a_stale_lock(tmp_path, monkey
     )
     with pytest.raises(InvalidInput) as caught:
         gf.Predictor(root)
-    assert caught.value.message.endswith("is out of date")
+    assert caught.value.message == "snapshot rows differ from gf.lock"
     manifest = root / "gf.yaml"
     manifest.write_text(manifest.read_text() + "selection: {seed: 2}\n")
     with pytest.raises(InvalidInput) as caught:
@@ -564,3 +564,75 @@ def test_a_declared_group_holds_at_most_eight_series_and_one_origin(tmp_path):
     with pytest.raises(InvalidInput) as caught:
         directory(tmp_path / "outside", rows(3), related=["region"], **manifest)
     assert caught.value.param == "related"
+
+
+def _forge(root, change) -> None:
+    from generalforecast.predictors.lock import lock_digest
+
+    document = yaml.safe_load((root / "gf.lock").read_text())
+    change(document)
+    if document.get("lock_version") == 2:
+        document["digest"] = lock_digest(document)
+    (root / "gf.lock").write_text(yaml.safe_dump(document, sort_keys=False))
+
+
+FORGERIES = {
+    "selection past the cap": lambda d: d["predictor"]["selection"].update(core=10**9),
+    "selection seed": lambda d: d["predictor"]["selection"].update(seed=99),
+    "outputs narrowed": lambda d: d["predictor"].update(outputs=["label"]),
+    "input kind": lambda d: d["predictor"]["inputs"][0].update(type="category"),
+    "classes": lambda d: d["predictor"].update(classes=[0, 1, 2]),
+    "resources": lambda d: d.update(resources={"accelerator": "L4"}),
+    "context rows": lambda d: d["predictor"]["context"].update(rows=3),
+    "version 1": lambda d: d.update(lock_version=1),
+}
+
+
+@pytest.mark.parametrize("forgery", list(FORGERIES))
+def test_every_entry_point_refuses_a_forged_lock(tmp_path, monkeypatch, forgery):
+    import generalforecast as gf
+    from generalforecast import cli
+    from generalforecast.predictors import verified
+    from generalforecast.serve import models as serve_models
+    from generalforecast.service.contracts import ServiceError
+
+    monkeypatch.setattr(serve_models, "checkpoint", lambda *a, **k: None)
+    root = directory(tmp_path / "churn", churn(), id="id")
+    _forge(root, FORGERIES[forgery])
+    with pytest.raises(InvalidInput):
+        verified(load(root), root)
+    for flag in ("--frozen", "--locked"):
+        with pytest.raises(SystemExit) as exited:
+            cli.main(["check", flag, "-q", str(root)])
+        assert exited.value.code != 0
+    with pytest.raises(PredictorError):
+        serve_models.served(str(root), tmp_path / "entry")
+    with pytest.raises(ServiceError):
+        pushed(root)
+    with pytest.raises(InvalidInput):
+        gf.Predictor(root)
+
+
+def test_a_forged_lone_lock_is_held_to_the_model_and_policy(tmp_path):
+    root = directory(tmp_path / "churn", churn(), id="id", context="request")
+    document = yaml.safe_load((root / "gf.lock").read_text())
+    document["predictor"]["selection"].update(
+        strategy="retrieved", core=10**9, neighbors=0
+    )
+    from generalforecast.predictors.lock import lock_digest
+
+    document["digest"] = lock_digest(document)
+    with pytest.raises(PredictorError, match="context cap"):
+        compile_lock(document, None)
+
+
+def test_check_locked_needs_a_current_version_2_lock(tmp_path):
+    from generalforecast import cli
+
+    root = directory(tmp_path / "churn", churn(), id="id")
+    cli.main(["check", "--locked", "-q", str(root)])
+    (root / "gf.lock").unlink()
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["check", "--locked", "-q", str(root)])
+    assert exited.value.code != 0
+    assert not (root / "gf.lock").exists()

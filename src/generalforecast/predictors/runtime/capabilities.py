@@ -5,7 +5,10 @@
 
 `compile_plan`, revision registration and the predictor runtime all call
 `admit`, so a lock forged to be self-consistent still cannot carry a quantile,
-output, horizon or bound its pinned model and the serving policy do not allow.
+output, horizon, selection or bound its pinned model and the serving policy
+do not allow. A lock beside its `gf.yaml` is held to more: every entry point
+that reads one (`resolution.verified`) requires it to be exactly the lock
+`gf check` writes now.
 """
 
 from typing import Any
@@ -59,6 +62,13 @@ def admit(spec: Any, pin: Any, task: str, outputs: tuple[str, ...]) -> None:
     )
     # A model that declares neither levels nor a step publishes them in its
     # pinned weights; binding checks the levels against them, on every path.
+    selection = spec.selection
+    if selection is not None and selection.strategy == "retrieved":
+        ensure(
+            (selection.core or 0) + selection.neighbors <= pin.max_context_rows,
+            "selection reads more rows per query than the model's context cap",
+            "CapacityExceeded",
+        )
     if spec.context.max_rows is not None:
         ensure(
             spec.context.max_rows <= pin.max_context_rows,
