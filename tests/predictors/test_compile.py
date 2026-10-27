@@ -130,3 +130,18 @@ def test_query_validation_takes_the_locked_column_order(tmp_path):
     lock = lock_of(directory(tmp_path, ROWS, id="id"))
     plan = compile_lock(lock, served_context(lock, ROWS))
     assert validate_queries(plan, [{"x": 3, "id": "q"}]).column_names == ["id", "x"]
+
+
+def test_an_ad_hoc_calls_outputs_decide_whether_it_predicts_quantiles():
+    from generalforecast import hosting
+
+    rows = pa.table({"x": [1.0, 2.0, 3.0, 4.0], "y": [2.0, 4.0, 6.0, 8.0]})
+    regressor = {"model": "general-forecast/tabicl-v2-regressor", "target": "y"}
+    lock = hosting.ad_hoc_lock(regressor, rows)
+    assert lock.predictor["quantiles"]
+    assert compile_lock(lock, None).spec.quantiles == tuple(lock.predictor["quantiles"])
+    value = compile_lock(lock, None, outputs=["value"])
+    assert value.outputs == ("value",) and value.spec.quantiles == ()
+    asked = hosting.ad_hoc_lock({**regressor, "quantiles": [0.1, 0.9]}, rows)
+    both = compile_lock(asked, None, outputs=["value", "quantiles"])
+    assert both.spec.quantiles == (0.1, 0.9)
