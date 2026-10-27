@@ -40,9 +40,9 @@ def test_functions_follow_the_contract(functions: SeriesFunctions) -> None:
 
 
 def test_models_pass_the_conformance_check(
-    functions: SeriesFunctions, model: Any
+    case: SeriesCase, functions: SeriesFunctions, model: Any
 ) -> None:
-    check_series(functions, model)
+    check_series(functions, model, tolerance=case.tolerance)
 
 
 def test_groups_in_one_bucket_share_one_compile(

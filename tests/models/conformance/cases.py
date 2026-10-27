@@ -151,11 +151,12 @@ def _mitra(regression: bool) -> Callable[[int], Any]:
 
 
 class SeriesCase(NamedTuple):
-    """A forecaster to check: its contract calls and a builder for random parameters."""
+    """A forecaster to check: its contract calls, a builder for random parameters, and how far its results may move between equivalent calls."""
 
     name: str
     functions: Callable[[], SeriesFunctions]
     build: Callable[[int], Any]
+    tolerance: float = 1e-5
 
 
 def _chronos2_functions() -> SeriesFunctions:
@@ -243,7 +244,9 @@ def _timesfm(seed: int) -> Any:
 
 
 SERIES_CASES = [
-    SeriesCase("chronos2", _chronos2_functions, _chronos2),
+    # Under jaxlib 0.12, padding moves one value of the tiny random Chronos-2
+    # by 1.2e-5 on a CPU, past the default by rounding alone.
+    SeriesCase("chronos2", _chronos2_functions, _chronos2, tolerance=2e-5),
     SeriesCase("timesfm3", _timesfm_functions, _timesfm),
     SeriesCase("timestral", _timestral_functions, _timestral(True)),
     SeriesCase("timestral-plain", _timestral_functions, _timestral(False)),
