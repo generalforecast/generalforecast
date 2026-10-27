@@ -694,6 +694,8 @@ class Context:
             raise InvalidInput("ids and values must have the same length")
         identity = owner._id_name() or "id"
         target = owner.target
+        if target is None and owner._kind in ("served", "hosted"):
+            target = owner._hosted_facts().get("target")
         if target is None:
             raise InvalidInput("the predictor names no target to label")
         rows = [
