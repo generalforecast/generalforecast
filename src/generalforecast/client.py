@@ -5,6 +5,12 @@
 
 Every operation is defined once, in `generalforecast._operations`; this client
 runs its steps in the calling thread, and `AsyncClient` awaits the same steps.
+
+Public, and stable across releases: `Client`, `PartialWrite`, and the
+identity action table a hosted service must serve, `WORKSPACE_ACTIONS`
+(each action's method, path template and resource name) with
+`workspace_request`, which binds one action and its payload to the request
+`Client.identity.manage` sends.
 """
 
 import time

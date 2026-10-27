@@ -490,3 +490,16 @@ def test_every_versioned_request_goes_through_call(monkeypatch):
     assert sync.keys.list() == []
     assert asyncio.run(asynchronous.keys.list()) == []
     assert seen == [("sync", "GET", "/keys"), ("async", "GET", "/keys")]
+
+
+def test_the_public_sdk_surface_is_declared_and_documented():
+    from generalforecast import client as sync_module
+    from generalforecast import transport
+
+    for module in (sync_module, transport):
+        for name in module.__all__:
+            value = getattr(module, name)
+            if callable(value):
+                assert (value.__doc__ or "").strip(), f"{module.__name__}.{name}"
+    assert {"WORKSPACE_ACTIONS", "workspace_request"} <= set(sync_module.__all__)
+    assert {"Transport", "AsyncTransport", "endpoint"} <= set(transport.__all__)

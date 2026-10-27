@@ -8,6 +8,13 @@
 public for any other caller. They send no cookies, follow no redirects, read
 no proxy settings from the environment and require HTTPS except on loopback,
 so a credential reaches only the origin it was given for.
+
+Public, and stable across releases, as `__all__` lists: the transports;
+`Profile` and `ConnectionSettings`, the one connection resolution the SDK
+and the CLI share; `endpoint`, `split_url` and `credential`, the checks
+every URL and key passes; and `PLATFORM_PROBE`, `hosted_only` and
+`HostedOnlyError`, how a standalone `gf serve` is told from the hosted
+platform.
 """
 
 import asyncio
@@ -44,6 +51,23 @@ from generalforecast.service.contracts import (
     number,
     require,
 )
+
+__all__ = [
+    "DEFAULT_ENVIRONMENT",
+    "DEFAULT_KEY_ENV",
+    "DEFAULT_SERVER",
+    "PLATFORM_PROBE",
+    "AsyncTransport",
+    "ConnectionSettings",
+    "HostedOnlyError",
+    "Profile",
+    "Transport",
+    "credential",
+    "endpoint",
+    "hosted_only",
+    "profiles_in_use",
+    "split_url",
+]
 
 DEFAULT_KEY_ENV = "GF_API_KEY"
 # The hosted service, the endpoint every surface uses unless told otherwise.
