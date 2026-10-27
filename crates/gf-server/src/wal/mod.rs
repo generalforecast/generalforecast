@@ -1713,6 +1713,7 @@ mod tests {
             route_by: None,
             roles: None,
             durability: Default::default(),
+            row_ids: None,
         };
         let log = Log::create(path, key, &definition, Terms::default()).unwrap();
         let mut header = serde_json::to_value(&definition).unwrap();

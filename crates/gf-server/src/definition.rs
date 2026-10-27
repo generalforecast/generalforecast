@@ -14,6 +14,7 @@ use gf_core::forecasting::GroupStrategy;
 use gf_core::node::{CutoffRefit, DEFAULT_FIT_ROWS, PastCap, RefitPolicy, SummaryScope, Task};
 use gf_core::planner::Strategy;
 use gf_core::regions::{Rebuild, RebuildWait, RegionSpec};
+use gf_core::table::ROW_IDS;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -93,6 +94,11 @@ pub struct TableDefinition {
     /// alone, under the name `ctx-<fingerprint>`, until the shard evicts them.
     #[serde(default, skip_serializing_if = "Durability::is_durable")]
     pub durability: Durability,
+    /// The most row ids the table assigns, live or since deleted, before it
+    /// refuses inserts: from 1 to `ROW_IDS`, the most any table assigns,
+    /// which it may assign if unset. Its log records it, so a restart keeps it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub row_ids: Option<u64>,
 }
 
 /// The frame columns a client's rows carry besides the feature columns, as
@@ -368,6 +374,14 @@ impl TableDefinition {
                 })
                 .transpose()?,
             summary: self.summary.scope(),
+            row_ids: self
+                .row_ids
+                .map(|row_ids| {
+                    NonZeroU64::new(row_ids)
+                        .filter(|row_ids| row_ids.get() <= ROW_IDS)
+                        .ok_or(format!("row_ids is 1 to {ROW_IDS}"))
+                })
+                .transpose()?,
         })
     }
 }
@@ -586,6 +600,8 @@ pub struct TableConfig {
     pub past_cap: PastCap,
     pub regions: Option<RegionSpec>,
     pub summary: SummaryScope,
+    /// The most row ids the table assigns, if capped below `ROW_IDS`.
+    pub row_ids: Option<NonZeroU64>,
 }
 
 fn each() -> String {
@@ -734,6 +750,7 @@ mod tests {
             times: TimeKind::Integer,
             route_by: None,
             durability: Default::default(),
+            row_ids: None,
         };
         let plain = serde_json::to_value(&definition).unwrap();
         assert!(plain.get("roles").is_none());

@@ -78,6 +78,7 @@ fn definition() -> TableDefinition {
         route_by: None,
         roles: None,
         durability: Default::default(),
+        row_ids: None,
     }
 }
 

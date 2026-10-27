@@ -248,142 +248,152 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
     };
     let (shards, routes) = started.map_err(|error| -> Box<dyn Error> { error })?;
 
-    let bound = front.as_ref().map(|(front, _, _)| front.bound_tables());
-    let placement = runtime::restore(&shards, &tables, &keys, bound.as_ref(), &interrupted)
-        .await
-        .map_err(|error| -> Box<dyn Error> { error })?;
+    // Whatever ends the start from here, its workers stop and their
+    // directories go: a failure past this point stops the shards as a
+    // graceful exit does.
+    let served: Result<(), Box<dyn Error>> = async {
+        let bound = front.as_ref().map(|(front, _, _)| front.bound_tables());
+        let placement = runtime::restore(&shards, &tables, &keys, bound.as_ref(), &interrupted)
+            .await
+            .map_err(|error| -> Box<dyn Error> { error })?;
 
-    // Ctrl-C while the tables restored: the workers are up, so stop them.
-    if *interrupted.borrow() {
-        stop_shards(&shards).await;
-        stopped_status(
-            front.as_ref().map(|(_, url, _)| url.as_str()),
-            &names,
-            began.elapsed(),
-        );
-        return Ok(());
-    }
+        // Ctrl-C while the tables restored: the workers are up, so stop them.
+        if *interrupted.borrow() {
+            stop_shards(&shards).await;
+            stopped_status(
+                front.as_ref().map(|(_, url, _)| url.as_str()),
+                &names,
+                began.elapsed(),
+            );
+            return Ok(());
+        }
 
-    if let Some(address) = &config.metrics_listen {
-        let listener = tokio::net::TcpListener::bind(address).await?;
-        let status = Status {
-            metrics: metrics.clone(),
-            draining: draining.clone(),
-        };
-        let router = Router::new()
-            .route(
-                "/metrics",
-                get(|State(status): State<Status>| async move { status.metrics.render() }),
-            )
-            .route("/healthz", get(|| async { "ok" }))
-            .route(
-                "/readyz",
-                get(|State(status): State<Status>| async move {
-                    if status.draining.load(Ordering::SeqCst) {
-                        (StatusCode::SERVICE_UNAVAILABLE, "draining")
-                    } else if status.metrics.workers_down.get() > 0 {
-                        (StatusCode::SERVICE_UNAVAILABLE, "restarting a worker")
-                    } else {
-                        (StatusCode::OK, "ready")
-                    }
-                }),
-            )
-            .with_state(status);
-        let mut stopped = stopped.clone();
-        tokio::spawn(async move {
-            let shutdown = async move {
-                let _ = stopped.wait_for(|stop| *stop).await;
+        if let Some(address) = &config.metrics_listen {
+            let listener = tokio::net::TcpListener::bind(address).await?;
+            let status = Status {
+                metrics: metrics.clone(),
+                draining: draining.clone(),
             };
-            if let Err(error) = axum::serve(listener, router)
-                .with_graceful_shutdown(shutdown)
-                .await
-            {
-                tracing::error!("metrics endpoint: {error}");
-            }
-        });
-    }
+            let router = Router::new()
+                .route(
+                    "/metrics",
+                    get(|State(status): State<Status>| async move { status.metrics.render() }),
+                )
+                .route("/healthz", get(|| async { "ok" }))
+                .route(
+                    "/readyz",
+                    get(|State(status): State<Status>| async move {
+                        if status.draining.load(Ordering::SeqCst) {
+                            (StatusCode::SERVICE_UNAVAILABLE, "draining")
+                        } else if status.metrics.workers_down.get() > 0 {
+                            (StatusCode::SERVICE_UNAVAILABLE, "restarting a worker")
+                        } else {
+                            (StatusCode::OK, "ready")
+                        }
+                    }),
+                )
+                .with_state(status);
+            let mut stopped = stopped.clone();
+            tokio::spawn(async move {
+                let shutdown = async move {
+                    let _ = stopped.wait_for(|stop| *stop).await;
+                };
+                if let Err(error) = axum::serve(listener, router)
+                    .with_graceful_shutdown(shutdown)
+                    .await
+                {
+                    tracing::error!("metrics endpoint: {error}");
+                }
+            });
+        }
 
-    let address: std::net::SocketAddr = config.listen.parse()?;
-    let tokens = Tokens::new(&config.tokens);
-    let replication_tokens = Tokens::new(&config.replication_tokens);
-    let mut server = tonic::transport::Server::builder()
-        .timeout(Duration::from_secs_f64(config.request_timeout_seconds))
-        // A cap on streams, not a queue for them: a stream waiting its turn would
-        // hold its rows in the connection's flow-control window, which the
-        // rows of the calls it waits on may then not get through.
-        .max_concurrent_streams(u32::try_from(config.connection_concurrency).unwrap_or(u32::MAX))
-        .http2_keepalive_interval(Some(Duration::from_secs(20)))
-        .http2_keepalive_timeout(Some(Duration::from_secs(10)))
-        .tcp_keepalive(Some(Duration::from_secs(60)));
-    if let Some(tls) = &config.tls {
-        let identity =
-            Identity::from_pem(std::fs::read(&tls.certificate)?, std::fs::read(&tls.key)?);
-        let mut tls_config = ServerTlsConfig::new().identity(identity);
-        if let Some(client_ca) = &tls.client_ca {
-            tls_config =
-                tls_config.client_ca_root(Certificate::from_pem(std::fs::read(client_ca)?));
-        }
-        server = server.tls_config(tls_config)?;
-    } else if !address.ip().is_loopback() {
-        tracing::warn!("serving without TLS beyond this machine, as allow_plaintext says");
-    }
-    tracing::info!(%address, tls = config.tls.is_some(), "serving");
-    if let Some((front, url, _)) = &front {
-        front.start(shards.clone(), routes.clone()).await?;
-        let started = std::time::Instant::now();
-        let buckets = tokio::select! {
-            buckets = front.warm(&metrics.compiling) => buckets,
-            () = live.follow(&metrics.compiling) => unreachable!("the progress line never ends"),
-            _ = interrupted.wait_for(|stop| *stop) => {
-                live.clear();
-                stop_shards(&shards).await;
-                stopped_status(Some(url), &names, began.elapsed());
-                return Ok(());
+        let address: std::net::SocketAddr = config.listen.parse()?;
+        let tokens = Tokens::new(&config.tokens);
+        let replication_tokens = Tokens::new(&config.replication_tokens);
+        let mut server = tonic::transport::Server::builder()
+            .timeout(Duration::from_secs_f64(config.request_timeout_seconds))
+            // A cap on streams, not a queue for them: a stream waiting its turn would
+            // hold its rows in the connection's flow-control window, which the
+            // rows of the calls it waits on may then not get through.
+            .max_concurrent_streams(u32::try_from(config.connection_concurrency).unwrap_or(u32::MAX))
+            .http2_keepalive_interval(Some(Duration::from_secs(20)))
+            .http2_keepalive_timeout(Some(Duration::from_secs(10)))
+            .tcp_keepalive(Some(Duration::from_secs(60)));
+        if let Some(tls) = &config.tls {
+            let identity =
+                Identity::from_pem(std::fs::read(&tls.certificate)?, std::fs::read(&tls.key)?);
+            let mut tls_config = ServerTlsConfig::new().identity(identity);
+            if let Some(client_ca) = &tls.client_ca {
+                tls_config =
+                    tls_config.client_ca_root(Certificate::from_pem(std::fs::read(client_ca)?));
             }
-        };
-        live.clear();
-        let programs = metrics.warm_compiles.get() + buckets as u64;
-        let cached = programs > 0 && metrics.compile_cache_misses.get() == 0;
-        compiled(programs, started.elapsed().as_secs_f64(), cached);
-        ready(&names, url);
-    }
-    let mut service = Service::new(shards.clone(), placement, metrics)
-        .with_request_budget(config.request_bytes_in_flight)
-        .with_max_tables(config.max_tables)
-        .with_profiling(
-            config
-                .profiling
-                .as_ref()
-                .map(|profiling| profiling.directory.clone()),
-        )
-        .with_placement(&config.placement, tables.clone(), keys.clone());
-    if config.require_lease {
-        service = service.requiring_leases();
-    }
-    if config.placement.assign == gf_server::config::Assign::Load
-        && config.placement.rebalance_seconds > 0.0
-    {
-        let every = Duration::from_secs_f64(config.placement.rebalance_seconds);
-        tokio::spawn(service.clone().rebalance(every));
-    }
-    let mut stopped = stopped.clone();
-    server
-        .add_service(service.into_server(tokens, replication_tokens))
-        .serve_with_shutdown(address, async move {
-            let _ = stopped.wait_for(|stop| *stop).await;
-        })
-        .await?;
-    stop_shards(&shards).await;
-    let url = match front {
-        Some((_, url, served)) => {
-            let _ = served.await;
-            Some(url)
+            server = server.tls_config(tls_config)?;
+        } else if !address.ip().is_loopback() {
+            tracing::warn!("serving without TLS beyond this machine, as allow_plaintext says");
         }
-        None => None,
-    };
-    stopped_status(url.as_deref(), &names, began.elapsed());
-    tracing::info!("drained");
-    Ok(())
+        tracing::info!(%address, tls = config.tls.is_some(), "serving");
+        if let Some((front, url, _)) = &front {
+            front.start(shards.clone(), routes.clone()).await?;
+            let started = std::time::Instant::now();
+            let buckets = tokio::select! {
+                buckets = front.warm(&metrics.compiling) => buckets,
+                () = live.follow(&metrics.compiling) => unreachable!("the progress line never ends"),
+                _ = interrupted.wait_for(|stop| *stop) => {
+                    live.clear();
+                    stop_shards(&shards).await;
+                    stopped_status(Some(url), &names, began.elapsed());
+                    return Ok(());
+                }
+            };
+            live.clear();
+            let programs = metrics.warm_compiles.get() + buckets as u64;
+            let cached = programs > 0 && metrics.compile_cache_misses.get() == 0;
+            compiled(programs, started.elapsed().as_secs_f64(), cached);
+            ready(&names, url);
+        }
+        let mut service = Service::new(shards.clone(), placement, metrics)
+            .with_request_budget(config.request_bytes_in_flight)
+            .with_max_tables(config.max_tables)
+            .with_profiling(
+                config
+                    .profiling
+                    .as_ref()
+                    .map(|profiling| profiling.directory.clone()),
+            )
+            .with_placement(&config.placement, tables.clone(), keys.clone());
+        if config.require_lease {
+            service = service.requiring_leases();
+        }
+        if config.placement.assign == gf_server::config::Assign::Load
+            && config.placement.rebalance_seconds > 0.0
+        {
+            let every = Duration::from_secs_f64(config.placement.rebalance_seconds);
+            tokio::spawn(service.clone().rebalance(every));
+        }
+        let mut stopped = stopped.clone();
+        server
+            .add_service(service.into_server(tokens, replication_tokens))
+            .serve_with_shutdown(address, async move {
+                let _ = stopped.wait_for(|stop| *stop).await;
+            })
+            .await?;
+        stop_shards(&shards).await;
+        let url = match front {
+            Some((_, url, served)) => {
+                let _ = served.await;
+                Some(url)
+            }
+            None => None,
+        };
+        stopped_status(url.as_deref(), &names, began.elapsed());
+        tracing::info!("drained");
+        Ok(())
+    }
+    .await;
+    if served.is_err() {
+        stop_shards(&shards).await;
+    }
+    served
 }
 
 /// Saves every shard's log heads, then stops its worker. Every write is

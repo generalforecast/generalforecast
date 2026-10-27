@@ -164,6 +164,9 @@ struct TableState {
     givens: std::collections::VecDeque<(RequestId, Vec<f32>, Vec<Given>)>,
     /// Whether the last step served given requests, whose turn is then over.
     gave: bool,
+    /// The most row ids the table assigns, live or since deleted, before it
+    /// refuses inserts: `ROW_IDS` unless `Node::set_row_ids` lowered it.
+    row_ids: u64,
     /// Counts changes to the table or its requests, so a plan made for them
     /// is known to still hold.
     generation: u64,

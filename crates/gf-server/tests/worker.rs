@@ -371,3 +371,47 @@ fn stale_worker_directories_go_once_their_server_has_exited() {
     kept.sort();
     assert_eq!(left, kept, "{gone} exited");
 }
+
+#[tokio::test]
+async fn a_stopped_worker_leaves_no_directory_behind() {
+    use gf_server::config::WorkerConfig;
+    use gf_server::worker::{Launch, WorkerConnection};
+
+    let noted = common::fresh_directory().with_extension("pids");
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let template = WorkerConnection::fake(ours, vec!["tiny".to_string()]).unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let launch = Launch {
+        config: WorkerConfig {
+            command: vec![
+                exe.to_string_lossy().into_owned(),
+                "--exact".to_string(),
+                "stand_in_worker_that_refuses_its_pools".to_string(),
+                "--nocapture".to_string(),
+                "--".to_string(),
+            ],
+            per_gpu: false,
+            cpu_threads: None,
+            models: std::collections::BTreeMap::new(),
+        },
+        disk: Some(noted.clone()),
+        ..template.launch.clone()
+    };
+    for kill in [false, true] {
+        let mut worker = WorkerConnection::spawn(launch.clone()).await.unwrap();
+        let directory = worker.directory().unwrap().to_path_buf();
+        assert!(directory.join("worker-0.sock").exists());
+        if kill {
+            worker.kill().await;
+        } else {
+            worker.terminate().await;
+        }
+        assert!(
+            !directory.exists(),
+            "{} is left behind",
+            directory.display()
+        );
+        assert!(worker.directory().is_none());
+    }
+    let _ = std::fs::remove_file(noted);
+}

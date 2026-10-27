@@ -465,6 +465,7 @@ fn definition(name: &str, classes: u32) -> TableDefinition {
         route_by: None,
         roles: None,
         durability: Default::default(),
+        row_ids: None,
     }
 }
 
@@ -2094,4 +2095,107 @@ async fn a_clamped_tables_compaction_keeps_the_strategy_it_was_given() {
     let described = replica.describe().await;
     assert_eq!(described.definition.strategy, StrategySpec::Exact);
     assert_eq!(described.strategy, clamped);
+}
+
+/// An insert of `keys` into `rows`, and where its answer arrives.
+fn insert_command(
+    keys: &[u128],
+) -> (
+    Command,
+    oneshot::Receiver<Result<gf_server::shard::Written, gf_server::error::ServerError>>,
+) {
+    let (reply, answer) = oneshot::channel();
+    let rows = Rows {
+        keys: keys.to_vec(),
+        features: keys.iter().flat_map(|&key| [key as f32, 0.0]).collect(),
+        targets: Targets::Classes(keys.iter().map(|&key| (key % 3) as i32).collect()),
+        times: None,
+        id: None,
+        words: Vec::new(),
+        series: Vec::new(),
+        writes: Vec::new(),
+        layout: None,
+        table: None,
+    };
+    let command = Command::Write {
+        table: name("rows"),
+        write: Write::Insert(rows.into()),
+        fence: Fence::default(),
+        charge: Charge::default(),
+        reply,
+    };
+    (command, answer)
+}
+
+#[tokio::test]
+async fn a_batch_past_a_tables_row_ids_refuses_its_last_insert_and_the_table_stays_in_service() {
+    let test = async {
+        let shard = shard(settings()).await;
+        let (reply, created) = oneshot::channel();
+        let capped = TableDefinition {
+            row_ids: Some(6),
+            ..definition("rows", 3)
+        };
+        shard
+            .commands
+            .send(Command::Create {
+                definition: capped,
+                terms: Terms::default(),
+                reply,
+            })
+            .await
+            .unwrap();
+        created.await.unwrap().unwrap();
+        // A row first, so the batch's writes are checked against a table
+        // that has settled what its targets are, as they are once it has rows.
+        shard.insert(&[0]).await;
+        // A held check blocks the shard, so both inserts wait for one batch.
+        let (reply, held) = oneshot::channel();
+        shard
+            .commands
+            .send(Command::Create {
+                definition: definition("held", 6),
+                terms: Terms::default(),
+                reply,
+            })
+            .await
+            .unwrap();
+        let (first, first_written) = insert_command(&[1, 2, 3]);
+        let (second, second_written) = insert_command(&[4, 5, 6]);
+        shard.commands.send(first).await.unwrap();
+        shard.commands.send(second).await.unwrap();
+        shard.held.notify_one();
+        held.await.unwrap().unwrap();
+
+        // Each fits the five ids the table has left alone; together they do not.
+        assert_eq!(
+            first_written.await.unwrap().map(|written| written.rows),
+            Ok(3)
+        );
+        let refused = second_written.await.unwrap().unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("every row id has been assigned"),
+            "{refused}"
+        );
+        assert_eq!(shard.describe().await.rows, 4);
+        // The table is in service: what still fits applies.
+        shard.insert(&[4, 5]).await;
+        assert_eq!(shard.describe().await.rows, 6);
+
+        // A restart restores every applied row and the table's cap.
+        let shard = shard.restart().await;
+        assert_eq!(shard.describe().await.rows, 6);
+        assert_eq!(shard.describe().await.definition.row_ids, Some(6));
+        let (past, written) = insert_command(&[6]);
+        shard.commands.send(past).await.unwrap();
+        assert!(
+            written.await.unwrap().is_err(),
+            "the cap holds after the restart"
+        );
+    };
+    tokio::time::timeout(Duration::from_secs(30), test)
+        .await
+        .expect("the inserts were answered in time");
 }

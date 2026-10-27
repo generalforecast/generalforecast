@@ -524,8 +524,8 @@ pub struct WorkerConnection {
     exited: JoinHandle<()>,
     /// Asks that task to stop the worker and wait for it to exit.
     stop: Option<oneshot::Sender<Stop>>,
-    /// Holds the socket; dropped after the pipeline.
-    _directory: Private,
+    /// Holds the socket, until the worker has exited or the connection drops.
+    directory: Option<Private>,
     /// Model names, in the order the worker numbers them.
     pub models: Vec<String>,
     /// Memory of the worker's device, as the worker reports it.
@@ -751,7 +751,7 @@ impl WorkerConnection {
             launch,
             exited,
             stop: Some(stop),
-            _directory: directory,
+            directory: Some(directory),
             models,
             device_memory,
             device_bytes,
@@ -799,7 +799,7 @@ impl WorkerConnection {
             },
             exited,
             stop: Some(stop),
-            _directory: directory,
+            directory: Some(directory),
             models,
             device_memory: 1 << 30,
             device_bytes: 1 << 29,
@@ -820,6 +820,11 @@ impl WorkerConnection {
         self.stop(Stop::Terminate).await;
     }
 
+    /// Stops the worker as `how` says and waits for it to exit, then removes
+    /// its socket's directory and the shared frames it may have left: every
+    /// way the server stops a worker cleans up after it, so neither outlives
+    /// a server that stops gracefully however it is asked to. A server
+    /// killed outright leaves them for `Private::remove_stale`.
     async fn stop(&mut self, how: Stop) {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(how);
@@ -827,6 +832,14 @@ impl WorkerConnection {
         if !self.exited.is_finished() {
             let _ = (&mut self.exited).await;
         }
+        self.directory = None;
+        self.pipeline.shared = None;
+    }
+
+    /// Where the worker's socket is, until it has exited.
+    #[must_use]
+    pub fn directory(&self) -> Option<&std::path::Path> {
+        self.directory.as_ref().map(Private::path)
     }
 
     /// Sends a frame and waits at most `timeout` for its reply. A worker that

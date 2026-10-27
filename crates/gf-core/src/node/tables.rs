@@ -188,6 +188,24 @@ impl Node {
         Ok(())
     }
 
+    /// Caps the row ids `table` assigns, live or since deleted, at
+    /// `row_ids`, past which its inserts are refused as `TableError::Full`.
+    /// Every table may assign `ROW_IDS` unless capped; a cap above that is
+    /// `ROW_IDS`, and one below the ids taken already refuses every insert
+    /// until a renumbering frees dead ids.
+    ///
+    /// # Errors
+    ///
+    /// If the table does not exist.
+    pub fn set_row_ids(&mut self, table: TableId, row_ids: NonZeroU64) -> Result<(), NodeError> {
+        let state = self
+            .tables
+            .get_mut(&table)
+            .ok_or(NodeError::UnknownTable(table))?;
+        state.row_ids = row_ids.get().min(ROW_IDS);
+        Ok(())
+    }
+
     /// The node with tables' rows in `memory`, which bounds what tables with
     /// files keep in memory; set before any table is made.
     #[must_use]
@@ -337,6 +355,7 @@ impl Node {
                 given: None,
                 givens: std::collections::VecDeque::new(),
                 gave: false,
+                row_ids: ROW_IDS,
                 generation: 0,
                 deferred: None,
                 restoring: None,
@@ -410,5 +429,21 @@ impl Node {
             .ok_or(NodeError::UnknownTable(table))?
             .table
             .len())
+    }
+
+    /// How many more rows `table` can take before its row ids run out,
+    /// counting the dead ids a sparse table frees when it is renumbered
+    /// before its next insert, as the write checks count them; a caller
+    /// checking several writes before any applies counts what each takes.
+    ///
+    /// # Errors
+    ///
+    /// If the table does not exist.
+    pub fn ids_left(&self, table: TableId) -> Result<u64, NodeError> {
+        Ok(self
+            .tables
+            .get(&table)
+            .ok_or(NodeError::UnknownTable(table))?
+            .ids_left())
     }
 }
