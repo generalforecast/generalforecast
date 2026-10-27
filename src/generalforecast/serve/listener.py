@@ -125,6 +125,11 @@ def configuration(
     timeout: float,
     models: list[dict],
     *,
+    keys: Mapping[str, str] | None = None,
+    surface: str = "self-hosted",
+    upstream: str | None = None,
+    trusted_proxies: tuple[str, ...] = (),
+    revisions: str | None = None,
     metrics: str | None = None,
 ) -> str:
     """gf-server's configuration for the models served on this machine.
@@ -132,28 +137,59 @@ def configuration(
     Flight listens on loopback under a random token nothing else holds.
     Request contexts live in ephemeral tables; the data directory holds only
     a snapshot predictor's table, bound once at startup. Keys are the bearer
-    key in `GF_API_KEY`. With `metrics`, a `host:port`, gf-server also serves
-    `/metrics`, `/healthz` and `/readyz` there once its workers start; they
-    take no token, so it belongs on loopback or a private network.
+    key in `GF_API_KEY` unless `keys` names another key store. A hosted
+    plane also sets these:
+
+    Args:
+        directory: The server's private directory.
+        address: The HTTP front's `host:port`.
+        timeout: The longest a request may run, in seconds.
+        models: The entries of the server's models file.
+        keys: gf-server's `[http.keys]` table, such as
+            `{"kind": "introspect", "url": ..., "token_env": ...}`.
+        surface: `self-hosted`, or `remote` for a hosted model surface.
+        upstream: Where every route the front does not own streams, such as
+            a control plane on loopback.
+        trusted_proxies: The networks whose `X-Forwarded-*` headers are kept.
+        revisions: The control plane origin deployed revisions are predicted
+            from, under the token in `GF_INTROSPECTION_TOKEN`.
+        metrics: A `host:port` where gf-server also serves `/metrics`,
+            `/healthz` and `/readyz` once its workers start; they take no
+            token, so it belongs on loopback or a private network.
     """
     command = [sys.executable, "-m", "generalforecast.worker_process"]
+    keys = {"kind": "static", "env": API_KEY_ENV} if keys is None else keys
+    front = [] if upstream is None else [f"upstream = {_toml(upstream)}"]
+    if trusted_proxies:
+        front.append(f"trusted_proxies = [{', '.join(map(_toml, trusted_proxies))}]")
+    published = (
+        []
+        if revisions is None
+        else [
+            "",
+            "[http.revisions]",
+            f"url = {_toml(revisions)}",
+            'token_env = "GF_INTROSPECTION_TOKEN"',
+        ]
+    )
     return "\n".join(
         [
             'listen = "127.0.0.1:0"',
-            *([] if metrics is None else [f"metrics_listen = {_toml(metrics)}"]),
             f"data = {_toml(str(directory / 'data'))}",
             f"tokens = [{_toml(secrets.token_hex(32))}]",
             'encryption_key_env = "GF_LOG_KEY"',
+            *([] if metrics is None else [f"metrics_listen = {_toml(metrics)}"]),
             "",
             "[http]",
             f"listen = {_toml(address)}",
             f"models = {_toml(str(directory / 'models.json'))}",
-            'surface = "self-hosted"',
+            f"surface = {_toml(surface)}",
             f"request_timeout_seconds = {timeout!r}",
+            *front,
+            *published,
             "",
             "[http.keys]",
-            'kind = "static"',
-            f"env = {_toml(API_KEY_ENV)}",
+            *(f"{field} = {_toml(value)}" for field, value in keys.items()),
             "",
             "[[workers]]",
             f"command = [{', '.join(_toml(part) for part in command)}]",
