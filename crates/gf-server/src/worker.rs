@@ -643,6 +643,16 @@ pub fn visible_gpus() -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Removes from a worker's environment what is the server's alone: the
+/// secrets the server reads, and the parent descriptor `parent` watches,
+/// which a worker inheriting it would watch in its turn.
+fn scrub(command: &mut std::process::Command, secrets: &[String]) {
+    for secret in secrets {
+        command.env_remove(secret);
+    }
+    command.env_remove(crate::parent::ENV);
+}
+
 impl WorkerConnection {
     /// Starts a worker and waits for it to load its models.
     ///
@@ -699,9 +709,7 @@ impl WorkerConnection {
         for (name, spec) in &config.models {
             command.arg("--model").arg(format!("{name}={spec}"));
         }
-        for secret in secrets {
-            command.env_remove(secret);
-        }
+        scrub(command.as_std_mut(), secrets);
         if let Some(gpu) = gpu {
             command.env("CUDA_VISIBLE_DEVICES", gpu);
         }
@@ -962,5 +970,28 @@ fn terminate(child: &tokio::process::Child) -> bool {
 impl Drop for WorkerConnection {
     fn drop(&mut self) {
         self.exited.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    #[test]
+    fn a_worker_inherits_neither_secrets_nor_the_parent_descriptor() {
+        let mut command = std::process::Command::new("true");
+        command
+            .env("GF_PARENT_FD", "3")
+            .env("GF_LOG_KEY", "k")
+            .env("PATH", "/bin");
+        super::scrub(&mut command, &["GF_LOG_KEY".to_string()]);
+        let removed: Vec<&OsStr> = command
+            .get_envs()
+            .filter(|(_, value)| value.is_none())
+            .map(|(name, _)| name)
+            .collect();
+        assert!(removed.contains(&OsStr::new("GF_PARENT_FD")));
+        assert!(removed.contains(&OsStr::new("GF_LOG_KEY")));
+        assert!(!removed.contains(&OsStr::new("PATH")));
     }
 }
