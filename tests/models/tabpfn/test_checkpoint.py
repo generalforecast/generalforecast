@@ -10,8 +10,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from huggingface_hub import hf_hub_download
 from safetensors.numpy import load_file, save_file
 
+from generalforecast.models import checkpoints
 from generalforecast.models.tabpfn import checkpoint
 from generalforecast.models.tabpfn.checkpoint import read_published, tabpfn_checkpoint
 from tests.models.test_checkpoints import _tensor, _text, _write
@@ -81,7 +83,7 @@ def test_converts_once_into_the_cache(
         time.sleep(0.2)
         return str(published)
 
-    monkeypatch.setattr(checkpoint, "hf_hub_download", download)
+    monkeypatch.setattr(checkpoints, "hf_hub_download", download)
     monkeypatch.delenv("GF_CHECKPOINTS", raising=False)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
 
@@ -128,7 +130,7 @@ def test_published_files_convert_exactly(
     monkeypatch.delenv("GF_CHECKPOINTS", raising=False)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     published = checkpoint.PUBLISHED[name]
-    path = checkpoint.hf_hub_download(
+    path = hf_hub_download(
         published.repository, published.filename, revision=published.revision
     )
     if path.endswith(".ckpt"):

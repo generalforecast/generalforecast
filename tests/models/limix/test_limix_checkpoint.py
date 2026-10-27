@@ -8,8 +8,10 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from huggingface_hub import hf_hub_download
 from safetensors.numpy import load_file
 
+from generalforecast.models import checkpoints
 from generalforecast.models.limix import checkpoint
 from generalforecast.models.limix.checkpoint import limix_checkpoint, read_published
 from tests.models.test_checkpoints import _tensor, _text, _write
@@ -61,7 +63,7 @@ def test_converts_each_task_once_into_the_cache(
     published = _ckpt(tmp_path / "published.ckpt")
     downloads = []
     monkeypatch.setattr(
-        checkpoint,
+        checkpoints,
         "hf_hub_download",
         lambda *args, **kwargs: downloads.append(args) or str(published),
     )
@@ -114,7 +116,7 @@ def test_published_files_convert_exactly(
     monkeypatch.delenv("GF_CHECKPOINTS", raising=False)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     published = checkpoint.PUBLISHED[name]
-    path = checkpoint.hf_hub_download(
+    path = hf_hub_download(
         published.repository, published.filename, revision=published.revision
     )
     expected = torch.load(path, map_location="cpu", weights_only=True)["state_dict"]

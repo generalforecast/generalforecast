@@ -24,12 +24,29 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from filelock import FileLock
+from huggingface_hub import hf_hub_download
 from jax import Array
 from safetensors.numpy import load_file, save_file
 
+from generalforecast.models.catalog import short_name
 from generalforecast.nn.attention import AttentionParameters
 from generalforecast.nn.linear import LinearParameters
 from generalforecast.nn.retrieval import RetrievalParameters
+
+
+class Published(NamedTuple):
+    """A checkpoint in a Hugging Face repository, at a pinned revision.
+
+    Attributes:
+        repository: The repository.
+        revision: The pinned revision.
+        filename: The one file a converted checkpoint is read from, or None
+            when its directory holds the files.
+    """
+
+    repository: str
+    revision: str
+    filename: str | None = None
 
 
 def local_checkpoint(name: str) -> Path | None:
@@ -85,6 +102,78 @@ def converted_checkpoint(
     return directory
 
 
+def converted_file(
+    id: str,
+    published: Published,
+    convert: Callable[[Path, str], tuple[str, Mapping[str, Any], Mapping[str, Any]]],
+) -> Path:
+    """A checkpoint directory converted from one published file, converting it if missing.
+
+    See `converted_checkpoint` for where the directory is kept.
+
+    Args:
+        id: The checkpoint's canonical id.
+        published: Where the file is.
+        convert: Reads the downloaded file for the checkpoint of a short
+            name, as `convert(path, name)`: its architecture, settings and
+            arrays keyed by PyTorch parameter name.
+
+    Returns:
+        A directory with `config.json` and `model.safetensors`.
+    """
+    if published.filename is None:
+        raise ValueError(f"{id} is published as a directory, not one file")
+    name, filename = short_name(id), published.filename
+
+    def write(directory: Path) -> None:
+        path = hf_hub_download(
+            published.repository, filename, revision=published.revision
+        )
+        save_state(directory, *convert(Path(path), name))
+
+    return converted_checkpoint(name, published.revision, write)
+
+
+def without(state: Mapping[str, Any], prefixes: tuple[str, ...]) -> dict[str, Any]:
+    """A state dict without the parameters whose names start with any of `prefixes`."""
+    return {key: value for key, value in state.items() if not key.startswith(prefixes)}
+
+
+def check_settings(
+    model: str,
+    settings: Mapping[str, Any],
+    supported: Mapping[str, tuple[Any, ...]],
+    known: tuple[str, ...] | None = None,
+    prefix: str = "",
+) -> None:
+    """Raises for a setting off the values a loader has been checked with.
+
+    Args:
+        model: The model's name, as messages give it.
+        settings: The checkpoint's settings, or a section of them.
+        supported: Each checked setting's supported values; a missing
+            setting reads as None.
+        known: The other settings the loader reads, of any value, when every
+            setting must be known; None takes any others.
+        prefix: What messages put before a setting's name, such as its section.
+
+    Raises:
+        NotImplementedError: Naming the unsupported or unknown setting.
+    """
+    for key, values in supported.items():
+        if settings.get(key) not in values:
+            raise NotImplementedError(
+                f"{model} {prefix}{key}={settings.get(key)!r} is not supported"
+            )
+    if known is None:
+        return
+    unknown = sorted(set(settings) - set(supported) - set(known))
+    if unknown:
+        raise NotImplementedError(
+            f"{model} {prefix}settings {unknown} are not supported"
+        )
+
+
 class MissingParameter(KeyError):
     """A parameter a model reads that its checkpoint lacks."""
 
@@ -115,22 +204,24 @@ class _Read(dict[str, Array]):
 
 
 def read_linear(
-    state: Mapping[str, Array], prefix: str, bias: bool = True
+    state: Mapping[str, Array], prefix: str, bias: bool | None = True
 ) -> LinearParameters:
     """Linear parameters stored under `prefix`, with a bias if the layer has one.
 
     Args:
         state: Arrays keyed by PyTorch parameter name.
         prefix: The layer's name.
-        bias: Whether the layer has a bias; without one, none is read.
+        bias: Whether the layer has a bias; without one, none is read. None
+            reads one if the state has it, for releases that differ.
 
     Returns:
         The weight and bias.
     """
-    return LinearParameters(
-        weight=state[f"{prefix}.weight"],
-        bias=state[f"{prefix}.bias"] if bias else None,
-    )
+    if bias is None:
+        stored = state.get(f"{prefix}.bias")
+    else:
+        stored = state[f"{prefix}.bias"] if bias else None
+    return LinearParameters(weight=state[f"{prefix}.weight"], bias=stored)
 
 
 def read_all[T](

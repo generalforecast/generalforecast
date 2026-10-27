@@ -11,13 +11,15 @@ them, and nothing is rehosted.
 """
 
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 from jax import Array
 
 from generalforecast.models import catalog
 from generalforecast.models.artifacts import checkpoint
 from generalforecast.models.checkpoints import (
+    Published,
+    check_settings,
     load_state,
     read_all,
     read_linear,
@@ -30,13 +32,6 @@ from generalforecast.nn.rope import RoPE
 from generalforecast.nn.scaling import PerDimScaleParameters
 
 ARCHITECTURE = "timesfm3"
-
-
-class Published(NamedTuple):
-    """A checkpoint in Google's Hugging Face repositories."""
-
-    repository: str
-    revision: str
 
 
 # The upstream repository and revision each converts from, as the catalog pins.
@@ -118,23 +113,6 @@ def timesfm_checkpoint(name: str) -> Path:
     return checkpoint(catalog.ENTRIES[name])
 
 
-def _check(
-    name: str,
-    settings: dict[str, Any],
-    supported: dict[str, tuple[Any, ...]],
-    sizes: tuple[str, ...],
-) -> None:
-    """Raises for a setting off `supported`'s values, or one neither lists."""
-    for key, values in supported.items():
-        if settings.get(key) not in values:
-            raise NotImplementedError(
-                f"TimesFM {name}{key}={settings.get(key)!r} is not supported"
-            )
-    unknown = sorted(set(settings) - set(supported) - set(sizes))
-    if unknown:
-        raise NotImplementedError(f"TimesFM {name}settings {unknown} are not supported")
-
-
 def check_supported(settings: dict[str, Any]) -> None:
     """Raises for a TimesFM 3 setting the loader has not been checked with.
 
@@ -144,19 +122,21 @@ def check_supported(settings: dict[str, Any]) -> None:
     Raises:
         NotImplementedError: Naming the unsupported or unknown setting.
     """
-    _check("", settings, SUPPORTED, SIZES)
-    _check(
-        "residual block ",
+    check_settings("TimesFM", settings, SUPPORTED, SIZES)
+    check_settings(
+        "TimesFM",
         settings.get("residual_block_config", {}),
         BLOCK_SUPPORTED,
         BLOCK_SIZES,
+        prefix="residual block ",
     )
     stack = settings.get("transformer_config", {})
-    _check(
-        "transformer ",
+    check_settings(
+        "TimesFM",
         {**stack, **stack.get("transformer", {})},
         TRANSFORMER_SUPPORTED,
         TRANSFORMER_SIZES,
+        prefix="transformer ",
     )
     if settings.get("output_patch_len", 0) % max(settings.get("input_patch_len", 1), 1):
         raise NotImplementedError("TimesFM output patches must be whole input patches")

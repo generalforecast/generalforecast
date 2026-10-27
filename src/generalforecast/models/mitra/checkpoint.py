@@ -3,7 +3,7 @@
 
 import json
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 from huggingface_hub import hf_hub_download
 from jax import Array
@@ -12,6 +12,8 @@ from safetensors.numpy import load_file
 from generalforecast.models import catalog
 from generalforecast.models.artifacts import checkpoint
 from generalforecast.models.checkpoints import (
+    Published,
+    check_settings,
     converted_checkpoint,
     load_state,
     read_all,
@@ -24,13 +26,6 @@ from generalforecast.nn.linear import MLPParameters
 from generalforecast.nn.norm import LayerNormParameters
 
 ARCHITECTURE = "mitra"
-
-
-class Published(NamedTuple):
-    """A checkpoint in AutoGluon's Hugging Face repositories."""
-
-    repository: str
-    revision: str
 
 
 PUBLISHED = {
@@ -89,14 +84,7 @@ def check_supported(settings: dict[str, Any]) -> None:
     Raises:
         NotImplementedError: Naming the unsupported or unknown setting.
     """
-    for key, values in SUPPORTED.items():
-        if settings.get(key) not in values:
-            raise NotImplementedError(
-                f"Mitra {key}={settings.get(key)!r} is not supported"
-            )
-    unknown = sorted(set(settings) - set(SUPPORTED) - set(SIZES))
-    if unknown:
-        raise NotImplementedError(f"Mitra settings {unknown} are not supported")
+    check_settings("Mitra", settings, SUPPORTED, known=SIZES)
     # Mitra-1's regressor predicts one value, where generalforecast's regressors return
     # quantiles; Mitra-2's predicts a distribution over buckets.
     if settings["task"] == "REGRESSION" and int(settings["dim_output"]) == 1:
