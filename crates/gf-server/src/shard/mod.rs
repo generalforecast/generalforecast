@@ -749,10 +749,6 @@ impl SeriesKeys {
         &self.keys
     }
 
-    fn len(&self) -> usize {
-        self.keys.len()
-    }
-
     /// The keys among `named` the table does not hold yet, each once and
     /// checked to read back, in the order named.
     fn new_among(&self, named: Vec<SeriesKey>) -> Result<Vec<SeriesKey>, String> {

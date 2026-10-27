@@ -79,7 +79,7 @@ fn a_context_the_lock_holds_no_schema_for_is_typed_by_its_kinds_and_every_value(
         .into_iter()
         .map(|(name, kind)| (name.to_string(), kind.to_string()))
         .collect();
-    let schema = inferred(&features, "y", &rows, &types).unwrap();
+    let schema = inferred(&features, "y", &rows, &types, &features).unwrap();
     let physical: Vec<(&str, &str, Option<&str>)> = schema
         .columns
         .iter()
@@ -116,7 +116,8 @@ fn a_kind_a_columns_values_cannot_hold_is_refused_naming_the_types() {
     let types = [("a".to_string(), "float".to_string())]
         .into_iter()
         .collect();
-    let refused = inferred(&["a".to_string()], "y", &rows, &types).unwrap_err();
+    let inputs = ["a".to_string()];
+    let refused = inferred(&inputs, "y", &rows, &types, &inputs).unwrap_err();
     assert_eq!(refused.status, 422);
     assert_eq!(
         refused

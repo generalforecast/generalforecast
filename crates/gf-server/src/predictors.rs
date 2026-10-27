@@ -406,6 +406,13 @@ impl ForecastPredictor {
             .collect()
     }
 
+    /// The past and known future inputs, the columns the lock lists as a
+    /// forecaster's inputs.
+    #[must_use]
+    pub fn covariates(&self) -> Vec<String> {
+        [self.past_inputs.as_slice(), self.future_inputs.as_slice()].concat()
+    }
+
     /// The columns a forecast context carries besides its target.
     #[must_use]
     pub fn context_columns(&self) -> Vec<String> {
@@ -988,7 +995,9 @@ fn kind_storage(
 /// `target`, each typed by the kind `types` declares for it and the storage
 /// every value the rows hold takes, so a whole first value of a float
 /// column, or a time the lock calls a timestamp, types the column as the
-/// binder does in process.
+/// binder does in process. One of `inputs` whose kind the lock does not
+/// record reads text that is all ISO 8601 times as UTC timestamps, as
+/// `runtime.context.typed` does (see `iso_times`).
 ///
 /// # Errors
 ///
@@ -998,16 +1007,23 @@ pub fn inferred(
     target: &str,
     rows: &[Value],
     types: &std::collections::BTreeMap<String, String>,
+    inputs: &[String],
 ) -> Result<Schema, RequestError> {
     let column = |name: &str, role: &str| -> Result<SchemaColumn, RequestError> {
-        let mut values = rows
+        let values: Vec<&Value> = rows
             .iter()
             .filter_map(|row| row.get(name))
             .filter(|value| !value.is_null())
-            .peekable();
-        let observed = values.peek().is_some().then(|| observed_physical(values));
+            .collect();
+        let observed = (!values.is_empty()).then(|| observed_physical(values.iter().copied()));
+        let kind = types.get(name).map(String::as_str);
+        let unrecorded = kind.is_none() && inputs.iter().any(|input| input == name);
         let (physical, semantic) =
-            kind_storage(name, types.get(name).map(String::as_str), observed)?;
+            if unrecorded && observed == Some("string") && iso_times(values.iter().copied()) {
+                ("timestamp", None)
+            } else {
+                kind_storage(name, kind, observed)?
+            };
         Ok(SchemaColumn {
             name: name.to_string(),
             physical: physical.to_string(),
@@ -1074,9 +1090,115 @@ fn typed<T>(
         .collect()
 }
 
+/// The microseconds since 1970 in UTC an ISO 8601 time names, and whether
+/// it names a zone; None for other text. This is the one rule both sides
+/// read ISO text by, Python's being Arrow's ISO 8601 cast to microseconds
+/// in `runtime.context._timestamps`: `YYYY-MM-DD` (years 0 to 9999), then
+/// optionally `T` or a space and `HH`, `HH:MM`, `HH:MM:SS` or
+/// `HH:MM:SS.ffffff` (one to six digits), then optionally, after a time,
+/// `Z`, `+HH`, `+HHMM` or `+HH:MM` (or `-`). Text without a zone is UTC.
+fn iso_time(text: &str) -> Option<(i64, bool)> {
+    let bytes = text.as_bytes();
+    let number = |range: std::ops::Range<usize>| -> Option<i64> {
+        let digits = bytes.get(range)?;
+        digits.iter().try_fold(0_i64, |total, digit| {
+            digit
+                .is_ascii_digit()
+                .then(|| total * 10 + i64::from(digit - b'0'))
+        })
+    };
+    if bytes.len() < 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let days = epoch_day(number(0..4)?, number(5..7)?, number(8..10)?)?;
+    let mut micros = days * 86_400_000_000;
+    if bytes.len() == 10 {
+        return Some((micros, false));
+    }
+    if !matches!(bytes[10], b'T' | b' ') {
+        return None;
+    }
+    let hour = number(11..13).filter(|hour| *hour < 24)?;
+    let mut seconds = hour * 3600;
+    let mut at = 13;
+    if bytes.get(at) == Some(&b':') {
+        seconds += number(at + 1..at + 3).filter(|minute| *minute < 60)? * 60;
+        at += 3;
+        if bytes.get(at) == Some(&b':') {
+            seconds += number(at + 1..at + 3).filter(|second| *second < 60)?;
+            at += 3;
+            if bytes.get(at) == Some(&b'.') {
+                let digits = bytes[at + 1..]
+                    .iter()
+                    .take_while(|byte| byte.is_ascii_digit())
+                    .count();
+                if !(1..=6).contains(&digits) {
+                    return None;
+                }
+                let fraction = number(at + 1..at + 1 + digits)?;
+                micros += fraction * 10_i64.pow(u32::try_from(6 - digits).ok()?);
+                at += 1 + digits;
+            }
+        }
+    }
+    micros += seconds * 1_000_000;
+    let zone = &bytes[at..];
+    let offset = match zone {
+        [] => return Some((micros, false)),
+        [b'Z'] => 0,
+        [sign @ (b'+' | b'-'), rest @ ..] => {
+            let (hours, minutes) = match rest.len() {
+                2 => (number(at + 1..at + 3)?, 0),
+                4 => (number(at + 1..at + 3)?, number(at + 3..at + 5)?),
+                5 if rest[2] == b':' => (number(at + 1..at + 3)?, number(at + 4..at + 6)?),
+                _ => return None,
+            };
+            if hours >= 24 || minutes >= 60 {
+                return None;
+            }
+            let offset = (hours * 60 + minutes) * 60_000_000;
+            if *sign == b'+' { offset } else { -offset }
+        }
+        _ => return None,
+    };
+    Some((micros - offset, true))
+}
+
+/// The days since 1970-01-01 of a date of the proleptic Gregorian
+/// calendar, or None for a month or day it does not have.
+fn epoch_day(year: i64, month: i64, day: i64) -> Option<i64> {
+    if !(1..=12).contains(&month) || day < 1 {
+        return None;
+    }
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = shifted.div_euclid(400);
+    let of_era = shifted.rem_euclid(400);
+    let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let of_era_days = of_era * 365 + of_era / 4 - of_era / 100 + of_year;
+    let days = era * 146_097 + of_era_days - 719_468;
+    (civil(days) == (year, month, day)).then_some(days)
+}
+
+/// Whether JSON values are all ISO 8601 times by `iso_time`, every one
+/// naming a zone or none: what Python's `_timestamps` reads as a column of
+/// UTC timestamps, trying a naive cast and then a UTC one.
+fn iso_times<'a>(values: impl Iterator<Item = &'a Value>) -> bool {
+    let mut zoned = None;
+    for value in values {
+        let Some((_, named)) = value.as_str().and_then(iso_time) else {
+            return false;
+        };
+        if *zoned.get_or_insert(named) != named {
+            return false;
+        }
+    }
+    zoned.is_some()
+}
+
 /// A timestamp column's cells as ISO 8601 strings, the binder's datetime
-/// columns parse: strings as given, and whole numbers, which the declared
-/// type counts in microseconds since 1970 in UTC, written out.
+/// columns parse: an ISO time `iso_time` reads, and whole numbers, which
+/// the declared type counts in microseconds since 1970 in UTC, written out
+/// in full; other strings as given.
 fn timestamps(name: &str, cells: &[Option<&Value>]) -> Result<StringArray, RequestError> {
     let failed = |error: arrow_schema::ArrowError| {
         RequestError::new(
@@ -1088,7 +1210,11 @@ fn timestamps(name: &str, cells: &[Option<&Value>]) -> Result<StringArray, Reque
     let micros = TimestampMicrosecondArray::from(
         cells
             .iter()
-            .map(|cell| cell.and_then(Value::as_i64))
+            .map(|cell| match cell {
+                Some(Value::String(text)) => iso_time(text).map(|(micros, _)| micros),
+                Some(value) => value.as_i64(),
+                None => None,
+            })
             .collect::<Vec<_>>(),
     )
     .with_timezone("+00:00");
@@ -1099,6 +1225,9 @@ fn timestamps(name: &str, cells: &[Option<&Value>]) -> Result<StringArray, Reque
         .enumerate()
         .map(|(row, cell)| match cell {
             None => Ok(None),
+            Some(Value::String(_)) if written.is_valid(row) => {
+                Ok(Some(written.value(row).to_string()))
+            }
             Some(Value::String(text)) => Ok(Some(text.clone())),
             Some(value) if value.as_i64().is_some() => Ok(Some(written.value(row).to_string())),
             Some(value) => Err(mistyped(name, "timestamp", value)),
@@ -1199,6 +1328,69 @@ pub fn read_snapshot(path: &Path) -> Result<RecordBatch, String> {
 #[cfg(test)]
 mod tests {
     use super::{civil, ordinal};
+    use serde_json::{Value, json};
+
+    #[test]
+    fn iso_text_reads_as_python_reads_it() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/iso_times.json")).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let text = case[0].as_str().unwrap();
+            let read = super::iso_time(text).map(|(micros, _)| micros);
+            assert_eq!(read, case[1].as_i64(), "{text:?}");
+        }
+        // Python reads a column naive or in UTC, never a mix of the two.
+        let times = |values: Value| super::iso_times(values.as_array().unwrap().iter());
+        assert!(times(json!(["2025-01-01", "2025-01-02 06:00"])));
+        assert!(times(json!([
+            "2025-01-01T00:00Z",
+            "2025-01-02T06:00+01:00"
+        ])));
+        assert!(!times(json!([
+            "2025-01-01T00:00",
+            "2025-01-02T06:00+01:00"
+        ])));
+        assert!(!times(json!(["2025-01-01", "gold"])));
+        assert!(!times(json!([])));
+    }
+
+    #[test]
+    fn an_input_of_no_recorded_kind_reads_iso_text_as_utc_timestamps() {
+        let rows = json!([
+            {"seen": "2025-01-01T00:00:00Z", "tier": "gold", "day": "2025-01-01", "y": "2025-01-01"},
+            {"seen": "2025-01-02T06:00:00+01:00", "tier": "2025-01-01", "day": "2025-01-02", "y": "2025-01-02"},
+        ]);
+        let rows = rows.as_array().unwrap();
+        let features: Vec<String> = ["seen", "tier", "day"].map(String::from).to_vec();
+        let types = [("day".to_string(), "category".to_string())].into();
+        let schema = super::inferred(&features, "y", rows, &types, &features).unwrap();
+        let physical: Vec<(&str, &str)> = schema
+            .columns
+            .iter()
+            .map(|column| (column.name.as_str(), column.physical.as_str()))
+            .collect();
+        // A declared kind and the target keep their text; so does an input
+        // whose text is not all times.
+        assert_eq!(
+            physical,
+            [
+                ("seen", "timestamp"),
+                ("tier", "string"),
+                ("day", "string"),
+                ("y", "string")
+            ]
+        );
+        let batch = super::records(&schema.columns, rows).unwrap();
+        let seen = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(seen.value(0), "2025-01-01T00:00:00Z");
+        assert_eq!(seen.value(1), "2025-01-02T05:00:00Z");
+        let unlisted = super::inferred(&features, "y", rows, &types, &[]).unwrap();
+        assert_eq!(unlisted.columns[0].physical, "string");
+    }
 
     #[test]
     fn civil_dates_follow_the_proleptic_calendar() {

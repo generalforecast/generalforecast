@@ -814,3 +814,24 @@ def test_an_input_of_no_recorded_kind_reads_iso_text_as_times(tmp_path):
         datetime.datetime.fromisoformat("2025-01-02T05:00"),
     ]
     assert bound["tier"].type == pa.string()
+
+
+def test_iso_text_reads_as_gf_server_reads_it():
+    """Python's ISO rule and gf-server's `iso_time` read one table of cases alike.
+
+    The Rust test `iso_text_reads_as_python_reads_it` holds gf-server to the
+    same file, so the two sides type and read ISO text by one rule.
+    """
+    from pathlib import Path
+
+    from generalforecast.predictors.runtime.context import _timestamps
+
+    fixture = Path(__file__).resolve().parents[2] / "crates/gf-server/tests/fixtures"
+    cases = json.loads((fixture / "iso_times.json").read_text())["cases"]
+    assert cases
+    for text, micros in cases:
+        try:
+            read = _timestamps(pa.array([text])).cast(pa.int64())[0].as_py()
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+            read = None
+        assert read == micros, text

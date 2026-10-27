@@ -730,7 +730,7 @@ async fn served_predict(
                 "context exceeds the predictor's max_rows",
             )?;
             let schema = if schema_free {
-                predictors::inferred(&features, &target, context, &predictor.types)?
+                predictors::inferred(&features, &target, context, &predictor.types, &features)?
             } else {
                 predictor.schema.clone()
             };
@@ -853,7 +853,13 @@ async fn series_predict(
                         .entry(forecast.time.clone())
                         .or_insert_with(|| "timestamp".to_string());
                 }
-                predictors::inferred(&forecast.context_columns(), target, context, &types)?
+                predictors::inferred(
+                    &forecast.context_columns(),
+                    target,
+                    context,
+                    &types,
+                    &forecast.covariates(),
+                )?
             } else {
                 predictor.schema.clone()
             };
@@ -1184,6 +1190,7 @@ mod tests {
             "sales",
             context.as_array().unwrap(),
             &predictor.types,
+            &forecast.covariates(),
         )
         .unwrap();
         let expected: Vec<&str> = schema

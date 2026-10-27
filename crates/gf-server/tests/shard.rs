@@ -1735,6 +1735,7 @@ impl Harness {
             before,
             horizon: std::num::NonZeroUsize::new(horizon).unwrap(),
             groups: None,
+            future: None,
             trace: String::new(),
             reply,
         };
