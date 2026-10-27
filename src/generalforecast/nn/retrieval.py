@@ -9,7 +9,7 @@ import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Float, Int
 
-from generalforecast.nn.attention import AttentionCache
+from generalforecast.nn.attention import AttentionCache, keys_read
 from generalforecast.nn.linear import LinearParameters, linear
 from generalforecast.nn.qassmax import QASSMaxParameters, qassmax
 
@@ -85,13 +85,7 @@ def retrieve(
         key = key * cache.key_scale[..., None].astype(q.dtype)
         value = value * cache.value_scale[..., None].astype(q.dtype)
     if parameters.scale is not None:
-        if cache.mask is not None:
-            n_keys = cache.mask.sum(axis=-1)
-        elif cache.length is not None:
-            n_keys = cache.length
-        else:
-            n_keys = key.shape[-3]
-        q = qassmax(parameters.scale, q, n_keys)
+        q = qassmax(parameters.scale, q, keys_read(cache))
     scores = jnp.einsum(
         "brhd,bchd->bhrc", q, key, preferred_element_type=jnp.float32
     ) * (q.shape[-1] ** -0.5)

@@ -9,9 +9,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from generalforecast.nn.attention import attention_block, block_kv
+from generalforecast.nn.attention import attention_block, block_kv, keys_read
 from generalforecast.nn.induced import compress
 from generalforecast.nn.qassmax import QASSMaxParameters, qassmax
+from generalforecast.nn.retrieval import RetrievalParameters, retrieval_cache, retrieve
 from tests.models.tabicl.tiny import EMBED, HEADS, ICL, tiny_tabicl
 
 LENGTHS = (7, 12)
@@ -121,3 +122,66 @@ def test_queries_masked_to_their_own_keys_attend_as_if_alone() -> None:
             block, queries[:, query : query + 1], block_kv(block, context[:, rows])
         )
         _close(together[:, query : query + 1], alone)
+
+
+def _reads_every_row(length: jax.Array, queries: int, rows: int) -> jax.Array:
+    """The mask a decode of several units together gives a unit that reads one context.
+
+    Every query reads every row of the call's padded context, past the
+    unit's own length too; only the length bounds what it reads.
+    """
+    return jnp.ones((length.shape[0], queries, rows), dtype=bool)
+
+
+def test_keys_read_counts_only_keys_within_the_length_that_the_mask_allows() -> None:
+    cache = block_kv(
+        tiny_tabicl(regression=False).icl.blocks[0],
+        _padded_rows(ICL),
+        jnp.asarray(LENGTHS, dtype=jnp.int32),
+    )
+    mask = _reads_every_row(cache.length, 3, max(LENGTHS)).at[1, 0, 2].set(False)
+
+    counts = keys_read(cache._replace(mask=mask))
+
+    np.testing.assert_array_equal(counts, [[7, 7, 7], [11, 12, 12]])
+    np.testing.assert_array_equal(keys_read(cache), LENGTHS)
+    assert keys_read(cache._replace(length=None)) == max(LENGTHS)
+
+
+def test_a_mask_past_the_length_scales_queries_as_the_length_alone() -> None:
+    block = tiny_tabicl(regression=False).icl.blocks[0]
+    assert block.attention.scale is not None
+    context = _padded_rows(ICL)
+    queries = jnp.asarray(
+        np.random.default_rng(4).normal(size=(2, 3, ICL)), jnp.float32
+    )
+    cache = block_kv(block, context, jnp.asarray(LENGTHS, dtype=jnp.int32))
+    mask = _reads_every_row(cache.length, 3, context.shape[1])
+
+    _close(
+        attention_block(block, queries, cache._replace(mask=mask)),
+        attention_block(block, queries, cache),
+    )
+
+
+def test_retrieval_scales_queries_by_the_keys_within_the_length() -> None:
+    from tests.models.conformance.cases import _retrieval
+
+    decoder = _retrieval(0).icl.decoder
+    assert isinstance(decoder, RetrievalParameters) and decoder.scale is not None
+    context = _padded_rows(ICL)
+    labels = jnp.asarray(
+        np.random.default_rng(5).integers(0, 3, context.shape[:2]), jnp.int32
+    )
+    queries = jnp.asarray(
+        np.random.default_rng(6).normal(size=(2, 3, ICL)), jnp.float32
+    )
+    cache = retrieval_cache(
+        decoder, context, labels, 3, jnp.asarray(LENGTHS, dtype=jnp.int32)
+    )
+    mask = _reads_every_row(cache.length, 3, context.shape[1])
+
+    _close(
+        retrieve(decoder, queries, cache._replace(mask=mask)),
+        retrieve(decoder, queries, cache),
+    )

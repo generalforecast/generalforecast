@@ -208,6 +208,31 @@ def project_kv(
     return AttentionCache(key=k, value=v, length=length)
 
 
+def keys_read(
+    cache: AttentionCache,
+) -> int | Int[Array, " batch"] | Int[Array, " batch queries"]:
+    """How many keys each query reads: those within `cache.length` that `cache.mask` allows.
+
+    Attention reads a key only where both allow it, so query scaling, which
+    depends on the count, must count only those. A mask may allow padding
+    past the length, as a decode of several units together sets one for a
+    unit that reads its whole context.
+
+    Args:
+        cache: Keys and values, batched as `attend` reads them.
+
+    Returns:
+        The count for every query, one per batch row, or one per query.
+    """
+    if cache.mask is None:
+        return cache.key.shape[-3] if cache.length is None else cache.length
+    allowed = cache.mask
+    if cache.length is not None:
+        within = jnp.arange(allowed.shape[-1]) < cache.length[..., None, None]
+        allowed = allowed & within
+    return allowed.sum(axis=-1)
+
+
 @functools.cache
 def _gpu_generation() -> tuple[int, int] | None:
     """The default GPU's compute capability, or None without an NVIDIA GPU."""
@@ -348,13 +373,7 @@ def attend(
         Attention outputs after the output projection, or the heads side by
         side without one.
     """
-    if cache.mask is not None:
-        n_keys = cache.mask.sum(axis=-1)
-    elif cache.length is not None:
-        n_keys = cache.length
-    else:
-        n_keys = cache.key.shape[-3]
-    q = _queries(parameters, query_rows, n_keys, positions)
+    q = _queries(parameters, query_rows, keys_read(cache), positions)
     attended = _dot_product_attention(q, cache, parameters.kernel)
     return _output(parameters, query_rows, attended)
 
