@@ -439,6 +439,92 @@ def test_open_keeps_the_retrieval_settings_of_an_adaptive_table(catalog) -> None
         table.drop()
 
 
+def _unkeyed(count: int, seed: int) -> pd.DataFrame:
+    return _rows(count, seed).drop(columns=["k"])
+
+
+def test_rows_without_ids_never_replace_rows_after_a_table_is_opened(catalog) -> None:
+    table = engine.Table(
+        "unkeyed",
+        model="general-forecast/tabicl-v2-classifier",
+        target="y",
+        download=False,
+    )
+    try:
+        table.insert(_unkeyed(20, seed=0))
+        table.delete(range(5))
+        assert len(table) == 15
+        again = engine.Table.open("unkeyed", download=False)
+        # Ids 15 to 19 are held, though only 15 rows are; the new rows take
+        # ids no row holds rather than replace those.
+        again.insert(_unkeyed(5, seed=1))
+        assert len(again) == 20
+        same = engine.Table(
+            "unkeyed",
+            model="general-forecast/tabicl-v2-classifier",
+            target="y",
+            download=False,
+            exists="open",
+        )
+        same.insert(_unkeyed(3, seed=2))
+        assert len(same) == 23
+        # The table that made it carries on from its own ids, past the others'.
+        table.insert(_unkeyed(2, seed=3))
+        assert len(table) == 25
+    finally:
+        table.drop()
+
+
+def test_tables_made_under_one_download_gate_open_under_the_other(catalog) -> None:
+    table = engine.Table(
+        "gated",
+        model="general-forecast/tabicl-v2-classifier",
+        schema=engine.Schema(target="y", id="k"),
+        download=False,
+    )
+    try:
+        table.insert(_rows())
+        again = engine.Table.open("gated", download=True)
+        assert len(again) == 32
+        same = engine.Table(
+            "gated",
+            model="general-forecast/tabicl-v2-classifier",
+            schema=engine.Schema(target="y", id="k"),
+            download=True,
+            exists="open",
+        )
+        same.insert(_rows(4, seed=7).assign(k=np.arange(100, 104)))
+        assert len(table) == 36
+    finally:
+        table.drop()
+
+
+def test_series_predict_takes_future_rows_without_the_target(catalog) -> None:
+    schema = engine.SeriesSchema(
+        target="units", time="t", series="item", frequency=1, known=["price"]
+    )
+    table = engine.SeriesTable(
+        "future",
+        model="general-forecast/chronos-2",
+        schema=schema,
+        horizon=3,
+        download=False,
+    )
+    try:
+        table.insert(_observations("shoes", 0, 1))
+        future = pd.DataFrame({"item": ["shoes"] * 3, "t": [20, 21, 22], "price": 3.0})
+        forecast = table.predict(future)
+        assert forecast["item"].tolist() == ["shoes"] * 3
+        assert forecast["step"].tolist() == [1, 2, 3]
+        assert np.isfinite(forecast["value"]).all()
+        # The future rows wait unobserved for the observations that replace them.
+        assert len(table) == 23
+        table.insert(_observations("shoes", 20, 2).head(1))
+        assert len(table) == 23
+    finally:
+        table.drop()
+
+
 def _served(*models: str) -> tuple[str, str]:
     """The process engine's Flight endpoint, its workers serving these models."""
     from generalforecast.models.catalog import parse

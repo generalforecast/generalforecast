@@ -12,13 +12,14 @@ the `Retrieved` selection (how each query's context is drawn), `TimeOptions`
 
 from __future__ import annotations
 
+import abc
 import datetime
 import json
 import math
 import re
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, Self
+from typing import Any, ClassVar, Literal, Self, override
 
 import numpy as np
 import pyarrow as pa
@@ -29,6 +30,7 @@ from generalforecast.errors import Conflict, InvalidInput, NotFound, boundary
 from generalforecast.native import models as registry
 from generalforecast.native.handles import (
     Described,
+    DuplicateKey,
     PastCap,
     Rebuild,
     RebuildWait,
@@ -37,6 +39,7 @@ from generalforecast.native.handles import (
     Roles,
     SeriesDefinition,
     Summary,
+    implied_levels,
 )
 from generalforecast.native.handles import SeriesTable as _NativeSeriesTable
 from generalforecast.native.handles import Table as _NativeTable
@@ -539,7 +542,143 @@ def _roles_of(described: Described) -> Roles:
     return described.roles
 
 
-class Table:
+class _Held[Handle: (_NativeTable, _NativeSeriesTable)](abc.ABC):
+    """What `Table` and `SeriesTable` share: a named table on an engine, made at its first insert or opened.
+
+    The engine's table is made by the first insert. With `exists="open"`, a
+    table of the name the engine holds already is attached to instead, once
+    its settings agree with these, as `open` attaches to it whatever they are.
+    """
+
+    # Whether the engine's tables of this kind hold series rather than rows,
+    # and what to insert to make one.
+    _series: ClassVar[bool]
+    _first: ClassVar[str]
+
+    def __init__(
+        self, name: str, model: str, client: Any, download: bool, exists: Exists
+    ) -> None:
+        """Keeps the settings every table has."""
+        if not isinstance(name, str) or not name:
+            raise InvalidInput("a table needs a name")
+        self.name = name
+        self.model = registry.canonical(model)
+        self._client = client
+        self._download = download
+        self._exists = _exists(exists)
+        self._table: Handle | None = None
+        # Whether the engine's table was attached to rather than made here.
+        self._attached = False
+
+    @classmethod
+    def open(cls, name: str, *, client: Any = None, download: bool = True) -> Self:
+        """The table of this name the engine already holds.
+
+        The schema and settings come from the engine, as the table was made,
+        so the table takes writes and predictions at once.
+
+        Args:
+            name: The table's name.
+            client: The engine holding the table; this process's if None.
+            download: Whether the model's files may download if not cached.
+
+        Returns:
+            The table.
+
+        Raises:
+            NotFound: If the engine holds no table of this name.
+            InvalidInput: If the name holds the other kind of table, which the
+                other class opens, or a table made without `gf.engine`.
+        """
+        handle = _opened(_client(client, download), name, series=cls._series)
+        return cls._of(name, handle, client, download)
+
+    @classmethod
+    @abc.abstractmethod
+    def _of(cls, name: str, handle: Handle, client: Any, download: bool) -> Self:
+        """A table with the settings the engine's table was made with, attached to it."""
+
+    @abc.abstractmethod
+    def _adopt(self, handle: Handle, *settings: Any) -> None:
+        """Attaches to the engine's table once it agrees with these settings.
+
+        Raises:
+            InvalidInput: Naming the first setting it does not agree with.
+        """
+
+    def _attach(self, handle: Handle) -> None:
+        """Takes the engine's table as this one."""
+        self._table = handle
+        self._attached = True
+
+    def _engine(self) -> Any:
+        """The client holding the table."""
+        return _client(self._client, self._download)
+
+    def _make(self, make: Callable[[], Handle], *settings: Any) -> None:
+        """Makes the engine's table with `make`, or attaches to one of the name as `exists` says.
+
+        `settings` are what `_adopt` checks an existing table against.
+
+        Raises:
+            Conflict: If the engine holds a table of the name already, and
+                `exists` is `error`.
+        """
+        if self._exists == "open" and self._open_existing(*settings):
+            return
+        try:
+            with boundary():
+                self._table = make()
+        except Conflict as exc:
+            # Another client made the table since the check above.
+            if self._exists == "open" and self._open_existing(*settings):
+                return
+            raise _conflict(self.name, type(self).__name__) from exc
+
+    def _open_existing(self, *settings: Any) -> bool:
+        """Attaches to the engine's table of this name, if there is one."""
+        try:
+            handle = _opened(self._engine(), self.name, series=self._series)
+        except NotFound:
+            return False
+        self._adopt(handle, *settings)
+        return True
+
+    def _ready(self) -> Handle:
+        """The engine's table.
+
+        Raises:
+            InvalidInput: If the first insert has not made it yet.
+        """
+        if self._table is None:
+            raise InvalidInput(
+                f"table {self.name} has no rows yet", hint=f"insert {self._first} first"
+            )
+        return self._table
+
+    def __len__(self) -> int:
+        return 0 if self._table is None else len(self._table)
+
+    def drop(self) -> None:
+        """Removes the table from its engine."""
+        if self._table is not None:
+            with boundary():
+                self._engine().drop_table(self.name)
+            self._table = None
+            self._attached = False
+
+    def close(self) -> None:
+        """Alias of `drop`."""
+        self.drop()
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self.drop()
+
+
+class Table(_Held[_NativeTable]):
     """Context rows in the engine, predicted against as they are.
 
     Args:
@@ -560,6 +699,9 @@ class Table:
             it, if its model, target and schema agree with these, and raises
             `InvalidInput` naming the first that does not.
     """
+
+    _series = False
+    _first = "context rows"
 
     def __init__(
         self,
@@ -582,10 +724,7 @@ class Table:
             schema = Schema(target=target)
         elif target is not None and target != schema.target:
             raise InvalidInput("target and schema.target disagree")
-        if not isinstance(name, str) or not name:
-            raise InvalidInput("a table needs a name")
-        self.name = name
-        self.model = registry.canonical(model)
+        super().__init__(name, model, client, download, exists)
         self.schema = schema
         self._selection = selection
         self._retrieval = Retrieved(core=None, neighbors=0)
@@ -599,39 +738,16 @@ class Table:
                 f"{self.model} forecasts series",
                 hint="use gf.engine.SeriesTable for a forecaster",
             )
-        self._download = download
-        self._client = client
-        self._exists = _exists(exists)
-        self._table: _NativeTable | None = None
         self._inputs: tuple[str, ...] | None = (
             tuple(schema.inputs) if schema.inputs is not None else None
         )
         self._classes: list[Any] = []
-        self._rows = 0
+        # The least id a row inserted without the `id` role may take.
+        self._next_id = 0
 
     @classmethod
-    def open(cls, name: str, *, client: Any = None, download: bool = True) -> Self:
-        """The table of this name the engine already holds.
-
-        The schema, classes, selection and settings come from the engine, as
-        the table was made, so the table takes inserts, labels, deletions and
-        predictions at once.
-
-        Args:
-            name: The table's name.
-            client: The engine holding the table; this process's if None.
-            download: Whether the model's files may download if not cached.
-
-        Returns:
-            The table.
-
-        Raises:
-            NotFound: If the engine holds no table of this name.
-            InvalidInput: If the name holds series, which `SeriesTable.open`
-                opens, or a table made without `gf.engine.Table`.
-        """
-        engine = _client(client, download)
-        handle = _opened(engine, name, series=False)
+    @override
+    def _of(cls, name: str, handle: _NativeTable, client: Any, download: bool) -> Self:
         with boundary():
             described = handle.describe()
         roles = _roles_of(described)
@@ -665,11 +781,11 @@ class Table:
             client=client,
             download=download,
         )
-        table._attach(handle, described)
+        table._took(handle, described)
         table._retrieval = _retrieval_of(described)
         return table
 
-    def _attach(self, handle: _NativeTable, described: Described) -> None:
+    def _took(self, handle: _NativeTable, described: Described) -> None:
         """Takes the engine's table as this one, with its classes and row count."""
         roles = _roles_of(described)
         self._inputs = tuple(column.name for column in described.columns)
@@ -679,8 +795,18 @@ class Table:
             self._classes = list(roles.classes)
         else:
             self._classes = list(described.labels or range(described.classes))
-        self._rows = described.rows
-        self._table = handle
+        # The rows it holds are as many as its least unused id at most; an
+        # insert moves past the ids rows deleted before leave held.
+        self._next_id = described.rows
+        self._attach(handle)
+
+    @override
+    def _adopt(self, handle: _NativeTable, *settings: Any) -> None:
+        (kinds,) = settings
+        with boundary():
+            described = handle.describe()
+        self._agrees(described, kinds)
+        self._took(handle, described)
 
     def _agrees(self, described: Described, kinds: Mapping[str, str]) -> None:
         """Checks an existing table is the one these settings describe."""
@@ -707,18 +833,6 @@ class Table:
             )
         if _route_of(described.route_by) != _route_of(self.ops.route_by):
             raise _mismatch(name, "route_by", described.route_by, self.ops.route_by)
-
-    def _open_existing(self, client: Any, kinds: Mapping[str, str]) -> bool:
-        """Attaches to the engine's table of this name, if there is one."""
-        try:
-            handle = _opened(client, self.name, series=False)
-        except NotFound:
-            return False
-        with boundary():
-            described = handle.describe()
-        self._agrees(described, kinds)
-        self._attach(handle, described)
-        return True
 
     @property
     def selection(self) -> Retrieved | None:
@@ -765,9 +879,6 @@ class Table:
         """A classifier's classes, in code order."""
         return list(self._classes)
 
-    def __len__(self) -> int:  # noqa: D105
-        return self._rows if self._table is None else len(self._table)
-
     def __repr__(self) -> str:  # noqa: D105
         inputs = "?" if self._inputs is None else str(len(self._inputs))
         return (
@@ -803,10 +914,12 @@ class Table:
                 hint="give the rows at least one input column",
             )
         kinds = self._kinds(table)
-        client = _client(self._client, self._download)
-        if self._exists == "open" and self._open_existing(client, kinds):
-            return
+        self._make(lambda: self._made(kinds, targets), kinds)
+
+    def _made(self, kinds: Mapping[str, str], targets: np.ndarray) -> _NativeTable:
+        """The engine's table, made with these columns' kinds and classes from `targets`."""
         limits = registry.limits(self.model)
+        assert self._inputs is not None
         if len(self._inputs) > limits.inputs:
             raise InvalidInput(
                 f"{len(self._inputs):,} inputs exceed the limit for {self.model}",
@@ -841,37 +954,30 @@ class Table:
             time=self.schema.time,
             classes=tuple(self._classes),
         )
-        try:
-            with boundary():
-                self._table = client._create_table(
-                    self.name,
-                    model=self.model,
-                    columns=kinds,
-                    classes=classes,
-                    strategy=strategy,
-                    page_size=ops.page_size,
-                    time_bucket=_bucket(time.bucket, times),
-                    refit_after=seconds(time.refit_after, "refit_after"),
-                    refit_shift=seconds(time.refit_shift, "refit_shift"),
-                    times=times,
-                    fit_rows=ops.fit_rows,
-                    past_cap=time.past,
-                    region_rows=selection.regions,
-                    rebuild=ops.rebuild,
-                    refit_cutoffs=time.cutoffs,
-                    scale_rows=selection.scale_rows,
-                    summary=ops.summary,
-                    retrieval_categoricals=selection.categoricals,
-                    partitions=ops.partitions,
-                    route_by=ops.route_by,
-                    roles=roles,
-                    **wait,
-                )
-        except Conflict as exc:
-            # Another client made the table since the check above.
-            if self._exists == "open" and self._open_existing(client, kinds):
-                return
-            raise _conflict(self.name, "Table") from exc
+        return self._engine()._create_table(
+            self.name,
+            model=self.model,
+            columns=kinds,
+            classes=classes,
+            strategy=strategy,
+            page_size=ops.page_size,
+            time_bucket=_span(time.bucket, times, "bucket"),
+            refit_after=seconds(time.refit_after, "refit_after"),
+            refit_shift=seconds(time.refit_shift, "refit_shift"),
+            times=times,
+            fit_rows=ops.fit_rows,
+            past_cap=time.past,
+            region_rows=selection.regions,
+            rebuild=ops.rebuild,
+            refit_cutoffs=time.cutoffs,
+            scale_rows=selection.scale_rows,
+            summary=ops.summary,
+            retrieval_categoricals=selection.categoricals,
+            partitions=ops.partitions,
+            route_by=ops.route_by,
+            roles=roles,
+            **wait,
+        )
 
     def _split(
         self, table: pa.Table, *, need_target: bool
@@ -906,8 +1012,11 @@ class Table:
 
         Args:
             rows: A frame, list of dicts, Arrow table or file with the target,
-                the role columns and the inputs. Ids come from the `id` role,
-                else from the row's position after the rows already inserted.
+                the role columns and the inputs. Ids come from the `id` role:
+                a row of an id the table holds is replaced. Without one, each
+                row takes the next integer no row of the table holds, its
+                position after the rows inserted before, and never replaces
+                one.
         """
         table = self._frame(rows)
         if len(table) == 0:
@@ -916,14 +1025,47 @@ class Table:
         assert targets is not None
         if self._table is None:
             self._create(table, targets)
-        assert self._table is not None
-        if ids is None:
-            ids = np.arange(self._rows, self._rows + len(table))
+        handle = self._ready()
         if self.task == "classification":
             targets = self._coded(targets)
+        if ids is None:
+            self._insert_unkeyed(handle, inputs, targets, times)
+            return
         with boundary():
-            self._table.upsert(ids, inputs, targets, times)
-        self._rows += len(table)
+            handle.upsert(ids, inputs, targets, times)
+
+    def _insert_unkeyed(
+        self, handle: _NativeTable, inputs: Any, targets: Any, times: Any
+    ) -> None:
+        """Inserts rows without the `id` role under the next integers no row holds.
+
+        The ids follow those of the rows inserted through this table. One
+        attached to a table the engine held knows only how many rows it
+        holds, so its ids start there; rows deleted before leave later ids
+        held, which the engine refuses whole rather than overwrite, so the
+        ids move past them, each move twice the last, until they are free.
+
+        Raises:
+            InvalidInput: If no free run of ids is left below the integers
+                an id takes.
+        """
+        count = len(inputs)
+        move = max(count, self._next_id, 1)
+        while self._next_id + count <= _LAST_ID:
+            ids = np.arange(self._next_id, self._next_id + count, dtype=np.int64)
+            with boundary():
+                try:
+                    handle.insert(ids, inputs, targets, times)
+                except DuplicateKey:
+                    self._next_id += move
+                    move *= 2
+                    continue
+            self._next_id += count
+            return
+        raise InvalidInput(
+            f"table {self.name} has no free run of {count:,} row ids left",
+            hint="give the rows an id column with Schema(id=...)",
+        )
 
     def _coded(self, targets: np.ndarray) -> np.ndarray:
         codes = {label: index for index, label in enumerate(self._classes)}
@@ -943,40 +1085,31 @@ class Table:
 
     def label(self, ids: Iterable[Any], values: Any) -> None:
         """Sets the target of rows already inserted, by id."""
-        self._ready()
+        handle = self._ready()
         values = np.asarray(list(values), dtype=object)
         if self.task == "classification":
             values = self._coded(values)
         with boundary():
-            assert self._table is not None
-            self._table.label(list(ids), values)
+            handle.label(list(ids), values)
 
     def delete(self, ids: Iterable[Any]) -> None:
         """Removes rows by id."""
-        self._ready()
+        handle = self._ready()
         with boundary():
-            assert self._table is not None
-            self._table.delete(list(ids), missing_ok=True)
+            handle.delete(list(ids), missing_ok=True)
 
     def truncate(self) -> None:
         """Removes every row."""
         if self._table is not None:
             with boundary():
                 self._table.truncate()
-        self._rows = 0
+        self._next_id = 0
 
     def refit(self) -> None:
         """Fits the model's state again on the rows now in the table."""
-        self._ready()
+        handle = self._ready()
         with boundary():
-            assert self._table is not None
-            self._table.refit()
-
-    def _ready(self) -> None:
-        if self._table is None:
-            raise InvalidInput(
-                f"table {self.name} has no rows yet", hint="insert context rows first"
-            )
+            handle.refit()
 
     def predict(
         self, rows: Any, as_of: Any = None, *, quantiles: Sequence[float] | None = None
@@ -996,14 +1129,13 @@ class Table:
             and `p_<class>` columns for a classifier, or `value` and
             `q_<level>` columns for a regressor.
         """
-        self._ready()
+        handle = self._ready()
         table = self._frame(rows)
         ids, inputs, _, times = self._split(table, need_target=False)
         if as_of is None and times is not None:
             as_of = times
         with boundary():
-            assert self._table is not None
-            outputs = self._table.predict(inputs, as_of, quantiles=quantiles)
+            outputs = handle.predict(inputs, as_of, quantiles=quantiles)
         return self._result(ids, outputs, quantiles)
 
     def _result(
@@ -1025,7 +1157,7 @@ class Table:
             levels = (
                 list(quantiles)
                 if quantiles is not None
-                else _implied_levels(outputs.shape[1] if outputs.ndim == 2 else 1)
+                else implied_levels(outputs.shape[1] if outputs.ndim == 2 else 1)
             )
             if outputs.ndim == 1:
                 columns["value"] = outputs
@@ -1036,43 +1168,39 @@ class Table:
                     columns[f"q_{level:g}"] = outputs[:, index]
         return pd.DataFrame(columns)
 
+    @override
     def drop(self) -> None:
-        """Removes the table from its engine."""
-        if self._table is not None:
-            client = _client(self._client, self._download)
-            with boundary():
-                client.drop_table(self.name)
-            self._table = None
-            self._rows = 0
-
-    def close(self) -> None:
-        """Alias of `drop`."""
-        self.drop()
-
-    def __enter__(self) -> Self:  # noqa: D105
-        return self
-
-    def __exit__(self, *_args: object) -> None:  # noqa: D105
-        self.drop()
+        super().drop()
+        self._next_id = 0
 
 
-def _implied_levels(count: int) -> list[float]:
-    if count <= 1:
-        return [0.5]
-    return [round((index + 1) / (count + 1), 4) for index in range(count)]
+# The most an id of a row inserted without the `id` role reaches: ids are int64.
+_LAST_ID = int(np.iinfo(np.int64).max)
 
 
 def _nearest(levels: Sequence[float], level: float) -> int:
     return min(range(len(levels)), key=lambda index: abs(levels[index] - level))
 
 
-def _bucket(width: Any, times: str) -> Any:
-    value = seconds(width, "bucket")
-    if value is None:
+def _span(value: Any, times: str, what: str) -> Any:
+    """A duration given as `seconds` reads it, as a client takes it for a table of `times`.
+
+    A timedelta for a datetime table, else a whole number of its units; None
+    for None.
+
+    Raises:
+        InvalidInput: If an integer table's span is not whole.
+    """
+    found = seconds(value, what)
+    if found is None:
         return None
     if times == "datetime":
-        return datetime.timedelta(seconds=value)
-    return int(value)
+        return datetime.timedelta(seconds=found)
+    if not float(found).is_integer():
+        raise InvalidInput(
+            f"{what} `{value}` is not a whole number of the table's time units"
+        )
+    return int(found)
 
 
 @dataclass(frozen=True)
@@ -1117,7 +1245,7 @@ class SeriesSchema:
         seconds(self.frequency, "frequency")
 
 
-class SeriesTable:
+class SeriesTable(_Held[_NativeSeriesTable]):
     """Series in the engine, forecast past their latest observations.
 
     Args:
@@ -1133,7 +1261,14 @@ class SeriesTable:
             table of this name: `error` raises `Conflict`; `open` attaches to
             it, if its model and schema agree with these, and raises
             `InvalidInput` naming the first that does not.
+
+    An opened table reports the model's own quantile levels. The engine keeps
+    series by digest, so an opened table does not know the keys of the series
+    it holds: `forecast` needs them named.
     """
+
+    _series = True
+    _first = "observations"
 
     def __init__(
         self,
@@ -1149,10 +1284,7 @@ class SeriesTable:
         exists: Exists = "error",
     ) -> None:
         """Checks the settings; the engine's table is made at the first insert."""
-        if not isinstance(name, str) or not name:
-            raise InvalidInput("a table needs a name")
-        self.name = name
-        self.model = registry.canonical(model)
+        super().__init__(name, model, client, download, exists)
         if registry.task_of(self.model) != "forecast":
             raise InvalidInput(
                 f"{self.model} does not forecast series",
@@ -1163,37 +1295,12 @@ class SeriesTable:
         self.grouping = grouping or Grouping(alone=True)
         self.quantiles = tuple(quantiles) if quantiles is not None else None
         self._levels = registry.quantiles(self.model)
-        self._client = client
-        self._download = download
-        self._exists = _exists(exists)
-        self._table: _NativeSeriesTable | None = None
-        self._times: str | None = None
-        self._attached = False
 
     @classmethod
-    def open(cls, name: str, *, client: Any = None, download: bool = True) -> Self:
-        """The series table of this name the engine already holds.
-
-        The schema, horizon and grouping come from the engine, as the table
-        was made, so the table takes inserts and forecasts at once. Forecasts
-        report the model's own quantile levels. The engine keeps series by
-        digest, so an opened table does not know the keys of the series it
-        holds: `forecast` needs them named.
-
-        Args:
-            name: The table's name.
-            client: The engine holding the table; this process's if None.
-            download: Whether the model's files may download if not cached.
-
-        Returns:
-            The table.
-
-        Raises:
-            NotFound: If the engine holds no table of this name.
-            InvalidInput: If the name holds rows, which `Table.open` opens.
-        """
-        engine = _client(client, download)
-        handle = _opened(engine, name, series=True)
+    @override
+    def _of(
+        cls, name: str, handle: _NativeSeriesTable, client: Any, download: bool
+    ) -> Self:
         definition: SeriesDefinition = handle.definition
         table = cls(
             name,
@@ -1206,6 +1313,12 @@ class SeriesTable:
         )
         table._attach(handle)
         return table
+
+    @override
+    def _adopt(self, handle: _NativeSeriesTable, *settings: Any) -> None:
+        kinds, times = settings
+        self._agrees(handle.definition, kinds, times)
+        self._attach(handle)
 
     def _agrees(
         self, definition: SeriesDefinition, kinds: Mapping[str, str], times: str
@@ -1244,22 +1357,6 @@ class SeriesTable:
                 name, "grouping", _grouping_of(definition.group.spec()), self.grouping
             )
 
-    def _open_existing(self, client: Any, kinds: Mapping[str, str], times: str) -> bool:
-        """Attaches to the engine's table of this name, if there is one."""
-        try:
-            handle = _opened(client, self.name, series=True)
-        except NotFound:
-            return False
-        self._agrees(handle.definition, kinds, times)
-        self._attach(handle)
-        return True
-
-    def _attach(self, handle: Any) -> None:
-        """Takes the engine's table as this one; its series stay unnamed."""
-        self._table = handle
-        self._times = handle.definition.times
-        self._attached = True
-
     def __repr__(self) -> str:  # noqa: D105
         return (
             f"SeriesTable({self.name!r}, model={self.model!r}, "
@@ -1284,34 +1381,23 @@ class SeriesTable:
             if pa.types.is_temporal(table.schema.field(schema.time).type)
             else "integer"
         )
-        step = seconds(schema.frequency, "frequency")
-        assert step is not None
-        client = _client(self._client, self._download)
-        if self._exists == "open" and self._open_existing(client, columns, times):
-            return
-        try:
-            with boundary():
-                self._table = client._create_series_table(
-                    self.name,
-                    model=self.model,
-                    series=schema.series[0],
-                    time=schema.time,
-                    target=schema.target,
-                    step=datetime.timedelta(seconds=step)
-                    if times == "datetime"
-                    else step,
-                    columns=columns or None,
-                    known=schema.known,
-                    group=self.grouping.strategy(),
-                    horizon=self.horizon,
-                    times=times,
-                )
-        except Conflict as exc:
-            # Another client made the table since the check above.
-            if self._exists == "open" and self._open_existing(client, columns, times):
-                return
-            raise _conflict(self.name, "SeriesTable") from exc
-        self._times = times
+
+        def made() -> _NativeSeriesTable:
+            return self._engine()._create_series_table(
+                self.name,
+                model=self.model,
+                series=schema.series[0],
+                time=schema.time,
+                target=schema.target,
+                step=_span(schema.frequency, times, "frequency"),
+                columns=columns or None,
+                known=schema.known,
+                group=self.grouping.strategy(),
+                horizon=self.horizon,
+                times=times,
+            )
+
+        self._make(made, columns, times)
 
     def insert(self, rows: Any) -> None:
         """Adds observations: series, time, target and covariate columns."""
@@ -1320,9 +1406,9 @@ class SeriesTable:
             return
         if self._table is None:
             self._create(table)
-        assert self._table is not None
+        handle = self._ready()
         with boundary():
-            self._table.upsert(table)
+            handle.upsert(table)
 
     def forecast(
         self,
@@ -1343,32 +1429,27 @@ class SeriesTable:
             A pandas DataFrame with the series column, `step` (1-based) and
             `q_<level>` columns, plus `value` at the median.
         """
-        if self._table is None:
-            raise InvalidInput(
-                f"table {self.name} has no rows yet", hint="insert observations first"
-            )
-        keys = list(series) if series is not None else self._all_series()
+        handle = self._ready()
+        keys = list(series) if series is not None else self._all_series(handle)
         with boundary():
-            outputs = self._table.forecast(
-                keys, horizon, as_of, quantiles=self.quantiles
-            )
+            outputs = handle.forecast(keys, horizon, as_of, quantiles=self.quantiles)
         return self._result(keys, np.asarray(outputs))
 
     def predict(self, rows: Any, as_of: Any = None) -> Any:
         """Forecasts the future rows: a time grid with known covariates.
 
         Rows carry the series and time columns, and the known covariates'
-        future values, which are inserted ahead of the series before the
-        forecast. The forecast covers the steps the rows span.
+        future values; their target may be left out, as it is not known yet.
+        Those rows are inserted ahead of the series, unobserved, so the
+        forecast reads the known covariates over its horizon, and stay in the
+        table until observations at their times replace them. The forecast
+        covers the steps the rows span.
         """
         table = tabular.frame(rows)
         schema = self.schema
-        if self._table is None:
-            raise InvalidInput(
-                f"table {self.name} has no rows yet", hint="insert observations first"
-            )
+        handle = self._ready()
         if schema.known:
-            self.insert(table)
+            self.insert(_unobserved(table, schema.target))
         keys_column = _column(table, schema.series[0], "series")
         keys = list(dict.fromkeys(keys_column.to_pylist()))
         counts = {key: 0 for key in keys}
@@ -1376,14 +1457,10 @@ class SeriesTable:
             counts[key] += 1
         horizon = max(counts.values())
         with boundary():
-            assert self._table is not None
-            outputs = self._table.forecast(
-                keys, horizon, as_of, quantiles=self.quantiles
-            )
+            outputs = handle.forecast(keys, horizon, as_of, quantiles=self.quantiles)
         return self._result(keys, np.asarray(outputs))
 
-    def _all_series(self) -> list[Any]:
-        assert self._table is not None
+    def _all_series(self, handle: _NativeSeriesTable) -> list[Any]:
         if self._attached:
             raise InvalidInput(
                 f"table {self.name} was opened, so name the series to forecast",
@@ -1391,7 +1468,7 @@ class SeriesTable:
                 "learns their keys only from the rows written through it",
             )
         with boundary():
-            keys = self._table.known_series()
+            keys = handle.known_series()
         if not keys:
             raise InvalidInput(
                 f"table {self.name} has no series yet", hint="insert observations first"
@@ -1404,7 +1481,7 @@ class SeriesTable:
         count, horizon, width = outputs.shape
         levels = list(self.quantiles or self._levels)
         if len(levels) != width:
-            levels = _implied_levels(width)
+            levels = list(implied_levels(width))
         median = _nearest(levels, 0.5)
         columns: dict[str, Any] = {
             self.schema.series[0]: np.repeat(np.asarray(keys, dtype=object), horizon),
@@ -1415,21 +1492,12 @@ class SeriesTable:
             columns[f"q_{level:g}"] = outputs[:, :, index].reshape(-1)
         return pd.DataFrame(columns)
 
-    def __len__(self) -> int:  # noqa: D105
-        return 0 if self._table is None else len(self._table)
 
-    def drop(self) -> None:
-        """Removes the table from its engine."""
-        if self._table is not None:
-            client = _client(self._client, self._download)
-            with boundary():
-                client.drop_table(self.name)
-            self._table = None
-            self._attached = False
-
-    def close(self) -> None:
-        """Alias of `drop`."""
-        self.drop()
+def _unobserved(table: pa.Table, target: str) -> pa.Table:
+    """Future rows with an unobserved target where they carry none."""
+    if target in table.column_names:
+        return table
+    return table.append_column(target, pa.nulls(len(table), pa.float64()))
 
 
 def _series_schema_of(definition: SeriesDefinition) -> SeriesSchema:

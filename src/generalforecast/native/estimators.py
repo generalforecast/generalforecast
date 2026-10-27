@@ -67,13 +67,20 @@ _shared_lock = threading.Lock()
 
 
 def _local(download: bool = True) -> LocalClient:
-    """The local client of estimators given none, one per download gate, on the process's engine."""
+    """The local client of tables and estimators given none, on the process's engine.
+
+    One per download gate, each seeing the same tables, so a table made under
+    one gate opens under the other.
+    """
     allow_downloads = bool(download)
     with _shared_lock:
         client = _shared.get(allow_downloads)
         if client is None:
-            client = _shared[allow_downloads] = LocalClient(
-                allow_downloads=allow_downloads
+            other = next(iter(_shared.values()), None)
+            client = _shared[allow_downloads] = (
+                LocalClient(allow_downloads=allow_downloads)
+                if other is None
+                else other.gated(allow_downloads)
             )
     return client
 
