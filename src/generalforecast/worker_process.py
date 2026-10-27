@@ -21,6 +21,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Iterator, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -159,8 +160,14 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
     worker.announce = announced
 
+    def loaded(frame: dict[str, Any]) -> None:
+        replies.put(lambda: (frame, []))
+
+    loads = _Loads(worker, names, loaded, progressed)
     while (frame := frames.get()) is not None:
-        replies.put(_answer(worker, names, progressed, *frame))
+        replies.put(_answer(worker, names, progressed, *frame, loads=loads))
+        # After the answer, so the server hears `Loading` before `Loaded`.
+        loads.start()
         if worker.lost:
             # The server starts the worker again, forgetting every cached context.
             failed.set()
@@ -168,6 +175,56 @@ def main(arguments: Sequence[str] | None = None) -> int:
     replies.put(None)
     writer.join()
     return 1 if failed.is_set() else 0
+
+
+class _Loads:
+    """Models a worker loads beside its steps, one at a time, in the order asked.
+
+    Each loads on a thread of its own while the worker answers steps for the
+    models it serves; it is served under its name once it loaded and
+    compiled what earlier workers recorded for it, and `send` takes the
+    `Loaded` report either way.
+    """
+
+    def __init__(
+        self,
+        worker: Worker,
+        names: dict[str, int],
+        send: Callable[[dict[str, Any]], None],
+        progressed: Callable[..., None],
+    ) -> None:
+        """Loads into `worker` under `names`, reporting through `send`."""
+        self._worker, self._names = worker, names
+        self._send, self._progressed = send, progressed
+        self._asked: list[tuple[str, str]] = []
+        self._loading = ThreadPoolExecutor(1, thread_name_prefix="gf-load")
+
+    def ask(self, name: str, spec: str) -> None:
+        """Takes a model to load once `start` is called."""
+        self._asked.append((name, spec))
+
+    def start(self) -> None:
+        """Starts loading the models asked for, after their answers went."""
+        for name, spec in self._asked:
+            self._loading.submit(self._load, name, spec)
+        self._asked.clear()
+
+    def _load(self, name: str, spec: str) -> None:
+        """Loads one model, unless the worker serves one by its name, and reports it."""
+        failure = None
+        try:
+            if name not in self._names:
+                # Loads run one at a time, and only they add names.
+                model = len(self._names)
+                self._worker.add_model(
+                    model, *registry.load_engine_model(spec), spec=spec
+                )
+                if self._worker.allocated:
+                    self._worker.warm_start(self._progressed, models=[model])
+                self._names[name] = model
+        except Exception as error:  # noqa: BLE001
+            failure = f"{type(error).__name__}: {error}"
+        self._send(protocol.reply(protocol.Loaded(name, failure)))
 
 
 # The compile cache's counts as the last reply that carried them read them.
@@ -192,17 +249,19 @@ def _answer(
     progressed: Callable[..., None],
     header: dict[str, Any],
     buffers: list[memoryview],
+    loads: _Loads | None = None,
 ) -> Callable[[], Frame]:
     """Handles one frame; returns what formats its reply, for the writer to call.
 
     `progressed` tells the server a long answer is moving, before its reply,
-    and how far a warm-up has got.
+    and how far a warm-up has got. `loads` takes the models asked for, to
+    load beside the steps; a worker without it refuses them.
     """
     tracing = _tracing
     if tracing is None or header.get("kind") != "step":
-        return _handled(worker, names, progressed, header, buffers)
+        return _handled(worker, names, progressed, header, buffers, loads)
     with tracing.step(worker):
-        return _handled(worker, names, progressed, header, buffers)
+        return _handled(worker, names, progressed, header, buffers, loads)
 
 
 def _handled(
@@ -211,6 +270,7 @@ def _handled(
     progressed: Callable[..., None],
     header: dict[str, Any],
     buffers: list[memoryview],
+    loads: _Loads | None = None,
 ) -> Callable[[], Frame]:
     """Answers one frame, outside any trace."""
     answer: protocol.Reply
@@ -271,17 +331,22 @@ def _handled(
                     worker.programs.warm_seconds - before[1],
                     {"hits": hits, "misses": misses},
                 )
+            case protocol.AddModel(name, spec):
+                if loads is None:
+                    raise RuntimeError("this worker loads no models beside its steps")
+                loads.ask(name, spec)
+                answer = protocol.Loading()
             case protocol.Controls(requests):
                 failures = []
                 for index, control in enumerate(requests):
                     try:
-                        _control(worker, names, control, progressed)
+                        _control(worker, names, control)
                     except Exception as error:  # noqa: BLE001
                         message = f"{type(error).__name__}: {error}"
                         failures.append(protocol.ControlFailure(index, message))
                 answer = protocol.Controlled(failures) if failures else protocol.Done()
             case protocol.AddTable() | protocol.RemoveTable() | protocol.Apply():
-                _control(worker, names, request, progressed)
+                _control(worker, names, request)
                 answer = protocol.Done()
     except Exception as error:  # noqa: BLE001
         answer = protocol.Failed(f"{type(error).__name__}: {error}")
@@ -292,26 +357,10 @@ def _handled(
 def _control(
     worker: Worker,
     names: dict[str, int],
-    control: protocol.AddModel
-    | protocol.AddTable
-    | protocol.RemoveTable
-    | protocol.Apply,
-    progressed: Callable[..., None],
+    control: protocol.AddTable | protocol.RemoveTable | protocol.Apply,
 ) -> None:
-    """Loads a model, adds or removes a table, or applies tiers' copies and drops.
-
-    A model loads under its name unless the worker serves one by it, as at
-    launch, and compiles what earlier workers recorded for it before any step.
-    """
+    """Adds or removes a table, or applies tiers' copies and drops."""
     match control:
-        case protocol.AddModel(name, spec):
-            if name not in names:
-                worker.add_model(
-                    len(names), *registry.load_engine_model(spec), spec=spec
-                )
-                names[name] = len(names)
-                if worker.allocated:
-                    worker.warm_start(progressed, models=[names[name]])
         case protocol.AddTable(
             table, model, classes, features, categorical, page_size, summary, series
         ):

@@ -271,3 +271,56 @@ def test_a_start_compiles_the_most_recently_used_programs_and_the_rest_ahead(
     # The rest wait to compile ahead while the worker serves.
     assert len(later.programs._later) == total - started
     later.programs.drop()
+
+
+def test_a_worker_loads_a_model_beside_its_steps_and_reports_it_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import queue
+    import threading
+
+    from generalforecast import worker_process
+    from generalforecast.models import registry
+
+    release = threading.Event()
+
+    def load(spec: str) -> tuple[Any, Any]:
+        if spec == "broken":
+            raise OSError("no weights")
+        assert release.wait(10)
+        return tabicl_functions, tiny_tabicl(regression=False)
+
+    monkeypatch.setattr(registry, "load_engine_model", load)
+    worker = Worker(slot_bytes=4096, compile_cache=False, compile_ahead=False)
+    worker.add_model(0, tabicl_functions, tiny_tabicl(regression=False))
+    worker.allocate(16, 0, 0)
+    names = {"served": 0}
+    sent: queue.Queue[dict[str, Any]] = queue.Queue()
+    loads = worker_process._Loads(worker, names, sent.put, lambda *_: None)
+
+    def answer(header: dict[str, Any]) -> dict[str, Any]:
+        replied, _ = worker_process._answer(
+            worker, names, lambda *_: None, header, [], loads=loads
+        )()
+        loads.start()
+        return replied
+
+    loading = answer({"kind": "add_model", "name": "slow", "spec": "tiny"})
+    assert loading == {"kind": "loading"}
+    # The served model's requests are answered while the other loads.
+    profiled = answer({"kind": "profile", "model": "served", "features": 5})
+    assert profiled["kind"] == "profile"
+    assert sent.empty() and "slow" not in names
+
+    release.set()
+    assert sent.get(timeout=10) == {"kind": "loaded", "name": "slow"}
+    assert names["slow"] == 1
+    assert answer({"kind": "add_model", "name": "broken", "spec": "broken"}) == {
+        "kind": "loading"
+    }
+    assert sent.get(timeout=10) == {
+        "kind": "loaded",
+        "name": "broken",
+        "failure": "OSError: no weights",
+    }
+    assert "broken" not in names
