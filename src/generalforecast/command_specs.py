@@ -173,7 +173,7 @@ def admin_action(noun: str, action: str) -> AdminAction:
     return next(spec for spec in ADMIN_ACTIONS[noun] if spec.name == action)
 
 
-# -- SDK routing tables, shared with the hosted test-suite -------------
+# The SDK routing tables, which the hosted test suite shares.
 
 COLLECTIONS: "dict[str, tuple[ResourceKind, str]]" = {
     "context": ("context", "contexts"),

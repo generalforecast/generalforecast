@@ -27,7 +27,7 @@ import pyarrow.compute as _compute
 
 from generalforecast import term
 from generalforecast.command_specs import DEFAULT_ENV
-from generalforecast.errors import AmbiguousReference, Error, InvalidInput, NotFound
+from generalforecast.errors import Error, InvalidInput, NotFound
 
 if TYPE_CHECKING:
     from generalforecast.predictors import Resolution
@@ -156,9 +156,6 @@ def predictor_class() -> Any:
     return Predictor
 
 
-# -- helpers --------------------------------------------------------------
-
-
 def _shown(root: Path) -> str:
     text = os.path.relpath(root)
     if text == ".":
@@ -169,16 +166,24 @@ def _shown(root: Path) -> str:
 
 
 def is_local(reference: str) -> bool:
-    """Whether a hosted command's DIR|NAME argument names a directory here.
+    """Whether a DIR|NAME argument names a directory here.
 
-    A path names one; so does a bare name with a `gf.yaml` beneath it, whose
-    manifest then names the hosted predictor.
+    One rule for every command: a path, such as `.`, `./churn` or `~/churn`,
+    names a directory; a bare name such as `churn` is the hosted predictor,
+    even where a directory of that name holds a `gf.yaml`.
     """
     if re.match(r"^https?://", reference):
         return False
-    if reference.startswith((".", "~")) or "/" in reference or os.sep in reference:
-        return True
-    return (Path(reference) / MANIFEST).is_file()
+    return reference.startswith((".", "~")) or "/" in reference or os.sep in reference
+
+
+def _shadowed(reference: str, out: term.Output) -> None:
+    """Warns when a bare name taken as hosted is also a predictor directory here."""
+    if not is_local(reference) and (Path(reference) / MANIFEST).is_file():
+        out.warning(
+            f"`{reference}` is the hosted predictor; pass ./{reference} for the "
+            "directory here"
+        )
 
 
 def _tables_in(root: Path) -> list[Path]:
@@ -253,9 +258,6 @@ def _write_frame(frame: Any, path: Path) -> None:
         raise
 
 
-# -- the commands ---------------------------------------------------------
-
-
 def execute(args: argparse.Namespace, out: term.Output) -> dict | None:
     """Runs one predictor command."""
     if args.command == "serve":
@@ -273,8 +275,6 @@ class PredictorCommands:
         self.args, self.out = args, out
         self.library = predictors()
 
-    # -- shared -----------------------------------------------------------
-
     @cached_property
     def client(self) -> Any:
         """The authenticated SDK client, built on first use."""
@@ -290,6 +290,7 @@ class PredictorCommands:
     def reference(self) -> tuple[str, Path | None]:
         """A DIR|NAME argument as `(hosted name, local root or None)`."""
         target = self.args.target
+        _shadowed(target, self.out)
         if is_local(target):
             root = Path(target).expanduser()
             return self.library.load(root).name, root
@@ -312,8 +313,6 @@ class PredictorCommands:
     def confirm(self, question: str) -> None:
         """Asks `question [y/N]` unless `--yes`; raises `Aborted` on anything but yes."""
         term.Prompter(self.out, yes=self.args.yes).confirm(question)
-
-    # -- init -------------------------------------------------------------
 
     def init(self) -> dict:
         """Writes a predictor manifest, asking for what the context does not say."""
@@ -365,7 +364,7 @@ class PredictorCommands:
             "Found",
             f"{relative}  {term.plural(info.rows, 'row')}, {term.plural(len(info.columns), 'column')}",
         )
-        out.say(force=True)
+        out.say()
         prompter = term.Prompter(out, yes=args.yes, no_input=args.no_input)
         registry = _registry()
         options = {c.name: term.Option(c.name, c.name, c.kind) for c in info.columns}
@@ -378,22 +377,15 @@ class PredictorCommands:
                 hint=f"{relative} has {', '.join(info.names)}",
                 param="target",
             )
-        if target is None:
-            first = info.targets[:1]
-            candidates = [
-                options[c] for c in (*first, *(c for c in info.names if c not in first))
-            ]
-            target = prompter.choose("Target", candidates, flag="--target")
-        else:
-            out.collapsed("Target", target)
-
-        column = info.column(target)
+        # A task the flags declare picks the target candidates; otherwise the
+        # chosen target decides the task.
         model = args.model
+        declared: tuple[str, str] | None = None
         if model is not None:
             model = registry.canonical(model)
-            task, why = registry.task_of(model), "from --model"
+            declared = registry.task_of(model), "from --model"
         elif args.task is not None:
-            task, why = args.task, "from --task"
+            declared = args.task, "from --task"
         elif args.time or args.frequency or args.horizon:
             flag = next(
                 f
@@ -404,7 +396,29 @@ class PredictorCommands:
                 )
                 if v
             )
-            task, why = "forecast", f"from {flag}"
+            declared = "forecast", f"from {flag}"
+        if target is None:
+            tasks = (
+                (declared[0],)
+                if declared is not None
+                else ("forecast", "classification")
+                if info.times
+                else ("classification", "regression")
+            )
+            names = dict.fromkeys(
+                name
+                for task in tasks
+                for name in self.library.target_candidates(info, task)
+            )
+            target = prompter.choose(
+                "Target", [options[c] for c in names], flag="--target"
+            )
+        else:
+            out.collapsed("Target", target)
+
+        column = info.column(target)
+        if declared is not None:
+            task, why = declared
         else:
             task = self.library.task_for(column, info.rows)
             why = f"{target} has {term.count(column.distinct)} distinct {column.kind} values"
@@ -548,7 +562,21 @@ class PredictorCommands:
             )
             if rule == "date":
                 assert time_name is not None
-                last, rows_after = _dates(_table(source).column(time_name))
+                table = _table(source)
+                last, rows_after = _dates(table.column(time_name))
+                if forecast:
+                    # Each series holds out exactly its horizon, as eval scores it.
+                    assert horizon is not None
+                    last = (
+                        self.library.default_until(
+                            table.filter(pc.is_valid(table.column(target))),
+                            time=time_name,
+                            series=list(series or ()),
+                            horizon=horizon,
+                            frequency=None if frequency is None else str(frequency),
+                        )
+                        or last
+                    )
                 until = prompter.ask(
                     "Until",
                     last,
@@ -592,11 +620,9 @@ class PredictorCommands:
         path = self.library.write_manifest(
             self.library.PredictorSpec.from_dict(spec), root, force=args.force
         )
-        out.say(force=True)
+        out.say()
         out.status("Initialized", f"predictor {name} in {_shown(root)}/{MANIFEST}")
         return {"name": name, "path": str(path), "manifest": spec}
-
-    # -- check ------------------------------------------------------------
 
     def check(self) -> dict:
         """Resolves the manifest, prints what was inferred and writes `gf.lock`."""
@@ -632,14 +658,14 @@ class PredictorCommands:
             # content: nothing to compare with, so the lock would change.
             lock_document(root)
         if args.locked and changes:
+            listed = f"{' is' if len(changes) == 1 else 's are'} listed above"
             raise Error(
                 "InvalidInput",
                 f"{LOCK} would change",
-                because=(
-                    f"{len(changes)} change"
-                    f"{' is' if len(changes) == 1 else 's are'}"
-                    " listed above"
-                ),
+                # Under -q and --json nothing was listed, so the error lists them.
+                because="\n".join(line.strip() for line in term.change_lines(changes))
+                if out.quiet
+                else f"{len(changes)} change{listed}",
                 hint="run `gf check` without --locked to write them",
             )
         if args.locked:
@@ -712,13 +738,11 @@ class PredictorCommands:
             text = f"retrieved  core {term.count(selection.core or 0)} {selection.kind}, {term.count(selection.neighbors)} nearest per query"
         self.out.status("Selection", text)
 
-    # -- eval -------------------------------------------------------------
-
     def eval(self) -> dict:
         """Scores the query rows with the predictor; returns the metrics."""
         args, out = self.args, self.out
         output = _output_path(args.output, args.queries, predictor=self.root)
-        predictor = predictor_class()(str(self.root))
+        predictor = predictor_class().local(self.root)
         resolution = predictor.explain()
         context = resolution.context
         out.status(
@@ -738,22 +762,20 @@ class PredictorCommands:
             out.status("Wrote", args.output)
         return {"name": resolution.name, "metrics": evaluation.metrics, "rows": rows}
 
-    # -- predict ----------------------------------------------------------
-
     def predict(self) -> dict:
         """Scores rows with a local, served, ad hoc or hosted predictor."""
         from generalforecast.predictor import resolve_reference
 
         args, out = self.args, self.out
         reference = args.target
-        try:
-            kind, where = resolve_reference(reference, env=args.env)
-        except AmbiguousReference:
-            raise AmbiguousReference(
-                f"`{reference}` is both a directory with gf.yaml and a hosted predictor name",
-                hint=f"pass ./{reference} for the local predictor, "
-                f"or --env {DEFAULT_ENV} for the hosted one",
-            ) from None
+        # A bare name is the hosted predictor, in the production environment
+        # unless --env names another; a path, URL or model id says what it is.
+        bare = not is_local(reference) and not re.match(r"^https?://", reference)
+        kind, where = resolve_reference(
+            reference, env=(args.env or DEFAULT_ENV) if bare else args.env
+        )
+        if kind == "hosted":
+            _shadowed(reference, out)
         if kind == "catalog" and not args.target_column:
             raise InvalidInput(
                 "a catalog model needs a target",
@@ -772,12 +794,30 @@ class PredictorCommands:
             args.context,
             predictor=where if kind == "local" else None,
         )
-        predictor = predictor_class()(
-            reference,
-            env=(args.env or DEFAULT_ENV) if kind == "hosted" else args.env,
-            target=args.target_column,
-            inputs=args.inputs,
-        )
+        if kind == "local":
+            given = [
+                flag
+                for flag, value in (
+                    ("--env", args.env),
+                    ("--target", args.target_column),
+                    ("--inputs", args.inputs),
+                )
+                if value is not None
+            ]
+            if given:
+                raise InvalidInput(
+                    f"{given[0]} does not apply to a local predictor",
+                    hint=f"a local predictor takes these from its {MANIFEST}",
+                    param=given[0].lstrip("-"),
+                )
+            predictor = predictor_class().local(where)
+        else:
+            predictor = predictor_class()(
+                reference,
+                env=(args.env or DEFAULT_ENV) if kind == "hosted" else args.env,
+                target=args.target_column,
+                inputs=args.inputs,
+            )
         started = time.perf_counter()
         frame = predictor.predict(args.queries, context=args.context)
         out.status(
@@ -785,12 +825,11 @@ class PredictorCommands:
             term.plural(len(frame), "row"),
             seconds=time.perf_counter() - started,
         )
-        if output is not None:
-            _write_frame(frame, output)
-            out.status("Wrote", args.output)
-        return {"rows": len(frame), "predictions": frame}
-
-    # -- hosted -----------------------------------------------------------
+        if output is None:
+            return {"rows": len(frame), "predictions": frame}
+        _write_frame(frame, output)
+        out.status("Wrote", args.output)
+        return {"rows": len(frame), "output": str(output)}
 
     def push(self) -> dict:
         """Uploads the locked predictor as a revision and points an environment at it."""

@@ -22,7 +22,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import IO, Any
 
-from generalforecast.errors import Error, InvalidInput
+from generalforecast.errors import Error, InvalidInput, printable
 
 # Status verbs are right-aligned in this many columns.
 VERB_WIDTH = 12
@@ -134,6 +134,31 @@ def clip(text: str, width: int) -> str:
     return "".join(shown)
 
 
+def change_lines(
+    items: Sequence[tuple[str, str, Any, Any]],
+    *,
+    style: Callable[..., str] = lambda text, *styles: text,
+) -> list[str]:
+    """Lock changes as lines: ` + key  value`, ` - key  value` or ` ~ key  old → new`.
+
+    Keys are padded to the longest in the block; `style` colours the sign.
+    """
+    if not items:
+        return []
+    width = max(LOCK_KEY_WIDTH, *(len(key) for _, key, _, _ in items))
+    lines = []
+    for op, key, old, new in items:
+        colour = {"+": "green", "-": "red", "~": "yellow"}.get(op, "bold")
+        if op == "+" or old is None:
+            value = f"{new}"
+        elif op == "-" or new is None:
+            value = f"{old}"
+        else:
+            value = f"{old} → {new}"
+        lines.append(f" {style(op, 'bold', colour)} {key.ljust(width)}  {value}")
+    return lines
+
+
 def suggest(word: str, choices: Iterable[str]) -> str | None:
     """The closest choice to a typo, or None when nothing is close."""
     import difflib
@@ -192,8 +217,6 @@ class Output:
             id(self.err): color_enabled(self.err, environ),
         }
 
-    # -- primitives --------------------------------------------------------
-
     def colored(self, stream: IO[str] | None = None) -> bool:
         """Whether a stream (default stderr) gets colour."""
         stream = self.err if stream is None else stream
@@ -229,13 +252,16 @@ class Output:
             self._write(self.quiet_text(text), self.err)
 
     def link(self, url: str, text: str | None = None) -> str:
-        """A clickable URL on terminals that support OSC 8 hyperlinks."""
-        shown = text or url
+        """A clickable URL on terminals that support OSC 8 hyperlinks.
+
+        Both may come from a server, so neither keeps a terminal escape that
+        could end the link early or write anything else.
+        """
+        url = printable(url)
+        shown = printable(text) if text else url
         if not self.colored():
             return shown
         return f"\x1b]8;;{url}\x1b\\{shown}\x1b]8;;\x1b\\"
-
-    # -- status ------------------------------------------------------------
 
     def status(self, verb: str, message: str, *, seconds: float | None = None) -> None:
         """A status line: the verb right-aligned in 12 columns, a space, the message.
@@ -254,33 +280,18 @@ class Output:
 
     def changes(self, items: Sequence[tuple[str, str, Any, Any]]) -> None:
         """Lock change lines, keys padded to the longest key in the block."""
-        if not items or self.quiet:
-            return
-        width = max(LOCK_KEY_WIDTH, *(len(key) for _, key, _, _ in items))
-        for op, key, old, new in items:
-            self.change(op, key, old, new, width=width)
-
-    def change(
-        self, op: str, key: str, old: Any, new: Any, *, width: int | None = None
-    ) -> None:
-        """One lock change: ` + key  value`, ` - key  value` or ` ~ key  old → new`."""
         if self.quiet:
             return
-        colour = {"+": "green", "-": "red", "~": "yellow"}.get(op, "bold")
-        shown = key.ljust(width or len(key))
-        if op == "+" or old is None:
-            value = f"{new}"
-        elif op == "-" or new is None:
-            value = f"{old}"
-        else:
-            value = f"{old} → {new}"
-        self._write(f" {self.style(op, 'bold', colour)} {shown}  {value}", self.err)
+        for line in change_lines(items, style=self.style):
+            self._write(line, self.err)
 
     def collapsed(self, label: str, value: str) -> None:
-        """A finished prompt: the label padded to column 14, then the value."""
-        self._write(f"{label.ljust(LABEL_WIDTH)}{value}", self.err)
+        """A finished prompt: the label padded to column 14, then the value.
 
-    # -- errors ------------------------------------------------------------
+        A summary, so dropped under `-q`; the manifest holds every answer.
+        """
+        if not self.quiet:
+            self._write(f"{label.ljust(LABEL_WIDTH)}{value}", self.err)
 
     def _labelled(self, label: str, text: str, *styles: str) -> None:
         head = self.style(f"{label}:", *styles)
@@ -342,14 +353,13 @@ class Output:
         self._write(f"{gutter} {quiet('|')} {lead}{carets}{label}", self.err)
 
     def warning(self, text: str) -> None:
-        """A `warning:` line."""
-        self._write(f"{self.style('warning:', 'bold', 'yellow')} {text}", self.err)
+        """A `warning:` line, dropped under `-q`."""
+        if not self.quiet:
+            self._write(f"{self.style('warning:', 'bold', 'yellow')} {text}", self.err)
 
     def hint(self, text: str) -> None:
         """A `hint:` line on its own."""
         self._labelled("hint", text, "bold")
-
-    # -- tables ------------------------------------------------------------
 
     def table(
         self,
@@ -540,8 +550,6 @@ class Prompter:
         if answer.lower() not in ("y", "yes"):
             raise Aborted("cancelled; nothing was changed")
 
-    # -- plain fallback ----------------------------------------------------
-
     def _answer(self, prompt: str, unanswered: Aborted) -> str:
         """One line read from stdin after `prompt`; `unanswered` when stdin ends.
 
@@ -607,8 +615,6 @@ class Prompter:
                     f"`{part}` is not one of the {label.lower()} choices"
                 )
         return sorted(set(chosen))
-
-    # -- raw terminal ------------------------------------------------------
 
     def _byte(self, fd: int, *, wait: bool) -> bytes:
         if not wait and not select.select([fd], [], [], ESCAPE_SECONDS)[0]:

@@ -20,6 +20,7 @@ platform.
 import asyncio
 import ipaddress
 import json
+import logging
 import os
 import re
 import ssl
@@ -688,6 +689,17 @@ def _download_failure(status: int, raw: bytes) -> ServiceError:
     )
 
 
+# Every exchange, at DEBUG: method, URL, status or failure, and request id.
+# The SDK leaves it silent; `gf -v` shows it.
+REQUESTS = logging.getLogger("generalforecast.requests")
+
+
+def _logged(method: str, url: str, outcome: object, headers: Mapping[str, str]) -> None:
+    REQUESTS.debug(
+        "%s %s %s %s", method, url, outcome, headers.get("X-GF-Request-ID") or "-"
+    )
+
+
 @dataclass(frozen=True)
 class _Attempt:
     """One HTTP exchange to make before `end`, reading at most `limit` bytes."""
@@ -823,10 +835,12 @@ class _Policy:
             try:
                 status, raw = yield _Attempt(method, path, data, headers, end, limit)
             except ServiceError as error:
+                _logged(method, self.url + path, error.code, self._headers | headers)
                 if not self._retry(method, body, attempt, error):
                     raise
                 yield pause
                 continue
+            _logged(method, self.url + path, status, self._headers | headers)
             if status == 503 and self._retry(
                 method, body, attempt, _failure(status, _error_object(raw))
             ):

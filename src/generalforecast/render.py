@@ -25,6 +25,7 @@ from typing import Any
 
 from generalforecast import term
 from generalforecast.command_specs import ADMIN_PREDICTOR_NOUNS, ADMIN_SERVE_ACTIONS
+from generalforecast.errors import printable
 
 # Response fields whose values are credentials, whatever the endpoint.
 _SECRET_FIELD = re.compile(
@@ -110,6 +111,7 @@ def render(args: argparse.Namespace, result: Any, out: term.Output) -> None:
 
 
 def _scalar(value: Any) -> str:
+    """One value of a server's reply as a person reads it, with no terminal escapes."""
     if value is None:
         return "-"
     if isinstance(value, bool):
@@ -119,8 +121,8 @@ def _scalar(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:g}"
     if isinstance(value, (dict, list)):
-        return json.dumps(jsonable(value), ensure_ascii=False)
-    return str(value)
+        return printable(json.dumps(jsonable(value), ensure_ascii=False))
+    return printable(str(value))
 
 
 def generic(result: dict, out: term.Output) -> None:
@@ -133,7 +135,10 @@ def generic(result: dict, out: term.Output) -> None:
     ):
         records(lists[0][1], out)
         return
-    out.fields([(key, _scalar(value)) for key, value in result.items()], indent=0)
+    out.fields(
+        [(printable(str(key)), _scalar(value)) for key, value in result.items()],
+        indent=0,
+    )
 
 
 def records(
@@ -149,7 +154,7 @@ def records(
     rows = [[_scalar(item.get(key)) for key in keys] for item in items]
     out.table(
         rows,
-        header=[out.quiet_text(key, out.out) for key in keys],
+        header=[out.quiet_text(printable(str(key)), out.out) for key in keys],
         indent=0,
         stream=out.out,
     )
@@ -249,16 +254,15 @@ def _eval(args: argparse.Namespace, result: dict, out: term.Output) -> None:
 
 def _predict(args: argparse.Namespace, result: dict, out: term.Output) -> None:
     frame = result.get("predictions")
-    if args.output or frame is None:
+    if frame is None:
         return
-    text = frame.to_csv(index=False) if hasattr(frame, "to_csv") else ""
-    for line in text.rstrip("\n").split("\n"):
+    for line in frame.to_csv(index=False).rstrip("\n").split("\n"):
         out.line(line)
 
 
 def _logs(args: argparse.Namespace, result: dict, out: term.Output) -> None:
     for line in result.get("lines", []):
-        out.line(str(line))
+        out.line(printable(str(line)))
 
 
 def _serving(args: argparse.Namespace, result: dict, out: term.Output) -> None:

@@ -196,9 +196,6 @@ CASES: tuple[Case, ...] = (
 )
 
 
-# -- fixtures ---------------------------------------------------------------
-
-
 def _write_csv(path: Path, header: list[str], rows: list[list[Any]]) -> None:
     with path.open("w", newline="") as handle:
         writer = csv.writer(handle)
@@ -372,9 +369,6 @@ def _before_signup_source(predictor: dict) -> None:
     predictor["selection"].update(core=1000, neighbors=3000)
 
 
-# -- fakes ------------------------------------------------------------------
-
-
 class FakeTime:
     """`perf_counter` returns the scripted instants; `sleep` does nothing."""
 
@@ -481,6 +475,10 @@ class FakePredictor:
         inputs: Any = None,
     ) -> None:
         self.reference, self.env = reference, env
+
+    @classmethod
+    def local(cls, path: Any) -> FakePredictor:
+        return cls(str(path))
 
     def explain(self) -> Any:
         from generalforecast.predictors import ContextInfo, Resolution, SelectionInfo
@@ -730,9 +728,6 @@ def run_case(name: str, fixtures: Path, *, json: bool = False) -> None:
     sys.stderr.flush()
 
 
-# -- the pseudo-terminal ------------------------------------------------------
-
-
 def capture(case: Case, fixtures: Path) -> tuple[bytes, bytes | None]:
     """Runs one case under a pty; returns its bytes and the mid-prompt snapshot."""
     fd, slave = pty.openpty()
@@ -886,8 +881,6 @@ class Screen:
     def text(self) -> str:
         return "\n".join("".join(c for c, _ in line).rstrip() for line in self.rows())
 
-
-# -- rendering --------------------------------------------------------------
 
 _PALETTE = {
     "31": (255, 85, 85),

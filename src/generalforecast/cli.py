@@ -26,6 +26,7 @@ reply does. The exit code says how the command ended:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import re
 import sys
@@ -76,9 +77,6 @@ def version() -> str:
         return installed("generalforecast")
     except PackageNotFoundError:
         return "0.0.0"
-
-
-# -- parser ---------------------------------------------------------------
 
 
 class _Parser(argparse.ArgumentParser):
@@ -177,6 +175,14 @@ def _columns(text: str) -> list[str]:
     return [part.strip() for part in text.split(",") if part.strip()]
 
 
+def _port(text: str) -> int:
+    """A TCP port; anything else is a usage error."""
+    value = int(text)
+    if not 0 <= value <= 65535:
+        raise ValueError(text)
+    return value
+
+
 def _listen(p: argparse.ArgumentParser, *, port: int, what: str) -> None:
     """`--host` and `--port`: where a server listens."""
     p.add_argument(
@@ -187,7 +193,7 @@ def _listen(p: argparse.ArgumentParser, *, port: int, what: str) -> None:
     )
     p.add_argument(
         "--port",
-        type=int,
+        type=_port,
         default=port,
         metavar="<PORT>",
         help=f"The port {what} listens on (default: {port})",
@@ -272,7 +278,8 @@ def parser() -> _Parser:
             nargs="?",
             default=".",
             metavar=metavar,
-            help=what or "A predictor directory or a hosted name (default: .)",
+            help=what
+            or "A path to a predictor directory, or a hosted name (default: .)",
         )
 
     p = command("init")
@@ -387,8 +394,8 @@ def parser() -> _Parser:
     p = command("predict")
     reference(
         p,
-        what="A predictor directory, a served URL, a catalog model or a hosted name "
-        "(default: .)",
+        what="A path to a predictor directory, a served URL, a catalog model or a "
+        "hosted name (default: .)",
     )
     p.add_argument(
         "--queries", metavar="<FILE>", required=True, help="The rows to score"
@@ -611,9 +618,6 @@ def parser() -> _Parser:
     return root
 
 
-# -- help -----------------------------------------------------------------
-
-
 def root_help(out: term.Output) -> str:
     """`gf --help`: the three groups, the global options and the closing line."""
     width = max(len(name) for name in COMMANDS) + 3
@@ -764,9 +768,6 @@ def _find(
     return p
 
 
-# -- usage errors ---------------------------------------------------------
-
-
 def _choices(p: argparse.ArgumentParser) -> list[str]:
     subs = _subparsers(p)
     return sorted(subs.choices) if subs is not None else []
@@ -888,6 +889,7 @@ def _usage_problem(
             "int": "an integer",
             "float": "a number",
             "_columns": "comma-separated column names",
+            "_port": "a port from 0 to 65535",
         }.get(kind, kind)
         shown = value if re.fullmatch(r"[\w.,-]{1,40}", value) else "..."
         return (
@@ -904,9 +906,6 @@ def _usage_problem(
             usage_hint,
         )
     return message, None, usage_hint
-
-
-# -- errors ---------------------------------------------------------------
 
 
 def error_object(error: BaseException) -> dict[str, Any]:
@@ -1070,8 +1069,6 @@ def _unauthorized_hint(error: BaseException) -> str | None:
     return None
 
 
-# -- dispatch -------------------------------------------------------------
-
 # The command line being parsed, for the near-miss tips of usage errors.
 _ARGV: list[str] = []
 
@@ -1128,6 +1125,28 @@ def run(args: argparse.Namespace, root: _Parser, out: term.Output) -> dict | Non
     return predictors(args, out)
 
 
+class _Requests(logging.Handler):
+    """Writes each request the SDK sends as a quiet `-v` line."""
+
+    def __init__(self, out: term.Output) -> None:
+        super().__init__(logging.DEBUG)
+        self.out = out
+
+    def emit(self, record: logging.LogRecord) -> None:
+        from generalforecast.render import redact
+
+        self.out.debug(redact(record.getMessage()))
+
+
+def _show_requests(out: term.Output) -> None:
+    """Shows every request under `-v`: method, URL, status and request id."""
+    from generalforecast.transport import REQUESTS
+
+    REQUESTS.handlers = [_Requests(out)]
+    REQUESTS.setLevel(logging.DEBUG)
+    REQUESTS.propagate = False
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Runs one command; failures print in the error grammar and exit nonzero."""
     global _ARGV
@@ -1141,6 +1160,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         args = root.parse_args(_ARGV)
         json = args.json
         out = term.Output(quiet=args.json or args.quiet, verbose=args.verbose)
+        if args.verbose:
+            _show_requests(out)
         result = run(args, root, out)
         if result is not None:
             from generalforecast.render import emit, render
