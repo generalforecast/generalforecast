@@ -176,20 +176,23 @@ def nvidia_gpu_visible(devices: Sequence[str] = NVIDIA_DEVICES) -> bool:
 def report_fallback(
     err: IO[str] | None = None, *, devices: Sequence[str] = NVIDIA_DEVICES
 ) -> bool:
-    """Starts JAX's backend and warns once if an NVIDIA GPU is visible but the process runs on the CPU.
+    """Starts JAX's backend and warns once if CUDA failed to start, or an NVIDIA GPU is visible but the process runs on the CPU.
 
-    JAX logs its own line about that through `logging`, which prints it bare on
-    stderr when nothing configures logging. This holds that line back and writes
-    the CLI's `warning:` and `hint:` lines instead: install the `cuda` extra, or,
-    when CUDA is installed but failed to start, JAX's reason. Call it before the
-    first JAX call of the process, so the filter is in place when the backend
-    starts.
+    JAX logs its own line about either through `logging`, which prints it
+    bare on stderr when nothing configures logging. This holds that line back
+    and writes the CLI's `warning:` and `hint:` lines instead: install the
+    `cuda` extra, or, when CUDA is installed but failed to start, JAX's
+    reason. Call it before the first JAX call of the process, so the filter
+    is in place when the backend starts.
+
+    A `JAX_PLATFORMS` setting is a choice, not a fallback, so a GPU it leaves
+    unused draws no warning; but CUDA that was tried and failed always does,
+    whatever the setting and whether a device file shows, since the line
+    held back would otherwise say it nowhere.
 
     Args:
         err: Where to write; stderr if None.
         devices: The device files that show an NVIDIA GPU.
-
-    A `JAX_PLATFORMS` setting is a choice, not a fallback, so it draws no warning.
 
     Returns:
         Whether a warning was written.
@@ -197,21 +200,29 @@ def report_fallback(
     global _reported
     if _advice not in _BACKEND_LOGGER.filters:
         _BACKEND_LOGGER.addFilter(_advice)
-    if jax.default_backend() != "cpu" or _reported or not nvidia_gpu_visible(devices):
+    backend = jax.default_backend()
+    if _reported:
         return False
-    if os.environ.get("JAX_PLATFORMS", "").strip():
-        # The caller chose the platform, so the CPU is no fallback.
-        return False
-    _reported = True
-    out = term.Output(err=err)
-    out.warning("an NVIDIA GPU is present, but generalforecast runs on the CPU")
     failure = next(
         (text for text in _advice.held if "failed to initialize" in text), None
     )
     if failure is None:
+        chosen = bool(os.environ.get("JAX_PLATFORMS", "").strip())
+        if backend != "cpu" or chosen or not nvidia_gpu_visible(devices):
+            return False
+    _reported = True
+    out = term.Output(err=err)
+    if failure is None:
+        out.warning("an NVIDIA GPU is present, but generalforecast runs on the CPU")
         out.hint(f'install the cuda extra to use it: pip install "{CUDA_EXTRA}"')
-    else:
+        return True
+    if backend == "cpu" and nvidia_gpu_visible(devices):
+        out.warning("an NVIDIA GPU is present, but generalforecast runs on the CPU")
         out.hint(f"CUDA failed to start. {failure}")
+        return True
+    running = "the CPU" if backend == "cpu" else backend.upper()
+    out.warning(f"CUDA failed to start, so generalforecast runs on {running}")
+    out.hint(failure)
     return True
 
 
