@@ -80,7 +80,9 @@ use crate::budget::Charge;
 pub use crate::budget::RequestBudget;
 use crate::config::{Assign, PlacementConfig};
 use crate::definition::{CreationId, Durability, TableDefinition};
-use crate::error::{ServerError, exists};
+use crate::error::ServerError;
+/// The Flight status for a name taken, where the router finds it.
+pub use crate::error::exists;
 use crate::metrics::{Histogram, Metrics};
 use crate::name::TableName;
 use crate::partition;

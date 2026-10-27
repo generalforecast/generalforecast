@@ -225,15 +225,7 @@ impl Service {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-        let imbalance = |g: &[f64]| {
-            let mean = g.iter().sum::<f64>() / g.len() as f64;
-            if mean > 0.0 {
-                g.iter().cloned().fold(0.0, f64::max) / mean
-            } else {
-                1.0
-            }
-        };
-        let imbalance_before = imbalance(&shard_loads);
+        let imbalance_before = gf_assign::imbalance(&shard_loads);
         let mut round = Round {
             moved: Vec::new(),
             imbalance_before,
@@ -284,7 +276,7 @@ impl Service {
                 .map_or(*from, |&(_, _, to)| to);
             after[shard] += load.load;
         }
-        round.imbalance_after = imbalance(&after);
+        round.imbalance_after = gf_assign::imbalance(&after);
         round.seconds = started.elapsed().as_secs_f64();
         self.metrics
             .placement_imbalance
