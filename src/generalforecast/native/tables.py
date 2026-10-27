@@ -1040,10 +1040,13 @@ class Table(_Held[_NativeTable]):
         holds, so its ids start there; rows deleted before leave later ids
         held, which the engine refuses whole rather than overwrite, so the
         ids move past them, each move twice the last, until they are free.
+        A router writes a partitioned table's partitions one after another,
+        so a refusal there may follow rows already written, which ids moved
+        on would write twice; such a table refuses the rows instead.
 
         Raises:
-            InvalidInput: If no free run of ids is left below the integers
-                an id takes.
+            InvalidInput: If the ids collide on a partitioned table, or no
+                free run of ids is left below the integers an id takes.
         """
         count = len(inputs)
         move = max(count, self._next_id, 1)
@@ -1052,7 +1055,15 @@ class Table(_Held[_NativeTable]):
             with boundary():
                 try:
                     handle.insert(ids, inputs, targets, times)
-                except DuplicateKey:
+                except DuplicateKey as error:
+                    if self.ops.partitions > 1:
+                        raise InvalidInput(
+                            f"table {self.name} holds rows under the ids rows "
+                            f"without an id take ({error})",
+                            because="a partitioned table's partitions may have "
+                            "taken some of the rows before one refused them",
+                            hint="give the rows an id column with Schema(id=...)",
+                        ) from error
                     self._next_id += move
                     move *= 2
                     continue

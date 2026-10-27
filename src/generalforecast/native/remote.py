@@ -6,6 +6,7 @@
 import asyncio
 import contextlib
 import functools
+import inspect
 import ipaddress
 import json
 import re
@@ -16,7 +17,7 @@ import warnings
 from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
-from typing import Any, Concatenate, Self, override
+from typing import Any, Concatenate, Self, overload, override
 
 import numpy as np
 
@@ -75,8 +76,11 @@ def _errors() -> Iterator[None]:
 
 
 # How a server refuses a write adding a key it holds: gf-core's
-# `TableError::DuplicateKey`, which leaves the table unchanged.
-_DUPLICATE = re.compile(r"row key .+? already exists")
+# `TableError::DuplicateKey`, which leaves the table unchanged. The key is a
+# number or digest, or the key as given, quoted, once named.
+_DUPLICATE = re.compile(
+    r"row key (?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|\S+) already exists"
+)
 
 
 @contextlib.contextmanager
@@ -1047,33 +1051,52 @@ class RemoteClient:
 class _Awaited[**P, R]:
     """A coroutine method that runs the wrapped table's method of its name off the event loop.
 
-    Each takes its synchronous twin's arguments and docstring, so the two
-    cannot drift apart.
+    Each takes its synchronous twin's name, signature and docstring, the one
+    its interface documents, so the two cannot drift apart.
     """
 
     def __init__(self, method: Callable[Concatenate[Any, P], R]) -> None:
         """Wraps `method`, which the wrapped table has under the same name."""
-        self.__doc__ = method.__doc__
+        self.__doc__ = inspect.getdoc(method)
         self._name: str = getattr(method, "__name__", "")
+        signature = inspect.signature(method)
+        self.__signature__ = signature.replace(
+            parameters=list(signature.parameters.values())[1:]
+        )
 
     def __set_name__(self, owner: type, name: str) -> None:
         """Checks the method keeps its twin's name."""
         if name != self._name:
             raise TypeError(f"{owner.__name__}.{name} wraps {self._name!r}")
+        self._qualname = f"{owner.__qualname__}.{name}"
+
+    @overload
+    def __get__(self, instance: None, owner: type | None = None) -> Self: ...
+
+    @overload
+    def __get__(
+        self, instance: object, owner: type | None = None
+    ) -> Callable[P, Coroutine[Any, Any, R]]: ...
 
     def __get__(
-        self, instance: Any, owner: type | None = None
-    ) -> Callable[P, Coroutine[Any, Any, R]]:
-        """The coroutine method of a wrapping table."""
+        self, instance: object | None, owner: type | None = None
+    ) -> "Self | Callable[P, Coroutine[Any, Any, R]]":
+        """The coroutine method of a wrapping table, or this wrapper on its class."""
+        if instance is None:
+            return self
         name = self._name
+        table: Any = instance
 
         async def run(*arguments: P.args, **options: P.kwargs) -> R:
-            method = getattr(instance._table, name)
-            return await instance._client._run(
+            method = getattr(table._table, name)
+            return await table._client._run(
                 functools.partial(method, *arguments, **options)
             )
 
+        run.__name__, run.__qualname__ = name, self._qualname
         run.__doc__ = self.__doc__
+        # Functions take a signature through their attributes, as inspect reads it.
+        run.__dict__["__signature__"] = self.__signature__
         return run
 
 

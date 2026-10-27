@@ -5,7 +5,7 @@
 
 import json
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -603,6 +603,8 @@ def _calls(kind: type) -> set[str]:
 
 
 def test_async_tables_wrap_every_call_of_their_twins() -> None:
+    import inspect
+
     from generalforecast.native.remote import (
         AsyncRemoteSeriesTable,
         AsyncRemoteTable,
@@ -610,9 +612,21 @@ def test_async_tables_wrap_every_call_of_their_twins() -> None:
         RemoteTable,
     )
 
-    assert _calls(RemoteTable) <= set(dir(AsyncRemoteTable))
-    assert _calls(RemoteSeriesTable) <= set(dir(AsyncRemoteSeriesTable))
-    assert AsyncRemoteTable.predict.__doc__ == RemoteTable.predict.__doc__
+    for twin, wrapper in (
+        (RemoteTable, AsyncRemoteTable),
+        (RemoteSeriesTable, AsyncRemoteSeriesTable),
+    ):
+        assert _calls(twin) <= set(dir(wrapper))
+        for name in _calls(twin) & set(vars(wrapper)):
+            assert getattr(wrapper, name).__doc__ == inspect.getdoc(getattr(twin, name))
+            assert getattr(wrapper, name).__doc__
+    bound = AsyncRemoteTable.__dict__["predict"].__get__(object())
+    assert list(inspect.signature(bound).parameters) == [
+        "queries",
+        "before",
+        "quantiles",
+    ]
+    assert bound.__qualname__ == "AsyncRemoteTable.predict"
 
 
 def test_async_tables_run_their_twins_calls(catalog) -> None:
@@ -647,3 +661,30 @@ def test_async_tables_run_their_twins_calls(catalog) -> None:
 
     assert predicted.shape == (2, 2) and count == 15
     np.testing.assert_array_equal(predicted, again)
+
+
+def test_rows_without_ids_refuse_a_collision_on_a_partitioned_table() -> None:
+    from generalforecast.native.handles import DuplicateKey
+
+    class Refusing:
+        """A handle refusing every insert, as a partition holding the ids would."""
+
+        inserted = 0
+
+        def insert(self, *_: Any) -> None:
+            self.inserted += 1
+            raise DuplicateKey("row key 0 already exists")
+
+    table = engine.Table(
+        "split",
+        model="general-forecast/tabicl-v2-classifier",
+        target="y",
+        ops=engine.TableOptions(partitions=2),
+        download=False,
+    )
+    handle = Refusing()
+    with pytest.raises(InvalidInput, match="holds rows under the ids") as caught:
+        table._insert_unkeyed(cast(Any, handle), np.zeros((2, 1)), np.zeros(2), None)
+    # Ids moved on would write again the rows earlier partitions took.
+    assert handle.inserted == 1
+    assert caught.value.hint == "give the rows an id column with Schema(id=...)"
