@@ -420,8 +420,7 @@ impl Router {
                 self.read_action(table, &action).await?
             }
             FlightAction::CreateTable(definition) => {
-                self.write_action(&definition.name, &action, &parsed)
-                    .await?
+                self.create_table(&action, &parsed, definition).await?
             }
             FlightAction::Delete(DeleteAction { table, .. })
             | FlightAction::Truncate(table)

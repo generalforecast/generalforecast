@@ -63,9 +63,10 @@ impl Router {
     /// Refuses to make a table under a name a table already serves, whole
     /// or split into partitions of any count: the name would reach only one
     /// of them, and hide the other's rows. The nodes that are up say what
-    /// they hold, so a table made through another router since this one's
-    /// last check counts; with any node out of reach, what the router last
-    /// saw of it counts too.
+    /// they hold now, so a table made through another router since this
+    /// one's last check counts. With any node out of reach, what this router
+    /// saw counts too, and what each node out of reach held when it last
+    /// answered, which a check keeps until the node answers again.
     async fn refuse_taken(&self, table: &str) -> Result<(), Status> {
         let serves = |name: &str| {
             name == table || partitions::parse(name).is_some_and(|(owner, _, _)| owner == table)
@@ -89,7 +90,9 @@ impl Router {
             .any(|name| serves(&name));
         let seen = !everyone && {
             let copies = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
-            copies.contains(table) || !copies.partition_counts(table).is_empty()
+            copies.contains(table)
+                || !copies.partition_counts(table).is_empty()
+                || copies.held_out_of_reach(table)
         };
         if held || seen {
             return Err(exists(format!("table {table:?} exists")));
@@ -98,7 +101,8 @@ impl Router {
     }
 
     /// Drops every partition of a partitioned table, of every count its
-    /// partitions name; None for a table not split.
+    /// partitions name; None for a table not split. `NOT_FOUND`, as for a
+    /// whole table, when no partition was left to drop.
     async fn drop_partitioned(&self, table: &str) -> Result<Option<Vec<Value>>, Status> {
         let counts = self
             .copies
@@ -108,13 +112,14 @@ impl Router {
         if counts.is_empty() {
             return Ok(None);
         }
+        let mut dropped = false;
         for count in counts {
             for index in 0..count {
                 match self
                     .drop_table(&partitions::name(table, index, count))
                     .await
                 {
-                    Ok(_) => {}
+                    Ok(_) => dropped = true,
                     Err(status) if status.code() == Code::NotFound => {}
                     Err(status) => return Err(status),
                 }
@@ -124,97 +129,107 @@ impl Router {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(table);
+        if !dropped {
+            return Err(Status::not_found(format!("table {table:?} does not exist")));
+        }
         Ok(Some(vec![json!({})]))
     }
 
-    /// Answers an action on a partitioned table, or a create that splits
-    /// one; None for any other action.
+    /// Makes a table, whole or split into `partitions`, once no table holds
+    /// its name.
+    pub(super) async fn create_table(
+        &self,
+        action: &Action,
+        parsed: &FlightAction,
+        definition: &TableDefinition,
+    ) -> Result<Vec<Value>, Status> {
+        let name = definition.name.as_str();
+        if name.contains(partitions::MARK) {
+            return Err(Status::invalid_argument(format!(
+                "table names may not hold {:?}, which names partitions",
+                partitions::MARK
+            )));
+        }
+        let body: Value = serde_json::from_slice(&action.body).unwrap_or(Value::Null);
+        let count = match body.get("partitions") {
+            None | Some(Value::Null) => None,
+            Some(count) => Some(
+                count
+                    .as_u64()
+                    .and_then(|count| usize::try_from(count).ok())
+                    .filter(|count| (1..=partitions::MOST).contains(count))
+                    .ok_or_else(|| {
+                        Status::invalid_argument(format!(
+                            "partitions must be 1 to {}",
+                            partitions::MOST
+                        ))
+                    })?,
+            ),
+        };
+        // A table without partitions is one partition, which a route
+        // with bounds cannot fit.
+        if let Some(route) = &definition.route_by
+            && route.kind == RouteKind::Ordered
+            && route.bounds.len() + 1 != count.unwrap_or(1)
+        {
+            return Err(Status::invalid_argument(format!(
+                "an ordered route's bounds cut {} partitions, not {}",
+                route.bounds.len() + 1,
+                count.unwrap_or(1)
+            )));
+        }
+        // A routed table's partitions answer their own queries as whole
+        // tables do, so they keep the settings a gathered context cannot.
+        let gathered = count.is_some_and(|count| count > 1) && definition.route_by.is_none();
+        // Each partition would cut its own context to the length, so the
+        // context gathered from them all would pass it again. An adaptive
+        // strategy is resolved within the length for the table as a whole,
+        // so there is nothing for the partitions to cut.
+        let adaptive = body.pointer("/strategy/kind").and_then(Value::as_str) == Some("adaptive");
+        if gathered && !adaptive && body.get("past_cap").and_then(Value::as_str) == Some("clamp") {
+            return Err(Status::invalid_argument(
+                "past_cap = \"clamp\" needs a table of one partition or a route",
+            ));
+        }
+        // A partitioned table gathers each prediction's context anew.
+        if gathered
+            && body
+                .get("regions")
+                .is_some_and(|regions| !regions.is_null())
+        {
+            return Err(Status::invalid_argument(
+                "regions need a table of one partition or a route",
+            ));
+        }
+        // Nor does it know rows' times when it gathers them.
+        let windowed = ["among", "recency"].into_iter().any(|field| {
+            body.pointer(&format!("/strategy/{field}"))
+                .is_some_and(|value| !value.is_null())
+        });
+        if gathered && windowed {
+            return Err(Status::invalid_argument(
+                "among and recency need a table of one partition or a route",
+            ));
+        }
+        // Held until the table is made, so a second create of the name
+        // through this router finds it taken.
+        let _creating = self.creating(name).await;
+        self.refuse_taken(name).await?;
+        match count {
+            None => self.write_action(name, action, parsed).await,
+            Some(count) => self.create_partitioned(definition, body, count).await,
+        }
+    }
+
+    /// Answers an action on a partitioned table; None for any other action,
+    /// and for a create, which `create_table` answers.
     pub(super) async fn act_partitioned(
         &self,
         action: &Action,
         parsed: &FlightAction,
     ) -> Result<Option<Vec<Value>>, Status> {
-        if let FlightAction::CreateTable(definition) = parsed {
-            let name = definition.name.as_str();
-            if name.contains(partitions::MARK) {
-                return Err(Status::invalid_argument(format!(
-                    "table names may not hold {:?}, which names partitions",
-                    partitions::MARK
-                )));
-            }
-            let body: Value = serde_json::from_slice(&action.body).unwrap_or(Value::Null);
-            let count = match body.get("partitions") {
-                None | Some(Value::Null) => None,
-                Some(count) => Some(
-                    count
-                        .as_u64()
-                        .and_then(|count| usize::try_from(count).ok())
-                        .filter(|count| (1..=partitions::MOST).contains(count))
-                        .ok_or_else(|| {
-                            Status::invalid_argument(format!(
-                                "partitions must be 1 to {}",
-                                partitions::MOST
-                            ))
-                        })?,
-                ),
-            };
-            // A table without partitions is one partition, which a route
-            // with bounds cannot fit.
-            if let Some(route) = &definition.route_by
-                && route.kind == RouteKind::Ordered
-                && route.bounds.len() + 1 != count.unwrap_or(1)
-            {
-                return Err(Status::invalid_argument(format!(
-                    "an ordered route's bounds cut {} partitions, not {}",
-                    route.bounds.len() + 1,
-                    count.unwrap_or(1)
-                )));
-            }
-            self.refuse_taken(name).await?;
-            let Some(count) = count else {
-                return Ok(None);
-            };
-            // A routed table's partitions answer their own queries as whole
-            // tables do, so they keep the settings a gathered context cannot.
-            let gathered = count > 1 && definition.route_by.is_none();
-            // Each partition would cut its own context to the length, so the
-            // context gathered from them all would pass it again. An adaptive
-            // strategy is resolved within the length for the table as a whole,
-            // so there is nothing for the partitions to cut.
-            let adaptive =
-                body.pointer("/strategy/kind").and_then(Value::as_str) == Some("adaptive");
-            if gathered
-                && !adaptive
-                && body.get("past_cap").and_then(Value::as_str) == Some("clamp")
-            {
-                return Err(Status::invalid_argument(
-                    "past_cap = \"clamp\" needs a table of one partition or a route",
-                ));
-            }
-            // A partitioned table gathers each prediction's context anew.
-            if gathered
-                && body
-                    .get("regions")
-                    .is_some_and(|regions| !regions.is_null())
-            {
-                return Err(Status::invalid_argument(
-                    "regions need a table of one partition or a route",
-                ));
-            }
-            // Nor does it know rows' times when it gathers them.
-            let windowed = ["among", "recency"].into_iter().any(|field| {
-                body.pointer(&format!("/strategy/{field}"))
-                    .is_some_and(|value| !value.is_null())
-            });
-            if gathered && windowed {
-                return Err(Status::invalid_argument(
-                    "among and recency need a table of one partition or a route",
-                ));
-            }
-            return self
-                .create_partitioned(definition, body, count)
-                .await
-                .map(Some);
+        if matches!(parsed, FlightAction::CreateTable(_)) {
+            return Ok(None);
         }
         let Some(table) = parsed.table() else {
             return Ok(None);
@@ -296,7 +311,7 @@ impl Router {
                 // As at creation: partitions each cut their own context to
                 // the length, so only an adaptive strategy, resolved within
                 // it for the table as a whole, gathers under a clamp.
-                let definition = self.definition_of(table, count).await?;
+                let definition = self.described(table, count).await?;
                 if definition.route_by.is_none()
                     && definition.past_cap == PastCapSpec::Clamp
                     && !matches!(strategy, StrategySpec::Adaptive)
@@ -380,10 +395,11 @@ impl Router {
     }
 
     /// A partitioned table's definition, as its first partition describes
-    /// it. A definition changes only by a write to every partition, which
-    /// moves the first partition's copy on, so one kept from a copy that has
-    /// not moved since is current; one changed through another router is
-    /// known here by this one's next check.
+    /// it, kept for predictions to assemble by. A definition changes only by
+    /// a write to every partition, which moves the first partition's copy
+    /// on, so one kept from a copy that has not moved since is current; one
+    /// changed through another router is known here by this one's next
+    /// check. What decides where rows go reads `described` instead.
     pub(super) async fn definition_of(
         &self,
         table: &str,
@@ -401,6 +417,22 @@ impl Router {
         {
             return Ok(definition.clone());
         }
+        self.described(table, count).await
+    }
+
+    /// A partitioned table's definition as its first partition describes it
+    /// now, kept for `definition_of`. A route read from a router's view
+    /// could be another table's: one dropped and made again through another
+    /// router, with the same partition count, before this one's next check.
+    pub(super) async fn described(
+        &self,
+        table: &str,
+        count: usize,
+    ) -> Result<TableDefinition, Status> {
+        let name = partitions::name(table, 0, count);
+        // The copy the description is read at, taken first: one taken after
+        // could be a later write's, past the definition read.
+        let version = current(&self.kept(&self.cluster(), &name)).cloned();
         let described = self
             .read_action(&name, &action("describe", &json!({"table": name})))
             .await?;
@@ -469,13 +501,15 @@ impl Router {
         Ok(whole)
     }
 
-    /// The column a partitioned table's rows and queries are routed by, if any.
+    /// The column a partitioned table's rows and queries are routed by, if
+    /// any, as its first partition says now: a stale route would send rows
+    /// and queries to partitions that do not hold them.
     pub(super) async fn route_of(
         &self,
         table: &str,
         count: usize,
     ) -> Result<Option<RouteBy>, Status> {
-        Ok(self.definition_of(table, count).await?.route_by)
+        Ok(self.described(table, count).await?.route_by)
     }
 
     /// Splits a write to a partitioned table by its keys' partitions, or by
