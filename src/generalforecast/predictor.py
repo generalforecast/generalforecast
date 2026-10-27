@@ -326,12 +326,16 @@ class PredictRequest:
             "queries": _records(self.queries),
             "inputs": list(self.inputs),
         }
-        for key in ("id", "time", "frequency", "horizon", "as_of"):
+        for key in ("id", "time", "frequency", "horizon"):
             value = getattr(self, key)
             if value is not None:
                 payload[key] = (
                     value if not hasattr(value, "isoformat") else value.isoformat()
                 )
+        if self.as_of is not None:
+            from generalforecast.contracts import format_as_of, parse_as_of
+
+            payload["as_of"] = format_as_of(parse_as_of(self.as_of))
         if self.series:
             payload["series"] = list(self.series)
         if self.quantiles is not None:
@@ -351,9 +355,10 @@ class PredictRequest:
         if context is not None:
             payload["context"] = _records(tabular.frame(context))
         if as_of is not None:
-            payload["as_of"] = (
-                as_of if not hasattr(as_of, "isoformat") else as_of.isoformat()
-            )
+            from generalforecast.contracts import format_as_of, parse_as_of
+
+            # Checked here as every server checks it, and sent in RFC 3339.
+            payload["as_of"] = format_as_of(parse_as_of(as_of))
         return payload
 
 
@@ -1097,6 +1102,14 @@ class Predictor:
         if self._kind in ("local", "catalog") and not (
             self._kind == "local" and self._context_kind == "live"
         ):
+            if (as_of if as_of is not None else self._as_of) is not None:
+                # As gf serve and hosted serving refuse it: only a live
+                # context changes over time.
+                kind = self._context_kind if self._kind == "local" else "request"
+                raise InvalidInput(
+                    f"as_of reads a live context; this predictor's is a {kind} context",
+                    param="as_of",
+                )
             request = self.request(queries, context, as_of=as_of)
             with boundary():
                 return run_local(request, download=self._download)

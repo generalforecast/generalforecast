@@ -4,6 +4,7 @@
 """Shared immutable surface values and ports, not a second control plane."""
 
 import datetime
+import re
 from dataclasses import MISSING, asdict, dataclass, is_dataclass, replace
 from dataclasses import fields as dataclass_fields
 from typing import Any, Self
@@ -262,26 +263,102 @@ class PromoteRequest(WireValue):
         integer(self.expected_generation, 0)
 
 
+# An RFC 3339 date-time; the offset is optional, and a time without one is UTC.
+_RFC3339 = re.compile(
+    r"\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}(\.\d{1,9})?([Zz]|[+-]\d{2}:\d{2})?"
+)
+# The latest instant an `as_of` may name, in UTC seconds (year 33658).
+_LATEST = 1e12
+
+
+def parse_as_of(value: Any) -> float | None:
+    """A request's `as_of` in UTC seconds: the one reading every surface applies.
+
+    gf-server, `gf serve`, the SDK and a hosted plane accept the same
+    values: an RFC 3339 date-time, `2026-10-27T08:00:00Z`, whose offset is
+    optional (a time without one is UTC), or a number of seconds since the
+    epoch. None is no `as_of`.
+
+    Raises:
+        ServiceError: A 422 `ValidationError` with `param="as_of"` for
+            anything else: a date alone, `yesterday`, a boolean, a negative
+            or non-finite number, or a time past year 33658.
+    """
+    from generalforecast.service.contracts import ServiceError
+
+    def refused() -> ServiceError:
+        return ServiceError(
+            "ValidationError",
+            "as_of must be an RFC 3339 time or epoch seconds",
+            422,
+            param="as_of",
+            hint="pass 2026-10-27T08:00:00Z, or seconds since 1970 in UTC",
+        )
+
+    if value is None:
+        return None
+    if isinstance(value, datetime.datetime):
+        moment = value
+    elif type(value) in (int, float):
+        if not 0 <= value < _LATEST:
+            raise refused()
+        return float(value)
+    elif type(value) is str and _RFC3339.fullmatch(value.strip()):
+        text = value.strip().replace("z", "Z").replace("t", "T")
+        # Python reads at most microseconds; RFC 3339 allows more digits.
+        text = re.sub(r"(\.\d{6})\d+", r"\1", text)
+        try:
+            moment = datetime.datetime.fromisoformat(text)
+        except ValueError:
+            raise refused() from None
+    else:
+        raise refused()
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=datetime.UTC)
+    seconds = moment.timestamp()
+    if not 0 <= seconds < _LATEST:
+        raise refused()
+    return seconds
+
+
+def format_as_of(seconds: float | None) -> str | None:
+    """An `as_of` as every reply carries it: RFC 3339 in UTC, `2026-10-27T08:00:00Z`.
+
+    Whole seconds print without a fraction; anything finer prints to the
+    microsecond. None stays None.
+    """
+    if seconds is None:
+        return None
+    moment = datetime.datetime.fromtimestamp(seconds, datetime.UTC)
+    spec = "seconds" if moment.microsecond == 0 else "microseconds"
+    return moment.replace(tzinfo=None).isoformat(timespec=spec) + "Z"
+
+
 @dataclass(frozen=True)
 class ContextVersion(WireValue):
     """The actual context observed by inference, not an accepted-write promise.
 
     Attributes:
         source: The context's kind: `snapshot`, `live` or `request`.
-        name: A live context's name; None for the other kinds.
-        version: A snapshot's digest, or a live context's sequence.
+        version: A live context's sequence; None for the other kinds.
         rows: The context rows inference read.
-        as_of: The time a live context was read as of, in UTC seconds.
+        as_of: When the context was read, in UTC seconds.
+        name: A live context's name; None for the other kinds.
+        digest: A snapshot's rows digest; None for the other kinds.
 
-    The wire form is `{source, name, version, rows, as_of}`. gf-server
-    refreshes a published revision whose context `source` is `live`.
+    The wire form, every prediction reply's `context` on `gf serve` and
+    hosted serving alike, is `{source, name, version, digest, rows,
+    as_of}`, `as_of` an RFC 3339 UTC time (`format_as_of`) or null.
+    gf-server refreshes a published revision whose context `source` is
+    `live`.
     """
 
     source: str
-    version: str | int | None = None
+    version: int | None = None
     rows: int | None = None
     as_of: float | None = None
     name: str | None = None
+    digest: str | None = None
 
     def __post_init__(self):
         """Checks version metadata without fetching a live context."""
@@ -293,46 +370,62 @@ class ContextVersion(WireValue):
         if self.name is not None:
             name(self.name)
         if self.version is not None:
-            ensure(type(self.version) in (int, str), "invalid context version")
+            ensure(
+                self.source == "live"
+                and type(self.version) is int
+                and self.version >= 0,
+                "a live context's version is its sequence",
+            )
+        if self.digest is not None:
+            ensure(self.source == "snapshot", "only a snapshot context has a digest")
+            hash_value(self.digest)
         if self.rows is not None:
             integer(self.rows, 0)
         if self.as_of is not None:
             ensure(
-                type(self.as_of) in (int, float) and 0 <= self.as_of < 1e12,
+                type(self.as_of) in (int, float) and 0 <= self.as_of < _LATEST,
                 "invalid context time",
             )
 
+    def to_dict(self) -> dict:
+        """The wire form: every key, `as_of` in RFC 3339."""
+        return {
+            "source": self.source,
+            "name": self.name,
+            "version": self.version,
+            "digest": self.digest,
+            "rows": self.rows,
+            "as_of": format_as_of(self.as_of),
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "ContextVersion":
+        """Reads the wire form; `as_of` may be RFC 3339 or epoch seconds."""
+        body = dict(
+            fields(value, {"source"}, {"name", "version", "digest", "rows", "as_of"})
+        )
+        body["as_of"] = parse_as_of(body.get("as_of"))
+        return cls(**body)
+
 
 def context_version(value: dict) -> ContextVersion:
-    """Decodes a context as the SDK or the predictor API describes it.
+    """Decodes a reply's or a stored record's context, in its current or an earlier form.
 
-    The predictor API sends `{kind, rows, digest?, name?, as_of?}`; the kind
-    is the source and the digest is the version. A source spelled
-    `live/<name>`, as hosted serving wrote it before the name had its own
-    key, reads as a live source and its name.
+    The current form is `ContextVersion.to_dict`'s. Earlier ones still read,
+    so stored records keep decoding: gf-server's `{kind, rows, digest,
+    as_of}`, a `version` holding a snapshot's digest, and a source spelled
+    `live/<name>`.
     """
-    if type(value) is dict and "kind" in value and "source" not in value:
+    ensure(type(value) is dict, "a context is an object")
+    if "kind" in value and "source" not in value:
         body = dict(fields(value, {"kind"}, {"rows", "digest", "as_of", "name"}))
-        as_of = body.get("as_of")
-        if isinstance(as_of, str):
-            as_of = datetime.datetime.fromisoformat(as_of).timestamp()
-        return ContextVersion(
-            source=body["kind"],
-            version=body.get("digest"),
-            rows=body.get("rows"),
-            as_of=as_of,
-            name=body.get("name"),
-        )
-    if (
-        type(value) is dict
-        and type(value.get("source")) is str
-        and value["source"].startswith("live/")
-    ):
-        value = {
-            **value,
-            "source": "live",
-            "name": value["source"].removeprefix("live/"),
-        }
+        value = {"source": body.pop("kind"), **body}
+    value = dict(value)
+    source = value.get("source")
+    if type(source) is str and source.startswith("live/"):
+        value["source"], value["name"] = "live", source.removeprefix("live/")
+    if type(value.get("version")) is str and "digest" not in value:
+        value["digest"] = value.pop("version")
     return ContextVersion.from_dict(value)
 
 
@@ -343,8 +436,9 @@ class PredictionRequest(WireValue):
     Attributes:
         queries: The rows to score.
         context: A request context's rows; None for a snapshot or live context.
-        as_of: For a live context, the time to read it as of: an ISO 8601
-            timestamp or UTC seconds. Every surface honours it or refuses it.
+        as_of: For a live context, the time to read it as of: an RFC 3339
+            time or epoch seconds (`parse_as_of`). Every surface honours it
+            or refuses it.
     """
 
     queries: tuple[dict, ...]
@@ -365,18 +459,7 @@ class PredictionRequest(WireValue):
                 and all(type(row) is dict for row in self.context),
                 "context must be a list of rows",
             )
-        if isinstance(self.as_of, str):
-            try:
-                datetime.datetime.fromisoformat(self.as_of)
-            except ValueError:
-                raise PredictorError(
-                    "ValidationError", "as_of must be an ISO 8601 time"
-                ) from None
-        elif self.as_of is not None:
-            ensure(
-                type(self.as_of) in (int, float) and 0 <= self.as_of < 1e12,
-                "as_of must be an ISO 8601 time or UTC seconds",
-            )
+        parse_as_of(self.as_of)
 
     @classmethod
     def from_dict(cls, value: dict) -> "PredictionRequest":

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import math
 from pathlib import Path
 from typing import Any, cast
@@ -250,10 +251,15 @@ def test_requests_name_columns_and_classes_in_their_errors() -> None:
         and payload["id"] == "customer_id"
     )
     assert "task" not in payload and "options" not in payload
-    assert PredictRequest.declared_payload([{"x": 1}], as_of="2025-01-01") == {
-        "queries": [{"x": 1}],
-        "as_of": "2025-01-01",
-    }
+    # as_of goes out in RFC 3339 UTC however it is given (contract C1).
+    naive = dt.datetime(2025, 1, 1)  # noqa: DTZ001 (a naive time is UTC)
+    for given in ("2025-01-01T01:00:00+01:00", 1735689600, naive):
+        assert PredictRequest.declared_payload([{"x": 1}], as_of=given) == {
+            "queries": [{"x": 1}],
+            "as_of": "2025-01-01T00:00:00Z",
+        }
+    with pytest.raises(gf.InvalidInput):
+        PredictRequest.declared_payload([{"x": 1}], as_of="2025-01-01")
     with pytest.raises(gf.CapacityExceeded) as caught:
         PredictRequest.build(
             model=MODEL,

@@ -388,19 +388,66 @@ def test_live_contexts_bind_through_the_one_served_context(tmp_path, monkeypatch
 
 
 def test_context_versions_name_a_live_context_apart_from_its_kind():
-    version = ContextVersion("live", 3, 10, name="events")
+    version = ContextVersion("live", 3, 10, 1761552000.0, name="events")
     assert version.to_dict() == {
         "source": "live",
-        "version": 3,
-        "rows": 10,
-        "as_of": None,
         "name": "events",
+        "version": 3,
+        "digest": None,
+        "rows": 10,
+        "as_of": "2025-10-27T08:00:00Z",
     }
+    assert ContextVersion.from_dict(version.to_dict()) == version
     assert context_version({"source": "live/events", "version": 3}) == ContextVersion(
         "live", 3, name="events"
     )
     with pytest.raises(PredictorError):
         ContextVersion("live/events")
+    digest = "sha256:" + "a" * 64
+    # Earlier forms still decode: gf-server's {kind, digest} and a digest
+    # held as a snapshot's version.
+    for earlier in (
+        {"kind": "snapshot", "rows": 4, "digest": digest, "as_of": 1761552000},
+        {"source": "snapshot", "version": digest, "rows": 4, "as_of": 1761552000},
+    ):
+        assert context_version(earlier) == ContextVersion(
+            "snapshot", rows=4, as_of=1761552000.0, digest=digest
+        )
+
+
+def test_as_of_reads_one_way_on_every_surface():
+    from generalforecast.contracts import format_as_of, parse_as_of
+    from generalforecast.service.contracts import ServiceError
+
+    stamp = 1761552000.0
+    for value in (
+        "2025-10-27T08:00:00Z",
+        "2025-10-27T08:00:00",
+        "2025-10-27 01:00:00-07:00",
+        "2025-10-27t08:00:00.000000000z",
+        datetime.datetime(2025, 10, 27, 8),  # noqa: DTZ001 (a naive time is UTC)
+        stamp,
+        int(stamp),
+    ):
+        assert parse_as_of(value) == stamp, value
+    assert parse_as_of(None) is None
+    for bad in (
+        "yesterday",
+        "2025-10-27",
+        "2025-10-27T08:00",
+        True,
+        -1,
+        float("nan"),
+        1e13,
+    ):
+        with pytest.raises(ServiceError) as caught:
+            parse_as_of(bad)
+        assert (caught.value.status, caught.value.param) == (422, "as_of")
+    assert format_as_of(stamp) == "2025-10-27T08:00:00Z"
+    assert format_as_of(stamp + 0.25) == "2025-10-27T08:00:00.250000Z"
+    assert format_as_of(None) is None
+    with pytest.raises(ServiceError):
+        PredictionRequest.from_dict({"queries": [{"x": 1}], "as_of": "yesterday"})
 
 
 def test_prediction_requests_carry_as_of():
@@ -409,7 +456,9 @@ def test_prediction_requests_carry_as_of():
     )
     assert request.as_of == "2025-01-01T00:00:00Z"
     assert request.to_dict() == {"queries": [{"x": 1}], "as_of": "2025-01-01T00:00:00Z"}
-    with pytest.raises(PredictorError):
+    from generalforecast.service.contracts import ServiceError
+
+    with pytest.raises(ServiceError):
         PredictionRequest.from_dict({"queries": [{"x": 1}], "as_of": "soon"})
 
 
