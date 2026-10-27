@@ -3,10 +3,22 @@
 
 """Estimator errors as both `gf.Error` and the builtin errors sklearn's tools look for."""
 
+import numpy as np
 import pytest
+from sklearn.utils.validation import check_array, check_scalar
 
-from generalforecast.errors import Error, InvalidInput
+from generalforecast.errors import InvalidInput
 from generalforecast.native.sklearn_shim import NotFittedError, public
+
+
+@public
+def _validating(rows: object) -> None:
+    check_array(rows)
+
+
+@public
+def _checking(value: object) -> None:
+    check_scalar(value, "horizon", int)
 
 
 @public
@@ -14,18 +26,28 @@ def _raising(error: Exception) -> None:
     raise error
 
 
-@pytest.mark.parametrize("builtin", [ValueError, TypeError])
-def test_refused_input_reads_as_the_builtin_error_it_came_from(builtin) -> None:
-    with pytest.raises(builtin, match=r"^X has 4 features, but") as caught:
-        _raising(builtin("X has 4 features, but Classifier is expecting 5"))
+def test_input_sklearn_refuses_with_a_value_error_reads_as_one() -> None:
+    with pytest.raises(ValueError, match=r"^Expected 2D array") as caught:
+        _validating(np.arange(3.0))
 
     assert isinstance(caught.value, InvalidInput)
-    assert caught.value.message == "x has 4 features, but Classifier is expecting 5"
+    assert caught.value.message.startswith("expected 2D array")
 
 
-def test_a_not_fitted_error_stays_one_and_others_stay_gf_errors() -> None:
+def test_input_sklearn_refuses_with_a_type_error_reads_as_one() -> None:
+    with pytest.raises(TypeError, match=r"^horizon must be an instance of") as caught:
+        _checking(1.5)
+
+    assert isinstance(caught.value, InvalidInput)
+
+
+def test_a_not_fitted_error_stays_one() -> None:
     with pytest.raises(NotFittedError):
         _raising(NotFittedError("call fit first"))
-    with pytest.raises(Error) as caught:
+
+
+def test_an_error_the_engine_did_not_raise_stays_itself() -> None:
+    with pytest.raises(KeyError) as caught:
         _raising(KeyError("table 'x' does not exist"))
-    assert not isinstance(caught.value, ValueError | TypeError)
+
+    assert not isinstance(caught.value, InvalidInput)
