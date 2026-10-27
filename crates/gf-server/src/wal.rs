@@ -922,6 +922,11 @@ impl EncryptionKey {
     /// message sealed under it, as hex.
     #[must_use]
     pub fn id(&self) -> String {
+        crate::setup::hex(&self.id_bytes())
+    }
+
+    /// The key's id, as a log's header names it.
+    fn id_bytes(&self) -> [u8; KEY_ID] {
         let tag = XChaCha20Poly1305::new(&self.0)
             .encrypt(
                 XNonce::from_slice(&[0; NONCE]),
@@ -932,18 +937,8 @@ impl EncryptionKey {
             )
             .expect("sealing an empty message cannot fail");
         tag[..KEY_ID]
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect()
-    }
-
-    fn id_bytes(&self) -> [u8; KEY_ID] {
-        let id = self.id();
-        let mut bytes = [0; KEY_ID];
-        for (byte, pair) in bytes.iter_mut().zip(id.as_bytes().chunks(2)) {
-            *byte = u8::from_str_radix(std::str::from_utf8(pair).expect("hex"), 16).expect("hex");
-        }
-        bytes
+            .try_into()
+            .expect("a tag is longer than an id")
     }
 }
 
@@ -1151,11 +1146,12 @@ fn definition_frame(
     ))
 }
 
-fn file_header(key: &EncryptionKey) -> [u8; HEADER] {
+/// A log file's plain header, naming the key its records are sealed under.
+fn file_header(key_id: &[u8; KEY_ID]) -> [u8; HEADER] {
     let mut header = [0; HEADER];
     header[..MAGIC.len()].copy_from_slice(MAGIC);
     header[MAGIC.len()] = FORMAT;
-    header[MAGIC.len() + 2..].copy_from_slice(&key.id_bytes());
+    header[MAGIC.len() + 2..].copy_from_slice(key_id);
     header
 }
 
@@ -1204,7 +1200,7 @@ impl Log {
             .map_err(LogError::from)
             .and_then(|()| log.seal(&definition_frame(definition, 1, &log.terms)?, 0))
             .and_then(|bytes| {
-                log.file.write_all(&file_header(key))?;
+                log.file.write_all(&file_header(&log.key_id))?;
                 log.file.write_all(&bytes)?;
                 log.file.sync_data()?;
                 sync_directory(path)?;
@@ -1347,10 +1343,36 @@ impl Log {
     /// The creation id entry `sequence` is sealed with: none for the
     /// definition, which names the creation itself.
     fn sealed_creation(&self, sequence: u64) -> &str {
-        match &self.created {
-            Some(created) if sequence != 0 => created.as_str(),
-            _ => "",
-        }
+        sealed_creation(self.created.as_ref(), sequence)
+    }
+
+    /// The entry between `start` and `end` in the file, as sealed, with its
+    /// length prefix.
+    fn sealed_at(&self, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
+        let mut sealed = vec![0u8; usize::try_from(end - start).expect("an entry fits in memory")];
+        self.file.read_exact_at(&mut sealed, start)?;
+        Ok(sealed)
+    }
+
+    /// Opens entry `sequence`, sealed after `previous` and found at
+    /// `offset`, under the key the log's records are sealed with; `sealed`
+    /// is its nonce and ciphertext.
+    fn open_sealed(
+        &self,
+        sealed: &[u8],
+        sequence: u64,
+        previous: &[u8; TAG],
+        offset: u64,
+    ) -> Result<Vec<u8>, LogError> {
+        open_entry(
+            &self.reader,
+            &self.table,
+            self.sealed_creation(sequence),
+            sealed,
+            sequence,
+            previous,
+            offset,
+        )
     }
 
     /// Who takes the table's writes, as its records last said.
@@ -1412,10 +1434,7 @@ impl Log {
         let mut entries = Vec::new();
         let mut previous = [0; TAG];
         if first > 0 {
-            let before = self.offsets[first - 1]..self.offsets[first];
-            let mut sealed = vec![0u8; usize::try_from(before.end - before.start).expect("fits")];
-            self.file.read_exact_at(&mut sealed, before.start)?;
-            previous = tag_of(&sealed[PREFIX..]);
+            previous = tag_of(&self.sealed_at(self.offsets[first - 1], self.offsets[first])?);
         }
         let synced = &self.offsets[..self.durable];
         let mut read = 0usize;
@@ -1426,21 +1445,9 @@ impl Log {
             }
             read += size;
             let sequence = self.sequence(index);
-            let mut sealed = vec![0u8; size];
-            self.file.read_exact_at(&mut sealed, window[0])?;
-            let (nonce, ciphertext) = sealed[PREFIX..].split_at(NONCE);
-            let created = self.sealed_creation(sequence);
-            let plain = self
-                .reader
-                .decrypt(
-                    XNonce::from_slice(nonce),
-                    Payload {
-                        msg: ciphertext,
-                        aad: &associated(&self.table, created, sequence, &previous),
-                    },
-                )
-                .map_err(|_| LogError::Decrypt { offset: window[0] })?;
-            previous = tag_of(&sealed[PREFIX..]);
+            let sealed = self.sealed_at(window[0], window[1])?;
+            let plain = self.open_sealed(&sealed[PREFIX..], sequence, &previous, window[0])?;
+            previous = tag_of(&sealed);
             entries.push((sequence, plain));
         }
         Ok(entries)
@@ -1624,25 +1631,13 @@ impl Log {
             .truncate(true)
             .write(true)
             .open(&staged)?;
-        file.write_all(&self.key_header())?;
+        file.write_all(&file_header(&self.key_id))?;
         let mut offsets = vec![HEADER as u64];
         let (mut read, mut written) = ([0; TAG], [0; TAG]);
         for (index, window) in self.offsets.windows(2).enumerate() {
             let sequence = self.sequence(index);
-            let mut sealed = vec![0u8; usize::try_from(window[1] - window[0]).expect("fits")];
-            self.file.read_exact_at(&mut sealed, window[0])?;
-            let (nonce, ciphertext) = sealed[PREFIX..].split_at(NONCE);
-            let created = self.sealed_creation(sequence);
-            let plain = self
-                .reader
-                .decrypt(
-                    XNonce::from_slice(nonce),
-                    Payload {
-                        msg: ciphertext,
-                        aad: &associated(&self.table, created, sequence, &read),
-                    },
-                )
-                .map_err(|_| LogError::Decrypt { offset: window[0] })?;
+            let sealed = self.sealed_at(window[0], window[1])?;
+            let plain = self.open_sealed(&sealed[PREFIX..], sequence, &read, window[0])?;
             read = tag_of(&sealed);
             let bytes = self.seal_plain_after(&plain, sequence, &written)?;
             file.write_all(&bytes)?;
@@ -1693,26 +1688,6 @@ impl Log {
                 Err(error.into())
             }
         }
-    }
-
-    /// The file header naming the current key, which seals the log from the
-    /// next compaction on.
-    fn key_header(&self) -> [u8; HEADER] {
-        let mut header = [0; HEADER];
-        header[..MAGIC.len()].copy_from_slice(MAGIC);
-        header[MAGIC.len()] = FORMAT;
-        let tag = self
-            .cipher
-            .encrypt(
-                XNonce::from_slice(&[0; NONCE]),
-                Payload {
-                    msg: &[],
-                    aad: b"gf log key",
-                },
-            )
-            .expect("sealing an empty message cannot fail");
-        header[MAGIC.len() + 2..].copy_from_slice(&tag[..KEY_ID]);
-        header
     }
 
     /// A frame sealed under its sequence number after the last entry, with its length prefix.
@@ -1776,7 +1751,7 @@ impl Log {
             .create_new(true)
             .write(true)
             .open(&staged)?;
-        file.write_all(&self.key_header())?;
+        file.write_all(&file_header(&self.key_id))?;
         let mut compactor = Compactor {
             staged,
             number,
@@ -1868,7 +1843,7 @@ impl Replay {
         }
         let id: [u8; KEY_ID] = header[MAGIC.len() + 2..].try_into().expect("sized");
         let (key, current) = keys.find(&id).ok_or_else(|| LogError::Key {
-            id: id.iter().map(|byte| format!("{byte:02x}")).collect(),
+            id: crate::setup::hex(&id),
         })?;
         let head = read_head(path, &table, keys)?;
         let mut entries = Entries {
@@ -2077,19 +2052,9 @@ impl Entries {
         }
         let mut sealed = vec![0; usize::try_from(length).expect("a u32 fits")];
         self.reader.read_exact(&mut sealed)?;
-        let (nonce, ciphertext) = sealed.split_at(NONCE);
-        let created = self.log.sealed_creation(sequence);
         let plain = self
             .log
-            .reader
-            .decrypt(
-                XNonce::from_slice(nonce),
-                Payload {
-                    msg: ciphertext,
-                    aad: &associated(&self.log.table, created, sequence, &self.log.last_tag),
-                },
-            )
-            .map_err(|_| LogError::Decrypt { offset })?;
+            .open_sealed(&sealed, sequence, &self.log.last_tag, offset)?;
         Ok(Some(Opened {
             plain,
             tag: tag_of(&sealed),
@@ -2413,14 +2378,10 @@ impl Compactor {
     }
 
     fn seal(&mut self, frame: &Frame, sequence: u64) -> Result<(), LogError> {
-        let created = match &self.created {
-            Some(created) if sequence != 0 => created.as_str(),
-            _ => "",
-        };
         let bytes = seal_entry(
             &self.cipher,
             &self.table,
-            created,
+            sealed_creation(self.created.as_ref(), sequence),
             &frame.to_bytes(),
             sequence,
             &self.previous,
@@ -2445,6 +2406,38 @@ impl fmt::Debug for Compactor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "Compactor({})", self.staged.display())
     }
+}
+
+/// The creation id entry `sequence` of a table created as `created` is
+/// sealed with: none for the definition, which names the creation itself.
+fn sealed_creation(created: Option<&CreationId>, sequence: u64) -> &str {
+    match created {
+        Some(created) if sequence != 0 => created.as_str(),
+        _ => "",
+    }
+}
+
+/// Opens an entry `seal_entry` sealed, given its nonce and ciphertext,
+/// found at `offset` in its file.
+fn open_entry(
+    cipher: &XChaCha20Poly1305,
+    table: &str,
+    created: &str,
+    sealed: &[u8],
+    sequence: u64,
+    previous: &[u8; TAG],
+    offset: u64,
+) -> Result<Vec<u8>, LogError> {
+    let (nonce, ciphertext) = sealed.split_at(NONCE);
+    cipher
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad: &associated(table, created, sequence, previous),
+            },
+        )
+        .map_err(|_| LogError::Decrypt { offset })
 }
 
 /// An entry sealed for a log: its length twice, then the nonce and ciphertext.
@@ -2943,7 +2936,11 @@ mod tests {
         );
         let sealed = log.seal_after(&frame, 0, &[0; TAG]).unwrap();
         drop(log);
-        std::fs::write(path, [file_header(key).as_slice(), &sealed].concat()).unwrap();
+        std::fs::write(
+            path,
+            [file_header(&key.id_bytes()).as_slice(), &sealed].concat(),
+        )
+        .unwrap();
     }
 
     #[test]

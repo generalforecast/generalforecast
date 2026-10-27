@@ -61,9 +61,7 @@ impl Private {
     /// If the directory cannot be made.
     pub fn new(parent: &std::path::Path) -> std::io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
-        let mut suffix = [0u8; 8];
-        getrandom::fill(&mut suffix).map_err(|error| std::io::Error::other(error.to_string()))?;
-        let suffix: String = suffix.iter().map(|byte| format!("{byte:02x}")).collect();
+        let suffix = crate::setup::random_hex(8).map_err(std::io::Error::other)?;
         let path = parent.join(format!("gf-{}-{suffix}", std::process::id()));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(Self(path))
