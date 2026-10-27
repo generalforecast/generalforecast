@@ -291,8 +291,6 @@ class Error(Exception):
         """The API's bare error envelope, with the OpenAPI code."""
         return {"error": self.error()}
 
-    body = public_body
-
     def __str__(self) -> str:
         """The CLI's plain shape, without colour: error, because, hint, request id."""
         lines = [f"error: {self.message}"]

@@ -18,7 +18,7 @@ import re
 import ssl
 import time
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
 from dataclasses import dataclass, field
 from http.client import HTTPException
 from pathlib import Path
@@ -36,10 +36,7 @@ from urllib.request import (
 import httpx
 
 from generalforecast._files import private_lock, read_private, write_private
-from generalforecast.errors import (
-    printable,  # noqa: F401  (re-exported)
-    wire_fields,
-)
+from generalforecast.errors import wire_fields
 from generalforecast.service.boundary import MAX_BYTES, json_object
 from generalforecast.service.contracts import (
     ServiceError,
@@ -553,6 +550,25 @@ def _download_failure(status: int, raw: bytes) -> ServiceError:
     )
 
 
+@dataclass(frozen=True)
+class _Attempt:
+    """One HTTP exchange to make before `end`, reading at most `limit` bytes."""
+
+    method: str
+    path: str
+    data: bytes | None
+    headers: dict[str, str]
+    end: float
+    limit: int
+
+
+@dataclass(frozen=True)
+class _Wait:
+    """A pause between attempts."""
+
+    seconds: float
+
+
 class _Policy:
     """What both transports share: settings, headers, retries and platform detection.
 
@@ -647,26 +663,103 @@ class _Policy:
             and (error.code == "TransportError" or error.status == 503)
         )
 
-    def _probe_needed(self, method: str, path: str, error: ServiceError) -> bool:
-        return (
-            self.platform is None and hosted_only(method, path) and route_missing(error)
-        )
+    def _exchanging(
+        self,
+        method: str,
+        path: str,
+        body: Any,
+        headers: dict[str, str],
+        deadline: float | None,
+        limit: int,
+    ) -> Generator[_Attempt | _Wait, Any, tuple[int, bytes]]:
+        """One request's attempts under one deadline; an unguarded write is never retried."""
+        end = self._end(deadline)
+        _checked_path(path)
+        data = request_data(body)
+        for attempt in range(self.retries + 1):
+            if end - time.monotonic() <= 0:
+                raise _timeout()
+            pause = _Wait(
+                min(self.retry_delay * 2**attempt, max(0.0, end - time.monotonic()))
+            )
+            try:
+                status, raw = yield _Attempt(method, path, data, headers, end, limit)
+            except ServiceError as error:
+                if not self._retry(method, body, attempt, error):
+                    raise
+                yield pause
+                continue
+            if status == 503 and self._retry(
+                method, body, attempt, _failure(status, _error_object(raw))
+            ):
+                yield pause
+                continue
+            return status, raw
+        raise AssertionError("unreachable")
 
-    def _learn(self, probe: ServiceError | None) -> None:
-        self.platform = platform_from_probe(probe)
+    def _sending(
+        self,
+        method: str,
+        path: str,
+        body: Any,
+        headers: Mapping[str, str] | None,
+        deadline: float | None,
+    ) -> Generator[_Attempt | _Wait, Any, dict[str, Any]]:
+        """`send`, written once: the request, its reply, and the platform it reveals.
 
-    def _explain(self, method: str, path: str, error: ServiceError) -> None:
-        """Raises a missing hosted-only route on a model server as `HostedOnlyError`."""
-        if (
-            self.platform is False
-            and hosted_only(method, path)
-            and route_missing(error)
-        ):
-            raise HostedOnlyError(method, path) from None
-
-    def _answered(self, method: str, path: str) -> None:
+        The platform is learned once, from one probe of `PLATFORM_PROBE` after
+        the first missing hosted-only route. It only explains a missing route
+        as `HostedOnlyError`; it never stops a request from being sent.
+        """
+        try:
+            status, raw = yield from self._exchanging(
+                method, path, body, dict(headers or {}), deadline, MAX_BYTES
+            )
+            value = response_value(status, raw)
+        except _Oversized:
+            raise _too_large() from None
+        except ServiceError as error:
+            if (
+                self.platform is None
+                and hosted_only(method, path)
+                and route_missing(error)
+            ):
+                try:
+                    response_value(
+                        *(
+                            yield from self._exchanging(
+                                "GET", PLATFORM_PROBE, None, {}, deadline, MAX_BYTES
+                            )
+                        )
+                    )
+                    probe = None
+                except ServiceError as answer:
+                    probe = answer
+                self.platform = platform_from_probe(probe)
+            if (
+                self.platform is False
+                and hosted_only(method, path)
+                and route_missing(error)
+            ):
+                raise HostedOnlyError(method, path) from None
+            raise
         if hosted_only(method, path):
             self.platform = True
+        return value
+
+    def _downloading(
+        self, path: str, limit: int, deadline: float | None
+    ) -> Generator[_Attempt | _Wait, Any, bytes]:
+        """`download`, written once."""
+        try:
+            status, raw = yield from self._exchanging(
+                "GET", path, None, {"Accept": "*/*"}, deadline, limit
+            )
+        except _Oversized:
+            raise _download_too_large(limit) from None
+        if not 200 <= status < 300:
+            raise _download_failure(status, raw)
+        return raw
 
 
 class Transport(_Policy):
@@ -707,80 +800,42 @@ class Transport(_Policy):
             ServiceError: The reply's error; `HostedOnlyError` for a hosted
                 route a standalone model server does not serve.
         """
-        try:
-            status, raw = self._exchange(
-                method, path, body, dict(headers or {}), deadline, MAX_BYTES
-            )
-            value = response_value(status, raw)
-        except _Oversized:
-            raise _too_large() from None
-        except ServiceError as error:
-            if self._probe_needed(method, path, error):
-                try:
-                    response_value(
-                        *self._exchange(
-                            "GET", PLATFORM_PROBE, None, {}, deadline, MAX_BYTES
-                        )
-                    )
-                    probe = None
-                except ServiceError as answer:
-                    probe = answer
-                self._learn(probe)
-            self._explain(method, path, error)
-            raise
-        self._answered(method, path)
-        return value
+        return self._drive(self._sending(method, path, body, headers, deadline))
 
     def download(
         self, path: str, *, limit: int, deadline: float | None = None
     ) -> bytes:
         """GETs a resource's bytes; more than `limit` of them is `CapacityExceeded`."""
-        try:
-            status, raw = self._exchange(
-                "GET", path, None, {"Accept": "*/*"}, deadline, limit
-            )
-        except _Oversized:
-            raise _download_too_large(limit) from None
-        if not 200 <= status < 300:
-            raise _download_failure(status, raw)
-        return raw
+        return self._drive(self._downloading(path, limit, deadline))
 
     def close(self) -> None:
         """Prevents further requests; urllib closes each response after reading."""
         self.closed = True
 
-    def _exchange(
-        self,
-        method: str,
-        path: str,
-        body: Any,
-        headers: dict[str, str],
-        deadline: float | None,
-        limit: int,
-    ) -> tuple[int, bytes]:
-        """Uses a single deadline; never retries an unguarded mutation."""
-        end = self._end(deadline)
-        _checked_path(path)
-        data = request_data(body)
-        for attempt in range(self.retries + 1):
-            if end - time.monotonic() <= 0:
-                raise _timeout()
+    def _drive[T](self, steps: Generator[_Attempt | _Wait, Any, T]) -> T:
+        """Runs attempts and waits in this thread, throwing failures back in."""
+        result: Any = None
+        failure: BaseException | None = None
+        while True:
             try:
-                status, raw = self._send_once(method, path, data, headers, end, limit)
-                if status == 503:
-                    error = _failure(status, _error_object(raw))
-                    if self._retry(method, body, attempt, error):
-                        self._pause(attempt, end)
-                        continue
-                return status, raw
-            except ServiceError as error:
-                if not self._retry(method, body, attempt, error):
-                    raise
-                self._pause(attempt, end)
-        raise AssertionError("unreachable")
-
-    def _pause(self, attempt: int, end: float) -> None:
-        time.sleep(min(self.retry_delay * 2**attempt, max(0, end - time.monotonic())))
+                step = steps.send(result) if failure is None else steps.throw(failure)
+            except StopIteration as stop:
+                return stop.value
+            result, failure = None, None
+            try:
+                if isinstance(step, _Wait):
+                    time.sleep(step.seconds)
+                else:
+                    result = self._send_once(
+                        step.method,
+                        step.path,
+                        step.data,
+                        step.headers,
+                        step.end,
+                        step.limit,
+                    )
+            except (ServiceError, _Oversized) as error:
+                failure = error
 
     def _send_once(self, method, path, data, headers, end, limit):
         request = Request(
@@ -891,80 +946,40 @@ class AsyncTransport(_Policy):
         deadline: float | None = None,
     ) -> dict[str, Any]:
         """Sends one request and returns the reply's JSON object; see `Transport.send`."""
-        try:
-            status, raw = await self._exchange(
-                method, path, body, dict(headers or {}), deadline, MAX_BYTES
-            )
-            value = response_value(status, raw)
-        except _Oversized:
-            raise _too_large() from None
-        except ServiceError as error:
-            if self._probe_needed(method, path, error):
-                try:
-                    response_value(
-                        *await self._exchange(
-                            "GET", PLATFORM_PROBE, None, {}, deadline, MAX_BYTES
-                        )
-                    )
-                    probe = None
-                except ServiceError as answer:
-                    probe = answer
-                self._learn(probe)
-            self._explain(method, path, error)
-            raise
-        self._answered(method, path)
-        return value
+        return await self._drive(self._sending(method, path, body, headers, deadline))
 
     async def download(
         self, path: str, *, limit: int, deadline: float | None = None
     ) -> bytes:
         """GETs a resource's bytes; more than `limit` of them is `CapacityExceeded`."""
-        try:
-            status, raw = await self._exchange(
-                "GET", path, None, {"Accept": "*/*"}, deadline, limit
-            )
-        except _Oversized:
-            raise _download_too_large(limit) from None
-        if not 200 <= status < 300:
-            raise _download_failure(status, raw)
-        return raw
+        return await self._drive(self._downloading(path, limit, deadline))
 
-    async def _exchange(
-        self,
-        method: str,
-        path: str,
-        body: Any,
-        headers: dict[str, str],
-        deadline: float | None,
-        limit: int,
-    ) -> tuple[int, bytes]:
-        """Enforces an overall timeout including retry delays and streaming reads."""
-        end = self._end(deadline)
-        _checked_path(path)
-        data = request_data(body)
-        remaining = end - time.monotonic()
-        if remaining <= 0:
-            raise _timeout()
-        try:
-            async with asyncio.timeout(remaining):
-                for attempt in range(self.retries + 1):
-                    try:
-                        status, raw = await self._send_once(
-                            method, path, data, headers, limit
+    async def _drive[T](self, steps: Generator[_Attempt | _Wait, Any, T]) -> T:
+        """Awaits attempts and waits, each bounded by the request's deadline."""
+        result: Any = None
+        failure: BaseException | None = None
+        while True:
+            try:
+                step = steps.send(result) if failure is None else steps.throw(failure)
+            except StopIteration as stop:
+                return stop.value
+            result, failure = None, None
+            try:
+                if isinstance(step, _Wait):
+                    await asyncio.sleep(step.seconds)
+                    continue
+                remaining = step.end - time.monotonic()
+                if remaining <= 0:
+                    raise _timeout()
+                try:
+                    async with asyncio.timeout(remaining):
+                        result = await self._send_once(
+                            step.method, step.path, step.data, step.headers, step.limit
                         )
-                        if status == 503:
-                            error = _failure(status, _error_object(raw))
-                            if self._retry(method, body, attempt, error):
-                                await asyncio.sleep(self.retry_delay * 2**attempt)
-                                continue
-                        return status, raw
-                    except ServiceError as error:
-                        if not self._retry(method, body, attempt, error):
-                            raise
-                    await asyncio.sleep(self.retry_delay * 2**attempt)
-        except TimeoutError:
-            raise _timeout() from None
-        raise AssertionError("unreachable")
+                except TimeoutError:
+                    raise _timeout() from None
+            except (ServiceError, _Oversized) as error:
+                failure = error
 
     async def _send_once(self, method, path, data, headers, limit):
         if self.closed:
