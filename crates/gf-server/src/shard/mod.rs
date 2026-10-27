@@ -52,7 +52,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use gf_core::cache::{Eviction, ModelId, Movement, Tier, TierConfig};
-use gf_core::forecasting::{self, HORIZON_PASSES, Neighbors, SeriesSpec, horizon_limit};
+use gf_core::forecasting::{self, FutureRow, HORIZON_PASSES, Neighbors, SeriesSpec, horizon_limit};
 use gf_core::node::{
     CompactionSource, EntrySizes, Node, NodeError, RequestId, Scheduling, SummaryScope, TableId,
     TableRows, TableSpec, Task,
@@ -566,6 +566,9 @@ pub enum Command {
         horizon: NonZeroUsize,
         /// Each series' group, for a table of given groups.
         groups: Option<Vec<Vec<u64>>>,
+        /// Known covariates' values past the cutoffs, which the forecasts
+        /// read in place of the table's rows there, if the request brings any.
+        future: Option<KnownFuture>,
         trace: String,
         reply: Reply<Predictions>,
     },
@@ -831,6 +834,19 @@ pub struct RequestContext {
     /// bit, from the first request on. Otherwise the context is one
     /// request's, fit and decoded in one fused call.
     pub shared: bool,
+}
+
+/// The known future a forecast request brings: per row its series, time and
+/// covariate values, as a write's rows carry them, the strings of
+/// categorical columns still to code.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KnownFuture {
+    /// Each row's series, as its key's 64-bit digest.
+    pub series: Vec<u64>,
+    pub times: Vec<i64>,
+    /// Row-major features, the table's features per row.
+    pub features: Vec<f32>,
+    pub strings: Strings,
 }
 
 /// What a request asks of its context: predictions of query rows, or
@@ -1429,24 +1445,26 @@ impl Shard {
                             .get(entry.definition.columns.len())
                             .map(|vocabulary| vocabulary.words().to_vec())
                             .unwrap_or_default(),
-                        series: entry
-                            .definition
-                            .series
-                            .is_some()
-                            .then(|| entry.series.len() as u64),
+                        series: self.node.held_series(id)?.map(|held| held.len() as u64),
                     })
                 });
                 let _ = reply.send(described);
             }
             Command::KnownSeries { table, reply } => {
-                let known = self.entry(&table).and_then(|_| {
+                let known = self.entry(&table).and_then(|id| {
                     let entry = &self.tables[&table];
-                    if entry.definition.series.is_none() {
-                        return Err(ServerError::Invalid(format!(
-                            "table {table:?} holds rows, not series"
-                        )));
-                    }
-                    Ok(entry.series.keys().to_vec())
+                    // The log keeps the key of every series a row was written
+                    // for; those whose rows were all deleted are left out.
+                    let held = self.node.held_series(id)?.ok_or_else(|| {
+                        ServerError::Invalid(format!("table {table:?} holds rows, not series"))
+                    })?;
+                    Ok(entry
+                        .series
+                        .keys()
+                        .iter()
+                        .filter(|key| held.contains(&gf_core::series::SeriesKey(key.digest)))
+                        .cloned()
+                        .collect())
                 });
                 let _ = reply.send(known);
             }
@@ -1606,11 +1624,13 @@ impl Shard {
                 before,
                 horizon,
                 groups,
+                future,
                 trace,
                 reply,
             } => {
                 let submitted = self.usable(&table).and_then(|id| {
-                    self.submit_forecast(id, &table, series, before, horizon, groups)
+                    let future = self.future_rows(&table, future)?;
+                    self.submit_forecast(id, &table, series, before, horizon, groups, future)
                 });
                 self.admit(submitted, reply, trace);
             }

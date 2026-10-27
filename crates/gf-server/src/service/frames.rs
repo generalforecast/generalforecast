@@ -330,6 +330,71 @@ pub(super) fn groups_column(batches: &[RecordBatch]) -> Result<Option<Vec<Vec<u6
     Ok(Some(groups))
 }
 
+/// The known future a forecast request brings, from a `future` column of
+/// lists, one per series: rows of its `time` and the table's covariate
+/// columns, as a write's rows carry them, null where a value is not known.
+/// None without the column.
+pub(super) fn future_column(
+    batches: &[RecordBatch],
+    series: &[u64],
+    columns: &[Column],
+) -> Result<Option<KnownFuture>, Status> {
+    let having = batches
+        .iter()
+        .filter(|batch| batch.column_by_name("future").is_some())
+        .count();
+    if having == 0 {
+        return Ok(None);
+    }
+    if having != batches.len() {
+        return Err(invalid(
+            "column \"future\" must be in every batch or in none",
+        ));
+    }
+    let mut future = KnownFuture {
+        series: Vec::new(),
+        times: Vec::new(),
+        features: Vec::new(),
+        strings: Vec::new(),
+    };
+    let mut strings: BTreeMap<usize, Vec<Option<String>>> = BTreeMap::new();
+    let mut at = 0;
+    for batch in batches {
+        let lists = batch
+            .column_by_name("future")
+            .and_then(|column| column.as_any().downcast_ref::<arrow_array::ListArray>())
+            .ok_or_else(|| invalid("column \"future\" holds a list of rows per forecast"))?;
+        let rows = lists
+            .values()
+            .as_any()
+            .downcast_ref::<arrow_array::StructArray>()
+            .ok_or_else(|| invalid("column \"future\" holds rows: a list of structs"))?;
+        let rows = RecordBatch::from(rows.clone());
+        let times = column(&rows, "time")?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| invalid("a future row's \"time\" must be int64"))?;
+        let (values, words, count) = features(std::slice::from_ref(&rows), columns)?;
+        let offsets = lists.value_offsets();
+        for index in 0..lists.len() {
+            let key = series[at + index];
+            let span = usize::try_from(offsets[index + 1] - offsets[index]).unwrap_or(0);
+            future.series.extend(std::iter::repeat_n(key, span));
+        }
+        at += lists.len();
+        future.times.extend(times.values().iter().copied());
+        future.features.extend(values);
+        for (column, words) in words {
+            strings.entry(column).or_default().extend(words);
+        }
+        if future.times.len() != future.series.len() || count != times.len() {
+            return Err(invalid("a future's rows must each belong to a forecast"));
+        }
+    }
+    future.strings = strings.into_iter().collect();
+    Ok(Some(future))
+}
+
 /// The keys of delete batches.
 pub(super) fn keys(batches: &[RecordBatch]) -> Result<Vec<u128>, Status> {
     let mut keys = Vec::new();

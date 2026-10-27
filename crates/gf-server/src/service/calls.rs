@@ -6,7 +6,7 @@
 
 use super::frames::{
     Laps, answer, answered, batches, changes, creation_id, descriptor, encoded, exchange_path,
-    forecasted, given_keys, groups_column, horizon_of, invalid, keys, lineage, path,
+    forecasted, future_column, given_keys, groups_column, horizon_of, invalid, keys, lineage, path,
     prediction_batch, quantile_batch, quantile_levels, query_rows, results, series_column, times,
     write_id,
 };
@@ -205,6 +205,7 @@ impl Service {
         }
         let before = times(&batches, "before")?;
         let groups = groups_column(&batches)?;
+        let future = future_column(&batches, &keys, &placement.columns)?;
         let decode = laps.lap();
         let (placement, _routed) = self.routed(table).await?;
         let counts = self.metrics.table(table);
@@ -218,6 +219,7 @@ impl Service {
                 before,
                 horizon,
                 groups,
+                future,
                 trace: trace.id().to_string(),
                 reply,
             })

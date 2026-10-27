@@ -431,6 +431,22 @@ impl Node {
             .len())
     }
 
+    /// The series of a table of series that hold rows now: a series whose
+    /// rows were all deleted is none of them. None for a table of rows.
+    ///
+    /// # Errors
+    ///
+    /// If the table does not exist.
+    pub fn held_series(&self, table: TableId) -> Result<Option<HashSet<SeriesKey>>, NodeError> {
+        Ok(self
+            .tables
+            .get(&table)
+            .ok_or(NodeError::UnknownTable(table))?
+            .series
+            .as_ref()
+            .map(|index| index.series().collect()))
+    }
+
     /// How many more rows `table` can take before its row ids run out,
     /// counting the dead ids a sparse table frees when it is renumbered
     /// before its next insert, as the write checks count them; a caller

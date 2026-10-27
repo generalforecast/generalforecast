@@ -265,7 +265,15 @@ impl Shard {
                 before,
                 horizon,
                 groups,
-            } => self.submit_forecast(id, name.as_str(), series, before, horizon, groups)?,
+            } => self.submit_forecast(
+                id,
+                name.as_str(),
+                series,
+                before,
+                horizon,
+                groups,
+                Vec::new(),
+            )?,
         };
         Ok((submitted, levels))
     }

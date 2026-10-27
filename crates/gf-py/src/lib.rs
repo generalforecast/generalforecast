@@ -1179,6 +1179,7 @@ impl Node {
                 before,
                 positive(horizon, "horizon")?,
                 groups.as_deref(),
+                Vec::new(),
             )
             .map_err(raised)?
             .0)

@@ -110,6 +110,32 @@ impl Shard {
             .or_else(|| self.tables.get(table).map(|entry| &entry.definition))
     }
 
+    /// A forecast request's known future as rows for the node, its strings
+    /// coded against the table's vocabularies; none without one.
+    pub(super) fn future_rows(
+        &self,
+        table: &str,
+        future: Option<KnownFuture>,
+    ) -> Result<Vec<FutureRow>, ServerError> {
+        let Some(mut future) = future else {
+            return Ok(Vec::new());
+        };
+        self.resolve(table, &mut future.features, &future.strings)?;
+        let width = future.features.len() / future.series.len().max(1);
+        Ok(future
+            .series
+            .iter()
+            .zip(&future.times)
+            .zip(future.features.chunks(width.max(1)))
+            .map(|((&series, &time), features)| FutureRow {
+                series: gf_core::series::SeriesKey(series),
+                time,
+                features: features.to_vec(),
+            })
+            .collect())
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn submit_forecast(
         &mut self,
         id: TableId,
@@ -118,6 +144,7 @@ impl Shard {
         before: Option<Vec<i64>>,
         horizon: NonZeroUsize,
         groups: Option<Vec<Vec<u64>>>,
+        future: Vec<FutureRow>,
     ) -> Result<Submitted, ServerError> {
         if let Some(reason) = self.quarantined.get(&id) {
             return Err(ServerError::Invalid(format!(
@@ -163,6 +190,7 @@ impl Shard {
             before.as_deref(),
             horizon,
             groups.as_deref(),
+            future,
         )?;
         Ok(Submitted {
             request,

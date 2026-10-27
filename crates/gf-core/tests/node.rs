@@ -2998,7 +2998,7 @@ mod series {
     use std::num::{NonZeroU64, NonZeroUsize};
 
     use gf_core::forecasting::{
-        ForecastError, GroupStrategy, KNOWN, Neighbors, PAST, SeriesSpec, TARGET,
+        ForecastError, FutureRow, GroupStrategy, KNOWN, Neighbors, PAST, SeriesSpec, TARGET,
     };
     use gf_core::node::{Action, Node, NodeError, TableId, Targets, Task};
     use gf_core::planner::Strategy;
@@ -3061,14 +3061,55 @@ mod series {
     }
 
     #[test]
+    fn a_series_whose_rows_are_all_deleted_is_no_longer_held() {
+        let mut node = node(64);
+        let table = table(&mut node, vec![], GroupStrategy::Alone);
+        let held = |node: &Node| node.held_series(table).unwrap().unwrap();
+        assert_eq!(held(&node), [A, B].into_iter().collect());
+
+        let a: Vec<u128> = (100..=150)
+            .step_by(10)
+            .map(|time| A.row_key(time).0)
+            .collect();
+        node.delete(table, &a).unwrap();
+
+        assert_eq!(held(&node), [B].into_iter().collect());
+    }
+
+    #[test]
+    fn a_forecast_reads_the_known_future_it_brings_and_writes_none() {
+        let mut node = node(64);
+        let table = table(&mut node, vec![1], GroupStrategy::Alone);
+        let rows = node.len(table).unwrap();
+        let future = vec![FutureRow {
+            series: A,
+            time: 160,
+            features: vec![f32::NAN, 42.0],
+        }];
+
+        node.submit_forecast(table, &[A.0], None, horizon(2), None, future)
+            .unwrap();
+        let step = node.schedule().unwrap().expect("a step");
+
+        let ahead = &step.forecasts()[0].future;
+        assert_eq!((ahead.rows, ahead.steps), (3, 2));
+        // The second covariate is known: its first step is the request's, its
+        // second the table's, which holds none there.
+        assert_eq!(ahead.values[4..6], [42.0, 0.0]);
+        assert_eq!(ahead.observed[4..6], [true, false]);
+        node.complete(&step);
+        assert_eq!(node.len(table).unwrap(), rows);
+    }
+
+    #[test]
     fn forecast_horizon_uses_the_model_pass_limit() {
         let mut node = node(64);
         let table = table(&mut node, vec![], GroupStrategy::Alone);
 
-        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(32), None)
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(32), None, Vec::new())
             .unwrap();
         assert!(matches!(
-            node.submit_forecast(table, &[A.0], Some(&[160]), horizon(33), None),
+            node.submit_forecast(table, &[A.0], Some(&[160]), horizon(33), None, Vec::new()),
             Err(NodeError::Forecast(ForecastError::HorizonTooLong {
                 horizon: 33,
                 limit: 32
@@ -3084,7 +3125,7 @@ mod series {
         );
         assert!(node.schedule().unwrap().is_some());
 
-        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(17), None)
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(17), None, Vec::new())
             .unwrap();
     }
 
@@ -3093,7 +3134,7 @@ mod series {
         let mut node = node(64);
         let table = table(&mut node, vec![], GroupStrategy::Alone);
         let empty = node.create_table(spec(Strategy::Exact)).unwrap();
-        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(2), None)
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(2), None, Vec::new())
             .unwrap();
 
         assert!(matches!(
@@ -3130,8 +3171,15 @@ mod series {
         assert_eq!(copy.compaction(restored).unwrap(), compaction);
         let mut grids = Vec::new();
         for (node, table) in [(&mut original, table), (&mut copy, restored)] {
-            node.submit_forecast(table, &[A.0, B.0], Some(&[160, 160]), horizon(5), None)
-                .unwrap();
+            node.submit_forecast(
+                table,
+                &[A.0, B.0],
+                Some(&[160, 160]),
+                horizon(5),
+                None,
+                Vec::new(),
+            )
+            .unwrap();
             let step = run(node);
             let grid = &step.series_units()[0].grid;
             grids.push((
@@ -3157,7 +3205,7 @@ mod series {
         let table = node.create_table(spec).unwrap();
         let placed: Vec<(SeriesKey, i64)> = (100..=150).step_by(10).map(|time| (A, time)).collect();
         insert(&mut node, table, &placed);
-        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None, Vec::new())
             .unwrap();
         let first = run(&mut node);
         let kept = &first.series_units()[0];
@@ -3167,7 +3215,7 @@ mod series {
         // Four more steps, one patch, and the cutoff four steps on: the grid
         // grows by the patch and the kept encoding is extended.
         insert(&mut node, table, &[(A, 160), (A, 170), (A, 180), (A, 190)]);
-        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         let second = run(&mut node);
         let grown = &second.series_units()[0];
@@ -3183,7 +3231,7 @@ mod series {
             table,
             &[(A, 200), (A, 210), (A, 220), (A, 230), (A, 240)],
         );
-        node.submit_forecast(table, &[A.0], Some(&[250]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[250]), horizon(4), None, Vec::new())
             .unwrap();
         let third = run(&mut node);
         assert_eq!(third.series_units()[0].placed.action(), Action::Encode);
@@ -3205,7 +3253,7 @@ mod series {
         let table = node.create_table(spec).unwrap();
         let placed: Vec<(SeriesKey, i64)> = (100..=150).step_by(10).map(|time| (A, time)).collect();
         insert(&mut node, table, &placed);
-        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None, Vec::new())
             .unwrap();
         let first = run(&mut node);
         assert_eq!(first.series_units()[0].placed.action(), Action::Encode);
@@ -3220,7 +3268,7 @@ mod series {
         // each change the rows the kept entry encoded.
         let (mut late, table) = kept(64, GroupStrategy::Alone);
         insert(&mut late, table, &[(A, 90)]);
-        late.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+        late.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         let step = run(&mut late);
         assert_eq!(step.series_units()[0].grid.steps, 12);
@@ -3237,7 +3285,7 @@ mod series {
             )
             .unwrap();
         corrected
-            .submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+            .submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         assert_eq!(
             run(&mut corrected).series_units()[0].placed.action(),
@@ -3247,7 +3295,7 @@ mod series {
         let (mut deleted, table) = kept(64, GroupStrategy::Alone);
         deleted.delete(table, &[A.row_key(120).0]).unwrap();
         deleted
-            .submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+            .submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         assert_eq!(
             run(&mut deleted).series_units()[0].placed.action(),
@@ -3277,7 +3325,7 @@ mod series {
                 (100..=150).step_by(10).map(|time| (series, time)).collect();
             insert(&mut node, table, &rows);
         }
-        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None, Vec::new())
             .unwrap();
         let first = run(&mut node);
         assert_eq!(first.series_units()[0].placed.action(), Action::Encode);
@@ -3291,7 +3339,7 @@ mod series {
         let c = SeriesKey(3);
         let rows: Vec<(SeriesKey, i64)> = (100..=190).step_by(10).map(|time| (c, time)).collect();
         insert(&mut node, table, &rows);
-        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         let step = run(&mut node);
         let unit = &step.series_units()[0];
@@ -3309,7 +3357,7 @@ mod series {
         // 2 patches takes 1 slot and its extension of 3 takes 2, so on two
         // device slots the extension would have to evict its own source.
         let (mut node, table) = kept(2, GroupStrategy::Alone);
-        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         let step = run(&mut node);
         let unit = &step.series_units()[0];
@@ -3324,13 +3372,13 @@ mod series {
     #[test]
     fn a_failed_extension_is_forgotten_and_the_source_extended_again() {
         let (mut node, table) = kept(64, GroupStrategy::Alone);
-        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         let step = node.schedule().unwrap().unwrap();
         assert_eq!(step.series_units()[0].placed.action(), Action::Extend);
         let source = step.series_units()[0].source;
         node.fail(&step);
-        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         let again = run(&mut node);
         assert_eq!(again.series_units()[0].placed.action(), Action::Extend);
@@ -3352,9 +3400,9 @@ mod series {
         let table = node.create_table(spec).unwrap();
         let rows: Vec<(SeriesKey, i64)> = (100..=190).step_by(10).map(|time| (A, time)).collect();
         insert(&mut node, table, &rows);
-        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None, Vec::new())
             .unwrap();
-        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         let step = run(&mut node);
         let actions: Vec<Action> = step
@@ -3368,11 +3416,11 @@ mod series {
         let (mut node, table) = kept(64, GroupStrategy::Alone);
         let rows: Vec<(SeriesKey, i64)> = (200..=230).step_by(10).map(|time| (A, time)).collect();
         insert(&mut node, table, &rows);
-        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         let first = node.schedule().unwrap().unwrap();
         assert_eq!(first.series_units()[0].placed.action(), Action::Extend);
-        node.submit_forecast(table, &[A.0], Some(&[240]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[240]), horizon(4), None, Vec::new())
             .unwrap();
         let second = node.schedule().unwrap().unwrap();
         // The entry at 160 is written, two patches back: that one is grown.
@@ -3408,15 +3456,22 @@ mod series {
                 (100..=190).step_by(10).map(|time| (series, time)).collect();
             insert(&mut node, table, &rows);
         }
-        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None, Vec::new())
             .unwrap();
         run(&mut node);
         for series in [B, c] {
-            node.submit_forecast(table, &[series.0], Some(&[200]), horizon(4), None)
-                .unwrap();
+            node.submit_forecast(
+                table,
+                &[series.0],
+                Some(&[200]),
+                horizon(4),
+                None,
+                Vec::new(),
+            )
+            .unwrap();
             run(&mut node);
         }
-        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         assert_eq!(
             run(&mut node).series_units()[0].placed.action(),
@@ -3451,12 +3506,12 @@ mod series {
         // An epoch that ends while a later step reuses the kept entry: the
         // next advance encodes in the new epoch rather than growing the old.
         let (mut node, table) = kept(64, GroupStrategy::Alone);
-        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None, Vec::new())
             .unwrap();
         let reading = node.schedule().unwrap().unwrap();
         assert_eq!(reading.series_units()[0].placed.action(), Action::Reuse);
         node.advance_epoch(table).unwrap();
-        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         let step = node.schedule().unwrap().unwrap();
         assert_eq!(step.series_units()[0].placed.action(), Action::Encode);
@@ -3478,7 +3533,7 @@ mod series {
         let table = node.create_table(spec).unwrap();
         let rows: Vec<(SeriesKey, i64)> = (100..=150).step_by(10).map(|time| (A, time)).collect();
         insert(&mut node, table, &rows);
-        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None, Vec::new())
             .unwrap();
         let first = node.schedule().unwrap().unwrap();
         assert_eq!(first.series_units()[0].placed.action(), Action::Encode);
@@ -3495,7 +3550,7 @@ mod series {
         node.complete(&first);
         let rows: Vec<(SeriesKey, i64)> = (160..=190).step_by(10).map(|time| (A, time)).collect();
         insert(node, table, &rows);
-        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         run(node)
     }
@@ -3526,7 +3581,7 @@ mod series {
             Some(&compaction.table),
         )
         .unwrap();
-        copy.submit_forecast(restored, &[A.0], Some(&[200]), horizon(4), None)
+        copy.submit_forecast(restored, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         assert_eq!(
             run(&mut copy).series_units()[0].placed.action(),
@@ -3534,7 +3589,7 @@ mod series {
         );
         let rows: Vec<(SeriesKey, i64)> = (200..=230).step_by(10).map(|time| (A, time)).collect();
         insert(&mut copy, restored, &rows);
-        copy.submit_forecast(restored, &[A.0], Some(&[240]), horizon(4), None)
+        copy.submit_forecast(restored, &[A.0], Some(&[240]), horizon(4), None, Vec::new())
             .unwrap();
         assert_eq!(
             run(&mut copy).series_units()[0].placed.action(),
@@ -3569,6 +3624,7 @@ mod series {
                 Some(&vec![160; chunk.len()]),
                 horizon(4),
                 None,
+                Vec::new(),
             )
             .unwrap();
             while let Some(step) = node.schedule().unwrap() {
@@ -3583,6 +3639,7 @@ mod series {
                 Some(&vec![200; chunk.len()]),
                 horizon(4),
                 None,
+                Vec::new(),
             )
             .unwrap();
             while let Some(step) = node.schedule().unwrap() {
@@ -3599,7 +3656,7 @@ mod series {
     #[test]
     fn a_source_doomed_while_its_extension_runs_is_dropped() {
         let (mut node, table) = kept(64, GroupStrategy::Alone);
-        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
             .unwrap();
         let step = node.schedule().unwrap().unwrap();
         assert_eq!(step.series_units()[0].placed.action(), Action::Extend);
@@ -3624,7 +3681,7 @@ mod series {
     fn an_earlier_cutoff_leaves_the_later_entry_as_the_one_extended() {
         for same_step in [false, true] {
             let (mut node, table) = kept(64, GroupStrategy::Alone);
-            node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None)
+            node.submit_forecast(table, &[A.0], Some(&[200]), horizon(4), None, Vec::new())
                 .unwrap();
             let mut units = Vec::new();
             if !same_step {
@@ -3632,7 +3689,7 @@ mod series {
             }
             // A historical forecast encodes an earlier cutoff, written after
             // the later one.
-            node.submit_forecast(table, &[A.0], Some(&[120]), horizon(4), None)
+            node.submit_forecast(table, &[A.0], Some(&[120]), horizon(4), None, Vec::new())
                 .unwrap();
             units.extend(run(&mut node).series_units().to_vec());
             let later = units.iter().find(|unit| unit.cutoff == 200).unwrap();
@@ -3643,7 +3700,7 @@ mod series {
             let rows: Vec<(SeriesKey, i64)> =
                 (200..=230).step_by(10).map(|time| (A, time)).collect();
             insert(&mut node, table, &rows);
-            node.submit_forecast(table, &[A.0], Some(&[240]), horizon(4), None)
+            node.submit_forecast(table, &[A.0], Some(&[240]), horizon(4), None, Vec::new())
                 .unwrap();
             let step = run(&mut node);
             let unit = &step.series_units()[0];
@@ -3671,7 +3728,7 @@ mod series {
                 let rows: Vec<(SeriesKey, i64)> =
                     (100..=180).step_by(10).map(|time| (A, time)).collect();
                 insert(&mut node, table, &rows);
-                node.submit_forecast(table, &[A.0], Some(&[190]), horizon(4), None)
+                node.submit_forecast(table, &[A.0], Some(&[190]), horizon(4), None, Vec::new())
                     .unwrap();
                 table
             })
@@ -3682,7 +3739,7 @@ mod series {
             let rows: Vec<(SeriesKey, i64)> =
                 (190..=220).step_by(10).map(|time| (A, time)).collect();
             insert(&mut node, table, &rows);
-            node.submit_forecast(table, &[A.0], Some(&[230]), horizon(4), None)
+            node.submit_forecast(table, &[A.0], Some(&[230]), horizon(4), None, Vec::new())
                 .unwrap();
         }
         let mut served = 0;
@@ -3717,7 +3774,7 @@ mod series {
         let table = node.create_table(spec).unwrap();
         let rows: Vec<(SeriesKey, i64)> = (100..=180).step_by(10).map(|time| (A, time)).collect();
         insert(&mut node, table, &rows);
-        node.submit_forecast(table, &[A.0], Some(&[190]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[190]), horizon(4), None, Vec::new())
             .unwrap();
         let first = run(&mut node);
         assert_eq!(first.series_units()[0].placed.slots().len(), 2);
@@ -3729,7 +3786,7 @@ mod series {
                 .map(|time| (A, time))
                 .collect();
             insert(&mut node, table, &rows);
-            node.submit_forecast(table, &[A.0], Some(&[cutoff]), horizon(4), None)
+            node.submit_forecast(table, &[A.0], Some(&[cutoff]), horizon(4), None, Vec::new())
                 .unwrap();
             let step = run(&mut node);
             let unit = &step.series_units()[0];
@@ -3764,6 +3821,7 @@ mod series {
             Some(&[160, 160]),
             horizon(5),
             Some(&groups),
+            Vec::new(),
         )
         .unwrap();
         let step = run(&mut node);
@@ -3773,15 +3831,22 @@ mod series {
 
         // A series the given never saw is forecast through the group given it.
         let c = SeriesKey(3);
-        node.submit_forecast(given, &[c.0], Some(&[160]), horizon(5), Some(&[vec![A.0]]))
-            .unwrap();
+        node.submit_forecast(
+            given,
+            &[c.0],
+            Some(&[160]),
+            horizon(5),
+            Some(&[vec![A.0]]),
+            Vec::new(),
+        )
+        .unwrap();
         let step = run(&mut node);
         assert_eq!(step.series_units()[0].members, [A, c]);
 
         // Refused: a forecast without its group, a group past the given's
         // size, a member the given lacks (not found, as a row key given to
         // `predict_given` is), and groups given to a given drawing its own.
-        node.submit_forecast(given, &[A.0], Some(&[160]), horizon(5), None)
+        node.submit_forecast(given, &[A.0], Some(&[160]), horizon(5), None, Vec::new())
             .unwrap();
         assert!(node.schedule().unwrap().is_none());
         assert!(matches!(
@@ -3794,6 +3859,7 @@ mod series {
             Some(&[160]),
             horizon(5),
             Some(&[vec![B.0, d.0]]),
+            Vec::new(),
         )
         .unwrap();
         assert!(node.schedule().unwrap().is_none());
@@ -3807,6 +3873,7 @@ mod series {
             Some(&[160]),
             horizon(5),
             Some(&[vec![SeriesKey(9).0]]),
+            Vec::new(),
         )
         .unwrap();
         assert!(node.schedule().unwrap().is_none());
@@ -3824,17 +3891,31 @@ mod series {
                 seed: 5,
             },
         );
-        node.submit_forecast(drawn, &[A.0], Some(&[160]), horizon(5), Some(&[vec![B.0]]))
-            .unwrap();
+        node.submit_forecast(
+            drawn,
+            &[A.0],
+            Some(&[160]),
+            horizon(5),
+            Some(&[vec![B.0]]),
+            Vec::new(),
+        )
+        .unwrap();
         assert!(node.schedule().unwrap().is_none());
         assert!(matches!(
             node.take_refused()[0].1,
             NodeError::Forecast(ForecastError::UngivenGroups)
         ));
         assert_eq!(
-            node.submit_forecast(drawn, &[A.0, B.0], None, horizon(5), Some(&[vec![B.0]]))
-                .unwrap_err()
-                .to_string(),
+            node.submit_forecast(
+                drawn,
+                &[A.0, B.0],
+                None,
+                horizon(5),
+                Some(&[vec![B.0]]),
+                Vec::new()
+            )
+            .unwrap_err()
+            .to_string(),
             "expected 2 groups, got 1"
         );
     }
@@ -3843,7 +3924,7 @@ mod series {
     fn a_forecast_plans_a_unit_on_a_grid_and_a_later_one_reuses_it() {
         let mut node = node(64);
         let table = table(&mut node, vec![], GroupStrategy::Alone);
-        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(5), None)
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(5), None, Vec::new())
             .unwrap();
 
         let step = run(&mut node);
@@ -3873,7 +3954,7 @@ mod series {
         // Without known columns, the future carries no rows.
         assert_eq!((forecast.future.rows, forecast.future.steps), (0, 5));
 
-        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(9), None)
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(9), None, Vec::new())
             .unwrap();
         let again = run(&mut node);
         assert_eq!(again.series_units()[0].placed.action(), Action::Reuse);
@@ -3884,7 +3965,7 @@ mod series {
     fn known_columns_make_units_transient_and_fill_the_future() {
         let mut node = node(64);
         let table = table(&mut node, vec![1], GroupStrategy::Alone);
-        node.submit_forecast(table, &[B.0], Some(&[140]), horizon(3), None)
+        node.submit_forecast(table, &[B.0], Some(&[140]), horizon(3), None, Vec::new())
             .unwrap();
 
         let step = run(&mut node);
@@ -3907,9 +3988,9 @@ mod series {
             seed: 3,
         };
         let table = table(&mut node, vec![], group);
-        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None)
+        node.submit_forecast(table, &[A.0], Some(&[160]), horizon(4), None, Vec::new())
             .unwrap();
-        node.submit_forecast(table, &[B.0], None, horizon(4), None)
+        node.submit_forecast(table, &[B.0], None, horizon(4), None, Vec::new())
             .unwrap();
 
         let step = run(&mut node);
@@ -3954,7 +4035,7 @@ mod series {
         ));
         let plain = super::table(&mut node, Strategy::Exact, 4);
         assert!(matches!(
-            node.submit_forecast(plain, &[1], None, horizon(2), None)
+            node.submit_forecast(plain, &[1], None, horizon(2), None, Vec::new())
                 .unwrap_err(),
             NodeError::Forecast(ForecastError::NotSeries)
         ));
@@ -3976,7 +4057,7 @@ mod series {
         let times: Vec<Option<i64>> = placed.iter().map(|&(_, time)| Some(time)).collect();
         node.replace_rows(table, &keys, &features, targets, Some(&times))
             .unwrap();
-        node.submit_forecast(table, &[A.0], Some(&[150]), horizon(2), None)
+        node.submit_forecast(table, &[A.0], Some(&[150]), horizon(2), None, Vec::new())
             .unwrap();
 
         let step = run(&mut node);
@@ -4029,7 +4110,7 @@ mod series {
             .unwrap();
 
         assert_eq!(node.len(table).unwrap(), before + 1);
-        node.submit_forecast(table, &[A.0], Some(&[170]), horizon(2), None)
+        node.submit_forecast(table, &[A.0], Some(&[170]), horizon(2), None, Vec::new())
             .unwrap();
         let step = run(&mut node);
         let grid = &step.series_units()[0].grid;
@@ -4052,10 +4133,10 @@ mod series {
         )
         .unwrap();
         let bad = node
-            .submit_forecast(table, &[c.0], None, horizon(2), None)
+            .submit_forecast(table, &[c.0], None, horizon(2), None, Vec::new())
             .unwrap();
         let good = node
-            .submit_forecast(table, &[A.0], Some(&[160]), horizon(2), None)
+            .submit_forecast(table, &[A.0], Some(&[160]), horizon(2), None, Vec::new())
             .unwrap();
 
         let step = run(&mut node);
@@ -4095,9 +4176,9 @@ mod series {
     fn units_forecast_whole_are_each_forecasts_own() {
         let mut node = node(64);
         let table = table(&mut node, vec![1], GroupStrategy::Alone);
-        node.submit_forecast(table, &[B.0], Some(&[140]), horizon(3), None)
+        node.submit_forecast(table, &[B.0], Some(&[140]), horizon(3), None, Vec::new())
             .unwrap();
-        node.submit_forecast(table, &[B.0], Some(&[140]), horizon(5), None)
+        node.submit_forecast(table, &[B.0], Some(&[140]), horizon(5), None, Vec::new())
             .unwrap();
 
         let step = run(&mut node);
@@ -4131,7 +4212,7 @@ mod series {
             Some(&times),
         )
         .unwrap();
-        node.submit_forecast(table, &[B.0], None, horizon(2), None)
+        node.submit_forecast(table, &[B.0], None, horizon(2), None, Vec::new())
             .unwrap();
 
         let step = run(&mut node);
@@ -4149,7 +4230,7 @@ mod series {
             Some(&[Some(100)]),
         )
         .unwrap();
-        node.submit_forecast(table, &[c.0], None, horizon(2), None)
+        node.submit_forecast(table, &[c.0], None, horizon(2), None, Vec::new())
             .unwrap();
         assert!(node.schedule().unwrap().is_none());
         assert!(matches!(

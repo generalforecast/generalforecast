@@ -7,7 +7,7 @@ use std::collections::HashSet;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use gf_core::forecasting::{
-    ForecastError, GroupStrategy, HORIZON_PASSES, KNOWN, Neighbors, PAST, SeriesPlan,
+    ForecastError, FutureRow, GroupStrategy, HORIZON_PASSES, KNOWN, Neighbors, PAST, SeriesPlan,
     SeriesRequest, SeriesSpec, TARGET, future, grid, horizon_limit, plan,
 };
 use gf_core::rows::Row;
@@ -97,6 +97,7 @@ fn request(series: &[SeriesKey], cutoffs: &[Option<i64>], horizon: usize) -> Ser
         cutoffs: cutoffs.to_vec(),
         horizon: NonZeroUsize::new(horizon).unwrap(),
         groups: None,
+        future: Vec::new(),
     }
 }
 
@@ -387,6 +388,108 @@ fn known_columns_read_rows_after_the_cutoff_and_forecast_whole() {
     assert_eq!(planned.units.len(), 2);
     assert_eq!(planned.forecasts[0][0].unit, planned.forecasts[1][0].unit);
     assert_ne!(planned.forecasts[0][0].unit, planned.forecasts[2][0].unit);
+}
+
+fn ahead(series: SeriesKey, time: i64, value: f32) -> FutureRow {
+    FutureRow {
+        series,
+        time,
+        features: vec![value],
+    }
+}
+
+#[test]
+fn a_future_the_request_brings_is_read_in_place_of_the_tables_rows() {
+    let (table, index, rows) = table();
+    let spec = spec(GroupStrategy::Alone, vec![0]);
+    // A's latest observation is at 150, so its forecast starts at 160.
+    let mut asked = request(&[A], &[None], 3);
+    asked.future = vec![
+        ahead(A, 160, 7.0),
+        ahead(A, 170, 8.0),
+        ahead(A, 180, f32::NAN),
+    ];
+
+    let planned = plan(&spec, &index, &table.snapshot(), 1, &[asked.clone()]).unwrap();
+
+    let laid = future(
+        &spec,
+        &planned.units[0],
+        &planned.forecasts[0][0],
+        1,
+        fetch(&rows),
+    )
+    .unwrap();
+    assert_eq!(laid.roles, [TARGET, KNOWN]);
+    // A value not known stays unobserved, and the target's future is never read.
+    assert_eq!(laid.values[3..5], [7.0, 8.0]);
+    assert_eq!(laid.observed[3..], [true, true, false]);
+    assert_eq!(laid.observed[..3], [false, false, false]);
+    // Another request's other future reads another unit; the same future shares one.
+    let mut other = asked.clone();
+    other.future[0].features = vec![9.0];
+    let planned = plan(
+        &spec,
+        &index,
+        &table.snapshot(),
+        1,
+        &[asked.clone(), other, asked],
+    )
+    .unwrap();
+    assert_eq!(planned.units.len(), 2);
+    assert_ne!(planned.forecasts[0][0].unit, planned.forecasts[1][0].unit);
+    assert_eq!(planned.forecasts[0][0].unit, planned.forecasts[2][0].unit);
+}
+
+#[test]
+fn a_future_is_refused_unless_after_the_series_latest_observation_on_its_grid() {
+    let (table, index, _) = table();
+    let known = spec(GroupStrategy::Alone, vec![0]);
+    let planned = |spec: &SeriesSpec, future: Vec<FutureRow>| {
+        let mut asked = request(&[A], &[None], 3);
+        asked.future = future;
+        plan(spec, &index, &table.snapshot(), 1, &[asked]).map(|_| ())
+    };
+
+    assert_eq!(
+        planned(&known, vec![ahead(A, 150, 1.0)]),
+        Err(ForecastError::FutureNotAfter {
+            series: A,
+            time: 150
+        })
+    );
+    assert_eq!(
+        planned(&known, vec![ahead(A, 165, 1.0)]),
+        Err(ForecastError::FutureOffGrid {
+            series: A,
+            time: 165
+        })
+    );
+    assert_eq!(
+        planned(&known, vec![ahead(A, 190, 1.0)]),
+        Err(ForecastError::FuturePastHorizon {
+            series: A,
+            time: 190
+        })
+    );
+    assert_eq!(
+        planned(&known, vec![ahead(A, 160, f32::INFINITY)]),
+        Err(ForecastError::FutureNotFinite {
+            series: A,
+            time: 160
+        })
+    );
+    assert_eq!(
+        planned(&known, vec![ahead(B, 180, 1.0)]),
+        Err(ForecastError::FutureUnasked(B))
+    );
+    assert_eq!(
+        planned(
+            &spec(GroupStrategy::Alone, vec![]),
+            vec![ahead(A, 160, 1.0)]
+        ),
+        Err(ForecastError::FutureWithoutKnown)
+    );
 }
 
 #[test]

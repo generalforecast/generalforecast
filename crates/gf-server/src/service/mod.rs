@@ -88,7 +88,9 @@ use crate::name::TableName;
 use crate::partition;
 use crate::protocol::{Predictions, StrategySpec};
 use crate::quantiles::{self, quantile_values};
-use crate::shard::{Command, Description, Fence, Incoming, Lease, Lineage, LogLength, Write};
+use crate::shard::{
+    Command, Description, Fence, Incoming, KnownFuture, Lease, Lineage, LogLength, Write,
+};
 use crate::trace::{Trace, traced};
 use crate::wal::{GivenKey, LogEntry, Rows, SeriesKey, Terms, decode};
 use gf_core::columns::{self, Cells, Column, ColumnKind, Strings};

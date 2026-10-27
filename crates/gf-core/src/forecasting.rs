@@ -108,7 +108,7 @@ pub struct SeriesSpec {
 }
 
 /// A request to forecast series, each from its cutoff.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct SeriesRequest {
     pub series: Vec<SeriesKey>,
     /// Each series' cutoff, or None for the step after its latest observed value.
@@ -117,6 +117,30 @@ pub struct SeriesRequest {
     /// Each series' group, the series itself in it or not, for a table of
     /// given groups; None for a table that draws its own.
     pub groups: Option<Vec<Vec<SeriesKey>>>,
+    /// Known covariates' values past the forecast series' cutoffs that the
+    /// request brings, read in place of any rows the table holds there, so
+    /// a forecast with a known future writes nothing to the table.
+    pub future: Vec<FutureRow>,
+}
+
+/// One time of a forecast series' known future, as a request brings it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FutureRow {
+    pub series: SeriesKey,
+    pub time: i64,
+    /// One value per feature column, as a row of the table holds them; only
+    /// the known columns' are read, and NaN is a value not known.
+    pub features: Vec<f32>,
+}
+
+/// A known value a request brought for a unit's forecast: its member, its
+/// known feature column and its step past the cutoff.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Supplied {
+    pub member: usize,
+    pub column: usize,
+    pub point: usize,
+    pub value: f32,
 }
 
 /// Why a request could not be planned, or a row placed in a series table.
@@ -163,6 +187,19 @@ pub enum ForecastError {
     TooFewSeries { size: usize, held: usize },
     /// A known column the table does not have.
     KnownColumn { column: usize, features: usize },
+    /// A known future brought to a table without known columns.
+    FutureWithoutKnown,
+    /// A known future for a series the request does not forecast.
+    FutureUnasked(SeriesKey),
+    /// A known future at a time the series has observed already, or before
+    /// its forecast starts.
+    FutureNotAfter { series: SeriesKey, time: i64 },
+    /// A known future at a time off the series' grid of steps.
+    FutureOffGrid { series: SeriesKey, time: i64 },
+    /// A known future past the forecast's horizon.
+    FuturePastHorizon { series: SeriesKey, time: i64 },
+    /// A known future value that is no bounded number.
+    FutureNotFinite { series: SeriesKey, time: i64 },
     /// A time span past `i64`.
     Series(SeriesError),
 }
@@ -242,6 +279,36 @@ impl fmt::Display for ForecastError {
                 formatter,
                 "known column {column} is not one of the table's {features} covariate columns"
             ),
+            Self::FutureWithoutKnown => write!(
+                formatter,
+                "the table has no known covariates for a future to give values of"
+            ),
+            Self::FutureUnasked(series) => write!(
+                formatter,
+                "a future was given for series {}, which the request does not forecast",
+                series.0
+            ),
+            Self::FutureNotAfter { series, time } => write!(
+                formatter,
+                "series {} has observed time {time} already, or forecasts from after it: a \
+                 future gives only times after each series' latest observation",
+                series.0
+            ),
+            Self::FutureOffGrid { series, time } => write!(
+                formatter,
+                "time {time} is off the grid of series {}",
+                series.0
+            ),
+            Self::FuturePastHorizon { series, time } => write!(
+                formatter,
+                "time {time} of series {} is past the forecast's horizon",
+                series.0
+            ),
+            Self::FutureNotFinite { series, time } => write!(
+                formatter,
+                "a future value of series {} at time {time} is not a finite number",
+                series.0
+            ),
             Self::Series(error) => write!(formatter, "{error}"),
         }
     }
@@ -291,7 +358,7 @@ impl PlannedUnit {
 }
 
 /// One series' forecast: which unit it reads, where it sits, and its horizon.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct PlannedForecast {
     pub unit: usize,
     /// The target's member index in the unit.
@@ -300,10 +367,13 @@ pub struct PlannedForecast {
     /// Each member's rows from the cutoff on, over the horizon, for the known
     /// columns; empty when the table has none.
     pub future: Vec<Window>,
+    /// The known values the request brought for the unit's members, read in
+    /// place of the rows the table holds there.
+    pub supplied: Vec<Supplied>,
 }
 
 /// The units a batch of requests encodes, and each request's forecasts in order.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct SeriesPlan {
     pub units: Vec<PlannedUnit>,
     pub forecasts: Vec<Vec<PlannedForecast>>,
@@ -464,8 +534,9 @@ pub fn plan(
     let step = index.step();
     let whole = !spec.reusable || spec.has_known(features);
     let mut plan = SeriesPlan::default();
-    let mut ids: HashMap<(Fingerprint, Option<usize>), usize> = HashMap::new();
+    let mut ids: HashMap<(Fingerprint, Option<usize>, Fingerprint), usize> = HashMap::new();
     for request in requests {
+        let future = futures(spec, index, features, request)?;
         if request.series.len() != request.cutoffs.len() {
             return Err(ForecastError::Cutoffs {
                 series: request.series.len(),
@@ -541,7 +612,22 @@ pub fn plan(
                 key,
                 whole,
             };
-            let shared = (key, whole.then_some(request.horizon.get()));
+            let supplied = overlay(
+                spec,
+                index,
+                features,
+                &future,
+                &members,
+                cutoff,
+                request.horizon.get(),
+            )?;
+            // A unit forecast whole reads its group's future, so units of
+            // different known futures are different units.
+            let shared = (
+                key,
+                whole.then_some(request.horizon.get()),
+                supplied_key(&supplied),
+            );
             let unit = *ids.entry(shared).or_insert_with(|| {
                 plan.units.push(planned);
                 plan.units.len() - 1
@@ -551,7 +637,7 @@ pub fn plan(
                 .iter()
                 .position(|&member| member == series)
                 .expect("the series is a member of its unit");
-            let future = if spec.has_known(features) {
+            let windows_after = if spec.has_known(features) {
                 plan.units[unit]
                     .members
                     .iter()
@@ -566,12 +652,107 @@ pub fn plan(
                 unit,
                 target,
                 horizon: request.horizon.get(),
-                future,
+                future: windows_after,
+                supplied,
             });
         }
         plan.forecasts.push(forecasts);
     }
     Ok(plan)
+}
+
+/// A request's known future by series, checked: only of series it
+/// forecasts, of a table with known columns, with bounded values, at times
+/// after each series' latest observation.
+fn futures<'a>(
+    spec: &SeriesSpec,
+    index: &SeriesIndex,
+    features: usize,
+    request: &'a SeriesRequest,
+) -> Result<HashMap<SeriesKey, Vec<&'a FutureRow>>, ForecastError> {
+    let mut by_series: HashMap<SeriesKey, Vec<&FutureRow>> = HashMap::new();
+    if request.future.is_empty() {
+        return Ok(by_series);
+    }
+    if !spec.has_known(features) {
+        return Err(ForecastError::FutureWithoutKnown);
+    }
+    for row in &request.future {
+        let (series, time) = (row.series, row.time);
+        if !request.series.contains(&series) {
+            return Err(ForecastError::FutureUnasked(series));
+        }
+        if row.features.iter().any(|value| value.is_infinite()) {
+            return Err(ForecastError::FutureNotFinite { series, time });
+        }
+        if index
+            .latest_observed(series)
+            .is_some_and(|latest| time <= latest)
+        {
+            return Err(ForecastError::FutureNotAfter { series, time });
+        }
+        by_series.entry(series).or_default().push(row);
+    }
+    Ok(by_series)
+}
+
+/// The known values a request's future gives a group's members, by step
+/// from each member's start at `cutoff`.
+fn overlay(
+    spec: &SeriesSpec,
+    index: &SeriesIndex,
+    features: usize,
+    future: &HashMap<SeriesKey, Vec<&FutureRow>>,
+    members: &[SeriesKey],
+    cutoff: i64,
+    horizon: usize,
+) -> Result<Vec<Supplied>, ForecastError> {
+    let step = i128::from(index.step());
+    let mut supplied = Vec::new();
+    for (member, &series) in members.iter().enumerate() {
+        let Some(rows) = future.get(&series) else {
+            continue;
+        };
+        let start = i128::from(index.align(series, cutoff)?);
+        for row in rows {
+            let time = row.time;
+            let offset = i128::from(time) - start;
+            if offset < 0 {
+                return Err(ForecastError::FutureNotAfter { series, time });
+            }
+            if offset % step != 0 {
+                return Err(ForecastError::FutureOffGrid { series, time });
+            }
+            let point = usize::try_from(offset / step).unwrap_or(usize::MAX);
+            if point >= horizon {
+                return Err(ForecastError::FuturePastHorizon { series, time });
+            }
+            for &column in spec.known.iter().filter(|&&column| column < features) {
+                let value = row.features.get(column).copied().unwrap_or(f32::NAN);
+                if value.is_finite() {
+                    supplied.push(Supplied {
+                        member,
+                        column,
+                        point,
+                        value,
+                    });
+                }
+            }
+        }
+    }
+    Ok(supplied)
+}
+
+/// What tells apart units of different supplied futures; the default for none.
+fn supplied_key(supplied: &[Supplied]) -> Fingerprint {
+    supplied
+        .iter()
+        .fold(Fingerprint::default(), |key, supplied| {
+            key.salted(supplied.member as u64)
+                .salted(supplied.column as u64)
+                .salted(supplied.point as u64)
+                .salted(u64::from(supplied.value.to_bits()))
+        })
 }
 
 /// A unit's identity: its rows' fingerprint with its window folded in, then
@@ -716,6 +897,13 @@ pub fn future<E>(
             laid.values[start..start + laid.steps].fill(0.0);
             laid.observed[start..start + laid.steps].fill(false);
         }
+    }
+    let per_member = spec.rows_per_member(features);
+    for supplied in &forecast.supplied {
+        let row = supplied.member * per_member + 1 + supplied.column;
+        let at = row * laid.steps + supplied.point;
+        laid.values[at] = supplied.value;
+        laid.observed[at] = true;
     }
     Ok(laid)
 }
