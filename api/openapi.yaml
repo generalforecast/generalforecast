@@ -493,6 +493,67 @@ paths:
                           limits: {context_rows: 100000, queries: 100, inputs: 32}
                           warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]
 
+  /v1/projects/{project}/models/{model}:
+    get:
+      operationId: models.get
+      tags: [models]
+      summary: show one model of the catalog with its limits
+      parameters:
+        - $ref: "#/components/parameters/project"
+        - $ref: "#/components/parameters/model"
+      responses:
+        "200":
+          description: the model, as the catalog lists it
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelReply"
+              examples:
+                shown:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-b3c4d5e6f708192a3b4c5d6e7f8091a2
+                    resource: {kind: model, name: tabicl-v2-classifier}
+                    result:
+                      model: general-forecast/tabicl-v2-classifier@sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                      name: general-forecast/tabicl-v2-classifier
+                      task: classification
+                      repository: general-forecast/tabicl-v2-classifier
+                      revision: 5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b
+                      license: BSD-3-Clause
+                      runtime: cpu
+                      artifact:
+                        repository: general-forecast/tabicl-v2-classifier
+                        revision: 5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b
+                        digest: sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                        license: BSD-3-Clause
+                        digest_format: sha256-of-sorted-compact-json-file-sha256-map
+                        files: {LICENSE: 4f90c5fa25a2b7883d6235c7f0b11f942a37859b9f89ac36157cc485329913b4, config.json: 7ec2941cc537535e1bd8f37d33fc97cea97953343d69d765a261ee6a1605d937, model.safetensors: 58f5fc1f276744f721974079c19d2f67efacc39083c54483fe3feba52297d253}
+                      artifact_verification: required-before-load
+                      bounds: {context_rows: 100000, query_rows: 100, features: 32, classes: 10, quantile_step: null, codes: 8, estimators: 8, members: 16}
+                      capabilities:
+                        - {name: classification, state: supported}
+                        - {name: request-context, state: supported}
+                      limits: {context_rows: 100000, queries: 100, inputs: 32}
+                      warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]
+        "404":
+          description: the server serves no model of that name
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorReply"
+              examples:
+                missing:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-c4d5e6f708192a3b4c5d6e7f8091a2b3
+                    resource: {kind: model, name: nothing}
+                    error:
+                      code: NotFound
+                      message: model is not served here
+
   /healthz:
     get:
       operationId: health
@@ -557,6 +618,28 @@ paths:
                       code: ModelNotReady
                       message: general-forecast/tabicl-v2-classifier is compiling 12 programs
                       hint: poll /readyz until it answers 200
+
+  /livez:
+    get:
+      operationId: live
+      tags: [health]
+      security: []
+      summary: 200 while the process answers, whether or not its models are ready
+      description: |
+        Liveness has no project and so no envelope. It answers 200 from the
+        moment the server listens, while models still load or compile, so a
+        supervisor restarts a process that stops answering without waiting
+        on one that is only warming up; `/healthz` says when it is ready.
+      responses:
+        "200":
+          description: the process answers
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+              examples:
+                live:
+                  value: {status: ok}
 
   # ---------------------------------------------------------------------------
   # Hosted control plane. These are the resources `gf admin`, `gf push`,
@@ -1527,6 +1610,14 @@ components:
       required: true
       schema: {$ref: "#/components/schemas/Name"}
       description: the live context's name
+    model:
+      name: model
+      in: path
+      required: true
+      schema: {$ref: "#/components/schemas/Name"}
+      description: |
+        a catalog model's name without its `general-forecast/` prefix, such
+        as `tabicl-v2-classifier`, since a path segment holds no `/`
 
   responses:
     NotReady:
@@ -1987,6 +2078,14 @@ components:
         models:
           type: array
           items: {$ref: "#/components/schemas/Model"}
+
+    ModelReply:
+      allOf:
+        - $ref: "#/components/schemas/Envelope"
+        - type: object
+          required: [result]
+          properties:
+            result: {$ref: "#/components/schemas/Model"}
 
     ModelListReply:
       allOf:

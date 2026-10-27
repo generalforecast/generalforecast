@@ -203,7 +203,7 @@ function mockFetch(log = []) {
       const responses = candidates.filter((e) => e.section === "response");
       chosen = responses.find((r) => r.status === 200);
       if (pathname.endsWith("/nothing")) chosen = responses.find((r) => r.status === 404) ?? chosen;
-      if (template.path === "/healthz" || template.path === "/readyz") {
+      if (["/healthz", "/readyz", "/livez"].includes(template.path)) {
         return new Response(JSON.stringify(chosen.value), { status: chosen.status });
       }
       envelope = {
@@ -338,7 +338,7 @@ test("a capacity error carries limit and actual", async () => {
   );
 });
 
-test("predictors.list, predictors.get and models.list unwrap collections", async () => {
+test("predictors.list, predictors.get, models.list and models.get unwrap their results", async () => {
   const gf = client();
   const predictors = await gf.predictors.list();
   assert.equal(predictors[0].name, "churn");
@@ -352,6 +352,27 @@ test("predictors.list, predictors.get and models.list unwrap collections", async
   assert.match(models[0].model, /^general-forecast\/tabicl-v2-classifier@sha256:[0-9a-f]{64}$/);
   assert.equal(models.length, 1);
   assert.equal(models[0].task, "classification");
+  const model = await gf.models.get("tabicl-v2-classifier");
+  assert.equal(model.name, "general-forecast/tabicl-v2-classifier");
+  await assert.rejects(gf.models.get("nothing"), (error) => error instanceof GFError && error.code === "NotFound");
+});
+
+test("live resolves while the server answers, and the default server is the spec's", async () => {
+  const log = [];
+  await client(log).live();
+  assert.deepEqual(log.map((call) => call.pathname), ["/livez"]);
+  const asked = [];
+  const hosted = new GeneralForecast({
+    project: "acme",
+    fetch: async (url) => {
+      asked.push(url);
+      return new Response(JSON.stringify({ status: "ok" }), { status: 200 });
+    },
+  });
+  await hosted.health();
+  const hostedServer = specText.match(/servers:\n\s+- url: (\S+)/)[1];
+  assert.deepEqual(asked, [`${hostedServer}/healthz`]);
+  assert.equal(hosted.baseUrl, "https://app.generalforecast.com");
 });
 
 test("health resolves on 200 and throws ModelNotReady on 503", async () => {

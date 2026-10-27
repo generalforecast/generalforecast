@@ -23,7 +23,7 @@ export interface Options {
   apiKey?: string;
   /** the project every route is scoped to */
   project: string;
-  /** `https://api.generalforecast.com` (the default) or a `gf serve` address */
+  /** `https://app.generalforecast.com` (the default) or a `gf serve` address */
   baseUrl?: string;
   /** replaces the global `fetch`, for tests and custom transports */
   fetch?: typeof fetch;
@@ -74,7 +74,7 @@ export class GFError extends Error {
   }
 }
 
-const DEFAULT_BASE_URL = "https://api.generalforecast.com";
+const DEFAULT_BASE_URL = "https://app.generalforecast.com";
 
 function randomRequestId(): string {
   const bytes = new Uint8Array(16);
@@ -127,13 +127,23 @@ export class GeneralForecast {
 
   /** `GET /healthz`: resolves when every served model is loaded and compiled, else throws GFError(ModelNotReady). */
   async health(): Promise<void> {
-    const response = await this.fetchImpl(this.baseUrl + ROUTES.health.path, { method: "GET" });
+    return this.probe(ROUTES.health.path);
+  }
+
+  /** `GET /livez`: resolves while the server answers, whether or not its models are ready yet. */
+  async live(): Promise<void> {
+    return this.probe(ROUTES.live.path);
+  }
+
+  /** A probe outside the envelope: resolves on 200, else throws the error the server sent. */
+  private async probe(path: string): Promise<void> {
+    const response = await this.fetchImpl(this.baseUrl + path, { method: "GET" });
     if (response.status === 200) return;
     const body: unknown = await response.json().catch(() => undefined);
     const error = (body as { error?: unknown } | undefined)?.error;
     if (isApiError(error)) throw new GFError(error, response.status);
     throw new GFError(
-      { code: "Internal", message: `GET /healthz answered ${response.status}` },
+      { code: "Internal", message: `GET ${path} answered ${response.status}` },
       response.status,
     );
   }
@@ -246,5 +256,14 @@ export class Models {
       { kind: "model", name: "models" },
     );
     return result.models;
+  }
+
+  /** One served model by its name without the `general-forecast/` prefix, such as `tabicl-v2-classifier`. */
+  async get(name: string): Promise<Model> {
+    return this.client.call<Model>(
+      ROUTES["models.get"],
+      { project: this.client.project, model: name },
+      { kind: "model", name },
+    );
   }
 }

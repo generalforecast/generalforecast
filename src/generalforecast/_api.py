@@ -930,6 +930,25 @@ class ModelList(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class ModelReply(Payload):
+    """The ModelReply schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    result: Model
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("result", "result", True, _record(Model)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class ModelListReply(Payload):
     """The ModelListReply schema."""
 
@@ -2211,8 +2230,16 @@ ROUTES: tuple[Route, ...] = (
         PredictorReply,
     ),
     Route("models.list", "GET", "/v1/projects/{project}/models", None, ModelListReply),
+    Route(
+        "models.get",
+        "GET",
+        "/v1/projects/{project}/models/{model}",
+        None,
+        ModelReply,
+    ),
     Route("health", "GET", "/healthz", None, Health),
     Route("ready", "GET", "/readyz", None, Health),
+    Route("live", "GET", "/livez", None, Health),
     Route("projects.list", "GET", "/v1/projects", None, ProjectListReply),
     Route(
         "projects.create",

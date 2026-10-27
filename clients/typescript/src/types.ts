@@ -294,6 +294,10 @@ export interface ModelList {
   models: Model[];
 }
 
+export interface ModelReply extends Envelope {
+  result: Model;
+}
+
 export interface ModelListReply extends Envelope {
   result: ModelList;
 }
@@ -671,8 +675,10 @@ export const ROUTES = {
   "predictors.list": { method: "GET", path: "/v1/projects/{project}/predictors", request: "null", reply: "PredictorListReply" },
   "predictors.get": { method: "GET", path: "/v1/projects/{project}/predictors/{name}", request: "null", reply: "PredictorReply" },
   "models.list": { method: "GET", path: "/v1/projects/{project}/models", request: "null", reply: "ModelListReply" },
+  "models.get": { method: "GET", path: "/v1/projects/{project}/models/{model}", request: "null", reply: "ModelReply" },
   "health": { method: "GET", path: "/healthz", request: "null", reply: "Health" },
   "ready": { method: "GET", path: "/readyz", request: "null", reply: "Health" },
+  "live": { method: "GET", path: "/livez", request: "null", reply: "Health" },
   "projects.list": { method: "GET", path: "/v1/projects", request: "null", reply: "ProjectListReply" },
   "projects.create": { method: "POST", path: "/v1/projects", request: "ProjectCreateRequest", reply: "ProjectReply" },
   "keys.list": { method: "GET", path: "/v1/projects/{project}/keys", request: "null", reply: "KeyListReply" },
