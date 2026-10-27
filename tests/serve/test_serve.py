@@ -207,7 +207,7 @@ def test_the_ad_hoc_route_predicts_and_names_what_it_refuses(server):
     assert row["id"] == "a" and type(row["label"]) is bool
     assert set(row["probabilities"]) == {"false", "true"}
     assert body["result"]["context"]["rows"] == 2
-    assert body["result"]["context"]["kind"] == "request"
+    assert body["result"]["context"]["source"] == "request"
     assert body["result"]["model"].startswith(f"{MODEL}@sha256:")
     status, body = predict(url, adhoc_payload(model="tabicl-v2-classifier"))
     assert status == 422, body
@@ -396,7 +396,9 @@ def test_snapshot_predictor_binds_once_and_answers_predictions(predictor_dir):
         status, body = call(url, "/v1/projects/local/predictors", key=KEY)
         assert status == 200
         [described] = body["result"]["predictors"]
-        assert described["name"] == "churn" and described["inputs"] == ["x"]
+        assert described["name"] == "churn"
+        assert described["inputs"] == [{"name": "x", "type": "number", "role": "input"}]
+        assert described["environments"] == []
         assert described["model"].startswith(f"{MODEL}@sha256:")
         digest = lock_of(predictor_dir).data_digest
         assert described["context"] == {
@@ -419,9 +421,14 @@ def test_snapshot_predictor_binds_once_and_answers_predictions(predictor_dir):
         assert [row["label"] for row in result["predictions"]] == [True, False]
         assert set(result["predictions"][0]["probabilities"]) == {"false", "true"}
         assert result["task"] == "classification"
-        assert result["context"]["kind"] == "snapshot"
-        assert result["context"]["rows"] == 4
-        assert result["context"]["digest"] == digest
+        assert result["context"] == {
+            "source": "snapshot",
+            "name": None,
+            "version": None,
+            "digest": digest,
+            "rows": 4,
+            "as_of": None,
+        }
         assert result["model"].startswith(f"{MODEL}@sha256:")
         # The retired infer route is no route at all.
         status, body = call(
@@ -468,7 +475,7 @@ def test_lone_lock_file_serves_request_context(lone_lock):
             predictor_payload(context=context, queries=[{"x": 2.9}, {"x": 0.1}]),
         )
         assert status == 200, body
-        assert body["result"]["context"]["kind"] == "request"
+        assert body["result"]["context"]["source"] == "request"
         assert body["result"]["context"]["rows"] == 3
         labels = [row["label"] for row in body["result"]["predictions"]]
         assert labels == [True, False]
@@ -477,11 +484,7 @@ def test_lone_lock_file_serves_request_context(lone_lock):
         assert body["error"]["param"] == "context"
         status, body = call(url, "/v1/projects/local/predictors/scorer", key=KEY)
         assert status == 200
-        assert body["result"]["context"] == {
-            "kind": "request",
-            "rows": None,
-            "digest": None,
-        }
+        assert body["result"]["context"] == {"kind": "request"}
     finally:
         _stop(process)
 

@@ -87,6 +87,12 @@ pub struct ServedPredictor {
     /// The most context rows one request may carry, for a request context.
     #[serde(default)]
     pub max_rows: Option<usize>,
+    /// The kinds the lock declares for its columns, by name: `int`,
+    /// `float`, `0/1`, `category`, `text`, `timestamp` or `bool`. A context
+    /// the lock holds no schema for is typed by them, as the binder types it
+    /// in process; a column without one is typed by every value it holds.
+    #[serde(default)]
+    pub types: std::collections::BTreeMap<String, String>,
 }
 
 /// How a forecast predictor's rows form its related series.
@@ -831,6 +837,64 @@ impl ServedPredictor {
         }
     }
 
+    /// The lock's inputs as a predictor resource lists them: each column's
+    /// name, its type (`number`, `category`, `text`, `boolean`, `date` or
+    /// `timestamp`), and its role: `input` for a tabular predictor, `past`
+    /// or `future` for a forecaster's covariates.
+    #[must_use]
+    pub fn described_inputs(&self) -> Vec<Value> {
+        let roles: Vec<(&str, &str)> = match &self.forecast {
+            Some(forecast) => forecast
+                .past_inputs
+                .iter()
+                .map(|name| (name.as_str(), "past"))
+                .chain(
+                    forecast
+                        .future_inputs
+                        .iter()
+                        .map(|name| (name.as_str(), "future")),
+                )
+                .collect(),
+            None => self
+                .inputs
+                .iter()
+                .map(|name| (name.as_str(), "input"))
+                .collect(),
+        };
+        roles
+            .into_iter()
+            .map(|(name, role)| json!({"name": name, "type": self.column_type(name), "role": role}))
+            .collect()
+    }
+
+    /// A column's type as the API names it: by the kind the lock declares,
+    /// else by its locked storage, else a number.
+    fn column_type(&self, name: &str) -> &'static str {
+        let declared = self.types.get(name).map(|kind| match kind.as_str() {
+            "category" => "category",
+            "text" => "text",
+            "timestamp" => "timestamp",
+            "bool" => "boolean",
+            _ => "number",
+        });
+        let stored = || {
+            self.schema
+                .columns
+                .iter()
+                .find(|column| column.name == name)
+                .map(
+                    |column| match (column.physical.as_str(), column.semantic.as_deref()) {
+                        (_, Some("category")) | ("string", _) => "category",
+                        ("boolean", _) => "boolean",
+                        ("date", _) => "date",
+                        ("timestamp", _) => "timestamp",
+                        _ => "number",
+                    },
+                )
+        };
+        declared.or_else(stored).unwrap_or("number")
+    }
+
     /// Whether each request names its own features and target, because the
     /// lock holds no schema.
     #[must_use]
@@ -839,40 +903,130 @@ impl ServedPredictor {
     }
 }
 
+/// The Arrow storage a declared kind takes, as `tables.PHYSICAL` has it.
+fn declared_physical(kind: &str) -> Option<&'static str> {
+    Some(match kind {
+        "int" | "0/1" => "int64",
+        "float" => "float64",
+        "category" | "text" => "string",
+        "timestamp" => "timestamp",
+        "bool" => "boolean",
+        _ => return None,
+    })
+}
+
+/// The storage a column of JSON values takes, judged by all of them, as
+/// Arrow types a list of them: text if any is text, else a float if any
+/// number has a fraction, else whole numbers, else booleans; numbers if it
+/// holds no value at all.
+fn observed_physical<'a>(values: impl Iterator<Item = &'a Value>) -> &'static str {
+    let (mut text, mut fraction, mut whole, mut boolean) = (false, false, false, false);
+    for value in values {
+        match value {
+            Value::String(_) => text = true,
+            Value::Number(number) if number.is_i64() || number.is_u64() => whole = true,
+            Value::Number(_) => fraction = true,
+            Value::Bool(_) => boolean = true,
+            _ => {}
+        }
+    }
+    if text {
+        "string"
+    } else if fraction {
+        "float64"
+    } else if whole {
+        "int64"
+    } else if boolean {
+        "boolean"
+    } else {
+        "float64"
+    }
+}
+
+/// A column's storage and the binder's override for it, from the kind the
+/// lock declares and the storage its values take, as the binder types it in
+/// process (`tables.semantic`): a time the lock calls a timestamp is one, a
+/// float column of whole numbers widens, and a category or boolean stored
+/// otherwise is read as categories.
+///
+/// # Errors
+///
+/// `ValidationError` naming `inputs.types` for a kind the values cannot
+/// hold, such as a float stored as text.
+fn kind_storage(
+    name: &str,
+    kind: Option<&str>,
+    observed: Option<&'static str>,
+) -> Result<(&'static str, Option<&'static str>), RequestError> {
+    let Some(kind) = kind else {
+        return Ok((observed.unwrap_or("float64"), None));
+    };
+    let Some(observed) = observed else {
+        return Ok((declared_physical(kind).unwrap_or("float64"), None));
+    };
+    let categorical = matches!(kind, "category" | "text");
+    Ok(match (kind, observed) {
+        ("timestamp", "string" | "int64" | "timestamp") => ("timestamp", None),
+        ("float", "int64") => ("float64", None),
+        ("int" | "float" | "0/1", "int64" | "float64" | "boolean") => (observed, None),
+        (_, "int64" | "boolean") if categorical => (observed, Some("category")),
+        (_, "string") if categorical => ("string", None),
+        ("bool", "boolean") => ("boolean", None),
+        ("bool", "string" | "int64") => (observed, Some("category")),
+        _ => {
+            return Err(RequestError::new(
+                "ValidationError",
+                format!("column {name:?} holds {observed} values, which cannot be read as {kind}"),
+                422,
+            )
+            .param("inputs.types"));
+        }
+    })
+}
+
 /// A schema for rows a lock holds none for: `features` as inputs and
-/// `target`, each typed by its first value.
-#[must_use]
-pub fn inferred(features: &[String], target: &str, rows: &[Value]) -> Schema {
-    let column = |name: &str, role: &str| {
-        let physical = rows
+/// `target`, each typed by the kind `types` declares for it and the storage
+/// every value the rows hold takes, so a whole first value of a float
+/// column, or a time the lock calls a timestamp, types the column as the
+/// binder does in process.
+///
+/// # Errors
+///
+/// As `kind_storage`, for a kind a column's values cannot hold.
+pub fn inferred(
+    features: &[String],
+    target: &str,
+    rows: &[Value],
+    types: &std::collections::BTreeMap<String, String>,
+) -> Result<Schema, RequestError> {
+    let column = |name: &str, role: &str| -> Result<SchemaColumn, RequestError> {
+        let mut values = rows
             .iter()
             .filter_map(|row| row.get(name))
-            .find(|value| !value.is_null())
-            .map_or("float64", |value| match value {
-                Value::Bool(_) => "boolean",
-                Value::Number(number) if number.is_i64() || number.is_u64() => "int64",
-                Value::String(_) => "string",
-                _ => "float64",
-            });
-        SchemaColumn {
+            .filter(|value| !value.is_null())
+            .peekable();
+        let observed = values.peek().is_some().then(|| observed_physical(values));
+        let (physical, semantic) =
+            kind_storage(name, types.get(name).map(String::as_str), observed)?;
+        Ok(SchemaColumn {
             name: name.to_string(),
             physical: physical.to_string(),
             nullable: true,
             role: role.to_string(),
-            semantic: None,
-        }
+            semantic: semantic.map(str::to_string),
+        })
     };
-    let mut columns: Vec<SchemaColumn> = features
+    let mut columns = features
         .iter()
         .map(|feature| column(feature, "input"))
-        .collect();
-    columns.push(column(target, "target"));
-    Schema {
+        .collect::<Result<Vec<_>, _>>()?;
+    columns.push(column(target, "target")?);
+    Ok(Schema {
         columns,
         rows: None,
         classes: Value::Null,
         frequency: None,
-    }
+    })
 }
 
 /// Refuses a column whose row holds `value`, which its declared type does

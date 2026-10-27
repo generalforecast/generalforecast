@@ -4,6 +4,11 @@
 //! `gf-server run --config generalforecast.toml`: serves tables over Arrow Flight.
 //! `init` writes a starter configuration, and `check` looks at everything a
 //! configuration needs before starting.
+//!
+//! `run --parent-fd <N>`, or `GF_PARENT_FD=<N>`, ties the server to the
+//! process that started it: `<N>` is the read end of a pipe whose write end
+//! that process alone holds, and once it closes the server drains and exits
+//! as on SIGTERM; see `gf_server::parent`.
 
 use std::error::Error;
 use std::io::IsTerminal;
@@ -47,6 +52,13 @@ enum Subcommand {
         /// The configuration file.
         #[arg(long)]
         config: PathBuf,
+        /// An inherited file descriptor: the read end of a pipe whose write
+        /// end only the parent process holds. Once the parent exits, however
+        /// it dies, the server drains and exits as on SIGTERM. The
+        /// environment variable GF_PARENT_FD names one when this flag does
+        /// not; the flag wins if both are given.
+        #[arg(long, value_name = "N")]
+        parent_fd: Option<i32>,
     },
     /// Writes a starter configuration for one server on this machine.
     Init {
@@ -93,7 +105,14 @@ struct Status {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     match Arguments::parse().command {
-        Subcommand::Run { config } => run(&config).await,
+        Subcommand::Run { config, parent_fd } => {
+            // An fd that cannot be watched is a usage error, as clap's own are.
+            let parent = gf_server::parent::named(parent_fd).unwrap_or_else(|error| {
+                eprintln!("gf-server: {error}");
+                std::process::exit(2);
+            });
+            run(&config, parent).await
+        }
         Subcommand::Init {
             path,
             listen,
@@ -180,7 +199,10 @@ fn init(
     Ok(())
 }
 
-async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
+async fn run(
+    config: &std::path::Path,
+    parent: Option<std::os::fd::OwnedFd>,
+) -> Result<(), Box<dyn Error>> {
     gf_server::trace::init_logging();
     gf_server::trace::abort_on_panic();
     let path = config;
@@ -198,7 +220,7 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
     tokio::spawn({
         let draining = draining.clone();
         async move {
-            shutdown().await;
+            shutdown(parent).await;
             draining.store(true, Ordering::SeqCst);
             let _ = stop.send(true);
             tokio::time::sleep(drain).await;
@@ -769,13 +791,23 @@ async fn listen_http(
     Ok((front, url, served))
 }
 
-/// Resolves on Ctrl-C or SIGTERM.
-async fn shutdown() {
+/// Resolves on Ctrl-C or SIGTERM, or once the parent `parent` names is gone.
+async fn shutdown(parent: Option<std::os::fd::OwnedFd>) {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("signal handler");
+    let parent_gone = async move {
+        match parent {
+            Some(fd) => {
+                let _ = gf_server::parent::gone(fd).await;
+                tracing::info!("the parent process is gone");
+            }
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
+        () = parent_gone => {}
     }
     tracing::info!("draining");
 }

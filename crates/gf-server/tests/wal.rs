@@ -3,6 +3,8 @@
 
 //! The write-ahead log: encrypted, durable, and replayed in order.
 
+mod common;
+
 use std::fs::OpenOptions;
 use std::io::Write;
 
@@ -906,13 +908,7 @@ fn startup_refuses_a_missing_key_keeps_short_logs_and_sets_damaged_ones_aside() 
 }
 
 fn tempdir() -> std::path::PathBuf {
-    // Tests run in parallel, so a counter keeps their directories apart.
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("gf-wal-{}-{index}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&path);
-    std::fs::create_dir_all(&path).unwrap();
-    path
+    common::scratch("wal")
 }
 
 #[test]

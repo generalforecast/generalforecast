@@ -65,6 +65,19 @@ impl TableState {
             .retain(|(request, _, _)| !requests.contains(request));
     }
 
+    /// Takes every request the table holds out of its queues, for a failure
+    /// of the table's own to refuse them all.
+    pub(super) fn take_requests(&mut self) -> Vec<RequestId> {
+        let mut requests: Vec<RequestId> = self.pending.drain(..).map(|(id, _, _)| id).collect();
+        requests.extend(self.later.drain(..).map(|(id, _, _)| id));
+        requests.extend(self.givens.drain(..).map(|(id, _, _)| id));
+        requests.extend(self.forecasts.drain(..).map(|(id, _)| id));
+        self.given = None;
+        self.deferred = None;
+        self.generation += 1;
+        requests
+    }
+
     /// The pending requests a plan gives a context of unlabeled rows alone,
     /// which says nothing of any target.
     pub(super) fn blind(&self, planned: &Plan) -> Vec<RequestId> {

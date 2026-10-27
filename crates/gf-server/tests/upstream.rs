@@ -17,7 +17,7 @@ use axum::response::Response;
 use futures::StreamExt;
 use gf_core::catalog::Surface;
 use gf_server::budget::RequestBudget;
-use gf_server::http::{Front, Static, dotted, internal, owns, router};
+use gf_server::http::{Front, Static, ambiguous, internal, owns, router};
 use gf_server::upstream::Upstream;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -467,21 +467,26 @@ async fn the_upstream_is_ready_only_while_its_readyz_answers_200() {
 }
 
 #[test]
-fn dot_segments_are_recognized_however_they_are_escaped() {
+fn dot_segments_and_escaped_separators_are_recognized_however_they_are_spelled() {
     for path in [
         "/./internal/v1/keys:introspect",
         "/%2e/internal/v1/keys:introspect",
         "/v1/../internal/v1/keys:introspect",
         "/v1/projects/p/x/%2E%2e/predict",
+        "/internal%2Fv1/keys:introspect",
+        "/internal%2fv1/keys:introspect",
+        "/v1%2Fprojects/p/predict",
+        "/v1/projects/p%5Cx/predict",
+        "/v1/projects/p\\x/predict",
     ] {
-        assert!(dotted(path), "{path}");
+        assert!(ambiguous(path), "{path}");
     }
     for path in [
         "/v1/projects/p/predict",
         "/v1/projects/p/.hidden",
         "/v1/projects/p/a..b",
     ] {
-        assert!(!dotted(path), "{path}");
+        assert!(!ambiguous(path), "{path}");
     }
 }
 
@@ -494,6 +499,8 @@ async fn no_spelling_of_a_route_reaches_the_upstream_as_another() {
         "/v1/../internal/v1/keys:introspect",
         "/v1/projects/p/x/../predict",
         "/v1/proj%65cts/p/predict",
+        "/internal%2Fv1/keys:introspect",
+        "/v1%2Fprojects/p/predict",
     ] {
         // Sent as written, without the client resolving its dot segments.
         let mut stream = tokio::net::TcpStream::connect(front.trim_start_matches("http://"))

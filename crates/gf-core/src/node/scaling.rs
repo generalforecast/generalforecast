@@ -215,7 +215,7 @@ impl Columns {
 }
 
 /// What drift is measured against: the state's rows and columns at its fit.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(super) struct Fitted {
     /// The served rows the fit drew on: those it read, or for a fit on a
     /// sample, those the sample was drawn from; labeled ones, and unlabeled
