@@ -90,7 +90,11 @@ def test_error_codes_are_the_contract_set():
         "ModelNotReady",
         "Internal",
         "Conflict",
+        "Unsupported",
     ]
+    from generalforecast.errors import WIRE_ERROR_CODES
+
+    assert {code.value for code in _api.ErrorCode} == WIRE_ERROR_CODES
     for example in EXAMPLES:
         if example.status is not None and example.status >= 400:
             error = example.value["error"]
