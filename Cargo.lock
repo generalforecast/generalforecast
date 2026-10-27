@@ -348,6 +348,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3ded4057c258ba199e2d26386d3af3780957ecaee6c4ef4041c6b4b8b97c0b06"
 
 [[package]]
+name = "blake2"
+version = "0.10.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46502ad458c9a52b69d4d4d32775c788b7a1b85e8bc9d482d92250fc0e3f8efe"
+dependencies = [
+ "digest",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -584,6 +593,7 @@ checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
  "block-buffer",
  "crypto-common",
+ "subtle",
 ]
 
 [[package]]
@@ -616,7 +626,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -789,14 +799,14 @@ dependencies = [
 
 [[package]]
 name = "gf-assign"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "gf-cli"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "clap",
  "reqwest",
@@ -807,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "gf-core"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -821,7 +831,7 @@ dependencies = [
 
 [[package]]
 name = "gf-py"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -836,7 +846,7 @@ dependencies = [
 
 [[package]]
 name = "gf-router"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -859,7 +869,7 @@ dependencies = [
 
 [[package]]
 name = "gf-server"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -868,6 +878,7 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "axum",
+ "blake2",
  "bytes",
  "chacha20poly1305",
  "clap",
@@ -1731,7 +1742,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

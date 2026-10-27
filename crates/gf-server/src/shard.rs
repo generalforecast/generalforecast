@@ -79,7 +79,7 @@ use crate::routes::Routes;
 use crate::service::Charge;
 use crate::wal::{
     self, Compacted, Compactor, CreationId, Durability, EncryptionKey, Log, LogEntry, LogError,
-    PastWrite, Record, Replay, RowSealer, Rows, TableDefinition, Terms, decode,
+    PastWrite, Record, Replay, RowSealer, Rows, SeriesKey, TableDefinition, Terms, decode,
 };
 use crate::worker::{self, WorkerConnection};
 use gf_core::columns::{self, Strings, Vocabulary, Words};
@@ -575,6 +575,8 @@ pub struct Description {
     pub vocabularies: Vec<Vec<String>>,
     /// A classifier's labels in code order, if its targets are strings.
     pub labels: Vec<String>,
+    /// How many series the table holds the keys of, for a table of series.
+    pub series: Option<u64>,
 }
 
 /// What a shard is asked to do.
@@ -643,6 +645,12 @@ pub enum Command {
     Describe {
         table: TableName,
         reply: Reply<Description>,
+    },
+    /// The keys of a table's series as clients gave them, in the order the
+    /// table first saw them.
+    KnownSeries {
+        table: TableName,
+        reply: Reply<Vec<SeriesKey>>,
     },
     /// A table's log entries from a sequence number, at most `limit` of them,
     /// with their sequence numbers.
@@ -778,12 +786,68 @@ struct Entry {
     levels: Option<Vec<f64>>,
     /// One per column; only categorical columns' hold words.
     vocabularies: Vec<Vocabulary>,
+    /// The series the table holds the keys of, for a table of series.
+    series: SeriesKeys,
     /// The log length a compaction on the shard's own account waits for, and
     /// how much longer the next wait is: each failed try copies the whole
     /// table, so the waits double.
     compact_after: u64,
     compact_wait: u64,
     metrics: Arc<TableMetrics>,
+}
+
+/// What a table keeps of its records besides rows: its columns' words and
+/// its series' keys.
+#[derive(Clone, Debug, Default)]
+struct Learned {
+    vocabularies: Vec<Vocabulary>,
+    series: SeriesKeys,
+}
+
+/// The series a table of series has been given the keys of, in the order it
+/// first saw them, with the digests it knows them by.
+#[derive(Clone, Debug, Default)]
+struct SeriesKeys {
+    keys: Vec<SeriesKey>,
+    digests: HashSet<u64>,
+}
+
+impl SeriesKeys {
+    fn keys(&self) -> &[SeriesKey] {
+        &self.keys
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    /// The keys among `named` the table does not hold yet, each once and
+    /// checked to read back, in the order named.
+    fn new_among(&self, named: Vec<SeriesKey>) -> Result<Vec<SeriesKey>, String> {
+        let mut fresh = Vec::new();
+        let mut seen = HashSet::new();
+        for key in named {
+            key.check()?;
+            if !self.digests.contains(&key.digest) && seen.insert(key.digest) {
+                fresh.push(key);
+            }
+        }
+        Ok(fresh)
+    }
+
+    /// Follows a record: a snapshot's keys are every key and a truncate
+    /// leaves none, and rows add the keys they name that are not held.
+    fn track(&mut self, record: &Record) {
+        if matches!(record, Record::Snapshot(_) | Record::Truncate) {
+            self.keys.clear();
+            self.digests.clear();
+        }
+        for key in record.series() {
+            if self.digests.insert(key.digest) {
+                self.keys.push(key.clone());
+            }
+        }
+    }
 }
 
 /// A table made from rows gathered for given contexts.
@@ -1419,9 +1483,26 @@ impl Shard {
                             .get(entry.definition.columns.len())
                             .map(|vocabulary| vocabulary.words().to_vec())
                             .unwrap_or_default(),
+                        series: entry
+                            .definition
+                            .series
+                            .is_some()
+                            .then(|| entry.series.len() as u64),
                     })
                 });
                 let _ = reply.send(described);
+            }
+            Command::KnownSeries { table, reply } => {
+                let known = self.entry(&table).and_then(|_| {
+                    let entry = &self.tables[&table];
+                    if entry.definition.series.is_none() {
+                        return Err(ServerError::Invalid(format!(
+                            "table {table:?} holds rows, not series"
+                        )));
+                    }
+                    Ok(entry.series.keys().to_vec())
+                });
+                let _ = reply.send(known);
             }
             Command::Models { reply } => {
                 let _ = reply.send(Ok(self.worker.models.clone()));
@@ -2009,6 +2090,20 @@ impl Shard {
         let target = entry.definition.columns.len();
         let labelled = strings.iter().any(|(column, _)| *column == target);
         self.check_labels(table, labelled)?;
+        if !rows.series.is_empty() {
+            if entry.definition.series.is_none() {
+                return Err(ServerError::Invalid(format!(
+                    "table {table:?} holds rows, not series, so its writes name no series keys"
+                )));
+            }
+            // The record carries the keys new to the table. A write staged
+            // earlier in the batch may carry a key again, since it applies
+            // after this one is prepared; replay takes each key once.
+            rows.series = entry
+                .series
+                .new_among(std::mem::take(&mut rows.series))
+                .map_err(ServerError::Invalid)?;
+        }
         for (column, values) in strings {
             let vocabulary = entry
                 .vocabularies
@@ -2992,6 +3087,7 @@ impl Shard {
         let (id, outputs, levels) = self.serve(&definition, false).await?;
         let path = self.log_path(&definition.name);
         let mut vocabularies = vec![Vocabulary::default(); vocabularies_of(&definition)];
+        let mut series = SeriesKeys::default();
         let mut replayed = Ok(());
         while let Some(record) = replay.next() {
             let record = match record {
@@ -3012,6 +3108,7 @@ impl Shard {
                 record.words(),
                 matches!(record, Record::Snapshot(_)),
             );
+            series.track(&record);
             // The worker starts empty, so a refit's drops have nothing to drop.
             if let Err(error) = self.apply_logged(id, record, replay.length()) {
                 self.unserve(id).await;
@@ -3027,7 +3124,10 @@ impl Shard {
                     outputs,
                     levels.clone(),
                     log,
-                    Some(vocabularies),
+                    Some(Learned {
+                        vocabularies,
+                        series,
+                    }),
                 );
                 Ok(levels)
             }
@@ -3053,10 +3153,15 @@ impl Shard {
         outputs: u64,
         levels: Option<Vec<f64>>,
         log: Log,
-        vocabularies: Option<Vec<Vocabulary>>,
+        learned: Option<Learned>,
     ) {
-        let vocabularies = vocabularies
-            .unwrap_or_else(|| vec![Vocabulary::default(); vocabularies_of(definition)]);
+        let Learned {
+            vocabularies,
+            series,
+        } = learned.unwrap_or_else(|| Learned {
+            vocabularies: vec![Vocabulary::default(); vocabularies_of(definition)],
+            series: SeriesKeys::default(),
+        });
         self.names.insert(id, definition.name.clone());
         self.tables.insert(
             definition.name.clone(),
@@ -3067,6 +3172,7 @@ impl Shard {
                 outputs,
                 levels,
                 vocabularies,
+                series,
                 compact_after: 0,
                 compact_wait: COMPACT_RECORDS,
                 metrics: self.metrics.table(definition.name.as_str()),
@@ -3109,7 +3215,19 @@ impl Shard {
         log_length: u64,
     ) -> Result<(Written, Vec<Movement>), ServerError> {
         self.learn(id, record.words(), matches!(record, Record::Snapshot(_)));
+        self.track_series(id, &record);
         self.apply_logged(id, record, log_length)
+    }
+
+    /// Follows a record's series keys in its table's.
+    fn track_series(&mut self, id: TableId, record: &Record) {
+        if let Some(entry) = self
+            .names
+            .get(&id)
+            .and_then(|name| self.tables.get_mut(name))
+        {
+            entry.series.track(record);
+        }
     }
 
     /// Applies a logged record as `apply_record` does, but for the words it
@@ -3629,6 +3747,7 @@ impl Shard {
                         std::slice::from_ref(&snapshot),
                     )?;
                     self.unsaved_heads.insert(self.names[&id].clone());
+                    self.track_series(id, &snapshot);
                     let Record::Snapshot(rows) = snapshot else {
                         unreachable!("matched a snapshot above");
                     };
@@ -3725,6 +3844,7 @@ impl Shard {
                 values: vocabulary.words().to_vec(),
             })
             .collect();
+        let series = entry.series.keys().to_vec();
         let writes = self.recent.get(&id).map_or_else(Vec::new, |recent| {
             recent
                 .order
@@ -3743,7 +3863,7 @@ impl Shard {
         let sender = self.compacted.clone();
         let table = name.clone();
         tokio::task::spawn_blocking(move || {
-            let compacted = write_compaction(compactor, &source, words, writes, per_record);
+            let compacted = write_compaction(compactor, &source, words, series, writes, per_record);
             let _ = sender.send(Finished {
                 table,
                 number,
@@ -4525,12 +4645,14 @@ fn apply_compacted(node: &mut Node, id: TableId, rows: Rows) -> Result<(), NodeE
 }
 
 /// Writes a table's compaction, part by part, from rows as they were when
-/// it began: the snapshot first, with the table's layout, its words and its
-/// clients' recent writes, then the rest as inserts that continue it.
+/// it began: the snapshot first, with the table's layout, its words, its
+/// series' keys and its clients' recent writes, then the rest as inserts
+/// that continue it.
 fn write_compaction(
     mut compactor: Compactor,
     source: &CompactionSource,
     mut words: Vec<Words>,
+    mut series: Vec<SeriesKey>,
     mut writes: Vec<PastWrite>,
     per_record: usize,
 ) -> Result<Compacted, String> {
@@ -4547,6 +4669,7 @@ fn write_compaction(
             times: Some(part.times),
             id: None,
             words: std::mem::take(&mut words),
+            series: std::mem::take(&mut series),
             writes: std::mem::take(&mut writes),
             layout: Some(layout),
             table: first.then(|| Box::new(source.table.clone())),

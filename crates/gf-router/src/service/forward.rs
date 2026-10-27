@@ -348,7 +348,9 @@ impl Router {
         if let Some(table) = parsed.table() {
             let reads = matches!(
                 parsed,
-                FlightAction::Describe { .. } | FlightAction::Locate(_)
+                FlightAction::Describe { .. }
+                    | FlightAction::KnownSeries(_)
+                    | FlightAction::Locate(_)
             );
             reachable(&scope, table, reads)?;
         }
@@ -414,7 +416,9 @@ impl Router {
                     .collect();
                 vec![json!({"nodes": names})]
             }
-            FlightAction::Describe { table, .. } => self.read_action(table, &action).await?,
+            FlightAction::Describe { table, .. } | FlightAction::KnownSeries(table) => {
+                self.read_action(table, &action).await?
+            }
             FlightAction::CreateTable(definition) => {
                 self.write_action(&definition.name, &action, &parsed)
                     .await?
@@ -528,6 +532,7 @@ impl FlightService for Router {
         let actions = [
             "create_table",
             "describe",
+            "known_series",
             "delete",
             "truncate",
             "refit",
