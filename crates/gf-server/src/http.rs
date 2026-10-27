@@ -1742,7 +1742,7 @@ async fn predictor_predict(
 }
 
 /// The ad hoc route's body: a manifest fragment (`model`, `target`, and
-/// optionally `inputs`, `id`, `quantiles`, `outputs`, `selection`) with the
+/// optionally `inputs`, `id`, `quantiles`, `outputs`; `selection` is refused) with the
 /// `context` and `queries` rows, for a catalog model served here.
 async fn adhoc_predict(front: &Front, payload: &Value, charge: Charge) -> Result<Value, ApiError> {
     adhoc_predict_with(front, front.engine()?, payload, charge).await
@@ -1798,10 +1798,14 @@ async fn adhoc_predict_with(
             .param(field));
         }
     }
-    if let Some(selection) = body.get("selection")
-        && !selection.is_object()
-    {
-        return Err(ApiError::validation("selection must be an object").param("selection"));
+    if body.contains_key("selection") {
+        // A selection resolves against a model's row cap as `gf check`
+        // resolves it; this route binds every row, so it refuses one rather
+        // than drop it. A predictor's lock carries its resolved selection.
+        return Err(ApiError::validation(
+            "selection is resolved into a predictor's gf.lock; serve a predictor to select rows",
+        )
+        .param("selection"));
     }
     let target = &body["target"];
     let target_name = target

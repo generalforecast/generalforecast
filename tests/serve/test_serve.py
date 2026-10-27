@@ -188,6 +188,7 @@ def test_the_ad_hoc_route_predicts_and_names_what_it_refuses(server):
         ("task", "classification"),
         ("options", {}),
         ("features", ["x"]),
+        ("selection", {"core": 1, "neighbors": 1}),
     ]:
         status, body = predict(url, adhoc_payload(**{field: value}))
         assert (status, body["error"]["param"]) == (422, field), body
