@@ -498,6 +498,7 @@ class Worker:
             ),
             ahead=compile_ahead,
             manifests=self._manifest_dir,
+            dropped=self._chunks.forget_counts,
         )
         self._models: dict[int, _Model] = {}
         # The spec each model was loaded from, under which its kinds of call are recorded.
@@ -514,7 +515,8 @@ class Worker:
         self._checked: set[tuple[int, int, int]] = set()
         self._disk_path = disk_path
         self._slots = (0, 0, 0)
-        self.allocate(0, 0, 0)
+        self._pools(0, 0, 0)
+        self._allocated = False
         self._contexts: dict[CacheKey, Context] = {}
         # The leaves a series cache keeps beside its patches, by entry.
         self._fixed: dict[CacheKey, list[Any]] = {}
@@ -542,6 +544,11 @@ class Worker:
             host_slots: Slots in its host tier.
             disk_slots: Slots in its disk tier, if the worker has a disk path.
         """
+        self._pools(device_slots, host_slots, disk_slots)
+        self._allocated = True
+
+    def _pools(self, device_slots: int, host_slots: int, disk_slots: int) -> None:
+        """Makes the pools at these sizes, freeing the old device pool first."""
         self._slots = (device_slots, host_slots, disk_slots)
         self._pool_bytes = device_slots * self._slot_bytes
         # What calls that ran out of memory beside the old pool taught no longer holds.
@@ -559,8 +566,12 @@ class Worker:
 
     @property
     def allocated(self) -> bool:
-        """Whether `allocate` sized the pools, which steps and `warm_start` read."""
-        return hasattr(self, "_device")
+        """Whether `allocate` sized the pools, which steps and `warm_start` read.
+
+        Until then the pools are empty, so a warm-up would compile paged
+        decodes for a pool of no slots.
+        """
+        return self._allocated
 
     @property
     def _call_bytes(self) -> int:
@@ -598,7 +609,7 @@ class Worker:
         self._contexts.clear()
         self._fixed.clear()
         self._pages.clear()
-        self.allocate(*self._slots)
+        self._pools(*self._slots)
 
     def add_model(
         self,
@@ -1192,6 +1203,8 @@ class Worker:
 
         Returns:
             Predictions per request id, and an error message per failed table.
+            A table `deferred` names has neither: it answers once its program
+            is ready, and a failed table is never deferred.
         """
         self.deferred = {}
         with self.stats.timed("move"):
@@ -1207,7 +1220,11 @@ class Worker:
             if not tables:
                 raise
             if len(tables) == 1:
+                self.deferred.pop(tables[0], None)
                 return {}, {tables[0]: _message(error)}
+        # Each part defers its table again if its program is still being
+        # readied, and not if it was readied meanwhile and the part answered.
+        self.deferred = {}
         predictions: dict[int, np.ndarray] = {}
         failed: dict[int, str] = {}
         for table in tables:
@@ -1215,6 +1232,7 @@ class Worker:
                 predictions.update(self._counted(_part(step, table)))
             except Exception as error:  # noqa: BLE001
                 failed[table] = _message(error)
+                self.deferred.pop(table, None)
         return predictions, failed
 
     def _counted(self, step: Step) -> dict[int, np.ndarray]:

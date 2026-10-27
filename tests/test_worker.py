@@ -8,9 +8,16 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
+from generalforecast import protocol
+from generalforecast._core import CacheKey
 from generalforecast.constants import STACK_CHUNK
-from generalforecast.worker import _stacked
+from generalforecast.models.conformance import table as conformance_table
+from generalforecast.models.tabicl.model import tabicl_functions
+from generalforecast.worker import Worker, _stacked
+from tests.models.conformance.cases import FEATURES
+from tests.models.tabicl.tiny import tiny_tabicl
 
 
 def _item(index: int) -> tuple:
@@ -45,3 +52,105 @@ def test_a_new_count_past_a_chunk_compiles_only_its_join() -> None:
         jax.monitoring.unregister_event_duration_listener(compile_event)
         jax.config.update("jax_enable_compilation_cache", True)
     assert compiled == ["jit(_join_columns)"]
+
+
+def _fused(worker: Worker, tables: int) -> tuple[Any, Any]:
+    """Tables of a tiny classifier, and a step fusing each named one with its queries."""
+    data = conformance_table(False, rows=48, queries=6)
+    worker.add_model(0, tabicl_functions, tiny_tabicl(regression=False))
+    worker.allocate(256, 0, 0)
+    for index in range(tables):
+        worker.add_table(index, 0, data.num_classes, FEATURES)
+
+    def step(indices: list[int]) -> protocol.Step:
+        units, batches = [], []
+        for at, index in enumerate(indices):
+            key = CacheKey(index, 0, 0, "context", 1)
+            rows = np.arange(48, dtype=np.uint32)
+            features = np.asarray(data.features) + np.float32(index)
+            targets = np.asarray(data.targets)
+            units.append(protocol.Unit(index, key, rows, "fuse", [], features, targets))
+            queries = np.asarray(data.queries)
+            batches.append(
+                protocol.QueryBatch(index, index, index, queries, [at] * len(queries))
+            )
+        return protocol.Step([], [], [], units, batches)
+
+    return data, step
+
+
+def test_a_worker_is_allocated_only_once_told_its_tiers() -> None:
+    worker = Worker(slot_bytes=4096, compile_cache=False, compile_ahead=False)
+    assert not worker.allocated
+    worker.forget_cache()
+    assert not worker.allocated
+
+    worker.allocate(4, 0, 0)
+
+    assert worker.allocated
+    worker.forget_cache()
+    assert worker.allocated
+
+
+def test_a_table_its_part_answers_after_the_whole_step_failed_is_not_deferred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = Worker(slot_bytes=4096, compile_ahead=False)
+    _, step = _fused(worker, 2)
+    # Table 0's program is being readied as the whole step runs, and is ready
+    # by the time its part runs alone; table 1 fails either way.
+    readying = [True]
+
+    def defers(unit: Any, arguments: tuple) -> bool:
+        if unit.table == 0 and readying[0]:
+            readying[0] = False
+            worker.deferred[0] = "readying"
+            return True
+        return False
+
+    called = worker._call
+
+    def failing(stage: str, work: Any, consume: Any = None) -> list[Any]:
+        if stage == "fit_decode" and work[0][0] == 1:
+            raise RuntimeError("table 1 failed")
+        return called(stage, work, consume)
+
+    monkeypatch.setattr(worker, "_defers", defers)
+    monkeypatch.setattr(worker, "_call", failing)
+
+    predictions, failed = worker.run_apart(step([0, 1]))
+
+    assert list(predictions) == [0]
+    assert failed == {1: "RuntimeError: table 1 failed"}
+    assert worker.deferred == {}
+
+
+def test_a_failed_table_is_never_also_deferred(monkeypatch: pytest.MonkeyPatch) -> None:
+    worker = Worker(slot_bytes=4096, compile_ahead=False)
+    _, step = _fused(worker, 2)
+
+    def defers(unit: Any, arguments: tuple) -> bool:
+        worker.deferred[unit.table] = "readying"
+        if unit.table == 1:
+            raise RuntimeError("table 1 failed")
+        return True
+
+    monkeypatch.setattr(worker, "_defers", defers)
+
+    predictions, failed = worker.run_apart(step([0, 1]))
+
+    assert predictions == {}
+    assert failed == {1: "RuntimeError: table 1 failed"}
+    assert worker.deferred == {0: "readying"}
+
+
+def test_dropping_every_program_forgets_the_counts_each_kind_compiled_for() -> None:
+    worker = Worker(slot_bytes=4096, compile_ahead=False)
+    _, step = _fused(worker, 1)
+    worker.run(step([0]))
+    assert any(worker._chunks._counts.values())
+
+    worker.programs.drop()
+
+    assert not any(worker._chunks._counts.values())
+    assert list(worker.run(step([0]))) == [0]
