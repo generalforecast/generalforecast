@@ -64,7 +64,9 @@ from generalforecast.system import usable_cpus
 from generalforecast.worker.admission import Admission
 from generalforecast.worker.ahead import Ahead, _manifests
 from generalforecast.worker.calls import Calls, _item, _only_item, _stack_columns
-from generalforecast.worker.contexts import Contexts, _Page
+from generalforecast.worker.decodes import Decodes
+from generalforecast.worker.encoding import Encoding
+from generalforecast.worker.pages import Pages, _Page
 from generalforecast.worker.records import (
     Memo,
     Step,
@@ -74,6 +76,7 @@ from generalforecast.worker.records import (
     _TabularModel,
 )
 from generalforecast.worker.series import Series
+from generalforecast.worker.slots import Slots
 from generalforecast.worker.stats import WorkerStats
 
 
@@ -139,7 +142,7 @@ def _part(step: protocol.Step, table: int) -> protocol.Step:
     )
 
 
-class Worker(Calls, Admission, Ahead, Contexts, Series):
+class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
     """Runs steps for the tables a node assigns it."""
 
     def __init__(
