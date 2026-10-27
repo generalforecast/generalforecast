@@ -2002,3 +2002,23 @@ async fn a_binding_whose_log_does_not_restore_is_set_aside_and_bound_again() {
     stop(&shards).await;
     std::fs::remove_file(snapshot).unwrap();
 }
+
+#[tokio::test]
+async fn an_engine_table_the_shard_does_not_hold_is_retried_not_missing() {
+    use gf_server::engine::Engine;
+    let engine = Engine::new(
+        vec![shard().await],
+        Arc::new(Routes::new(1, 4)),
+        RequestBudget::new(1 << 20),
+        Duration::from_secs(5),
+    );
+    let table = gf_server::name::TableName::new("pkg-gone").unwrap();
+    let refused = engine
+        .predict_bound(&table, &[0; 32], vec![0.0], None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (refused.status, refused.code.as_str()),
+        (503, "ModelUnavailable")
+    );
+}

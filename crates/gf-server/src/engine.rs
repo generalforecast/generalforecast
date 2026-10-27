@@ -526,13 +526,25 @@ impl Engine {
 
     /// Sends a shard a command and waits, within the request timeout, for
     /// its answer, counted in the shard's load until then.
+    ///
+    /// The tables a call reaches are the engine's own, a request's context
+    /// or a predictor's binding, which the shard may have just evicted,
+    /// dropped with a restarted worker, or not yet restored; one it does not
+    /// find is gone for now, not a resource the caller named, so the call is
+    /// answered as one to retry rather than as not found.
     async fn wait<T>(
         &self,
         busy: Busy<'_>,
         command: Command,
         answer: oneshot::Receiver<Result<T, ServerError>>,
     ) -> Result<T, ApiError> {
-        Ok(self.answered(busy, command, answer).await??)
+        Ok(self
+            .answered(busy, command, answer)
+            .await?
+            .map_err(|error| match error {
+                ServerError::NotFound(message) => ServerError::Unavailable(message),
+                error => error,
+            })?)
     }
 
     /// The shard's answer to a command, or why there is none: it stopped, or
