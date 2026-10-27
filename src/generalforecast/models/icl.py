@@ -155,22 +155,6 @@ def _num_outputs(parameters: ICLParameters) -> int:
     return parameters.decoder.output.weight.shape[0]
 
 
-def check_class_count(parameters: ICLParameters, num_classes: int) -> None:
-    """Raises if a model whose ICL stage this is cannot serve `num_classes`.
-
-    Args:
-        parameters: ICL stage parameters.
-        num_classes: Number of classes in the task, or 0 for regression.
-    """
-    if isinstance(parameters.target_encoder, ValueEncoder):
-        if num_classes != 0:
-            raise ValueError(f"regressors take num_classes=0, got {num_classes}")
-        return
-    slots = _num_outputs(parameters)
-    if not 1 <= num_classes <= slots:
-        raise ValueError(f"num_classes must be in 1 .. {slots}, got {num_classes}")
-
-
 def encode_table(
     parameters: ICLParameters,
     rows: Float[Array, " context model"],

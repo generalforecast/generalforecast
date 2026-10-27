@@ -11,13 +11,18 @@ from jax import Array
 from jaxtyping import Bool, Float, Int
 
 from generalforecast.models.buckets import QUANTILE_LEVELS, bucket_quantiles
+from generalforecast.models.common import (
+    TableState,
+    as_tokens,
+    check_class_count,
+    compute_dtype,
+)
 from generalforecast.models.contract import (
     Averaging,
     TabularFunctions,
     TabularProperties,
 )
 from generalforecast.models.mitra.prepare import (
-    MitraSnapshot,
     bucket_borders,
     fit_snapshot,
     prepare_features,
@@ -70,37 +75,14 @@ class Mitra:
     regression: bool = field(default=False, metadata={"static": True})
 
 
+def _width(model: Mitra) -> int:
+    """The width of each token."""
+    return model.cells.weight.shape[0]
+
+
 def _slots(model: Mitra) -> int:
     """The classes, or regression buckets, the head predicts over."""
     return model.decoder.weight.shape[0]
-
-
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class TableState:
-    """State fit on every context row: the preprocessing snapshot.
-
-    `num_classes` is static: postprocessing slices logits by it.
-    """
-
-    snapshot: MitraSnapshot
-    num_classes: int = field(metadata={"static": True})
-
-
-def _dtype(model: Mitra) -> jnp.dtype:
-    """The dtype the network computes in, set by its parameters."""
-    return model.cells.weight.dtype
-
-
-def check_class_count(model: Mitra, num_classes: int) -> None:
-    """Raises if the model cannot serve `num_classes` classes, 0 for regression."""
-    if model.regression:
-        if num_classes != 0:
-            raise ValueError(f"regressors take num_classes=0, got {num_classes}")
-        return
-    slots = _slots(model)
-    if not 1 <= num_classes <= slots:
-        raise ValueError(f"num_classes must be in 1 .. {slots}, got {num_classes}")
 
 
 def _tokens(
@@ -110,7 +92,7 @@ def _tokens(
     targets: Array | None,
 ) -> Float[Array, " rows tokens model"]:
     """A row's target token, then a token per cell, columns that vary first."""
-    values = prepare_features(state.snapshot, features).astype(_dtype(model))
+    values = prepare_features(state.snapshot, features).astype(compute_dtype(model))
     cells = linear(model.cells, values[..., None])
     encoder = model.targets
     if targets is None:
@@ -155,9 +137,9 @@ def fit(
         The table state and one representation per context row.
     """
     del categorical
-    check_class_count(model, num_classes)
+    check_class_count(properties(model), num_classes)
     snapshot = fit_snapshot(features, targets if model.regression else None, num_rows)
-    state = TableState(snapshot, num_classes)
+    state = TableState(snapshot, None, num_classes)
     return state, embed(model, state, features, targets)
 
 
@@ -209,12 +191,6 @@ def _layer(
     return _within_row(layer.within_row, tokens, length)
 
 
-def _as_tokens(model: Mitra, rows: Array) -> Float[Array, " 1 rows tokens model"]:
-    """Row representations as tokens, in a batch of one."""
-    width = model.cells.weight.shape[0]
-    return rows.reshape(1, rows.shape[0], -1, width)
-
-
 def _keys_per_row(state: TableState) -> Int[Array, ""]:
     """The target token and the columns that vary."""
     return state.snapshot.columns.count + 1
@@ -244,7 +220,7 @@ def encode(
     """
     del targets
     length = batch_length(num_rows)
-    tokens = _as_tokens(model, rows)
+    tokens = as_tokens(rows, _width(model))
     caches: list[AttentionCache] = []
     for index, layer in enumerate(model.layers):
         cache = block_kv(layer.across_rows, tokens, length)
@@ -273,7 +249,7 @@ def decode(
         Logits over every class slot, or over the regression buckets.
     """
     batched = jax.tree.map(lambda values: values[None], cache)
-    tokens = _as_tokens(model, rows)
+    tokens = as_tokens(rows, _width(model))
     for layer, layer_cache in zip(model.layers, batched, strict=True):
         tokens = _layer(layer, tokens, layer_cache, _keys_per_row(state))
     target = layer_norm(model.final_norm, tokens[0, :, 0])

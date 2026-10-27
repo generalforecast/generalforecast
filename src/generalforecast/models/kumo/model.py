@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import jax
@@ -11,6 +10,7 @@ import numpy as np
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
+from generalforecast.models.common import TableState, check_class_count
 from generalforecast.models.contract import (
     Averaging,
     TabularFunctions,
@@ -19,7 +19,6 @@ from generalforecast.models.contract import (
 from generalforecast.models.icl import (
     ICLCache,
     ICLParameters,
-    check_class_count,
     decode_queries,
     decode_table,
     encode_context,
@@ -57,21 +56,15 @@ class KumoTabular(NamedTuple):
         return isinstance(self.icl.target_encoder, ValueEncoder)
 
 
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class TableState:
-    """State fit on every context row, and which columns are categorical.
+class KumoColumns(NamedTuple):
+    """What Kumo Tabular keeps of each column: its imputation, states and type.
 
-    Categories, standardization, imputation and column states. `means` follows
-    the prepared columns' order and `categorical` the table's. `num_classes` is
-    static, like TabICL's.
+    `means` follows the prepared columns' order and `categorical` the table's.
     """
 
-    snapshot: KumoSnapshot
     means: Float[Array, " features"]
-    columns: ColumnStates
+    states: ColumnStates
     categorical: Bool[Array, " features"] | None
-    num_classes: int = field(metadata={"static": True})
 
 
 def _prepared_order(
@@ -115,7 +108,7 @@ def fit(
     Returns:
         The table state and one representation per context row.
     """
-    check_class_count(model.icl, num_classes)
+    check_class_count(properties(model), num_classes)
     valid = valid_rows(features.shape[0], num_rows)
     regression_targets = targets if model.regression else None
     snapshot = fit_snapshot(features, regression_targets, valid, categorical)
@@ -131,7 +124,7 @@ def fit(
         categorical=_prepared_order(snapshot, categorical),
         count=snapshot.columns.count,
     )
-    state = TableState(snapshot, means, columns, categorical, num_classes)
+    state = TableState(snapshot, KumoColumns(means, columns, categorical), num_classes)
     return state, _project(model, rows)
 
 
@@ -152,15 +145,16 @@ def embed(
     Returns:
         One representation per row.
     """
-    prepared = prepare_features(state.snapshot, features, state.categorical)
+    columns = state.columns
+    prepared = prepare_features(state.snapshot, features, columns.categorical)
     scaled = None if targets is None else scale_targets(state.snapshot, targets)
     _, rows = embed_rows(
         model.rows,
         prepared,
-        state.means,
+        columns.means,
         scaled,
-        state.columns,
-        categorical=_prepared_order(state.snapshot, state.categorical),
+        columns.states,
+        categorical=_prepared_order(state.snapshot, columns.categorical),
         count=state.snapshot.columns.count,
     )
     return _project(model, rows)
@@ -264,9 +258,10 @@ def crowded_categories(state: TableState) -> int:
         The number of such columns.
     """
     categories = state.snapshot.categories
-    if categories is None or state.categorical is None:
+    categorical = state.columns.categorical
+    if categories is None or categorical is None:
         return 0
-    crowded = np.asarray(categories.crowded & state.categorical)
+    crowded = np.asarray(categories.crowded & categorical)
     return int(crowded.sum(axis=-1).max())
 
 

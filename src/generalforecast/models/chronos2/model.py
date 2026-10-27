@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Bool, Float
 
+from generalforecast.models.common import compute_dtype
 from generalforecast.models.series import (
     SeriesFunctions,
     SeriesGroup,
@@ -95,11 +96,6 @@ class Scale(NamedTuple):
     scale: Array
 
 
-def _dtype(model: Chronos2) -> jnp.dtype:
-    """The dtype the network computes in, set by its parameters."""
-    return model.register.dtype
-
-
 def _feed_forward(parameters: FeedForward, values: Array) -> Array:
     """A pre-norm feed-forward with ReLU, added to its input."""
     hidden = jnn.relu(linear(parameters.input, rms_norm(parameters.norm, values)))
@@ -154,7 +150,7 @@ def _patches(
         ],
         axis=-1,
     )
-    return residual_block(model.patch_embedding, features.astype(_dtype(model)))
+    return residual_block(model.patch_embedding, features.astype(compute_dtype(model)))
 
 
 def _layer(

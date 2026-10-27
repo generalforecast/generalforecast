@@ -134,8 +134,8 @@ def test_column_codes_are_fixed_per_table_width() -> None:
     first, _ = limix_functions.fit(model, features, targets, 2)
     second, _ = limix_functions.fit(model, features + 1, targets, 2)
 
-    np.testing.assert_array_equal(np.asarray(first.codes), np.asarray(second.codes))
-    assert first.codes.shape == (3, 16)
+    np.testing.assert_array_equal(np.asarray(first.columns), np.asarray(second.columns))
+    assert first.columns.shape == (3, 16)
 
 
 @pytest.mark.parametrize("regression", [False, True])

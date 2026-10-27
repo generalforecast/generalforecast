@@ -29,6 +29,7 @@ import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
+from generalforecast.models.common import compute_dtype
 from generalforecast.models.series import (
     KNOWN,
     PAST,
@@ -190,11 +191,6 @@ class TimestralCache:
     real: Bool[Array, " rows"]
 
 
-def _dtype(model: Timestral) -> jnp.dtype:
-    """The dtype the network computes in, set by its parameters."""
-    return model.query.dtype
-
-
 def _combine(a: Welford, b: Welford) -> Welford:
     """Merges two sets of running moments; no observations is the identity."""
     count = a.count + b.count
@@ -302,7 +298,7 @@ def _embed(
         ],
         axis=-1,
     )
-    return residual_block(model.patch_embedding, features.astype(_dtype(model)))
+    return residual_block(model.patch_embedding, features.astype(compute_dtype(model)))
 
 
 def _valid(
@@ -573,7 +569,7 @@ def _block(
         [
             _embed(model, scaled, observed),
             jnp.broadcast_to(model.query, (rows, horizon, model.query.shape[0])).astype(
-                _dtype(model)
+                compute_dtype(model)
             ),
         ],
         axis=1,
@@ -1013,7 +1009,7 @@ def _cached_block(
     positions = held + jnp.arange(patches) - cache.first
     outputs, _ = _transform(
         model,
-        tokens.astype(_dtype(model)),
+        tokens.astype(compute_dtype(model)),
         positions,
         time_mask,
         _variate_mask(cache, jnp.ones((patches, rows), bool)),

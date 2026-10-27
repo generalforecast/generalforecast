@@ -30,6 +30,7 @@ import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
+from generalforecast.models.common import compute_dtype
 from generalforecast.models.series import (
     KNOWN,
     TARGET,
@@ -184,11 +185,6 @@ class TimesFMCache:
     real: Bool[Array, " rows"]
 
 
-def _dtype(model: TimesFM) -> jnp.dtype:
-    """The dtype the network computes in, set by its parameters."""
-    return model.head.weight.dtype
-
-
 def _safe(deviation: Array) -> Array:
     """A deviation to divide by: 1 where it is near zero."""
     return jnp.where(deviation < DEVIATION_FLOOR, 1.0, deviation)
@@ -334,7 +330,7 @@ def _embed(
     features = jnp.concatenate(
         [normalized, following, masks.astype(jnp.float32)], axis=-1
     )
-    tokens = residual_block(model.embedding, features.astype(_dtype(model)))
+    tokens = residual_block(model.embedding, features.astype(compute_dtype(model)))
     return tokens, masks.all(axis=-1)
 
 
