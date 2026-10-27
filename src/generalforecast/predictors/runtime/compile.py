@@ -81,7 +81,8 @@ def compile_lock(
             for a live context, its captured rows; None for a request
             context, whose rows come with each call.
         outputs: A call's own outputs, for an ad hoc request; the lock's
-            otherwise.
+            otherwise. Outputs without `quantiles` predict no quantile
+            levels, whatever levels the lock records.
         resolver: The trusted catalog; the built-in one by default.
 
     Raises:
@@ -95,6 +96,8 @@ def compile_lock(
     plan = ExecutionPlan.from_lock(locked)
     if outputs is not None:
         plan = replace(plan, outputs=tuple(outputs))
+        if "quantiles" not in plan.outputs:
+            plan = replace(plan, quantiles=())
     context = locked.context
     if locked.context_kind == "snapshot":
         ensure(

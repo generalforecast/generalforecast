@@ -310,3 +310,64 @@ def test_a_real_node_configuration_writes_and_checks(tmp_path, monkeypatch):
     assert code == 0, stderr
     assert json.loads(stdout)["checks"]
     assert os.path.isfile(config)
+
+
+KEYS = {"kind": "introspect", "url": "http://127.0.0.1:9", "token_env": "T"}
+PROXIES = ("127.0.0.1/32", "10.0.0.0/8")
+MODELS = [{"worker": "tabicl", "reference": "general-forecast/tabicl-v2-classifier"}]
+
+
+def hosted(directory: Path, models: list[dict]) -> str:
+    """gf-server's configuration as a hosted plane writes it for its front."""
+    return listener.configuration(
+        directory,
+        "127.0.0.1:0",
+        30.0,
+        models,
+        keys=KEYS,
+        surface="remote",
+        upstream="http://127.0.0.1:9",
+        trusted_proxies=PROXIES,
+        revisions="http://127.0.0.1:9",
+        metrics="127.0.0.1:9090",
+    )
+
+
+def test_a_hosted_configuration_names_its_key_store_upstream_and_revisions(tmp_path):
+    import tomllib
+
+    plain = tomllib.loads(listener.configuration(tmp_path, "127.0.0.1:0", 30.0, MODELS))
+    assert plain["http"]["keys"] == {"kind": "static", "env": listener.API_KEY_ENV}
+    assert plain["http"]["surface"] == "self-hosted"
+    assert not {"upstream", "trusted_proxies", "revisions"} & plain["http"].keys()
+    assert "metrics_listen" not in plain
+
+    config = tomllib.loads(hosted(tmp_path, MODELS))
+    assert config["http"]["keys"] == KEYS
+    assert config["http"]["surface"] == "remote"
+    assert config["http"]["upstream"] == "http://127.0.0.1:9"
+    assert config["http"]["trusted_proxies"] == list(PROXIES)
+    assert config["http"]["revisions"] == {
+        "url": "http://127.0.0.1:9",
+        "token_env": "GF_INTROSPECTION_TOKEN",
+    }
+    assert config["metrics_listen"] == "127.0.0.1:9090"
+
+
+@pytest.mark.slow
+@pytest.mark.server
+def test_gf_server_checks_a_hosted_configuration(tmp_path):
+    from tests.utils.server import build
+
+    (tmp_path / "models.json").write_text("[]")
+    config = tmp_path / "server.toml"
+    config.write_text(hosted(tmp_path, []))
+    config.chmod(0o600)
+    done = subprocess.run(
+        [str(build()), "check", "--config", str(config)],
+        env=dict(os.environ, GF_LOG_KEY="0" * 64, T="t" * 32),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stdout + done.stderr

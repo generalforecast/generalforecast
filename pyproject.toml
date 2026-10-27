@@ -150,6 +150,6 @@ convention = "google"
 
 [tool.ty.src]
 # The reference tests need the reference dependency group, which CI does not
-# install, and the example notebooks install their own libraries, such as
-# pandas and LightGBM, in Colab.
-exclude = ["tests/models/reference", "examples"]
+# install, the GPU job brings its own Modal client, and the example notebooks
+# install their own libraries, such as pandas and LightGBM, in Colab.
+exclude = ["tests/models/reference", "examples", ".github/gpu.py"]

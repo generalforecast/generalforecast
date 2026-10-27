@@ -1,0 +1,37 @@
+name: GPU
+
+# The test suite on an NVIDIA L4 on Modal, on request.
+# Needs the MODAL_TOKEN_ID and MODAL_TOKEN_SECRET repository secrets, and skips
+# without them; HF_TOKEN lets it download the checkpoints for their tests.
+
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: env.MODAL_TOKEN_ID != ''
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        if: env.MODAL_TOKEN_ID != ''
+        with:
+          version: "0.8.0"
+      - name: Run on Modal, with its SDK installed by hash
+        if: env.MODAL_TOKEN_ID != ''
+        run: |
+          uv venv --python 3.12 "$RUNNER_TEMP/modal"
+          uv pip install --python "$RUNNER_TEMP/modal/bin/python" --require-hashes \
+            -r .github/modal-requirements.txt
+          "$RUNNER_TEMP/modal/bin/modal" run .github/gpu.py
