@@ -380,8 +380,7 @@ class Chunks:
                 )
             stop = min(count, first + padded)
             call = prepare(first, stop, padded)
-            if key not in self._measured:
-                self._measured.add(key)
+            if self._first_measure(key):
                 started = time.perf_counter()
                 measured = measured_bytes(call)
                 measuring += time.perf_counter() - started
@@ -407,12 +406,14 @@ class Chunks:
                 continue
             finished = time.perf_counter()
             compiled = _traces(call.function) > traces
-            flops = self._flops.get((key, padded))
+            with self._lock:
+                flops = self._flops.get((key, padded))
             if flops is None:
                 # Read once per program: here if this call compiled it, else
                 # where it was compiled ahead or at start.
                 flops = estimated_flops(call) if compiled else _noted_flops(call)
-                self._flops[(key, padded)] = flops
+                with self._lock:
+                    self._flops[(key, padded)] = flops
             self._counted(stage, measuring + finished - started, flops)
             if compiled and self._noted is not None:
                 self._noted(stage, key, call, finished - started)
@@ -496,6 +497,14 @@ class Chunks:
 
         ahead(call, done)
 
+    def _first_measure(self, key: Hashable) -> bool:
+        """Whether a kind's first call is to be measured; only one call of each is."""
+        with self._lock:
+            if key in self._measured:
+                return False
+            self._measured.add(key)
+            return True
+
     def ran(self, key: Hashable) -> bool:
         """Whether a kind has a program for any padded count."""
         with self._lock:
@@ -511,13 +520,25 @@ class Chunks:
             self._counts.setdefault(key, set()).add(padded)
             self._compiling.discard((key, padded))
 
+    def forget_counts(self) -> None:
+        """Forgets the padded counts each kind has a program for, as when every program is dropped.
+
+        Each kind's next call then compiles in it, as its first did, and its
+        other counts compile on the side again.
+        """
+        with self._lock:
+            self._counts.clear()
+            self._compiling.clear()
+
     def parts(self, key: Hashable) -> int | None:
         """The most parts of one item a call of `key` takes, or None while any number fit."""
-        return self._parts.get(key)
+        with self._lock:
+            return self._parts.get(key)
 
     def split(self, key: Hashable, parts: int) -> None:
         """Limits a kind of call to `parts` parts of an item, after one item ran out of memory."""
-        self._parts[key] = parts
+        with self._lock:
+            self._parts[key] = parts
 
     def relax(self) -> None:
         """Forgets what calls that ran out of memory taught, as when the pool is sized again."""

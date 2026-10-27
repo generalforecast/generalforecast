@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The native table API: tables' definitions and what every table client shares."""
+"""The handles on an engine's tables: their definitions, and what every client's handle does.
+
+`RemoteTable` and `RemoteSeriesTable` implement them over Flight, for a
+server, a router or this process's engine; `gf.engine.Table` and
+`gf.engine.SeriesTable` hold one each.
+"""
 
 import abc
 import contextlib
@@ -44,6 +49,10 @@ Summary = Literal["table", "context"]
 
 # The writes that carry rows; deletes carry keys alone.
 WriteKind = Literal["insert", "update", "upsert"]
+
+
+class DuplicateKey(ValueError):
+    """A write that adds a row under a key the table holds already, refused whole."""
 
 
 @dataclass(frozen=True)
@@ -261,7 +270,7 @@ class Described(Definition):
             if levels is not None:
                 levels = tuple(float(level) for level in levels)
             elif classes is None:
-                levels = _implied(outputs)
+                levels = implied_levels(outputs)
             return cls(
                 name=str(reply["name"]),
                 columns=columns,
@@ -989,8 +998,8 @@ def _series_definition_of(reply: Mapping[str, Any]) -> SeriesDefinition:
         raise ValueError(f"a malformed table description: {error!r}") from None
 
 
-def _implied(columns: int) -> tuple[float, ...]:
-    """The levels of a tabular regressor's evenly spaced quantile columns."""
+def implied_levels(columns: int) -> tuple[float, ...]:
+    """The levels of a tabular regressor's evenly spaced quantile columns: column k is (k + 1) / (columns + 1)."""
     return tuple((column + 1) / (columns + 1) for column in range(columns))
 
 

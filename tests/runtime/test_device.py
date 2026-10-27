@@ -448,3 +448,34 @@ def test_report_fallback_respects_a_chosen_platform(cpu_backend, monkeypatch, tm
     err = io.StringIO()
     assert not report_fallback(err, devices=[str(gpu)])
     assert err.getvalue() == ""
+
+
+def test_report_fallback_reports_a_cuda_failure_on_a_chosen_platform(
+    cpu_backend, monkeypatch, tmp_path
+):
+    import io
+
+    monkeypatch.setenv("JAX_PLATFORMS", "cuda,cpu")
+    gpu = tmp_path / "nvidia0"
+    gpu.touch()
+    cpu_backend._advice.held.append("CUDA backend failed to initialize: no device.")
+    err = io.StringIO()
+    assert report_fallback(err, devices=[str(gpu)])
+    assert err.getvalue().splitlines()[1] == (
+        "  hint: CUDA failed to start. CUDA backend failed to initialize: no device."
+    )
+
+
+def test_report_fallback_reports_a_cuda_failure_without_a_device_file(
+    cpu_backend, tmp_path
+):
+    import io
+
+    cpu_backend._advice.held.append("CUDA backend failed to initialize: no device.")
+    err = io.StringIO()
+    assert report_fallback(err, devices=[str(tmp_path / "nvidia0")])
+    assert err.getvalue().splitlines() == [
+        "warning: CUDA failed to start, so generalforecast runs on the CPU",
+        "  hint: CUDA backend failed to initialize: no device.",
+    ]
+    assert not report_fallback(err, devices=[str(tmp_path / "nvidia0")])

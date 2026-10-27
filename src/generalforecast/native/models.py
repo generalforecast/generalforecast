@@ -16,7 +16,7 @@ from typing import Any, Literal
 
 from generalforecast.errors import Error, InvalidInput, NotFound
 from generalforecast.models import catalog as _catalog
-from generalforecast.models.catalog import Limits, ModelEntry, ModelRef, ModelRefError
+from generalforecast.models.catalog import Limits, ModelEntry, ModelRefError
 
 ORGANIZATION = _catalog.ORGANIZATION
 CATALOG_ID = re.compile(r"^[a-z0-9-]+/[a-z0-9.-]+(@.+)?$")
@@ -27,38 +27,16 @@ def _base(ref: str) -> str:
     return re.split(r"[@*]", ref, maxsplit=1)[0]
 
 
-def _ref(ref: Any) -> ModelRef:
-    try:
-        return _catalog.parse(ref)
-    except ModelRefError as error:
-        if not isinstance(ref, str):
-            raise InvalidInput(
-                str(error), hint='pass a custom model as "module:attribute"'
-            ) from None
-        name = _base(ref)
-        if (known := _catalog.known_as(name)) is not None:
-            raise InvalidInput(
-                _catalog.not_canonical(name, known), param="model"
-            ) from None
-        if error.code == "UnknownModel":
-            raise NotFound(
-                f"model `{name}` is not in the catalog",
-                hint="run `gf model list` to see the models",
-                param="model",
-            ) from None
-        raise InvalidInput(str(error), param="model") from None
-
-
 def _entry(ref: str) -> ModelEntry:
     try:
-        return _ref(ref).entry
+        return _catalog.reference(ref).entry
     except ModelRefError as error:
         raise InvalidInput(str(error), param="model") from None
 
 
 def _capability(ref: str) -> _catalog.Capability:
     """What the model can do; a custom model's is read from its loaded contract."""
-    parsed = _ref(ref)
+    parsed = _catalog.reference(ref)
     if not parsed.custom:
         return parsed.entry.capability
     from generalforecast.models import custom
@@ -74,7 +52,7 @@ def canonical(ref: str) -> str:
 
     A custom model's `module:attribute` is its own canonical spelling.
     """
-    return str(_ref(ref))
+    return str(_catalog.reference(ref))
 
 
 def limits(ref: str) -> Limits:
@@ -147,7 +125,7 @@ def is_bare_name(ref: Any) -> bool:
 
 def is_custom(ref: str) -> bool:
     """Whether `ref` names a custom model by its `module:attribute`."""
-    return _ref(ref).custom
+    return _catalog.reference(ref).custom
 
 
 def is_catalog_model(ref: Any) -> bool:
