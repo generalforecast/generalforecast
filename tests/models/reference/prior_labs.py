@@ -14,6 +14,7 @@ import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
 
+from generalforecast.models.catalog import short_name
 from generalforecast.models.tabpfn.checkpoint import (
     PUBLISHED,
     load_tabpfn,
@@ -66,7 +67,7 @@ def upstream_outputs(name: str, regression: bool, prepared: Any) -> np.ndarray:
     table = _kept(prepared)
     # TabPFN-3.5 serves both tasks and takes which one per call.
     task = {}
-    if name.startswith("tabpfn-3.5"):
+    if short_name(name).startswith("tabpfn-3.5"):
         task = {"task_type": "regression" if regression else "multiclass"}
     with torch.no_grad():
         outputs = model(

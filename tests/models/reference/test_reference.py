@@ -453,7 +453,10 @@ def test_forecasts_match_upstream(reference: SeriesReference) -> None:
     )
 
 
-MASKED = [r for r in REFERENCES if r.name.startswith(("limix", "mitra"))]
+# Names may carry the organization, as canonical ids do.
+MASKED = [
+    r for r in REFERENCES if r.name.rpartition("/")[2].startswith(("limix", "mitra"))
+]
 
 
 @pytest.mark.parametrize("reference", MASKED, ids=[r.name for r in MASKED])
