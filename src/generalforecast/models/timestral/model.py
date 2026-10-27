@@ -37,9 +37,12 @@ from generalforecast.models.series import (
     SeriesFunctions,
     SeriesGroup,
     SeriesProperties,
+    group_inputs,
     median_index,
+    observed_moments,
     padded_horizon,
     real_patches,
+    refuse_known,
     rows_first,
 )
 from generalforecast.nn.attention import (
@@ -270,12 +273,8 @@ def _scaled(
     running = _running(values, observed, before)
     scaled = _standardize(model, values, observed, _patch_frames(model, running))
     known = (roles == KNOWN)[:, None]
-    count = jnp.maximum(observed.sum(axis=-1, keepdims=True), 1)
-    loc = jnp.where(observed, values, 0.0).sum(axis=-1, keepdims=True) / count
-    deviation = jnp.where(observed, jnp.square(values - loc), 0.0)
-    scale = jnp.maximum(
-        jnp.sqrt(deviation.sum(axis=-1, keepdims=True) / count), model.minimum_scale
-    )
+    _, loc, deviation = observed_moments(values, observed, keepdims=True)
+    scale = jnp.maximum(deviation, model.minimum_scale)
     indicator = ((values == 0) | (values == 1) | ~observed).all(axis=-1, keepdims=True)
     indicator = indicator & observed.any(axis=-1, keepdims=True)
     whole = Scale(jnp.where(indicator, 0.0, loc), jnp.where(indicator, 1.0, scale))
@@ -492,32 +491,11 @@ def _refine(
 
 def _rows(model: Timestral, group: SeriesGroup, horizon: int) -> Rows:
     """A group as the network reads it: trimmed, masked, and mirrored if averaging."""
-    rows, steps = group.values.shape
-    if steps % model.patch:
-        raise ValueError(
-            f"the context's {steps} steps are not whole patches of {model.patch}"
-        )
+    rows = group.values.shape[0]
     limit = model.context_limit // model.patch * model.patch
-    real = (
-        jnp.ones(rows, bool)
-        if group.num_rows is None
-        else jnp.arange(rows) < group.num_rows
+    values, observed, real, future, future_observed = group_inputs(
+        group, model.patch, limit, horizon
     )
-    observed = (group.observed & real[:, None])[:, -limit:]
-    values = jnp.where(observed, group.values[:, -limit:], 0.0).astype(jnp.float32)
-    if group.future is None:
-        future = jnp.zeros((rows, horizon), jnp.float32)
-        future_observed = jnp.zeros((rows, horizon), bool)
-    else:
-        future_observed = (
-            jnp.isfinite(group.future)
-            if group.future_observed is None
-            else group.future_observed
-        )
-        future_observed = (
-            future_observed & real[:, None] & (group.roles == KNOWN)[:, None]
-        )
-        future = jnp.where(future_observed, group.future, 0.0).astype(jnp.float32)
     data = Rows(
         values,
         observed,
@@ -884,12 +862,7 @@ def encode(model: Timestral, group: SeriesGroup) -> TimestralCache:
     Raises:
         ValueError: If a row is a known covariate, when that can be seen.
     """
-    if not isinstance(group.roles, jax.core.Tracer) and bool(
-        (group.roles == KNOWN).any()
-    ):
-        raise ValueError(
-            "a group with a known covariate is forecast whole, not encoded"
-        )
+    refuse_known(group)
     data = _rows(model, group, 0)
     return _grow(model, None, data, data.values, data.observed)
 

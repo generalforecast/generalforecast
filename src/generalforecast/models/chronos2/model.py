@@ -26,6 +26,8 @@ from generalforecast.models.series import (
     SeriesFunctions,
     SeriesGroup,
     SeriesProperties,
+    group_inputs,
+    observed_moments,
     padded_horizon,
 )
 from generalforecast.nn.attention import AttentionParameters, attend, project_kv
@@ -118,11 +120,7 @@ def _standardize(
     Returns:
         The standardized values and each row's location and scale.
     """
-    count = observed.sum(axis=-1, keepdims=True)
-    present = jnp.where(observed, values, 0.0)
-    loc = present.sum(axis=-1, keepdims=True) / jnp.maximum(count, 1)
-    squares = jnp.where(observed, jnp.square(values - loc), 0.0)
-    scale = jnp.sqrt(squares.sum(axis=-1, keepdims=True) / jnp.maximum(count, 1))
+    count, loc, scale = observed_moments(values, observed, keepdims=True)
     scale = jnp.where(count > 0, scale, 1.0)
     scale = jnp.where(scale == 0, 1e-5, scale)
     standardized = jnp.where(observed, jnp.arcsinh((values - loc) / scale), 0.0)
@@ -288,31 +286,12 @@ def forecast(
     Returns:
         Quantiles at the model's levels for every row and step.
     """
-    rows, steps = group.values.shape
-    if steps % model.patch:
-        raise ValueError(
-            f"the context's {steps} steps are not whole patches of {model.patch}"
-        )
-    real = (
-        jnp.ones(rows, bool)
-        if group.num_rows is None
-        else jnp.arange(rows) < group.num_rows
+    rows = group.values.shape[0]
+    # Chronos-2 reads every row's future values where observed, not only
+    # known covariates'.
+    values, observed, real, future, future_observed = group_inputs(
+        group, model.patch, model.context_limit, horizon, known_only=False
     )
-    observed = (group.observed & real[:, None])[:, -model.context_limit :]
-    values = jnp.where(observed, group.values[:, -model.context_limit :], 0.0)
-    values = values.astype(jnp.float32)
-    if group.future is None:
-        future = jnp.zeros((rows, horizon), jnp.float32)
-        future_observed = jnp.zeros((rows, horizon), bool)
-    else:
-        # Known where observed, or where finite if the group does not say.
-        future_observed = (
-            jnp.isfinite(group.future)
-            if group.future_observed is None
-            else group.future_observed
-        )
-        future_observed = future_observed & real[:, None]
-        future = jnp.where(future_observed, group.future, 0.0).astype(jnp.float32)
 
     first = _steps(model, horizon)
     prediction = _pass(

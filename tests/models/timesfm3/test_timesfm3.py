@@ -67,10 +67,15 @@ def test_quantiles_come_sorted() -> None:
 def test_a_row_without_observations_is_read_as_zeros() -> None:
     data = group(steps=4 * PATCH, horizon=PATCH, known=False)
     empty = data._replace(observed=data.observed.at[1].set(False))
+    # What an unobserved step holds is not a value, whatever it is.
+    zeros = empty._replace(values=empty.values.at[1].set(0.0))
 
     predictions = timesfm_functions.forecast(tiny_timesfm(), empty, PATCH)
 
     assert bool(np.isfinite(predictions).all())
+    np.testing.assert_array_equal(
+        predictions, timesfm_functions.forecast(tiny_timesfm(), zeros, PATCH)
+    )
 
 
 def test_encode_refuses_known_covariates() -> None:

@@ -37,9 +37,12 @@ from generalforecast.models.series import (
     SeriesFunctions,
     SeriesGroup,
     SeriesProperties,
+    group_inputs,
     median_index,
+    observed_moments,
     padded_horizon,
     real_patches,
+    refuse_known,
     rows_first,
 )
 from generalforecast.nn.attention import (
@@ -196,12 +199,8 @@ def _update(
     masked: Bool[Array, " rows patch"],
 ) -> Moments:
     """The moments after one patch of values, as upstream accumulates them."""
-    seen = (~masked).astype(jnp.float32)
-    count = seen.sum(axis=-1)
-    present = jnp.where(masked, 0.0, values)
-    mean = present.sum(axis=-1) / jnp.maximum(count, 1.0)
-    variance = jnp.where(masked, 0.0, jnp.square(values - mean[:, None])).sum(axis=-1)
-    deviation = jnp.sqrt(variance / jnp.maximum(count, 1.0))
+    count, mean, deviation = observed_moments(values, ~masked)
+    count = count.astype(jnp.float32)
     total = moments.count + count
     safe = jnp.maximum(total, 1.0)
     new_mean = jnp.where(
@@ -486,40 +485,19 @@ def _sizes(model: TimesFM, horizon: int) -> tuple[int, int, int]:
 
 def _rows(model: TimesFM, group: SeriesGroup, horizon: int) -> Rows:
     """A group as the network reads it: trimmed, masked and clipped."""
-    rows, steps = group.values.shape
-    if steps % model.patch:
-        raise ValueError(
-            f"the context's {steps} steps are not whole patches of {model.patch}"
-        )
+    rows = group.values.shape[0]
     if rows > model.max_rows:
         raise ValueError(f"a group of {rows} rows passes the model's {model.max_rows}")
     limit = CONTEXT_LIMIT // model.patch * model.patch
-    real = (
-        jnp.ones(rows, bool)
-        if group.num_rows is None
-        else jnp.arange(rows) < group.num_rows
+    values, observed, real, future, future_observed = group_inputs(
+        group, model.patch, limit, horizon
     )
-    observed = (group.observed & real[:, None])[:, -limit:]
     first = _first(~observed, real & (group.roles == TARGET), model.patch)
     # A row the network would see nothing of is read as observed zeros, as
     # upstream's forecaster reads an all-missing series.
     observed = observed | ~observed.any(axis=-1, keepdims=True)
-    values = jnp.where(observed, group.values[:, -limit:], 0.0).astype(jnp.float32)
     values = jnp.clip(jnp.nan_to_num(values), -model.value_clip, model.value_clip)
-    if group.future is None:
-        future = jnp.zeros((rows, horizon), jnp.float32)
-        future_observed = jnp.zeros((rows, horizon), bool)
-    else:
-        future_observed = (
-            jnp.isfinite(group.future)
-            if group.future_observed is None
-            else group.future_observed
-        )
-        future_observed = (
-            future_observed & real[:, None] & (group.roles == KNOWN)[:, None]
-        )
-        future = jnp.where(future_observed, group.future, 0.0).astype(jnp.float32)
-        future = jnp.clip(jnp.nan_to_num(future), -model.value_clip, model.value_clip)
+    future = jnp.clip(jnp.nan_to_num(future), -model.value_clip, model.value_clip)
     return Rows(values, ~observed, group.roles, real, future, ~future_observed, first)
 
 
@@ -622,12 +600,7 @@ def encode(model: TimesFM, group: SeriesGroup) -> TimesFMCache:
     Raises:
         ValueError: If a row is a known covariate, when that can be seen.
     """
-    if not isinstance(group.roles, jax.core.Tracer) and bool(
-        (group.roles == KNOWN).any()
-    ):
-        raise ValueError(
-            "a group with a known covariate is forecast whole, not encoded"
-        )
+    refuse_known(group)
     data = _rows(model, group, 0)
     rows, steps = data.values.shape
     context = steps // model.patch
