@@ -20,7 +20,6 @@ from generalforecast.contracts import (
     PredictorLock,
     Revision,
 )
-from generalforecast.predictors.models import describe
 from generalforecast.predictors.validation import PredictorError
 from generalforecast.service.boundary import (
     JsonObject,
@@ -411,63 +410,6 @@ def prediction_payload(
         payload["features"] = list(features)
     if options is not None:
         payload["options"] = options
-    return json_object(payload)
-
-
-def one_shot_payload(
-    queries: Any,
-    *,
-    model: str,
-    target: str,
-    context: Any,
-    context_columns: Sequence[str] | None = None,
-    task: str | None = None,
-    features: Sequence[str] | None = None,
-    options: JsonObject | None = None,
-    outputs: Sequence[str] | None = None,
-) -> JsonObject:
-    """Uses catalog task metadata and declared roles, never target-value heuristics."""
-    semantic = json_object({} if options is None else options)
-    if outputs is not None:
-        require(not isinstance(outputs, str), "outputs must be a sequence of names")
-        require(
-            "outputs" not in semantic or semantic["outputs"] == list(outputs),
-            "conflicting output selections",
-        )
-        semantic["outputs"] = list(outputs)
-    if task is None:
-        tasks = describe(model).tasks
-        require(len(tasks) == 1, "provide an explicit model task")
-        task = tasks[0]
-    query_table = table(queries, columns=features)
-    if features is None:
-        require(
-            all(
-                semantic.get(role) is None or type(semantic[role]) is str
-                for role in ("id", "time")
-            ),
-            "invalid role column",
-        )
-        reserved = {target, semantic.get("id"), semantic.get("time")}
-        for role in ("series", "past_inputs", "future_inputs"):
-            columns = semantic.get(role, [])
-            require(type(columns) is list, "role columns must be a list")
-            require(
-                all(type(column) is str for column in columns), "invalid role column"
-            )
-            reserved.update(columns)
-        features = [
-            column for column in query_table.column_names if column not in reserved
-        ]
-    payload = prediction_payload(
-        query_table,
-        context=context,
-        context_columns=context_columns,
-        target=target,
-        features=features,
-        options=semantic,
-    )
-    payload.update(model=model, task=task)
     return json_object(payload)
 
 

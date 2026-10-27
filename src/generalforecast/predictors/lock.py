@@ -41,7 +41,7 @@ from typing import Any
 
 import yaml
 
-from generalforecast.errors import InvalidInput
+from generalforecast.errors import Error, InvalidInput
 from generalforecast.predictors import files
 from generalforecast.predictors.resolution import (
     ContextInfo,
@@ -408,14 +408,31 @@ def upgrade(value: Any) -> dict[str, Any]:
     exact; the seed is 0.
 
     Raises:
-        PredictorError: For a document that is not a version 1 lock.
+        PredictorError: `UnsupportedLockVersion` for a document that is not a
+            version 1 lock, `InvalidPredictor` for any version 1 lock out of
+            shape. Nothing else escapes, so a store upgrading many locks
+            can set aside each one that fails.
     """
     ensure(
         type(value) is dict and value.get("lock_version") == 1,
         "only a version 1 lock upgrades",
         "UnsupportedLockVersion",
     )
+    try:
+        return _upgraded(value)
+    except PredictorError:
+        raise
+    except (KeyError, TypeError, AttributeError, ValueError, RecursionError, Error):
+        # A version 1 field out of shape fails wherever it is first read.
+        raise PredictorError(
+            "InvalidPredictor", "the version 1 lock is out of shape"
+        ) from None
+
+
+def _upgraded(value: dict[str, Any]) -> dict[str, Any]:
     old = fields(value, {"lock_version", "predictor", "model"})
+    ensure(type(old["predictor"]) is dict, "the lock's predictor must be an object")
+    ensure(type(old["model"]) is dict, "the lock's model must be an object")
     source = dict(old["predictor"])
     task = source["task"]
     predictor: dict[str, Any] = {
@@ -667,11 +684,13 @@ def _flatten(value: dict[str, Any], prefix: str = "") -> dict[str, Any]:
 def load_lock(root: str | Path, spec: PredictorSpec | None = None) -> Resolution:
     """The resolution a `gf.lock` records, without touching the context.
 
-    This is what `gf check --frozen`, `gf.Predictor` and `gf serve` read. The
-    lock must describe the manifest beside it exactly: it records the
-    digest of the normalized `gf.yaml`, so any edit that could change a
-    prediction (inputs, types, split, selection and its seed, frequency,
-    quantiles, resources) makes it stale.
+    This is what `gf check --frozen` reads. (`gf.Predictor` resolves the
+    manifest again and compares; `gf serve` and `gf push` validate the
+    document and its manifest digest themselves.) The lock must describe
+    the manifest beside it exactly: it records the digest of the
+    normalized `gf.yaml`, so any edit that could change a prediction
+    (inputs, types, split, selection and its seed, frequency, quantiles,
+    resources) makes it stale.
 
     Raises:
         InvalidInput: If there is no lock, it is not a version 2 lock, or it

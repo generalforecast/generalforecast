@@ -11,7 +11,7 @@ import pytest
 
 from generalforecast.models import catalog
 from generalforecast.service.boundary import Scope, json_object
-from generalforecast.service.catalog import CatalogService, create_catalog
+from generalforecast.service.catalog import CatalogService
 from generalforecast.service.contracts import ServiceError
 from generalforecast.service.interfaces import ModelPort
 
@@ -35,9 +35,9 @@ REMOTE = [
 
 
 @pytest.mark.parametrize("invalid", ["true", 1, None])
-def test_provider_factory_explicitly_enables_downloads(invalid):
+def test_downloads_are_enabled_only_explicitly(invalid):
     assert not CatalogService().allow_downloads
-    assert create_catalog().allow_downloads
+    assert CatalogService(allow_downloads=True).allow_downloads
     with pytest.raises(ServiceError):
         CatalogService(allow_downloads=invalid)
 

@@ -10,7 +10,6 @@ it in process, binding a `CompiledPlan`. These are part of the hosting API,
 `generalforecast.hosting`.
 """
 
-from collections.abc import Iterator
 from typing import (
     TYPE_CHECKING,
     Literal,
@@ -106,21 +105,6 @@ class ContextSnapshot(TypedDict):
     source_wait_count: int
 
 
-class EffectStatus(TypedDict):
-    """Integration-owned progress for one exact revision and data receipt."""
-
-    effect: JsonObject
-    state: Literal[
-        "queued", "processing", "source_wait", "visible", "failed", "superseded"
-    ]
-    accepted_at: float
-    processed_at: float | None
-    visible_at: float | None
-    oldest_processing_at: float | None
-    source_wait_count: int
-    error: JsonObject | None
-
-
 class ImportOutcome(TypedDict):
     """One source occurrence; infrastructure failures raise, not row-conflict."""
 
@@ -151,80 +135,8 @@ class SourceRecord(TypedDict):
     issue: JsonObject | None
 
 
-class DataPort(Protocol):
-    """A: component admission/history, called by C and integration."""
-
-    def create(self, scope: Scope, config: JsonObject) -> JsonObject:
-        """Creates a bounded versioned context, never overwriting its schema."""
-        ...
-
-    def list(self, scope: Scope) -> list[JsonObject]:
-        """Lists only contexts in this project."""
-        ...
-
-    def get(self, scope: Scope, context: str) -> JsonObject:
-        """Returns schema, capacities and separate pending/processing counts."""
-        ...
-
-    def mutate(self, scope: Scope, context: str, mutation: Mutation) -> AcceptedWrite:
-        """Atomically accepts all components or replays the original receipt."""
-        ...
-
-    def snapshot(
-        self,
-        scope: Scope,
-        context: str,
-        *,
-        target: str,
-        knowledge_at: float | None = None,
-        event_before: float | None = None,
-    ) -> ContextSnapshot:
-        """Selects acceptance <= knowledge_at and event time < event_before."""
-        ...
-
-    def import_record(
-        self,
-        scope: Scope,
-        context: str,
-        *,
-        write_id: str,
-        ordinal: int,
-        record: ObservationInput,
-        skip_identical: bool,
-    ) -> ImportOutcome:
-        """Admits one record atomically; skips never renew versions or deadlines."""
-        ...
-
-    def expire(self, scope: Scope, context: str) -> int:
-        """Durably expires due pending labels using the injected acceptance clock."""
-        ...
-
-
-class SourcePort(Protocol):
-    """A: pinned source reader for C, without owning revision coordination."""
-
-    def pin(self, scope: Scope, spec: JsonObject) -> SourcePin:
-        """Copies bounded regular JSONL/CSV bytes into a private immutable spool."""
-        ...
-
-    def list(self, scope: Scope) -> list[SourcePin]:
-        """Lists project-scoped pinned source metadata, not private file paths."""
-        ...
-
-    def read(
-        self,
-        scope: Scope,
-        pin: SourcePin,
-        *,
-        offset: int = 0,
-        limit: int = 100,
-    ) -> Iterator[SourceRecord]:
-        """Verifies pinned identity and yields stable source order/checkpoints."""
-        ...
-
-
 class ModelPort(Protocol):
-    """B: the curated catalog gf-server serves; predictions go to gf-server."""
+    """The curated catalog gf-server serves; predictions go to gf-server."""
 
     def list(self, scope: Scope) -> list[JsonObject]:
         """Lists pins, license, bounds and supported/unconfigured capabilities."""

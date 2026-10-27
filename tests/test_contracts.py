@@ -76,7 +76,7 @@ def test_environment_promotion_and_rollback_are_cas_and_do_not_mutate_production
     assert rollback.revision == 1 and rollback.generation == 2
 
 
-def test_runtime_plan_derivation_is_pure_and_preserves_placement(tmp_path):
+def test_runtime_plan_holds_placement_to_its_rules(tmp_path):
     rows = pa.table({"x": [1, 2], "y": [2.0, 4.0]})
     lock = lock_of(
         directory(
@@ -86,17 +86,21 @@ def test_runtime_plan_derivation_is_pure_and_preserves_placement(tmp_path):
             model="general-forecast/tabicl-v2-regressor",
         )
     )
-    plan = RuntimePlan.for_lock(
-        lock,
-        runtime="byoc",
-        environment="production",
-        secret_refs=("secret/warehouse",),
+    plan = RuntimePlan(
+        "byoc",
+        "production",
+        lock.digest,
+        lock.predictor["model_digest"],
+        lock.data_digest,
+        None,
+        (),
+        1,
+        "2Gi",
+        1,
+        1,
+        ("secret/warehouse",),
     )
-    assert plan.predictor_digest == lock.digest
-    assert plan.model_digest == lock.predictor["model_digest"]
-    assert plan.data_digest is None
-    assert plan.cpu == 1 and plan.memory == "2Gi"
-    assert plan.region is None and plan.residency == ()
+    assert plan.predictor_digest == lock.digest and plan.data_digest is None
     with pytest.raises(PredictorError):
         dataclasses.replace(plan, region="eu-west-1", residency=("us-east-1",))
     with pytest.raises(PredictorError):
