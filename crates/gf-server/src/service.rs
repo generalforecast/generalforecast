@@ -718,6 +718,21 @@ impl Service {
             .ok_or_else(|| Status::not_found(format!("table {table:?} does not exist")))
     }
 
+    /// Asks the shard serving `table`, holding the table's route until it
+    /// answers so the command never crosses a move; answers what the shard
+    /// said and where the table was.
+    async fn at_table<T>(
+        &self,
+        table: TableName,
+        command: impl FnOnce(TableName, oneshot::Sender<Result<T, ServerError>>) -> Command,
+    ) -> Result<(T, Placement), Status> {
+        let (placement, _routed) = self.routed(&table).await?;
+        let answer = self
+            .ask(placement.shard, |reply| command(table, reply))
+            .await?;
+        Ok((answer, placement))
+    }
+
     async fn ask<T>(
         &self,
         shard: usize,
@@ -1199,6 +1214,33 @@ async fn batches(
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner);
     Ok((batches, charge))
+}
+
+/// A query exchange's rows: its batches, held against `charge` until the
+/// shard has answered them, and their features and words for `columns`.
+///
+/// # Errors
+///
+/// As `batches` and `features`, and `INVALID_ARGUMENT` for no rows at all.
+async fn query_rows(
+    stream: Peekable<Streaming<FlightData>>,
+    columns: &[Column],
+    charge: Charge,
+) -> Result<(Vec<RecordBatch>, Charge, Vec<f32>, Strings), Status> {
+    let (batches, charge) = batches(stream, charge).await?;
+    let (features, strings, rows) = features(&batches, columns)?;
+    if rows == 0 {
+        return Err(invalid("no query rows"));
+    }
+    Ok((batches, charge, features, strings))
+}
+
+/// One batch as a Flight response.
+fn encoded(batch: RecordBatch) -> Response<Boxed<FlightData>> {
+    let encoded = FlightDataEncoderBuilder::new()
+        .build(stream::iter([Ok(batch)]))
+        .map_err(|error| Status::internal(error.to_string()));
+    Response::new(Box::pin(encoded))
 }
 
 /// Bytes a batch takes once decoded for the shard, beyond the Arrow data it
@@ -2078,11 +2120,8 @@ impl Service {
         }
         let mut laps = self.laps(|| started);
         let mut route = laps.lap();
-        let (batches, _charge) = batches(stream, self.budget.charge()).await?;
-        let (features, strings, rows) = features(&batches, &placement.columns)?;
-        if rows == 0 {
-            return Err(invalid("no query rows"));
-        }
+        let (batches, _charge, features, strings) =
+            query_rows(stream, &placement.columns, self.budget.charge()).await?;
         let before = times(&batches, "before")?;
         let given = given_keys(&batches)?;
         if before.is_some() && given.is_some() {
@@ -2192,11 +2231,8 @@ impl Service {
         stream: Peekable<Streaming<FlightData>>,
     ) -> Result<Response<Boxed<FlightData>>, Status> {
         let placement = self.placement(table).await?;
-        let (batches, _charge) = batches(stream, self.budget.charge()).await?;
-        let (features, strings, rows) = features(&batches, &placement.columns)?;
-        if rows == 0 {
-            return Err(invalid("no query rows"));
-        }
+        let (batches, _charge, features, strings) =
+            query_rows(stream, &placement.columns, self.budget.charge()).await?;
         let before = times(&batches, "before")?;
         let (placement, _routed) = self.routed(table).await?;
         let contexts = self
@@ -2219,10 +2255,7 @@ impl Service {
         }
         let batch = RecordBatch::try_from_iter([("keys", Arc::new(keys.finish()) as ArrayRef)])
             .map_err(|error| Status::internal(error.to_string()))?;
-        let encoded = FlightDataEncoderBuilder::new()
-            .build(stream::iter([Ok(batch)]))
-            .map_err(|error| Status::internal(error.to_string()));
-        Ok(Response::new(Box::pin(encoded)))
+        Ok(encoded(batch))
     }
 
     /// Each query's region churn, as `Rebuild::Churn` compares it: one row per
@@ -2233,11 +2266,8 @@ impl Service {
         stream: Peekable<Streaming<FlightData>>,
     ) -> Result<Response<Boxed<FlightData>>, Status> {
         let placement = self.placement(table).await?;
-        let (batches, _charge) = batches(stream, self.budget.charge()).await?;
-        let (features, strings, rows) = features(&batches, &placement.columns)?;
-        if rows == 0 {
-            return Err(invalid("no query rows"));
-        }
+        let (_, _charge, features, strings) =
+            query_rows(stream, &placement.columns, self.budget.charge()).await?;
         let (placement, _routed) = self.routed(table).await?;
         let churn = self
             .ask(placement.shard, |reply| Command::RegionChurn {
@@ -2253,10 +2283,7 @@ impl Service {
             .collect();
         let batch = RecordBatch::try_from_iter([("churn", Arc::new(churn) as ArrayRef)])
             .map_err(|error| Status::internal(error.to_string()))?;
-        let encoded = FlightDataEncoderBuilder::new()
-            .build(stream::iter([Ok(batch)]))
-            .map_err(|error| Status::internal(error.to_string()));
-        Ok(Response::new(Box::pin(encoded)))
+        Ok(encoded(batch))
     }
 
     /// The rows a partition offers queries, and the queries, as rows travel
@@ -2279,11 +2306,8 @@ impl Service {
             serde_json::from_slice(body).map_err(|error| invalid(error.to_string()))?
         };
         let placement = self.placement(table).await?;
-        let (batches, _charge) = batches(stream, self.budget.charge()).await?;
-        let (features, strings, rows) = features(&batches, &placement.columns)?;
-        if rows == 0 {
-            return Err(invalid("no query rows"));
-        }
+        let (batches, _charge, features, strings) =
+            query_rows(stream, &placement.columns, self.budget.charge()).await?;
         // A router asks for one cutoff's queries at a time.
         let before = match times(&batches, "before")? {
             None => None,
@@ -2311,10 +2335,7 @@ impl Service {
             Some(&offers),
         )
         .map_err(|error| Status::internal(error.to_string()))?;
-        let encoded = FlightDataEncoderBuilder::new()
-            .build(stream::iter([Ok(batch)]))
-            .map_err(|error| Status::internal(error.to_string()));
-        Ok(Response::new(Box::pin(encoded)))
+        Ok(encoded(batch))
     }
 
     /// Predicts the rows without keys against contexts the body gives them
@@ -2522,10 +2543,9 @@ impl Service {
                 // The keys are held until the shard answers, as a put's rows are.
                 let mut charge = self.budget.charge();
                 charge.grow((keys.len() * std::mem::size_of::<u128>()) as u64)?;
-                let (placement, _routed) = self.routed(&table).await?;
-                let counts = self.metrics.table(&table);
-                let written = self
-                    .ask(placement.shard, |reply| Command::Write {
+                let name = table.clone();
+                let (written, placement) = self
+                    .at_table(table, |table, reply| Command::Write {
                         table,
                         write: Write::Delete {
                             keys: keys.into_iter().map(|key| key as u128).collect(),
@@ -2537,26 +2557,30 @@ impl Service {
                         reply,
                     })
                     .await?;
-                counts.rows_written.add(written.rows as u64);
+                if let Some(counts) = self.metrics.existing_table(&name) {
+                    counts.rows_written.add(written.rows as u64);
+                }
                 results(vec![answer(&written, &placement)])
             }
             FlightAction::Describe { table, words } => {
-                let (placement, _routed) = self.routed(&table).await?;
-                let Description {
-                    definition,
-                    rows,
-                    log_length,
-                    outputs,
-                    levels,
-                    strategy,
-                    context_rows,
-                    effective_fit_rows,
-                    regions,
-                    vocabularies,
-                    labels,
-                    series,
-                } = self
-                    .ask(placement.shard, |reply| Command::Describe { table, reply })
+                let (
+                    Description {
+                        definition,
+                        rows,
+                        log_length,
+                        outputs,
+                        levels,
+                        strategy,
+                        context_rows,
+                        effective_fit_rows,
+                        regions,
+                        vocabularies,
+                        labels,
+                        series,
+                    },
+                    _,
+                ) = self
+                    .at_table(table, |table, reply| Command::Describe { table, reply })
                     .await?;
                 let words: serde_json::Map<String, serde_json::Value> = definition
                     .columns
@@ -2596,19 +2620,14 @@ impl Service {
                 results(vec![described])
             }
             FlightAction::KnownSeries(table) => {
-                let (placement, _routed) = self.routed(&table).await?;
-                let keys = self
-                    .ask(placement.shard, |reply| Command::KnownSeries {
-                        table,
-                        reply,
-                    })
+                let (keys, _) = self
+                    .at_table(table, |table, reply| Command::KnownSeries { table, reply })
                     .await?;
                 results(vec![json!(keys)])
             }
             FlightAction::Truncate(table) => {
-                let (placement, _routed) = self.routed(&table).await?;
-                let written = self
-                    .ask(placement.shard, |reply| Command::Write {
+                let (written, placement) = self
+                    .at_table(table, |table, reply| Command::Write {
                         table,
                         write: Write::Truncate,
                         fence,
@@ -2619,9 +2638,8 @@ impl Service {
                 results(vec![answer(&written, &placement)])
             }
             FlightAction::Refit(table) => {
-                let (placement, _routed) = self.routed(&table).await?;
-                let written = self
-                    .ask(placement.shard, |reply| Command::Refit {
+                let (written, placement) = self
+                    .at_table(table, |table, reply| Command::Refit {
                         table,
                         fence,
                         reply,
@@ -2630,9 +2648,8 @@ impl Service {
                 results(vec![answer(&written, &placement)])
             }
             FlightAction::SetStrategy { table, strategy } => {
-                let (placement, _routed) = self.routed(&table).await?;
-                let written = self
-                    .ask(placement.shard, |reply| Command::SetStrategy {
+                let (written, placement) = self
+                    .at_table(table, |table, reply| Command::SetStrategy {
                         table,
                         strategy,
                         fence,
@@ -2666,9 +2683,8 @@ impl Service {
                 results(vec![json!(lengths)])
             }
             FlightAction::Compact(table) => {
-                let (placement, _routed) = self.routed(&table).await?;
-                let log_length = self
-                    .ask(placement.shard, |reply| Command::Compact {
+                let (log_length, _) = self
+                    .at_table(table, |table, reply| Command::Compact {
                         table,
                         fence,
                         reply,
@@ -2689,9 +2705,8 @@ impl Service {
                 term,
                 primary,
             } => {
-                let (placement, _routed) = self.routed(&table).await?;
-                let log_length = self
-                    .ask(placement.shard, |reply| Command::Promote {
+                let (log_length, _) = self
+                    .at_table(table, |table, reply| Command::Promote {
                         table,
                         term,
                         primary,
