@@ -487,8 +487,23 @@ def select_context(spec: ExecutionPlan, data: Any, pin: ModelPin) -> pa.Table:
             "context exceeds the predictor's max_rows",
             "CapacityExceeded",
         )
+    if spec.task == "forecast":
+        # A forecaster reads each series' own history, so the model's row
+        # cap bounds a series, not the context; any number of series bind.
+        if spec.series and table.num_rows > pin.max_context_rows:
+            counts = table.group_by(list(spec.series)).aggregate([([], "count_all")])
+            longest = max(counts["count_all"].to_pylist(), default=0)
+        else:
+            longest = table.num_rows
+        ensure(
+            longest <= pin.max_context_rows,
+            f"a series has {longest:,} context rows; the model reads at most "
+            f"{pin.max_context_rows:,} per series, so keep each series' most recent ones",
+            "CapacityExceeded",
+        )
+        return table
     strategy = spec.selection.strategy if spec.selection is not None else "exact"
-    if strategy == "exact" or spec.task == "forecast":
+    if strategy == "exact":
         ensure(
             table.num_rows <= pin.max_context_rows,
             "context exceeds model limit; declare an explicit selection",

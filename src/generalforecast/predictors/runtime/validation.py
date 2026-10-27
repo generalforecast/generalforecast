@@ -7,6 +7,7 @@ from typing import Any
 
 import pyarrow as pa
 
+from generalforecast.contracts import MAX_QUERIES
 from generalforecast.predictors.models import CatalogResolver
 from generalforecast.predictors.runtime.compile import validate_queries
 from generalforecast.predictors.runtime.compiled import CompiledPlan
@@ -19,7 +20,7 @@ from generalforecast.predictors.runtime.schema import (
 from generalforecast.predictors.validation import ensure
 from generalforecast.tabular import arrow_bytes, physical_type, table_digest, to_arrow
 
-MAX_QUERY_ROWS = 10_000
+MAX_QUERY_ROWS = MAX_QUERIES
 
 
 def isolated(data: pa.Table, *, max_rows: int = 1_000_000) -> pa.Table:

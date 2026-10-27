@@ -288,6 +288,11 @@ def resolve(
     if frame is not None:
         labeled = frame.num_rows - frame[spec.target].null_count
     selection, reason = _selection(spec, labeled, limits.context_rows)
+    if task == "forecast" and selection.strategy == "retrieved":
+        # A forecaster reads each series' whole history; the row cap bounds
+        # a series (`schema.select_context`), never how many there are.
+        selection = SelectionInfo("exact", kind=selection.kind, seed=selection.seed)
+        reason = "a forecaster reads each series' whole history"
     if reason is not None:
         inferred["selection"] = reason
     if selection.recent is not None and spec.time is not None and selection.neighbors:
@@ -720,7 +725,11 @@ def _forecast_rows(spec: PredictorSpec, frame: pa.Table, queries: Any) -> None:
     }
     for key, times in _series_times(spec, queries).items():
         last = history.get(key)
-        early = [t for t in times if last is not None and t is not None and frequency.instant(t) <= last]
+        early = [
+            t
+            for t in times
+            if last is not None and t is not None and frequency.instant(t) <= last
+        ]
         if early:
             shown = early[0].isoformat() if hasattr(early[0], "isoformat") else early[0]
             raise spec.error(
@@ -767,8 +776,7 @@ def _forecast_queries(
         )
         if steps != [float(index) for index in range(1, spec.horizon + 1)]:
             raise spec.error(
-                f"{_label(key)}: the query rows are not its next "
-                f"{spec.horizon} steps",
+                f"{_label(key)}: the query rows are not its next {spec.horizon} steps",
                 param="time",
                 because=f"they must follow its last value, one `{cadence}` apart",
                 hint="give each series the rows right after its history",

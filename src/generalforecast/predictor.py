@@ -608,6 +608,33 @@ def _pinball(y: np.ndarray, q: np.ndarray, level: float) -> float:
     return float(np.mean(np.where(diff >= 0, level * diff, (level - 1) * diff)))
 
 
+def _query_batches(
+    table: pa.Table, series: Sequence[str], cap: int
+) -> list[np.ndarray]:
+    """The row indices of each call, at most `cap` rows apiece, in row order.
+
+    With series columns, each series' rows stay in one call, as a
+    forecaster needs a series' whole horizon at once; series are packed in
+    order of first appearance. A series of more than `cap` rows is a call
+    of its own, which the server bounds.
+    """
+    if not series:
+        return [
+            np.arange(start, min(start + cap, table.num_rows))
+            for start in range(0, table.num_rows, cap)
+        ]
+    keys = list(zip(*(table[name].to_pylist() for name in series), strict=True))
+    members: dict[Any, list[int]] = {}
+    for index, key in enumerate(keys):
+        members.setdefault(key, []).append(index)
+    batches: list[list[int]] = [[]]
+    for rows in members.values():
+        if batches[-1] and len(batches[-1]) + len(rows) > cap:
+            batches.append([])
+        batches[-1].extend(rows)
+    return [np.asarray(sorted(rows), dtype=np.int64) for rows in batches if rows]
+
+
 def _when(moment: Any) -> Any:
     """A time as it sorts: an instant for dates and datetimes, else itself."""
     from generalforecast.predictors.frequency import instant
@@ -1087,6 +1114,11 @@ class Predictor:
     def predict(self, queries: Any, context: Any = None, *, as_of: Any = None) -> Any:
         """Scores rows.
 
+        Any number of query rows score: past one call's bound
+        (`contracts.MAX_QUERIES`, or the model's own) they go as several
+        calls, a forecaster's series each whole within one, and come back
+        in the order given.
+
         Args:
             queries: Rows to score: a frame, list of dicts, Arrow table, or a
                 path or URL to a .csv, .parquet or .json file.
@@ -1099,6 +1131,42 @@ class Predictor:
             columns for a classifier, or `value` and `q_<level>` columns for
             a regressor or forecaster.
         """
+        table = tabular.frame(queries)
+        cap = self._query_cap()
+        if table.num_rows <= cap:
+            return self._predict_once(table, context, as_of=as_of)
+        import pandas as pd
+
+        parts, order = [], []
+        for rows in _query_batches(table, self._series_columns(), cap):
+            parts.append(self._predict_once(table.take(rows), context, as_of=as_of))
+            order.append(rows)
+        frame = pd.concat(parts, ignore_index=True)
+        placed = np.empty(table.num_rows, dtype=np.int64)
+        placed[np.concatenate(order)] = np.arange(table.num_rows)
+        return frame.iloc[placed].reset_index(drop=True)
+
+    def _query_cap(self) -> int:
+        """Most query rows one call carries: the wire bound, or a model's lower one."""
+        from generalforecast.contracts import MAX_QUERIES
+
+        if self._kind == "catalog" and self.task != "forecast":
+            # An ad hoc call is held to the model's own per-call bound.
+            return max(1, min(MAX_QUERIES, registry.limits(self.model).queries))
+        return MAX_QUERIES
+
+    def _series_columns(self) -> tuple[str, ...]:
+        """A forecaster's series columns, which a batch keeps whole; none otherwise."""
+        if self._kind in ("served", "hosted") and not self.series:
+            facts = self._hosted_facts()
+            if facts.get("task") == "forecast":
+                self.series = tuple(facts.get("series") or ())
+        return tuple(self.series)
+
+    def _predict_once(
+        self, queries: Any, context: Any = None, *, as_of: Any = None
+    ) -> Any:
+        """One prediction call: at most `MAX_QUERIES` query rows."""
         if self._kind in ("local", "catalog") and not (
             self._kind == "local" and self._context_kind == "live"
         ):
@@ -1250,24 +1318,35 @@ class Predictor:
         for ref in (self.model, *models):
             model = registry.canonical(ref)
             task = registry.task_of(model)
-            cap = registry.limits(model).queries if task != "forecast" else len(held)
-            frames = []
+            from generalforecast.contracts import MAX_QUERIES
+
+            cap = (
+                MAX_QUERIES
+                if task == "forecast"
+                else max(1, min(MAX_QUERIES, registry.limits(model).queries))
+            )
+            frames, order = [], []
             lock = self._lock if model == self.model else self._lock_for(model)
-            for start in range(0, max(len(held), 1), max(cap, 1)):
+            series = self.series if task == "forecast" else ()
+            for indices in _query_batches(held, series, cap):
                 given = None if self._kind == "local" else context
                 batch = dataclasses.replace(
-                    self.request(held.slice(start, cap), given),
+                    self.request(held.take(indices), given),
                     model=model,
                     task=task,
                     lock=lock,
                 )
-                if start == 0:
+                if not frames:
                     request = batch
                 with boundary():
                     frames.append(run_local(batch, download=self._download))
+                order.append(indices)
             frame = (
                 frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
             )
+            placed = np.empty(len(frame), dtype=np.int64)
+            placed[np.concatenate(order)] = np.arange(len(frame))
+            frame = frame.iloc[placed].reset_index(drop=True)
             metrics[model] = self._score(request, frame, truth, held)
             key = (
                 registry.short(model)

@@ -26,6 +26,9 @@ from generalforecast.predictors.validation import (
 )
 
 API_PREFIX = "/v1"
+# Most query rows one prediction call carries, on every surface; the SDK
+# sends more as several calls.
+MAX_QUERIES = 10_000
 STATES = frozenset({"pending", "building", "ready", "failed", "stopped"})
 TASKS = ("classification", "regression", "forecast")
 CONTEXT_KINDS = ("snapshot", "request", "live")
@@ -449,7 +452,7 @@ class PredictionRequest(WireValue):
         """Checks the rows and the time."""
         ensure(
             type(self.queries) is tuple
-            and 0 < len(self.queries) <= 10_000
+            and 0 < len(self.queries) <= MAX_QUERIES
             and all(type(row) is dict for row in self.queries),
             "queries must contain 1..10000 rows",
         )

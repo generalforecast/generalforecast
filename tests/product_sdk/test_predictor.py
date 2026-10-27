@@ -761,3 +761,34 @@ def test_forecast_eval_scales_each_series_by_its_own_history(monkeypatch) -> Non
     scores = predictor.eval(held).metrics["general-forecast/chronos-2"]
     # |8 - 0| over each series' naive error: 8 for east, 2 for west.
     assert scores["mase"] == pytest.approx((8 + 8 + 2 + 2) / 4)
+
+
+def test_predict_sends_large_query_sets_as_several_calls_in_order(monkeypatch) -> None:
+    import generalforecast.predictor as predictor_module
+    from generalforecast.native import models as registry
+    from generalforecast.predictor import _query_batches
+
+    calls = []
+
+    def fake_run(request: PredictRequest, *, download: bool = True) -> pd.DataFrame:
+        calls.append(len(request.queries))
+        return pd.DataFrame({"value": request.queries.column("x").to_pylist()})
+
+    monkeypatch.setattr(predictor_module, "run_local", fake_run)
+    context = [{"x": float(i), "y": float(i)} for i in range(10)]
+    predictor = gf.Predictor(REGRESSOR, target="y", context=context)
+    cap = registry.limits(REGRESSOR).queries
+    queries = pa.table({"x": [float(i) for i in range(2 * cap + cap // 2)]})
+    frame = predictor.predict(queries)
+    # An ad hoc call is held to the model's per-call bound.
+    assert calls == [cap, cap, cap // 2]
+    assert frame["value"].tolist() == queries["x"].to_pylist()
+    # A forecaster's series stay whole within one call; rows come back in order.
+    keys = pa.table({"s": ["a", "b", "a", "c", "b", "c", "a"]})
+    batches = _query_batches(keys, ["s"], 4)
+    assert [b.tolist() for b in batches] == [[0, 2, 6], [1, 3, 4, 5]]
+    assert [b.tolist() for b in _query_batches(keys, [], 3)] == [
+        [0, 1, 2],
+        [3, 4, 5],
+        [6],
+    ]
