@@ -437,3 +437,125 @@ def test_open_keeps_the_retrieval_settings_of_an_adaptive_table(catalog) -> None
         assert described.retrieval_categoricals == "one_hot"
     finally:
         table.drop()
+
+
+def _served(*models: str) -> tuple[str, str]:
+    """The process engine's Flight endpoint, its workers serving these models."""
+    from generalforecast.models.catalog import parse
+
+    local = engine.local()
+    for model in models:
+        local.load(parse(model))
+    return local.serve()
+
+
+def test_a_client_sees_a_table_another_made_again_as_it_is_now(catalog) -> None:
+    from generalforecast.native.remote import RemoteClient
+
+    location, token = _served(
+        "general-forecast/tabicl-v2-classifier", "general-forecast/chronos-2"
+    )
+    first, second = RemoteClient(location, token), RemoteClient(location, token)
+    try:
+        made = first._create_table(
+            "remade",
+            model="general-forecast/tabicl-v2-classifier",
+            features=2,
+            classes=2,
+        )
+        assert first.table("remade") is made
+        second.drop_table("remade")
+        second._create_table(
+            "remade",
+            model="general-forecast/tabicl-v2-classifier",
+            features=3,
+            classes=2,
+        )
+
+        remade = first.table("remade")
+
+        assert remade is not made
+        assert len(remade.columns) == 3
+        assert first.table("remade") is remade
+        series = second._create_series_table(
+            "remade-series",
+            model="general-forecast/chronos-2",
+            series="item",
+            time="t",
+            target="units",
+            step=1,
+        )
+        assert first.series_table("remade-series").definition == series.definition
+        first.drop_table("remade-series")
+        first._create_series_table(
+            "remade-series",
+            model="general-forecast/chronos-2",
+            series="item",
+            time="t",
+            target="units",
+            step=2,
+        )
+        assert second.series_table("remade-series").step == 2
+    finally:
+        for name in ("remade", "remade-series"):
+            first.drop_table(name)
+        first.close()
+        second.close()
+
+
+def _calls(kind: type) -> set[str]:
+    """A table class's public methods, its properties left out."""
+    import inspect
+
+    return {
+        name
+        for name, value in inspect.getmembers(kind)
+        if not name.startswith("_") and inspect.isfunction(value)
+    }
+
+
+def test_async_tables_wrap_every_call_of_their_twins() -> None:
+    from generalforecast.native.remote import (
+        AsyncRemoteSeriesTable,
+        AsyncRemoteTable,
+        RemoteSeriesTable,
+        RemoteTable,
+    )
+
+    assert _calls(RemoteTable) <= set(dir(AsyncRemoteTable))
+    assert _calls(RemoteSeriesTable) <= set(dir(AsyncRemoteSeriesTable))
+    assert AsyncRemoteTable.predict.__doc__ == RemoteTable.predict.__doc__
+
+
+def test_async_tables_run_their_twins_calls(catalog) -> None:
+    import asyncio
+
+    from generalforecast.native.remote import AsyncRemoteClient, RemoteClient
+
+    location, token = _served("general-forecast/tabicl-v2-classifier")
+    features = np.random.default_rng(0).normal(size=(16, 2)).astype(np.float32)
+    targets = (np.arange(16) % 2).astype(np.int32)
+
+    async def run() -> tuple[np.ndarray, np.ndarray, int]:
+        async with AsyncRemoteClient(RemoteClient(location, token)) as client:
+            table = await client._create_table(
+                "awaited",
+                model="general-forecast/tabicl-v2-classifier",
+                features=2,
+                classes=2,
+            )
+            try:
+                await table.insert(np.arange(16), features, targets)
+                await table.delete([3])
+                return (
+                    await table.predict(features[:2]),
+                    await table.predict(features[:2], quantiles=None),
+                    await table.count(),
+                )
+            finally:
+                await client.drop_table("awaited")
+
+    predicted, again, count = asyncio.run(run())
+
+    assert predicted.shape == (2, 2) and count == 15
+    np.testing.assert_array_equal(predicted, again)
