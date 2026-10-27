@@ -25,7 +25,10 @@ use gf_core::predictor;
 use gf_core::regions::{Rebuild, RebuildWait, RegionSpec};
 use gf_core::request::{self, Inference, Label, Limits, Num, Options};
 use gf_core::table::RowId;
-use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{
+    IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyUntypedArrayMethods,
+};
 use pyo3::IntoPyObjectExt;
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -437,6 +440,27 @@ fn row_times(times: Option<&PyReadonlyArray1<'_, i64>>) -> PyResult<Option<Vec<O
     times
         .map(|times| Ok(times.as_slice()?.iter().copied().map(Some).collect()))
         .transpose()
+}
+
+/// A C-contiguous matrix of `table`'s rows, refused unless its rows are the
+/// table's width: its values alone would be read as rows of that width,
+/// however the array was shaped. An empty matrix holds no rows to measure.
+fn table_rows<'a>(
+    node: &node::Node,
+    table: u32,
+    matrix: &'a PyReadonlyArray2<'_, f32>,
+    what: &str,
+) -> PyResult<&'a [f32]> {
+    let width = node.spec(TableId(table)).map_err(raised)?.features;
+    if let [rows, columns] = *matrix.shape()
+        && rows > 0
+        && columns != width
+    {
+        return Err(invalid(format!(
+            "{what} are rows of {columns} values, and table {table} takes rows of {width}"
+        )));
+    }
+    Ok(matrix.as_slice()?)
 }
 
 /// Keys from Python: a C-contiguous (n, 2) array of each key's low and high
@@ -1176,7 +1200,7 @@ impl Node {
         let times = row_times(times.as_ref())?;
         let (keys, features, targets) = (
             wide_keys(&keys)?,
-            features.as_slice()?.to_vec(),
+            table_rows(&self.0, table, &features, "features")?.to_vec(),
             self::targets(targets)?,
         );
         let node = &mut self.0;
@@ -1202,7 +1226,7 @@ impl Node {
         let times = row_times(times.as_ref())?;
         let (keys, features, targets) = (
             wide_keys(&keys)?,
-            features.as_slice()?.to_vec(),
+            table_rows(&self.0, table, &features, "features")?.to_vec(),
             self::targets(targets)?,
         );
         let node = &mut self.0;
@@ -1244,7 +1268,7 @@ impl Node {
         let times = row_times(times.as_ref())?;
         let (keys, features, targets) = (
             wide_keys(&keys)?,
-            features.as_slice()?.to_vec(),
+            table_rows(&self.0, table, &features, "features")?.to_vec(),
             self::targets(targets)?,
         );
         let node = &mut self.0;
@@ -1313,7 +1337,11 @@ impl Node {
             .transpose()?;
         Ok(self
             .0
-            .submit_before(TableId(table), queries.as_slice()?, before)
+            .submit_before(
+                TableId(table),
+                table_rows(&self.0, table, &queries, "queries")?,
+                before,
+            )
             .map_err(raised)?
             .0)
     }
@@ -1329,9 +1357,10 @@ impl Node {
             .iter()
             .map(wide_keys)
             .collect::<PyResult<Vec<_>>>()?;
+        let queries = table_rows(&self.0, table, &queries, "queries")?;
         Ok(self
             .0
-            .submit_keys(TableId(table), queries.as_slice()?, &contexts)
+            .submit_keys(TableId(table), queries, &contexts)
             .map_err(raised)?
             .0)
     }
@@ -1350,7 +1379,7 @@ impl Node {
             .as_ref()
             .map(|before| before.as_slice().map(<[i64]>::to_vec))
             .transpose()?;
-        let queries = queries.as_slice()?.to_vec();
+        let queries = table_rows(&self.0, table, &queries, "queries")?.to_vec();
         let node = &mut self.0;
         py.detach(|| node.contexts(TableId(table), &queries, before.as_deref()))
             .map_err(raised)?
@@ -1391,9 +1420,10 @@ impl Node {
         table: u32,
         queries: PyReadonlyArray2<'_, f32>,
     ) -> PyResult<Py<PyArray1<f64>>> {
+        let queries = table_rows(&self.0, table, &queries, "queries")?;
         let churn: Vec<f64> = self
             .0
-            .region_churn(TableId(table), queries.as_slice()?)
+            .region_churn(TableId(table), queries)
             .map_err(raised)?
             .into_iter()
             .map(|churn| churn.unwrap_or(f64::NAN))

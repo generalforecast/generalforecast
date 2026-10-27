@@ -1,11 +1,13 @@
 name: Weekly
 
 # Tests marked slow compile models or start servers, so they run once a week
-# instead of on every pull request. Run it by hand before a release.
+# instead of on every pull request, and release.yml runs them before it
+# publishes.
 on:
   schedule:
     - cron: "0 7 * * 1"
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read

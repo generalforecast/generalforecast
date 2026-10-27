@@ -137,7 +137,9 @@ impl TimeIndex {
     }
 
     /// The `count` latest rows of `within`, by time: untimed rows are the
-    /// oldest, and at one time the higher rows count as later. With `before`,
+    /// oldest, and at one time the higher rows count as later, so which rows
+    /// at one time it keeps follows the order they were inserted in, until a
+    /// renumbering orders them by key. With `before`,
     /// every row of `within` is before it, so the walk starts there.
     #[must_use]
     pub fn latest(&self, within: &Context, count: u64, before: Option<i64>) -> Context {
