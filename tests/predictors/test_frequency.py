@@ -8,7 +8,7 @@ import datetime
 import pytest
 
 from generalforecast.predictors import frequency
-from generalforecast.predictors.spec import frequency_seconds, parse_text
+from generalforecast.predictors.spec import parse_text
 
 
 def _at(year: int, month: int, day: int) -> datetime.datetime:
@@ -46,7 +46,6 @@ def test_every_spelling_normalizes_to_one(given, canonical, seconds) -> None:
     assert frequency.normalize(given) == canonical
     assert frequency.normalize(canonical) == canonical
     assert frequency.seconds(given) == seconds
-    assert frequency_seconds(given) == seconds
 
 
 @pytest.mark.parametrize("bad", ["fast", "0d", "1y", "W-XYZ", "", "1.5h", -1, 0, True])
@@ -70,9 +69,10 @@ def test_calendar_aliases_step_by_the_calendar() -> None:
     assert frequency.grid(10, 2, "1d") == [86410, 172810]
     assert frequency.grid(10, 2, 5) == [15, 20]
     months = [_at(2024, m, 1) for m in (1, 2, 3)]
-    assert frequency.regular(months, "MS")
-    assert not frequency.regular(months, "1w")
-    assert not frequency.regular(months, "ME")
+    frequency.check({"a": months}, "MS")
+    for other in ("1w", "ME"):
+        with pytest.raises(frequency.FrequencyError):
+            frequency.check({"a": months}, other)
 
 
 def test_manifests_keep_the_canonical_spelling() -> None:

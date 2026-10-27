@@ -17,7 +17,6 @@ from sklearn.model_selection import cross_val_score
 from generalforecast.engine import LocalEngine
 from generalforecast.estimators import Forecaster, Regressor
 from generalforecast.predictor import Predictor
-from generalforecast.predictors.validation import PredictorError
 from tests.utils import engine_client as generalforecast
 
 pytestmark = pytest.mark.slow

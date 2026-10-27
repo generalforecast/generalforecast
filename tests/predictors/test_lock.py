@@ -268,7 +268,7 @@ def test_version_1_locks_upgrade_to_what_they_served():
     assert [column["role"] for column in predictor["inputs"]] == ["past", "future"]
     assert predictor["outputs"] == ["value", "quantiles"]
     assert predictor["selection"]["strategy"] == "exact"
-    assert predictor["time_type"] == "timestamp"
+    assert predictor["time_type"] is None and predictor["series_types"] == [None]
     assert PredictorLock.from_dict(upgraded).digest == upgraded["digest"]
     regression = upgrade(
         {

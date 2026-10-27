@@ -546,9 +546,13 @@ def pushed(predictor: "str | Path") -> Pushed:
                 f"gf.lock in {root} was written for another gf.yaml; run `gf check` first",
                 422,
             )
+    except ServiceError:
+        raise
     except Error as error:
         raise ServiceError(
-            "LockRequired", f"{error.message}; run `gf check` first", 422
+            "LockRequired" if error.param == "lock" else error.code,
+            error.message,
+            422,
         ) from None
     lock = PredictorLock.from_dict(document)
     snapshot = None

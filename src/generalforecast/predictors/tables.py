@@ -430,6 +430,12 @@ def split_by(
         error: Builds the `InvalidInput` for a missing time column, pointing
             at the manifest when there is one.
     """
+    if target not in table.column_names:
+        message = f"target column `{target}` is not in the context"
+        hint = f"the context has {', '.join(table.column_names)}"
+        if error is not None:
+            raise error(message, param="target", hint=hint)
+        raise InvalidInput(message=message, param="target", hint=hint)
     empty = pc.is_null(_blank_to_null(table[target]))
     labeled = pc.invert(empty)
     queried = empty

@@ -273,7 +273,8 @@ def resolve(
                 hint="add `frequency: 1d`, or the step your times follow",
             )
     if task != "classification":
-        quantiles = spec.quantiles or DEFAULT_QUANTILES
+        # Levels are a set; the lock keeps them in ascending order.
+        quantiles = tuple(sorted(spec.quantiles)) or DEFAULT_QUANTILES
         if not spec.quantiles:
             inferred["quantiles"] = "the default levels"
     labeled = None

@@ -582,11 +582,6 @@ def _frequency(top: _Fields) -> str | int | float | None:
     )
 
 
-def frequency_seconds(value: str | float | None) -> float | None:
-    """A declared frequency in seconds, or None when none was declared."""
-    return frequency.seconds(value)
-
-
 def _quantiles(top: _Fields) -> tuple[float, ...]:
     value = top.get("quantiles")
     if value is None:

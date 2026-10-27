@@ -41,11 +41,18 @@ def bound_order(lock: CompiledPlan, table: pa.Table) -> pa.Table:
     """The context rows in the order the binder writes them: by time, when they have one.
 
     A retrieved selection's neighbors lean to the newest rows by their order
-    in the bound table, so every path binds them oldest first. `gf serve`
-    writes its snapshot rows in this order too.
+    in the bound table, so every path binds a snapshot or live context
+    oldest first; `gf serve` writes its snapshot rows in this order too. A
+    request context binds in the order its rows come.
     """
     time = lock.spec.time
-    if time is None or time not in table.column_names:
+    if (
+        time is None
+        or time not in table.column_names
+        or lock.spec.context.mode == "request"
+    ):
+        # A request context binds in the order the call sends, as gf-server
+        # binds a request's rows.
         return table
     return table.sort_by([(time, "ascending")])
 

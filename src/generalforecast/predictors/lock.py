@@ -234,7 +234,21 @@ def validate(value: Any) -> dict[str, Any]:
     for key in ("id", "time"):
         if key in predictor:
             text(predictor[key])
+            ensure(
+                f"{key}_type" in predictor,
+                f"a lock with an {key} records its {key}_type",
+            )
             _kind(predictor[f"{key}_type"])
+    if "classes" in predictor:
+        classes = predictor["classes"]
+        ensure(
+            task == "classification"
+            and type(classes) is list
+            and len(classes) >= 2
+            and all(type(label) in (str, int, bool) for label in classes)
+            and len(set(map(repr, classes))) == len(classes),
+            "a classifier's classes are distinct string, integer or boolean labels",
+        )
     if "series" in predictor:
         ensure(
             type(predictor["series"]) is list
@@ -270,14 +284,25 @@ def validate(value: Any) -> dict[str, Any]:
             "quantiles are levels between 0 and 1",
         )
     outputs = predictor["outputs"]
+    allowed = (
+        ("label", "probabilities")
+        if task == "classification"
+        else ("value", "quantiles")
+    )
     ensure(
         type(outputs) is list
         and bool(outputs)
-        and all(type(o) is str for o in outputs),
-        "outputs are a list of output names",
+        and all(type(o) is str and o in allowed for o in outputs)
+        and len(set(outputs)) == len(outputs),
+        f"a {task} lock's outputs are distinct names among {', '.join(allowed)}",
     )
     inputs = predictor["inputs"]
     ensure(type(inputs) is list, "lock inputs must list {name, type, role} columns")
+    ensure(
+        len({column.get("name") for column in inputs if type(column) is dict})
+        == len(inputs),
+        "lock inputs name each column once",
+    )
     for column in inputs:
         fields(column, {"name", "type", "role"})
         text(column["name"])
@@ -302,9 +327,13 @@ def validate(value: Any) -> dict[str, Any]:
             holdout = fields(context["holdout"], {"fraction", "seed"})
             ensure(
                 type(holdout["fraction"]) in (int, float)
-                and 0 < holdout["fraction"] < 1,
-                "invalid holdout fraction",
+                and 0 < holdout["fraction"] < 1
+                and type(holdout["seed"]) is int
+                and 0 <= holdout["seed"] < 2**32,
+                "invalid holdout fraction or seed",
             )
+        if "until" in context:
+            ensure(_iso(context["until"]), "`until` is an ISO date or timestamp")
         ensure(
             not ("until" in context and "holdout" in context),
             "`until` and `holdout` cannot both be set",
@@ -323,7 +352,10 @@ def validate(value: Any) -> dict[str, Any]:
             and context["max_rows"] > 0,
             "max_rows bounds a request context",
         )
-    SelectionInfo.from_dict(predictor["selection"])
+    try:
+        SelectionInfo.from_dict(predictor["selection"])
+    except InvalidInput as error:
+        raise PredictorError("ValidationError", error.message) from None
     if "resources" in value:
         fields(value["resources"], set(), RESOURCE_FIELDS)
     model = fields(value["model"], {"files"})
@@ -333,6 +365,18 @@ def validate(value: Any) -> dict[str, Any]:
         "model files map paths to digests",
     )
     return value
+
+
+def _iso(value: Any) -> bool:
+    import datetime as dt
+
+    if type(value) is not str:
+        return False
+    try:
+        dt.datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return True
 
 
 def _kind(value: Any) -> None:
@@ -372,11 +416,12 @@ def upgrade(value: Any) -> dict[str, Any]:
         predictor["id_type"] = source.get("id_type")
     if source.get("time") is not None:
         predictor["time"] = source["time"]
-        stepped = isinstance(source.get("frequency"), int | float)
-        predictor["time_type"] = "int" if stepped else "timestamp"
+        # A version 1 lock records no time kind; the rows a revision binds
+        # give it, as they give a request context's.
+        predictor["time_type"] = None
     if source.get("series"):
         predictor["series"] = list(source["series"])
-        predictor["series_types"] = ["category"] * len(source["series"])
+        predictor["series_types"] = [None] * len(source["series"])
     if task == "forecast":
         predictor["frequency"] = source.get("frequency")
         predictor["horizon"] = source.get("horizon")

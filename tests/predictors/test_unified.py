@@ -226,7 +226,7 @@ def test_monthly_contexts_lock_a_calendar_frequency_and_forecast_on_it(
     lock = lock_of(root)
     assert lock.predictor["frequency"] == "MS"
     plan = compile_lock(lock, served_context(lock, rows))
-    assert published_entry(plan)["predictor"]["forecast"]["calendar"] == "M"
+    assert published_entry(plan)["predictor"]["forecast"]["calendar"] == "MS"
     prepared = PredictorExecutor().prepare(plan, served_context(lock, rows))
     queries = pa.table({"month": [datetime.date(2024, m, 1) for m in (1, 2, 3)]})
     assert prepared.predict(queries).num_rows == 3
@@ -438,3 +438,91 @@ def test_serving_refuses_a_lock_pinned_to_another_artifact(tmp_path):
     with pytest.raises(PredictorError) as caught:
         compile_lock(value, served_context(value, churn()))
     assert caught.value.code == "ModelMismatch"
+
+
+def test_calendar_periods_win_over_equal_gaps():
+    from generalforecast.predictors import frequency
+
+    years = [datetime.date(2021 + i, 1, 1) for i in range(3)]
+    assert frequency.infer({"a": years}) == "YS"
+    quarters = [datetime.date(2024, 7, 1), datetime.date(2024, 10, 1)]
+    assert frequency.infer({"a": quarters}) == "QS"
+    months = [datetime.date(2024, 1, 1), datetime.date(2024, 2, 1)]
+    assert frequency.infer({"a": months}) == "MS"
+    weeks = [
+        datetime.date(2024, 1, 1) + datetime.timedelta(days=7 * i) for i in range(4)
+    ]
+    assert frequency.infer({"a": weeks}) == "1w"
+    zoned = datetime.datetime(
+        2024, 1, 31, 19, tzinfo=datetime.timezone(datetime.timedelta(hours=-5))
+    )
+    stepped = frequency.grid(zoned, 2, "MS")
+    assert [stamp.isoformat() for stamp in stepped] == [
+        "2024-03-01T00:00:00+00:00",
+        "2024-04-01T00:00:00+00:00",
+    ]
+
+
+def test_validation_names_what_is_malformed(tmp_path):
+    from generalforecast.predictors.lock import lock_digest, validate
+
+    root = directory(tmp_path / "churn", churn(), id="id")
+    good = yaml.safe_load((root / "gf.lock").read_text())
+
+    def broken(change):
+        value = yaml.safe_load(yaml.safe_dump(good))
+        change(value)
+        value["digest"] = lock_digest(value)
+        with pytest.raises(PredictorError):
+            validate(value)
+
+    broken(lambda v: v["predictor"].pop("id_type"))
+    broken(lambda v: v["predictor"]["context"].update(until=5))
+    broken(lambda v: v["predictor"].update(classes="ab"))
+    broken(lambda v: v["predictor"].update(outputs=["nonsense"]))
+    broken(lambda v: v["predictor"]["inputs"].append(dict(v["predictor"]["inputs"][0])))
+    broken(lambda v: v["predictor"]["selection"].update(strategy="nearest"))
+
+
+def test_a_snapshot_without_its_target_is_a_clear_error(tmp_path):
+    from generalforecast.service.contracts import ServiceError
+    from generalforecast.tabular import arrow_bytes
+
+    root = directory(tmp_path / "churn", churn(), id="id")
+    (root / "history.arrow").write_bytes(arrow_bytes(churn().drop(["y"])))
+    with pytest.raises(ServiceError) as caught:
+        pushed(root)
+    assert "target column `y` is not in the context" in caught.value.message
+
+
+def test_frozen_checks_and_local_predictors_refuse_a_stale_lock(tmp_path, monkeypatch):
+    import generalforecast as gf
+    from generalforecast.predictors import load_lock
+    from generalforecast.tabular import arrow_bytes
+
+    root = directory(tmp_path / "churn", churn(), id="id")
+    (root / "history.arrow").write_bytes(
+        arrow_bytes(churn().set_column(2, "spend", pa.array([7.0] * 12)))
+    )
+    with pytest.raises(InvalidInput) as caught:
+        gf.Predictor(root)
+    assert caught.value.message.endswith("is out of date")
+    manifest = root / "gf.yaml"
+    manifest.write_text(manifest.read_text() + "selection: {seed: 2}\n")
+    with pytest.raises(InvalidInput) as caught:
+        load_lock(root)
+    assert caught.value.message == "gf.lock was written for another gf.yaml"
+
+
+def test_unordered_quantiles_lock_in_order(tmp_path):
+    rows = pa.table(
+        {"x": [float(i) for i in range(10)], "price": [float(i) for i in range(10)]}
+    )
+    root = directory(
+        tmp_path / "price",
+        rows,
+        model="general-forecast/tabicl-v2-regressor",
+        target="price",
+        quantiles=[0.9, 0.1],
+    )
+    assert lock_of(root).predictor["quantiles"] == [0.1, 0.9]

@@ -606,12 +606,17 @@ class PredictorCommands:
         spec = self.library.load(root)
         frozen = args.frozen
         if frozen:
-            if _previous_lock(root) is None:
+            from generalforecast.predictors.lock import load_lock
+
+            if not (root / LOCK).is_file():
                 raise Error(
                     "InvalidInput",
                     f"no {LOCK} in {_shown(root)}",
                     hint="run `gf check` without --frozen to write one",
                 )
+            # Without resolving the context, the lock must still be a valid
+            # version 2 lock for exactly this gf.yaml.
+            load_lock(root, spec)
             out.status("Trusted", f"{LOCK} in {_shown(root)}")
             return {"name": spec.name, "frozen": True}
         resolution = self.library.resolve(

@@ -351,20 +351,28 @@ def infer(series: Mapping[Any, Sequence[Any]]) -> str | int | float:
         for times in ordered.values()
         for left, right in pairwise(times)
     }
+    # Steps of four weeks or more may be calendar periods even when the
+    # times seen happen to sit equally far apart (three Jan-1s, two month
+    # starts), so the calendar is tried first; shorter steps are spans.
+    longest = max(lengths)
+    if longest >= 28 * _DAY:
+        for alias, months in (
+            ("YS", 12),
+            ("YE", 12),
+            ("QS", 3),
+            ("QE", 3),
+            ("MS", 1),
+            ("ME", 1),
+        ):
+            count = _calendar_count(ordered, alias, months)
+            if count is not None:
+                return alias if count == 1 else f"{count}{alias}"
     if len(lengths) == 1:
         length = lengths.pop()
         try:
             return _span(length)
         except ValueError:
             return length
-    for alias, months in (("YS", 12), ("YE", 12), ("QS", 3), ("QE", 3)):
-        count = _calendar_count(ordered, alias, months)
-        if count is not None:
-            return alias if count == 1 else f"{count}{alias}"
-    for alias in ("MS", "ME"):
-        count = _calendar_count(ordered, alias, 1)
-        if count is not None:
-            return alias if count == 1 else f"{count}{alias}"
     raise _irregular(ordered)
 
 
@@ -467,9 +475,13 @@ def grid(origin: Any, count: int, value: Any) -> list[Any]:
         import pandas as pd
 
         offset = pd.tseries.frequencies.to_offset(str(spelled))
-        stamps = [pd.Timestamp(origin) + offset * (index + 1) for index in range(count)]
+        start = pd.Timestamp(_utc(origin))
+        stamps = [start + offset * (index + 1) for index in range(count)]
         if isinstance(origin, datetime.datetime):
-            return [stamp.to_pydatetime() for stamp in stamps]
+            # Calendar periods are UTC periods; an origin with a zone gets
+            # UTC times back.
+            zone = datetime.UTC if origin.tzinfo is not None else None
+            return [stamp.to_pydatetime().replace(tzinfo=zone) for stamp in stamps]
         return [stamp.date() for stamp in stamps]
     total = seconds(spelled)
     assert total is not None
@@ -477,15 +489,6 @@ def grid(origin: Any, count: int, value: Any) -> list[Any]:
         origin + datetime.timedelta(seconds=total * (index + 1))
         for index in range(count)
     ]
-
-
-def regular(times: list[Any], value: Any) -> bool:
-    """Whether sorted `times` sit one frequency step apart, from the first on."""
-    try:
-        check({(): times}, value)
-    except FrequencyError:
-        return False
-    return True
 
 
 __all__ = [
@@ -501,7 +504,6 @@ __all__ = [
     "is_calendar",
     "normalize",
     "ordinal",
-    "regular",
     "seconds",
     "step",
 ]

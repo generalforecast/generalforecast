@@ -204,6 +204,12 @@ def typed(table: pa.Table, predictor: dict[str, Any]) -> pa.Table:
     for key, kind in (("id", "id_type"), ("time", "time_type")):
         if predictor.get(key):
             kinds[predictor[key]] = predictor.get(kind)
+    frequency = predictor.get("frequency")
+    time = predictor.get("time")
+    if time and kinds.get(time) is None and isinstance(frequency, str):
+        # A lock checked without rows knows a forecaster's time column by its
+        # frequency: a span or calendar alias steps through timestamps.
+        kinds[time] = "timestamp"
     for column, kind in zip(
         predictor.get("series") or (), predictor.get("series_types") or (), strict=False
     ):

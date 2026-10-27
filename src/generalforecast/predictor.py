@@ -876,6 +876,15 @@ class Predictor:
         with boundary():
             spec = load(self._root)
             resolution = resolve(spec, self._root)
+        if lock.read_lock(self._root) is not None and resolution.lock_changes:
+            # A gf.lock beside the manifest is what gf serve and gf push run;
+            # predicting from anything else would answer differently.
+            raise InvalidInput(
+                f"gf.lock in {self._root} is out of date",
+                because="gf.yaml or its snapshot changed since `gf check` wrote it",
+                hint="run `gf check` to update it",
+                param="lock",
+            )
         self._spec, self._resolution = spec, resolution
         self._lock = lock.document(resolution)
         self.name = spec.name

@@ -242,8 +242,8 @@ def published_entry(plan: Any, *, snapshot: Path | None = None) -> dict[str, Any
     The entry's `predictor.context` is `snapshot` or `request`; hosted
     serving binds a live context's captured rows as a snapshot. A forecast
     entry's `frequency` is the step on the time axis, `declared` the same
-    step when the lock declares it, and `calendar` the period a calendar
-    frequency counts (`frequency.calendar_unit`).
+    step when the lock declares it, and `calendar` a calendar frequency's
+    alias (`MS`, `2QE`, `W-MON`), whose UTC periods gf-server counts.
     """
     from generalforecast.predictors import frequency as _frequency
 
@@ -271,7 +271,9 @@ def published_entry(plan: Any, *, snapshot: Path | None = None) -> dict[str, Any
             "future_inputs": list(spec.future_inputs),
             "frequency": step,
             "declared": step,
-            "calendar": _frequency.calendar_unit(spec.frequency),
+            "calendar": spec.frequency
+            if _frequency.is_calendar(spec.frequency)
+            else None,
         }
         inputs = list(spec.forecast_inputs)
     selection = spec.selection
