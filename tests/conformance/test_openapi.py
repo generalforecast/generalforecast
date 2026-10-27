@@ -7,6 +7,7 @@ generated module round-trips them, regenerating changes nothing, and (with
 
 import subprocess
 import sys
+from typing import Any
 
 import pytest
 
@@ -365,3 +366,26 @@ def test_server_answers_the_example(pair):
         assert answer["resource"] == body["resource"]
     if body is not None and "predictions" in answer.get("result", {}):
         assert len(answer["result"]["predictions"]) == len(body["payload"]["queries"])
+
+
+def _locks(node: Any) -> list[dict]:
+    """Every `lock` document the spec's examples hold."""
+    found = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "lock" and isinstance(value, dict) and "predictor" in value:
+                found.append(value)
+            found.extend(_locks(value))
+    elif isinstance(node, list):
+        for value in node:
+            found.extend(_locks(value))
+    return found
+
+
+def test_every_example_lock_is_one_the_sdk_accepts() -> None:
+    from generalforecast.contracts import parse_lock
+
+    locks = _locks(SPEC["paths"])
+    assert locks
+    for lock in locks:
+        assert parse_lock(lock).digest == lock["digest"]

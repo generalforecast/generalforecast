@@ -132,7 +132,7 @@ paths:
                     result:
                       model: general-forecast/tabicl-v2-classifier@sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
                       task: classification
-                      context: {kind: snapshot, rows: 1840, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
+                      context: {source: snapshot, name: null, version: null, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e, rows: 1840, as_of: null}
                       revision: 7
                       environment: production
                       predictions:
@@ -299,7 +299,7 @@ paths:
                     result:
                       model: general-forecast/tabicl-v2-classifier@sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
                       task: classification
-                      context: {kind: request, rows: 4}
+                      context: {source: request, name: null, version: null, digest: null, rows: 4, as_of: null}
                       predictions:
                         - {id: 1041, label: 0, probabilities: {"0": 0.83, "1": 0.17}}
                 forecast:
@@ -311,7 +311,7 @@ paths:
                     result:
                       model: general-forecast/chronos-2@sha256:0b1c2d3e4f5061728394a5b6c7d8e9f0a1b2c3d4e5f60718293a4b5c6d7e8f90
                       task: forecast
-                      context: {kind: request, rows: 4}
+                      context: {source: request, name: null, version: null, digest: null, rows: 4, as_of: null}
                       predictions:
                         - {value: 18.2, quantiles: {"0.1": 16.1, "0.5": 18.2, "0.9": 20.4}}
                         - {value: 19.0, quantiles: {"0.1": 16.0, "0.5": 19.0, "0.9": 22.1}}
@@ -388,13 +388,14 @@ paths:
                           model_digest: sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
                           task: classification
                           target: churned
-                          target_type: category
-                          classes: ["0", "1"]
+                          target_type: "0/1"
+                          classes: [0, 1]
                           id: customer_id
+                          lock_digest: sha256:48dd695891fef75de34e61338027fb033a48c2bb2221f9336a5c3e06d99df7b7
                           inputs:
-                            - {name: spend, type: number}
-                            - {name: plan, type: category}
-                            - {name: signups, type: number}
+                            - {name: spend, type: float, role: input}
+                            - {name: plan, type: category, role: input}
+                            - {name: signups, type: int, role: input}
                           context: {kind: snapshot, rows: 1840, query_rows: 212, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
                           selection: {strategy: retrieved, core: 1000, neighbors: 3000, kind: stratified, recent: null, seed: 0}
                           limits: {context_rows: 100000, queries: 100, inputs: 32}
@@ -469,13 +470,14 @@ paths:
                       model_digest: sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
                       task: classification
                       target: churned
-                      target_type: category
-                      classes: ["0", "1"]
+                      target_type: "0/1"
+                      classes: [0, 1]
                       id: customer_id
+                      lock_digest: sha256:48dd695891fef75de34e61338027fb033a48c2bb2221f9336a5c3e06d99df7b7
                       inputs:
-                        - {name: spend, type: number}
-                        - {name: plan, type: category}
-                        - {name: signups, type: number}
+                        - {name: spend, type: float, role: input}
+                        - {name: plan, type: category, role: input}
+                        - {name: signups, type: int, role: input}
                       context: {kind: snapshot, rows: 1840, query_rows: 212, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
                       selection: {strategy: retrieved, core: 1000, neighbors: 3000, kind: stratified, recent: null, seed: 0}
                       limits: {context_rows: 100000, queries: 100, inputs: 32}
@@ -1077,7 +1079,7 @@ paths:
                     resource: {kind: predictor, name: churn}
                     result:
                       revisions:
-                        - {predictor: churn, number: 7, predictor_digest: sha256:9c0d1e2f30415263748596a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7081, model: general-forecast/tabicl-v2-classifier, created_at: 1761300000.0, status: ready}
+                        - {predictor: churn, number: 7, predictor_digest: sha256:48dd695891fef75de34e61338027fb033a48c2bb2221f9336a5c3e06d99df7b7, model: general-forecast/tabicl-v2-classifier, created_at: 1761300000.0, status: ready}
     post:
       operationId: revisions.register
       tags: [hosted]
@@ -1105,7 +1107,7 @@ paths:
                   payload:
                     lock:
                       lock_version: 2
-                      digest: sha256:4e2c0a8f6d4b2e0c8a6f4d2b0e8c6a4f2d0b8e6c4a2f0d8b6e4c2a0f8d6b4e2c
+                      digest: sha256:82e622176a6ff9bbbf524b7805b72f5674832b67a1cd6028a3635f7bd3c8bb83
                       manifest: sha256:1f3e5d7c9b1a3f5e7d9c1b3a5f7e9d1c3b5a7f9e1d3c5b7a9f1e3d5c7b9a1f3e
                       predictor:
                         name: churn
@@ -1122,7 +1124,7 @@ paths:
                           - {name: spend, type: float, role: input}
                           - {name: plan, type: category, role: input}
                         context: {kind: snapshot, path: context.csv, rows: 1840, query_rows: 212, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
-                        selection: {strategy: retrieved, core: 1000, neighbors: 3000, kind: stratified, recent: null, seed: 0}
+                        selection: {strategy: retrieved, core: 1200, neighbors: 3000, kind: stratified, recent: null, seed: 0}
                       resources: {accelerator: L4}
                       model:
                         files: {"model.safetensors": 7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0}
@@ -1141,7 +1143,7 @@ paths:
                     project: acme
                     request_id: r-8091a2b3c4d5e6f708192a3b4c5d6e7f
                     resource: {kind: predictor, name: churn}
-                    result: {predictor: churn, number: 8, predictor_digest: sha256:0d1e2f30415263748596a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f70819c, model: general-forecast/tabicl-v2-classifier, created_at: 1761400000.0, status: pending}
+                    result: {predictor: churn, number: 8, predictor_digest: sha256:82e622176a6ff9bbbf524b7805b72f5674832b67a1cd6028a3635f7bd3c8bb83, model: general-forecast/tabicl-v2-classifier, created_at: 1761400000.0, status: pending}
 
   /v1/projects/{project}/predictors/{name}/revisions/{number}:
     get:
@@ -1170,10 +1172,10 @@ paths:
                     request_id: r-91a2b3c4d5e6f708192a3b4c5d6e7f80
                     resource: {kind: predictor, name: churn}
                     result:
-                      revision: {predictor: churn, number: 7, predictor_digest: sha256:9c0d1e2f30415263748596a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7081, model: general-forecast/tabicl-v2-classifier, created_at: 1761300000.0, status: ready}
+                      revision: {predictor: churn, number: 7, predictor_digest: sha256:48dd695891fef75de34e61338027fb033a48c2bb2221f9336a5c3e06d99df7b7, model: general-forecast/tabicl-v2-classifier, created_at: 1761300000.0, status: ready}
                       lock:
                         lock_version: 2
-                        digest: sha256:4e2c0a8f6d4b2e0c8a6f4d2b0e8c6a4f2d0b8e6c4a2f0d8b6e4c2a0f8d6b4e2c
+                        digest: sha256:48dd695891fef75de34e61338027fb033a48c2bb2221f9336a5c3e06d99df7b7
                         manifest: sha256:1f3e5d7c9b1a3f5e7d9c1b3a5f7e9d1c3b5a7f9e1d3c5b7a9f1e3d5c7b9a1f3e
                         predictor:
                           name: churn
@@ -1386,7 +1388,7 @@ paths:
                     resource: {kind: predictor, name: churn}
                     result:
                       status: ready
-                      context: {source: live/churn-history, version: 312, rows: 1840, as_of: 1767225600.0, accepted_version: 312, serving_version: 312, freshness_lag_seconds: 0.0}
+                      context: {source: live/churn-history, version: 312, rows: 1840, as_of: "2026-01-01T00:00:00Z", accepted_version: 312, serving_version: 312, freshness_lag_seconds: 0.0}
                       accepted_version: 312
                       serving_version: 312
                       fresh: true
@@ -3634,10 +3636,7 @@ components:
         context:
           type: array
           items: {$ref: "#/components/schemas/Row"}
-        as_of:
-          type: string
-          format: date-time
-          description: for a live context, score against the rows accepted at or before this instant
+        as_of: {$ref: "#/components/schemas/AsOfRequest"}
 
     QueriesRequest:
       allOf:
@@ -3651,16 +3650,49 @@ components:
       type: string
       enum: [snapshot, request, live]
 
+    AsOfRequest:
+      description: |
+        for a live context, score against the rows accepted at or before this
+        instant: an RFC 3339 time (one with no offset is UTC), or a number of
+        seconds since the epoch. Anything else is a `ValidationError` whose
+        `param` is `as_of`. A snapshot or request context refuses it the same
+        way.
+      oneOf:
+        - {type: string, format: date-time}
+        - {type: number, minimum: 0}
+
+    AsOf:
+      description: |
+        an instant as every reply carries it: an RFC 3339 UTC string such as
+        `2026-10-27T08:00:00Z`, or null
+      oneOf:
+        - {type: string, format: date-time, pattern: "Z$"}
+        - {type: "null"}
+
     ContextInfo:
       type: object
-      description: the context a prediction actually used
-      required: [kind, rows]
+      description: |
+        the context a prediction actually used, the same shape from gf serve
+        and the hosted platform. `source` is the context's kind; `name` names
+        a live context; `version` is a live context's accepted sequence;
+        `digest` is a snapshot's content digest; `rows` counts the rows read;
+        `as_of` is the instant a live context was read as of. Each field a
+        source does not have is null.
+      required: [source, name, version, digest, rows, as_of]
       additionalProperties: false
       properties:
-        kind: {$ref: "#/components/schemas/ContextKind"}
+        source: {$ref: "#/components/schemas/ContextKind"}
+        name:
+          oneOf:
+            - $ref: "#/components/schemas/Name"
+            - type: "null"
+        version: {type: [integer, "null"], minimum: 0}
+        digest:
+          oneOf:
+            - $ref: "#/components/schemas/Digest"
+            - type: "null"
         rows: {type: integer, minimum: 0}
-        digest: {$ref: "#/components/schemas/Digest"}
-        as_of: {type: string, format: date-time}
+        as_of: {$ref: "#/components/schemas/AsOf"}
 
     Prediction:
       type: object
@@ -3688,8 +3720,15 @@ components:
         model: {$ref: "#/components/schemas/ModelId"}
         task: {$ref: "#/components/schemas/Task"}
         context: {$ref: "#/components/schemas/ContextInfo"}
-        revision: {type: integer, minimum: 1}
-        environment: {$ref: "#/components/schemas/Name"}
+        predictor:
+          oneOf:
+            - $ref: "#/components/schemas/Name"
+            - type: "null"
+        revision: {type: [integer, "null"], minimum: 1}
+        environment:
+          oneOf:
+            - $ref: "#/components/schemas/Name"
+            - type: "null"
         predictions:
           type: array
           items: {$ref: "#/components/schemas/Prediction"}
@@ -3722,14 +3761,6 @@ components:
         queries: {type: integer, minimum: 1}
         inputs: {type: integer, minimum: 1}
         classes: {type: integer, minimum: 2}
-
-    Input:
-      type: object
-      required: [name, type]
-      additionalProperties: false
-      properties:
-        name: {type: string}
-        type: {$ref: "#/components/schemas/ColumnType"}
 
     LockInput:
       type: object
@@ -3869,19 +3900,26 @@ components:
         latest_revision: {type: [integer, "null"], minimum: 1}
         environments:
           type: array
+          description: the hosted environments; always empty from gf serve, which has none
           items: {$ref: "#/components/schemas/Environment"}
+        lock_digest:
+          $ref: "#/components/schemas/Digest"
+          description: the digest of the gf.lock the predictor resolves to
         model: {$ref: "#/components/schemas/ModelId"}
         model_digest: {$ref: "#/components/schemas/Digest"}
         task: {$ref: "#/components/schemas/Task"}
         target: {type: string}
-        target_type: {$ref: "#/components/schemas/ColumnType"}
-        classes: {type: array, items: {type: string}}
+        target_type:
+          oneOf:
+            - $ref: "#/components/schemas/Kind"
+            - type: "null"
+        classes: {type: array, items: {type: [string, integer, boolean]}}
         id: {type: string}
         time: {type: string}
         series: {type: array, items: {type: string}}
         inputs:
           type: array
-          items: {$ref: "#/components/schemas/Input"}
+          items: {$ref: "#/components/schemas/LockInput"}
         context: {$ref: "#/components/schemas/ContextLock"}
         selection: {$ref: "#/components/schemas/ResolvedSelection"}
         limits: {$ref: "#/components/schemas/Limits"}
@@ -4515,7 +4553,7 @@ components:
         source: {type: string}
         version: {type: [integer, string, "null"]}
         rows: {type: integer, minimum: 0}
-        as_of: {type: [number, "null"]}
+        as_of: {$ref: "#/components/schemas/AsOf"}
         accepted_version: {type: [integer, string, "null"]}
         serving_version: {type: [integer, string, "null"]}
         freshness_lag_seconds: {type: [number, "null"]}

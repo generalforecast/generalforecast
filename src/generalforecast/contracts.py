@@ -269,23 +269,32 @@ class ContextVersion(WireValue):
 
     Attributes:
         source: The context's kind: `snapshot`, `live` or `request`.
-        name: A live context's name; None for the other kinds.
-        version: A snapshot's digest, or a live context's sequence.
+        version: A live context's accepted sequence.
         rows: The context rows inference read.
         as_of: The time a live context was read as of, in UTC seconds.
+        name: A live context's name; None for the other kinds.
+        digest: A snapshot's content digest.
 
-    The wire form is `{source, name, version, rows, as_of}`. gf-server
-    refreshes a published revision whose context `source` is `live`.
+    The wire form, the same from gf serve and the hosted platform, is
+    `{source, name, version, digest, rows, as_of}`, every key present and
+    `as_of` an RFC 3339 UTC string (`generalforecast.as_of`). A string
+    `version`, as callers passed a snapshot's digest before the two had
+    their own fields, is read as the digest.
     """
 
     source: str
-    version: str | int | None = None
+    version: int | str | None = None
     rows: int | None = None
     as_of: float | None = None
     name: str | None = None
+    digest: str | None = None
 
     def __post_init__(self):
         """Checks version metadata without fetching a live context."""
+        if isinstance(self.version, str):
+            ensure(self.digest is None, "a context has one digest")
+            object.__setattr__(self, "digest", self.version)
+            object.__setattr__(self, "version", None)
         ensure(self.source in CONTEXT_KINDS, "invalid context source")
         ensure(
             (self.name is not None) == (self.source == "live"),
@@ -294,35 +303,53 @@ class ContextVersion(WireValue):
         if self.name is not None:
             name(self.name)
         if self.version is not None:
-            ensure(type(self.version) in (int, str), "invalid context version")
+            integer(self.version, 0)
+        if self.digest is not None:
+            ensure(type(self.digest) is str, "invalid context digest")
         if self.rows is not None:
             integer(self.rows, 0)
         if self.as_of is not None:
-            ensure(
-                type(self.as_of) in (int, float) and 0 <= self.as_of < 1e12,
-                "invalid context time",
-            )
+            from generalforecast import as_of
+
+            object.__setattr__(self, "as_of", as_of.parse(self.as_of))
+
+    def to_dict(self) -> dict:
+        """The one wire shape: every key, `as_of` as RFC 3339 UTC or null."""
+        from generalforecast import as_of
+
+        return {
+            "source": self.source,
+            "name": self.name,
+            "version": self.version,
+            "digest": self.digest,
+            "rows": self.rows,
+            "as_of": as_of.format(self.as_of),
+        }
+
+    @classmethod
+    def from_dict(cls, value: dict) -> Self:
+        """Decodes the wire shape; `as_of` is RFC 3339 text or epoch seconds."""
+        body = dict(
+            fields(value, {"source"}, {"name", "version", "digest", "rows", "as_of"})
+        )
+        return cls(**body)
 
 
 def context_version(value: dict) -> ContextVersion:
-    """Decodes a context as the SDK or the predictor API describes it.
+    """Decodes a prediction's context.
 
-    The predictor API sends `{kind, rows, digest?, name?, as_of?}`; the kind
-    is the source and the digest is the version. A source spelled
-    `live/<name>`, as hosted serving wrote it before the name had its own
-    key, reads as a live source and its name.
+    Besides the one wire shape, reads the forms servers sent before it: the
+    predictor API's `{kind, rows, digest?, name?, as_of?}`, where the kind is
+    the source, and a source spelled `live/<name>`.
     """
     if type(value) is dict and "kind" in value and "source" not in value:
         body = dict(fields(value, {"kind"}, {"rows", "digest", "as_of", "name"}))
-        as_of = body.get("as_of")
-        if isinstance(as_of, str):
-            as_of = datetime.datetime.fromisoformat(as_of).timestamp()
         return ContextVersion(
             source=body["kind"],
-            version=body.get("digest"),
             rows=body.get("rows"),
-            as_of=as_of,
+            as_of=body.get("as_of"),
             name=body.get("name"),
+            digest=body.get("digest"),
         )
     if (
         type(value) is dict
@@ -344,8 +371,9 @@ class PredictionRequest(WireValue):
     Attributes:
         queries: The rows to score.
         context: A request context's rows; None for a snapshot or live context.
-        as_of: For a live context, the time to read it as of: an ISO 8601
-            timestamp or UTC seconds. Every surface honours it or refuses it.
+        as_of: For a live context, the time to read it as of: RFC 3339 text
+            (no offset means UTC) or epoch seconds, as `generalforecast.as_of`
+            parses it. Every surface honours it or refuses it.
     """
 
     queries: tuple[dict, ...]
@@ -366,18 +394,9 @@ class PredictionRequest(WireValue):
                 and all(type(row) is dict for row in self.context),
                 "context must be a list of rows",
             )
-        if isinstance(self.as_of, str):
-            try:
-                datetime.datetime.fromisoformat(self.as_of)
-            except ValueError:
-                raise PredictorError(
-                    "ValidationError", "as_of must be an ISO 8601 time"
-                ) from None
-        elif self.as_of is not None:
-            ensure(
-                type(self.as_of) in (int, float) and 0 <= self.as_of < 1e12,
-                "as_of must be an ISO 8601 time or UTC seconds",
-            )
+        from generalforecast import as_of
+
+        as_of.parse(self.as_of)
 
     @classmethod
     def from_dict(cls, value: dict) -> "PredictionRequest":

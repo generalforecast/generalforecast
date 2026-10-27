@@ -498,6 +498,10 @@ class ManifestRequest(Payload):
     )
 
 
+AsOfRequest = str | float
+_decode_AsOfRequest: Decoder = _union(_text, _number)
+
+
 @dataclass(frozen=True, kw_only=True)
 class Queries(Payload):
     """The Queries schema.
@@ -508,12 +512,12 @@ class Queries(Payload):
 
     queries: tuple[Row, ...]
     context: tuple[Row, ...] | None = None
-    as_of: str | None = None
+    as_of: AsOfRequest | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("queries", "queries", True, _items(_decode_Row)),
         Field("context", "context", False, _items(_decode_Row)),
-        Field("as_of", "as_of", False, _text),
+        Field("as_of", "as_of", False, _decode_AsOfRequest),
     )
 
 
@@ -540,20 +544,35 @@ ContextKind = Literal["snapshot", "request", "live"]
 _decode_ContextKind: Decoder = _literal("snapshot", "request", "live")
 
 
+AsOf = str | None
+_decode_AsOf: Decoder = _union(_pattern("Z$"), _null)
+
+
 @dataclass(frozen=True, kw_only=True)
 class ContextInfo(Payload):
-    """The context a prediction actually used."""
+    """The ContextInfo schema.
 
-    kind: ContextKind
+    the context a prediction actually used, the same shape from gf serve and the hosted
+    platform. `source` is the context's kind; `name` names a live context; `version` is
+    a live context's accepted sequence; `digest` is a snapshot's content digest; `rows`
+    counts the rows read; `as_of` is the instant a live context was read as of. Each
+    field a source does not have is null.
+    """
+
+    source: ContextKind
+    name: Name | None
+    version: int | None
+    digest: Digest | None
     rows: int
-    digest: Digest | None = None
-    as_of: str | None = None
+    as_of: AsOf
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("kind", "kind", True, _decode_ContextKind),
+        Field("source", "source", True, _decode_ContextKind),
+        Field("name", "name", True, _union(_decode_Name, _null)),
+        Field("version", "version", True, _union(_integer, _null)),
+        Field("digest", "digest", True, _union(_decode_Digest, _null)),
         Field("rows", "rows", True, _integer),
-        Field("digest", "digest", False, _decode_Digest),
-        Field("as_of", "as_of", False, _text),
+        Field("as_of", "as_of", True, _decode_AsOf),
     )
 
 
@@ -589,6 +608,7 @@ class Result(Payload):
     task: Task
     context: ContextInfo
     predictions: tuple[Prediction, ...]
+    predictor: Name | None = None
     revision: int | None = None
     environment: Name | None = None
 
@@ -596,8 +616,9 @@ class Result(Payload):
         Field("model", "model", True, _decode_ModelId),
         Field("task", "task", True, _decode_Task),
         Field("context", "context", True, _record(ContextInfo)),
-        Field("revision", "revision", False, _integer),
-        Field("environment", "environment", False, _decode_Name),
+        Field("predictor", "predictor", False, _union(_decode_Name, _null)),
+        Field("revision", "revision", False, _union(_integer, _null)),
+        Field("environment", "environment", False, _union(_decode_Name, _null)),
         Field("predictions", "predictions", True, _items(_record(Prediction))),
     )
 
@@ -650,19 +671,6 @@ class Shape(Payload):
         Field("queries", "queries", True, _integer),
         Field("inputs", "inputs", True, _integer),
         Field("classes", "classes", False, _integer),
-    )
-
-
-@dataclass(frozen=True, kw_only=True)
-class Input(Payload):
-    """The Input schema."""
-
-    name: str
-    type: ColumnType
-
-    FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("name", "name", True, _text),
-        Field("type", "type", True, _decode_ColumnType),
     )
 
 
@@ -870,16 +878,17 @@ class Predictor(Payload):
     environments: tuple[Environment, ...]
     created_at: float | None = None
     latest_revision: int | None = None
+    lock_digest: Digest | None = None
     model: ModelId | None = None
     model_digest: Digest | None = None
     task: Task | None = None
     target: str | None = None
-    target_type: ColumnType | None = None
-    classes: tuple[str, ...] | None = None
+    target_type: Kind | None = None
+    classes: tuple[str | int | bool, ...] | None = None
     id: str | None = None
     time: str | None = None
     series: tuple[str, ...] | None = None
-    inputs: tuple[Input, ...] | None = None
+    inputs: tuple[LockInput, ...] | None = None
     context: ContextLock | None = None
     selection: ResolvedSelection | None = None
     limits: Limits | None = None
@@ -890,16 +899,17 @@ class Predictor(Payload):
         Field("created_at", "created_at", False, _number),
         Field("latest_revision", "latest_revision", False, _union(_integer, _null)),
         Field("environments", "environments", True, _items(_record(Environment))),
+        Field("lock_digest", "lock_digest", False, _decode_Digest),
         Field("model", "model", False, _decode_ModelId),
         Field("model_digest", "model_digest", False, _decode_Digest),
         Field("task", "task", False, _decode_Task),
         Field("target", "target", False, _text),
-        Field("target_type", "target_type", False, _decode_ColumnType),
-        Field("classes", "classes", False, _items(_text)),
+        Field("target_type", "target_type", False, _union(_decode_Kind, _null)),
+        Field("classes", "classes", False, _items(_union(_text, _integer, _boolean))),
         Field("id", "id", False, _text),
         Field("time", "time", False, _text),
         Field("series", "series", False, _items(_text)),
-        Field("inputs", "inputs", False, _items(_record(Input))),
+        Field("inputs", "inputs", False, _items(_record(LockInput))),
         Field("context", "context", False, _record(ContextLock)),
         Field("selection", "selection", False, _record(ResolvedSelection)),
         Field("limits", "limits", False, _record(Limits)),
@@ -1963,7 +1973,7 @@ class ServingContext(Payload):
     source: str
     version: int | str | None
     rows: int
-    as_of: float | None
+    as_of: AsOf
     accepted_version: int | str | None
     serving_version: int | str | None
     freshness_lag_seconds: float | None
@@ -1973,7 +1983,7 @@ class ServingContext(Payload):
         Field("source", "source", True, _text),
         Field("version", "version", True, _union(_integer, _text, _null)),
         Field("rows", "rows", True, _integer),
-        Field("as_of", "as_of", True, _union(_number, _null)),
+        Field("as_of", "as_of", True, _decode_AsOf),
         Field(
             "accepted_version",
             "accepted_version",
