@@ -61,6 +61,10 @@ pub const MAX_BYTES: usize = 1_048_576;
 const MAX_DEPTH: usize = 16;
 const MAX_NODES: usize = 65_536;
 const MAX_INTEGER: i64 = (1 << 53) - 1;
+/// The query parameter that names a hosted predictor's environment.
+const ENVIRONMENT_PARAMETER: &str = "env";
+/// The environment a hosted predictor's prediction scores when it names none.
+const DEFAULT_ENVIRONMENT: &str = "production";
 /// The first path segment of the control plane's service-to-service routes.
 const INTERNAL: &str = "internal";
 /// The kinds of resource an envelope may name.
@@ -1038,11 +1042,8 @@ async fn answer(
             && !parts.uri.path().contains('\\'),
         "invalid request target",
     )?;
-    require(
-        parts.uri.query().is_none(),
-        "query parameters are not supported",
-    )?;
     let (project, action, resource) = resolve(&parts.method, parts.uri.path())?;
+    let environment = environment(parts.uri.query(), &action)?;
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     let request_id = match header("x-gf-request-id") {
         Some(id) => id.to_string(),
@@ -1120,10 +1121,41 @@ async fn answer(
     if !front.ready() {
         return Err(not_ready());
     }
-    let result = dispatch(front, &project, action, &resource, payload, charge).await?;
+    let result = dispatch(
+        front,
+        &project,
+        action,
+        &resource,
+        environment.as_deref(),
+        payload,
+        charge,
+    )
+    .await?;
     let mut body = envelope(scope.as_ref().expect("set above"));
     body.insert("result".into(), result);
     Ok(respond(200, &Value::Object(body)))
+}
+
+/// The deployment environment a predictor's `predict?env=` names, if it
+/// names one: the route's only query parameter, given once, a resource name.
+fn environment(query: Option<&str>, action: &Action) -> Result<Option<String>, ApiError> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+    require(
+        *action == Action::PredictorPredict,
+        "query parameters are not supported",
+    )?;
+    let mut named = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        require(
+            key == ENVIRONMENT_PARAMETER && named.is_none(),
+            "env, once, is the only query parameter a prediction takes",
+        )?;
+        named = Some(name(value).map_err(|error| error.param(ENVIRONMENT_PARAMETER))?);
+    }
+    Ok(named)
 }
 
 /// Refuses repeated headers and header values that are too long or split lines.
@@ -1226,11 +1258,14 @@ fn name(value: &str) -> Result<String, ApiError> {
     Ok(value.to_string())
 }
 
-/// Whether `method` on `path` is the front's to answer: health, or one of
-/// the routes `resolve` serves, however its segments are cased or split, so
-/// no inference route, nor a misspelling of one, is ever proxied. Every
-/// other route, such as a hosted predictor's revisions or environments,
-/// streams upstream.
+/// Whether `method` on `path` is the front's to answer even with an upstream
+/// behind it: health, the catalog models it serves, and predictions,
+/// however their segments are cased or split, so no inference route, nor a
+/// misspelling of one, is ever proxied. Every other route streams upstream:
+/// the predictor registry and each predictor's lifecycle, its creation,
+/// revisions, environments, promotions, rollbacks, metrics, logs and
+/// deletion, are the upstream's, which `resolve` answers only from the
+/// front's own predictors when nothing stands behind it.
 #[must_use]
 pub fn owns(method: &Method, path: &str) -> bool {
     if matches!(path, "/livez" | "/healthz" | "/readyz") {
@@ -1250,7 +1285,8 @@ pub fn owns(method: &Method, path: &str) -> bool {
     }
     let lower: Vec<String> = tail.iter().map(|part| part.to_ascii_lowercase()).collect();
     let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
-    route(method, &lower).is_some()
+    route(method, &lower)
+        .is_some_and(|action| action != Action::Predictors && action != Action::Predictor)
 }
 
 /// The action a route's segments after its project name, if it is one the
@@ -1741,6 +1777,7 @@ async fn dispatch(
     project: &str,
     action: Action,
     resource: &str,
+    environment: Option<&str>,
     payload: Value,
     charge: Charge,
 ) -> Result<Value, ApiError> {
@@ -1765,12 +1802,26 @@ async fn dispatch(
             Ok(front.predictor_description(served, predictor))
         }
         Action::PredictorPredict => match front.predictor(project, resource) {
+            Ok(_) if environment.is_some() => Err(ApiError::validation(format!(
+                "predictor {resource} is served from its lock alone, with no environments"
+            ))
+            .param(ENVIRONMENT_PARAMETER)),
             Ok((served, predictor)) => {
                 predictor_predict(front, served, predictor, &payload, charge).await
             }
             Err(error) => match front.revisions.as_ref() {
                 Some(revisions) => {
-                    revision_predict(front, revisions, project, resource, &payload, charge).await
+                    let environment = environment.unwrap_or(DEFAULT_ENVIRONMENT);
+                    revision_predict(
+                        front,
+                        revisions,
+                        project,
+                        resource,
+                        environment,
+                        &payload,
+                        charge,
+                    )
+                    .await
                 }
                 None => Err(error),
             },
@@ -2557,17 +2608,17 @@ fn bound_fingerprint(served: &ServedModel, bound: &predictor::Context) -> [u8; 3
     hasher.finalize().into()
 }
 
-/// A hosted predictor: the revision its `production` environment serves,
-/// loaded from the control plane on demand and predicted as a native predictor.
+/// A hosted predictor: the revision `environment` serves, loaded from the
+/// control plane on demand and predicted as a native predictor.
 async fn revision_predict(
     front: &Front,
     revisions: &Revisions,
     project: &str,
     predictor: &str,
+    environment: &str,
     payload: &Value,
     charge: Charge,
 ) -> Result<Value, ApiError> {
-    let environment = "production";
     let resolved = revisions.resolve(project, predictor, environment).await?;
     let revision = resolved.revision;
     let version = resolved.context_version.unwrap_or(Value::Null);

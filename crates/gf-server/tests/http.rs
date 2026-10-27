@@ -1095,6 +1095,10 @@ async fn plane(state: Arc<Plane>) -> String {
                 let revision = state.serving.load(Ordering::SeqCst);
                 return answer(200, json!({"revision": revision, "context_version": null}));
             }
+            // A staging environment one revision ahead of the first production one.
+            if path == format!("{base}/environments/staging:revision") {
+                return answer(200, json!({"revision": 2, "context_version": null}));
+            }
             if path.starts_with(&format!("{base}/environments/")) {
                 return answer(
                     404,
@@ -1175,11 +1179,26 @@ async fn score(
     key: &str,
     payload: &Value,
 ) -> (StatusCode, Value) {
+    score_at(
+        front,
+        "/v1/projects/team-a/predictors/scorer/predict",
+        key,
+        payload,
+    )
+    .await
+}
+
+async fn score_at(
+    front: &Arc<Front>,
+    path: &str,
+    key: &str,
+    payload: &Value,
+) -> (StatusCode, Value) {
     let bearer = format!("Bearer {key}");
     let (status, _, body) = call(
         front,
         "POST",
-        "/v1/projects/team-a/predictors/scorer/predict",
+        path,
         Some(&served_envelope(payload)),
         &[("authorization", bearer.as_str())],
     )
@@ -1742,4 +1761,75 @@ async fn a_shard_whose_queue_stays_full_times_a_request_out() {
         (refused.status, refused.code.as_str()),
         (504, "RequestTimeout")
     );
+}
+
+#[tokio::test]
+async fn a_prediction_scores_the_environment_its_env_names() {
+    let state = Arc::new(Plane {
+        serving: 1.into(),
+        predictors: 0.into(),
+        records: std::sync::Mutex::new(Vec::new()),
+    });
+    let origin = plane(state.clone()).await;
+    let front = revision_front(&origin, 1 << 20).await;
+    let queries = json!({"queries": [{"id": "q", "x": 2.5}]});
+    let route = "/v1/projects/team-a/predictors/scorer/predict";
+    for (query, revision, environment) in [
+        ("", 1, "production"),
+        ("?env=staging", 2, "staging"),
+        ("?env=production", 1, "production"),
+    ] {
+        let (status, body) = score_at(&front, &format!("{route}{query}"), SCORER, &queries).await;
+        assert_eq!(status, StatusCode::OK, "{query}: {body}");
+        assert_eq!(
+            (&body["result"]["revision"], &body["result"]["environment"]),
+            (&json!(revision), &json!(environment)),
+            "{query}"
+        );
+    }
+    let (status, body) = score_at(&front, &format!("{route}?env=preview"), SCORER, &queries).await;
+    assert_eq!(
+        (status, &body["error"]["code"]),
+        (StatusCode::NOT_FOUND, &json!("NotFound"))
+    );
+    for query in [
+        "?env=staging&env=production",
+        "?env=Staging",
+        "?env=",
+        "?page=2",
+    ] {
+        let (status, body) = score_at(&front, &format!("{route}{query}"), SCORER, &queries).await;
+        assert_eq!(status.as_u16(), 422, "{query}: {body}");
+    }
+    let bearer = format!("Bearer {SCORER}");
+    let (status, _, body) = call(
+        &front,
+        "GET",
+        "/v1/projects/team-a/predictors?env=staging",
+        None,
+        &[("authorization", bearer.as_str())],
+    )
+    .await;
+    assert_eq!(status.as_u16(), 422, "{body}");
+    assert_eq!(
+        body["error"]["message"],
+        "query parameters are not supported"
+    );
+}
+
+#[tokio::test]
+async fn a_locally_served_predictor_has_no_environments_to_name() {
+    let snapshot = snapshot_file();
+    let front = predictor_front(predictor_model("churn", "snapshot", Some(&snapshot))).await;
+    let payload = predictor_payload("churn", json!([]), json!([{"id": "q", "x": 1.5}]));
+    let (status, _, body) = call(
+        &front,
+        "POST",
+        "/v1/projects/local/predictors/churn/predict?env=staging",
+        Some(&predictor_envelope("churn", &payload)),
+        &[],
+    )
+    .await;
+    assert_eq!(status.as_u16(), 422, "{body}");
+    assert_eq!(body["error"]["param"], "env");
 }

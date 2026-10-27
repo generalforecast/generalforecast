@@ -141,8 +141,6 @@ fn the_fronts_routes_are_owned_however_they_are_spelled() {
         (Method::GET, "//v1//projects/p//models"),
         (Method::GET, "/V1/Projects/p/Models/m"),
         (Method::POST, "/v1/projects/p/predict"),
-        (Method::GET, "/v1/projects/p/predictors"),
-        (Method::GET, "/v1/projects/p/predictors/x"),
         (Method::POST, "/v1/projects/p/predictors/x/predict"),
         (Method::POST, "/v1/projects/p/Predictors/x/PREDICT"),
         (Method::GET, "/v1/projects/p/%6dodels"),
@@ -158,6 +156,8 @@ fn the_fronts_routes_are_owned_however_they_are_spelled() {
         (Method::POST, "/v1/projects/p/keys"),
         (Method::GET, "/v1/projects/p/contexts/c"),
         (Method::GET, "/v1/projects/p/environments/e"),
+        (Method::GET, "/v1/projects/p/predictors"),
+        (Method::GET, "/v1/projects/p/predictors/x"),
         (Method::POST, "/v1/projects/p/predictors"),
         (Method::DELETE, "/v1/projects/p/predictors/x"),
         (Method::GET, "/v1/projects/p/predictors/x/revisions"),
@@ -192,23 +192,50 @@ fn the_control_planes_internal_routes_are_recognized_however_they_are_spelled() 
 #[tokio::test]
 async fn hosted_predictor_routes_go_upstream_and_internal_ones_nowhere() {
     let (origin, front) = origin_and_front().await;
+    // Every step of a predictor's life the clients take through the front,
+    // as `gf push` and the predictor commands call them.
+    let base = "/v1/projects/p/predictors";
     for (method, path) in [
-        ("POST", "/v1/projects/p/predictors"),
-        ("GET", "/v1/projects/p/predictors/x/revisions"),
+        ("POST", base.to_string()),
+        ("GET", base.to_string()),
+        ("GET", format!("{base}/churn")),
+        ("POST", format!("{base}/churn/revisions")),
+        ("GET", format!("{base}/churn/revisions")),
+        ("GET", format!("{base}/churn/revisions/3")),
+        ("GET", format!("{base}/churn/environments")),
+        ("GET", format!("{base}/churn/environments/production")),
         (
             "POST",
-            "/v1/projects/p/predictors/x/environments/prod/rollback",
+            format!("{base}/churn/environments/production/promote"),
         ),
-        ("DELETE", "/v1/projects/p/predictors/x"),
+        (
+            "POST",
+            format!("{base}/churn/environments/production/rollback"),
+        ),
+        (
+            "GET",
+            format!("{base}/churn/environments/production/metrics"),
+        ),
+        ("GET", format!("{base}/churn/environments/production/logs")),
+        ("POST", format!("{base}/churn/delete")),
+        ("DELETE", format!("{base}/churn")),
     ] {
         let response = client()
             .request(method.parse().unwrap(), format!("{front}{path}"))
+            .header("content-type", "application/json")
+            .body("{}")
             .send()
             .await
             .unwrap();
         assert!(
             response.headers().contains_key("x-upstream"),
             "{method} {path}"
+        );
+        let echo: Value = response.json().await.unwrap();
+        assert_eq!(
+            (&echo["method"], &echo["target"]),
+            (&json!(method), &json!(path)),
+            "forwarded as sent"
         );
     }
     let forwarded = origin.hits.load(Ordering::SeqCst);
@@ -389,7 +416,11 @@ async fn inference_routes_are_never_proxied() {
         ("GET", "/v1/projects/local/models"),
         ("POST", "/v1/projects/local/predict"),
         ("POST", "/v1/projects/local/predictors/x/predict"),
-        ("GET", "/v1/projects/local/predictors/x"),
+        (
+            "POST",
+            "/v1/projects/local/predictors/x/predict?env=staging",
+        ),
+        ("GET", "/v1/projects/local/models/m"),
         ("GET", "/v1/projects/local/models/"),
         ("GET", "/readyz"),
     ] {
