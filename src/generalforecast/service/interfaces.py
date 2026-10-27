@@ -237,30 +237,6 @@ class ModelPort(Protocol):
         ...
 
 
-class OperatorPort(Protocol):
-    """D: local-state lifecycle proof, not hosted placement or recovery."""
-
-    def doctor(self, scope: Scope) -> JsonObject:
-        """Returns redacted runtime/state/capability checks."""
-        ...
-
-
-class IdentityPort(Protocol):
-    """E: authentication is separate from routing and project selection."""
-
-    def authenticate(self, token: str) -> JsonObject:
-        """Returns a redacted principal; never echoes tokens or secret material."""
-        ...
-
-    def authorize(self, principal: JsonObject, scope: Scope, permission: str) -> None:
-        """Checks project and action on EVERY request, including read/list."""
-        ...
-
-    def manage(self, scope: Scope, action: str, payload: JsonObject) -> JsonObject:
-        """Executes integration-allowlisted identity/key/secret metadata actions."""
-        ...
-
-
 @runtime_checkable
 class PreparedExecution(Protocol):
     """One published worker lifecycle, shared by native and isolated executions.

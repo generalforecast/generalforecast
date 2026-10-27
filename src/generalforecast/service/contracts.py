@@ -15,8 +15,6 @@ import threading
 import time
 from typing import Any
 
-from generalforecast.predictors.validation import NAME
-
 # The wire vocabulary lives with `Error`; services import it from here too.
 from generalforecast.errors import (  # noqa: F401
     WIRE_ERROR_CODES,
@@ -24,6 +22,7 @@ from generalforecast.errors import (  # noqa: F401
     public_code,
     reason_of,
 )
+from generalforecast.predictors.validation import NAME
 
 VERSION = "gf/v1"
 
