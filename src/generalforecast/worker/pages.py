@@ -56,20 +56,27 @@ class Pages:
         # page is embedded once a plan reads it.
         fused = [index for index, fit in enumerate(fits) if fit.pages]
         alone = [index for index, fit in enumerate(fits) if not fit.pages]
+        # A program that keeps only the state rounds its sums apart from one
+        # that also embeds the rows, as a context fit with its queries does.
+        # A fit within the rows such a call takes runs that program, and
+        # drops the rows it embeds, so its state is the same to the bit.
+        whole = [index for index in alone if self._embeds_whole(fits[index])]
+        apart = [index for index in alone if index not in whole]
+        states = zip(
+            whole, self._call("fit", [work[index] for index in whole]), strict=True
+        )
+        for index, (state, _) in states:
+            self._took_state(fits[index], state)
         for index, state in zip(
-            alone, self._call("state", [work[index] for index in alone]), strict=True
+            apart, self._call("state", [work[index] for index in apart]), strict=True
         ):
-            self._tables[fits[index].table].state = state
-            self._warn_crowded(fits[index].table, state)
-            self._warm(fits[index])
+            self._took_state(fits[index], state)
         filled: dict[int, Representations] = {}
         for index, (state, representations) in zip(
             fused, self._call("fit", [work[index] for index in fused]), strict=True
         ):
             fit = fits[index]
-            self._tables[fit.table].state = state
-            self._warn_crowded(fit.table, state)
-            self._warm(fit)
+            self._took_state(fit, state)
             # Split on the host: slicing on the device compiles once per page
             # length, and pages change length with every write.
             with self.stats.timed("fetch"):
@@ -82,6 +89,25 @@ class Pages:
                 self._keep(pages[index], filled[index])
                 offset += count
         return filled
+
+    def _embeds_whole(self: "Worker", fit: Fit) -> bool:
+        """Whether a fit's rows are within those a call that fits its state and embeds them takes.
+
+        Within `fit_bound`, which takes no compile, surely; past it, as the
+        measure the server asked for to plan the fit says.
+        """
+        table = self._tables[fit.table]
+        rows = self._size(len(fit.features))
+        if rows <= self.fit_bound(table.model, table.features):
+            return True
+        _, fused_rows = self.fit_rows(table.model, table.features)
+        return rows <= fused_rows
+
+    def _took_state(self: "Worker", fit: Fit, state: Any) -> None:
+        """Keeps a newly fit state for its table, and compiles its page embeds ahead."""
+        self._tables[fit.table].state = state
+        self._warn_crowded(fit.table, state)
+        self._warm(fit)
 
     def _warn_crowded(self: "Worker", table: int, state: Any) -> None:
         """Logs once per table that categorical columns held more categories than kept.

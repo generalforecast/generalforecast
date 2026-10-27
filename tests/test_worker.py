@@ -16,7 +16,7 @@ from generalforecast.constants import STACK_CHUNK
 from generalforecast.models.conformance import table as conformance_table
 from generalforecast.models.tabicl.model import tabicl_functions
 from generalforecast.worker import Worker, _stacked
-from tests.models.conformance.cases import FEATURES
+from tests.models.conformance.cases import CASES, FEATURES
 from tests.models.tabicl.tiny import tiny_tabicl
 
 
@@ -324,3 +324,36 @@ def test_a_worker_loads_a_model_beside_its_steps_and_reports_it_by_name(
         "failure": "OSError: no weights",
     }
     assert "broken" not in names
+
+
+def _kept_state(case: Any, fused: bool) -> Any:
+    """The state a worker keeps for a table of 300 rows, fit with its queries or alone."""
+    worker = Worker(slot_bytes=4096, compile_ahead=False, compile_cache=False)
+    worker.add_model(0, case.functions(), case.build(0))
+    worker.allocate(256, 0, 0)
+    data = conformance_table(case.regression, rows=300, queries=6, features=FEATURES)
+    worker.add_table(0, 0, data.num_classes, FEATURES)
+    features, targets = np.asarray(data.features), np.asarray(data.targets)
+    rows = np.arange(300, dtype=np.uint32)
+    if fused:
+        key = CacheKey(0, 0, 0, "context", 1)
+        unit = protocol.Unit(0, key, rows, "fuse", [], features, targets)
+        queries = np.asarray(data.queries)
+        batch = protocol.QueryBatch(0, 0, 0, queries, [0] * len(queries))
+        worker.run(protocol.Step([], [], [], [unit], [batch]))
+    else:
+        fit = protocol.Fit(0, 0, rows, features, targets, [])
+        worker.run(protocol.Step([], [fit], [], [], []))
+    return worker._tables[0].state
+
+
+@pytest.mark.parametrize("case", CASES, ids=[case.name for case in CASES])
+def test_a_context_fit_with_its_queries_keeps_the_state_a_fit_alone_would(
+    case: Any,
+) -> None:
+    fused, alone = _kept_state(case, True), _kept_state(case, False)
+
+    # To the bit, so a context reused after its first answer reads the state
+    # a fit of it alone would, whichever came first.
+    for kept, fit in zip(jax.tree.leaves(fused), jax.tree.leaves(alone), strict=True):
+        assert np.asarray(kept).tobytes() == np.asarray(fit).tobytes()
