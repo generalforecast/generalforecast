@@ -5468,3 +5468,21 @@ fn deferred_given_requests_go_ahead_of_those_given_since() {
     let requests: Vec<RequestId> = step.queries().iter().map(|batch| batch.request).collect();
     assert_eq!(requests, [first, second]);
 }
+
+#[test]
+fn a_table_says_how_many_row_ids_it_has_left_as_its_writes_count_them() {
+    use gf_core::table::ROW_IDS;
+    let mut node = node(64);
+    let table = table(&mut node, Strategy::Exact, 10);
+    assert_eq!(node.ids_left(table).unwrap(), ROW_IDS - 10);
+    // A deleted row keeps its id until a sparse table is renumbered.
+    node.delete(table, &[0]).unwrap();
+    assert_eq!(node.ids_left(table).unwrap(), ROW_IDS - 10);
+    // An upsert takes ids for its new keys alone.
+    let (_, features, targets) = rows(2);
+    node.upsert_at(table, &[1, 1_000_000], &features, targets, None)
+        .unwrap();
+    assert_eq!(node.ids_left(table).unwrap(), ROW_IDS - 11);
+    node.remove_table(table).unwrap();
+    assert!(node.ids_left(table).is_err());
+}

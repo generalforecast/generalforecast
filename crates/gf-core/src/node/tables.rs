@@ -411,4 +411,20 @@ impl Node {
             .table
             .len())
     }
+
+    /// How many more rows `table` can take before its row ids run out,
+    /// counting the dead ids a sparse table frees when it is renumbered
+    /// before its next insert, as the write checks count them; a caller
+    /// checking several writes before any applies counts what each takes.
+    ///
+    /// # Errors
+    ///
+    /// If the table does not exist.
+    pub fn ids_left(&self, table: TableId) -> Result<u64, NodeError> {
+        Ok(self
+            .tables
+            .get(&table)
+            .ok_or(NodeError::UnknownTable(table))?
+            .ids_left())
+    }
 }

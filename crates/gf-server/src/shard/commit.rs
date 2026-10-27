@@ -155,13 +155,24 @@ impl Shard {
         // batch says whether their targets are labels or codes; a later one
         // waits, so it is checked against what that write decided.
         let mut unsettled: HashSet<TableName> = HashSet::new();
+        // Row ids each table's staged writes take; each write's own check
+        // counts the ids left before any of them applies, so a later write
+        // past what is left after them waits for the next batch, where its
+        // check refuses it, rather than being logged and failing to apply.
+        let mut taken: HashMap<TableName, u64> = HashMap::new();
         let mut rest = Vec::new();
         let mut queued = batch.into_iter();
         for next in queued.by_ref() {
             let conflicts = touched
                 .get(&next.table)
                 .is_some_and(|keys| next.write.keys().iter().any(|key| keys.contains(key)));
+            let takes = self.ids_taken(&next.table, &next.write);
+            let short = taken.get(&next.table).is_some_and(|&earlier| {
+                self.ids_left(&next.table)
+                    .is_some_and(|left| earlier + takes > left)
+            });
             if conflicts
+                || short
                 || (next.write.has_strings() && extended.contains(&next.table))
                 || (next.write.has_targets() && unsettled.contains(&next.table))
                 || truncated.contains(&next.table)
@@ -210,6 +221,7 @@ impl Shard {
                     if !record.words().is_empty() {
                         extended.insert(table.clone());
                     }
+                    *taken.entry(table.clone()).or_default() += takes;
                     if matches!(record, Record::Truncate) {
                         truncated.insert(table.clone());
                     }
@@ -298,6 +310,34 @@ impl Shard {
             self.compact_if_large(&table).await;
         }
         rest
+    }
+
+    /// The row ids `write` takes from `table`: one per key an insert adds,
+    /// and one per key an upsert does not find; none for a write that adds
+    /// no rows, or to a table the shard does not serve.
+    fn ids_taken(&self, table: &str, write: &Write) -> u64 {
+        let Ok(id) = self.entry(table) else {
+            return 0;
+        };
+        match write {
+            Write::Insert(incoming) => incoming.rows.keys.len() as u64,
+            Write::Upsert(incoming) => {
+                let keys = &incoming.rows.keys;
+                let present = self
+                    .node
+                    .present(id, keys)
+                    .map_or(0, |present| present.len());
+                (keys.len() - present) as u64
+            }
+            _ => 0,
+        }
+    }
+
+    /// The row ids `table` has left, if the shard serves it.
+    fn ids_left(&self, table: &str) -> Option<u64> {
+        self.entry(table)
+            .ok()
+            .and_then(|id| self.node.ids_left(id).ok())
     }
 
     /// Resolves a write into the record to log, or the answer for one the
