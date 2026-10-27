@@ -226,7 +226,9 @@ class WorkerStats:
             the call's, `fetch` copies results to the host, `store` packs
             contexts and pages into their slots, and `other` is the rest of
             the step, the Python between the parts and XLA's measures of a
-            call's memory. A step that fails keeps no part but `other`,
+            call's memory. Timed, `store`, `move` and the decode's
+            `dispatch` wait for the device work they start, which would
+            otherwise count in the next part that waits. A step that fails keeps no part but `other`,
             which takes its whole time. The compiled stages' `seconds`
             overlap the parts: a call's seconds are its `compile` or
             `dispatch`, its `wait` and its measure.
@@ -631,7 +633,7 @@ class Worker:
 
     def warm_start(
         self,
-        progress: Callable[[], None] | None = None,
+        progress: Callable[[int, int], None] | None = None,
         models: Sequence[int] | None = None,
     ) -> None:
         """Compiles the kinds of call earlier processes recorded for the loaded models, before any step.
@@ -644,14 +646,25 @@ class Worker:
         is skipped. Call it after `allocate`: paged decodes read the pool.
 
         Args:
-            progress: Called after each program compiles.
+            progress: Called with the programs compiled so far and the
+                programs to compile in all, after each program and each
+                measure, so the caller can show how far along it is.
             models: The loaded models to compile for; every one by default.
         """
         started = time.perf_counter()
         chosen = self._specs.keys() if models is None else models
-        for model, spec in [(model, self._specs[model]) for model in chosen]:
+        planned = []
+        for model in chosen:
+            recorded = self.programs.recorded(self._specs[model])
+            kinds = [
+                (kind, self._buckets(kind.program[0]) or counts_up_to(counts))
+                for kind, counts in recorded.kinds.items()
+            ]
+            planned.append((model, recorded, kinds))
+        total = sum(len(counts) for _, _, kinds in planned for _, counts in kinds)
+        done = 0
+        for model, recorded, kinds in planned:
             parameters = self._models[model].parameters
-            recorded = self.programs.recorded(spec)
             if not self.forecaster(model) and recorded.kinds:
                 # What a step measures by compiling, once per model and width,
                 # before it decides where a context goes.
@@ -659,13 +672,13 @@ class Worker:
                 for measure in recorded.measures:
                     self._measure(model, measure)
                     if progress is not None:
-                        progress()
-            for kind, counts in recorded.kinds.items():
+                        progress(done, total)
+            for kind, counts in kinds:
                 program = (kind.program[0], model, *kind.program[2:])
+                planned_before = done
                 try:
                     function = cast(jax.stages.Wrapped, self._program(program))
-                    stacks = self._buckets(kind.program[0])
-                    for count in stacks or counts_up_to(counts):
+                    for count in counts:
                         items = abstract(kind.item, count)
                         shared = self._shared(program, kind, items)
                         arguments = (parameters, *shared, *items)
@@ -685,12 +698,18 @@ class Worker:
                                 function(parameters, *inputs[0], *inputs[1])
                             )
                         self.programs.warmed += 1
+                        done += 1
                         if progress is not None:
-                            progress()
+                            progress(done, total)
                 except Exception as error:  # noqa: BLE001
                     logger.warning(
                         "not compiling a recorded %s call: %s", kind.program[0], error
                     )
+                    # The shapes not compiled still count, so the progress a
+                    # server shows reaches its total.
+                    done = planned_before + len(counts)
+                    if progress is not None:
+                        progress(done, total)
         self.programs.warm_seconds += time.perf_counter() - started
 
     def _remember(self, model: int, measure: tuple) -> None:
@@ -1267,6 +1286,7 @@ class Worker:
             data = self._below(movement.source).read(context.slots)
         if movement.target == "device":
             self._device.write(slots, data)
+            self._settled(self._device.data)
             self.stats.promoted += 1
         else:
             self._below(movement.target).write(slots, data)
@@ -1288,6 +1308,11 @@ class Worker:
 
     def _size(self, rows: int) -> int:
         return bucket_size(rows, self._minimum)
+
+    def _settled(self, value: Any) -> None:
+        """Waits for the device to finish `value` if parts are timed, so its time counts in the part that asked for it."""
+        if self.timers:
+            _block(value)
 
     def _call(
         self,
@@ -2009,6 +2034,7 @@ class Worker:
             self._device.write_cache(slots[:packed], layout, cache)
             if own_data is not None:
                 self._device.write(slots[packed:used], own_data)
+            self._settled(self._device.data)
         self._contexts[key] = Context(layout, rows, slots)
 
     def _decode(
@@ -2170,6 +2196,7 @@ class Worker:
                 padded = _host_padded(batch.features, self._size(len(batch.units)))
             with self.stats.timed("dispatch"):
                 features.append(jnp.asarray(padded))
+                self._settled(features[-1])
         fit_own = [self._tables[batch.table].own is not None for batch in batches]
         embedded = iter(
             self._call(
@@ -2997,6 +3024,11 @@ def _stacked_shape(value: Any, count: int, stacked: bool = False) -> Any:
         jnp.result_type(value),
         weak_type=bool(getattr(value, "weak_type", False)),
     )
+
+
+def _block(value: Any) -> None:
+    """Waits for the device to finish computing `value`."""
+    jax.block_until_ready(value)
 
 
 def _host_padded(values: Any, size: int) -> np.ndarray:

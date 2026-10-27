@@ -239,12 +239,10 @@ def test_local_context_beyond_package_capacity_runs_but_never_exports(
     estimator.close()
 
 
-def test_module_function_specs_are_not_catalog_models() -> None:
+def test_module_function_specs_name_custom_models() -> None:
     import generalforecast as gf
 
-    for estimator in (gf.Classifier, gf.Regressor, gf.Forecaster):
-        with pytest.raises(
-            gf.InvalidInput,
-            match="is not a catalog model id; use general-forecast/<name>",
-        ):
-            estimator(model="os.path:join")
+    for estimator in (gf.Classifier, gf.Regressor):
+        assert estimator(model="os.path:join").model == "os.path:join"
+    with pytest.raises(gf.InvalidInput, match=r"not custom model `os\.path:join`"):
+        gf.Forecaster(model="os.path:join")

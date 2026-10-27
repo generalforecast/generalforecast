@@ -1925,7 +1925,7 @@ fn candidates_hold_what_a_table_plans_with_their_ranks() {
         let table = table(&mut node, strategy, 32);
         let expected = planned(&mut node, table, &query);
 
-        let offered = node.candidates(table, &query, None, None).unwrap();
+        let offered = node.candidates(table, &query, None, None, None).unwrap();
 
         let rows: HashSet<RowId> = offered.iter().map(|candidate| candidate.row).collect();
         assert_eq!(rows, expected, "{strategy:?}");
@@ -1953,7 +1953,9 @@ fn a_partitions_share_of_a_sample_is_its_own_sample() {
     let mut node = node(64);
     let table = table(&mut node, Strategy::subsample(16, 3, CoreKind::Random), 32);
 
-    let offered = node.candidates(table, &[0.0, 0.0], Some(4), None).unwrap();
+    let offered = node
+        .candidates(table, &[0.0, 0.0], Some(4), None, None)
+        .unwrap();
     let rows = node
         .rows_of(
             table,
@@ -2042,7 +2044,7 @@ fn candidates_with_a_cutoff_come_from_before_it() {
     let mut node = node(64);
     let table = timed(&mut node);
 
-    let offered = node.candidates(table, &A, None, Some(14)).unwrap();
+    let offered = node.candidates(table, &A, None, Some(14), None).unwrap();
 
     let mut rows: Vec<u32> = offered.iter().map(|candidate| candidate.row.0).collect();
     rows.sort_unstable();
@@ -2144,7 +2146,7 @@ fn a_regression_core_offered_to_a_router_is_the_one_planned() {
         .unwrap();
 
     let offered: HashSet<RowId> = node
-        .candidates(table, &A, None, None)
+        .candidates(table, &A, None, None, None)
         .unwrap()
         .iter()
         .map(|candidate| candidate.row)
@@ -2670,7 +2672,7 @@ fn a_recent_context_holds_the_windows_latest_rows_and_neighbors() {
     assert_eq!(rows.len(), 7);
     assert!(rows.iter().all(|row| row.0 >= 16), "{rows:?}");
     let core: HashSet<RowId> = node
-        .candidates(table, &A, None, None)
+        .candidates(table, &A, None, None, None)
         .unwrap()
         .iter()
         .filter(|candidate| candidate.query.is_none())
@@ -3092,7 +3094,7 @@ mod series {
             .unwrap();
 
         assert!(matches!(
-            node.candidates(empty, &[1.0, 2.0], None, None),
+            node.candidates(empty, &[1.0, 2.0], None, None, None),
             Err(NodeError::Unscaled)
         ));
         assert_eq!(
@@ -4970,4 +4972,91 @@ fn a_deferred_single_use_table_waits_for_its_program_then_serves_its_requests() 
     );
     let step = node.schedule().unwrap().expect("a step");
     assert!(step.queries().iter().any(|batch| batch.request == request));
+}
+
+/// Rows the step's unit for `table` reads.
+fn unit_rows(node: &mut Node, table: TableId, query: &[f32]) -> usize {
+    node.submit(table, query).unwrap();
+    let step = run(node);
+    step.units()
+        .iter()
+        .filter(|unit| unit.table == table)
+        .map(|unit| unit.rows.len())
+        .sum()
+}
+
+#[test]
+fn an_adaptive_table_crosses_into_retrieval_as_it_grows_and_back_as_it_shrinks() {
+    let mut node = node(64);
+    let table = node
+        .create_table(TableSpec {
+            context_rows: NonZeroU64::new(8),
+            past_cap: PastCap::Clamp,
+            ..spec(Strategy::Adaptive)
+        })
+        .unwrap();
+    assert_eq!(node.spec(table).unwrap().strategy, Strategy::Adaptive);
+    let (keys, features, _) = rows(32);
+    let labels =
+        |keys: &[u128]| Targets::Classes(keys.iter().map(|&key| (key % 3) as i32).collect());
+    node.insert(table, &keys[..4], &features[..8], labels(&keys[..4]))
+        .unwrap();
+    assert_eq!(node.strategy(table).unwrap(), Strategy::Exact);
+    assert_eq!(unit_rows(&mut node, table, &A), 4);
+
+    // Past the cap, the plan draws a stratified core of 2 and 6 neighbors.
+    node.insert(table, &keys[4..], &features[8..], labels(&keys[4..]))
+        .unwrap();
+    let retrieved = Strategy::Adaptive.resolve(32, NonZeroU64::new(8), false);
+    assert!(matches!(
+        retrieved,
+        Strategy::Retrieved { neighbors: 6, .. }
+    ));
+    assert_eq!(node.strategy(table).unwrap(), retrieved);
+    assert_eq!(unit_rows(&mut node, table, &A), 8);
+    assert_eq!(unit_rows(&mut node, table, &B), 8);
+    assert!(node.take_past_cap().is_empty());
+
+    // Back under the cap, every live row is the context again.
+    node.delete(table, &keys[6..]).unwrap();
+    assert_eq!(node.strategy(table).unwrap(), Strategy::Exact);
+    assert_eq!(unit_rows(&mut node, table, &A), 6);
+
+    // A strategy set explicitly stays, until the table goes adaptive again.
+    node.set_strategy(table, Strategy::neighbors(2)).unwrap();
+    assert_eq!(node.spec(table).unwrap().strategy, Strategy::neighbors(2));
+    assert_eq!(unit_rows(&mut node, table, &A), 2);
+    node.set_strategy(table, Strategy::Adaptive).unwrap();
+    assert_eq!(unit_rows(&mut node, table, &A), 6);
+    assert!(matches!(
+        node.set_strategy(table, Strategy::neighbors(0)),
+        Err(NodeError::Strategy(StrategyError::Empty))
+    ));
+}
+
+#[test]
+fn a_timed_adaptive_table_leans_its_neighbors_to_the_newest_rows() {
+    let mut node = node(64);
+    let table = node
+        .create_table(TableSpec {
+            context_rows: NonZeroU64::new(8),
+            ..spec(Strategy::Adaptive)
+        })
+        .unwrap();
+    let (keys, features, targets) = rows(32);
+    let times: Vec<Option<i64>> = (0..32).map(Some).collect();
+    node.insert_at(table, &keys, &features, targets, Some(&times))
+        .unwrap();
+    assert_eq!(
+        node.strategy(table).unwrap(),
+        Strategy::Adaptive.resolve(32, NonZeroU64::new(8), true)
+    );
+    assert!(matches!(
+        node.strategy(table).unwrap(),
+        Strategy::Retrieved {
+            among: Some(24),
+            ..
+        }
+    ));
+    assert_eq!(unit_rows(&mut node, table, &A), 8);
 }

@@ -20,6 +20,20 @@ def _tabicl_classifier() -> tuple[Any, Any]:
     return classifier()
 
 
+def _tabicl_classifier_capped() -> tuple[Any, Any]:
+    """The tiny classifier saying it was trained on 16-row contexts, so a
+    table crosses the model's cap with a few dozen rows."""
+    import dataclasses
+
+    functions, parameters = _tabicl_classifier()
+    properties = functions.properties
+
+    def capped(parameters: Any) -> Any:
+        return dataclasses.replace(properties(parameters), context_rows=16)
+
+    return functions._replace(properties=capped), parameters
+
+
 def _tabicl_regressor() -> tuple[Any, Any]:
     from tests.models.tabicl.tiny import regressor
 
@@ -88,6 +102,7 @@ def _chronos2_catalog_forecaster() -> tuple[Any, Any]:
 
 TINY_MODELS = {
     "tests/tabicl-classifier": _tabicl_classifier,
+    "tests/tabicl-classifier-capped": _tabicl_classifier_capped,
     "tests/tabicl-regressor": _tabicl_regressor,
     "tests/kumo-classifier": _kumo_classifier,
     "tests/kumo-regressor": _kumo_regressor,

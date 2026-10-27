@@ -146,6 +146,10 @@ pub struct TableDefinition {
     /// How the table's series are forecast, for a table of series.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub series: Option<Box<SeriesDefinition>>,
+    /// The columns a client's frames hold around the feature columns, and
+    /// the target's class values, kept so a client can open the table again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<Box<Roles>>,
     /// An id the server gives each creation, so copies of an earlier table of
     /// the same name never mix with this one's; None until it is created.
     #[serde(
@@ -167,6 +171,49 @@ pub struct TableDefinition {
     /// alone, under the name `ctx-<fingerprint>`, until the shard evicts them.
     #[serde(default, skip_serializing_if = "Durability::is_durable")]
     pub durability: Durability,
+}
+
+/// The frame columns a client's rows carry besides the feature columns, as
+/// `gf.engine.Table` reads them: the target, and the id and time if the
+/// frame has them. A classifier's table also keeps its class values, in code
+/// order, since clients write codes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Roles {
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub classes: Vec<Value>,
+}
+
+impl Roles {
+    /// Checks the roles name distinct columns and the classes match `classes`.
+    ///
+    /// # Errors
+    ///
+    /// If the target is unnamed, two roles share a name, or there are more
+    /// class values than classes.
+    pub fn check(&self, classes: u32) -> Result<(), String> {
+        if self.target.is_empty() {
+            return Err("roles need a target column name".into());
+        }
+        let named: Vec<&String> = [Some(&self.target), self.id.as_ref(), self.time.as_ref()]
+            .into_iter()
+            .flatten()
+            .collect();
+        if named.iter().collect::<HashSet<_>>().len() != named.len() {
+            return Err("the target, id and time roles need columns of their own".into());
+        }
+        let count = self.classes.len();
+        if count > classes as usize {
+            return Err(format!(
+                "roles name {count} class values for a table of {classes} classes"
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Whether a table's rows are logged, or held in memory for requests alone.
@@ -678,6 +725,8 @@ pub enum Record {
     Refit,
     /// Every row deleted, as when the source table is truncated.
     Truncate,
+    /// From here on the table chooses contexts with this strategy.
+    Strategy(StrategySpec),
     /// Every live row at this point: the table is exactly these rows.
     Snapshot(Rows),
     /// From here on the table's writes go to the node named `primary`, under
@@ -695,7 +744,11 @@ impl Record {
         match self {
             Self::Insert(rows) | Self::Update(rows) | Self::Upsert(rows) => rows.id.as_deref(),
             Self::Delete { id, .. } => id.as_deref(),
-            Self::Refit | Self::Truncate | Self::Snapshot(_) | Self::Term { .. } => None,
+            Self::Refit
+            | Self::Truncate
+            | Self::Strategy(_)
+            | Self::Snapshot(_)
+            | Self::Term { .. } => None,
         }
     }
 
@@ -707,7 +760,7 @@ impl Record {
                 &rows.keys
             }
             Self::Delete { keys, .. } => keys,
-            Self::Refit | Self::Truncate | Self::Term { .. } => &[],
+            Self::Refit | Self::Truncate | Self::Strategy(_) | Self::Term { .. } => &[],
         }
     }
 
@@ -718,7 +771,11 @@ impl Record {
             Self::Insert(rows) | Self::Update(rows) | Self::Upsert(rows) | Self::Snapshot(rows) => {
                 &rows.words
             }
-            Self::Delete { .. } | Self::Refit | Self::Truncate | Self::Term { .. } => &[],
+            Self::Delete { .. }
+            | Self::Refit
+            | Self::Truncate
+            | Self::Strategy(_)
+            | Self::Term { .. } => &[],
         }
     }
 }
@@ -2247,6 +2304,7 @@ fn record_frame(record: &Record) -> Frame {
         }
         Record::Refit => json!({"record": "refit"}),
         Record::Truncate => json!({"record": "truncate"}),
+        Record::Strategy(strategy) => json!({"record": "strategy", "strategy": strategy}),
         Record::Term { term, primary } => {
             json!({"record": "term", "term": term, "primary": primary})
         }
@@ -2586,6 +2644,7 @@ fn table_layout_header(frame: &mut Frame, table: &TableLayout) -> Value {
         "column_sums": frame.push(f64_bytes(&table.column_sums)),
         "column_counts": frame.push(u64_bytes(&table.column_counts)),
         "fitted": fitted,
+        "strategy": table.strategy.map(StrategySpec::of),
     })
 }
 
@@ -2689,6 +2748,14 @@ fn table_layout_from(frame: &Frame, header: &Value) -> Result<TableLayout, LogEr
         column_counts: u64_values(frame.buffer(header, "column_counts")?)?,
         fitted,
         changed: number("changed")?,
+        strategy: match header.get("strategy") {
+            Some(strategy) if !strategy.is_null() => Some(
+                serde_json::from_value::<StrategySpec>(strategy.clone())
+                    .map_err(|_| malformed("a layout's strategy is malformed"))?
+                    .strategy(),
+            ),
+            _ => None,
+        },
     })
 }
 
@@ -2776,6 +2843,17 @@ fn record_from(frame: &Frame) -> Result<Record, LogError> {
         "delete" => Record::Delete { keys: keys()?, id },
         "refit" => Record::Refit,
         "truncate" => Record::Truncate,
+        "strategy" => Record::Strategy(
+            header
+                .get("strategy")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| LogError::Malformed(format!("a strategy record: {error}")))?
+                .ok_or_else(|| {
+                    LogError::Malformed("a strategy record needs a strategy".to_string())
+                })?,
+        ),
         "term" => Record::Term {
             term: header
                 .get("term")
@@ -2823,6 +2901,7 @@ mod tests {
             created: CreationId::parse("0123456789abcdef"),
             times: TimeKind::Integer,
             route_by: None,
+            roles: None,
             durability: Default::default(),
         };
         let log = Log::create(path, key, &definition, Terms::default()).unwrap();
@@ -2954,5 +3033,79 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(plain.route_by, None);
+    }
+
+    fn roles(classes: &[Value]) -> Roles {
+        Roles {
+            target: "y".to_string(),
+            id: Some("k".to_string()),
+            time: None,
+            classes: classes.to_vec(),
+        }
+    }
+
+    #[test]
+    fn roles_round_trip_through_a_definition_and_default_to_none() {
+        let mut definition = TableDefinition {
+            name: TableName::new("payments").unwrap(),
+            model: "tiny".to_string(),
+            columns: vec![Column {
+                name: "amount".to_string(),
+                kind: ColumnKind::Numeric,
+            }],
+            classes: 2,
+            strategy: StrategySpec::default(),
+            page_size: 64,
+            time_bucket: None,
+            refit_after: None,
+            refit_shift: None,
+            fit_rows: None,
+            past_cap: PastCapSpec::default(),
+            regions: None,
+            series: None,
+            roles: None,
+            refit_cutoffs: "each".to_string(),
+            retrieval_categoricals: "codes".to_string(),
+            scale_rows: None,
+            summary: Default::default(),
+            created: CreationId::parse("0123456789abcdef"),
+            times: TimeKind::Integer,
+            route_by: None,
+            durability: Default::default(),
+        };
+        let plain = serde_json::to_value(&definition).unwrap();
+        assert!(plain.get("roles").is_none());
+        let read: TableDefinition = serde_json::from_value(plain).unwrap();
+        assert_eq!(read.roles, None);
+        definition.roles = Some(Box::new(roles(&[Value::from("no"), Value::from("yes")])));
+        let encoded = serde_json::to_value(&definition).unwrap();
+        assert_eq!(encoded["roles"]["target"], "y");
+        assert_eq!(encoded["roles"]["id"], "k");
+        assert!(encoded["roles"].get("time").is_none());
+        let read: TableDefinition = serde_json::from_value(encoded).unwrap();
+        assert_eq!(read.roles, definition.roles);
+    }
+
+    #[test]
+    fn roles_need_distinct_columns_and_at_most_one_value_per_class() {
+        assert_eq!(roles(&[]).check(2), Ok(()));
+        assert_eq!(roles(&[Value::from(0)]).check(2), Ok(()));
+        assert_eq!(roles(&[Value::from(0), Value::from(1)]).check(2), Ok(()));
+        assert_eq!(
+            roles(&[Value::from(0), Value::from(1), Value::from(2)]).check(2),
+            Err("roles name 3 class values for a table of 2 classes".to_string())
+        );
+        let mut same = roles(&[]);
+        same.time = Some("y".to_string());
+        assert_eq!(
+            same.check(2),
+            Err("the target, id and time roles need columns of their own".to_string())
+        );
+        let mut unnamed = roles(&[]);
+        unnamed.target = String::new();
+        assert_eq!(
+            unnamed.check(2),
+            Err("roles need a target column name".to_string())
+        );
     }
 }

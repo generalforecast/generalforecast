@@ -11,6 +11,7 @@ import tempfile
 import warnings
 import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, Self
 
@@ -284,6 +285,7 @@ class LocalTable(Table):
                     for name in Definition.__dataclass_fields__
                 },
                 rows=self._client._node.len(self._id),
+                resolved_strategy=self._client._node.strategy(self._id),
                 effective_fit_rows=None
                 if self.definition.summary == "context"
                 else self._client._node.effective_fit_rows(self._id),
@@ -291,6 +293,12 @@ class LocalTable(Table):
                 labels=self.labels,
                 region_stats=self._client._node.region_stats(self._id),
             )
+
+    def set_strategy(self, strategy: Strategy) -> None:
+        with self._client._lock:
+            self._live()
+            self._client._node.set_strategy(self._id, strategy)
+            self.definition = replace(self.definition, strategy=strategy)
 
     def vocabularies(self) -> dict[str, list[str]]:
         with self._client._lock:

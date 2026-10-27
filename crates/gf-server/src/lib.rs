@@ -14,6 +14,7 @@ pub mod name;
 pub mod partition;
 pub mod predictors;
 pub mod private;
+pub mod progress;
 pub mod protocol;
 pub mod revisions;
 pub mod routes;

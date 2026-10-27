@@ -670,7 +670,15 @@ class Warmed:
 
 @dataclass(frozen=True)
 class Progress:
-    """Sent while a step runs, once per compile finished; answers no request."""
+    """Sent while a request runs, once per compile finished; answers no request.
+
+    Attributes:
+        done: Programs compiled so far by the warm-up this reports, if any.
+        total: Programs that warm-up compiles in all.
+    """
+
+    done: int | None = None
+    total: int | None = None
 
 
 @dataclass(frozen=True)
@@ -761,6 +769,8 @@ def reply(answer: Reply) -> dict[str, Any]:
         fields = {
             key: value for key, value in fields.items() if key not in _SERIES_FIELDS
         }
+    if isinstance(answer, Progress):
+        fields = {key: value for key, value in fields.items() if value is not None}
     return {"kind": _REPLIES[type(answer)], **fields}
 
 

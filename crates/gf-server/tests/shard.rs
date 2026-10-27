@@ -94,12 +94,11 @@ fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notif
                     COMPILE => {
                         for _ in 0..6 {
                             tokio::time::sleep(Duration::from_millis(100)).await;
-                            if WorkerReply::Progress
-                                .frame()
-                                .write_to(&mut stream)
-                                .await
-                                .is_err()
-                            {
+                            let progress = WorkerReply::Progress {
+                                done: None,
+                                total: None,
+                            };
+                            if progress.frame().write_to(&mut stream).await.is_err() {
                                 return;
                             }
                         }
@@ -144,6 +143,22 @@ fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notif
                         })
                         .frame()
                     }
+                    // The capped model was trained on two-row contexts.
+                    WorkerRequest::Profile { model, .. } if model == "capped" => {
+                        WorkerReply::Profile(ModelProfile {
+                            bytes_per_row: 64,
+                            representation_bytes: 16,
+                            regression: false,
+                            class_slots: 10,
+                            outputs: 10,
+                            context_rows: Some(2),
+                            state_bytes: 32,
+                            categorical_state_bytes: 64,
+                            column_summary: true,
+                            ..ModelProfile::default()
+                        })
+                        .frame()
+                    }
                     WorkerRequest::Profile { .. } => WorkerReply::Profile(ModelProfile {
                         bytes_per_row: 64,
                         representation_bytes: 16,
@@ -173,12 +188,11 @@ fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notif
                     // starts, reporting progress after each.
                     WorkerRequest::Allocate { .. } => {
                         for _ in 0..3 {
-                            if WorkerReply::Progress
-                                .frame()
-                                .write_to(&mut stream)
-                                .await
-                                .is_err()
-                            {
+                            let progress = WorkerReply::Progress {
+                                done: None,
+                                total: None,
+                            };
+                            if progress.frame().write_to(&mut stream).await.is_err() {
                                 return;
                             }
                         }
@@ -371,6 +385,7 @@ async fn shard_routed(
             "tiny".to_string(),
             "tiny-forecaster".to_string(),
             "bounded".to_string(),
+            "capped".to_string(),
         ],
     )
     .unwrap();
@@ -450,6 +465,7 @@ fn definition(name: &str, classes: u32) -> TableDefinition {
         created: CreationId::parse("0123456789abcdef"),
         times: TimeKind::Integer,
         route_by: None,
+        roles: None,
         durability: Default::default(),
     }
 }
@@ -1682,6 +1698,7 @@ fn context(fingerprint: &str, rows: u128) -> RequestContext {
     RequestContext {
         fingerprint: fingerprint_of(fingerprint),
         definition: TableDefinition {
+            roles: None,
             durability: Durability::Ephemeral,
             ..definition(&format!("ctx-{fingerprint}"), 3)
         },
@@ -1839,4 +1856,128 @@ async fn a_request_context_larger_than_the_fit_bound_is_measured_and_answered() 
     assert_eq!(shard.metrics.ephemeral_tables.get(), 1);
     // The shard is still up and answers a second, small context.
     shard.infer(context("small", 4)).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_strategy_set_on_a_table_holds_across_a_restart() {
+    use gf_server::protocol::StrategySpec;
+
+    let shard = shard(settings()).await;
+    shard.create(3).await.unwrap();
+    shard.insert(&[1, 2, 3]).await;
+    assert_eq!(shard.describe().await.strategy, StrategySpec::Exact);
+
+    let set = |shard: &Harness, strategy: StrategySpec| {
+        let (reply, answer) = oneshot::channel();
+        let command = Command::SetStrategy {
+            table: name("rows"),
+            strategy,
+            fence: Fence::default(),
+            reply,
+        };
+        let commands = shard.commands.clone();
+        async move {
+            commands.send(command).await.unwrap();
+            answer.await.unwrap()
+        }
+    };
+    let neighbors = StrategySpec::Neighbors { rows: 2 };
+    assert_eq!(
+        set(&shard, neighbors.clone())
+            .await
+            .map(|written| written.rows),
+        Ok(0)
+    );
+    let described = shard.describe().await;
+    assert_eq!(described.strategy, StrategySpec::of(neighbors.strategy()));
+    assert_eq!(described.definition.strategy, neighbors);
+    assert_eq!(shard.predict().await, Ok(1));
+    assert_eq!(
+        set(&shard, StrategySpec::Neighbors { rows: 0 })
+            .await
+            .map(|written| written.rows)
+            .map_err(|error| status(&error)),
+        Err(Code::InvalidArgument)
+    );
+
+    // The log carries the strategy, through a compaction and a restart, and
+    // a replica that takes the snapshot in place of the records before it.
+    shard.compact().await;
+    let replica = self::shard(self::settings()).await;
+    replica.create(3).await.unwrap();
+    replica.replicate(shard.read_log(0).await).await.unwrap();
+    let described = replica.describe().await;
+    assert_eq!(described.strategy, StrategySpec::of(neighbors.strategy()));
+    // The replica's definition took the snapshot's spelling of the strategy.
+    assert_eq!(
+        described.definition.strategy.strategy(),
+        neighbors.strategy()
+    );
+    let again = shard.restart().await;
+    let described = again.describe().await;
+    assert_eq!(described.strategy, StrategySpec::of(neighbors.strategy()));
+    assert_eq!(described.definition.strategy, neighbors);
+
+    // Back to adaptive: without a model cap it reads whole.
+    set(&again, StrategySpec::Adaptive).await.unwrap();
+    let described = again.describe().await;
+    assert_eq!(described.definition.strategy, StrategySpec::Adaptive);
+    assert_eq!(described.strategy, StrategySpec::Exact);
+    let again = again.restart().await;
+    assert_eq!(
+        again.describe().await.definition.strategy,
+        StrategySpec::Adaptive
+    );
+}
+
+#[tokio::test]
+async fn a_clamped_tables_compaction_keeps_the_strategy_it_was_given() {
+    use gf_server::protocol::StrategySpec;
+
+    let shard = shard(settings()).await;
+    let mut definition = definition("rows", 3);
+    definition.model = "capped".to_string();
+    definition.past_cap = gf_server::wal::PastCapSpec::Clamp;
+    let (reply, answer) = oneshot::channel();
+    shard
+        .commands
+        .send(Command::Create {
+            definition,
+            terms: Terms::default(),
+            reply,
+        })
+        .await
+        .unwrap();
+    answer.await.unwrap().unwrap();
+    shard.insert(&[1, 2, 3]).await;
+    let clamped = StrategySpec::of(gf_core::planner::Strategy::Exact.capped(2));
+    let described = shard.describe().await;
+    assert_eq!(described.definition.strategy, StrategySpec::Exact);
+    assert_eq!(described.strategy, clamped);
+
+    // The snapshot carries the strategy as given, and the clamp cuts it again.
+    shard.compact().await;
+    let again = shard.restart().await;
+    let described = again.describe().await;
+    assert_eq!(described.definition.strategy, StrategySpec::Exact);
+    assert_eq!(described.strategy, clamped);
+    let replica = self::shard(self::settings()).await;
+    let mut definition = self::definition("rows", 3);
+    definition.model = "capped".to_string();
+    definition.past_cap = gf_server::wal::PastCapSpec::Clamp;
+    let (reply, answer) = oneshot::channel();
+    replica
+        .commands
+        .send(Command::Create {
+            definition,
+            terms: Terms::default(),
+            reply,
+        })
+        .await
+        .unwrap();
+    answer.await.unwrap().unwrap();
+    replica.replicate(again.read_log(0).await).await.unwrap();
+    let described = replica.describe().await;
+    assert_eq!(described.definition.strategy, StrategySpec::Exact);
+    assert_eq!(described.strategy, clamped);
 }

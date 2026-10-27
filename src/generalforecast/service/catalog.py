@@ -130,7 +130,7 @@ class CatalogService:
         """Lists immutable model metadata without downloads or context retention."""
         require(isinstance(scope, Scope), "expected validated scope")
         return [
-            self.get(scope, entry.name)
+            self.get(scope, entry.id)
             for entry in entries()
             if entry.gates.allows("remote")
         ]

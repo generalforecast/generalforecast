@@ -411,12 +411,34 @@ fn sorted_names() -> String {
         .join(", ")
 }
 
+/// Whether a name is a custom model's `module:attribute`: dotted identifiers, a colon, an identifier.
+fn custom_shaped(name: &str) -> bool {
+    let Some((module, attribute)) = name.split_once(':') else {
+        return false;
+    };
+    let identifier = |part: &str| {
+        let mut chars = part.chars();
+        chars.next().is_some_and(|c| c.is_alphabetic() || c == '_')
+            && chars.all(|c| c.is_alphanumeric() || c == '_')
+    };
+    module.split('.').all(identifier) && identifier(attribute)
+}
+
+/// The one message a custom model is refused with off the local surface.
+fn custom_refused(spec: &str) -> String {
+    format!(
+        "custom model `{spec}` runs locally only; predictors, gf push and serving take a \
+         catalog model id, such as {ORG}/tabicl-v2-classifier"
+    )
+}
+
 /// Parses an untrusted reference as `generalforecast.models.catalog.parse` does.
 ///
 /// # Errors
 ///
-/// `InvalidModel` for a malformed spelling, a zero count or a colon-separated code path
-/// code, `UnknownModel` for no built-in model,
+/// `InvalidModel` for a malformed spelling or a zero count, `UnsupportedModel`
+/// for a custom model's `module:attribute`, which runs locally only (as
+/// `generalforecast.models.catalog.custom_refused` says), `UnknownModel` for no built-in model,
 /// `ModelMismatch` for a pin to other content, and `UnsupportedCapability`
 /// for a variant the model cannot take.
 pub fn parse(spec: &str) -> Result<Model, RefError> {
@@ -427,9 +449,10 @@ pub fn parse(spec: &str) -> Result<Model, RefError> {
             python_repr(spec)
         ),
     };
-    let parts = spec
+    let prefixed = spec
         .strip_prefix(&format!("{ORG}/"))
-        .or_else(|| spec.strip_prefix("catalog/"))
+        .or_else(|| spec.strip_prefix("catalog/"));
+    let parts = prefixed
         .and_then(spelled)
         .or_else(|| spelled(spec))
         .ok_or_else(invalid)?;
@@ -445,24 +468,49 @@ pub fn parse(spec: &str) -> Result<Model, RefError> {
             message: format!("counts in a model spec are positive: {}", python_repr(spec)),
         });
     }
+    // A bare name or an upstream id that names a model is refused with the
+    // canonical id, as the Python catalog refuses it; an unknown one falls
+    // through to the catalog lookup and its `UnknownModel`.
+    if prefixed.is_none() && !parts.name.contains(':') {
+        let canonical = catalog().aliases.get(parts.name).cloned().or_else(|| {
+            catalog()
+                .named(&format!("{ORG}/{}", parts.name))
+                .map(|entry| entry.id.clone())
+        });
+        if let Some(canonical) = canonical {
+            return Err(RefError {
+                code: "InvalidModel",
+                message: format!("`{spec}` is not a catalog model id; use {canonical}"),
+            });
+        }
+    }
     if parts.name.contains(':') {
+        if custom_shaped(parts.name) && spec.starts_with(parts.name) {
+            if codes.is_some() || estimators.is_some() || parts.digest.is_some() {
+                return Err(RefError {
+                    code: "UnsupportedCapability",
+                    message: format!(
+                        "a custom model takes no pin, codes or estimators: {}",
+                        python_repr(spec)
+                    ),
+                });
+            }
+            return Err(RefError {
+                code: "UnsupportedModel",
+                message: custom_refused(parts.name),
+            });
+        }
         return Err(RefError {
             code: "InvalidModel",
             message: format!(
-                "`{}` is not a catalog model id; use general-forecast/<name>",
+                "`{}` is neither a catalog model id, {ORG}/<name>, nor a custom model's \
+                 \"module:attribute\"",
                 parts.name
             ),
         });
     }
     let entry = catalog()
         .named(&format!("{ORG}/{}", parts.name))
-        .or_else(|| catalog().named(parts.name))
-        .or_else(|| {
-            catalog()
-                .aliases
-                .get(parts.name)
-                .and_then(|canonical| catalog().named(canonical))
-        })
         .ok_or_else(|| RefError {
             code: "UnknownModel",
             message: format!(

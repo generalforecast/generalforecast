@@ -73,6 +73,11 @@ def records(
 
 
 def _whoami(args: argparse.Namespace, result: dict, out: term.Output) -> None:
+    workspace = result.get("workspace")
+    if isinstance(workspace, dict):
+        result = result | {
+            "workspace": workspace.get("display_name") or workspace.get("id")
+        }
     pairs = [
         (label, _scalar(result[key]))
         for key, label in (

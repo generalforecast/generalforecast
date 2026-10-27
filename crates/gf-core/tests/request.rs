@@ -153,7 +153,12 @@ fn requests_are_refused_as_the_models_api_refuses_them() {
     let cases: Vec<(Value, (&str, &str, u16))> = vec![
         (
             json!({"model": "custom.py:run"}),
-            ("ModelNotFound", "model is not in the curated catalog", 404),
+            (
+                "UnsupportedModel",
+                "custom model `custom.py:run` runs locally only; predictors, gf push and \
+                 serving take a catalog model id, such as general-forecast/tabicl-v2-classifier",
+                422,
+            ),
         ),
         (
             json!({"task": "forecast"}),

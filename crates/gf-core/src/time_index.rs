@@ -61,6 +61,12 @@ impl TimeIndex {
         !self.untimed.is_empty()
     }
 
+    /// Whether any row has a time.
+    #[must_use]
+    pub fn has_timed(&self) -> bool {
+        !self.times.is_empty()
+    }
+
     /// Removes a row, returning its timestamp if it had one.
     pub fn remove(&mut self, row: RowId) -> Option<i64> {
         self.untimed.remove(row.0);

@@ -34,15 +34,18 @@ function examples(spec) {
     const code = /^        "(\d{3})":\s*$/.exec(line);
     if (code && section === "response") { status = Number(code[1]); continue; }
     const name = /^(\s+)([a-z-]+):\s*$/.exec(line);
-    const inline = name && lines[i + 1] ? /^\s+value: (\{.*\})\s*$/.exec(lines[i + 1]) : null;
+    // An example may carry `x-gf-*` annotations before its value.
+    let next = i + 1;
+    while (name && lines[next] && /^\s+x-gf-[a-z-]+:/.test(lines[next])) next++;
+    const inline = name && lines[next] ? /^\s+value: (\{.*\})\s*$/.exec(lines[next]) : null;
     if (name && inline && path) {
       found.push({ path, method, section, status, name: name[2], value: flow(inline[1]) });
       continue;
     }
-    if (name && lines[i + 1] && /^\s+value:\s*$/.test(lines[i + 1]) && path && path.startsWith("/")) {
+    if (name && lines[next] && /^\s+value:\s*$/.test(lines[next]) && path && path.startsWith("/")) {
       const indent = name[1].length;
       const block = [];
-      for (let j = i + 2; j < lines.length; j++) {
+      for (let j = next + 1; j < lines.length; j++) {
         const current = lines[j];
         if (current.trim() === "" ) break;
         const currentIndent = current.length - current.trimStart().length;
@@ -345,8 +348,10 @@ test("predictors.list, predictors.get and models.list unwrap collections", async
   assert.equal(churn.environments.length, 2);
   await assert.rejects(gf.predictors.get("nothing"), (error) => error instanceof GFError && error.code === "NotFound");
   const models = await gf.models.list();
-  assert.equal(models[0].model, "general-forecast/tabicl-v2-classifier");
-  assert.equal(models[1].ready, false);
+  // The catalog lists each model by its pinned id.
+  assert.match(models[0].model, /^general-forecast\/tabicl-v2-classifier@sha256:[0-9a-f]{64}$/);
+  assert.equal(models.length, 1);
+  assert.equal(models[0].task, "classification");
 });
 
 test("health resolves on 200 and throws ModelNotReady on 503", async () => {

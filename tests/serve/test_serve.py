@@ -66,13 +66,15 @@ def call(url, path, body=None, *, key=None, headers=None):
         return error.code, json.loads(error.read())
 
 
-def _start(arguments, *, env=None):
+def _start(arguments, *, env=None, own_group=False):
     from tests.utils.server import build
 
     binary = build()
     environment = {k: v for k, v in os.environ.items() if k not in CLEAN}
     environment["PATH"] = f"{binary.parent}{os.pathsep}{environment['PATH']}"
     environment |= env or {}
+    # `own_group` puts the server and its workers in their own process
+    # group, so a test can send them a terminal's Ctrl-C.
     return subprocess.Popen(
         [sys.executable, "-m", "generalforecast.serve", *arguments],
         stdout=subprocess.PIPE,
@@ -80,6 +82,7 @@ def _start(arguments, *, env=None):
         text=True,
         env=environment,
         cwd=ROOT,
+        start_new_session=own_group,
     )
 
 
@@ -229,6 +232,41 @@ def test_ten_thousand_context_rows_are_answered(server):
     assert body["result"]["context"]["rows"] == 10_000
     [row] = body["result"]["predictions"]
     assert set(row["probabilities"]) == {"0", "1"}
+
+
+@pytest.mark.slow
+def test_ctrl_c_stops_the_server_and_its_workers_quietly():
+    port = _port()
+    process = _start(
+        [MODEL, "--port", str(port)], env={"GF_API_KEY": KEY}, own_group=True
+    )
+    url = _event(process, "serving")["url"]
+    _event(process, "ready")
+    workers = _children(process.pid)
+    assert workers
+    os.killpg(process.pid, signal.SIGINT)
+    assert _event(process, "stopped")["url"] == url
+    assert process.wait(60) == 0
+    assert process.stdout.read() == ""
+    stderr = process.stderr.read()
+    assert "Traceback" not in stderr and "KeyboardInterrupt" not in stderr, stderr
+    _assert_exited(workers)
+
+
+def _children(pid):
+    listed = subprocess.run(
+        ["pgrep", "-P", str(pid)], capture_output=True, text=True, check=False
+    )
+    return [int(child) for child in listed.stdout.split()]
+
+
+def _assert_exited(pids):
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if not any(Path(f"/proc/{pid}").exists() for pid in pids):
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"workers still running: {pids}")
 
 
 @pytest.mark.slow

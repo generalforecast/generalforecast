@@ -339,7 +339,7 @@ class _Estimator(BaseEstimator):
         return table
 
     def _native_model(self) -> Any:
-        if self.client is not None:
+        if self.client is not None or not isinstance(self.model, str):
             return self.model
         from generalforecast.predictors.models import for_task
 

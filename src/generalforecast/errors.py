@@ -10,6 +10,7 @@ server reply and a local mistake render identically.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -302,7 +303,7 @@ def convert(exc: BaseException) -> Error | None:
     if name.startswith("pyarrow._flight."):
         return _flight(exc, message)
     if name.startswith("pyarrow.lib.Arrow") or isinstance(exc, (ValueError, TypeError)):
-        return _by_text(_lower(_strip(message)))
+        return _framed(message)
     if isinstance(exc, (FileNotFoundError, KeyError)):
         return NotFound(_lower(_strip(message)))
     if isinstance(exc, PermissionError):
@@ -313,7 +314,9 @@ def convert(exc: BaseException) -> Error | None:
 
 
 def _by_text(text: str) -> Error:
-    if "not found" in text or ("unknown" in text and "table" in text):
+    if "not found" in text or "does not exist" in text:
+        return NotFound(text)
+    if "unknown" in text and "table" in text:
         return NotFound(text)
     if "capacity" in text or "too many" in text or "exceed" in text:
         return CapacityExceeded(text)
@@ -333,14 +336,34 @@ def _flight(exc: BaseException, message: str) -> Error:
     text = _lower(_strip(message))
     if (found := by_name.get(type(exc).__name__)) is not None:
         return found(text)
+    return _framed(message)
+
+
+# How pyarrow frames a server's status: `Flight returned <status> error: ...`
+# or `Flight returned <status> error, with message: ...`.
+_FRAMING = re.compile(r"^Flight returned ([a-z ]+) error(?:, with message)?:\s*")
+_BY_FLIGHT: dict[str, type[Error]] = {
+    "already exists": Conflict,
+    "not found": NotFound,
+    "unauthenticated": Unauthorized,
+    "unauthorized": Unauthorized,
+    "resource exhausted": CapacityExceeded,
+}
+
+
+def _framed(message: str) -> Error:
+    """The error a Flight status names, else the one its text suggests."""
+    found = _FRAMING.match(message.strip())
+    text = _lower(_strip(message))
+    if found is not None and (kind := _BY_FLIGHT.get(found.group(1))) is not None:
+        return kind(text)
     return _by_text(text)
 
 
 def _strip(message: str) -> str:
     """Drops Arrow and Flight framing and gRPC detail from a message."""
-    text = message.strip()
-    for prefix in ("Flight returned invalid argument error: ", "Flight returned "):
-        text = text.removeprefix(prefix)
+    text = _FRAMING.sub("", message.strip(), count=1)
+    text = text.removeprefix("Flight returned ")
     for marker in (". Detail:", ". gRPC client debug context:", "Detail: "):
         cut = text.find(marker)
         if cut > 0:

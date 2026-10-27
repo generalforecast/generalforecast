@@ -163,3 +163,12 @@ def test_controls_carry_tables_and_tiers_changes_in_one_frame() -> None:
     }
     with pytest.raises(ValueError, match="must be controls"):
         protocol.request({"kind": "controls", "requests": [{"kind": "record"}]}, [])
+
+
+def test_progress_replies_carry_the_warm_up_count_only_when_given() -> None:
+    assert protocol.reply(protocol.Progress()) == {"kind": "progress"}
+    assert protocol.reply(protocol.Progress(3, 12)) == {
+        "kind": "progress",
+        "done": 3,
+        "total": 12,
+    }
