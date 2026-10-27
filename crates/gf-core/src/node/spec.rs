@@ -170,25 +170,6 @@ impl Targets {
         }
     }
 
-    /// The targets `keep` marks.
-    pub(super) fn picked(&self, keep: &[bool]) -> Self {
-        let kept = |index: usize| keep[index];
-        match self {
-            Self::Classes(labels) => Self::Classes(
-                (0..labels.len())
-                    .filter(|&i| kept(i))
-                    .map(|i| labels[i])
-                    .collect(),
-            ),
-            Self::Values(values) => Self::Values(
-                (0..values.len())
-                    .filter(|&i| kept(i))
-                    .map(|i| values[i])
-                    .collect(),
-            ),
-        }
-    }
-
     /// Whether each target is known: a class from 0, or a finite value.
     pub(super) fn labeled(&self) -> Vec<bool> {
         match self {
@@ -459,6 +440,20 @@ pub struct TableSpec {
 pub const DEFAULT_FIT_ROWS: usize = 1 << 20;
 
 impl TableSpec {
+    /// The most rows a context of this table holds: the model's trained
+    /// length under `PastCap::Clamp`, or None for any number.
+    pub(super) fn clamp(&self) -> Option<u64> {
+        match (self.past_cap, self.context_rows) {
+            (PastCap::Clamp, Some(rows)) => Some(rows.get()),
+            _ => None,
+        }
+    }
+
+    /// `strategy` cut to the contexts `clamp` allows.
+    pub(super) fn clamped(&self, strategy: Strategy) -> Strategy {
+        self.clamp().map_or(strategy, |rows| strategy.capped(rows))
+    }
+
     /// The values of each row the model reads.
     #[must_use]
     pub fn model_features(&self) -> usize {

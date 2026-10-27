@@ -292,12 +292,9 @@ impl Node {
             // here, never drawn smaller than the table asked.
             series.check_fit(spec.features)?;
         }
-        let spec = match (spec.past_cap, spec.context_rows) {
-            (PastCap::Clamp, Some(rows)) => TableSpec {
-                strategy: spec.strategy.capped(rows.get()),
-                ..spec
-            },
-            _ => spec,
+        let spec = TableSpec {
+            strategy: spec.clamped(spec.strategy),
+            ..spec
         };
         let series = spec
             .series

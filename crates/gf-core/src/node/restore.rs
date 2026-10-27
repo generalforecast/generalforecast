@@ -153,14 +153,7 @@ impl Node {
             .get(&table)
             .ok_or(NodeError::UnknownTable(table))?;
         let keys = state.rows.rows(rows)?.iter().map(|row| row.key).collect();
-        let times = rows.iter().map(|&row| state.times.time(row)).collect();
-        let (features, targets) = state.gather(rows)?;
-        Ok(TableRows {
-            keys,
-            features,
-            targets,
-            times,
-        })
+        state.table_rows(rows, keys)
     }
 
     /// Every live row of a table, in key order, with each row's time.
@@ -178,14 +171,7 @@ impl Node {
         keyed.sort_unstable();
         let rows: Vec<RowId> = keyed.iter().map(|&(_, row)| row).collect();
         let keys = keyed.into_iter().map(|(key, _)| key).collect();
-        let times = rows.iter().map(|&row| state.times.time(row)).collect();
-        let (features, targets) = state.gather(&rows)?;
-        Ok(TableRows {
-            keys,
-            features,
-            targets,
-            times,
-        })
+        state.table_rows(&rows, keys)
     }
 
     /// Every live row of a table in page order, with each row's id and page,
@@ -294,14 +280,15 @@ impl Node {
         layout: &RowLayout,
         table_layout: Option<&TableLayout>,
     ) -> Result<(), NodeError> {
-        let state = self
-            .tables
-            .get(&table)
-            .ok_or(NodeError::UnknownTable(table))?;
         let times: Vec<Option<i64>> = rows.times.clone();
-        state.check(&rows.keys, &rows.features, &rows.targets)?;
-        check_times(&rows.keys, Some(&times))?;
-        state.check_series(&rows.keys, Some(&times), true)?;
+        let state = self.checked_batch(
+            table,
+            &rows.keys,
+            &rows.features,
+            &rows.targets,
+            Some(&times),
+            true,
+        )?;
         if layout.ids.len() != rows.keys.len() || layout.pages.len() != rows.keys.len() {
             return Err(NodeError::Restore(
                 "a record's rows and layout differ in length",
@@ -327,10 +314,7 @@ impl Node {
             let state = self.state(table)?;
             state.begin_restore(layout.clone())?;
             if let Some(strategy) = layout.strategy {
-                let strategy = match (state.spec.past_cap, state.spec.context_rows) {
-                    (PastCap::Clamp, Some(rows)) => strategy.capped(rows.get()),
-                    _ => strategy,
-                };
+                let strategy = state.spec.clamped(strategy);
                 state.set_strategy(strategy);
             }
         }

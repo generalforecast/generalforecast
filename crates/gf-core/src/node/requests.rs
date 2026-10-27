@@ -197,10 +197,9 @@ impl Node {
             .tables
             .get(&table)
             .ok_or(NodeError::UnknownTable(table))?;
-        let cap = match (state.spec.past_cap, state.spec.context_rows) {
-            (PastCap::Clamp, Some(rows)) => usize::try_from(rows.get()).unwrap_or(usize::MAX),
-            _ => usize::MAX,
-        };
+        let cap = state.spec.clamp().map_or(usize::MAX, |rows| {
+            usize::try_from(rows).unwrap_or(usize::MAX)
+        });
         let given = contexts
             .iter()
             .map(|keys| {

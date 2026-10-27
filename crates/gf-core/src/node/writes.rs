@@ -132,15 +132,7 @@ impl Node {
         targets: Targets,
         times: Option<&[Option<i64>]>,
     ) -> Result<(), NodeError> {
-        check_times(keys, times)?;
-        if let Some(state) = self.tables.get(&table) {
-            state.check_series(keys, times, true)?;
-        }
-        let state = self
-            .tables
-            .get(&table)
-            .ok_or(NodeError::UnknownTable(table))?;
-        state.check(keys, features, &targets)?;
+        let state = self.checked_batch(table, keys, features, &targets, times, true)?;
         let width = state.spec.features;
         let wanted: HashSet<u128> = keys.iter().copied().collect();
         let (mut updates, mut inserts) = (Vec::new(), Vec::new());
@@ -247,6 +239,28 @@ impl Node {
             .collect())
     }
 
+    /// The table a batch writes to, once the batch's shape, keys, targets
+    /// and times are checked against it; with `replacing`, a time a series
+    /// already holds may be written over, as an update or upsert does.
+    pub(super) fn checked_batch(
+        &self,
+        table: TableId,
+        keys: &[u128],
+        features: &[f32],
+        targets: &Targets,
+        times: Option<&[Option<i64>]>,
+        replacing: bool,
+    ) -> Result<&TableState, NodeError> {
+        check_times(keys, times)?;
+        let state = self
+            .tables
+            .get(&table)
+            .ok_or(NodeError::UnknownTable(table))?;
+        state.check(keys, features, targets)?;
+        state.check_series(keys, times, replacing)?;
+        Ok(state)
+    }
+
     /// Checks an insert without applying it, so it can be logged before it is applied.
     ///
     /// # Errors
@@ -260,13 +274,7 @@ impl Node {
         targets: &Targets,
         times: Option<&[Option<i64>]>,
     ) -> Result<(), NodeError> {
-        check_times(keys, times)?;
-        let state = self
-            .tables
-            .get(&table)
-            .ok_or(NodeError::UnknownTable(table))?;
-        state.check(keys, features, targets)?;
-        state.check_series(keys, times, false)?;
+        let state = self.checked_batch(table, keys, features, targets, times, false)?;
         if let Some(&key) = keys
             .iter()
             .find(|&&key| state.table.row(RowKey(key)).is_some())
@@ -292,13 +300,7 @@ impl Node {
         targets: &Targets,
         times: Option<&[Option<i64>]>,
     ) -> Result<(), NodeError> {
-        check_times(keys, times)?;
-        let state = self
-            .tables
-            .get(&table)
-            .ok_or(NodeError::UnknownTable(table))?;
-        state.check(keys, features, targets)?;
-        state.check_series(keys, times, true)?;
+        let state = self.checked_batch(table, keys, features, targets, times, true)?;
         match keys
             .iter()
             .find(|&&key| state.table.row(RowKey(key)).is_none())
@@ -321,13 +323,7 @@ impl Node {
         targets: &Targets,
         times: Option<&[Option<i64>]>,
     ) -> Result<(), NodeError> {
-        check_times(keys, times)?;
-        let state = self
-            .tables
-            .get(&table)
-            .ok_or(NodeError::UnknownTable(table))?;
-        state.check(keys, features, targets)?;
-        state.check_series(keys, times, true)?;
+        let state = self.checked_batch(table, keys, features, targets, times, true)?;
         let new = keys
             .iter()
             .filter(|&&key| state.table.row(RowKey(key)).is_none())
@@ -414,19 +410,14 @@ impl Node {
         let paged = state.spec.series.is_none();
         if paged && state.standardizer.is_none() {
             // Labeled rows set the scaling, unless the batch has none.
-            let fit: Vec<f32> = features
-                .chunks(width)
-                .zip(&labeled)
-                .filter(|&(_, &labeled)| labeled)
-                .flat_map(|(row, _)| row)
-                .copied()
-                .collect();
+            let at: Vec<usize> = (0..keys.len()).filter(|&row| labeled[row]).collect();
             // Labeled rows it was fit on, so the first labeled ones fit it again.
-            state.scaled_rows = (fit.len() / width) as u64;
-            let standardizer = if fit.is_empty() {
+            state.scaled_rows = at.len() as u64;
+            let standardizer = if at.is_empty() {
                 Standardizer::fit(features, targets, &state.spec)
             } else {
-                Standardizer::fit(&fit, &targets.picked(&labeled), &state.spec)
+                let fit = Picked::new(keys, features, width, targets, None, &at);
+                Standardizer::fit(&fit.features, &fit.targets, &state.spec)
             };
             state.standardizer = Some(standardizer);
         }

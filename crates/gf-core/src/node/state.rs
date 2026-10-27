@@ -550,6 +550,22 @@ impl TableState {
         Ok((features, Targets::from_bits(self.spec.task, &bits)))
     }
 
+    /// Rows in the order given, whose keys are `keys`, with their features,
+    /// targets and times.
+    pub(super) fn table_rows(
+        &self,
+        rows: &[RowId],
+        keys: Vec<u128>,
+    ) -> Result<TableRows, NodeError> {
+        let (features, targets) = self.gather(rows)?;
+        Ok(TableRows {
+            keys,
+            features,
+            targets,
+            times: rows.iter().map(|&row| self.times.time(row)).collect(),
+        })
+    }
+
     /// As `gather`, with only the features the model reads.
     pub(super) fn inputs(&self, rows: &[RowId]) -> Result<(Vec<f32>, Targets), NodeError> {
         let (features, targets) = self.gather(rows)?;

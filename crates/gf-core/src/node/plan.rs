@@ -591,10 +591,7 @@ impl Node {
     pub fn set_strategy(&mut self, table: TableId, strategy: Strategy) -> Result<(), NodeError> {
         strategy.check()?;
         let state = self.state(table)?;
-        let strategy = match (state.spec.past_cap, state.spec.context_rows) {
-            (PastCap::Clamp, Some(rows)) => strategy.capped(rows.get()),
-            _ => strategy,
-        };
+        let strategy = state.spec.clamped(strategy);
         state.set_strategy(strategy);
         Ok(())
     }
