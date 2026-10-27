@@ -206,6 +206,9 @@ fn declared_call(
         }
     };
     let inputs: Vec<&str> = match &predictor.forecast {
+        // A lock checked without rows holds no schema to read the columns
+        // from; the request's own context shows them.
+        Some(forecast) if predictor.schema_free() => forecast.query_columns(),
         Some(forecast) => {
             let queried = forecast.query_columns();
             predictor
@@ -226,8 +229,18 @@ fn declared_call(
     }))
 }
 
+/// Refuses `as_of` for a context that is not live: only a live source's
+/// versions stand at different times.
+fn not_live(predictor: &str, context: &str) -> ApiError {
+    ApiError::validation(format!(
+        "as_of selects a live context's version; predictor {predictor}'s context is a {context} one"
+    ))
+    .param(as_of::FIELD)
+}
+
 /// A predictor served here from its lock: a snapshot predictor's rows are
-/// bound at startup, so its body brings none.
+/// bound at startup, so its body brings none. Its context is never live, so
+/// it takes no `as_of`.
 async fn predictor_predict(
     front: &Front,
     served: &ServedModel,
@@ -235,6 +248,9 @@ async fn predictor_predict(
     payload: &Value,
     charge: Charge,
 ) -> Result<Value, ApiError> {
+    if AsOf::parse(payload.get(as_of::FIELD))?.is_some() {
+        return Err(not_live(&served.name, predictor.context.kind()));
+    }
     let call = declared_call(predictor, payload, || Ok(json!([])))?;
     served_predict(front, served, predictor, &call, charge).await
 }
@@ -439,9 +455,7 @@ pub(super) async fn adhoc_predict_with(
     Ok(prediction_result(
         &served.resolved,
         task,
-        "request",
-        None,
-        parsed.usable_rows(),
+        &Used::request(parsed.usable_rows()),
         predictions,
     ))
 }
@@ -540,23 +554,87 @@ fn projected(
         .collect()
 }
 
-/// The shared `PredictionResult` wire value, with the context rows used.
-fn prediction_result(
-    model: &str,
-    task: &str,
-    source: &str,
-    version: Option<&str>,
+/// The context a prediction used, as every reply reports it: where it came
+/// from (`snapshot`, `live` or `request`), the live source's name, the
+/// context's version and digest where it has them, the rows it held, and
+/// the time it stands as of. gf serve and the hosted runtime report it
+/// alike; a field a context has no value for is null.
+pub(super) struct Used {
+    source: &'static str,
+    name: Option<String>,
+    version: Option<i64>,
+    digest: Option<String>,
     rows: usize,
-    predictions: Vec<Value>,
-) -> Value {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs_f64();
+    as_of: Option<AsOf>,
+}
+
+impl Used {
+    /// The context a request brought.
+    fn request(rows: usize) -> Self {
+        Self {
+            source: "request",
+            name: None,
+            version: None,
+            digest: None,
+            rows,
+            as_of: None,
+        }
+    }
+
+    /// The rows a lock pins, by their digest.
+    fn snapshot(rows: usize, digest: Option<&str>) -> Self {
+        Self {
+            source: "snapshot",
+            digest: digest.map(str::to_string),
+            ..Self::request(rows)
+        }
+    }
+
+    /// The context a hosted revision was published with, as the control
+    /// plane describes it: its source as `ContextSource` reads it, then its
+    /// version, digest and as-of time. A legacy description gives its digest
+    /// as a textual `version`.
+    fn published(context: &Value, rows: usize) -> Self {
+        let source = ContextSource::of(context);
+        let kind = match source.as_ref().map(|source| source.kind) {
+            Some(SourceKind::Live) => "live",
+            _ => "snapshot",
+        };
+        let name = source
+            .and_then(|source| source.name)
+            .or_else(|| context["name"].as_str().map(str::to_string));
+        let digest = context["digest"]
+            .as_str()
+            .or_else(|| context["version"].as_str())
+            .map(str::to_string);
+        Self {
+            source: kind,
+            name,
+            version: context["version"].as_i64(),
+            digest,
+            rows,
+            as_of: AsOf::read(context.get(as_of::FIELD)),
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "source": self.source,
+            "name": self.name,
+            "version": self.version,
+            "digest": self.digest,
+            "rows": self.rows,
+            "as_of": AsOf::json(self.as_of),
+        })
+    }
+}
+
+/// The shared `PredictionResult` wire value, with the context it used.
+fn prediction_result(model: &str, task: &str, used: &Used, predictions: Vec<Value>) -> Value {
     json!({
         "model": model,
         "task": task,
-        "context": {"kind": source, "rows": rows, "digest": version, "as_of": now},
+        "context": used.json(),
         "predictions": predictions,
     })
 }
@@ -619,7 +697,7 @@ async fn served_predict(
         require(features == predictor.inputs, "inputs differ from lock")?;
         predictor.target.clone().unwrap_or_default()
     };
-    let (inferred, classes, rows, source, version) = match predictor.context {
+    let (inferred, classes, used) = match predictor.context {
         ContextMode::Snapshot => {
             if !context.is_empty() {
                 return Err(context_declared());
@@ -636,9 +714,7 @@ async fn served_predict(
             (
                 inferred,
                 bound.classes.clone(),
-                bound.rows,
-                "snapshot",
-                predictor.context_digest.as_deref(),
+                Used::snapshot(bound.rows, predictor.context_digest.as_deref()),
             )
         }
         ContextMode::Request => {
@@ -651,7 +727,7 @@ async fn served_predict(
                 "context exceeds the predictor's max_rows",
             )?;
             let schema = if schema_free {
-                predictors::inferred(&features, &target, context)
+                predictors::inferred(&features, &target, context, &predictor.types)?
             } else {
                 predictor.schema.clone()
             };
@@ -679,7 +755,7 @@ async fn served_predict(
                 .engine()?
                 .ask(context, Asked::Rows(encoded), &fingerprint)
                 .await?;
-            (inferred, bound.classes, bound.rows, "request", None)
+            (inferred, bound.classes, Used::request(bound.rows))
         }
     };
     drop(charge);
@@ -694,9 +770,7 @@ async fn served_predict(
     Ok(prediction_result(
         &served.resolved,
         &predictor.task,
-        source,
-        version,
-        rows,
+        &used,
         predictions,
     ))
 }
@@ -741,7 +815,7 @@ async fn series_predict(
         "target differs from lock",
     )?;
     let aligned;
-    let (bound, schema, source, version) = match predictor.context {
+    let (bound, schema, snapshot) = match predictor.context {
         ContextMode::Snapshot => {
             if !context.is_empty() {
                 return Err(context_declared());
@@ -751,12 +825,7 @@ async fn series_predict(
                 .get()
                 .and_then(|series| series.get(&served.name))
                 .ok_or_else(not_ready)?;
-            (
-                bound,
-                predictor.schema.clone(),
-                "snapshot",
-                predictor.context_digest.as_deref(),
-            )
+            (bound, predictor.schema.clone(), true)
         }
         ContextMode::Request => {
             require(
@@ -768,13 +837,25 @@ async fn series_predict(
                 "context exceeds the predictor's max_rows",
             )?;
             let schema = if predictor.schema_free() {
-                predictors::inferred(&forecast.context_columns(), target, context)
+                // A forecaster's times arrive as ISO text, which a lock that
+                // declares no kind for them still reads as times.
+                let mut types = predictor.types.clone();
+                let textual = context
+                    .iter()
+                    .filter_map(|row| row.get(&forecast.time))
+                    .all(Value::is_string);
+                if textual {
+                    types
+                        .entry(forecast.time.clone())
+                        .or_insert_with(|| "timestamp".to_string());
+                }
+                predictors::inferred(&forecast.context_columns(), target, context, &types)?
             } else {
                 predictor.schema.clone()
             };
             let rows = predictors::records(&schema.columns, context)?;
             aligned = front.bind_series(served, predictor, forecast, &rows, None)?;
-            (&aligned, schema, "request", None)
+            (&aligned, schema, false)
         }
     };
     let expected: Vec<&str> = schema
@@ -888,12 +969,15 @@ async fn series_predict(
         predictor.id.as_deref(),
         queried.positions.len(),
     );
+    let used = if snapshot {
+        Used::snapshot(bound.rows, predictor.context_digest.as_deref())
+    } else {
+        Used::request(bound.rows)
+    };
     Ok(prediction_result(
         &served.resolved,
         &predictor.task,
-        source,
-        version,
-        bound.rows,
+        &used,
         predictions,
     ))
 }
@@ -926,7 +1010,9 @@ fn bound_fingerprint(served: &ServedModel, bound: &predictor::Context) -> [u8; 3
 }
 
 /// A hosted predictor: the revision `environment` serves, loaded from the
-/// control plane on demand and predicted as a native predictor.
+/// control plane on demand and predicted as a native predictor. With
+/// `as_of`, a live context is the version that stood then, as the control
+/// plane keeps its history; any other context refuses it.
 async fn revision_predict(
     front: &Front,
     revisions: &Revisions,
@@ -936,14 +1022,28 @@ async fn revision_predict(
     payload: &Value,
     charge: Charge,
 ) -> Result<Value, ApiError> {
+    let as_of = AsOf::parse(payload.get(as_of::FIELD))?;
     let resolved = revisions.resolve(project, predictor, environment).await?;
     let revision = resolved.revision;
     let version = resolved.context_version.unwrap_or(Value::Null);
     let started = std::time::Instant::now();
     let scored = async {
-        let published = revisions
+        let mut published = revisions
             .load(project, predictor, revision, Some(&version))
             .await?;
+        if let Some(as_of) = as_of {
+            if !published.live() {
+                let Published::Native { served, .. } = &*published;
+                let kind = served
+                    .predictor
+                    .as_ref()
+                    .map_or("request", |predictor| predictor.context.kind());
+                return Err(not_live(predictor, kind));
+            }
+            published = revisions
+                .load_as_of(project, predictor, revision, as_of)
+                .await?;
+        }
         let Published::Native {
             served,
             context,
@@ -969,16 +1069,6 @@ async fn revision_predict(
         latency_seconds: started.elapsed().as_secs_f64(),
     });
     let mut result = scored?;
-    // The hosted result keeps the control plane's context shape: `source`
-    // and `version`, which its Python path and console read.
-    if let Some(context) = result["context"].as_object_mut() {
-        if let Some(kind) = context.remove("kind") {
-            context.insert("source".into(), kind);
-        }
-        if let Some(digest) = context.remove("digest") {
-            context.insert("version".into(), digest);
-        }
-    }
     result["predictor"] = json!(predictor);
     result["revision"] = json!(revision);
     result["environment"] = json!(environment);
@@ -1021,9 +1111,75 @@ async fn native_predict(
     if predictor.context == ContextMode::Snapshot
         && let Some(captured) = captured
     {
-        let rows = result["context"]["rows"].clone();
-        result["context"] = captured.clone();
-        result["context"]["rows"] = rows;
+        let rows = result["context"]["rows"].as_u64().unwrap_or_default();
+        let rows = usize::try_from(rows).unwrap_or(usize::MAX);
+        result["context"] = Used::published(captured, rows).json();
     }
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request-context forecaster whose lock was checked without rows,
+    /// so it holds no column kinds.
+    fn schema_free_forecaster() -> ServedPredictor {
+        serde_json::from_value(json!({
+            "schema": {"columns": [], "rows": null, "classes": null, "frequency": null},
+            "task": "forecast",
+            "target": "sales",
+            "inputs": ["promo"],
+            "id": null,
+            "context": "request",
+            "quantiles": [0.5],
+            "context_digest": null,
+            "lock_digest": "sha256:forecaster",
+            "snapshot": null,
+            "forecast": {
+                "series": ["store"],
+                "time": "day",
+                "horizon": 2,
+                "past_inputs": ["visits"],
+                "future_inputs": ["promo"],
+                "frequency": null,
+                "declared": null,
+            },
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_schema_free_forecasters_call_names_the_columns_its_context_gives() {
+        let predictor = schema_free_forecaster();
+        let forecast = predictor.forecast.as_ref().unwrap();
+        let context = json!([
+            {"store": "a", "day": "2026-10-01T00:00:00Z", "visits": 3, "promo": 0, "sales": 1.5},
+            {"store": "a", "day": "2026-10-02T00:00:00Z", "visits": 4, "promo": 1, "sales": 2.5},
+        ]);
+        let payload = json!({"queries": [{"store": "a", "day": "2026-10-03T00:00:00Z", "promo": 1}], "context": context});
+        let call = declared_call(&predictor, &payload, || Ok(json!([]))).unwrap();
+        let inputs: Vec<&str> = call["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect();
+        // What `series_predict` holds the call's inputs to, from the context.
+        let schema = predictors::inferred(
+            &forecast.context_columns(),
+            "sales",
+            context.as_array().unwrap(),
+            &predictor.types,
+        )
+        .unwrap();
+        let expected: Vec<&str> = schema
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .filter(|name| forecast.query_columns().contains(name))
+            .collect();
+        assert_eq!(inputs, expected);
+        assert_eq!(inputs, ["store", "day", "promo"]);
+    }
 }

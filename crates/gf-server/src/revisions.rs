@@ -9,6 +9,37 @@
 //! is held in a byte-budgeted LRU that also drops what sat idle; its rows
 //! bind through `gf_core::predictor` into the same ephemeral tables, under the
 //! same budget, as a request's own context.
+//!
+//! # The control plane's internal routes
+//!
+//! gf owns this contract; the control plane implements it. Every call
+//! carries `Authorization: Bearer <service token>`, and a refusal answers a
+//! 4xx with `{"error": {"code", "message", "param"?}}`, which gf-server
+//! passes on to its caller as it came; anything else is `ModelNotReady`.
+//!
+//! - `GET /internal/v1/projects/{project}/predictors/{predictor}/environments/{environment}:revision`
+//!   answers `{"revision": int, "context_version": any}`: the revision the
+//!   environment serves now, and the version of its context.
+//! - `GET /internal/v1/projects/{project}/predictors/{predictor}/revisions/{revision}:lock`
+//!   answers the revision's `Published` package: `served`, the predictor as
+//!   gf serve would serve it; `context`, its context as captured,
+//!   `{"source", "name", "version", "digest", "as_of"}` (a live source's
+//!   `source` may also be written `"live/<name>"`); and `rows`, the
+//!   context's rows, which a request-context predictor has none of.
+//! - The same route with `?as_of=<RFC 3339 UTC>`, such as
+//!   `?as_of=2026-10-27T08:00:00Z`, answers the package of a live-context
+//!   revision with its context as of that time: the rows and `version` of
+//!   the context version that stood then, and that version's `as_of`. A
+//!   time before the history the control plane keeps is refused with 422
+//!   `ValidationError` (param `as_of`), or 409 `Conflict` where that
+//!   version is gone; gf-server answers its caller the same. gf-server asks
+//!   it only for a revision whose context is live: a prediction with
+//!   `as_of` of any other context is refused with 422 `ValidationError`
+//!   (param `as_of`) before the control plane is asked.
+//! - `POST /internal/v1/predictions:record` takes `{"records": [...]}`, the
+//!   predictions gf-server answered, for the control plane's metrics.
+//!
+//! `as_of` is read and written as `crate::as_of` has it, in every direction.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -19,6 +50,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
+use crate::as_of::{self, AsOf};
 use crate::http::{ApiError, ServedModel};
 
 /// What a predictor's predict route names.
@@ -102,6 +134,20 @@ impl ContextSource {
             kind,
             name: name.filter(|name| !name.is_empty()).map(str::to_string),
         })
+    }
+}
+
+impl Published {
+    /// Whether the revision's context comes from a live source.
+    #[must_use]
+    pub fn live(&self) -> bool {
+        match self {
+            Self::Native {
+                context: Some(context),
+                ..
+            } => ContextSource::of(context).is_some_and(|source| source.kind == SourceKind::Live),
+            Self::Native { context: None, .. } => false,
+        }
     }
 }
 
@@ -322,11 +368,55 @@ impl Revisions {
         revision: u64,
         version: Option<&Value>,
     ) -> Result<std::sync::Arc<Published>, ApiError> {
+        let version = version.map(Value::to_string).unwrap_or_default();
+        self.package(project, predictor, revision, version, None)
+            .await
+    }
+
+    /// A live-context revision's package with its context as of `as_of`,
+    /// from the control plane's history; see the module's contract. A past
+    /// version never changes, so it is held until it sits idle or is evicted.
+    ///
+    /// # Errors
+    ///
+    /// The control plane's own refusal, such as a time before the history
+    /// it keeps, or `ModelNotReady`.
+    ///
+    /// # Panics
+    ///
+    /// If the cache's lock was poisoned.
+    pub async fn load_as_of(
+        &self,
+        project: &str,
+        predictor: &str,
+        revision: u64,
+        as_of: AsOf,
+    ) -> Result<std::sync::Arc<Published>, ApiError> {
+        let at = as_of.rfc3339();
+        self.package(
+            project,
+            predictor,
+            revision,
+            format!("{}={at}", as_of::FIELD),
+            Some(at),
+        )
+        .await
+    }
+
+    /// The package held under `version`, or fetched: as of `at` if given.
+    async fn package(
+        &self,
+        project: &str,
+        predictor: &str,
+        revision: u64,
+        version: String,
+        at: Option<String>,
+    ) -> Result<std::sync::Arc<Published>, ApiError> {
         let key = (
             project.to_string(),
             predictor.to_string(),
             revision,
-            version.map(Value::to_string).unwrap_or_default(),
+            version,
         );
         if let Some(published) = self
             .cache
@@ -336,21 +426,19 @@ impl Revisions {
         {
             return Ok(published);
         }
-        let (published, bytes): (Published, usize) = self
-            .fetch(&format!(
-                "/internal/v1/projects/{project}/predictors/{predictor}/revisions/{revision}:lock"
-            ))
-            .await?;
+        let mut path = format!(
+            "/internal/v1/projects/{project}/predictors/{predictor}/revisions/{revision}:lock"
+        );
+        if let Some(at) = &at {
+            path.push_str(&format!("?{}={at}", as_of::FIELD));
+        }
+        let (published, bytes): (Published, usize) = self.fetch(&path).await?;
         self.loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let now = Instant::now();
-        let live = match &published {
-            Published::Native {
-                context: Some(context),
-                ..
-            } => ContextSource::of(context).is_some_and(|source| source.kind == SourceKind::Live),
-            Published::Native { context: None, .. } => false,
-        };
+        // A live source's rows move under one version, unless they are the
+        // ones that stood at a past time.
+        let live = at.is_none() && published.live();
         let published = std::sync::Arc::new(published);
         self.cache.lock().expect("revision cache").insert(
             key,
@@ -412,7 +500,11 @@ impl Revisions {
             let error = &refused["error"];
             return match (error["code"].as_str(), error["message"].as_str()) {
                 (Some(code), Some(message)) if (400..600).contains(&status) && status != 401 => {
-                    Err(ApiError::new(code, message, status))
+                    let refused = ApiError::new(code, message, status);
+                    Err(match error["param"].as_str() {
+                        Some(param) => refused.param(param),
+                        None => refused,
+                    })
                 }
                 _ => {
                     tracing::warn!(status, "control plane refused gf-server");

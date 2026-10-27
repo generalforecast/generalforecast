@@ -4,6 +4,7 @@
 //! generalforecast's server: an Arrow Flight API over nodes, with a write-ahead log and Python workers.
 
 pub mod action;
+pub mod as_of;
 pub mod auth;
 pub mod budget;
 pub mod config;
