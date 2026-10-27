@@ -12,6 +12,8 @@ from generalforecast.models.prepare import (
     Columns,
     constant_columns,
     kept_first,
+    masked_mean,
+    masked_moments,
     valid_rows,
 )
 
@@ -45,10 +47,6 @@ class TabPFNSnapshot(NamedTuple):
     ranks: RankBuckets | None = None
 
 
-def _sum(values: Array, mask: Array) -> Array:
-    return jnp.sum(jnp.where(mask, values, 0), axis=0)
-
-
 def fit_snapshot(
     features: Float[Array, " rows features"],
     targets: Float[Array, " rows"] | None = None,
@@ -68,20 +66,15 @@ def fit_snapshot(
         The snapshot.
     """
     valid = valid_rows(features.shape[0], num_rows)
-    count = jnp.sum(valid).astype(features.dtype)
-    finite = valid[:, None] & jnp.isfinite(features)
-    finite_count = jnp.sum(finite, axis=0).astype(features.dtype)
-    finite_mean = _sum(features, finite) / jnp.maximum(finite_count, 1)
+    count = jnp.sum(valid)
+    finite_mean = masked_mean(features, valid[:, None] & jnp.isfinite(features))
     filled = jnp.where(jnp.isfinite(features), features, finite_mean)
-    center = _sum(filled, valid[:, None]) / jnp.maximum(count, 1)
-    variance = _sum((filled - center) ** 2, valid[:, None]) / jnp.maximum(count - 1, 1)
-    deviation = jnp.sqrt(variance)
+    center, deviation = masked_moments(filled, valid[:, None], ddof=1)
     scale = jnp.where((deviation == 0) | (count == 1), 1, deviation)
     target_center = target_scale = None
     if targets is not None:
-        target_center = _sum(targets, valid) / jnp.maximum(count, 1)
-        spread = _sum((targets - target_center) ** 2, valid) / jnp.maximum(count, 1)
-        target_scale = jnp.sqrt(spread) + 1e-20
+        target_center, target_deviation = masked_moments(targets, valid)
+        target_scale = target_deviation + 1e-20
     ranks = None
     if rank_buckets is not None:
         filled = jnp.where(jnp.isfinite(features), features, center)
