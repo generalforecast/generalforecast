@@ -5,12 +5,13 @@
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from generalforecast.models.conformance import group
-from generalforecast.models.series import KNOWN
+from generalforecast.models.conformance import group, paged_series
+from generalforecast.models.series import KNOWN, TARGET, SeriesGroup
 from generalforecast.models.timesfm3.checkpoint import (
     check_supported,
     timesfm_from_state,
@@ -106,3 +107,29 @@ def test_a_grid_without_a_median_is_refused_at_load() -> None:
 
     with pytest.raises(NotImplementedError, match="must hold the median"):
         timesfm_from_state(state, {**settings, "quantiles": levels})
+
+
+def test_a_cache_read_back_padded_decodes_as_the_cache_encode_made() -> None:
+    model = tiny_timesfm()
+    steps = 10 * PATCH
+    time = np.arange(steps)
+    noise = np.random.default_rng(0).normal(size=(2, steps))
+    # Trending rows, so the trend's time scale counts the real patches only.
+    values = np.stack([5 + 0.5 * time, 2 - 0.2 * time]) + 0.2 * noise
+    data = SeriesGroup(
+        jnp.asarray(values, jnp.float32),
+        jnp.ones((2, steps), bool),
+        jnp.asarray([TARGET, TARGET], jnp.int32),
+    )
+    cache = encode(model, data)
+    assert bool(cache.trend.applies.all())
+    # The patches pad to a bucket of 16, as the worker stores them.
+    grows = [leaf.ndim > 0 and leaf.shape[0] == 10 for leaf in jax.tree.leaves(cache)]
+    paged = paged_series(cache, grows, 6)
+
+    np.testing.assert_allclose(
+        timesfm_functions.decode(model, paged, 3 * PATCH),
+        timesfm_functions.decode(model, cache, 3 * PATCH),
+        rtol=1e-6,
+        atol=1e-6,
+    )

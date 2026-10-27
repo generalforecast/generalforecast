@@ -37,6 +37,8 @@ from generalforecast.models.series import (
     SeriesProperties,
     median_index,
     padded_horizon,
+    real_patches,
+    rows_first,
 )
 from generalforecast.nn.attention import (
     AttentionCache,
@@ -535,16 +537,6 @@ def _rows(model: Timestral, group: SeriesGroup, horizon: int) -> Rows:
     )
 
 
-def _length(cache: TimestralCache) -> Int[Array, ""] | None:
-    """How many of a cache's patches are real, from its attention caches' lengths; None when all are."""
-    return cache.time[0].length if cache.time else None
-
-
-def _along_rows(leaf: Array) -> Array:
-    """A stored attention cache leaf with rows first, as attention along time reads it; a cache's scalar length stays as it is."""
-    return leaf.swapaxes(0, 1) if leaf.ndim > 1 else leaf
-
-
 def _first(observed: Bool[Array, " rows time"], patch: int) -> Int[Array, ""]:
     """The first patch any row observes, or 0 when none does."""
     patches = observed.reshape(observed.shape[0], -1, patch).any(axis=(0, 2))
@@ -767,7 +759,7 @@ def _grow(
     earlier = 0 if cache is None else cache.valid.shape[0]
     # A cache read back from the runtime's slots holds its real patches
     # first, then padding, and says how many are real.
-    real = None if cache is None else _length(cache)
+    real = None if cache is None else real_patches(cache.time)
     if real is None and (earlier + patches) * model.patch > model.context_limit:
         raise ValueError(
             f"a context of {(earlier + patches) * model.patch} steps passes the "
@@ -796,7 +788,7 @@ def _grow(
             ],
             -1,
         )
-        prefix = tuple(jax.tree.map(_along_rows, layer) for layer in cache.time)
+        prefix = rows_first(cache.time)
     positions = held + jnp.arange(patches) - first
     _, caches = _transform(
         model, tokens, positions, time_mask, _variate_mask(data, valid.T), prefix
@@ -924,7 +916,7 @@ def decode(
     while done < horizon:
         patches = min(model.block_size, -(-(horizon - done) // model.patch))
         context = cache.valid.shape[0]
-        real = _length(cache)
+        real = real_patches(cache.time)
         tokens = jnp.broadcast_to(model.query, (rows, patches, model.query.shape[0]))
         own = _causal(patches, patches) | jnp.eye(patches, dtype=bool)
         time_mask = jnp.concatenate(
@@ -936,7 +928,7 @@ def decode(
         )
         held = context if real is None else real
         positions = held + jnp.arange(patches) - cache.first
-        prefix = tuple(jax.tree.map(_along_rows, layer) for layer in cache.time)
+        prefix = rows_first(cache.time)
         slots = jnp.ones((patches, rows), bool)
         outputs, _ = _transform(
             model,

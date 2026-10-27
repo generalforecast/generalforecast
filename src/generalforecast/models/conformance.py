@@ -487,7 +487,8 @@ def check_series(
     rows past `num_rows` and unobserved steps before the real ones, garbage
     and NaN included, reach no real row; that groups batch with `jax.vmap`;
     that it jits; and, for a reusable model, that decoding its context cache
-    forecasts as `forecast` does.
+    forecasts as `forecast` does, read back padded past its real patches as
+    the runtime reads it too.
 
     Args:
         functions: The model's contract calls.
@@ -547,6 +548,38 @@ def _long_horizon(properties: SeriesProperties) -> int:
     if properties.pass_limit is None:
         return 3 * properties.output_patch
     return properties.pass_limit + properties.output_patch
+
+
+def paged_series(cache: Any, grows: list[bool], extra: int) -> Any:
+    """A forecaster's cache as the runtime reads it back from its slots.
+
+    Args:
+        cache: The cache, its leaves in `jax.tree.leaves` order.
+        grows: Which leaves have the patches on their first axis.
+        extra: Zero patches to pad those leaves with.
+
+    Returns:
+        The padded cache, each attention cache's length its real patches.
+    """
+    leaves, treedef = jax.tree.flatten(cache)
+    real = next(
+        leaf.shape[0] for leaf, grown in zip(leaves, grows, strict=True) if grown
+    )
+    padded = [
+        jnp.concatenate([leaf, jnp.zeros((extra, *leaf.shape[1:]), leaf.dtype)])
+        if grown
+        else leaf
+        for leaf, grown in zip(leaves, grows, strict=True)
+    ]
+    return jax.tree.map(
+        lambda layer: (
+            layer._replace(length=jnp.int32(real))
+            if isinstance(layer, AttentionCache)
+            else layer
+        ),
+        jax.tree.unflatten(treedef, padded),
+        is_leaf=lambda node: isinstance(node, AttentionCache),
+    )
 
 
 def _series_padding(functions, model, properties, tolerance):
@@ -625,6 +658,19 @@ def _series_reuse(functions, model, properties, tolerance):
     close(
         functions.decode(model, cache, horizon),
         functions.forecast(model, data, horizon),
+        tolerance,
+    )
+    # As the runtime reads a cache back from its slots: padded past its real
+    # patches with zeros, its attention caches saying how many are real.
+    grows = [
+        leaf.ndim > 0 and grown.shape[0] == leaf.shape[0] + 1
+        for leaf, grown in zip(
+            jax.tree.leaves(cache), jax.tree.leaves(longer), strict=True
+        )
+    ]
+    close(
+        functions.decode(model, paged_series(cache, grows, 3), horizon),
+        functions.decode(model, cache, horizon),
         tolerance,
     )
     # Under a trace, roles cannot be checked, so a known row must poison the

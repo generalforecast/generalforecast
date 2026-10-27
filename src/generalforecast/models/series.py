@@ -16,8 +16,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol
 
+import jax
 import jax.numpy as jnp
 from jax import Array
+from jaxtyping import Int
+
+from generalforecast.nn.attention import AttentionCache
 
 # The roles of a group's rows: the series forecast, a covariate known only
 # in the past, and a covariate known over the horizon too.
@@ -192,6 +196,33 @@ def median_index(levels: Sequence[float]) -> int:
     if 0.5 not in levels:
         raise ValueError(f"the quantile levels {tuple(levels)} have no median, 0.5")
     return list(levels).index(0.5)
+
+
+def real_patches(layers: Sequence[AttentionCache]) -> Int[Array, ""] | None:
+    """How many of a context cache's patches are real, from its attention caches' lengths.
+
+    A cache the runtime reads back from its slots holds its real patches
+    first and zeros after, and says how many are real; one from `encode` or
+    `extend` holds only real patches and says nothing.
+
+    Args:
+        layers: The cache's attention caches along time, patches first.
+
+    Returns:
+        The count, or None when every patch is real.
+    """
+    return layers[0].length if layers else None
+
+
+def rows_first(layers: Sequence[AttentionCache]) -> tuple[AttentionCache, ...]:
+    """Attention caches stored patches first, with rows first as attention along time reads them.
+
+    A scalar length stays as it is.
+    """
+    return tuple(
+        jax.tree.map(lambda leaf: leaf.swapaxes(0, 1) if leaf.ndim > 1 else leaf, layer)
+        for layer in layers
+    )
 
 
 def padded_horizon(values: Array, steps: int, fill: float | bool) -> Array:

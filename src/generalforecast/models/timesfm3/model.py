@@ -38,6 +38,8 @@ from generalforecast.models.series import (
     SeriesProperties,
     median_index,
     padded_horizon,
+    real_patches,
+    rows_first,
 )
 from generalforecast.nn.attention import (
     AttentionCache,
@@ -166,6 +168,10 @@ class TimesFMCache:
             covariate, whose cache would forecast wrongly.
         roles: Each row's role.
         real: Which rows are real.
+
+    A cache the runtime reads back from its slots may carry `length` on
+    its attention caches: how many patches are real, which come first; the
+    rest are zeros, which `decode` reads as no keys.
     """
 
     sequence: tuple[AttentionCache, ...]
@@ -176,11 +182,6 @@ class TimesFMCache:
     last: Float[Array, " rows outputs"]
     roles: Int[Array, " rows"]
     real: Bool[Array, " rows"]
-
-
-def _along_rows(leaf: Array) -> Array:
-    """A stored attention cache leaf with rows first, as attention along time reads it; a cache's scalar length stays as it is."""
-    return leaf.swapaxes(0, 1) if leaf.ndim > 1 else leaf
 
 
 def _dtype(model: TimesFM) -> jnp.dtype:
@@ -531,7 +532,7 @@ def _finish(
     outputs: Float[Array, " rows patches outputs"],
     frames: Moments,
     trend: Trend,
-    context: int,
+    context: int | Int[Array, ""],
     horizon: int,
 ) -> Float[Array, " rows horizon quantiles"]:
     """Predictions on the original scale from the last context patch's outputs on.
@@ -693,6 +694,11 @@ def decode(
     """
     del future, future_observed
     context, rows = cache.visible.shape
+    # A cache read back from the runtime's slots holds its real patches
+    # first, then padding, and says how many are real.
+    real = real_patches(cache.sequence)
+    held = context if real is None else real
+    visible = cache.visible.T & (jnp.arange(context) < held)
     _, patches, _ = _sizes(model, horizon)
     blank = jnp.zeros((rows, patches * model.patch), jnp.float32)
     masked = jnp.ones((rows, patches * model.patch), bool)
@@ -702,7 +708,7 @@ def decode(
     tokens, _ = _embed(model, blank, masked, jnp.ones(rows, bool), unchanged)
     time_mask = jnp.concatenate(
         [
-            jnp.broadcast_to(cache.visible.T[:, None, :], (rows, patches, context)),
+            jnp.broadcast_to(visible[:, None, :], (rows, patches, context)),
             jnp.broadcast_to(
                 jnp.tril(jnp.ones((patches, patches), bool)), (rows, patches, patches)
             ),
@@ -712,8 +718,8 @@ def decode(
     # The horizon's tokens are keys for every real row, since no real row is
     # fully masked from its start.
     variate_mask = jnp.broadcast_to(cache.real[None, None, :], (patches, rows, rows))
-    prefix = tuple(jax.tree.map(_along_rows, layer) for layer in cache.sequence)
-    positions = context + jnp.arange(patches) - cache.first
+    prefix = rows_first(cache.sequence)
+    positions = held + jnp.arange(patches) - cache.first
     outputs, _ = _transform(model, tokens, positions, time_mask, variate_mask, prefix)
     raw = linear(model.head, outputs).astype(jnp.float32)
     refined = _refined(model, cache.moments, cache.last, raw)
@@ -723,7 +729,7 @@ def decode(
         refined,
     )
     outputs = jnp.concatenate([cache.last[:, None], raw], axis=1)
-    return _finish(model, outputs, frames, cache.trend, context, horizon)
+    return _finish(model, outputs, frames, cache.trend, held, horizon)
 
 
 def properties(model: TimesFM) -> SeriesProperties:
