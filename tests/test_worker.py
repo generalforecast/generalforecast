@@ -185,3 +185,50 @@ def test_a_drop_ends_the_page_embeds_a_table_has_not_compiled_yet() -> None:
         jax.monitoring.unregister_event_duration_listener(compile_event)
         jax.config.update("jax_enable_compilation_cache", True)
     assert compiled == []
+
+
+def test_a_measure_threads_share_runs_once_and_holds_up_no_other() -> None:
+    import threading
+
+    from generalforecast.worker.records import Memo
+
+    memo: Memo[str, int] = Memo()
+    started, release = threading.Event(), threading.Event()
+    measured: list[str] = []
+
+    def slow() -> int:
+        measured.append("slow")
+        started.set()
+        assert release.wait(10)
+        return 1
+
+    threads = [threading.Thread(target=memo.get, args=("slow", slow)) for _ in range(2)]
+    threads[0].start()
+    assert started.wait(10)
+    threads[1].start()
+    # Another key measures while the first is still measuring.
+    assert memo.get("fast", lambda: 2) == 2
+    release.set()
+    for thread in threads:
+        thread.join()
+
+    assert measured == ["slow"]
+    assert memo["slow"] == 1
+
+
+def test_a_measure_that_raises_is_taken_again() -> None:
+    from generalforecast.worker.records import Memo
+
+    memo: Memo[str, int] = Memo()
+    attempts: list[int] = []
+
+    def flaky() -> int:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise ValueError("no memory analysis yet")
+        return 3
+
+    with pytest.raises(ValueError):
+        memo.get("key", flaky)
+    assert memo.get("key", flaky) == 3
+    assert len(attempts) == 2

@@ -328,11 +328,13 @@ class Ahead:
             return False
         digest = hashlib.sha256(repr(key).encode()).hexdigest()[:16]
         name = f"{self.programs.drops}:{digest}"
-        if name in self._unpreparable:
-            return False
-        self.deferred[unit.table] = name
-        if name not in self._preparing:
+        with self._readying:
+            if name in self._unpreparable:
+                return False
+            start = name not in self._preparing
             self._preparing.add(name)
+        self.deferred[unit.table] = name
+        if start:
             self.programs.soon(lambda: self._prepare(unit, key, arguments, name))
         return True
 
@@ -359,9 +361,11 @@ class Ahead:
                 "next needs it compiles it",
                 error,
             )
-            self._unpreparable.add(name)
+            with self._readying:
+                self._unpreparable.add(name)
         finally:
-            self._preparing.discard(name)
+            with self._readying:
+                self._preparing.discard(name)
             if self.announce is not None:
                 self.announce([name])
 

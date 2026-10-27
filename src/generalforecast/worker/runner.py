@@ -12,6 +12,7 @@ runs as one vectorized call.
 """
 
 import dataclasses
+import threading
 import time
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -65,6 +66,7 @@ from generalforecast.worker.ahead import Ahead, _manifests
 from generalforecast.worker.calls import Calls, _item, _only_item, _stack_columns
 from generalforecast.worker.contexts import Contexts, _Page
 from generalforecast.worker.records import (
+    Memo,
     Step,
     _Model,
     _SeriesModel,
@@ -187,9 +189,11 @@ class Worker(Calls, Admission, Ahead, Contexts, Series):
         # The tables the running step defers, by the program they wait for.
         self.deferred: dict[int, str] = {}
         # Programs being readied beside steps, and those that failed to be,
-        # which the steps that need them compile and report.
+        # which the steps that need them compile and report; the step thread
+        # and the thread readying them share them under the lock.
         self._preparing: set[str] = set()
         self._unpreparable: set[str] = set()
+        self._readying = threading.Lock()
         # On an accelerator a program compiles for tens of seconds, so a
         # stacked count not yet compiled compiles on the side; see `Chunks.run`.
         self._on_side = self._stacks and compile_ahead
@@ -227,15 +231,16 @@ class Worker(Calls, Admission, Ahead, Contexts, Series):
         # The spec each model was loaded from, under which its kinds of call are recorded.
         self._specs: dict[int, str] = {}
         self._tables: dict[int, _Table] = {}
-        self._layouts: dict[tuple[int, int], CacheLayout] = {}
-        self._profiles: dict[tuple[int, int], MemoryProfile] = {}
-        self._decodes: dict[int, WorkingProfile] = {}
-        self._encodes: dict[
-            tuple[int, bool, tuple[int, int]], EncodeProfile | None
-        ] = {}
-        self._encode_bytes: dict[tuple[int, bool, int, int], int | None] = {}
-        self._fit_profiles: dict[tuple[int, int], FitProfile] = {}
-        self._checked: set[tuple[int, int, int]] = set()
+        # What each model measures by tracing or compiling, once per shape.
+        self._layouts: Memo[tuple[int, int], CacheLayout] = Memo()
+        self._profiles: Memo[tuple[int, int], MemoryProfile] = Memo()
+        self._decodes: Memo[int, WorkingProfile] = Memo()
+        self._encodes: Memo[tuple[int, bool, tuple[int, int]], EncodeProfile | None] = (
+            Memo()
+        )
+        self._encode_bytes: Memo[tuple[int, bool, int, int], int | None] = Memo()
+        self._fit_profiles: Memo[tuple[int, int], FitProfile] = Memo()
+        self._checked: Memo[tuple[int, int, int], bool] = Memo()
         self._disk_path = disk_path
         self._slots = (0, 0, 0)
         self._pools(0, 0, 0)
@@ -243,8 +248,8 @@ class Worker(Calls, Admission, Ahead, Contexts, Series):
         self._contexts: dict[CacheKey, Context] = {}
         # The leaves a series cache keeps beside its patches, by entry.
         self._fixed: dict[CacheKey, list[Any]] = {}
-        self._series_layouts: dict[tuple[int, int], CacheLayout] = {}
-        self._series_profiles: dict[int, SeriesBytes] = {}
+        self._series_layouts: Memo[tuple[int, int], CacheLayout] = Memo()
+        self._series_profiles: Memo[int, SeriesBytes] = Memo()
         self._pages: dict[CacheKey, _Page] = {}
         self.stats = WorkerStats()
         self.timers = timers
