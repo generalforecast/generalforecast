@@ -48,7 +48,9 @@ fn gpu_loads(work: &[Work], gpus: usize) -> Vec<f64> {
     g
 }
 
-fn imbalance(g: &[f64]) -> f64 {
+/// The busiest GPU's load over the mean of `loads`, one per GPU; 1 when
+/// nothing is loaded.
+pub fn imbalance(g: &[f64]) -> f64 {
     let mean = g.iter().sum::<f64>() / g.len() as f64;
     if mean <= 0.0 {
         1.0
@@ -70,6 +72,12 @@ fn argmin(g: &[f64]) -> usize {
 }
 
 /// One round over `current` with `loads` aligned to its slices.
+///
+/// With `min_slices_per_gpu` at `usize::MAX`, `max_copies` at 1 and no load
+/// naming a median, a round neither merges, splits nor copies: its slices are
+/// `current`'s, in order and with the same starts, each held by one GPU, and
+/// only who holds them changes. A caller whose slices are whole units, such as
+/// one table each, may zip them with what they stand for.
 ///
 /// # Panics
 ///
@@ -137,8 +145,9 @@ fn free(
         if work[i].load.median.is_some() || mean_gpu <= 0.0 {
             continue;
         }
-        let want = ((work[i].load.load / (p.copy_above * mean_gpu)).ceil() as usize)
-            .clamp(1, p.max_copies.min(gpus));
+        // A policy of no copies at all holds each slice once, as 1 does.
+        let most = p.max_copies.clamp(1, gpus);
+        let want = ((work[i].load.load / (p.copy_above * mean_gpu)).ceil() as usize).clamp(1, most);
         while work[i].slice.holders.len() < want {
             let mut g = gpu_loads(work, gpus);
             for &h in &work[i].slice.holders {
@@ -302,7 +311,9 @@ fn split(work: &mut Vec<Work>, gpus: usize, p: &Policy, out: &mut Rebalance) {
             .load
             .median
             .filter(|&m| m > w.slice.start && w.end.is_none_or(|e| m < e));
+        // A slice without load is never hot, however cold the rest are.
         if let Some(m) = inside
+            && w.load.load > 0.0
             && w.load.load >= p.hot_split * mean_slice
             && work.len() < p.max_slices_per_gpu.saturating_mul(gpus)
         {
@@ -466,6 +477,76 @@ mod tests {
             r.assignment.slices[4].holders,
             r.assignment.slices[3].holders
         );
+    }
+
+    #[test]
+    fn an_idle_table_splits_nothing() {
+        let a = Assignment::even(4, 2, false);
+        let l: Vec<SliceLoad> = (0..4)
+            .map(|i| SliceLoad {
+                load: 0.0,
+                rows: 10.0,
+                median: Some(a.slices[i].start + 1),
+            })
+            .collect();
+        let p = Policy {
+            min_slices_per_gpu: 1,
+            ..Policy::default()
+        };
+        let r = rebalance(&a, &l, 2, &p);
+        assert_eq!(r.splits, 0);
+        assert_eq!(r.assignment, a);
+    }
+
+    #[test]
+    fn no_copies_holds_each_slice_once() {
+        let a = Assignment::even(4, 4, false);
+        let p = Policy {
+            min_slices_per_gpu: 1,
+            max_copies: 0,
+            ..Policy::default()
+        };
+        let r = rebalance(&a, &loads(&[1.0, 1.0, 1.0, 9.0]), 4, &p);
+        assert_eq!(r.copies, 0);
+        assert!(r.assignment.slices.iter().all(|s| s.holders.len() == 1));
+    }
+
+    #[test]
+    fn a_moves_only_policy_keeps_every_slice() {
+        let a = Assignment {
+            generation: 0,
+            slices: (0..12)
+                .map(|i| Slice {
+                    start: i,
+                    holders: vec![(i % 3) as usize],
+                })
+                .collect(),
+        };
+        let l: Vec<SliceLoad> = (0..12)
+            .map(|i| SliceLoad {
+                load: if i % 3 == 0 { 8.0 } else { 0.5 },
+                rows: 1.0 + i as f64,
+                median: None,
+            })
+            .collect();
+        let p = Policy {
+            min_slices_per_gpu: usize::MAX,
+            max_copies: 1,
+            churn_budget: 1.0,
+            ..Policy::default()
+        };
+        let r = rebalance(&a, &l, 3, &p);
+        assert!(r.moves > 0);
+        let starts = |x: &Assignment| x.slices.iter().map(|s| s.start).collect::<Vec<_>>();
+        assert_eq!(starts(&r.assignment), starts(&a));
+        assert!(r.assignment.slices.iter().all(|s| s.holders.len() == 1));
+        assert_eq!(r.merges + r.splits + r.copies, 0);
+    }
+
+    #[test]
+    fn imbalance_is_the_busiest_over_the_mean() {
+        assert_eq!(imbalance(&[1.0, 3.0]), 1.5);
+        assert_eq!(imbalance(&[0.0, 0.0]), 1.0);
     }
 
     #[test]

@@ -61,6 +61,9 @@ if TYPE_CHECKING:
 class ModelOutputError(ValueError):
     """A model returned outputs of another shape, or values no model of its task returns."""
 
+    # The model's fault, not the caller's: an `Internal` error at the boundary.
+    code = "ModelOutputError"
+
 
 @dataclass(frozen=True, eq=False)
 class Labeled:

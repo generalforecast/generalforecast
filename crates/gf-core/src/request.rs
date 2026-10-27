@@ -1229,6 +1229,14 @@ fn forecast(
                     .all(|position| (position - position.round_ties_even()).abs() < 1e-6),
                 "series times must align to step and origin",
             )?;
+            // Times closer than the alignment tolerance would share a step.
+            let mut steps = HashSet::new();
+            require(
+                positions
+                    .iter()
+                    .all(|position| steps.insert((position.round_ties_even() + 0.0).to_bits())),
+                "duplicate series time",
+            )?;
             if observed(points) == 0 {
                 return Err(RequestError::empty(
                     "query group has no usable series observations",

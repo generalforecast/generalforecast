@@ -28,6 +28,7 @@ use std::num::NonZeroUsize;
 use std::ops::Index;
 
 use crate::context::Context;
+use crate::distance::{squared, squared32};
 use crate::rows::RowsError;
 use crate::table::{Keys, RowId};
 
@@ -52,6 +53,8 @@ pub enum IndexError {
     Unknown(RowId),
     /// A restored layout naming a page it does not hold, or leaving one out of every cell.
     UnknownPage(PageId),
+    /// A restored layout holding a page at or past the id it gives its next.
+    PageNumber(PageId),
     /// A row's values that could not be read to place it.
     Rows(RowsError),
 }
@@ -92,6 +95,11 @@ impl fmt::Display for IndexError {
                     page.0
                 )
             }
+            Self::PageNumber(page) => write!(
+                formatter,
+                "a restored layout holds page {} at or past its next page id",
+                page.0
+            ),
             Self::Rows(error) => error.fmt(formatter),
         }
     }
@@ -167,12 +175,7 @@ impl Page {
     /// Widens the radius by how far the centroid moved from `before`.
     fn moved(&mut self, before: Option<Vec<f64>>) {
         if let Some(before) = before {
-            let shift = before
-                .iter()
-                .zip(self.centroid())
-                .map(|(old, new)| (old - new).powi(2))
-                .sum::<f64>()
-                .sqrt();
+            let shift = squared(&before, &self.centroid()).sqrt();
             self.radius = slack(self.radius + shift);
         }
     }
@@ -372,33 +375,6 @@ pub struct IndexLayout {
 /// A distance bound widened a little, so rounding never leaves a point outside it.
 fn slack(distance: f64) -> f64 {
     distance * (1.0 + 1e-9) + 1e-9
-}
-
-/// The squared distance between two float32 points, eight lanes at a time.
-fn squared32(point: &[f32], vector: &[f32]) -> f32 {
-    let mut lanes = [0.0f32; 8];
-    let mut pairs = point.chunks_exact(8).zip(vector.chunks_exact(8));
-    for (left, right) in &mut pairs {
-        for lane in 0..8 {
-            let difference = left[lane] - right[lane];
-            lanes[lane] += difference * difference;
-        }
-    }
-    let whole = point.len() / 8 * 8;
-    let tail: f32 = point[whole..]
-        .iter()
-        .zip(&vector[whole..])
-        .map(|(left, right)| (left - right) * (left - right))
-        .sum();
-    lanes.iter().sum::<f32>() + tail
-}
-
-fn squared(point: &[f64], vector: &[f32]) -> f64 {
-    point
-        .iter()
-        .zip(vector)
-        .map(|(coordinate, &value)| (coordinate - f64::from(value)).powi(2))
-        .sum()
 }
 
 /// A step of a best-first search: a cell to open, or a page to yield.
@@ -650,8 +626,9 @@ impl PageIndex {
     ///
     /// # Errors
     ///
-    /// If a row is in two pages, a page's sum has the wrong length, or the
-    /// layout names a page it does not hold.
+    /// If a row is in two pages, a page's sum has the wrong length, the
+    /// layout names a page it does not hold, or a page's id is not below the
+    /// layout's next.
     pub fn restore(
         dimensions: NonZeroUsize,
         page_size: NonZeroUsize,
@@ -700,6 +677,10 @@ impl PageIndex {
         }
         if let Some(&page) = index.ids.iter().find(|id| !index.cell_of.contains_key(id)) {
             return Err(IndexError::UnknownPage(page));
+        }
+        // New pages take ids from `next_page` on, so no page may hold one.
+        if let Some(&page) = index.ids.last().filter(|page| page.0 >= layout.next_page) {
+            return Err(IndexError::PageNumber(page));
         }
         index.next_page = layout.next_page;
         index.reach = layout.reach;
@@ -826,13 +807,7 @@ impl PageIndex {
                 cell
             }
         };
-        let distance = self.cells[cell]
-            .center
-            .iter()
-            .zip(&centroid)
-            .map(|(a, b)| (a - b).powi(2))
-            .sum::<f64>()
-            .sqrt();
+        let distance = squared(&self.cells[cell].center, &centroid).sqrt();
         // A little slack, so rounding never leaves a centroid outside its bound.
         let page_radius = self.pages[&id].radius;
         let reach = &mut self.cells[cell].reach;
@@ -1052,12 +1027,7 @@ impl PageIndex {
                         if !allowed.contains(row) {
                             continue;
                         }
-                        let distance = vectors
-                            .vector(row)?
-                            .iter()
-                            .zip(query)
-                            .map(|(&value, &target)| (f64::from(value) - f64::from(target)).powi(2))
-                            .sum();
+                        let distance = squared(&vectors.vector(row)?, query);
                         best.push(Near(distance, keys.key(row), row));
                         if best.len() > count {
                             best.pop();

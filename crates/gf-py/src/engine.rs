@@ -72,6 +72,8 @@ pub struct Engine {
 pub struct BoundTable {
     table: TableName,
     fingerprint: [u8; 32],
+    /// The values in each of its rows, which every query has too.
+    width: usize,
     levels: Option<Vec<f64>>,
 }
 
@@ -370,6 +372,7 @@ impl Engine {
         Ok(BoundTable {
             table,
             fingerprint,
+            width,
             levels,
         })
     }
@@ -382,7 +385,15 @@ impl Engine {
         features: PyReadonlyArray2<'_, f32>,
     ) -> PyResult<(Py<PyAny>, Option<Vec<f64>>)> {
         let running = self.running()?;
-        let (features, _, _) = rows(&features);
+        // Queries are read in rows of the table's width, so another width
+        // would score other rows than the caller shaped.
+        let (features, queries, width) = rows(&features);
+        if queries > 0 && width != bound.width {
+            return Err(PyValueError::new_err(format!(
+                "queries are rows of {width} values, and the bound table's rows are {}",
+                bound.width
+            )));
+        }
         let inferred = py
             .detach(|| {
                 running.runtime.block_on(running.engine.predict_bound(

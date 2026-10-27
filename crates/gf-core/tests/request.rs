@@ -417,6 +417,27 @@ fn forecasts_are_refused_as_the_models_api_refuses_them() {
 }
 
 #[test]
+fn seconds_closer_than_the_alignment_tolerance_are_one_time() {
+    let mut value = forecast();
+    for row in value["context"].as_array_mut().unwrap() {
+        let time = row["time"].as_f64().unwrap();
+        row["time"] = json!(time);
+    }
+    for query in value["queries"].as_array_mut().unwrap() {
+        query["origin"] = json!(3.0);
+    }
+    value["options"]["series"]["step"] = json!(1.0);
+    assert!(parse(&value).is_ok());
+
+    // Within a millionth of a step of another, a time would share its step.
+    let mut near = value["context"][1].clone();
+    near["key"] = json!("a-near");
+    near["time"] = json!(1.000_000_000_1);
+    value["context"].as_array_mut().unwrap().push(near);
+    assert_eq!(refusal(&value), invalid("duplicate series time"));
+}
+
+#[test]
 fn package_contexts_take_loaded_levels_and_skip_request_bounds() {
     let mut value = forecast();
     value["model"] = json!("general-forecast/timesfm-3");

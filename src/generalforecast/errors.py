@@ -3,17 +3,171 @@
 
 """The errors every General Forecast surface raises, shaped as the CLI prints them.
 
-One hierarchy for the SDK, the CLI and the engine boundary. The HTTP error
-object (section 5 of the interface contract) maps onto the same fields, so a
-server reply and a local mistake render identically.
+One hierarchy for the SDK, the clients, the CLI, the engine boundary and the
+services. Every error is an `Error` of one category: `InvalidInput`,
+`NotFound`, `Unauthorized`, `CapacityExceeded`, `ModelNotReady`, `Conflict`,
+`Internal`, `AmbiguousReference` or `Unavailable`. An error made from a code,
+such as `ServiceError("WriteConflict", ..., 409)`, takes the category its
+code and status name, so `except gf.Conflict` catches it whichever layer
+raised it. The HTTP error object (section 5 of the interface contract) maps
+onto the same fields, so a server reply and a local mistake render alike.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, ClassVar
+
+WIRE_ERROR_CODES = frozenset(
+    [
+        "ValidationError",
+        "NotFound",
+        "Unauthorized",
+        "CapacityExceeded",
+        "ModelNotReady",
+        "Internal",
+        "Conflict",
+    ]
+)
+"""The OpenAPI `ErrorCode` enum: the only codes a GF service puts on the wire."""
+
+# Codes that name their wire code whatever status they are raised with. This
+# is the services' wire contract: a change here changes what they send.
+_PUBLIC_BY_CODE: dict[str, str] = {
+    **dict.fromkeys(
+        (
+            "Forbidden",
+            "AccessDenied",
+            "InvalidLogin",
+            "ExpiredToken",
+            "NotLoggedIn",
+            "SessionRequired",
+            "ReauthenticationRequired",
+            "LinkConfirmationRequired",
+            "WaitlistRequired",
+            "CredentialInactive",
+            "AuthorizationPending",
+        ),
+        "Unauthorized",
+    ),
+    **dict.fromkeys(
+        (
+            "AlreadyExists",
+            "WriteConflict",
+            "StaleComponent",
+            "OperationSuperseded",
+        ),
+        "Conflict",
+    ),
+    **dict.fromkeys(("RateLimited", "ContextCapacityExceeded"), "CapacityExceeded"),
+    **dict.fromkeys(
+        (
+            "NotReady",
+            "ModelUnavailable",
+            "RuntimeUnavailable",
+            "ProviderUnavailable",
+            "SingleWriterUnavailable",
+            "Timeout",
+            "WaitTimeout",
+            "PredictorTimeout",
+        ),
+        "ModelNotReady",
+    ),
+    "InternalError": "Internal",
+}
+
+# Categories of codes raised on this side of the wire, which a service never
+# sends: an unreachable or silent service, a closed client, a model's own
+# fault, and the engine's refusals named by what they refuse. Every other
+# code takes its wire code's category.
+_LOCAL_CATEGORY: dict[str, str] = {
+    "TransportError": "Unavailable",
+    "Timeout": "Unavailable",
+    "ClientClosed": "InvalidInput",
+    "AmbiguousReference": "AmbiguousReference",
+    "ModelOutputError": "Internal",
+    "Unauthenticated": "Unauthorized",
+    "UnknownModel": "NotFound",
+    "QueryCapacityExceeded": "CapacityExceeded",
+    **dict.fromkeys(
+        (
+            "InvalidInput",
+            "InvalidTable",
+            "InvalidModel",
+            "InvalidPredictor",
+            "InvalidContext",
+            "SchemaRequired",
+            "UnsupportedCapability",
+            "ModelMismatch",
+            "AmbiguousTask",
+            "ContextRequired",
+            "EmptyContext",
+        ),
+        "InvalidInput",
+    ),
+}
+
+
+def reason_of(code: str) -> str:
+    """A service code's wire `reason`: its name in snake case."""
+    return re.sub(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", "_", code).lower()
+
+
+def public_code(code: str, status: int | None) -> str:
+    """The wire code for a failure code raised with `status`."""
+    if code in WIRE_ERROR_CODES:
+        return code
+    if code in _PUBLIC_BY_CODE:
+        return _PUBLIC_BY_CODE[code]
+    if code.endswith("NotFound") or status == 404:
+        return "NotFound"
+    if status in (401, 403):
+        return "Unauthorized"
+    if status == 409:
+        return "Conflict"
+    if status == 429:
+        return "CapacityExceeded"
+    if status == 503:
+        return "ModelNotReady"
+    if status is not None and status >= 500:
+        return "Internal"
+    return "ValidationError"
+
+
+# Category names that are spelled differently as codes.
+_CODE_ALIASES = {"InvalidInput": "ValidationError"}
+
+# Codes that are their own reason: the wire codes.
+_UNREASONED = WIRE_ERROR_CODES
+
+# Codes only a client raises about its own side of the wire; a server that
+# sends one is not believed.
+_CLIENT_ONLY = frozenset(
+    {"TransportError", "ClientClosed", "RedirectRefused", "ModelOutputError"}
+)
+
+
+def known_code(code: str) -> bool:
+    """Whether a code names its category without a status."""
+    return (
+        code in WIRE_ERROR_CODES or code in _PUBLIC_BY_CODE or code in _LOCAL_CATEGORY
+    )
+
+
+_ESCAPES = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])|\x9b[0-?]*[ -/]*[@-~]"
+)
+
+
+def printable(message: str) -> str:
+    """Removes terminal escapes and non-printable characters from a message."""
+    return "".join(
+        " " if character in "\t\n\r" else character
+        for character in _ESCAPES.sub("", message)
+        if character in "\t\n\r" or character.isprintable()
+    ).strip()
 
 
 def _wrap(label: str, text: str) -> str:
@@ -23,13 +177,18 @@ def _wrap(label: str, text: str) -> str:
     return head + ("\n" + pad).join(lines)
 
 
+# The optional wire fields of an error object, in the order they are sent.
+_DETAILS = ("param", "hint", "limit", "actual")
+
+
 class Error(Exception):
     """A General Forecast error with the fields the CLI and the API render.
 
     Attributes:
         code: The stable error code, such as `ValidationError`.
         message: One lowercase line naming the mistake, without a trailing period.
-        reason: The service's finer reason behind `code`, in snake case, if any.
+        status: The HTTP status the error answers with.
+        reason: The finer reason behind `code`, in snake case, if any.
         param: The field or column the error refers to, if any.
         because: The cause, when the message alone does not explain it.
         hint: What to do instead, if there is a short answer.
@@ -42,12 +201,17 @@ class Error(Exception):
     """
 
     code = "Internal"
+    # The status an error of this category answers with when none is given.
+    default_status: ClassVar[int] = 500
+    # Set on the category classes; every other class takes one from its code.
+    _category: ClassVar[bool] = False
 
     def __init__(
         self,
-        *args: str,
+        *args: Any,
         code: str | None = None,
         message: str | None = None,
+        status: int | None = None,
         reason: str | None = None,
         param: str | None = None,
         because: str | None = None,
@@ -59,27 +223,72 @@ class Error(Exception):
         line: int | None = None,
         column: int | None = None,
     ) -> None:
-        """Builds an error from `(message)` or `(code, message)`; `code` defaults to the class's code."""
-        if len(args) == 2:
-            code, message = args[0], args[1]
+        """Builds an error from `(message)`, `(code, message)` or `(code, message, status)`.
+
+        `code` defaults to the class's code, and an error of a class that is
+        not a category, such as `ServiceError`, becomes one of its category.
+        """
+        if len(args) == 3:
+            code, message, status = args
+        elif len(args) == 2:
+            code, message = args
         elif len(args) == 1:
             message = args[0]
         elif args:
-            raise TypeError("Error takes a message, or a code and a message")
-        if code is not None:
-            self.code = _CODES.get(code, code)
-        self.message = message or ""
-        self.reason = reason
-        self.path = path
+            raise TypeError("Error takes a message, a code and a message, and a status")
+        self.code = (
+            type(self).code
+            if code is None
+            # A category's name is spelled as its code; a service's own code
+            # stays as it was raised.
+            else _CODE_ALIASES.get(code, code)
+            if type(self) is Error or type(self)._category
+            else code
+        )
+        self.message = "" if message is None else message
+        self.reason = (
+            reason
+            if reason is not None or self.code in _UNREASONED
+            else reason_of(self.code)
+        )
         self.param = param
         self.because = because
         self.hint = hint
         self.limit = limit
         self.actual = actual
         self.request_id = request_id
+        self.path = path
         self.line = line
         self.column = column
         super().__init__(self.message)
+        self.__class__ = _classified(type(self), self.code, status)
+        self.status = type(self).default_status if status is None else status
+
+    @property
+    def public(self) -> str:
+        """The wire code, one of the OpenAPI `ErrorCode` enum."""
+        return public_code(self.code, self.status)
+
+    def details(self) -> dict[str, Any]:
+        """The optional wire fields that are set: `param`, `hint`, `limit` and `actual`."""
+        return {
+            key: value
+            for key in _DETAILS
+            if (value := getattr(self, key, None)) is not None
+        }
+
+    def error(self) -> dict[str, Any]:
+        """The wire error object: the OpenAPI code, message, reason and details."""
+        error: dict[str, Any] = {"code": self.public, "message": self.message}
+        if self.reason is not None:
+            error["reason"] = self.reason
+        return error | self.details()
+
+    def public_body(self) -> dict[str, Any]:
+        """The API's bare error envelope, with the OpenAPI code."""
+        return {"error": self.error()}
+
+    body = public_body
 
     def __str__(self) -> str:
         """The CLI's plain shape, without colour: error, because, hint, request id."""
@@ -93,103 +302,171 @@ class Error(Exception):
         return "\n".join(lines)
 
     def to_dict(self) -> dict[str, Any]:
-        """The `--json` and HTTP error object."""
+        """The `--json` error object, with the error's own code."""
         value: dict[str, Any] = {"code": self.code, "message": self.message}
-        for key in ("param", "hint", "limit", "actual", "request_id"):
-            if (item := getattr(self, key)) is not None:
+        for key in ("reason", *_DETAILS, "request_id"):
+            if (item := getattr(self, key, None)) is not None:
                 value[key] = item
         return value
 
-    @classmethod
-    def from_dict(
-        cls, value: dict[str, Any], *, request_id: str | None = None
-    ) -> Error:
-        """The error class for a server error object."""
-        code = str(value.get("code", "Internal"))
-        klass = _BY_CODE.get(code, Internal)
-        return klass(
-            str(value.get("message", "")),
-            code=code,
-            param=value.get("param"),
-            hint=value.get("hint"),
-            limit=value.get("limit"),
-            actual=value.get("actual"),
-            request_id=request_id or value.get("request_id"),
-        )
+    def __reduce__(self) -> tuple[Any, ...]:
+        """Pickles the declared class and fields; unpickling classifies again."""
+        return (_restore, (_declared(type(self)), self.args), self.__dict__)
+
+    def __setstate__(self, state: dict[str, Any] | None, /) -> None:
+        """Restores the fields and the category they name."""
+        self.__dict__.update(state or {})
+        self.__class__ = _classified(type(self), self.code, self.status)
 
 
 class InvalidInput(Error):
     """A manifest, flag, column, reference or request value is wrong."""
 
     code = "ValidationError"
+    default_status = 422
+    _category = True
 
 
 class NotFound(Error):
     """A predictor, model, context, revision or file that is not there."""
 
     code = "NotFound"
+    default_status = 404
+    _category = True
 
 
 class Unauthorized(Error):
-    """No credential, a bad credential or the wrong project."""
+    """No credential, a bad credential, a missing permission or the wrong project."""
 
     code = "Unauthorized"
+    default_status = 401
+    _category = True
 
 
 class CapacityExceeded(Error):
     """A request is larger than the model or the plan allows; see `limit` and `actual`."""
 
     code = "CapacityExceeded"
+    default_status = 413
+    _category = True
 
 
 class ModelNotReady(Error):
-    """The model is still loading or compiling; retry shortly."""
+    """The model or environment is still loading or compiling; retry shortly."""
 
     code = "ModelNotReady"
+    default_status = 503
+    _category = True
 
 
 class AmbiguousReference(Error):
     """A reference names both a local predictor and a hosted one."""
 
     code = "AmbiguousReference"
+    default_status = 422
+    _category = True
 
 
 class Conflict(Error):
-    """A compare-and-swap lost: the generation moved since it was read."""
+    """A compare-and-swap lost, or a resource already exists or moved meanwhile."""
 
     code = "Conflict"
+    default_status = 409
+    _category = True
+
+
+class Unavailable(Error):
+    """The service could not be reached or did not answer in time.
+
+    The outcome of a write is unknown: retry it with the same `write_id` or
+    `submission_id`.
+    """
+
+    code = "Unavailable"
+    default_status = 503
+    _category = True
 
 
 class Internal(Error):
     """Our fault; always carries a request id when it came from a server."""
 
     code = "Internal"
+    default_status = 500
+    _category = True
 
 
-_CODES: dict[str, str] = {
-    "InvalidInput": "ValidationError",
-    "NotFound": "NotFound",
-    "Unauthorized": "Unauthorized",
-    "CapacityExceeded": "CapacityExceeded",
-    "ModelNotReady": "ModelNotReady",
-    "AmbiguousReference": "AmbiguousReference",
-    "Conflict": "Conflict",
-    "Internal": "Internal",
+_BY_WIRE: dict[str, type[Error]] = {
+    "ValidationError": InvalidInput,
+    "NotFound": NotFound,
+    "Unauthorized": Unauthorized,
+    "CapacityExceeded": CapacityExceeded,
+    "ModelNotReady": ModelNotReady,
+    "Conflict": Conflict,
+    "Internal": Internal,
+}
+_BY_NAME: dict[str, type[Error]] = {
+    "InvalidInput": InvalidInput,
+    "AmbiguousReference": AmbiguousReference,
+    "Unavailable": Unavailable,
+    **{klass.__name__: klass for klass in _BY_WIRE.values()},
 }
 
-_BY_CODE: dict[str, type[Error]] = {
-    klass.code: klass
-    for klass in (
-        InvalidInput,
-        NotFound,
-        Unauthorized,
-        CapacityExceeded,
-        ModelNotReady,
-        AmbiguousReference,
-        Conflict,
-        Internal,
-    )
-}
+
+def category(code: str, status: int | None = None) -> type[Error]:
+    """The category of an error raised with `code` and `status`."""
+    local = _LOCAL_CATEGORY.get(code)
+    if local is not None:
+        return _BY_NAME[local]
+    if code in _BY_NAME:
+        return _BY_NAME[code]
+    if status == 413:
+        return CapacityExceeded
+    if status is None and not known_code(code) and not code.endswith("NotFound"):
+        return InvalidInput
+    return _BY_WIRE[public_code(code, status)]
+
+
+_MIXED: dict[tuple[type[Error], type[Error]], type[Error]] = {}
+
+
+def _classified(cls: type[Error], code: str, status: int | None) -> type[Error]:
+    """The class an error of `cls` raised with `code` and `status` is.
+
+    A category class stays itself. `Error` becomes the category; another
+    class, such as `ServiceError`, becomes a subclass of both, so it is
+    caught both as itself and as its category.
+    """
+    cls = _declared(cls)
+    if cls._category:
+        return cls
+    kind = category(code, status)
+    if cls is Error:
+        return kind
+    key = (cls, kind)
+    if key not in _MIXED:
+        _MIXED[key] = type(
+            cls.__name__,
+            (cls, kind),
+            {
+                "__module__": cls.__module__,
+                "__qualname__": cls.__qualname__,
+                "__doc__": cls.__doc__,
+                "_declared_class": cls,
+            },
+        )
+    return _MIXED[key]
+
+
+def _declared(cls: type[Error]) -> type[Error]:
+    """The class an error was raised as, before its category was mixed in."""
+    return cls.__dict__.get("_declared_class", cls)
+
+
+def _restore(cls: type[Error], args: tuple[Any, ...]) -> Error:
+    error = Exception.__new__(cls)
+    error.args = args
+    return error
+
 
 __all__ = [
     "AmbiguousReference",
@@ -201,98 +478,143 @@ __all__ = [
     "ModelNotReady",
     "NotFound",
     "Unauthorized",
+    "Unavailable",
+    "boundary",
+    "category",
+    "convert",
+    "from_wire",
+    "wire_fields",
 ]
 
 
-_ALIASES: dict[str, type[Error]] = {
-    "InvalidInput": InvalidInput,
-    "InvalidTable": InvalidInput,
-    "InvalidModel": InvalidInput,
-    "InvalidPredictor": InvalidInput,
-    "InvalidContext": InvalidInput,
-    "SchemaRequired": InvalidInput,
-    "UnsupportedCapability": InvalidInput,
-    "ModelMismatch": InvalidInput,
-    "AmbiguousTask": InvalidInput,
-    "ContextRequired": InvalidInput,
-    "EmptyContext": InvalidInput,
-    "UnknownModel": NotFound,
-    "ModelNotFound": NotFound,
-    "NotReady": ModelNotReady,
-    "RuntimeUnavailable": ModelNotReady,
-    "WriteConflict": Conflict,
-    "Unauthenticated": Unauthorized,
-    "AccessDenied": Unauthorized,
-    "CredentialInactive": Unauthorized,
-    "CredentialUnavailable": Unauthorized,
-    "CredentialsUnavailable": Unauthorized,
-    "ContextCapacityExceeded": CapacityExceeded,
-    "QueryCapacityExceeded": CapacityExceeded,
-}
-
-_BY_STATUS: dict[int, type[Error]] = {
-    400: InvalidInput,
-    401: Unauthorized,
-    403: Unauthorized,
-    404: NotFound,
-    409: Conflict,
-    413: CapacityExceeded,
-    422: InvalidInput,
-    429: CapacityExceeded,
-    503: ModelNotReady,
-}
+_ERROR_KEYS = frozenset({"code", "message", "reason", *_DETAILS, "request_id"})
+# The longest server message relayed as it is; longer ones are replaced.
+MAX_MESSAGE = 512
 
 
-def _class_for(code: str, status: int | None) -> type[Error]:
-    found = _BY_CODE.get(code) or _ALIASES.get(code)
-    if found is not None:
-        return found
-    if status is not None and status in _BY_STATUS:
-        return _BY_STATUS[status]
-    return Internal
+def wire_fields(
+    detail: Any, *, status: int | None = None, request_id: str | None = None
+) -> dict[str, Any] | None:
+    """The fields of a reply's error object, made printable, or None if it is malformed.
+
+    A code outside the known vocabulary becomes `RemoteError`, so an untrusted
+    server's codes are never echoed; its category then follows the status.
+    An empty or overlong message is left empty.
+    """
+    if (
+        not isinstance(detail, Mapping)
+        or not {"code", "message"} <= set(detail)
+        or not set(detail) <= _ERROR_KEYS
+        or any(type(detail[key]) is not str for key in ("code", "message"))
+        or any(
+            detail.get(key) is not None and type(detail[key]) is not str
+            for key in ("reason", "param", "hint", "request_id")
+        )
+        or any(
+            detail.get(key) is not None
+            and (type(detail[key]) not in (int, float) or type(detail[key]) is bool)
+            for key in ("limit", "actual")
+        )
+    ):
+        return None
+    code = detail["code"]
+    message = detail["message"]
+    fields: dict[str, Any] = {
+        "code": code
+        if known_code(code) and code not in _CLIENT_ONLY
+        else "RemoteError",
+        "message": printable(message) if len(message) <= MAX_MESSAGE else "",
+        "status": status,
+        "request_id": detail.get("request_id") or request_id,
+    }
+    for key in ("reason", *_DETAILS):
+        value = detail.get(key)
+        if value is not None:
+            fields[key] = printable(value) if type(value) is str else value
+    if fields["request_id"] is not None:
+        fields["request_id"] = printable(fields["request_id"])
+    return fields
 
 
 def from_wire(
-    error: dict[str, Any], *, status: int | None = None, request_id: str | None = None
+    error: Any, *, status: int | None = None, request_id: str | None = None
 ) -> Error:
-    """The error for a reply's error object, falling back on the HTTP status."""
-    code = str(error.get("code", "Internal"))
-    return _class_for(code, status)(
-        str(error.get("message", "service rejected request")),
-        code=code,
-        param=error.get("param"),
-        hint=error.get("hint"),
-        limit=error.get("limit"),
-        actual=error.get("actual"),
-        request_id=error.get("request_id", request_id),
+    """The error a reply's error object describes, its category from its code and status.
+
+    A malformed error object is an `Internal` `ProtocolError`.
+    """
+    fields = wire_fields(error, status=status, request_id=request_id)
+    if fields is None:
+        return Error(
+            "ProtocolError",
+            "invalid service error",
+            status=status,
+            request_id=request_id,
+        )
+    if not fields["message"]:
+        fields["message"] = "service rejected request"
+    return Error(**fields)
+
+
+# Where an uncoded ValueError, TypeError or KeyError says the caller's input
+# or the engine's answer was refused: the engine, and the data libraries it
+# hands the caller's rows to. Raised there, its type is the documented signal
+# (pyarrow raises gRPC NOT_FOUND as a KeyError and INVALID_ARGUMENT as a
+# ValueError; sklearn refuses inconsistent arrays with a ValueError). Raised
+# anywhere else it is a bug, and stays itself.
+_ENGINE_MODULES = (
+    "generalforecast.native",
+    "generalforecast.keys",
+    "generalforecast.columns",
+    "generalforecast.engine",
+    "generalforecast.tabular",
+    "generalforecast.models",
+    "generalforecast.predictors",
+    "pyarrow",
+    "numpy",
+    "pandas",
+    "sklearn",
+)
+
+
+def _engine_raised(exc: BaseException) -> bool:
+    """Whether the innermost frame of an exception's traceback is engine code."""
+    trace = exc.__traceback__
+    if trace is None:
+        return False
+    while trace.tb_next is not None:
+        trace = trace.tb_next
+    module = str(trace.tb_frame.f_globals.get("__name__", ""))
+    return any(
+        module == name or module.startswith(name + ".") for name in _ENGINE_MODULES
     )
 
 
 def convert(exc: BaseException) -> Error | None:
     """The public error for an exception another layer raised, or None.
 
-    Maps the service error, the predictor errors, model reference errors,
-    Arrow and Flight failures, and the `ValueError`/`TypeError` the native
-    tables raise for a caller's mistake. Returns None for errors that are not
-    the caller's.
+    Maps by code first: an exception with a string `code` (a predictor,
+    model reference or artifact error) or the engine's coded `RequestError`.
+    Then by cause: a Flight status, an Arrow error about the caller's data, a
+    file the caller named, a refused credential, or a `ValueError`,
+    `TypeError` or `KeyError` the engine raised for the caller's input.
+    Returns None for anything else, such as a bug, which stays itself.
     """
     if isinstance(exc, Error):
         return exc
     code = getattr(exc, "code", None)
-    message = getattr(exc, "message", None) or str(exc) or type(exc).__name__
+    if not isinstance(code, str) and type(exc).__name__ == "RequestError":
+        parts = exc.args
+        if len(parts) == 3 and isinstance(parts[0], str) and isinstance(parts[2], int):
+            return Error(parts[0], _lower(str(parts[1])), status=parts[2])
+    message = getattr(exc, "message", None) or _text(exc)
     if isinstance(code, str):
         status = getattr(exc, "status", None)
-        found = _BY_CODE.get(code) or _ALIASES.get(code)
-        if found is None:
-            if isinstance(status, int) and status in _BY_STATUS:
-                found = _BY_STATUS[status]
-            elif isinstance(exc, (ValueError, TypeError)):
-                found = InvalidInput
-            else:
-                found = Internal
-        return found(
-            _lower(message),
-            code=code,
+        return Error(
+            code,
+            _lower(str(message)),
+            status=status if isinstance(status, int) else None,
+            reason=getattr(exc, "reason", None),
             param=getattr(exc, "param", None),
             hint=getattr(exc, "hint", None),
             limit=getattr(exc, "limit", None),
@@ -302,15 +624,36 @@ def convert(exc: BaseException) -> Error | None:
     name = type(exc).__module__ + "." + type(exc).__name__
     if name.startswith("pyarrow._flight."):
         return _flight(exc, message)
-    if name.startswith("pyarrow.lib.Arrow") or isinstance(exc, (ValueError, TypeError)):
+    if _FRAMING.match(message.strip()):
         return _framed(message)
-    if isinstance(exc, (FileNotFoundError, KeyError)):
-        return NotFound(_lower(_strip(message)))
-    if isinstance(exc, PermissionError):
+    if name.startswith("pyarrow.lib.Arrow"):
+        return _framed(message)
+    if isinstance(exc, PermissionError) and _engine_raised(exc):
         return Unauthorized(_lower(_strip(message)))
-    if isinstance(exc, (OSError, OverflowError, ArithmeticError)):
-        return InvalidInput(_lower(_strip(message)))
+    if isinstance(exc, OSError) and getattr(exc, "filename", None) is not None:
+        text = _lower(_strip(exc.strerror or message))
+        named = f"{text}: {exc.filename}"
+        if isinstance(exc, FileNotFoundError):
+            return NotFound(named)
+        return InvalidInput(named)
+    if isinstance(exc, KeyError) and _engine_raised(exc):
+        return NotFound(_lower(_strip(message)))
+    if isinstance(exc, (ValueError, TypeError, ArithmeticError)) and _engine_raised(
+        exc
+    ):
+        return _framed(message)
     return None
+
+
+def _text(exc: BaseException) -> str:
+    """An exception's message; a KeyError's without the quotes `str` adds."""
+    if (
+        isinstance(exc, KeyError)
+        and len(exc.args) == 1
+        and isinstance(exc.args[0], str)
+    ):
+        return exc.args[0] or type(exc).__name__
+    return str(exc) or type(exc).__name__
 
 
 def _by_text(text: str) -> Error:
@@ -327,9 +670,9 @@ def _flight(exc: BaseException, message: str) -> Error:
     by_name: dict[str, type[Error]] = {
         "FlightUnauthenticatedError": Unauthorized,
         "FlightUnauthorizedError": Unauthorized,
-        "FlightUnavailableError": ModelNotReady,
-        "FlightTimedOutError": ModelNotReady,
-        "FlightCancelledError": ModelNotReady,
+        "FlightUnavailableError": Unavailable,
+        "FlightTimedOutError": Unavailable,
+        "FlightCancelledError": Unavailable,
         "FlightInternalError": Internal,
         "FlightServerError": Internal,
     }
@@ -348,6 +691,8 @@ _BY_FLIGHT: dict[str, type[Error]] = {
     "unauthenticated": Unauthorized,
     "unauthorized": Unauthorized,
     "resource exhausted": CapacityExceeded,
+    "unavailable": Unavailable,
+    "internal": Internal,
 }
 
 
@@ -389,6 +734,3 @@ def boundary() -> Iterator[None]:
         if mapped is None:
             raise
         raise mapped from exc
-
-
-__all__ += ["boundary", "convert", "from_wire"]

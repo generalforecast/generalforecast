@@ -5060,3 +5060,411 @@ fn a_timed_adaptive_table_leans_its_neighbors_to_the_newest_rows() {
     ));
     assert_eq!(unit_rows(&mut node, table, &A), 8);
 }
+
+#[test]
+fn a_given_context_follows_its_rows_through_a_renumbering() {
+    let mut node = node(64);
+    let table = table(&mut node, Strategy::Exact, 5_000);
+    // Keys 3 and 4990 to 4999 stay, so renumbering moves row 3 to id 0.
+    let gone: Vec<u128> = (0..4_990).filter(|&key| key != 3).collect();
+    node.delete(table, &gone).unwrap();
+    node.submit(table, &A).unwrap();
+    let given = [RowId(3)].into_iter().collect();
+    node.submit_given(table, &A, vec![given]).unwrap();
+    run(&mut node);
+
+    // The insert renumbers the sparse table before the given request is planned.
+    let (_, features, targets) = rows(1);
+    node.insert(table, &[100_000], &features, targets).unwrap();
+    let step = run(&mut node);
+
+    let read = node.rows_of(table, &step.units()[0].rows).unwrap();
+    assert_eq!(read.keys, [3]);
+}
+
+/// A sealer whose blocks open as `Plain` opens them for a number of reads,
+/// then fail to, as a damaged row file's do, until it heals.
+#[derive(Debug)]
+struct Flaky(std::sync::atomic::AtomicU64);
+
+impl Flaky {
+    fn new() -> Arc<Self> {
+        Arc::new(Self(std::sync::atomic::AtomicU64::new(u64::MAX)))
+    }
+
+    /// Opens `reads` more blocks, then fails.
+    fn fail_after(&self, reads: u64) {
+        self.0.store(reads, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn heal(&self) {
+        self.fail_after(u64::MAX);
+    }
+}
+
+impl Sealer for Flaky {
+    fn seal(&self, block: u32, version: u32, plain: &[u8]) -> Vec<u8> {
+        Plain.seal(block, version, plain)
+    }
+
+    fn open(&self, block: u32, version: u32, sealed: &[u8]) -> Option<Vec<u8>> {
+        use std::sync::atomic::Ordering;
+        let left = self.0.load(Ordering::SeqCst);
+        if left == 0 {
+            return None;
+        }
+        if left != u64::MAX {
+            self.0.store(left - 1, Ordering::SeqCst);
+        }
+        Plain.open(block, version, sealed)
+    }
+}
+
+/// A node whose rows all spill, and a table on `sealer`'s file there.
+fn spilling(spec: TableSpec, sealer: Arc<Flaky>, name: &str) -> (Node, TableId) {
+    let directory = std::env::temp_dir().join(format!("gf-node-flaky-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let mut node = node(64).with_row_memory(RowMemory::bounded(0));
+    let table = node
+        .create_table_on_disk(spec, &directory.join(name), sealer)
+        .unwrap();
+    (node, table)
+}
+
+#[test]
+fn a_page_whose_rows_fail_to_read_is_embedded_by_the_next_step() {
+    let flaky = Flaky::new();
+    let (mut node, table) = spilling(spec(Strategy::Exact), flaky.clone(), "pages.rows");
+    let (keys, features, targets) = rows(32);
+    node.insert(table, &keys, &features, targets).unwrap();
+    node.submit(table, &A).unwrap();
+    run(&mut node);
+    // Row 0 moves to a page of its own, which the next step embeds.
+    node.update(table, &[0], &[0.5, 0.5], Targets::Classes(vec![1]))
+        .unwrap();
+    node.submit(table, &A).unwrap();
+
+    flaky.fail_after(0);
+    assert!(matches!(node.schedule(), Err(NodeError::Rows(_))));
+    flaky.heal();
+    let step = run(&mut node);
+
+    let page = step
+        .pages()
+        .iter()
+        .find(|page| page.rows == [RowId(0)])
+        .expect("row 0's page");
+    assert_eq!(page.placed.action(), Action::Encode);
+    assert!(page.embed.is_some());
+}
+
+#[test]
+fn a_fused_fit_whose_rows_fail_to_read_is_fit_again() {
+    let flaky = Flaky::new();
+    let (mut node, table) = spilling(spec(Strategy::Exact), flaky.clone(), "fused.rows");
+    let (keys, features, targets) = rows(32);
+    node.insert(table, &keys, &features, targets).unwrap();
+    node.set_single_use(table).unwrap();
+    node.submit(table, &A).unwrap();
+
+    // The fit reads the rows, then the unit fails to read them again.
+    flaky.fail_after(1);
+    assert!(matches!(node.schedule(), Err(NodeError::Rows(_))));
+    flaky.heal();
+    let step = run(&mut node);
+
+    assert_eq!(actions(&step), [Action::Fuse]);
+}
+
+#[test]
+fn a_rebuild_step_that_fails_to_plan_leaves_nothing_behind() {
+    let flaky = Flaky::new();
+    let mut node = node(64).with_row_memory(RowMemory::bounded(0));
+    let kept = node.create_table(regioned(Rebuild::Always)).unwrap();
+    let directory = std::env::temp_dir().join(format!("gf-node-flaky-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let spilled = node
+        .create_table_on_disk(
+            regioned(Rebuild::Always),
+            &directory.join("rebuild.rows"),
+            flaky.clone(),
+        )
+        .unwrap();
+    for table in [kept, spilled] {
+        let (keys, features, targets) = rows(64);
+        node.insert(table, &keys, &features, targets).unwrap();
+        node.submit(table, &A).unwrap();
+    }
+    run(&mut node);
+    // A step that starts with the spilled table, so the next starts with the kept one.
+    node.submit(spilled, &A).unwrap();
+    run(&mut node);
+    for table in [kept, spilled] {
+        node.insert(table, &[1_000], &[0.155, 0.0], Targets::Classes(vec![0]))
+            .unwrap();
+    }
+
+    // The kept table's rebuild is placed before the spilled one's fails.
+    flaky.fail_after(0);
+    assert!(matches!(node.schedule(), Err(NodeError::Plan(_))));
+    flaky.heal();
+    let rebuild = run_idle(&mut node);
+
+    let kept_units: Vec<Action> = rebuild
+        .units()
+        .iter()
+        .filter(|unit| unit.table == kept)
+        .map(|unit| unit.placed.action())
+        .collect();
+    assert_eq!(kept_units, [Action::Encode]);
+}
+
+/// The rows the next plan reads for `A` after an adaptive table with
+/// regions grows past its cap, with a look at its contexts first if `look`.
+fn adaptive_after_growth(look: bool) -> Vec<RowId> {
+    let mut node = node(64);
+    let spec = TableSpec {
+        strategy: Strategy::Adaptive,
+        context_rows: NonZeroU64::new(16),
+        scale_rows: NonZeroU64::new(12),
+        ..regioned(Rebuild::Always)
+    };
+    let table = node.create_table(spec).unwrap();
+    let (keys, features, targets) = rows(64);
+    node.insert(
+        table,
+        &keys[..12],
+        &features[..24],
+        targets_of(&targets, 0..12),
+    )
+    .unwrap();
+    node.submit(table, &A).unwrap();
+    run(&mut node);
+    node.insert(
+        table,
+        &keys[12..],
+        &features[24..],
+        targets_of(&targets, 12..64),
+    )
+    .unwrap();
+    if look {
+        node.contexts(table, &A, None).unwrap();
+    }
+    node.submit(table, &A).unwrap();
+    run(&mut node).units()[0].rows.clone()
+}
+
+#[test]
+fn looking_at_contexts_leaves_the_next_plan_as_it_was() {
+    assert_eq!(adaptive_after_growth(true), adaptive_after_growth(false));
+}
+
+#[test]
+fn a_region_without_a_device_tier_is_rebuilt_by_its_next_query_alone() {
+    let mut node = node(0);
+    let table = node.create_table(regioned(Rebuild::Always)).unwrap();
+    let (keys, features, targets) = rows(64);
+    node.insert(table, &keys, &features, targets).unwrap();
+    node.submit(table, &A).unwrap();
+    run(&mut node);
+    node.insert(table, &[1_000], &[0.155, 0.0], Targets::Classes(vec![0]))
+        .unwrap();
+
+    // Its context is not held, so no rebuild step computes one to throw away.
+    assert!(node.schedule().unwrap().is_none());
+    node.submit(table, &A).unwrap();
+    assert_eq!(actions(&run(&mut node)), [Action::Transient]);
+}
+
+#[test]
+fn a_rebuild_without_room_waits_for_it() {
+    let mut node = node(1);
+    let table = node.create_table(regioned(Rebuild::Always)).unwrap();
+    let (keys, features, targets) = rows(64);
+    node.insert(table, &keys, &features, targets).unwrap();
+    node.submit(table, &A).unwrap();
+    run(&mut node);
+    node.insert(table, &[1_000], &[0.155, 0.0], Targets::Classes(vec![0]))
+        .unwrap();
+    // A step in flight reads the stale context, pinning the device's slot.
+    node.submit(table, &A).unwrap();
+    let reading = node.schedule().unwrap().expect("a request waits");
+    assert_eq!(actions(&reading), [Action::Reuse]);
+
+    assert!(node.schedule().unwrap().is_none());
+    node.complete(&reading);
+    assert_eq!(actions(&run_idle(&mut node)), [Action::Encode]);
+}
+
+#[test]
+fn requests_wait_out_a_restore_rather_than_read_its_first_records() {
+    let mut original = node(64);
+    let table = original.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(48);
+    original.insert(table, &keys, &features, targets).unwrap();
+    let compaction = original.compaction(table).unwrap();
+
+    let mut copy = node(64);
+    let restored = copy.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(8);
+    copy.insert(restored, &keys, &features, targets).unwrap();
+    let request = copy.submit(restored, &A).unwrap();
+    // A first record without rows leaves the table empty until the rest.
+    let (rows, layout) = part(&compaction, 0, 0);
+    copy.restore(restored, &rows, &layout, Some(&compaction.table))
+        .unwrap();
+    assert!(copy.schedule().unwrap().is_none());
+    assert!(copy.take_refused().is_empty());
+    let (rows, layout) = part(&compaction, 0, compaction.rows.keys.len());
+    copy.restore(restored, &rows, &layout, None).unwrap();
+
+    let step = run(&mut copy);
+    assert_eq!(step.queries()[0].request, request);
+}
+
+#[test]
+fn a_layout_that_does_not_fit_the_table_is_refused_before_it_is_read() {
+    let mut original = node(64);
+    let table = original.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(48);
+    original.insert(table, &keys, &features, targets).unwrap();
+    original.submit(table, &A).unwrap();
+    run(&mut original);
+    let compaction = original.compaction(table).unwrap();
+    let (rows, layout) = part(&compaction, 0, compaction.rows.keys.len());
+
+    let mut narrow = compaction.table.clone();
+    narrow.fitted.as_mut().expect("fit above").deviations.pop();
+    let mut copy = node(64);
+    let restored = copy.create_table(spec(NEAREST)).unwrap();
+    assert!(matches!(
+        copy.restore(restored, &rows, &layout, Some(&narrow)),
+        Err(NodeError::Restore(_))
+    ));
+
+    // Pages numbered past the next id would take an id a new page takes.
+    let mut renumbered = compaction.table.clone();
+    renumbered.index.next_page = 0;
+    let mut copy = node(64);
+    let restored = copy.create_table(spec(NEAREST)).unwrap();
+    assert!(matches!(
+        copy.restore(restored, &rows, &layout, Some(&renumbered)),
+        Err(NodeError::Index(gf_core::pages::IndexError::PageNumber(_)))
+    ));
+}
+
+#[test]
+fn a_deferred_table_that_reads_shared_contexts_queues_its_requests_again() {
+    let mut node = node(64);
+    let table = table(&mut node, Strategy::Exact, 32);
+    let request = node.submit(table, &A).unwrap();
+    let step = node.schedule().unwrap().expect("a step");
+    node.complete_deferring(&step, &HashSet::new(), &[(table, "k".to_string())]);
+    assert!(node.schedule().unwrap().is_none());
+
+    node.compiled(vec!["k".to_string()]);
+    let step = run(&mut node);
+    assert_eq!(step.queries()[0].request, request);
+}
+
+#[test]
+fn a_context_a_step_in_flight_moves_counts_against_the_budget() {
+    let mut node = node(1);
+    // Room for one new context and a part of another.
+    node.set_step_bytes(120);
+    let moved = table(&mut node, Strategy::Exact, 8);
+    let mover = table(&mut node, Strategy::Exact, 8);
+    let other = table(&mut node, Strategy::Exact, 8);
+    node.submit(moved, &A).unwrap();
+    run(&mut node);
+    // The mover's context takes the device's one slot, demoting the moved table's.
+    node.submit(mover, &A).unwrap();
+    let moving = node.schedule().unwrap().expect("a request waits");
+
+    node.submit(other, &A).unwrap();
+    node.submit(moved, &A).unwrap();
+    let step = node.schedule().unwrap().expect("requests wait");
+    node.complete(&moving);
+
+    // The moved context is computed again, so it waits for its own step.
+    let tables: Vec<TableId> = step.queries().iter().map(|batch| batch.table).collect();
+    assert_eq!(tables, [other]);
+}
+
+#[test]
+fn a_given_context_queued_through_a_restore_reads_the_rows_of_its_keys() {
+    // Written in reverse, so the restored rows take other ids than the copy's.
+    let mut original = node(64);
+    let table = original.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(48);
+    let reversed: Vec<usize> = (0..48).rev().collect();
+    let features: Vec<f32> = reversed
+        .iter()
+        .flat_map(|&row| features[row * 2..row * 2 + 2].to_vec())
+        .collect();
+    let Targets::Classes(labels) = targets else {
+        unreachable!("rows are classified")
+    };
+    let labels = Targets::Classes(reversed.iter().map(|&row| labels[row]).collect());
+    let keys: Vec<u128> = reversed.iter().map(|&row| keys[row]).collect();
+    original.insert(table, &keys, &features, labels).unwrap();
+    let compaction = original.compaction(table).unwrap();
+
+    let mut copy = node(64);
+    let restored = copy.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(8);
+    copy.insert(restored, &keys, &features, targets).unwrap();
+    let given = [RowId(0)].into_iter().collect();
+    copy.submit_given(restored, &A, vec![given]).unwrap();
+    let (rows, layout) = part(&compaction, 0, compaction.rows.keys.len());
+    copy.restore(restored, &rows, &layout, Some(&compaction.table))
+        .unwrap();
+
+    let step = run(&mut copy);
+    let read = copy.rows_of(restored, &step.units()[0].rows).unwrap();
+    assert_eq!(read.keys, [0]);
+}
+
+#[test]
+fn a_restore_whose_layout_does_not_build_leaves_the_table_restoring() {
+    let mut original = node(64);
+    let table = original.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(48);
+    original.insert(table, &keys, &features, targets).unwrap();
+    let compaction = original.compaction(table).unwrap();
+    let (records, layout) = part(&compaction, 0, compaction.rows.keys.len());
+    let mut renumbered = compaction.table.clone();
+    renumbered.index.next_page = 0;
+
+    let mut copy = node(64);
+    let restored = copy.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(8);
+    copy.insert(restored, &keys, &features, targets).unwrap();
+    let request = copy.submit(restored, &A).unwrap();
+    assert!(
+        copy.restore(restored, &records, &layout, Some(&renumbered))
+            .is_err()
+    );
+    assert!(copy.schedule().unwrap().is_none());
+    assert!(copy.take_refused().is_empty());
+
+    copy.restore(restored, &records, &layout, Some(&compaction.table))
+        .unwrap();
+    assert_eq!(run(&mut copy).queries()[0].request, request);
+}
+
+#[test]
+fn deferred_given_requests_go_ahead_of_those_given_since() {
+    let mut node = node(64);
+    let table = table(&mut node, Strategy::Exact, 32);
+    node.compiled(vec!["k".to_string()]);
+    let rows: gf_core::context::Context = [RowId(1), RowId(2)].into_iter().collect();
+    let first = node.submit_given(table, &A, vec![rows.clone()]).unwrap();
+    let step = node.schedule().unwrap().expect("a step");
+    let second = node.submit_given(table, &B, vec![rows]).unwrap();
+    node.complete_deferring(&step, &HashSet::new(), &[(table, "k".to_string())]);
+
+    let step = run(&mut node);
+    let requests: Vec<RequestId> = step.queries().iter().map(|batch| batch.request).collect();
+    assert_eq!(requests, [first, second]);
+}

@@ -51,12 +51,16 @@ def test_top_level_exports_are_exactly_the_contract() -> None:
         "AmbiguousReference",
         "Internal",
         "Conflict",
+        "Unavailable",
         "Client",
         "AsyncClient",
         "engine",
         "errors",
+        "predictors",
         "__version__",
     }
+    for name in gf.__all__:
+        assert getattr(gf, name) is not None
     for name in ("Strategy", "GroupStrategy", "local", "Table", "Package"):
         with pytest.raises(AttributeError):
             getattr(gf, name)
@@ -136,9 +140,14 @@ def test_server_error_objects_map_to_the_classes() -> None:
         type(errors.from_wire({"code": "Weird", "message": "x"}, status=500))
         is gf.Internal
     )
-    mapped_value = errors.convert(ValueError("Rows must be numeric"))
-    assert mapped_value is not None and mapped_value.message == "rows must be numeric"
     assert errors.convert(RuntimeError("engine")) is None
+    # A ValueError the engine's data libraries raise is the caller's; one
+    # raised by any other code is a bug, and stays itself.
+    with pytest.raises(gf.InvalidInput), errors.boundary():
+        pd.DataFrame({"a": [1], "b": [1, 2]})
+    with pytest.raises(ValueError, match="a bug") as bug, errors.boundary():
+        raise ValueError("a bug")
+    assert not isinstance(bug.value, gf.Error)
     with pytest.raises(gf.InvalidInput), errors.boundary():
         pa.array([1, "a"]).cast(pa.int64())
 

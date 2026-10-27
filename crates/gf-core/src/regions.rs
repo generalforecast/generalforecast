@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 
 use crate::cache::Epoch;
 use crate::context::{Context, Fingerprint, mix};
+use crate::distance::squared32;
 use crate::pages::Vectors;
 use crate::planner::{hash, smallest};
 use crate::rows::RowsError;
@@ -258,7 +259,7 @@ impl Regions {
         let points: Vec<Vec<f32>> = ranked.into_iter().map(|(_, vector)| vector).collect();
         let count = (count as usize).min(points.len()).max(1);
         let (top, within, centers) = if count as u64 <= FLAT_REGIONS {
-            let centers = k_means(&points, count, REGION_SEED, dimensions);
+            let centers = k_means(&points, count, REGION_SEED, &vec![0.0; dimensions]);
             (Vec::new(), Vec::new(), centers)
         } else {
             two_levels(&points, count, dimensions)
@@ -422,7 +423,7 @@ type Levels = (Vec<Vec<f32>>, Vec<Range<usize>>, Vec<Vec<f32>>);
 /// centers, each one's range of regions, and the regions' centers.
 fn two_levels(points: &[Vec<f32>], count: usize, dimensions: usize) -> Levels {
     let tops = (count as f64).sqrt().ceil() as usize;
-    let top = k_means(points, tops, REGION_SEED, dimensions);
+    let top = k_means(points, tops, REGION_SEED, &vec![0.0; dimensions]);
     let mut members: Vec<Vec<Vec<f32>>> = vec![Vec::new(); top.len()];
     for point in points {
         members[nearest(&top, point)].push(point.clone());
@@ -434,11 +435,13 @@ fn two_levels(points: &[Vec<f32>], count: usize, dimensions: usize) -> Levels {
             .div_ceil(points.len())
             .clamp(1, rows.len().max(1));
         let start = centers.len();
+        // A top center no point is nearest is its cluster's one leaf, so a
+        // query near it reads a context near it.
         centers.extend(k_means(
             rows,
             share,
             mix(REGION_SEED ^ cluster as u64),
-            dimensions,
+            &top[cluster],
         ));
         within.push(start..centers.len());
     }
@@ -448,14 +451,16 @@ fn two_levels(points: &[Vec<f32>], count: usize, dimensions: usize) -> Levels {
 /// `count` centers over `points` by k-means: k-means++ seeding from the first
 /// point, each later center drawn in proportion to its squared distance from
 /// those before under `seed`, then `LLOYD_ROUNDS` rounds of moving each center
-/// to the mean of the points nearest it. With no points, one center at zero.
-fn k_means(points: &[Vec<f32>], count: usize, seed: u64, dimensions: usize) -> Vec<Vec<f32>> {
+/// to the mean of the points nearest it. With no points, one center at
+/// `empty`, which is as long as every point.
+fn k_means(points: &[Vec<f32>], count: usize, seed: u64, empty: &[f32]) -> Vec<Vec<f32>> {
+    let dimensions = empty.len();
     let Some(first) = points.first() else {
-        return vec![vec![0.0; dimensions]];
+        return vec![empty.to_vec()];
     };
     let mut centers = vec![first.clone()];
     let mut nearest_distance: Vec<f32> =
-        points.iter().map(|point| distance(point, first)).collect();
+        points.iter().map(|point| squared32(point, first)).collect();
     while centers.len() < count.min(points.len()) {
         let total: f64 = nearest_distance
             .iter()
@@ -476,7 +481,7 @@ fn k_means(points: &[Vec<f32>], count: usize, seed: u64, dimensions: usize) -> V
             .unwrap_or(points.len() - 1);
         let center = points[chosen].clone();
         for (held, point) in nearest_distance.iter_mut().zip(points) {
-            *held = held.min(distance(point, &center));
+            *held = held.min(squared32(point, &center));
         }
         centers.push(center);
     }
@@ -507,7 +512,7 @@ fn k_means(points: &[Vec<f32>], count: usize, seed: u64, dimensions: usize) -> V
 fn nearest(centers: &[Vec<f32>], vector: &[f32]) -> usize {
     let mut best = (f32::INFINITY, 0);
     for (index, center) in centers.iter().enumerate() {
-        let distance = distance(center, vector);
+        let distance = squared32(center, vector);
         if distance < best.0 {
             best = (distance, index);
         }
@@ -515,19 +520,11 @@ fn nearest(centers: &[Vec<f32>], vector: &[f32]) -> usize {
     best.1
 }
 
-/// The squared distance between two vectors.
-fn distance(left: &[f32], right: &[f32]) -> f32 {
-    left.iter()
-        .zip(right)
-        .map(|(&left, &right)| (left - right) * (left - right))
-        .sum()
-}
-
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
 
-    use super::{MOST_SAMPLE, Regions};
+    use super::{MOST_SAMPLE, Regions, k_means, nearest};
     use crate::cache::Epoch;
     use crate::context::Context;
     use crate::pages::Vectors;
@@ -559,6 +556,21 @@ mod tests {
         let vectors = Counted(Cell::new(0));
         Regions::draw((Epoch(0), 0, 0), &live, per_region, 2, &vectors, &Ids).unwrap();
         vectors.0.get()
+    }
+
+    #[test]
+    fn a_top_cluster_without_points_has_its_top_center_as_its_leaf() {
+        // Two top centers, the second with no point nearest it once the
+        // first moves to its points' mean.
+        let points = vec![vec![0.0, 0.0], vec![4.0, 0.0], vec![2.0, 0.0]];
+        let top = vec![vec![2.0, 0.0], vec![2.0, 0.0]];
+        let mut members: Vec<Vec<Vec<f32>>> = vec![Vec::new(); top.len()];
+        for point in &points {
+            members[nearest(&top, point)].push(point.clone());
+        }
+        assert!(members[1].is_empty());
+        assert_eq!(k_means(&members[1], 1, 7, &top[1]), [top[1].clone()]);
+        assert_eq!(k_means(&[], 1, 7, &[0.0, 0.0]), [vec![0.0, 0.0]]);
     }
 
     #[test]

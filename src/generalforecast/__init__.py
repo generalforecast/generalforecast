@@ -4,7 +4,8 @@
 """General Forecast: predictors on tabular foundation models.
 
 Exports `Predictor`, the estimators `Classifier`, `Regressor` and
-`Forecaster`, the error classes, and the `engine` and `errors` submodules.
+`Forecaster`, the hosted `Client` and `AsyncClient`, the error classes, and
+the `engine`, `errors` and `predictors` submodules.
 Everything loads on first use, so `import generalforecast` stays cheap and
 never needs the optional sklearn extra.
 """
@@ -16,17 +17,20 @@ from typing import TYPE_CHECKING, Any
 from generalforecast.errors import (
     AmbiguousReference,
     CapacityExceeded,
+    Conflict,
     Error,
     Internal,
     InvalidInput,
     ModelNotReady,
     NotFound,
     Unauthorized,
+    Unavailable,
 )
 
 if TYPE_CHECKING:
     from generalforecast import engine as engine
     from generalforecast import errors as errors
+    from generalforecast import predictors as predictors
     from generalforecast.async_client import AsyncClient as AsyncClient
     from generalforecast.client import Client as Client
     from generalforecast.estimators import Classifier as Classifier
@@ -55,9 +59,11 @@ __all__ = [
     "Predictor",
     "Regressor",
     "Unauthorized",
+    "Unavailable",
     "__version__",
     "engine",
     "errors",
+    "predictors",
 ]
 
 _EXPORTS = {
@@ -69,7 +75,6 @@ _EXPORTS = {
     "Forecaster": ("generalforecast.estimators", "Forecaster"),
     "engine": ("generalforecast.engine", None),
     "errors": ("generalforecast.errors", None),
-    # contract: provided by session B; loaded lazily when its module exists.
     "predictors": ("generalforecast.predictors", None),
 }
 

@@ -113,6 +113,27 @@ struct RowFile {
 }
 
 impl RowFile {
+    /// A new, empty row file at `path`, sealed by `sealer`. A file there
+    /// already is unlinked rather than emptied, so snapshots reading it keep
+    /// the blocks they saw.
+    fn create(path: &Path, sealer: Arc<dyn Sealer>) -> Result<Self, RowsError> {
+        match std::fs::remove_file(path) {
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        Ok(Self {
+            file,
+            path: path.to_path_buf(),
+            sealer,
+            length: Mutex::new(0),
+        })
+    }
+
     fn read(&self, block: u32, location: Location) -> Result<Vec<u8>, RowsError> {
         let mut sealed = vec![0; location.length as usize];
         self.file.read_exact_at(&mut sealed, location.offset)?;
@@ -232,18 +253,7 @@ impl RowStore {
         path: &Path,
         sealer: Arc<dyn Sealer>,
     ) -> Result<Self, RowsError> {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
-        let file = RowFile {
-            file,
-            path: path.to_path_buf(),
-            sealer,
-            length: Mutex::new(0),
-        };
+        let file = RowFile::create(path, sealer)?;
         Ok(Self::make(memory, width, Some(Arc::new(file))))
     }
 
@@ -458,13 +468,22 @@ impl RowStore {
         }
     }
 
-    /// Empties the store, keeping its file and width.
+    /// Empties the store, keeping its width and its file's path. The rows go
+    /// on in a new file, so snapshots taken before read the old one, as they
+    /// read any block as it was.
     ///
     /// # Errors
     ///
-    /// If the file cannot be emptied.
+    /// If the new file cannot be made. The store is then unchanged.
     pub fn clear(&mut self) -> Result<(), RowsError> {
         let mut pool = self.memory.lock();
+        let file = match &pool.stores[&self.id].file {
+            Some(file) => Some(Arc::new(RowFile::create(
+                &file.path,
+                Arc::clone(&file.sealer),
+            )?)),
+            None => None,
+        };
         let blocks: Vec<u32> = pool.stores[&self.id].memory.keys().copied().collect();
         for block in blocks {
             pool.forget(self.id, block);
@@ -477,10 +496,7 @@ impl RowStore {
         self.targets.clear();
         store.disk.clear();
         store.garbage = 0;
-        if let Some(file) = &store.file {
-            file.file.set_len(0)?;
-            *file.length.lock().unwrap_or_else(PoisonError::into_inner) = 0;
-        }
+        store.file = file;
         Ok(())
     }
 }

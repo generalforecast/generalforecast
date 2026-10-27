@@ -64,3 +64,73 @@ fn leases_default_to_half_the_failover_and_plaintext_nodes_are_named() {
     let loopback = load("", "", "http://[::1]:8816").unwrap();
     assert!(loopback.plaintext_nodes().is_empty());
 }
+
+#[test]
+fn a_burst_needs_a_rate() {
+    // A client without per_second is not limited, so a burst alone would be ignored.
+    assert!(load("", "burst = 5", PLAIN).is_err());
+    assert!(load("", "per_second = 2.0\nburst = 5", PLAIN).is_ok());
+}
+
+#[test]
+fn two_nodes_may_not_be_one_server() {
+    let second = |address: &str| {
+        format!("[[nodes]]\nname = \"node-1\"\naddress = \"{address}\"\ntoken = \"replicator\"")
+    };
+    for same in [
+        PLAIN,
+        "HTTP://10.0.0.5:8816/",
+        "http://10.0.0.5:8816/flight",
+    ] {
+        let refused = load(&second(same), "", PLAIN).unwrap_err();
+        assert!(refused.contains("one server"), "{same}: {refused}");
+    }
+    assert!(load(&second("http://gf-node:80"), "", "http://GF-NODE").is_err());
+    assert!(load(&second("http://10.0.0.5:8817"), "", PLAIN).is_ok());
+    assert!(load(&second("https://10.0.0.5:8816"), "", PLAIN).is_ok());
+}
+
+#[test]
+fn a_reload_keeps_the_settings_that_take_effect_on_restart() {
+    let running = load("call_timeout_seconds = 60\nreplicas = 1", "", PLAIN).unwrap();
+    let loaded = load(
+        "call_timeout_seconds = 1200\nwrite_timeout_seconds = 5\nreplicas = 2\n\
+         check_seconds = 0.5",
+        "per_second = 3.0",
+        "http://10.0.0.6:8816",
+    )
+    .unwrap();
+
+    let (reloaded, ignored) = running.reloaded(loaded.clone());
+
+    // The router's own call timeout is sized from the node timeouts at start,
+    // so they change with it, on restart.
+    assert_eq!(
+        ignored,
+        [
+            "call_timeout_seconds",
+            "check_seconds",
+            "write_timeout_seconds"
+        ]
+    );
+    assert_eq!(reloaded.call_timeout_seconds, 60.0);
+    assert_eq!(
+        reloaded.write_timeout_seconds,
+        running.write_timeout_seconds
+    );
+    assert_eq!(reloaded.check_seconds, running.check_seconds);
+    assert_eq!(reloaded.replicas, 2);
+    assert_eq!(reloaded.nodes[0].address, "http://10.0.0.6:8816");
+    assert_eq!(reloaded.clients[0].per_second, Some(3.0));
+    // Every setting is either reloaded or named as kept, and nothing else differs.
+    let value = |config: &Config| serde_json::to_value(config).unwrap();
+    let (reloaded, running, loaded) = (value(&reloaded), value(&running), value(&loaded));
+    for (name, setting) in reloaded.as_object().unwrap() {
+        let source = if ignored.contains(name) {
+            &running
+        } else {
+            &loaded
+        };
+        assert_eq!(Some(setting), source.get(name), "{name}");
+    }
+}

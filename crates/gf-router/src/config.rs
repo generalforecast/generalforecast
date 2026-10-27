@@ -6,10 +6,11 @@
 use std::path::{Path, PathBuf};
 
 use gf_server::config::toml_error;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Everything a router needs to start.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// The address to serve Arrow Flight on.
@@ -81,7 +82,7 @@ fn one_second() -> f64 {
 }
 
 /// A client's token, the tables it may reach, and its quota.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ClientConfig {
     pub token: String,
@@ -98,7 +99,7 @@ pub struct ClientConfig {
 }
 
 /// The router's TLS identity, and a client certificate authority for mutual TLS.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     pub certificate: PathBuf,
@@ -108,7 +109,7 @@ pub struct TlsConfig {
 }
 
 /// A node: its address, the token the router uses, and how to verify and present TLS.
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
     pub name: String,
@@ -130,37 +131,43 @@ pub struct NodeConfig {
     pub key: Option<PathBuf>,
 }
 
+/// The settings a reload takes up: the nodes, the replica count, and the
+/// clients with their tokens and quotas. Every other setting, the node
+/// timeouts among them, takes effect only on restart.
+const RELOADED: [&str; 3] = ["nodes", "replicas", "clients"];
+
 impl Config {
     /// The settings that take effect only on restart, by name, that differ
     /// between this configuration and `loaded`.
     #[must_use]
-    pub fn restart_differences(&self, loaded: &Self) -> Vec<&'static str> {
-        let differs = [
-            ("listen", self.listen != loaded.listen),
-            (
-                "metrics_listen",
-                self.metrics_listen != loaded.metrics_listen,
-            ),
-            (
-                "tls",
-                format!("{:?}", self.tls) != format!("{:?}", loaded.tls),
-            ),
-            ("name", self.name != loaded.name),
-            (
-                "failover_seconds",
-                self.failover_seconds != loaded.failover_seconds,
-            ),
-            ("lease_seconds", self.lease_seconds != loaded.lease_seconds),
-            ("check_seconds", self.check_seconds != loaded.check_seconds),
-            (
-                "connection_concurrency",
-                self.connection_concurrency != loaded.connection_concurrency,
-            ),
-        ];
-        differs
-            .into_iter()
-            .filter_map(|(name, differs)| differs.then_some(name))
+    pub fn restart_differences(&self, loaded: &Self) -> Vec<String> {
+        let (Ok(Value::Object(running)), Ok(Value::Object(loaded))) =
+            (serde_json::to_value(self), serde_json::to_value(loaded))
+        else {
+            return Vec::new();
+        };
+        running
+            .iter()
+            .filter(|(name, value)| {
+                !RELOADED.contains(&name.as_str()) && loaded.get(*name) != Some(*value)
+            })
+            .map(|(name, _)| name.clone())
             .collect()
+    }
+
+    /// What a reload of `loaded` runs: this configuration with `loaded`'s
+    /// nodes, replica count and clients, and the names of the settings
+    /// `loaded` changes that keep their running values until a restart.
+    #[must_use]
+    pub fn reloaded(&self, loaded: Self) -> (Self, Vec<String>) {
+        let ignored = self.restart_differences(&loaded);
+        let running = Self {
+            nodes: loaded.nodes,
+            replicas: loaded.replicas,
+            clients: loaded.clients,
+            ..self.clone()
+        };
+        (running, ignored)
     }
 
     /// Reads a configuration file.
@@ -235,6 +242,13 @@ impl Config {
             if client.burst == Some(0) {
                 return Err("burst must be at least 1".to_string());
             }
+            if client.burst.is_some() && client.per_second.is_none() {
+                return Err(
+                    "burst needs per_second, the rate its quota refills at; a client \
+                     without per_second is not limited"
+                        .to_string(),
+                );
+            }
         }
         if config.connection_concurrency == 0 {
             return Err("connection_concurrency must be at least 1".to_string());
@@ -242,6 +256,18 @@ impl Config {
         let mut names = std::collections::HashSet::new();
         if let Some(node) = config.nodes.iter().find(|node| !names.insert(&node.name)) {
             return Err(format!("two nodes are named {:?}", node.name));
+        }
+        // Two names for one server would count it twice among a table's
+        // replicas, so a write acknowledged on two of them is on one server.
+        let mut servers = std::collections::HashMap::new();
+        for node in &config.nodes {
+            if let Some(other) = servers.insert(endpoint(&node.address), &node.name) {
+                return Err(format!(
+                    "nodes {other:?} and {:?} are one server, at {}; each node is a \
+                     server of its own",
+                    node.name, node.address
+                ));
+            }
         }
         Ok(config)
     }
@@ -275,5 +301,25 @@ impl Config {
             })
             .map(|node| node.name.as_str())
             .collect()
+    }
+}
+
+/// The server an address reaches, so that two spellings of one compare
+/// equal: its scheme and host in lowercase, and its port, or the scheme's
+/// default without one.
+fn endpoint(address: &str) -> String {
+    let Ok(uri) = address.parse::<tonic::transport::Uri>() else {
+        return address.to_string();
+    };
+    let scheme = uri.scheme_str().unwrap_or_default().to_ascii_lowercase();
+    let host = uri.host().unwrap_or_default().to_ascii_lowercase();
+    let port = uri.port_u16().or(match scheme.as_str() {
+        "http" => Some(80),
+        "https" => Some(443),
+        _ => None,
+    });
+    match port {
+        Some(port) => format!("{scheme}://{host}:{port}"),
+        None => format!("{scheme}://{host}"),
     }
 }

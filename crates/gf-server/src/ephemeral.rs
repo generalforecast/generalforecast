@@ -11,10 +11,10 @@ use std::sync::Arc;
 use gf_core::node::TableId;
 use tokio::time::Instant;
 
+use crate::definition::TableDefinition;
 use crate::metrics::TableMetrics;
 use crate::name::TableName;
 use crate::shard::EphemeralLimits;
-use crate::wal::TableDefinition;
 
 /// A table holding one request context's rows in memory alone, named
 /// `ctx-<fingerprint>` for the context, so requests with the same context
