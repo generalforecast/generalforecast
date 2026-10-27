@@ -170,6 +170,11 @@ class SeriesFunctions(NamedTuple):
             and `extend` places the new patches right after the real ones.
             `decode` reads such a cache too.
         properties: Describes the model from its parameters, once at load.
+        decode_within: `decode` for a cache whose real steps plus the horizon
+            stay within `context_limit`, which the engine calls for such
+            caches so the model may skip, statically, the work of passing
+            the limit; or None when `decode` has none to skip. Its outputs
+            must equal `decode`'s bit for bit.
     """
 
     forecast: Forecast
@@ -177,6 +182,7 @@ class SeriesFunctions(NamedTuple):
     decode: Decode | None
     extend: Extend | None
     properties: Properties
+    decode_within: Decode | None = None
 
 
 class GroupInputs(NamedTuple):

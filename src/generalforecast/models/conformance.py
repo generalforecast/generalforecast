@@ -759,8 +759,10 @@ def _series_properties(functions, model, properties, tolerance):
         properties.reusable
         == (functions.encode is not None)
         == (functions.decode is not None)
-        and (properties.reusable or functions.extend is None),
-        "reusable must say whether encode and decode exist, and extend needs them",
+        and (properties.reusable or functions.extend is None)
+        and (functions.decode is not None or functions.decode_within is None),
+        "reusable must say whether encode and decode exist, and extend and "
+        "decode_within need them",
     )
     for horizon in (properties.output_patch + 1, _long_horizon(properties)):
         data = group(steps=4 * properties.patch, horizon=horizon)
@@ -908,6 +910,22 @@ def _series_reuse(functions, model, properties, tolerance):
         functions.decode(model, cache, horizon),
         tolerance,
     )
+    if (
+        functions.decode_within is not None
+        and 4 * properties.patch + horizon <= properties.context_limit
+    ):
+        # As the runtime decodes caches stored at the limit's bucket whose
+        # real steps and horizon stay within the limit, under `jax.vmap`.
+        extra = properties.context_limit // properties.patch - 4
+        paged = jax.tree.map(lambda leaf: leaf[None], paged_series(cache, grows, extra))
+        within, general = (
+            jax.jit(jax.vmap(lambda c, decode=decode: decode(model, c, horizon)))(paged)
+            for decode in (functions.decode_within, functions.decode)
+        )
+        _require(
+            np.array_equal(within, general),
+            "decode_within must forecast as decode does, bit for bit",
+        )
     # Under a trace, roles cannot be checked, so a known row must poison the
     # cache instead of slipping through as a target.
     known = group(steps=4 * properties.patch, horizon=horizon)

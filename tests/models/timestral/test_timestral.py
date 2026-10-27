@@ -20,6 +20,7 @@ from generalforecast.models.timestral.checkpoint import (
 )
 from generalforecast.models.timestral.model import (
     decode,
+    decode_within,
     encode,
     extend,
     timestral_functions,
@@ -139,6 +140,62 @@ def test_paged_caches_of_different_lengths_decode_together_past_the_limit() -> N
             rtol=1e-5,
             atol=1e-5,
         )
+
+
+def test_caches_at_the_limit_bucket_decode_within_it_bit_for_bit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tiny_timestral()
+    bucket = CONTEXT // PATCH
+    # Three blocks; the fed-back medians keep every context within the limit,
+    # though each is stored at the limit's bucket, as the worker stores it.
+    horizon = 3 * BLOCK_SIZE * PATCH
+    lengths = (bucket - 6, bucket - 7, bucket - 6, bucket - 9)
+    groups = [
+        group(steps=patches * PATCH, horizon=PATCH, known=False, seed=seed)
+        for seed, patches in enumerate(lengths)
+    ]
+    assert all(g.values.shape[1] + horizon <= CONTEXT for g in groups)
+    pages = []
+    for data in groups:
+        cache = encode(model, data)
+        pages.append(paged_series(cache, _grows(cache), bucket - cache.valid.shape[0]))
+    stacked = jax.tree.map(lambda *leaves: jnp.stack(leaves), *pages)
+
+    within = jax.jit(jax.vmap(lambda cache: decode_within(model, cache, horizon)))
+    general = jax.jit(jax.vmap(lambda cache: decode(model, cache, horizon)))
+
+    np.testing.assert_array_equal(within(stacked), general(stacked))
+    for index, data in enumerate(groups):
+        np.testing.assert_allclose(
+            within(stacked)[index],
+            timestral_functions.forecast(model, data, horizon),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+    # No block of the promised decode runs the window whole.
+    from generalforecast.models.timestral import model as timestral
+
+    passes: list[int] = []
+    window = timestral._window_block
+
+    def counted(*args: Any) -> Any:
+        passes.append(1)
+        return window(*args)
+
+    monkeypatch.setattr(timestral, "_window_block", counted)
+    jax.eval_shape(jax.vmap(lambda c: decode_within(model, c, horizon)), stacked)
+    assert not passes
+    jax.eval_shape(jax.vmap(lambda c: decode(model, c, horizon)), stacked)
+    assert passes
+
+
+def test_decode_within_refuses_a_cache_it_can_see_passes_the_limit() -> None:
+    model = tiny_timestral()
+    cache = encode(model, group(steps=CONTEXT - PATCH, horizon=PATCH, known=False))
+    decode_within(model, cache, PATCH)
+    with pytest.raises(ValueError, match="limit"):
+        decode_within(model, cache, 2 * PATCH)
 
 
 def test_a_reduced_precision_cache_keeps_the_context_values_exact() -> None:

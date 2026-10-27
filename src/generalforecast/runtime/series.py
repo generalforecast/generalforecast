@@ -224,6 +224,7 @@ def series_decode(
     stored: bool,
     layout: CacheLayout,
     horizon: int,
+    within: bool = False,
 ) -> Callable[..., Any]:
     """A decode of groups whose caches sit in slots, vectorized over the groups.
 
@@ -235,13 +236,15 @@ def series_decode(
         stored: Whether `decode` reads caches as the runtime stores them.
         layout: The caches' layout.
         horizon: Steps to decode, static.
+        within: Whether every item's real steps plus `horizon` stay within
+            the model's context limit, so `decode_within` decodes them.
 
     Returns:
         A function of the parameters, the slots' source, and per item its
         blocks, positions, patch count and fixed leaves.
     """
-    assert functions.decode is not None
-    decode = functions.decode
+    decode = functions.decode_within if within else functions.decode
+    assert decode is not None
 
     def one(
         parameters: Any,
@@ -357,6 +360,21 @@ def resized(layout: CacheLayout, cache: Any, rows: int) -> Any:
         value = pad_rows(value, rows) if value.shape[0] < rows else value[:rows]
         leaves[leaf.index] = jnp.moveaxis(value, 0, leaf.axis)
     return jax.tree.unflatten(layout.treedef, leaves)
+
+
+def decodes_within(
+    functions: SeriesFunctions, properties: SeriesProperties, patches: int, horizon: int
+) -> bool:
+    """Whether a cache of `patches` real ones decodes `horizon` steps by `decode_within`.
+
+    Only a model with one, and only while the real steps plus the horizon
+    stay within its context limit. Each answer is a program of its own, so a
+    model without `decode_within` decodes every cache alike.
+    """
+    return (
+        functions.decode_within is not None
+        and patches * properties.patch + horizon <= properties.context_limit
+    )
 
 
 def patch_bucket(patches: int, properties: SeriesProperties, minimum: int) -> int:

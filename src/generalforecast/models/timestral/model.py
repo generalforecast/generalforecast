@@ -19,6 +19,7 @@ encodes once and decodes any horizon, growing exactly by whole patches.
 """
 
 import functools
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -877,6 +878,8 @@ def decode(
     horizon: int,
     future: Array | None = None,
     future_observed: Array | None = None,
+    *,
+    within: bool = False,
 ) -> Float[Array, " rows horizon quantiles"]:
     """Forecasts `horizon` steps from an encoded context, block by block, as `forecast` does.
 
@@ -894,12 +897,18 @@ def decode(
         horizon: Steps to forecast.
         future: Must be None: a group with known covariates is forecast whole.
         future_observed: Must be None.
+        within: The caller's promise that the cache's real steps plus
+            `horizon` stay within the limit, so every block reads the cache.
+            A cache read back from slots says its real patches only when
+            traced; without the promise, each of its blocks past the stored
+            patches chooses at run time, and under `jax.vmap` runs both ways.
 
     Returns:
         Quantiles at the model's levels for every row and step.
 
     Raises:
-        ValueError: If known future values are given.
+        ValueError: If known future values are given, or `within` is promised
+            of a cache that can be seen to pass the limit.
     """
     if future is not None or future_observed is not None:
         raise ValueError(
@@ -914,6 +923,11 @@ def decode(
     real = real_patches(cache.time)
     stored = cache.valid.shape[0] * model.patch
     start = stored if real is None else real * model.patch
+    if within and real is None and stored + horizon > limit:
+        raise ValueError(
+            f"a context of {stored} steps and a horizon of {horizon} pass the "
+            f"model's limit of {model.context_limit}"
+        )
     values = jax.lax.bitcast_convert_type(_by_row(cache.values), jnp.float32)
     observed = _by_row(cache.observed)
     blocks = []
@@ -930,13 +944,17 @@ def decode(
         # The fed-back medians pass the limit only if the stored patches would.
         # A cache read back from slots says its real patches only when traced,
         # so its groups choose apart; decoded together under `jax.vmap`, each
-        # such block runs both ways.
+        # such block runs both ways. Promised `within`, the other way is a
+        # blank instead of a window: still through `cond`, whose batching
+        # lays the cached block out its own way, so the forecasts stay the
+        # same to the bit.
         if stored + done <= limit:
             quantiles = cached()
         elif real is None:
             quantiles = whole()
         else:
-            quantiles = jax.lax.cond(start + done > limit, whole, cached)
+            passed = _blank(jax.eval_shape(cached)) if within else whole
+            quantiles = jax.lax.cond(start + done > limit, passed, cached)
         blocks.append(quantiles)
         done += steps
         if done < horizon:
@@ -968,6 +986,27 @@ def decode(
                 cache = _grow(model, cache, data, added, added_observed, fold=False)
     quantiles = jnp.concatenate(blocks, axis=1)[:, :horizon]
     return _finish(model, quantiles, cache, low, high, nonnegative)
+
+
+def _blank(shape: jax.ShapeDtypeStruct) -> Callable[[], Array]:
+    """A branch of zeros shaped as `shape`."""
+    return lambda: jnp.zeros(shape.shape, shape.dtype)
+
+
+def decode_within(
+    model: Timestral,
+    cache: TimestralCache,
+    horizon: int,
+    future: Array | None = None,
+    future_observed: Array | None = None,
+) -> Float[Array, " rows horizon quantiles"]:
+    """`decode` for a cache whose real steps plus `horizon` stay within the model's limit.
+
+    Every block reads the cache, so none runs the window whole, even for a
+    cache read back from slots stored at the limit's bucket. Its forecasts
+    are `decode`'s, bit for bit.
+    """
+    return decode(model, cache, horizon, future, future_observed, within=True)
 
 
 def _cached_block(
@@ -1071,4 +1110,5 @@ timestral_functions = SeriesFunctions(
     decode=decode,
     extend=extend,
     properties=properties,
+    decode_within=decode_within,
 )

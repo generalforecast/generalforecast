@@ -255,6 +255,61 @@ def test_forecasts_match_the_model_on_the_group_and_reuse_the_cache(
     assert set(worker.stats.seconds) & {"forecast", "series_encode", "series_decode"}
 
 
+@pytest.mark.parametrize(("horizon", "within"), [(12, True), (32, False)])
+def test_contexts_at_the_limit_bucket_decode_apart_by_whether_they_pass_it(
+    monkeypatch: pytest.MonkeyPatch, horizon: int, within: bool
+) -> None:
+    """An entry of 8 patches extended by one is stored at the limit's bucket of 16.
+
+    Its 36 steps and 12 more stay within the 64 the model reads, so it decodes
+    by `decode_within`; 32 more pass them. Either way, the forecasts are the
+    ones every cache decoded the general way gives, to the bit.
+    """
+    from generalforecast.models.timestral.model import decode_within
+    from generalforecast.worker import series as worker_series
+
+    parameters = tiny_timestral()
+    properties = timestral_functions.properties(parameters)
+    patch, keys = properties.patch, np.array([A, B], dtype=np.uint64)
+    calls: list[tuple[int, int, bool]] = []
+    decodes_within = worker_series.decodes_within
+
+    def recorded(functions: Any, properties: Any, patches: int, horizon: int) -> bool:
+        assert functions.decode_within is decode_within
+        calls.append(
+            (patches, horizon, decodes_within(functions, properties, patches, horizon))
+        )
+        return calls[-1][-1]
+
+    def forecast() -> tuple[dict[int, np.ndarray], _core.Step, Worker]:
+        node, worker, table = _setup(timestral_functions, parameters, [], steps=30)
+        node.submit_forecast(table, keys, horizon, np.array([420] * 2))
+        _run(node, worker)
+        _advance(node, table, 420, patch)
+        node.submit_forecast(table, keys, horizon, np.array([420 + STEP * patch] * 2))
+        predictions, step = _run(node, worker)
+        assert step.series_units[0].action == "extend"
+        return predictions, step, worker
+
+    with monkeypatch.context() as patch_:
+        patch_.setattr(worker_series, "decodes_within", recorded)
+        predictions, step, worker = forecast()
+    # The encoded entry's 8 patches, then the extended one's 9.
+    assert calls == [(8, horizon, 8 * patch + horizon <= 64), (9, horizon, within)]
+    assert worker._patch_bucket(0, 9) == properties.context_limit // patch
+    programs = [cast(tuple, key) for key in worker.programs._compiled]
+    decodes = {key[-1] for key in programs if key[0] == "series_decode"}
+    assert within in decodes
+    _fresh(timestral_functions, parameters, step, predictions)
+
+    with monkeypatch.context() as patch_:
+        patch_.setattr(worker_series, "decodes_within", lambda *_: False)
+        general, _, _ = forecast()
+    assert predictions.keys() == general.keys()
+    for request, outputs in predictions.items():
+        np.testing.assert_array_equal(outputs, general[request])
+
+
 def test_known_columns_are_forecast_whole_with_their_future() -> None:
     parameters = tiny_timestral()
     node, worker, table = _setup(timestral_functions, parameters, known=[0])

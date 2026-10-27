@@ -18,6 +18,7 @@ from generalforecast.runtime.memory import tree_bytes
 from generalforecast.runtime.paging import CacheLayout
 from generalforecast.runtime.series import (
     buckets,
+    decodes_within,
     fixed_leaves,
     horizon_bucket,
     laid_group,
@@ -374,8 +375,19 @@ class Series:
             model = self._tables[units[unit].table].model
             context = self._contexts[units[unit].key]
             bucket = self._patch_bucket(model, context.rows)
-            alike[(model, context.layout, bucket, horizon)].append((unit, horizon))
-        for (model, layout, patches, horizon), items_keys in alike.items():
+            # Caches whose real steps and horizon stay within the limit decode
+            # apart from those that pass it, so a model can skip, statically,
+            # what only passing the limit needs.
+            within = decodes_within(
+                self._series(model).functions,
+                self.series_properties(model),
+                context.rows,
+                horizon,
+            )
+            alike[(model, context.layout, bucket, horizon, within)].append(
+                (unit, horizon)
+            )
+        for (model, layout, patches, horizon, within), items_keys in alike.items():
             entry = self._series(model)
             # Forecasters read caches as `encode` returned them, so stored
             # dtypes are loaded back first.
@@ -386,11 +398,12 @@ class Series:
                 stored: bool = stored,
                 layout: CacheLayout = layout,
                 horizon: int = horizon,
+                within: bool = within,
             ) -> Any:
-                return series_decode(entry.functions, stored, layout, horizon)
+                return series_decode(entry.functions, stored, layout, horizon, within)
 
             compiled = self.programs.compiled(
-                ("series_decode", model, layout, horizon), build
+                ("series_decode", model, layout, horizon, within), build
             )
             # Every entry's bucket is read; its real patches are the count,
             # so one program serves every count in the bucket.
@@ -424,7 +437,7 @@ class Series:
 
             self._run_items(
                 "series_decode",
-                ("series_decode", model, layout, patches, horizon),
+                ("series_decode", model, layout, patches, horizon, within),
                 compiled,
                 (entry.parameters, source),
                 items,
