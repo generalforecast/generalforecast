@@ -16,7 +16,7 @@ from generalforecast.credentials import (
     key_suffix,
     server_url,
 )
-from generalforecast.errors import Unauthorized
+from generalforecast.errors import Unauthorized, printable
 from generalforecast.service.contracts import (
     WIRE_ERROR_CODES,
     ServiceError,
@@ -62,7 +62,8 @@ def login(args: argparse.Namespace, out: Output) -> dict[str, Any]:
         identity = whoami(args)
         out.verb(
             "Verified",
-            f"key {identity['key']['suffix']} from {ENV_KEY} as {identity['email']}",
+            f"key {identity['key']['suffix']} from {ENV_KEY} as "
+            f"{printable(str(identity['email']))}",
         )
         out.hint(f"unset {ENV_KEY} to log in through your browser instead")
         return {"authenticated": True, **identity}
@@ -72,10 +73,10 @@ def login(args: argparse.Namespace, out: Output) -> dict[str, Any]:
 
     server = server_url().rstrip("/")
     flow = DeviceLogin(server, timeout=args.timeout)
-    out.debug(f"POST {server}/v1/cli-logins")
     grant = flow.start(machine_name())
-    code, uri = grant["user_code"], grant["verification_uri"]
-    complete = grant.get("verification_uri_complete") or uri
+    # The server's words reach the terminal, so none may carry a terminal escape.
+    code, uri = printable(grant["user_code"]), printable(grant["verification_uri"])
+    complete = printable(grant.get("verification_uri_complete") or uri)
     reason = browser_unavailable()
     opened = False
     if reason is None:
@@ -128,7 +129,9 @@ def login(args: argparse.Namespace, out: Output) -> dict[str, Any]:
     )
     location = store.location(saved)
     out.verb(
-        "Logged in", f"as {token.get('email')} to workspace {workspace['display_name']}"
+        "Logged in",
+        f"as {printable(str(token.get('email')))} to workspace "
+        f"{printable(workspace['display_name'])}",
     )
     where = f"the {location}" if saved.store == "keychain" else f"{location} (0600)"
     out.verb("Stored", f"key {saved.suffix} in {where}")
@@ -145,7 +148,12 @@ def login(args: argparse.Namespace, out: Output) -> dict[str, Any]:
 
 
 def logout(args: argparse.Namespace, out: Output) -> dict[str, Any]:
-    """Revokes the stored key on the server, then forgets it locally."""
+    """Revokes the stored key on the server, then forgets it locally.
+
+    The key is forgotten whatever the server says: a server that cannot be
+    reached, or refuses, leaves the key valid there until it expires, which
+    the warning and `revoke_error` say.
+    """
     server = server_url().rstrip("/")
     store = CredentialStore()
     saved = store.load(server)
@@ -159,7 +167,7 @@ def logout(args: argparse.Namespace, out: Output) -> dict[str, Any]:
             )
         out.warning(f"not logged in to {host(server)}")
         return {"logged_out": False, "server": server}
-    revoked = False
+    revoked, failure = False, None
     if saved.key:
         from generalforecast.client import Client
         from generalforecast.transport import Profile
@@ -173,9 +181,14 @@ def logout(args: argparse.Namespace, out: Output) -> dict[str, Any]:
             client.identity.manage("auth.logout")
             revoked = True
         except ServiceError as error:
-            if wire_code(error)[0] not in {"Unauthorized", "NotFound"}:
-                raise
-            out.warning(f"{host(server)} no longer accepts key {saved.suffix}")
+            if wire_code(error)[0] in {"Unauthorized", "NotFound"}:
+                out.warning(f"{host(server)} no longer accepts key {saved.suffix}")
+            else:
+                failure = printable(error.message)
+                out.warning(
+                    f"could not revoke key {saved.suffix} on {host(server)} "
+                    f"({failure}); it stays valid there until it expires"
+                )
     location = store.location(saved)
     store.remove(server)
     if revoked:
@@ -186,6 +199,7 @@ def logout(args: argparse.Namespace, out: Output) -> dict[str, Any]:
         "logged_out": True,
         "server": server,
         "revoked": revoked,
+        **({} if failure is None else {"revoke_error": failure}),
         "key": {"id": saved.key_id, "suffix": saved.suffix},
         "store": saved.store,
     }

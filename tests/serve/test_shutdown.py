@@ -10,15 +10,26 @@ import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from generalforecast import protocol
-from tests.serve.processes import assert_exited as _assert_exited
-from tests.serve.processes import children as _children
+from tests.utils import processes
+from tests.utils.processes import assert_exited as _assert_exited
+from tests.utils.processes import children as _children
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def _stopped():
+    """Every process a test here starts is stopped, with its group, when it ends."""
+    with processes.scoped():
+        yield
 
 
 def _assert_quiet(stderr):
@@ -40,8 +51,14 @@ def test_a_worker_ignores_sigint_and_exits_when_its_socket_closes():
         path = Path(short) / "worker.sock"
         listener.bind(str(path))
         listener.listen(1)
-        worker = subprocess.Popen(
-            [sys.executable, "-m", "generalforecast.worker_process", "--socket", path],
+        worker = processes.start(
+            [
+                sys.executable,
+                "-m",
+                "generalforecast.worker_process",
+                "--socket",
+                str(path),
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -75,14 +92,13 @@ def _server(tmp_path, *, stdout):
         "PYTHONPATH": str(ROOT),
         "XDG_CACHE_HOME": str(tmp_path / "cache"),
     }
-    process = subprocess.Popen(
+    process = processes.start(
         [str(server.binary), "run", "--config", str(server.config)],
         stdin=subprocess.DEVNULL,
         stdout=stdout,
         stderr=subprocess.PIPE,
         text=True,
         env=environment,
-        start_new_session=True,
     )
     return server, process
 
@@ -168,3 +184,42 @@ def test_a_terminal_sees_one_stopped_line(tmp_path):
     assert len(lines) == 1, lines
     assert lines[0].startswith("\x1b[1;32m     Stopped\x1b[0m after "), lines
     _assert_quiet(process.stderr.read())
+
+
+def test_a_server_stops_when_the_process_that_started_it_is_killed(tmp_path):
+    """No exit handler runs under SIGKILL; the server sees its parent's pipe close."""
+    from tests.utils.server import build
+
+    code = textwrap.dedent(
+        f"""
+        import time
+        from pathlib import Path
+        from tests.utils.server import Server
+        server = Server(Path({str(build())!r}), Path({str(tmp_path)!r})).start()
+        Path({str(tmp_path / "pid")!r}).write_text(str(server.process.pid))
+        time.sleep(600)
+        """
+    )
+    log = tmp_path / "parent.log"
+    with log.open("w") as written:
+        parent = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.DEVNULL,
+            stderr=written,
+            cwd=ROOT,
+            env={**os.environ, "PYTHONPATH": str(ROOT)},
+        )
+    try:
+        deadline = time.monotonic() + 600
+        while not (tmp_path / "pid").exists():
+            assert parent.poll() is None, log.read_text()
+            assert time.monotonic() < deadline
+            time.sleep(0.2)
+        server = int((tmp_path / "pid").read_text())
+        workers = _children(server)
+        assert workers
+        parent.kill()
+        parent.wait(30)
+        _assert_exited([server, *workers], seconds=120)
+    finally:
+        parent.kill()

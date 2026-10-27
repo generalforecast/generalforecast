@@ -24,9 +24,10 @@ from generalforecast.serve.models import served
 from generalforecast.service.boundary import Scope
 from generalforecast.service.catalog import CatalogService
 from generalforecast.tabular import arrow_bytes
-from tests.serve.processes import assert_exited as _assert_exited
-from tests.serve.processes import children as _children
+from tests.utils import processes
 from tests.utils.locks import directory, lock_of
+from tests.utils.processes import assert_exited as _assert_exited
+from tests.utils.processes import children as _children
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = "general-forecast/tabicl-v2-classifier"
@@ -69,23 +70,23 @@ def call(url, path, body=None, *, key=None, headers=None):
         return error.code, json.loads(error.read())
 
 
-def _start(arguments, *, env=None, own_group=False):
+def _start(arguments, *, env=None):
+    """`gf serve` in a process group of its own, which a terminal's Ctrl-C reaches whole.
+
+    stderr is a pipe tests read only when something fails, so the server
+    logs warnings alone there, and never fills it.
+    """
     from tests.utils.server import build
 
-    binary = build()
     environment = {k: v for k, v in os.environ.items() if k not in CLEAN}
-    environment["PATH"] = f"{binary.parent}{os.pathsep}{environment['PATH']}"
-    environment |= env or {}
-    # `own_group` puts the server and its workers in their own process
-    # group, so a test can send them a terminal's Ctrl-C.
-    return subprocess.Popen(
+    environment |= {"GF_SERVER_BIN": str(build()), "GF_LOG": "warn"} | (env or {})
+    return processes.start(
         [sys.executable, "-m", "generalforecast.serve", *arguments],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
         env=environment,
         cwd=ROOT,
-        start_new_session=own_group,
     )
 
 
@@ -113,10 +114,13 @@ def server():
         "auth": "bearer",
     }
     _event(process, "ready")
-    yield serving["url"], process
-    process.send_signal(signal.SIGTERM)
-    assert _event(process, "stopped")["url"] == serving["url"]
-    assert process.wait(60) == 0
+    try:
+        yield serving["url"], process
+        process.send_signal(signal.SIGTERM)
+        assert _event(process, "stopped")["url"] == serving["url"]
+        assert process.wait(60) == 0
+    finally:
+        processes.stop(process)
 
 
 @pytest.mark.slow
@@ -267,9 +271,7 @@ def test_ten_thousand_context_rows_are_answered(server):
 @pytest.mark.slow
 def test_ctrl_c_stops_the_server_and_its_workers_quietly():
     port = _port()
-    process = _start(
-        [MODEL, "--port", str(port)], env={"GF_API_KEY": KEY}, own_group=True
-    )
+    process = _start([MODEL, "--port", str(port)], env={"GF_API_KEY": KEY})
     url = _event(process, "serving")["url"]
     _event(process, "ready")
     workers = _children(process.pid)
@@ -307,8 +309,7 @@ def test_public_bind_without_a_key_warns():
             f"gf serve: warning: listening on 0.0.0.0:{port} without an API key"
         )
     finally:
-        process.kill()
-        process.wait(30)
+        processes.stop(process, sent=signal.SIGKILL)
 
 
 def test_unservable_targets_fail_before_listening(tmp_path):
@@ -382,9 +383,12 @@ def _serving(target):
 
 
 def _stop(process):
-    process.send_signal(signal.SIGTERM)
-    _event(process, "stopped")
-    assert process.wait(60) == 0
+    try:
+        process.send_signal(signal.SIGTERM)
+        _event(process, "stopped")
+        assert process.wait(60) == 0
+    finally:
+        processes.stop(process)
 
 
 @pytest.mark.slow

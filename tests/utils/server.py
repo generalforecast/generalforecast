@@ -5,8 +5,6 @@
 
 from __future__ import annotations
 
-import atexit
-import contextlib
 import json
 import os
 import shutil
@@ -14,7 +12,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -25,6 +22,8 @@ import numpy as np
 import pyarrow as pa
 import pytest
 from pyarrow import flight
+
+from tests.utils import processes
 
 ROOT = Path(__file__).resolve().parents[2]
 TOKEN = b"Bearer secret"
@@ -43,55 +42,22 @@ SETTLE_SECONDS = float(os.environ.get("GF_TEST_SETTLE_SECONDS", "180"))
 # How long a stopped server may take to drain before it is killed.
 STOP_SECONDS = 60.0
 
-# The process groups of the servers this process started and has not yet
-# stopped, killed at exit, so a test that fails or times out leaves none.
-_RUNNING: set[int] = set()
-
-
-def _spawn(command: list[str], **options) -> subprocess.Popen:
-    """Starts a server in a process group of its own, which holds its workers."""
-    process = subprocess.Popen(command, start_new_session=True, **options)
-    _RUNNING.add(process.pid)
-    return process
-
-
-def _stop(process: subprocess.Popen) -> int:
-    """Stops a server with SIGTERM, then kills its group: workers it left too."""
-    process.terminate()
-    try:
-        code = process.wait(timeout=STOP_SECONDS)
-    except subprocess.TimeoutExpired:
-        _kill(process.pid)
-        code = process.wait()
-    _kill(process.pid)
-    return code
-
-
-def _kill(group: int) -> None:
-    _RUNNING.discard(group)
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(group, signal.SIGKILL)
-
-
-@atexit.register
-def _kill_running() -> None:
-    for group in list(_RUNNING):
-        _kill(group)
-
 
 def _session_cache() -> Path:
-    """This process's cache directory for the servers it starts, removed at exit.
+    """This process's cache directory for the servers it starts.
 
     A worker compiles every program the servers before it recorded as it
     starts, and records live in the cache directory. Shared with every run
     on the machine, they grow with every shape any test ever asked for, and
     each start compiles them all; a directory of this session's own keeps a
-    start to what its tests asked for.
+    start to what its tests asked for. It is made as `gf serve` makes its
+    own, so it goes once this process exits, even when it is killed.
     """
     global _CACHE
     if _CACHE is None:
-        _CACHE = Path(tempfile.mkdtemp(prefix="gf-test-cache-"))
-        atexit.register(shutil.rmtree, _CACHE, ignore_errors=True)
+        from generalforecast.serve.listener import private_directory
+
+        _CACHE, _ = private_directory()
     return _CACHE
 
 
@@ -131,12 +97,12 @@ def _ready(process: subprocess.Popen, what: str, probe: Callable[[], object]) ->
         except Exception as error:
             code = process.poll()
             if code is not None:
-                _kill(process.pid)
+                processes.kill(process)
                 raise AssertionError(
                     f"{what} exited with {code} as it started"
                 ) from error
             if time.monotonic() > deadline:
-                _stop(process)
+                processes.stop(process, timeout=STOP_SECONDS)
                 raise AssertionError(
                     f"{what} did not answer within {STARTUP_SECONDS:.0f} seconds"
                 ) from error
@@ -237,7 +203,7 @@ host_bytes = {256 << 20}
         It listens only once its workers have compiled the programs they
         recorded, so an answer means the server takes calls at once.
         """
-        self.process = _spawn(
+        self.process = processes.start(
             [str(self.binary), "run", "--config", str(self.config)],
             env=server_environment(),
         )
@@ -258,8 +224,9 @@ host_bytes = {256 << 20}
         """Stops the server with SIGTERM and returns its exit code."""
         code = 0
         if self.process is not None:
-            code = _stop(self.process)
-            self.process = None
+            stopped = processes.stop(self.process, timeout=STOP_SECONDS)
+            assert stopped is not None, "the server did not stop, and was killed"
+            code, self.process = stopped, None
         return code
 
     def http(self, path: str) -> tuple[int, str]:
@@ -368,7 +335,7 @@ class Router:
         The router serves only once it has learned its nodes' copies.
         """
         with self.log.open("ab") as log:
-            self.process = _spawn(
+            self.process = processes.start(
                 [str(self.binary), "run", "--config", str(self.config)], stderr=log
             )
         _ready(self.process, "gf-router", check)
@@ -390,7 +357,7 @@ class Router:
 
     def stop(self) -> None:
         if self.process is not None:
-            _stop(self.process)
+            processes.stop(self.process, timeout=STOP_SECONDS)
             self.process = None
 
     def metric(self, line: str) -> bool:

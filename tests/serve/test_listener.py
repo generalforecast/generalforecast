@@ -65,7 +65,13 @@ def test_a_missing_server_is_reported_before_any_weights(monkeypatch, private):
     monkeypatch.setattr(listener, "BIN", private / "absent")
     monkeypatch.setattr(listener.shutil, "which", lambda name: None)
     monkeypatch.setattr(listener.sysconfig, "get_path", lambda name: str(private))
-    code, stdout, stderr = gf("--json", "serve", "x", monkeypatch=monkeypatch)
+    monkeypatch.delenv("GF_SERVER_BIN", raising=False)
+    code, stdout, stderr = gf(
+        "--json",
+        "serve",
+        "general-forecast/tabicl-v2-classifier",
+        monkeypatch=monkeypatch,
+    )
     assert code == 1 and not stdout
     error = json.loads(stderr)["error"]
     assert error["message"] == "gf-server is not installed with gf"
@@ -88,8 +94,10 @@ def test_a_failure_before_the_server_starts_removes_its_directory(
 
     monkeypatch.setattr("generalforecast.serve.models.served", served)
     monkeypatch.setattr(listener, "binary", lambda name: tmp_path / name)
-    code, _, stderr = gf("serve", "missing", monkeypatch=monkeypatch)
-    assert code == 1 and stderr == "error: no predictor at missing\n"
+    predictor = tmp_path / "unlocked"
+    predictor.mkdir()
+    code, _, stderr = gf("serve", str(predictor), monkeypatch=monkeypatch)
+    assert code == 1 and stderr == f"error: no predictor at {predictor}\n"
     assert made and not made[0].exists()
 
 
@@ -210,6 +218,8 @@ def test_router_check_reports_and_fails_with_the_routers_words(monkeypatch, tmp_
 
 def test_serving_a_node_or_router_becomes_its_server(monkeypatch, tmp_path):
     monkeypatch.delenv("GF_OFFLINE", raising=False)
+    # A launcher's parent pipe reaches the server through the exec.
+    monkeypatch.setenv("GF_PARENT_FD", "7")
     started = []
     monkeypatch.setattr(listener, "binary", lambda name: tmp_path / name)
     monkeypatch.setattr(
@@ -236,6 +246,7 @@ def test_serving_a_node_or_router_becomes_its_server(monkeypatch, tmp_path):
     assert node_args[1:] == router_args[1:] == ["run", "--config", str(config)]
     assert node_env["HF_HUB_OFFLINE"] == node_env["GF_OFFLINE"] == "1"
     assert "GF_OFFLINE" not in router_env
+    assert node_env["GF_PARENT_FD"] == router_env["GF_PARENT_FD"] == "7"
 
 
 def test_metrics_are_configured_only_when_asked_for(tmp_path):
@@ -371,3 +382,40 @@ def test_gf_server_checks_a_hosted_configuration(tmp_path):
         check=False,
     )
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_a_server_is_found_in_its_documented_order(monkeypatch, tmp_path):
+    def program(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\n")
+        path.chmod(0o755)
+        return path
+
+    checkout = tmp_path / "checkout"
+    (checkout / "crates" / "gf-server" / "src").mkdir(parents=True)
+    source = checkout / "crates" / "gf-server" / "src" / "main.rs"
+    source.write_text("")
+    (checkout / "Cargo.lock").write_text("")
+    staged = program(tmp_path / "bin" / "gf-server")
+    on_path = program(tmp_path / "path" / "gf-server")
+    monkeypatch.setattr(listener, "BIN", staged.parent)
+    monkeypatch.setattr(listener, "_checkout", lambda: checkout)
+    monkeypatch.setattr(listener.sysconfig, "get_path", lambda name: str(tmp_path))
+    monkeypatch.setenv("PATH", str(on_path.parent))
+    monkeypatch.delenv("GF_SERVER_BIN", raising=False)
+
+    os.utime(source, (time.time() - 60, time.time() - 60))
+    assert listener.binary() == staged
+    # A source edited after the staging makes the staged server stale.
+    os.utime(source, None)
+    os.utime(staged, (time.time() - 60, time.time() - 60))
+    assert listener.binary() == on_path
+    explicit = program(tmp_path / "explicit" / "gf-server")
+    monkeypatch.setenv("GF_SERVER_BIN", str(explicit))
+    assert listener.binary() == explicit
+    monkeypatch.setenv("GF_SERVER_BIN", str(tmp_path / "missing"))
+    with pytest.raises(Exception, match="GF_SERVER_BIN names no program"):
+        listener.binary()
+    monkeypatch.delenv("GF_SERVER_BIN")
+    monkeypatch.setattr(listener, "_checkout", lambda: None)
+    assert listener.binary() == staged
