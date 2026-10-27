@@ -266,7 +266,7 @@ def profiles_in_use(
     return "default" in Profile.load_all(config_path, environ=env, missing_ok=True)
 
 
-def _origin_of(url: str) -> str:
+def origin_of(url: str) -> str:
     parsed = urlsplit(url)
     return f"{parsed.scheme}://{(parsed.hostname or '').lower()}:{parsed.port or ''}"
 
@@ -400,7 +400,7 @@ class ConnectionSettings:
             )
         )
         home = env.get("GF_URL") or DEFAULT_SERVER
-        if ambient and _origin_of(resolved.url) != _origin_of(home):
+        if ambient and origin_of(resolved.url) != origin_of(home):
             # An ambient key is for its own server, never this endpoint.
             return cls(selected, resolved, None, None)
         return cls(

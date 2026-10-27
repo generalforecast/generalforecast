@@ -218,3 +218,56 @@ def test_explain_of_a_local_predictor_is_its_lock_resolution(tmp_path):
     assert resolution.input_roles == ("input", "input")
     assert resolution.selection.strategy == "exact"
     assert Path(root / "gf.lock").is_file()
+
+
+def test_a_served_predictor_never_receives_an_ambient_hosted_key(monkeypatch):
+    import http.server
+    import threading
+
+    seen: list[str | None] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen.append(self.headers.get("Authorization"))
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            self.send_response(500)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error": {"code": "InternalError", "message": "x"}}')
+
+        do_GET = do_POST
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    monkeypatch.delenv("GF_URL", raising=False)
+    monkeypatch.delenv("GF_TOKEN", raising=False)
+    monkeypatch.setenv("GF_API_KEY", "gf_hosted_secret_key_0123456789abcdef")
+
+    def call(**options):
+        with pytest.raises(gf.Error):
+            gf.Predictor(f"{url}/churn", **options).predict([{"x": 1}])
+        assert len(set(seen)) == 1, seen
+        sent = seen[0]
+        seen.clear()
+        return sent
+
+    try:
+        # A hosted key in the environment belongs to the hosted service.
+        assert call() is None
+        monkeypatch.setenv("GF_TOKEN", "gf_token_secret_0123456789abcdefgh")
+        assert call() is None
+        # Given for this server, or GF_URL naming it, the key goes.
+        assert call(api_key="gf_serve_key_0123456789abcdefgh") == (
+            "Bearer gf_serve_key_0123456789abcdefgh"
+        )
+        monkeypatch.setenv("GF_URL", url)
+        assert call() == "Bearer gf_hosted_secret_key_0123456789abcdef"
+    finally:
+        server.shutdown()
+    # Plain HTTP goes to loopback alone.
+    with pytest.raises(gf.Error):
+        gf.Predictor("http://example.com/churn").predict([{"x": 1}])

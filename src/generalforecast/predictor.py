@@ -806,7 +806,9 @@ class Predictor:
         client: The hosted client to use; one from the profile if None.
         download: Whether a model's files may download if not cached.
         project: A served predictor's project; `local` if None.
-        api_key: A served predictor's key; `GF_API_KEY` if None.
+        api_key: A served predictor's key. When None, a served predictor is
+            called without one, unless GF_URL names its origin and
+            GF_API_KEY holds that server's key.
     """
 
     def __init__(
@@ -1219,16 +1221,33 @@ class Predictor:
     # -- served HTTP --------------------------------------------------------
 
     def _served_transport(self) -> Any:
-        """The SDK transport to a `gf serve`, with its key, made once."""
-        if self._transport is None:
-            from generalforecast.transport import Transport, credential_from_env
+        """The SDK transport to a `gf serve`, with its key, made once.
 
-            key = self._api_key
-            if key is None:
-                value, _ = credential_from_env()
-                key = value or None
+        The connection resolves as every SDK connection does
+        (`ConnectionSettings.resolve`): HTTPS except on loopback, and a key
+        only when `api_key` gives one, or when GF_URL names this very
+        origin and GF_API_KEY is its key. An ambient hosted key never goes
+        to another server.
+        """
+        if self._transport is None:
+            from generalforecast.transport import (
+                ConnectionSettings,
+                Transport,
+                endpoint,
+                origin_of,
+            )
+
             with boundary():
-                self._transport = Transport(self._base, token=key, timeout=120)
+                base = endpoint(self._base)
+                ambient = os.environ.get("GF_URL")
+                owned = ambient is not None and origin_of(ambient) == origin_of(base)
+                settings = ConnectionSettings.resolve(
+                    base_url=base,
+                    api_key=self._api_key,
+                    project=self._project,
+                    key_env="GF_API_KEY" if owned and self._api_key is None else None,
+                )
+                self._transport = Transport(base, token=settings.token, timeout=120)
         return self._transport
 
     def _served_post(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
