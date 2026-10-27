@@ -1132,15 +1132,29 @@ class Predictor:
         """
         table = tabular.frame(queries)
         cap = self._query_cap()
-        if table.num_rows <= cap:
+        if table.num_rows <= cap and self._kind in ("local", "catalog"):
             return self._predict_once(table, context, as_of=as_of)
         import pandas as pd
 
+        series = self._series_columns()
         parts, order = [], []
-        for rows in _query_batches(table, self._series_columns(), cap):
-            parts.append(self._predict_once(table.take(rows), context, as_of=as_of))
+        pending = list(reversed(_query_batches(table, series, cap)))
+        while pending:
+            rows = pending.pop()
+            try:
+                parts.append(self._predict_once(table.take(rows), context, as_of=as_of))
+            except Error as error:
+                # A reply past the SDK's response bound comes back as a
+                # protocol error; half as many rows answer in half the bytes.
+                halves = _query_batches(
+                    table.take(rows), series, max(1, len(rows) // 2)
+                )
+                if error.code != "ProtocolError" or len(halves) < 2:
+                    raise
+                pending.extend(reversed([rows[half] for half in halves]))
+                continue
             order.append(rows)
-        frame = pd.concat(parts, ignore_index=True)
+        frame = parts[0] if len(parts) == 1 else pd.concat(parts, ignore_index=True)
         placed = np.empty(table.num_rows, dtype=np.int64)
         placed[np.concatenate(order)] = np.arange(table.num_rows)
         return frame.iloc[placed].reset_index(drop=True)

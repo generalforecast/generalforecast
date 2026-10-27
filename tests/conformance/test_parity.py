@@ -362,17 +362,8 @@ def test_every_path_predicts_the_same_and_knows_the_same_lock(
     hosted_frame = _frame_of_result({"predictions": hosted.to_pylist()}, plan.spec.id)
 
     server = Served(build(), str(root))
-    pending = None
     try:
-        try:
-            served_rows = _predicted(server, case, queries, context)
-        except AssertionError as refused:
-            # gf-server's binder types a request context from the lock's
-            # kinds, which a lock checked without rows lacks; its fix lands
-            # with gf-server's (P1). Every Python path still must agree.
-            if case != "request" or "features differ from lock" not in str(refused):
-                raise
-            served_rows, pending = [], "gf serve refuses a kindless request lock (P1)"
+        served_rows = _predicted(server, case, queries, context)
         described = json.loads((server.directory / "models.json").read_text())[0][
             "predictor"
         ]
@@ -408,8 +399,112 @@ def test_every_path_predicts_the_same_and_knows_the_same_lock(
     for name, frame in (
         ("cli", command),
         ("hosted", hosted_frame),
-        *(() if pending else (("served", served_frame),)),
+        ("served", served_frame),
     ):
         _same(_outputs(frame), expected, name)
-    if pending:
-        pytest.xfail(pending)
+
+
+# Hand edits to a checked lock, each re-digested so the lock is
+# self-consistent; every entry point must refuse every one alike.
+def _forge(root: Path, change: Any) -> None:
+    from generalforecast.predictors.lock import lock_digest
+
+    document = yaml.safe_load((root / "gf.lock").read_text())
+    change(document)
+    if document.get("lock_version") == 2:
+        document["digest"] = lock_digest(document)
+    (root / "gf.lock").write_text(yaml.safe_dump(document, sort_keys=False))
+
+
+FORGERIES = {
+    "selection past the cap": lambda d: d["predictor"]["selection"].update(core=10**9),
+    "selection seed": lambda d: d["predictor"]["selection"].update(seed=99),
+    "outputs narrowed": lambda d: d["predictor"].update(outputs=["label"]),
+    "input kind": lambda d: d["predictor"]["inputs"][0].update(
+        type="text" if d["predictor"]["inputs"][0]["type"] != "text" else "category"
+    ),
+    "classes": lambda d: d["predictor"].update(classes=[0, 1, 2]),
+    "resources": lambda d: d.update(resources={"accelerator": "L4"}),
+    "context rows": lambda d: d["predictor"]["context"].update(rows=3),
+    "version 1": lambda d: d.update(lock_version=1),
+}
+
+
+@pytest.mark.parametrize("forgery", list(FORGERIES))
+def test_every_entry_point_refuses_a_forged_lock(tmp_path, monkeypatch, forgery):
+    from generalforecast.predictors import verified
+    from generalforecast.predictors.validation import PredictorError
+    from generalforecast.service.contracts import ServiceError
+
+    monkeypatch.setattr(serve_models, "checkpoint", lambda *a, **k: None)
+    root = _directory(tmp_path / "classifier", "classifier")
+    _forge(root, FORGERIES[forgery])
+    with pytest.raises(gf.InvalidInput):
+        verified(load(root), root)
+    for flag in ("--frozen", "--locked"):
+        with pytest.raises(SystemExit) as exited:
+            cli.main(["check", flag, "-q", str(root)])
+        assert exited.value.code != 0
+    with pytest.raises(PredictorError):
+        serve_models.served(str(root), tmp_path / "entry")
+    with pytest.raises(ServiceError):
+        pushed(root)
+    with pytest.raises(gf.InvalidInput):
+        gf.Predictor(root)
+
+
+def test_any_number_of_series_and_queries_predict_alike_past_one_call(tmp_path, engine):
+    """2,100 series, 10,500 queries: past one call's bound, every path agrees.
+
+    gf.Predictor in process, a gf serve reached through gf.Predictor(url)
+    and hosted serving each split the queries into calls of at most
+    `MAX_QUERIES` rows, every series whole within one.
+    """
+    from generalforecast.contracts import MAX_QUERIES
+    from generalforecast.predictor import _query_batches
+
+    columns: dict[str, list] = {"sku": [], "date": [], "units": []}
+    for sku in range(2100):
+        for step in range(12 + sku % 3):
+            columns["sku"].append(f"s{sku:04d}")
+            columns["date"].append(START + datetime.timedelta(days=step))
+            columns["units"].append(
+                None if step >= 7 + sku % 3 else float((sku + step) % 9)
+            )
+    root = tmp_path / "wide"
+    root.mkdir()
+    pq.write_table(pa.table(columns), root / "rows.parquet")
+    manifest = {
+        "name": "wide",
+        "model": "general-forecast/chronos-2",
+        "target": "units",
+        "time": "date",
+        "series": ["sku"],
+        "horizon": 5,
+        "context": {"snapshot": "rows.parquet"},
+    }
+    (root / "gf.yaml").write_text(yaml.safe_dump(manifest, sort_keys=False))
+    write_lock(resolve(load(root), root), root)
+    queries = _queries(root)
+    assert queries.num_rows == 10_500 > MAX_QUERIES
+
+    local = gf.Predictor(root).predict(queries)
+    sent = pushed(root)
+    plan = hosting.compile_lock(sent.lock, sent.snapshot)
+    prepared = hosting.PredictorExecutor().prepare(plan, sent.snapshot)
+    hosted = pd.concat(
+        [
+            _frame_of_result(
+                {"predictions": prepared.predict(queries.take(rows)).to_pylist()}, None
+            ).set_index(pd.Index(rows))
+            for rows in _query_batches(queries, ["sku"], MAX_QUERIES)
+        ]
+    ).sort_index()
+    server = Served(build(), str(root))
+    try:
+        served = gf.Predictor(f"{server.url}/wide").predict(queries)
+    finally:
+        server.stop()
+    expected = _outputs(local)
+    _same(_outputs(hosted.reset_index(drop=True)), expected, "hosted")
+    _same(_outputs(served), expected, "served")
