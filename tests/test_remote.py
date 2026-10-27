@@ -550,7 +550,13 @@ def test_deletes_models_and_closing_reach_the_server(server: Server) -> None:
             rows.delete([2])
 
         assert len(rows) == 28
-        assert client.models() == ["tiny", "tiny-forecaster", "tiny-regressor"]
+        # Every model the workers serve, sorted, the capped one an adaptive test reads among them.
+        assert client.models() == [
+            "tiny",
+            "tiny-capped",
+            "tiny-forecaster",
+            "tiny-regressor",
+        ]
         assert client.table("rows").outputs == 3
         assert rows.predict(NEAR_A[:0]).shape == (0, 3)
 

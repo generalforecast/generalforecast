@@ -330,6 +330,44 @@ def test_a_count_that_fails_to_compile_on_the_side_starts_again_later() -> None:
     assert [padded for padded, _ in aside] == [8, 8]
 
 
+def test_a_kind_compiles_in_its_call_again_once_its_programs_are_dropped() -> None:
+    doubled = jax.jit(lambda rows: rows * 2)
+    items = np.arange(5, dtype=np.float32).reshape(5, 1)
+    chunks = Chunks(lambda *_: None)
+    aside: list[int] = []
+    padded_counts: list[int] = []
+
+    def prepare(first: int, stop: int, padded: int) -> Call:
+        padded_counts.append(padded)
+        rows = items[first:stop]
+        stacked = np.concatenate([rows, np.repeat(rows[-1:], padded - len(rows), 0)])
+        return Call(doubled, (), (stacked,), padded)
+
+    def run(count: int) -> list[int]:
+        padded_counts.clear()
+        chunks.run(
+            "fit",
+            "key",
+            count,
+            8 << 20,
+            lambda: 1 << 20,
+            prepare,
+            lambda *_: None,
+            lambda call, done: aside.append(call.padded),
+        )
+        return padded_counts
+
+    run(2)
+    assert chunks.ran("key")
+    chunks.forget_counts()
+
+    # Nothing compiled is left for the kind, so it neither waits on a count
+    # it no longer has nor sends its own count to the side.
+    assert not chunks.ran("key")
+    assert run(5) == [8]
+    assert aside == []
+
+
 @pytest.mark.parametrize(
     ("analysis", "flops"),
     [

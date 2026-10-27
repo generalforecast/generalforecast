@@ -1,11 +1,14 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The gf command table: groups, commands, admin nouns and their help text.
+"""The gf command table: groups, commands, admin nouns, their actions and defaults.
 
-Kept free of heavy imports so `gf --help` and argument errors stay fast.
+The parser, the dispatcher and the renderer all read these tables, so a noun
+or an action is named in exactly one place. Kept free of heavy imports so
+`gf --help` and argument errors stay fast.
 """
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -43,7 +46,7 @@ COMMANDS = tuple(name for _, names in GROUPS for name in names)
 
 MODEL_ACTIONS: tuple[tuple[str, str], ...] = (
     ("list", "List catalog models, newest first"),
-    ("show", "Show one model's task, limits and files"),
+    ("show", "Show one model's task and limits"),
     ("pull", "Download a model's weights to the cache"),
 )
 
@@ -54,7 +57,104 @@ CONTEXT_ACTIONS: tuple[tuple[str, str], ...] = (
     ("show", "Show a live context"),
 )
 
-# `gf admin <noun> <action>`: everything an operator needs and a user rarely does.
+# Where `gf serve` listens: the Models API over HTTP.
+SERVE_HOST = "127.0.0.1"
+SERVE_PORT = 8000
+# Where a node or a router listens: tables over Arrow Flight.
+TABLE_PORT = 8815
+# The hosted environment a command uses when none is named.
+DEFAULT_ENV = "production"
+# Seconds `push`, `promote` and `rollback` wait for an environment to be ready.
+READY_SECONDS = 600.0
+# The files `gf admin node init` and `gf admin router init` write by default.
+NODE_CONFIG = "generalforecast.toml"
+NODE_DATA = "gf-data"
+ROUTER_CONFIG = "router.toml"
+
+
+@dataclass(frozen=True)
+class AdminAction:
+    """One `gf admin <noun> <action>`.
+
+    `target` names what the NAME argument is, or is None for an action that
+    takes none. An action with a `body` reads its request from `--file`; one
+    without takes no file. A `destructive` action asks before it runs unless
+    `--yes`.
+    """
+
+    name: str
+    help: str
+    target: str | None = None
+    body: bool = False
+    destructive: bool = False
+
+
+# `gf admin <noun> <action>` over the API: everything an operator needs and a
+# user rarely does.
+ADMIN_ACTIONS: dict[str, tuple[AdminAction, ...]] = {
+    "key": (
+        AdminAction("list", "List API keys"),
+        AdminAction("create", "Create an API key from --file", body=True),
+        AdminAction("revoke", "Revoke an API key", target="key id", destructive=True),
+        AdminAction("rotate", "Rotate an API key", target="key id", destructive=True),
+    ),
+    "secret": (
+        AdminAction("list", "List secrets"),
+        AdminAction("get", "Show one secret's metadata", target="secret"),
+        AdminAction("create", "Create a secret from --file", body=True),
+        AdminAction(
+            "rotate", "Rotate a secret from --file", target="secret", body=True
+        ),
+        AdminAction("delete", "Delete a secret", target="secret", destructive=True),
+    ),
+    "workspace": (AdminAction("get", "Show the workspace"),),
+    "project": (
+        AdminAction("list", "List projects"),
+        AdminAction("create", "Create a project from --file", body=True),
+    ),
+    "organization": (
+        AdminAction("list", "List organizations"),
+        AdminAction("create", "Create an organization from --file", body=True),
+    ),
+    "membership": (
+        AdminAction("list", "List members"),
+        AdminAction("add", "Add a member from --file", body=True),
+        AdminAction(
+            "remove", "Remove a member named in --file", body=True, destructive=True
+        ),
+    ),
+    "sso": (
+        AdminAction("get", "Show the single sign-on settings"),
+        AdminAction("configure", "Configure single sign-on from --file", body=True),
+    ),
+    "audit": (AdminAction("list", "List audit events"),),
+    "operator": (AdminAction("doctor", "Check operator health"),),
+    "source": (
+        AdminAction("list", "List pinned sources"),
+        AdminAction("pin", "Pin a source from --file", body=True),
+    ),
+}
+
+# The request field an action's NAME fills, per noun.
+NAME_FIELDS = {"key": "id", "secret": "name"}
+
+# Admin nouns that start a server on this machine, and their actions.
+ADMIN_SERVE_ACTIONS: dict[str, tuple[tuple[str, str], ...]] = {
+    "node": (
+        ("init", "Write a node's configuration file"),
+        ("check", "Check a node's configuration without serving"),
+        ("serve", "Serve a node from its configuration"),
+    ),
+    "router": (
+        ("init", "Write a router's configuration file"),
+        ("check", "Check a router's configuration and reach its nodes"),
+        ("serve", "Route clients to nodes from its configuration"),
+    ),
+}
+
+# Admin nouns that act on hosted predictors rather than API collections.
+ADMIN_PREDICTOR_NOUNS = ("logs", "diff", "delete")
+
 ADMIN_HELP = {
     "key": "API keys",
     "secret": "Project secrets",
@@ -66,8 +166,8 @@ ADMIN_HELP = {
     "audit": "Audit log",
     "operator": "Operator diagnostics",
     "source": "Pinned data sources",
-    "node": "Serve a node of a hosted cluster",
-    "router": "Serve a router in front of nodes",
+    "node": "Serve a node of a cluster",
+    "router": "Route clients to the nodes of a cluster",
     "logs": "Show an environment's logs",
     "diff": "Compare a predictor with a revision",
     "delete": "Delete a hosted predictor",
@@ -75,63 +175,11 @@ ADMIN_HELP = {
 
 ADMIN_NOUNS = tuple(ADMIN_HELP)
 
-# API-backed admin nouns and their actions, each with one help line.
-ADMIN_ACTIONS: dict[str, tuple[tuple[str, str], ...]] = {
-    "key": (
-        ("list", "List API keys"),
-        ("create", "Create an API key from --file"),
-        ("revoke", "Revoke an API key"),
-        ("rotate", "Rotate an API key"),
-    ),
-    "secret": (
-        ("list", "List secrets"),
-        ("get", "Show one secret's metadata"),
-        ("create", "Create a secret from --file"),
-        ("rotate", "Rotate a secret"),
-        ("delete", "Delete a secret"),
-    ),
-    "workspace": (("get", "Show the workspace"),),
-    "project": (
-        ("list", "List projects"),
-        ("create", "Create a project from --file"),
-    ),
-    "organization": (
-        ("list", "List organizations"),
-        ("create", "Create an organization from --file"),
-    ),
-    "membership": (
-        ("list", "List members"),
-        ("add", "Add a member from --file"),
-        ("remove", "Remove a member"),
-    ),
-    "sso": (
-        ("get", "Show the single sign-on settings"),
-        ("configure", "Configure single sign-on from --file"),
-    ),
-    "audit": (("list", "List audit events"),),
-    "operator": (("doctor", "Check operator health"),),
-    "source": (
-        ("list", "List pinned sources"),
-        ("pin", "Pin a source from --file"),
-    ),
-}
 
-# Admin nouns that act on hosted predictors rather than API collections.
-ADMIN_PREDICTOR_NOUNS = ("logs", "diff", "delete")
-# Admin nouns that start a process on this machine.
-ADMIN_SERVE_NOUNS = ("node", "router")
+def admin_action(noun: str, action: str) -> AdminAction:
+    """The table entry for `gf admin <noun> <action>`."""
+    return next(spec for spec in ADMIN_ACTIONS[noun] if spec.name == action)
 
-# Actions that take no resource name.
-UNNAMED_ACTIONS = {
-    "list",
-    "create",
-    "submit",
-    "add",
-    "pin",
-    "doctor",
-    "backup",
-    "restore",
-}
 
 # -- SDK routing tables, shared with the hosted test-suite -------------
 
@@ -180,11 +228,3 @@ IDENTITY_GROUPS = {
     "sso": "sso",
     "audit": "audit",
 }
-
-
-def action_help(group: str, action: str) -> str:
-    """One line describing `gf admin <group> <action>`."""
-    for name, text in ADMIN_ACTIONS.get(group, ()):
-        if name == action:
-            return text
-    return action

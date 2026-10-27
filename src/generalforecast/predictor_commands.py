@@ -6,7 +6,8 @@
 `gf init` asks for what it cannot infer and writes `gf.yaml`. `gf check`
 resolves the manifest against the context and the model registry through
 `generalforecast.predictors` and writes `gf.lock`. The hosted commands use
-the SDK's transport and the hosted predictor routes.
+the SDK's transport and the hosted predictor routes. Each command returns
+its result for `generalforecast.render` to write.
 """
 
 from __future__ import annotations
@@ -15,8 +16,9 @@ import argparse
 import datetime
 import os
 import re
+import tempfile
 import time
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -24,11 +26,13 @@ from typing import TYPE_CHECKING, Any
 import pyarrow.compute as _compute
 
 from generalforecast import term
-from generalforecast.cli import Error
+from generalforecast.command_specs import DEFAULT_ENV
+from generalforecast.errors import AmbiguousReference, Error, InvalidInput, NotFound
 
 if TYPE_CHECKING:
     from generalforecast.predictors import Resolution
 
+# pyarrow.compute builds its kernels at import, so its stubs name none of them.
 pc: Any = _compute
 MANIFEST = "gf.yaml"
 LOCK = "gf.lock"
@@ -149,17 +153,10 @@ def predictors() -> Any:
 
 
 def predictor_class() -> Any:
-    """Session D's `generalforecast.Predictor`."""
-    try:  # contract: provided by session D
-        from generalforecast import Predictor
+    """`generalforecast.Predictor`."""
+    from generalforecast.predictor import Predictor
 
-        return Predictor
-    except (ImportError, AttributeError):
-        raise Error(
-            "Internal",
-            "the predictor runtime is not installed in this build",
-            hint="install a build with `generalforecast.Predictor`, or run `gf serve` and call it over HTTP",
-        ) from None
+    return Predictor
 
 
 # -- helpers --------------------------------------------------------------
@@ -175,15 +172,16 @@ def _shown(root: Path) -> str:
 
 
 def is_local(reference: str) -> bool:
-    """Whether a DIR|NAME argument names a directory on this machine."""
-    if reference.startswith((".", "/", "~")) or "/" in reference or "\\" in reference:
-        return not re.match(r"^https?://", reference)
+    """Whether a hosted command's DIR|NAME argument names a directory here.
+
+    A path names one; so does a bare name with a `gf.yaml` beneath it, whose
+    manifest then names the hosted predictor.
+    """
+    if re.match(r"^https?://", reference):
+        return False
+    if reference.startswith((".", "~")) or "/" in reference or os.sep in reference:
+        return True
     return (Path(reference) / MANIFEST).is_file()
-
-
-def is_url(reference: str) -> bool:
-    """Whether a reference is a `gf serve` URL."""
-    return bool(re.match(r"^https?://", reference))
 
 
 def _tables_in(root: Path) -> list[Path]:
@@ -194,13 +192,68 @@ def _tables_in(root: Path) -> list[Path]:
     )
 
 
+def _output_path(
+    text: str | None, *inputs: str | Path | None, predictor: Path | None = None
+) -> Path | None:
+    """The `--output` file, checked before any scoring.
+
+    Its directory must exist, and it must be none of the files the command
+    reads, which writing it would destroy: the queries and context it was
+    given, and a local predictor's manifest, lock and snapshot.
+    """
+    if text is None:
+        return None
+    path = Path(text).expanduser()
+    if not path.parent.is_dir():
+        raise NotFound(
+            f"cannot write `{text}`: directory `{path.parent}` does not exist",
+            param="output",
+        )
+    if path.is_dir():
+        raise InvalidInput(f"cannot write `{text}`: it is a directory", param="output")
+    read = list(inputs)
+    if predictor is not None:
+        read += [predictor / MANIFEST, predictor / LOCK]
+        snapshot = predictors().load(predictor).context.snapshot
+        if snapshot is not None:
+            read.append(predictor / snapshot)
+    for given in read:
+        if given is not None and Path(given).expanduser().resolve() == path.resolve():
+            raise InvalidInput(
+                f"--output `{text}` is also an input; it would be overwritten",
+                hint="write the scored rows to another file",
+                param="output",
+            )
+    return path
+
+
+def _mode(path: Path) -> int:
+    """The mode a written file takes: the one it replaces, else what the umask gives."""
+    if path.exists():
+        return path.stat().st_mode & 0o777
+    umask = os.umask(0)
+    os.umask(umask)
+    return 0o666 & ~umask
+
+
 def _write_frame(frame: Any, path: Path) -> None:
-    if path.suffix == ".parquet":
-        frame.to_parquet(path, index=False)
-    elif path.suffix == ".json":
-        frame.to_json(path, orient="records")
-    else:
-        frame.to_csv(path, index=False)
+    """Writes rows as their suffix says, atomically: a reader sees all or nothing."""
+    descriptor, temporary = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    try:
+        if path.suffix == ".parquet":
+            frame.to_parquet(temporary, index=False)
+        elif path.suffix == ".json":
+            frame.to_json(temporary, orient="records")
+        else:
+            frame.to_csv(temporary, index=False)
+        os.chmod(temporary, _mode(path))
+        os.replace(temporary, path)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
 
 
 # -- the commands ---------------------------------------------------------
@@ -209,34 +262,10 @@ def _write_frame(frame: Any, path: Path) -> None:
 def execute(args: argparse.Namespace, out: term.Output) -> dict | None:
     """Runs one predictor command."""
     if args.command == "serve":
-        return serve_process(args, out)
+        from generalforecast.serve import listener
+
+        listener.serve(args)
     return getattr(PredictorCommands(args, out), args.command)()
-
-
-def serve_process(args: argparse.Namespace, out: term.Output) -> dict | None:
-    """`gf serve`, `gf admin node serve` and `gf admin router serve` over `generalforecast.serve`."""
-    from generalforecast.serve.listener import run
-
-    noun = getattr(args, "noun", None)
-    namespace = argparse.Namespace(
-        target=getattr(args, "target", "."),
-        host=args.host,
-        port=args.port,
-        offline=getattr(args, "offline", False),
-        request_timeout=getattr(args, "request_timeout", 60.0),
-        upstream=getattr(args, "upstream", None) or None if noun == "router" else None,
-        node=getattr(args, "node", None) if noun == "node" else None,
-        config=getattr(args, "config", None) if noun == "node" else None,
-        init=getattr(args, "init", None) if noun == "node" else None,
-        force=getattr(args, "force", False) if noun == "node" else False,
-        check=getattr(args, "check", False) if noun == "node" else False,
-        quiet=out.quiet,
-        json=getattr(args, "json", False),
-        verbose=out.verbose,
-        timeout=getattr(args, "timeout", 40),
-    )
-    result = run(namespace)
-    return result if isinstance(result, dict) else None
 
 
 class PredictorCommands:
@@ -258,18 +287,14 @@ class PredictorCommands:
 
     @property
     def root(self) -> Path:
-        """The predictor directory."""
-        return Path(
-            getattr(self.args, "directory", None)
-            or getattr(self.args, "target", None)
-            or "."
-        )
+        """The predictor directory a DIR argument names."""
+        return Path(self.args.directory).expanduser()
 
     def reference(self) -> tuple[str, Path | None]:
         """A DIR|NAME argument as `(hosted name, local root or None)`."""
-        target = getattr(self.args, "target", None) or "."
+        target = self.args.target
         if is_local(target):
-            root = Path(target)
+            root = Path(target).expanduser()
             return self.library.load(root).name, root
         return target, None
 
@@ -287,21 +312,16 @@ class PredictorCommands:
             payload,
         )
 
-    def confirm(self, question: str) -> bool:
-        """Asks `question [y/N]` on stderr and reads one line."""
-        import sys
-
-        self.out.err.write(f"{question} [y/N] ")
-        self.out.err.flush()
-        answer = sys.stdin.readline().strip().lower()
-        return answer in ("y", "yes")
+    def confirm(self, question: str) -> None:
+        """Asks `question [y/N]` unless `--yes`; raises `Aborted` on anything but yes."""
+        term.Prompter(self.out, yes=self.args.yes).confirm(question)
 
     # -- init -------------------------------------------------------------
 
     def init(self) -> dict:
         """Writes a predictor manifest, asking for what the context does not say."""
         args, out = self.args, self.out
-        root = Path(args.directory)
+        root = self.root
         manifest = root / MANIFEST
         if manifest.exists() and not args.force:
             raise Error(
@@ -310,7 +330,7 @@ class PredictorCommands:
                 hint="pass --force to overwrite it, or run `gf check` to validate it",
             )
         if args.context:
-            source = Path(args.context)
+            source = Path(args.context).expanduser()
             if not source.is_file():
                 raise Error(
                     "NotFound",
@@ -428,7 +448,11 @@ class PredictorCommands:
             else:
                 out.collapsed("Frequency", str(frequency))
             if horizon is None:
-                horizon = int(prompter.ask("Horizon", "7", flag="--horizon"))
+                horizon = int(
+                    prompter.ask(
+                        "Horizon", "7", flag="--horizon", check=_horizon_problem
+                    )
+                )
             else:
                 out.collapsed("Horizon", str(horizon))
 
@@ -527,13 +551,12 @@ class PredictorCommands:
             )
             if rule == "date":
                 assert time_name is not None
+                last, rows_after = _dates(_table(source).column(time_name))
                 until = prompter.ask(
                     "Until",
-                    self._last_date(source, time_name),
+                    last,
                     flag="--until",
-                    note=lambda v: term.plural(
-                        self._rows_after(source, time_name, v), "row"
-                    ),
+                    note=lambda v: term.plural(rows_after(v), "row"),
                 )
                 context["until"] = until
             elif rule == "fraction":
@@ -541,9 +564,10 @@ class PredictorCommands:
                     "Holdout",
                     _holdout_default(info.rows, cap),
                     flag="--holdout",
-                    note=lambda v: _holdout_note(_fraction(v), info.rows, cap, model),
+                    check=_fraction_problem,
+                    note=lambda v: _holdout_note(float(v), info.rows, cap, model),
                 )
-                context["holdout"] = {"fraction": _fraction(fraction), "seed": 0}
+                context["holdout"] = {"fraction": float(fraction), "seed": 0}
 
         name = (
             root.resolve().name
@@ -575,40 +599,15 @@ class PredictorCommands:
         out.status("Initialized", f"predictor {name} in {_shown(root)}/{MANIFEST}")
         return {"name": name, "path": str(path), "manifest": spec}
 
-    def _last_date(self, source: Path, column: str) -> str:
-        pc: Any = _compute
-
-        value = pc.max(_table(source).column(column)).as_py()
-        return (
-            str(value)[:10]
-            if value is not None
-            else datetime.datetime.now(tz=datetime.UTC).date().isoformat()
-        )
-
-    def _rows_after(self, source: Path, column: str, value: str) -> int:
-        pc: Any = _compute
-
-        try:
-            return int(
-                pc.sum(
-                    pc.greater_equal(
-                        _table(source).column(column).cast("string"), value
-                    )
-                ).as_py()
-                or 0
-            )
-        except Exception:  # noqa: BLE001
-            return 0
-
     # -- check ------------------------------------------------------------
 
-    def check(self, *, write: bool = True) -> dict:
+    def check(self) -> dict:
         """Resolves the manifest, prints what was inferred and writes `gf.lock`."""
         args, out = self.args, self.out
         started = time.perf_counter()
         root = self.root
         spec = self.library.load(root)
-        frozen = getattr(args, "frozen", False)
+        frozen = args.frozen
         if frozen:
             if _previous_lock(root) is None:
                 raise Error(
@@ -621,14 +620,14 @@ class PredictorCommands:
         resolution = self.library.resolve(
             spec,
             root,
-            online=getattr(args, "online", False),
-            upgrade=getattr(args, "upgrade", False),
+            online=args.online,
+            upgrade=args.upgrade,
         )
         self.print_resolution(resolution)
         out.table(self.roles(resolution, spec), indent=2)
         changes = _shown_changes(resolution.lock_changes, resolution.model)
         out.changes(changes)
-        if getattr(args, "locked", False) and changes:
+        if args.locked and changes:
             raise Error(
                 "InvalidInput",
                 f"{LOCK} would change",
@@ -639,9 +638,9 @@ class PredictorCommands:
                 ),
                 hint="run `gf check` without --locked to write them",
             )
-        if getattr(args, "locked", False):
+        if args.locked:
             out.status("Verified", LOCK, seconds=time.perf_counter() - started)
-        elif write:
+        else:
             self.library.write_lock(resolution, root)
             out.status("Locked", LOCK, seconds=time.perf_counter() - started)
         return _resolution_dict(resolution)
@@ -691,8 +690,9 @@ class PredictorCommands:
     # -- eval -------------------------------------------------------------
 
     def eval(self) -> dict:
-        """Scores the query rows with the predictor and prints the metrics."""
+        """Scores the query rows with the predictor; returns the metrics."""
         args, out = self.args, self.out
+        output = _output_path(args.output, args.queries, predictor=self.root)
         predictor = predictor_class()(str(self.root))
         resolution = predictor.explain()
         context = resolution.context
@@ -708,59 +708,51 @@ class PredictorCommands:
         out.status(
             "Predicted", term.plural(rows, "row"), seconds=time.perf_counter() - started
         )
-        out.say(force=True)
-        self.metrics(evaluation.metrics)
-        if args.output:
-            _write_frame(evaluation.rows, Path(args.output))
+        if output is not None:
+            _write_frame(evaluation.rows, output)
             out.status("Wrote", args.output)
         return {"name": resolution.name, "metrics": evaluation.metrics, "rows": rows}
-
-    def metrics(self, metrics: dict[str, dict[str, float]]) -> None:
-        """The metrics table: names left, values right, one column per model, at column 14."""
-        models = list(metrics)
-        names: list[str] = []
-        for values in metrics.values():
-            for metric in values:
-                if metric not in names:
-                    names.append(metric)
-        rows = [
-            [metric, *(f"{metrics[m].get(metric, float('nan')):.3f}" for m in models)]
-            for metric in names
-        ]
-        header = (
-            ["", *(m.split("/", 1)[-1] for m in models)] if len(models) > 1 else None
-        )
-        self.out.table(
-            rows,
-            indent=LABEL_INDENT,
-            gap=3,
-            align=["<", *([">"] * len(models))],
-            header=header,
-            stream=self.out.out,
-        )
 
     # -- predict ----------------------------------------------------------
 
     def predict(self) -> dict:
-        """Scores rows with a local, served or hosted predictor."""
+        """Scores rows with a local, served, ad hoc or hosted predictor."""
+        from generalforecast.predictor import resolve_reference
+
         args, out = self.args, self.out
         reference = args.target
-        Predictor = predictor_class()
-        if is_url(reference) or is_local(reference):
-            predictor = Predictor(reference)
-        elif "/" in reference:
-            if not args.target_column:
-                raise Error(
-                    "InvalidInput",
-                    "a catalog model needs a target",
-                    hint="pass '--target C' and optionally '--inputs C,C'",
-                    param="target",
-                )
-            predictor = Predictor(
-                reference, target=args.target_column, inputs=args.inputs
+        try:
+            kind, where = resolve_reference(reference, env=args.env)
+        except AmbiguousReference:
+            raise AmbiguousReference(
+                f"`{reference}` is both a directory with gf.yaml and a hosted predictor name",
+                hint=f"pass ./{reference} for the local predictor, "
+                f"or --env {DEFAULT_ENV} for the hosted one",
+            ) from None
+        if kind == "catalog" and not args.target_column:
+            raise InvalidInput(
+                "a catalog model needs a target",
+                hint="pass '--target C' and optionally '--inputs C,C'",
+                param="target",
             )
-        else:
-            predictor = Predictor(reference, env=args.env)
+        if kind == "catalog" and args.context is None:
+            raise InvalidInput(
+                "a catalog model needs context rows",
+                hint="pass '--context FILE' with rows whose target is known",
+                param="context",
+            )
+        output = _output_path(
+            args.output,
+            args.queries,
+            args.context,
+            predictor=where if kind == "local" else None,
+        )
+        predictor = predictor_class()(
+            reference,
+            env=(args.env or DEFAULT_ENV) if kind == "hosted" else args.env,
+            target=args.target_column,
+            inputs=args.inputs,
+        )
         started = time.perf_counter()
         frame = predictor.predict(args.queries, context=args.context)
         out.status(
@@ -768,12 +760,10 @@ class PredictorCommands:
             term.plural(len(frame), "row"),
             seconds=time.perf_counter() - started,
         )
-        if args.output:
-            _write_frame(frame, Path(args.output))
+        if output is not None:
+            _write_frame(frame, output)
             out.status("Wrote", args.output)
-        else:
-            out.line(frame.to_csv(index=False).rstrip("\n"))
-        return {"rows": len(frame), "predictions": frame.to_dict(orient="records")}
+        return {"rows": len(frame), "predictions": frame}
 
     # -- hosted -----------------------------------------------------------
 
@@ -836,9 +826,9 @@ class PredictorCommands:
             ("hardware", hardware),
             ("first call", _cost_line(accelerator)),
         ]
-        out.table(plan, indent=2)
-        if not args.yes and not self.confirm("Push?"):
-            raise term.Aborted()
+        # The plan is what a confirmation answers, so it shows whenever one is asked.
+        out.table(plan, indent=2, force=not args.yes)
+        self.confirm("Push?")
         snapshot = None
         if context.get("kind") == "snapshot":
             from generalforecast.commands import upload_snapshot
@@ -884,10 +874,14 @@ class PredictorCommands:
         }
 
     def wait(self, environment: Any) -> Any:
-        """Polls the environment until it is ready."""
+        """Polls the environment until it is ready, for at most `--wait` seconds.
+
+        `--timeout` bounds each request; `--wait` bounds the whole start, which
+        a cold start of a GPU replica can take most of a minute or more.
+        """
         from generalforecast.contracts import Environment
 
-        deadline = time.monotonic() + float(getattr(self.args, "timeout", 40) or 40)
+        deadline = time.monotonic() + self.args.wait
         current = environment
         while current.status != "ready":
             if current.status in ("failed", "stopped"):
@@ -900,7 +894,7 @@ class PredictorCommands:
                 raise Error(
                     "Internal",
                     f"environment {environment.name} is not ready yet",
-                    hint=f"run `gf status {environment.predictor}` to follow it, or pass a longer '--timeout'",
+                    hint=f"run `gf status {environment.predictor}` to follow it, or pass a longer '--wait'",
                 )
             time.sleep(0.25)
             current = Environment.from_dict(
@@ -995,10 +989,7 @@ class PredictorCommands:
     def logs(self) -> dict:
         """An environment's recent log lines."""
         name, _ = self.reference()
-        result = self.call("GET", name, f"/environments/{self.args.env}/logs")
-        for line in result.get("lines", []):
-            self.out.line(str(line))
-        return result
+        return self.call("GET", name, f"/environments/{self.args.env}/logs")
 
     def diff(self) -> dict:
         """The lock changes between this directory and what an environment serves."""
@@ -1041,16 +1032,10 @@ class PredictorCommands:
     def delete(self) -> dict:
         """Deletes a hosted predictor and every environment of it."""
         name, _ = self.reference()
-        if not self.args.yes and not self.confirm(
-            f"Delete {name} and its environments?"
-        ):
-            raise term.Aborted()
+        self.confirm(f"Delete {name} and its environments?")
         result = self.call("DELETE", name)
         self.out.status("Deleted", f"predictor {name}")
         return result if isinstance(result, dict) else {"name": name, "deleted": True}
-
-
-LABEL_INDENT = term.LABEL_WIDTH
 
 
 def _from(declared: set[str], key: str) -> str:
@@ -1075,24 +1060,41 @@ def _holdout_note(fraction: float, rows: int, cap: int, model: str) -> str:
     return note
 
 
-def _fraction(text: str) -> float:
+def _fraction_problem(text: str) -> str | None:
+    """What is wrong with a typed holdout fraction, or None."""
     try:
         value = float(text)
     except ValueError:
-        raise Error(
-            "InvalidInput",
-            f"`{text}` is not a fraction",
-            hint="use a number between 0 and 1, like 0.2",
-            param="holdout",
-        ) from None
-    if not 0 < value < 1:
-        raise Error(
-            "InvalidInput",
-            f"holdout fraction {text} is out of range",
-            hint="use a number between 0 and 1, like 0.2",
-            param="holdout",
-        )
-    return value
+        return "must be a number between 0 and 1, like 0.2"
+    return None if 0 < value < 1 else "must be between 0 and 1, like 0.2"
+
+
+def _horizon_problem(text: str) -> str | None:
+    """What is wrong with a typed horizon, or None."""
+    return (
+        None
+        if text.isascii() and text.isdigit() and int(text) >= 1
+        else "must be a whole number of steps"
+    )
+
+
+def _dates(column: Any) -> tuple[str, Callable[[str], int]]:
+    """A time column's last date, and a count of its rows at or after a date.
+
+    The column is read once; the count runs on every keystroke of the prompt.
+    """
+    last = pc.max(column).as_py()
+    shown = (
+        str(last)[:10]
+        if last is not None
+        else datetime.datetime.now(tz=datetime.UTC).date().isoformat()
+    )
+    text = column.cast("string")
+
+    def after(value: str) -> int:
+        return int(pc.sum(pc.greater_equal(text, value)).as_py() or 0)
+
+    return shown, after
 
 
 def _number(value: Any) -> Any:

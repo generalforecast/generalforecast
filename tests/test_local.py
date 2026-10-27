@@ -29,6 +29,7 @@ from generalforecast.runtime.device import device_settings
 from generalforecast.runtime.memory import NoMemoryAnalysis, memory_profile
 from generalforecast.runtime.paging import DevicePool, read_context
 from generalforecast.worker import Worker
+from generalforecast.worker import admission as worker_admission
 from tests.models.conformance.cases import CASES, Case, table
 from tests.models.kumo.tiny import tiny_kumo
 from tests.models.tabicl.tiny import tiny_tabicl
@@ -896,7 +897,7 @@ def test_contexts_whose_encode_cannot_be_measured_are_checked_by_their_decode(
         raise NoMemoryAnalysis("no analysis")
 
     # Where XLA gives no measure, the decode alone decides.
-    monkeypatch.setattr(generalforecast.worker, "encode_bytes", unmeasured)
+    monkeypatch.setattr(worker_admission, "encode_bytes", unmeasured)
     assert table.predict(NEAR_A).shape == (2, 3)
 
 
@@ -912,7 +913,7 @@ def test_contexts_whose_encode_cannot_be_compiled_are_refused(
         raise RuntimeError("RESOURCE_EXHAUSTED: Failed to get configs")
 
     # An encode XLA cannot compile to measure would fail the same way when run.
-    monkeypatch.setattr(generalforecast.worker, "encode_bytes", failing)
+    monkeypatch.setattr(worker_admission, "encode_bytes", failing)
     with pytest.raises(ValueError, match="could not compile the encode"):
         table.predict(NEAR_A)
     assert client.stats.encoded == 0
@@ -2912,8 +2913,8 @@ def test_an_untimed_step_reports_no_parts_and_predicts_as_a_timed_one(
 def test_timed_parts_wait_for_the_device_work_they_start(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from generalforecast import worker as worker_module
     from generalforecast import worker_process
+    from generalforecast.worker import calls as worker_calls
 
     client = node_harness.local()
     rows = _table(client)
@@ -2923,7 +2924,7 @@ def test_timed_parts_wait_for_the_device_work_they_start(
     step = _as_frame(node.schedule())
     monkeypatch.setattr(protocol, "request", lambda header, buffers: step)
     waited: list[object] = []
-    monkeypatch.setattr(worker_module, "_block", waited.append)
+    monkeypatch.setattr(worker_calls, "_block", waited.append)
 
     worker.timers = True
     timed, _ = worker_process._answer(worker, {}, lambda: None, {"kind": "step"}, [])()
@@ -2993,7 +2994,8 @@ def test_a_record_request_samples_the_steps_stacks(
         stack: n
         for stack, n in mine.items()
         if any(
-            frame.startswith("run_apart (generalforecast/worker.py:") for frame in stack
+            frame.startswith("run_apart (generalforecast/worker/runner.py:")
+            for frame in stack
         )
     }
     assert sum(stepping.values()) > sum(mine.values()) / 2

@@ -16,8 +16,38 @@ from generalforecast.credentials import (
     key_suffix,
     server_url,
 )
-from generalforecast.service.contracts import ServiceError
+from generalforecast.errors import Unauthorized
+from generalforecast.service.contracts import (
+    WIRE_ERROR_CODES,
+    ServiceError,
+    public_code,
+    reason_of,
+)
 from generalforecast.term import Output
+
+
+def not_logged_in() -> Unauthorized:
+    """The error every command raises without a credential, as the service folds it."""
+    return Unauthorized(
+        "not logged in", reason=reason_of("NotLoggedIn"), hint="run `gf login`"
+    )
+
+
+def wire_code(error: BaseException) -> tuple[str, str | None]:
+    """An error's contract code and reason, folding a service-internal code.
+
+    A service puts one of the OpenAPI codes on the wire and moves the specific
+    name into `reason`; an error raised in this process may still carry the
+    specific name, so both read the same way here.
+    """
+    code = str(getattr(error, "code", None) or "Internal")
+    reason = getattr(error, "reason", None)
+    if code in WIRE_ERROR_CODES:
+        return code, reason
+    status = getattr(error, "status", None)
+    return public_code(code, status if isinstance(status, int) else 400), (
+        reason or reason_of(code)
+    )
 
 
 def host(server: str) -> str:
@@ -27,10 +57,6 @@ def host(server: str) -> str:
 
 def login(args: argparse.Namespace, out: Output) -> dict[str, Any]:
     """Device-code login: open the approval page, wait, store the key."""
-    if getattr(args, "profile", None) is not None or getattr(args, "key_env", None):
-        from generalforecast.commands import configured_login
-
-        return configured_login(args)
     if os.environ.get(ENV_KEY):
         # Like `gh auth login` with GH_TOKEN set: the env key wins, so verify it.
         identity = whoami(args)
@@ -44,8 +70,8 @@ def login(args: argparse.Namespace, out: Output) -> dict[str, Any]:
 
     from generalforecast.login import DeviceLogin, browser_unavailable, machine_name
 
-    server = (getattr(args, "url", None) or server_url()).rstrip("/")
-    flow = DeviceLogin(server, timeout=getattr(args, "timeout", 30))
+    server = server_url().rstrip("/")
+    flow = DeviceLogin(server, timeout=args.timeout)
     out.debug(f"POST {server}/v1/cli-logins")
     grant = flow.start(machine_name())
     code, uri = grant["user_code"], grant["verification_uri"]
@@ -120,7 +146,7 @@ def login(args: argparse.Namespace, out: Output) -> dict[str, Any]:
 
 def logout(args: argparse.Namespace, out: Output) -> dict[str, Any]:
     """Revokes the stored key on the server, then forgets it locally."""
-    server = (getattr(args, "url", None) or server_url()).rstrip("/")
+    server = server_url().rstrip("/")
     store = CredentialStore()
     saved = store.load(server)
     if saved is None:
@@ -141,13 +167,13 @@ def logout(args: argparse.Namespace, out: Output) -> dict[str, Any]:
         client = Client(
             profile=Profile(server, saved.project, key_env=None),
             token=saved.key,
-            timeout=getattr(args, "timeout", 40),
+            timeout=args.timeout,
         )
         try:
             client.identity.manage("auth.logout")
             revoked = True
         except ServiceError as error:
-            if error.code not in {"Unauthorized", "NotFound"}:
+            if wire_code(error)[0] not in {"Unauthorized", "NotFound"}:
                 raise
             out.warning(f"{host(server)} no longer accepts key {saved.suffix}")
     location = store.location(saved)
@@ -176,12 +202,12 @@ def whoami(args: argparse.Namespace) -> dict[str, Any]:
     )
     from generalforecast.login import call
 
-    if uses_profiles(args) or getattr(args, "local", False):
+    if uses_profiles(args):
         return _profile_whoami(args)
     server = server_url()
     found = CredentialStore().resolve(server)
     if found is None:
-        raise ServiceError("NotLoggedIn", "not logged in", 401)
+        raise not_logged_in()
     SEEN.add(found.key)
     CONNECTION.clear()
     CONNECTION.update(server=server, source=found.source)
@@ -192,7 +218,7 @@ def whoami(args: argparse.Namespace) -> dict[str, Any]:
     status = call(
         server,
         "/v1/auth/status",
-        timeout=getattr(args, "timeout", None) or 40,
+        timeout=args.timeout,
         token=found.key,
         project=project or "local",
     )
@@ -214,7 +240,7 @@ def whoami(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def _profile_whoami(args: argparse.Namespace) -> dict[str, Any]:
-    """Whoami for saved profiles and explicit endpoints, through the SDK."""
+    """Whoami for `GF_PROFILE`, `GF_TOKEN` or a saved default profile, through the SDK."""
     from generalforecast.commands import CONNECTION, client_for, connection_for
 
     settings = connection_for(args)
