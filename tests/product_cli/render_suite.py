@@ -90,6 +90,36 @@ CASES: tuple[Case, ...] = (
     ),
     Case("init-yes", ("init", "--yes"), cwd="init-yes/churn"),
     Case(
+        "init-forecast",
+        ("init", "--target", "units", "--task", "forecast"),
+        cwd="init-forecast/sales",
+        keys=(
+            ("Time", b"\r"),
+            ("Series", b"\r"),
+            ("Frequency", b"\r"),
+            ("Horizon", b"\x7f"),
+            ("Horizon", b"\r"),
+            ("Horizon", b"5"),
+            ("Horizon", b"\r"),
+            ("Model", b"\r"),
+            ("Id", b"\r"),
+            ("Queries", b"\r"),
+            ("Until", b"\r"),
+        ),
+    ),
+    Case(
+        "init-holdout",
+        ("init", "--target", "churned", "--id", "customer_id", "--model", TABICL),
+        cwd="init-holdout/churn",
+        keys=(
+            ("Inputs", b"\r"),
+            ("Queries", b"\r"),
+            *(("Holdout", b"\x7f") for _ in range(7)),
+            *(("Holdout", key.encode()) for key in "0.03"),
+            ("Holdout", b"\r"),
+        ),
+    ),
+    Case(
         "init-flags",
         (
             "init",
@@ -221,6 +251,20 @@ def write_fixtures(root: Path) -> None:
         fresh = root / name / "churn" if name != "fresh" else root / name
         fresh.mkdir(parents=True)
         _write_csv(fresh / "context.csv", header, rows)
+    labelled = root / "init-holdout" / "churn"
+    labelled.mkdir(parents=True)
+    _write_csv(labelled / "context.csv", *_churn_rows(queries=0))
+    series = root / "init-forecast" / "sales"
+    series.mkdir(parents=True)
+    _write_csv(
+        series / "context.csv",
+        ["date", "store", "units"],
+        [
+            [f"2025-01-{day:02d}", store, day * 2 + (store == "a")]
+            for day in range(1, 31)
+            for store in ("a", "b")
+        ],
+    )
 
     typo = root / "typo"
     typo.mkdir()
@@ -471,7 +515,7 @@ class FakePredictor:
     def predict(self, queries: Any, context: Any = None, *, as_of: Any = None) -> Any:
         import pandas as pd
 
-        from generalforecast.cli import Error
+        from generalforecast.errors import Error
 
         if self.env is not None:
             raise Error(
@@ -666,8 +710,8 @@ def install_fakes(case: Case, fixtures: Path) -> None:
     )
 
 
-def run_case(name: str, fixtures: Path) -> None:
-    """Child side: fakes in, then `gf <argv>` in the fixture directory."""
+def run_case(name: str, fixtures: Path, *, json: bool = False) -> None:
+    """Child side: fakes in, then `gf <argv>` in the fixture directory, `--json` first if asked."""
     case = next(c for c in CASES if c.name == name)
     os.chdir(fixtures / case.cwd)
     os.environ.update(case.env)
@@ -675,7 +719,7 @@ def run_case(name: str, fixtures: Path) -> None:
 
     install_fakes(case, fixtures)
     try:
-        cli.main(list(case.argv))
+        cli.main(["--json", *case.argv] if json else list(case.argv))
     except SystemExit as error:
         sys.stdout.flush()
         sys.stderr.flush()
@@ -934,9 +978,10 @@ def main() -> None:
     parser.add_argument("--png", action="store_true")
     parser.add_argument("--case")
     parser.add_argument("--fixtures")
+    parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     if args.case:
-        run_case(args.case, Path(args.fixtures))
+        run_case(args.case, Path(args.fixtures), json=args.json)
         return
     if not args.outdir:
         parser.error("an output directory is required")

@@ -5,33 +5,20 @@
 
 import os
 import pty
-import select
 import signal
 import socket
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 
 from generalforecast import protocol
+from tests.serve.processes import assert_exited as _assert_exited
+from tests.serve.processes import children as _children
 
 ROOT = Path(__file__).resolve().parents[2]
-
-
-def _children(pid):
-    listed = subprocess.run(
-        ["pgrep", "-P", str(pid)], capture_output=True, text=True, check=False
-    )
-    return [int(child) for child in listed.stdout.split()]
-
-
-def _assert_exited(pids):
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if not any(Path(f"/proc/{pid}").exists() for pid in pids):
-            return
-        time.sleep(0.1)
-    raise AssertionError(f"workers still running: {pids}")
 
 
 def _assert_quiet(stderr):
@@ -43,9 +30,14 @@ def _assert_quiet(stderr):
     assert not noisy, stderr
 
 
-def test_a_worker_ignores_sigint_and_exits_when_its_socket_closes(tmp_path):
-    path = tmp_path / "worker.sock"
-    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+def test_a_worker_ignores_sigint_and_exits_when_its_socket_closes():
+    # A socket path holds at most 104 bytes on macOS, which pytest's own
+    # temporary directories outgrow; the system's is short enough.
+    with (
+        tempfile.TemporaryDirectory(prefix="gfsock") as short,
+        socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener,
+    ):
+        path = Path(short) / "worker.sock"
         listener.bind(str(path))
         listener.listen(1)
         worker = subprocess.Popen(
@@ -137,26 +129,42 @@ def test_ctrl_c_while_the_workers_start_stops_them_and_exits_zero(tmp_path):
     _assert_exited(workers)
 
 
+def _drain(fd):
+    """Reads a pty's output as it comes, until the last writer closes it.
+
+    A terminal is read while the program runs; macOS discards what is left
+    unread on the pty once its last writer exits, where Linux keeps it.
+    """
+    shown = bytearray()
+
+    def read():
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+            except OSError:
+                return
+            if not chunk:
+                return
+            shown.extend(chunk)
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    return reader, shown
+
+
 def test_a_terminal_sees_one_stopped_line(tmp_path):
     parent, child = pty.openpty()
     try:
         server, process = _server(tmp_path, stdout=child)
     finally:
         os.close(child)
+    reader, shown = _drain(parent)
     _wait_healthy(server, process)
     os.killpg(process.pid, signal.SIGINT)
     assert process.wait(120) == 0
-    shown = b""
-    while select.select([parent], [], [], 1)[0]:
-        try:
-            chunk = os.read(parent, 4096)
-        except OSError:
-            break
-        if not chunk:
-            break
-        shown += chunk
+    reader.join(30)
     os.close(parent)
-    lines = shown.decode().replace("\r\n", "\n").splitlines()
+    lines = bytes(shown).decode().replace("\r\n", "\n").splitlines()
     assert len(lines) == 1, lines
     assert lines[0].startswith("\x1b[1;32m     Stopped\x1b[0m after "), lines
     _assert_quiet(process.stderr.read())

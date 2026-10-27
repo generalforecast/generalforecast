@@ -1,20 +1,103 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Renders a command's result for a person.
+"""Writes a command's result: for a person, or as one JSON object under `--json`.
 
-Commands that stream status lines print as they go; this module draws the
-results that are tables or records: `whoami`, `status`, `model list`,
-`model show`, `context show` and the `admin` collections.
+Commands print status lines on stderr as they go and return their result;
+this module is the only writer of results on stdout. `emit` prints the
+result as JSON, `render` draws it for a person: the scored rows of
+`predict`, the metrics of `eval`, log lines, and the tables and records of
+`whoami`, `status`, `model`, `context` and `admin`.
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
+import math
+import os
+import re
+import sys
+from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
 from generalforecast import term
+from generalforecast.command_specs import ADMIN_PREDICTOR_NOUNS, ADMIN_SERVE_ACTIONS
+
+# Response fields whose values are credentials, whatever the endpoint.
+_SECRET_FIELD = re.compile(
+    r"(?i)(token|password|secret_value|credential_value|authorization|private_key)"
+)
+# Environment variables that hold credentials, redacted wherever they appear.
+_SECRET_ENVS = (
+    "GF_API_KEY",
+    "GF_TOKEN",
+    "GF_PLATFORM_TOKEN",
+    "GF_MODAL_KEY",
+    "GF_MODAL_SECRET",
+)
+
+
+def jsonable(value: Any) -> Any:
+    """`value` as plain JSON values.
+
+    A data frame becomes its records, numpy scalars and paths their Python
+    values, dates ISO strings, and a float JSON cannot hold, such as an
+    undefined metric's NaN, becomes null.
+    """
+    if isinstance(value, dict):
+        return {str(key): jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [jsonable(item) for item in value]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (str, int, bool)) or value is None:
+        return value
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (datetime.date, datetime.datetime, datetime.time)):
+        return value.isoformat()
+    pandas = sys.modules.get("pandas")
+    if pandas is not None and isinstance(value, pandas.DataFrame):
+        return jsonable(value.to_dict(orient="records"))
+    if pandas is not None and value is pandas.NaT:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if hasattr(value, "item") and type(value).__module__ == "numpy":
+        return jsonable(value.item())
+    raise TypeError(f"{type(value).__name__} is not a result value")
+
+
+def redact(value: Any) -> Any:
+    """Removes secret response fields and known credential values."""
+    from generalforecast.credentials import SEEN
+
+    if isinstance(value, dict):
+        return {
+            redact(key): "[redacted]" if _SECRET_FIELD.search(key) else redact(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    if isinstance(value, str):
+        values = SEEN | {os.environ.get(env, "") for env in _SECRET_ENVS}
+        for secret in sorted(values, key=len, reverse=True):
+            if secret:
+                value = value.replace(secret, "[redacted]")
+        return value
+    return value
+
+
+def emit(value: dict, *, error: bool = False) -> None:
+    """One JSON object on stdout (results) or stderr (errors)."""
+    print(
+        json.dumps(redact(jsonable(value)), allow_nan=False, ensure_ascii=False),
+        file=sys.stderr if error else sys.stdout,
+        flush=True,
+    )
 
 
 def render(args: argparse.Namespace, result: Any, out: term.Output) -> None:
@@ -36,7 +119,7 @@ def _scalar(value: Any) -> str:
     if isinstance(value, float):
         return f"{value:g}"
     if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False)
+        return json.dumps(jsonable(value), ensure_ascii=False)
     return str(value)
 
 
@@ -82,7 +165,6 @@ def _whoami(args: argparse.Namespace, result: dict, out: term.Output) -> None:
         (label, _scalar(result[key]))
         for key, label in (
             ("email", "account"),
-            ("account", "account"),
             ("workspace", "workspace"),
             ("project", "project"),
             ("server", "server"),
@@ -112,31 +194,22 @@ def _status(args: argparse.Namespace, result: dict, out: term.Output) -> None:
 
 
 def _model(args: argparse.Namespace, result: dict, out: term.Output) -> None:
+    def row(model: dict) -> dict:
+        limits = model.get("limits") or {}
+        return {
+            "model": model.get("id"),
+            "task": model.get("task"),
+            "context rows": limits.get("context_rows"),
+            "queries": limits.get("queries"),
+            "inputs": limits.get("inputs"),
+            "cached": model.get("cached"),
+        }
+
     if args.action == "list":
-        rows = [
-            {
-                "model": m["id"],
-                "task": m["task"],
-                "context rows": m["limits"]["context_rows"],
-                "queries": m["limits"]["queries"],
-                "inputs": m["limits"]["inputs"],
-                "cached": m["cached"],
-            }
-            for m in result.get("models", [])
-        ]
-        records(rows, out)
+        records([row(m) for m in result.get("models", [])], out)
     elif args.action == "show":
-        limits = result.get("limits", {})
         out.fields(
-            [
-                ("model", result["id"]),
-                ("task", result["task"]),
-                ("context rows", _scalar(limits.get("context_rows"))),
-                ("queries", _scalar(limits.get("queries"))),
-                ("inputs", _scalar(limits.get("inputs"))),
-                ("cached", _scalar(result.get("cached"))),
-            ],
-            indent=0,
+            [(key, _scalar(value)) for key, value in row(result).items()], indent=0
         )
 
 
@@ -145,16 +218,73 @@ def _context(args: argparse.Namespace, result: dict, out: term.Output) -> None:
         generic(result, out)
 
 
-def _admin(args: argparse.Namespace, result: dict, out: term.Output) -> None:
-    if args.noun in ("node", "router", "logs", "diff", "delete"):
+def metrics(result: dict, out: term.Output) -> None:
+    """The metrics table: names left, values right, one column per model, at column 14."""
+    table = result.get("metrics") or {}
+    models = list(table)
+    names: list[str] = []
+    for values in table.values():
+        for metric in values:
+            if metric not in names:
+                names.append(metric)
+
+    def cell(value: Any) -> str:
+        return f"{value:.3f}" if isinstance(value, (int, float)) else "-"
+
+    rows = [[metric, *(cell(table[m].get(metric)) for m in models)] for metric in names]
+    header = ["", *(m.split("/", 1)[-1] for m in models)] if len(models) > 1 else None
+    out.say()
+    out.table(
+        rows,
+        indent=term.LABEL_WIDTH,
+        gap=3,
+        align=["<", *([">"] * len(models))],
+        header=header,
+        stream=out.out,
+    )
+
+
+def _eval(args: argparse.Namespace, result: dict, out: term.Output) -> None:
+    metrics(result, out)
+
+
+def _predict(args: argparse.Namespace, result: dict, out: term.Output) -> None:
+    frame = result.get("predictions")
+    if args.output or frame is None:
         return
-    generic(result, out)
+    text = frame.to_csv(index=False) if hasattr(frame, "to_csv") else ""
+    for line in text.rstrip("\n").split("\n"):
+        out.line(line)
 
 
-_HANDLERS = {
+def _logs(args: argparse.Namespace, result: dict, out: term.Output) -> None:
+    for line in result.get("lines", []):
+        out.line(str(line))
+
+
+def _serving(args: argparse.Namespace, result: dict, out: term.Output) -> None:
+    for line in result.get("checks", []):
+        out.line(str(line))
+    steps = result.get("next") or []
+    for index, step in enumerate(steps):
+        out.line(f"{'next: ' if index == 0 else '      '}{step}")
+
+
+def _admin(args: argparse.Namespace, result: dict, out: term.Output) -> None:
+    if args.noun == "logs":
+        _logs(args, result, out)
+    elif args.noun in ADMIN_SERVE_ACTIONS:
+        _serving(args, result, out)
+    elif args.noun not in ADMIN_PREDICTOR_NOUNS:
+        generic(result, out)
+
+
+_HANDLERS: dict[str, Callable[[argparse.Namespace, dict, term.Output], None]] = {
     "whoami": _whoami,
     "status": _status,
     "model": _model,
     "context": _context,
+    "eval": _eval,
+    "predict": _predict,
     "admin": _admin,
 }

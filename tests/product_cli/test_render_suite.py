@@ -151,12 +151,13 @@ def test_eval_table(suite):
         "             log loss   0.187",
         "             auroc      0.961",
     ]
-    assert lines(suite, "eval-models")[3:] == [
+    assert lines(suite, "eval-models")[2:] == [
+        "       Wrote scored.parquet",
+        "",
         "                        tabicl-v2-classifier   mitra-2-classifier",
         "             accuracy                  0.934                0.921",
         "             log loss                  0.187                0.203",
         "             auroc                     0.961                0.948",
-        "       Wrote scored.parquet",
     ]
 
 
@@ -223,3 +224,65 @@ def test_a_prompt_is_ready_only_when_its_frame_is_whole():
     assert not ready(b"Until        2025-01-28", "Until")
     assert ready(b"Push? [y/N] ", "Push?")
     assert not ready(b"Push? [y/", "Push?")
+
+
+def test_every_command_under_json_prints_one_parseable_object(tmp_path):
+    """`--json` puts exactly one JSON object on stdout, or one error object on stderr."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from generalforecast.service.contracts import WIRE_ERROR_CODES
+    from tests.product_cli import render_suite
+
+    fixtures = tmp_path / "fixtures"
+    render_suite.write_fixtures(fixtures)
+    environment = {**os.environ, "PYTHONPATH": str(render_suite.ROOT)}
+    for case in CASES:
+        if case.name.startswith("help"):
+            continue
+        done = subprocess.run(
+            [
+                sys.executable,
+                render_suite.__file__,
+                "--case",
+                case.name,
+                "--fixtures",
+                str(fixtures),
+                "--json",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=300,
+            check=False,
+        )
+        if done.returncode == 0:
+            assert done.stdout.count("\n") == 1, (case.name, done.stdout)
+            assert isinstance(json.loads(done.stdout), dict), case.name
+            continue
+        assert done.stdout == "", (case.name, done.stdout)
+        error = json.loads(done.stderr.strip().splitlines()[-1])["error"]
+        assert error["code"] in WIRE_ERROR_CODES, (case.name, error)
+        assert error["message"], case.name
+
+
+def test_init_asks_nothing_it_cannot_offer_and_takes_only_good_values(suite):
+    forecast = lines(suite, "init-forecast")
+    assert forecast[2:9] == [
+        "Target       units",
+        "Task         forecast  from --task",
+        "Time         date",
+        "Series       store",
+        "Frequency    1d",
+        "Horizon      5",
+        "Model        general-forecast/chronos-2",
+    ]
+    assert "Inputs       none" in forecast
+    assert "Until        2025-01-30  2 rows" in forecast
+    assert forecast[-1] == " Initialized predictor sales in ./gf.yaml"
+    holdout = lines(suite, "init-holdout")
+    assert "Holdout      0.03  62 rows" in holdout
+    assert holdout[-1] == " Initialized predictor churn in ./gf.yaml"

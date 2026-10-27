@@ -172,8 +172,8 @@ fn init(
     if starter.key_file.is_none() {
         steps.push("export GF_LOG_KEY=$(openssl rand -hex 32)".to_string());
     }
-    steps.push(format!("gf serve --check --config {}", path.display()));
-    steps.push(format!("gf serve --config {}", path.display()));
+    steps.push(format!("gf admin node check --config {}", path.display()));
+    steps.push(format!("gf admin node serve --config {}", path.display()));
     for (index, step) in steps.iter().enumerate() {
         println!("{}{step}", if index == 0 { "next: " } else { "      " });
     }
@@ -416,10 +416,18 @@ fn served_names(front: &Front) -> String {
         .join(", ")
 }
 
+/// Whether stdout gets status lines for a person rather than NDJSON events:
+/// a terminal does, unless `GF_EVENTS=json` asks for the events anyway, as
+/// `gf serve --json` does.
+fn for_person() -> bool {
+    std::io::stdout().is_terminal()
+        && std::env::var_os("GF_EVENTS").is_none_or(|value| value != "json")
+}
+
 /// Writes one NDJSON event on stdout, as `gf serve` reports its progress.
 /// Says the Models API is up: a status line on a terminal, else a JSON event.
 fn ready(names: &str, url: &str) {
-    if !std::io::stdout().is_terminal() {
+    if !for_person() {
         event(&serde_json::json!({"event": "ready", "url": url}));
         return;
     }
@@ -434,7 +442,7 @@ fn ready(names: &str, url: &str) {
 /// and the warm shape buckets are compiled; `cached` when every one loaded
 /// from the compile cache, which is why it took no time.
 fn compiled(programs: u64, seconds: f64, cached: bool) {
-    if !std::io::stdout().is_terminal() {
+    if !for_person() {
         event(&serde_json::json!({
             "event": "compiled", "programs": programs, "seconds": seconds, "cached": cached,
         }));
@@ -460,7 +468,7 @@ fn programs_noun(programs: u64) -> String {
 /// <models> after <uptime>` line on a terminal, else a `stopped` event for
 /// the Models API at `url`, if one was served.
 fn stopped_status(url: Option<&str>, names: &str, uptime: Duration) {
-    if !std::io::stdout().is_terminal() {
+    if !for_person() {
         if let Some(url) = url {
             event(&serde_json::json!({"event": "stopped", "url": url}));
         }
@@ -516,7 +524,7 @@ impl Live {
     fn show(&mut self, progress: Progress) {
         use std::io::Write;
         let mut stdout = std::io::stdout().lock();
-        if !stdout.is_terminal() {
+        if !for_person() {
             if !self.event_due(progress) {
                 return;
             }
@@ -576,7 +584,7 @@ fn compiling_message(progress: Progress) -> String {
 
 /// The `Loading <model>` line for each model the front serves.
 fn loading(models: &[ServedModel]) {
-    if !std::io::stdout().is_terminal() {
+    if !for_person() {
         return;
     }
     for served in models {
@@ -625,7 +633,7 @@ fn thousands(count: u64) -> String {
 fn event(value: &serde_json::Value) {
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();
-    if stdout.is_terminal() {
+    if for_person() {
         return;
     }
     let _ = writeln!(stdout, "{value}");
