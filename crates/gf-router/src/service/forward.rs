@@ -172,6 +172,28 @@ impl Forward {
     }
 }
 
+/// Refuses a table a client may not name: one outside its scope, and a
+/// partition of a table outside it. A partition is part of its table, which
+/// splits writes and gathers predictions between its partitions, so a client
+/// may only read one, as a describe or a locate does; a write straight to a
+/// partition would put rows where the table never looks for them.
+fn reachable(scope: &Scope, table: &str, read: bool) -> Result<(), Status> {
+    scope.check(table)?;
+    let Some((owner, _, _)) = partitions::parse(table) else {
+        return Ok(());
+    };
+    if !scope.allows(owner) {
+        return Err(Status::not_found(format!("table {table:?} does not exist")));
+    }
+    if read {
+        return Ok(());
+    }
+    Err(Status::invalid_argument(format!(
+        "{table:?} is a partition of table {owner:?}; write to and predict from {owner:?}, \
+         which splits rows between its partitions"
+    )))
+}
+
 impl Router {
     async fn put(
         &self,
@@ -185,8 +207,8 @@ impl Router {
                 .is_ok_and(PutCommand::is_client_write)
         };
         let (forward, failure) = Forward::new(request.into_inner(), client_write).await?;
-        scope.check(&forward.table)?;
-        let count = self.partition_count(&forward.table);
+        reachable(&scope, &forward.table, false)?;
+        let count = self.partition_count(&forward.table)?;
         if count > 0 {
             return self
                 .put_partitioned(&forward, failure, &metadata, count)
@@ -243,8 +265,8 @@ impl Router {
             ["predict", "contexts", "region_churn", "forecast"].contains(&command)
         })
         .await?;
-        scope.check(&forward.table)?;
-        let count = self.partition_count(&forward.table);
+        reachable(&scope, &forward.table, false)?;
+        let count = self.partition_count(&forward.table)?;
         if count > 0 && forward.command == "contexts" {
             return Err(Status::invalid_argument(
                 "a partitioned table's contexts are gathered for each prediction alone",
@@ -323,6 +345,13 @@ impl Router {
             )));
         }
         parsed.check_scope(&scope)?;
+        if let Some(table) = parsed.table() {
+            let reads = matches!(
+                parsed,
+                FlightAction::Describe { .. } | FlightAction::Locate(_)
+            );
+            reachable(&scope, table, reads)?;
+        }
         if let Some(answer) = self.act_partitioned(&action, &parsed).await? {
             return Ok(Response::new(results(answer)));
         }

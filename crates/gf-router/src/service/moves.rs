@@ -34,18 +34,17 @@ impl Router {
             .ok_or_else(|| {
                 Status::internal(format!("{} did not report a log length", target.name))
             })?;
-        let mut copies = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(copy) = copies
-            .get_mut(table)
-            .and_then(|copies| copies.get_mut(&target.name))
-        {
-            copy.terms.begin(Term {
-                term,
-                primary: named.name.clone(),
-                start: copy.length,
+        self.copies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .update(table, &target.name, |copy| {
+                copy.terms.begin(Term {
+                    term,
+                    primary: named.name.clone(),
+                    start: copy.length,
+                });
+                copy.length = length;
             });
-            copy.length = length;
-        }
         Ok(length)
     }
 

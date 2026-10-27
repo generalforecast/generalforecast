@@ -13,11 +13,11 @@ use arrow_flight::error::FlightError;
 use arrow_flight::{Action, FlightData, FlightDescriptor, PutResult};
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use gf_core::planner::Strategy;
-use gf_server::action::{Answer, FlightAction};
+use gf_server::action::{Answer, FlightAction, check_write_id};
 use gf_server::auth::{MISSING_OK, QUANTILES, WRITE_ID};
 use gf_server::name::TableName;
 use gf_server::protocol::StrategySpec;
-use gf_server::service::{EPOCH, GPU_SECONDS};
+use gf_server::service::{EPOCH, GPU_SECONDS, exists};
 use gf_server::wal::{PastCapSpec, RouteBy, RouteKind, TableDefinition};
 use serde_json::{Value, json};
 use tokio::sync::oneshot;
@@ -28,39 +28,103 @@ use tonic::{Code, Response, Status, Streaming};
 use super::forward::{Forward, within};
 use super::{Boxed, Router, action, no_copy, put_answer, write_failed};
 use crate::partitions;
+use crate::replication::current;
 
 /// The most bytes a request to a partitioned table may carry, which the
 /// router reads whole to split.
 const PARTITIONED_BYTES: usize = 256 << 20;
 
 impl Router {
-    /// How many partitions a table splits into, as created or as its
-    /// partitions' copies show; 0 for a table not split.
-    pub(super) fn partition_count(&self, table: &str) -> usize {
-        if let Some(&count) = self
-            .partitioned
+    /// How many partitions a table splits into, as its partitions' names on
+    /// the nodes say; 0 for a table not split. A partitioned table made or
+    /// dropped through another router is known here by this one's next check.
+    ///
+    /// # Errors
+    ///
+    /// `FAILED_PRECONDITION` if partitions of two counts hold the name, as
+    /// when two routers made it at once: until it is dropped, which drops
+    /// them all, no one count serves it.
+    pub(super) fn partition_count(&self, table: &str) -> Result<usize, Status> {
+        let counts = self
+            .copies
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(table)
-        {
-            return count;
+            .partition_counts(table);
+        match counts.as_slice() {
+            [] => Ok(0),
+            [count] => Ok(*count),
+            counts => Err(Status::failed_precondition(format!(
+                "table {table:?} was made as {counts:?} partitions at once, through two \
+                 routers; drop it and make it again"
+            ))),
         }
-        // Any one partition's name says how many there are.
-        let count = {
-            let copies = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
-            copies
-                .keys()
-                .filter_map(|name| partitions::parse(name))
-                .find(|(owner, _, _)| *owner == table)
-                .map_or(0, |(_, _, count)| count)
+    }
+
+    /// Refuses to make a table under a name a table already serves, whole
+    /// or split into partitions of any count: the name would reach only one
+    /// of them, and hide the other's rows. The nodes that are up say what
+    /// they hold, so a table made through another router since this one's
+    /// last check counts; with any node out of reach, what the router last
+    /// saw of it counts too.
+    async fn refuse_taken(&self, table: &str) -> Result<(), Status> {
+        let serves = |name: &str| {
+            name == table || partitions::parse(name).is_some_and(|(owner, _, _)| owner == table)
         };
-        if count > 0 {
-            self.partitioned
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(table.to_string(), count);
+        let cluster = self.cluster();
+        let answers = futures::future::join_all(
+            cluster
+                .nodes
+                .iter()
+                .filter(|node| node.is_up())
+                .map(|node| node.control("list_tables", json!({}))),
+        )
+        .await;
+        let everyone = answers.len() == cluster.nodes.len() && answers.iter().all(Result::is_ok);
+        let held = answers
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|listed| serde_json::from_value::<Vec<String>>(listed).ok())
+            .flatten()
+            .any(|name| serves(&name));
+        let seen = !everyone && {
+            let copies = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
+            copies.contains(table) || !copies.partition_counts(table).is_empty()
+        };
+        if held || seen {
+            return Err(exists(format!("table {table:?} exists")));
         }
-        count
+        Ok(())
+    }
+
+    /// Drops every partition of a partitioned table, of every count its
+    /// partitions name; None for a table not split.
+    async fn drop_partitioned(&self, table: &str) -> Result<Option<Vec<Value>>, Status> {
+        let counts = self
+            .copies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .partition_counts(table);
+        if counts.is_empty() {
+            return Ok(None);
+        }
+        for count in counts {
+            for index in 0..count {
+                match self
+                    .drop_table(&partitions::name(table, index, count))
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(status) if status.code() == Code::NotFound => {}
+                    Err(status) => return Err(status),
+                }
+            }
+        }
+        self.definitions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(table);
+        Ok(Some(vec![json!({})]))
     }
 
     /// Answers an action on a partitioned table, or a create that splits
@@ -106,6 +170,7 @@ impl Router {
                     count.unwrap_or(1)
                 )));
             }
+            self.refuse_taken(name).await?;
             let Some(count) = count else {
                 return Ok(None);
             };
@@ -155,7 +220,10 @@ impl Router {
             return Ok(None);
         };
         let table = table.as_str();
-        let count = self.partition_count(table);
+        if matches!(parsed, FlightAction::DropTable(_)) {
+            return self.drop_partitioned(table).await;
+        }
+        let count = self.partition_count(table)?;
         if count == 0 {
             return Ok(None);
         }
@@ -176,6 +244,11 @@ impl Router {
                 // Keys say nothing of a routed table's column, so every
                 // partition deletes what it holds of them.
                 let routed = self.route_of(table, count).await?.is_some();
+                let ids = delete
+                    .write_id
+                    .as_deref()
+                    .map(|id| part_ids(id, count))
+                    .transpose()?;
                 let mut answers = Vec::new();
                 for (index, name) in names.iter().enumerate() {
                     let mine: Vec<Value> = delete
@@ -194,8 +267,8 @@ impl Router {
                     if routed {
                         part["missing_ok"] = json!(true);
                     }
-                    if let Some(id) = &delete.write_id {
-                        part["write_id"] = json!(format!("{id}/{index}"));
+                    if let Some(ids) = &ids {
+                        part["write_id"] = json!(ids[index]);
                     }
                     let request = self::action("delete", &part);
                     let parsed = FlightAction::parse(&request)?;
@@ -240,33 +313,7 @@ impl Router {
                     let parsed = FlightAction::parse(&request)?;
                     answers.extend(self.write_action(name, &request, &parsed).await?);
                 }
-                if let Some(definition) = self
-                    .definitions
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .get_mut(table)
-                {
-                    definition.strategy = strategy.clone();
-                }
                 answers
-            }
-            FlightAction::DropTable(_) => {
-                for name in &names {
-                    match self.drop_table(name).await {
-                        Ok(_) => {}
-                        Err(status) if status.code() == Code::NotFound => {}
-                        Err(status) => return Err(status),
-                    }
-                }
-                self.partitioned
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(table);
-                self.definitions
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(table);
-                vec![json!({})]
             }
             FlightAction::Locate(_) => {
                 let cluster = self.cluster();
@@ -329,33 +376,31 @@ impl Router {
                 }
             }
         }
-        self.partitioned
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(table.to_string(), count);
-        self.definitions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(table.to_string(), definition.clone());
         Ok(first.unwrap_or_default())
     }
 
-    /// A partitioned table's definition, as created or as its first
-    /// partition describes it.
+    /// A partitioned table's definition, as its first partition describes
+    /// it. A definition changes only by a write to every partition, which
+    /// moves the first partition's copy on, so one kept from a copy that has
+    /// not moved since is current; one changed through another router is
+    /// known here by this one's next check.
     pub(super) async fn definition_of(
         &self,
         table: &str,
         count: usize,
     ) -> Result<TableDefinition, Status> {
-        if let Some(definition) = self
-            .definitions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get(table)
+        let name = partitions::name(table, 0, count);
+        let version = current(&self.kept(&self.cluster(), &name)).cloned();
+        if let Some(version) = &version
+            && let Some((kept, definition)) = self
+                .definitions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(table)
+            && kept == version
         {
             return Ok(definition.clone());
         }
-        let name = partitions::name(table, 0, count);
         let described = self
             .read_action(&name, &action("describe", &json!({"table": name})))
             .await?;
@@ -364,10 +409,12 @@ impl Router {
             .cloned()
             .and_then(|answer| serde_json::from_value(answer).ok())
             .ok_or_else(|| Status::internal(format!("partition {name:?} has no definition")))?;
-        self.definitions
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(table.to_string(), definition.clone());
+        if let Some(version) = version {
+            self.definitions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(table.to_string(), (version, definition.clone()));
+        }
         Ok(definition)
     }
 
@@ -447,6 +494,15 @@ impl Router {
         metadata: &MetadataMap,
         count: usize,
     ) -> Result<Response<Boxed<PutResult>>, Status> {
+        let ids = metadata
+            .get(WRITE_ID)
+            .map(|id| {
+                let id = id
+                    .to_str()
+                    .map_err(|_| Status::invalid_argument(format!("{WRITE_ID} must be ASCII")))?;
+                part_ids(id, count)
+            })
+            .transpose()?;
         let command = forward
             .first
             .flight_descriptor
@@ -490,9 +546,10 @@ impl Router {
             let name = partitions::name(&forward.table, index, count);
             let messages = encoded(vec![command.clone(), name.clone()], part).await?;
             let mut asked = metadata.clone();
-            if let Some(id) = metadata.get(WRITE_ID).and_then(|id| id.to_str().ok())
-                && let Ok(id) = format!("{id}/{index}").parse()
-            {
+            if let Some(ids) = &ids {
+                let id = ids[index]
+                    .parse()
+                    .map_err(|_| Status::invalid_argument(format!("bad {WRITE_ID}")))?;
                 asked.insert(WRITE_ID, id);
             }
             if everywhere {
@@ -810,6 +867,27 @@ fn all_held(table: &str, keys: usize, deleted: usize) -> Result<(), Status> {
         )));
     }
     Ok(())
+}
+
+/// The write id of each partition's part of a write under `id`,
+/// `{id}/{index}`, so that a retry applies each part once.
+///
+/// # Errors
+///
+/// `INVALID_ARGUMENT` if a part's id is too long for a write id, which is
+/// refused before any part is written: a part refused after others applied
+/// would leave the write half done however often it is retried.
+pub(super) fn part_ids(id: &str, count: usize) -> Result<Vec<String>, Status> {
+    let ids: Vec<String> = (0..count).map(|index| format!("{id}/{index}")).collect();
+    for part in &ids {
+        check_write_id(part).map_err(|error| {
+            Status::invalid_argument(format!(
+                "write id {id:?}: each of a table's {count} partitions takes its part of \
+                 a write as {part:?}, and {error}; use a shorter id"
+            ))
+        })?;
+    }
+    Ok(ids)
 }
 
 /// A client's whole stream, read for a partitioned table.

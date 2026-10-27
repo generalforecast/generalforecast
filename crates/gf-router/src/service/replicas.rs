@@ -17,7 +17,8 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 use tonic::{Code, Status, Streaming};
 
-use super::{CHECK_TIMEOUT, Cluster, Copies, Node, Router, SHIP_TIMEOUT, put_answer, unavailable};
+use super::copies::Tables;
+use super::{CHECK_TIMEOUT, Cluster, Node, Router, SHIP_TIMEOUT, put_answer, unavailable};
 use crate::replication::{Repair, TableCopy, repairs};
 
 impl Router {
@@ -252,8 +253,15 @@ impl Router {
         }
     }
 
+    /// Learns every node's copies, and whether it is up, then fails tables
+    /// over and starts repairs.
     pub(super) async fn check(&self) {
         let cluster = self.cluster();
+        let since = self
+            .copies
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .stamp();
         let answers = futures::future::join_all(cluster.nodes.iter().map(|node| async move {
             tokio::time::timeout(CHECK_TIMEOUT, node.action("log_lengths", json!({})))
                 .await
@@ -261,7 +269,7 @@ impl Router {
         }))
         .await;
         let up: Vec<bool> = answers.iter().map(Result::is_ok).collect();
-        let mut copies = Copies::new();
+        let mut answered = Tables::new();
         for (node, answer) in cluster.nodes.iter().zip(answers) {
             let answer = match answer {
                 Ok(answer) => {
@@ -297,7 +305,7 @@ impl Router {
                     created,
                 }) = CopyLength::deserialize(copy)
                 {
-                    copies.entry(table.clone()).or_default().insert(
+                    answered.entry(table.clone()).or_default().insert(
                         node.name.clone(),
                         TableCopy {
                             length,
@@ -308,12 +316,19 @@ impl Router {
                 }
             }
         }
-        let tables: Vec<String> = copies.keys().cloned().collect();
-        *self.copies.lock().unwrap_or_else(PoisonError::into_inner) = copies;
-        self.creations
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .retain(|table, _| tables.contains(table));
+        let tables: Vec<String> = {
+            let mut copies = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
+            copies.install(answered, since);
+            self.creations
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|table, _| copies.contains(table));
+            self.definitions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .retain(|table, _| !copies.partition_counts(table).is_empty());
+            copies.names().cloned().collect()
+        };
         // Only now, so leases never see a returning node up with its copies unknown.
         for (node, up) in cluster.nodes.iter().zip(up) {
             node.up.store(up, Ordering::Relaxed);

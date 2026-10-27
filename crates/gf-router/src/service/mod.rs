@@ -76,6 +76,7 @@ use tonic::service::interceptor::InterceptedService;
 use tonic::{Code, Request, Status};
 
 use crate::quota::Quotas;
+use crate::replication::TableCopy;
 use copies::{Copies, Seen};
 use failover::Failover;
 pub use node::{Cluster, Node, Timeouts};
@@ -124,11 +125,10 @@ pub struct Router {
     moves: Arc<Counter>,
     failover: Option<Failover>,
     clients: Arc<RwLock<Arc<Clients>>>,
-    /// How many partitions each table split into has, as created or learned.
-    partitioned: Arc<Mutex<HashMap<String, usize>>>,
-    /// Each partitioned table's definition, as its first partition holds it:
-    /// the strategy its predictions assemble by, and its route if it has one.
-    definitions: Arc<Mutex<HashMap<String, TableDefinition>>>,
+    /// Each partitioned table's definition, as its first partition described
+    /// it, with the copy of that partition it was read from: the strategy
+    /// its predictions assemble by, and its route if it has one.
+    definitions: Arc<Mutex<HashMap<String, (TableCopy, TableDefinition)>>>,
 }
 
 impl Router {
@@ -150,7 +150,6 @@ impl Router {
                 tokens: HashMap::new(),
                 quotas: Quotas::new(HashMap::new()),
             }))),
-            partitioned: Arc::default(),
             definitions: Arc::default(),
         }
     }
@@ -209,7 +208,7 @@ impl Router {
             .copies
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .keys()
+            .names()
             .cloned()
             .collect();
         let behind: usize = tables
@@ -420,7 +419,7 @@ impl Router {
             .copies
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(table);
+            .contains(table);
         if !known {
             let describe = action("describe", &json!({"table": table}));
             if let Err(status) = self.read_action(table, &describe).await
@@ -456,7 +455,7 @@ impl Router {
         self.copies
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .remove(table);
+            .drop_table(table);
         self.creations
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

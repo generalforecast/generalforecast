@@ -3,14 +3,21 @@
 
 //! What the router saw of each table's copies, and what follows from it: each
 //! table's creation, writer, term, and the nodes that should hold it.
+//!
+//! A check learns every copy from the nodes, while writes, shipments,
+//! promotions and drops record what they changed as they go. A check's
+//! answers are gathered before it takes their place, so the changes recorded
+//! since it began stand over them: a check never takes back a term a write
+//! began meanwhile, nor brings back a table dropped meanwhile.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::PoisonError;
 
 use gf_server::wal::{CreationId, Terms};
 use tonic::Status;
 
 use super::{Cluster, Node, Router};
+use crate::partitions;
 use crate::replication::{TableCopy, creation, current, diverged, read_order, same_creation};
 
 /// The longest log seen on a replica of one creation of a table.
@@ -20,14 +27,175 @@ pub(super) struct Seen {
     pub(super) length: u64,
 }
 
-/// What the router saw of each table's copies, by table and then node name.
-pub(super) type Copies = HashMap<String, HashMap<String, TableCopy>>;
+/// Each table's copies, by table and then node name.
+pub(super) type Tables = HashMap<String, HashMap<String, TableCopy>>;
+
+/// What the router saw of each table's copies, and the changes it made to
+/// them since its last check began.
+#[derive(Debug, Default)]
+pub(super) struct Copies {
+    tables: Tables,
+    /// For each table split into partitions, how many partitions of each
+    /// count its partitions' names say there are.
+    partitions: HashMap<String, BTreeMap<usize, usize>>,
+    /// Counts the changes the router makes, each stamped with the count.
+    stamp: u64,
+    /// The latest change to each table's copy on a node, by table and node
+    /// name, or to a whole table, by its name alone.
+    changed: HashMap<(String, Option<String>), u64>,
+}
+
+impl Copies {
+    /// A table's copies, by node name.
+    pub(super) fn table(&self, table: &str) -> Option<&HashMap<String, TableCopy>> {
+        self.tables.get(table)
+    }
+
+    /// One node's copy of a table.
+    pub(super) fn get(&self, table: &str, node: &str) -> Option<&TableCopy> {
+        self.tables.get(table)?.get(node)
+    }
+
+    /// Whether any node holds a copy of the table.
+    pub(super) fn contains(&self, table: &str) -> bool {
+        self.tables.contains_key(table)
+    }
+
+    /// Every table with a copy.
+    pub(super) fn names(&self) -> impl Iterator<Item = &String> {
+        self.tables.keys()
+    }
+
+    /// The partition counts the partitions of a table split into partitions
+    /// name, fewest first; empty for a table not split. More than one is a
+    /// table made twice at once through two routers.
+    pub(super) fn partition_counts(&self, table: &str) -> Vec<usize> {
+        self.partitions
+            .get(table)
+            .map(|counts| counts.keys().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// The stamp a check begins at: changes after it stand over its answers.
+    pub(super) fn stamp(&self) -> u64 {
+        self.stamp
+    }
+
+    fn change(&mut self, table: &str, node: Option<&str>) {
+        self.stamp += 1;
+        self.changed
+            .insert((table.to_string(), node.map(str::to_string)), self.stamp);
+    }
+
+    /// Sets a node's copy of a table.
+    pub(super) fn set(&mut self, table: &str, node: &str, copy: TableCopy) {
+        self.change(table, Some(node));
+        if !self.tables.contains_key(table) {
+            index(&mut self.partitions, table, 1);
+        }
+        self.tables
+            .entry(table.to_string())
+            .or_default()
+            .insert(node.to_string(), copy);
+    }
+
+    /// Changes a node's copy of a table, if the router saw one.
+    pub(super) fn update(&mut self, table: &str, node: &str, change: impl FnOnce(&mut TableCopy)) {
+        if let Some(copy) = self
+            .tables
+            .get_mut(table)
+            .and_then(|copies| copies.get_mut(node))
+        {
+            change(copy);
+            self.change(table, Some(node));
+        }
+    }
+
+    /// Forgets a node's copy of a table, as once it is set aside.
+    pub(super) fn forget(&mut self, table: &str, node: &str) {
+        self.change(table, Some(node));
+        if let Some(copies) = self.tables.get_mut(table) {
+            copies.remove(node);
+            if copies.is_empty() {
+                self.remove(table);
+            }
+        }
+    }
+
+    /// Forgets every copy of a dropped table.
+    pub(super) fn drop_table(&mut self, table: &str) {
+        self.change(table, None);
+        self.remove(table);
+    }
+
+    fn remove(&mut self, table: &str) {
+        if self.tables.remove(table).is_some() {
+            index(&mut self.partitions, table, -1);
+        }
+    }
+
+    /// Takes a check's answers, begun at `since`, in place of what the
+    /// router saw, but for what it changed itself since then.
+    pub(super) fn install(&mut self, mut answered: Tables, since: u64) {
+        for ((table, node), &stamp) in &self.changed {
+            if stamp <= since {
+                continue;
+            }
+            match node {
+                Some(node) => match self.get(table, node) {
+                    Some(copy) => {
+                        answered
+                            .entry(table.clone())
+                            .or_default()
+                            .insert(node.clone(), copy.clone());
+                    }
+                    None => {
+                        if let Some(copies) = answered.get_mut(table) {
+                            copies.remove(node);
+                        }
+                    }
+                },
+                None => match self.tables.get(table) {
+                    Some(copies) => {
+                        answered.insert(table.clone(), copies.clone());
+                    }
+                    None => {
+                        answered.remove(table);
+                    }
+                },
+            }
+        }
+        answered.retain(|_, copies| !copies.is_empty());
+        self.changed.retain(|_, stamp| *stamp > since);
+        self.partitions.clear();
+        for table in answered.keys() {
+            index(&mut self.partitions, table, 1);
+        }
+        self.tables = answered;
+    }
+}
+
+/// Counts a partition's table in or out of the partition index.
+fn index(partitions: &mut HashMap<String, BTreeMap<usize, usize>>, table: &str, by: isize) {
+    let Some((owner, _, count)) = partitions::parse(table) else {
+        return;
+    };
+    let counts = partitions.entry(owner.to_string()).or_default();
+    let held = counts.entry(count).or_default();
+    *held = held.saturating_add_signed(by);
+    if *held == 0 {
+        counts.remove(&count);
+    }
+    if counts.is_empty() {
+        partitions.remove(owner);
+    }
+}
 
 impl Router {
     /// What the router saw of a table's copies, by node index.
     pub(super) fn copies(&self, cluster: &Cluster, table: &str) -> Vec<Option<TableCopy>> {
         let copies = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
-        let copies = copies.get(table);
+        let copies = copies.table(table);
         cluster
             .nodes
             .iter()
@@ -116,11 +284,12 @@ impl Router {
             creations.get(table).cloned()
         };
         let mut copies = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
-        let copies = copies.entry(table.to_string()).or_default();
         // The terms come from the table's own copies: one of an earlier
         // creation, left on a node that missed the drop, has terms of its own.
         let (terms, seen) = copies
-            .values()
+            .table(table)
+            .into_iter()
+            .flat_map(HashMap::values)
             .filter(|copy| known.is_none() || copy.created.is_none() || copy.created == known)
             .max_by_key(|copy| (copy.term().term, copy.length))
             .map_or_else(
@@ -128,8 +297,9 @@ impl Router {
                 |copy| (copy.terms.clone(), copy.created.clone()),
             );
         let created = created.or(seen).or(known);
-        copies.insert(
-            node.name.clone(),
+        copies.set(
+            table,
+            &node.name,
             TableCopy {
                 length,
                 terms,
@@ -143,8 +313,8 @@ impl Router {
         self.copies
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(table)
-            .and_then(|copies| copies.get(&node.name).cloned())
+            .get(table, &node.name)
+            .cloned()
     }
 
     /// Raises the longest log seen on a replica of the table's creation; a
@@ -171,15 +341,12 @@ impl Router {
             .map_or(0, |seen| seen.length)
     }
 
+    /// Forgets a node's copy of a table, once it is set aside.
     pub(super) fn forget(&self, table: &str, node: &Node) {
-        if let Some(copies) = self
-            .copies
+        self.copies
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get_mut(table)
-        {
-            copies.remove(&node.name);
-        }
+            .forget(table, &node.name);
     }
 
     /// The node that takes a table's writes: the primary its latest term
@@ -239,5 +406,108 @@ impl Router {
     pub(super) fn read_order(&self, cluster: &Cluster, table: &str) -> Vec<usize> {
         let (lengths, up) = self.view(cluster, table);
         read_order(&self.desired(cluster, table), &lengths, &up)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gf_server::wal::Term;
+
+    fn copy(length: u64, term: u64) -> TableCopy {
+        let mut terms = Terms::default();
+        if term > 0 {
+            terms.begin(Term {
+                term,
+                primary: "a".to_string(),
+                start: 0,
+            });
+        }
+        TableCopy {
+            length,
+            terms,
+            created: CreationId::parse("one"),
+        }
+    }
+
+    fn answered(entries: &[(&str, &str, TableCopy)]) -> Tables {
+        let mut tables = Tables::new();
+        for (table, node, copy) in entries {
+            tables
+                .entry(table.to_string())
+                .or_default()
+                .insert(node.to_string(), copy.clone());
+        }
+        tables
+    }
+
+    #[test]
+    fn a_check_takes_back_nothing_recorded_since_it_began() {
+        let mut copies = Copies::default();
+        copies.set("rows", "a", copy(1, 0));
+        let since = copies.stamp();
+        // While the check waits on the nodes, a write begins term 1 and grows the log.
+        copies.update("rows", "a", |copy| *copy = self::copy(2, 1));
+        copies.set("rows", "b", copy(2, 1));
+
+        copies.install(answered(&[("rows", "a", copy(1, 0))]), since);
+
+        assert_eq!(copies.get("rows", "a"), Some(&copy(2, 1)));
+        assert_eq!(copies.get("rows", "b"), Some(&copy(2, 1)));
+        // The next check's answers, begun after the write, stand.
+        let since = copies.stamp();
+        copies.install(answered(&[("rows", "a", copy(5, 1))]), since);
+        assert_eq!(copies.get("rows", "a"), Some(&copy(5, 1)));
+        assert_eq!(copies.get("rows", "b"), None);
+    }
+
+    #[test]
+    fn a_check_never_brings_back_a_table_dropped_since_it_began() {
+        let mut copies = Copies::default();
+        copies.set("gone", "a", copy(3, 1));
+        copies.set("kept", "a", copy(3, 1));
+        let since = copies.stamp();
+        copies.drop_table("gone");
+        copies.forget("kept", "a");
+
+        let stale = [("gone", "a", copy(3, 1)), ("kept", "a", copy(3, 1))];
+        copies.install(answered(&stale), since);
+
+        assert!(!copies.contains("gone"));
+        assert!(!copies.contains("kept"));
+        // Made again after the drop, the table's new copy stands.
+        let since = copies.stamp();
+        copies.drop_table("gone");
+        copies.set("gone", "b", copy(1, 0));
+        copies.install(answered(&stale), since);
+        assert_eq!(copies.table("gone").map(HashMap::len), Some(1));
+        assert_eq!(copies.get("gone", "b"), Some(&copy(1, 0)));
+    }
+
+    #[test]
+    fn partition_counts_follow_the_partitions_held() {
+        let mut copies = Copies::default();
+        let name = |index, count| partitions::name("split", index, count);
+        copies.set(&name(0, 2), "a", copy(1, 0));
+        copies.set(&name(1, 2), "a", copy(1, 0));
+        copies.set(&name(1, 2), "b", copy(1, 0));
+        assert_eq!(copies.partition_counts("split"), [2]);
+        assert!(copies.partition_counts("other").is_empty());
+
+        copies.drop_table(&name(0, 2));
+        assert_eq!(copies.partition_counts("split"), [2]);
+        copies.forget(&name(1, 2), "a");
+        copies.forget(&name(1, 2), "b");
+        assert!(copies.partition_counts("split").is_empty());
+
+        let since = copies.stamp();
+        copies.install(
+            answered(&[
+                (&name(0, 3), "a", copy(1, 0)),
+                (&name(0, 5), "a", copy(1, 0)),
+            ]),
+            since,
+        );
+        assert_eq!(copies.partition_counts("split"), [3, 5]);
     }
 }

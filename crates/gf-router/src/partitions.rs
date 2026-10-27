@@ -24,6 +24,12 @@
 //! partition holds the rows its queries read and answers them as a table of
 //! its own, with its own contexts, regions and cutoffs, and nothing is
 //! gathered. A delete carries keys alone, so it goes to every partition.
+//!
+//! A partition is part of its table. Clients reach it through the table, and
+//! name one only to read it, within the table's scope; a name serves one
+//! table, whole or split, so a table is not made over another of its name.
+//! Which tables are split, and how, is the nodes' to say: every router learns
+//! it from the partitions its checks find.
 
 use std::collections::{BTreeMap, HashMap};
 
