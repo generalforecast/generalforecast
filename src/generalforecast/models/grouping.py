@@ -13,8 +13,15 @@ from typing import Any
 
 
 def instant(value: Any) -> int | float:
-    """A time as integer periods, or as floating UTC seconds for a date or datetime."""
+    """A time as integer periods, or as floating UTC seconds for a date or datetime.
+
+    A datetime without a zone is read as UTC, as
+    `generalforecast.predictors.frequency.instant` reads it, never as the
+    machine's local time.
+    """
     if isinstance(value, datetime.datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=datetime.UTC)
         return float(value.timestamp())
     if isinstance(value, datetime.date):
         return float((value - datetime.date(1970, 1, 1)).days * 86400)
