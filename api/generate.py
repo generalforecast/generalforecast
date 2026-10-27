@@ -30,6 +30,7 @@ WIDTH = 88
 ENUM_CLASSES = {"ErrorCode"}
 TS_NAMES = {"Error": "ApiError"}
 ENVELOPE = "Envelope"
+JSON = "application/json"
 
 Json = dict[str, Any]
 
@@ -77,6 +78,7 @@ class Operation:
     path: str
     request: str | None
     reply: str
+    body: str | None
 
 
 class Spec:
@@ -166,12 +168,12 @@ class Spec:
     def _operations(self):
         for path, methods in self.document["paths"].items():
             for method, operation in methods.items():
-                request = None
+                request = media = None
                 body = operation.get("requestBody")
                 if body is not None:
-                    request = self.ref_name(
-                        body["content"]["application/json"]["schema"]
-                    )
+                    [(media, content)] = body["content"].items()
+                    if media == JSON:
+                        request = self.ref_name(content["schema"])
                 success = next(
                     response
                     for status, response in operation["responses"].items()
@@ -181,7 +183,12 @@ class Spec:
                 if reply is None:
                     raise ValueError(f"{path} {method} reply must be a $ref")
                 yield Operation(
-                    operation["operationId"], method.upper(), path, request, reply
+                    operation["operationId"],
+                    method.upper(),
+                    path,
+                    request,
+                    reply,
+                    media,
                 )
 
     def ordered(self) -> list[Record | Alias]:
@@ -360,7 +367,8 @@ Do not edit: run `python api/generate.py`. Every schema is a frozen dataclass
 (or a type alias for scalars, arrays and mappings) with `from_payload`, which
 checks the JSON shape and names the offending field in `PayloadError.param`,
 and `to_payload`, which writes the JSON back without the optional fields left
-as None. `ROUTES` lists every route with its request and reply types.
+as None. `ROUTES` lists every route with its request and reply types, and
+the media type of its request body.
 """
 
 from __future__ import annotations
@@ -557,13 +565,18 @@ class Payload:
 
 @dataclass(frozen=True)
 class Route:
-    """A route: its request envelope type (None for GET) and its reply type."""
+    """A route: its request and reply types, and its request body's media type.
+
+    `request` is None for a GET, which has no body, and for a body that is not
+    JSON, such as an Arrow stream, which `body` names.
+    """
 
     name: str
     method: str
     path: str
     request: type[Payload] | None
     reply: type[Payload]
+    body: str | None
 '''
 
 
@@ -770,6 +783,7 @@ class PythonEmitter:
                         Atom(quote(op.path)),
                         Atom(op.request or "None"),
                         Atom(op.reply),
+                        Atom(quote(op.body) if op.body else "None"),
                     ],
                 )
                 for op in self.spec.operations
@@ -949,9 +963,11 @@ class TypeScriptEmitter:
         out.append("export const ROUTES = {")
         for op in self.spec.operations:
             request = TS_NAMES.get(op.request or "null", op.request or "null")
+            body = f'"{op.body}"' if op.body else "null"
             out.append(
                 f'  "{op.name}": {{ method: "{op.method}", path: "{op.path}",'
-                f' request: "{request}", reply: "{TS_NAMES.get(op.reply, op.reply)}" }},'
+                f' request: "{request}", reply: "{TS_NAMES.get(op.reply, op.reply)}",'
+                f" body: {body} }},"
             )
         out.append("} as const;")
         out.append("")

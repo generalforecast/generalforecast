@@ -145,20 +145,24 @@ fn clients(config: &Config) -> (HashMap<[u8; 32], Scope>, Quotas) {
 }
 
 /// Reloads the cluster and clients from the configuration file on each
-/// SIGHUP; settings that take effect only on restart keep their running
+/// SIGHUP; settings that take effect only on restart, the node timeouts that
+/// the router's own call timeout is sized by among them, keep their running
 /// values, and the log names any that changed.
-async fn reload(router: Router, path: PathBuf, running: Config) {
+async fn reload(router: Router, path: PathBuf, mut running: Config) {
     use tokio::signal::unix::{SignalKind, signal};
     let mut hangups = signal(SignalKind::hangup()).expect("signal handler");
     while hangups.recv().await.is_some() {
         let loaded = Config::load(&path)
             .map_err(Into::<Box<dyn Error>>::into)
-            .and_then(|config| Ok((cluster(&config)?, clients(&config), config)));
+            .and_then(|loaded| {
+                let (config, ignored) = running.reloaded(loaded);
+                Ok((cluster(&config)?, clients(&config), config, ignored))
+            });
         match loaded {
-            Ok((cluster, (tokens, quotas), config)) => {
+            Ok((cluster, (tokens, quotas), config, ignored)) => {
                 router.reconfigure(cluster);
                 router.set_clients(tokens, quotas);
-                let ignored = running.restart_differences(&config);
+                running = config;
                 if ignored.is_empty() {
                     tracing::info!("reloaded the configuration");
                 } else {

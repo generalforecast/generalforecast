@@ -24,6 +24,12 @@
 //! partition holds the rows its queries read and answers them as a table of
 //! its own, with its own contexts, regions and cutoffs, and nothing is
 //! gathered. A delete carries keys alone, so it goes to every partition.
+//!
+//! A partition is part of its table. Clients reach it through the table, and
+//! name one only to read it, within the table's scope; a name serves one
+//! table, whole or split, so a table is not made over another of its name.
+//! Which tables are split, and how, is the nodes' to say: every router learns
+//! it from the partitions its checks find.
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -59,12 +65,7 @@ pub fn parse(name: &str) -> Option<(&str, usize, usize)> {
 /// The partition a key belongs to, by a hash that never changes.
 #[must_use]
 pub fn of(key: u128, count: usize) -> usize {
-    // SplitMix64's finalizer over the key's halves folded together.
-    let mut mixed = (key as u64) ^ ((key >> 64) as u64).rotate_left(32);
-    mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    mixed ^= mixed >> 31;
-    (mixed % count as u64) as usize
+    (gf_assign::key::wide(key) % count as u64) as usize
 }
 
 /// Each partition's rows of the batches, by their keys' partitions.
