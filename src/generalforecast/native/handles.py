@@ -890,6 +890,7 @@ class SeriesTable(abc.ABC):
         before: Any = None,
         *,
         quantiles: Sequence[float] | None = None,
+        future: Any = None,
     ) -> np.ndarray:
         """Forecasts series over the steps after a time.
 
@@ -906,6 +907,12 @@ class SeriesTable(abc.ABC):
                 None. Each lies linearly between the two of the model's levels
                 around it, and one beyond the model's outermost level takes
                 that level.
+            future: Rows of the forecast series' known covariates over the
+                horizon, with the series and time columns, read in place of
+                any rows the table holds there and written nowhere: each time
+                after its series' latest observation, on its grid and within
+                the horizon, and each value a finite number, or missing where
+                it is not known.
 
         Returns:
             Forecasts `(series, horizon, levels)` on the target's scale.
@@ -920,6 +927,7 @@ class SeriesTable(abc.ABC):
         before: Any = None,
         *,
         quantiles: Sequence[float] | None = None,
+        future: Any = None,
     ) -> np.ndarray:
         """Forecasts series, each in the group of series given it.
 
@@ -937,6 +945,7 @@ class SeriesTable(abc.ABC):
             horizon: Steps to forecast; the table's if None.
             before: The time each forecast starts at, as `forecast` takes it.
             quantiles: Quantile levels, as `forecast` takes them.
+            future: Known covariates' values, as `forecast` takes them.
 
         Returns:
             Forecasts, as `forecast` returns them.

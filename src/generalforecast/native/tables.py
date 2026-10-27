@@ -13,12 +13,11 @@ the `Retrieved` selection (how each query's context is drawn), `TimeOptions`
 from __future__ import annotations
 
 import abc
-import contextlib
 import datetime
 import json
 import math
 import threading
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, Literal, Self, override
 
@@ -1477,18 +1476,10 @@ class SeriesTable(_Held[_NativeSeriesTable]):
 
         Rows carry the series and time columns, and the known covariates'
         future values; their target may be left out, or empty, as it is not
-        known yet. The forecast covers the steps the rows span.
-
-        A table with known covariates reads their future from its own rows,
-        so the future rows are written for the forecast, unobserved, and
-        taken out again once it answers, or fails: a prediction leaves the
-        table as it found it. They are inserted, never upserted, so a future
-        row at a time a series holds is refused rather than replacing what
-        the table holds there.
-
-        Raises:
-            InvalidInput: If a future row gives a time its series holds a
-                row at already.
+        known yet. The forecast covers the steps the rows span. The known
+        covariates' values travel with the forecast and are read in place of
+        the table's rows at their times, so a prediction writes nothing to
+        the table; each time comes after its series' latest observation.
         """
         schema = self.schema
         table = tabular.frame(_pending_target(rows, schema.target))
@@ -1499,54 +1490,12 @@ class SeriesTable(_Held[_NativeSeriesTable]):
         for key in keys_column.to_pylist():
             counts[key] += 1
         horizon = max(counts.values())
-        with self._future(handle, keys, table if schema.known else None), boundary():
-            outputs = handle.forecast(keys, horizon, as_of, quantiles=self.quantiles)
-        return self._result(keys, np.asarray(outputs))
-
-    @contextlib.contextmanager
-    def _future(
-        self, handle: _NativeSeriesTable, series: Sequence[Any], rows: pa.Table | None
-    ) -> Iterator[None]:
-        """Holds future rows of `series` in the table, unobserved, for the block alone; nothing for None.
-
-        A series the table does not hold is refused before anything is
-        written: the server keeps the key of every series a row was written
-        for, so one written for a typo would stay among the series every
-        forecast reads.
-
-        Raises:
-            InvalidInput: If a series is one the table does not hold, or a
-                row gives a time its series holds a row at.
-        """
-        if rows is None or len(rows) == 0:
-            yield
-            return
+        future = table if schema.known else None
         with boundary():
-            held = set(handle.known_series())
-        unknown = [key for key in series if key not in held]
-        if unknown:
-            raise InvalidInput(
-                f"table {self.name} holds no series {', '.join(map(repr, unknown))}",
-                param=self.schema.series[0],
-                hint="predict the series the table holds observations of",
+            outputs = handle.forecast(
+                keys, horizon, as_of, quantiles=self.quantiles, future=future
             )
-        future = _unobserved(rows, self.schema.target)
-        with boundary():
-            try:
-                handle.insert(future)
-            except DuplicateKey as error:
-                raise InvalidInput(
-                    f"table {self.name} holds a row at a time the future rows "
-                    f"give ({error})",
-                    because="future rows are written beside the observations "
-                    "for the forecast alone, and never replace one",
-                    hint="give only times after each series' latest observation",
-                ) from error
-        try:
-            yield
-        finally:
-            with boundary():
-                handle.delete(future, missing_ok=True)
+        return self._result(keys, np.asarray(outputs))
 
     def _all_series(self, handle: _NativeSeriesTable) -> list[Any]:
         with boundary():
@@ -1573,16 +1522,6 @@ class SeriesTable(_Held[_NativeSeriesTable]):
         for index, level in enumerate(levels):
             columns[f"q_{level:g}"] = outputs[:, :, index].reshape(-1)
         return pd.DataFrame(columns)
-
-
-def _unobserved(table: pa.Table, target: str) -> pa.Table:
-    """Future rows with an unobserved target where they carry none, or only nulls of no type."""
-    if target not in table.column_names:
-        return table.append_column(target, pa.nulls(len(table), pa.float64()))
-    if pa.types.is_null(table.schema.field(target).type):
-        index = table.column_names.index(target)
-        return table.set_column(index, target, pa.nulls(len(table), pa.float64()))
-    return table
 
 
 def _series_schema_of(definition: SeriesDefinition) -> SeriesSchema:

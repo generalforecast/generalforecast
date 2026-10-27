@@ -395,8 +395,9 @@ class LocalSeriesTable(SeriesTable):
         before: Any = None,
         *,
         quantiles: Sequence[float] | None = None,
+        future: Any = None,
     ) -> np.ndarray:
-        return self._forecast(series, None, horizon, before, quantiles)
+        return self._forecast(series, None, horizon, before, quantiles, future)
 
     def forecast_given(
         self,
@@ -406,8 +407,9 @@ class LocalSeriesTable(SeriesTable):
         before: Any = None,
         *,
         quantiles: Sequence[float] | None = None,
+        future: Any = None,
     ) -> np.ndarray:
-        return self._forecast(series, groups, horizon, before, quantiles)
+        return self._forecast(series, groups, horizon, before, quantiles, future)
 
     def _forecast(
         self,
@@ -416,8 +418,13 @@ class LocalSeriesTable(SeriesTable):
         horizon: int | None,
         before: Any,
         quantiles: Sequence[float] | None,
+        future: Any = None,
     ) -> np.ndarray:
         """Forecasts series, in the groups given them if any."""
+        if future is not None:
+            raise ValueError(
+                "the in-process node takes a known future through gf-server"
+            )
         horizon = self._horizon(horizon)
         levels = _levels(self.name, self.quantile_levels, quantiles)
         digests = self._keys(series)
