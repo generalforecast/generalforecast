@@ -399,7 +399,7 @@ paths:
                           selection: {strategy: retrieved, core: 1000, neighbors: 3000, kind: stratified, recent: null, seed: 0}
                           limits: {context_rows: 100000, queries: 100, inputs: 32}
                           environments:
-                            - {predictor: churn, name: production, revision: 7, generation: 9, runtime: hosted, status: ready}
+                            - {predictor: churn, name: production, revision: 7, generation: 9, status: ready}
                           serving: {loaded: true, compiled: true, warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]}
 
     post:
@@ -480,8 +480,8 @@ paths:
                       selection: {strategy: retrieved, core: 1000, neighbors: 3000, kind: stratified, recent: null, seed: 0}
                       limits: {context_rows: 100000, queries: 100, inputs: 32}
                       environments:
-                        - {predictor: churn, name: staging, revision: 8, generation: 3, runtime: hosted, status: ready}
-                        - {predictor: churn, name: production, revision: 7, generation: 9, runtime: hosted, status: ready}
+                        - {predictor: churn, name: staging, revision: 8, generation: 3, status: ready}
+                        - {predictor: churn, name: production, revision: 7, generation: 9, status: ready}
                       serving: {loaded: true, compiled: true, warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]}
         "404":
           description: no predictor of that name in the project
@@ -1219,12 +1219,12 @@ paths:
                     resource: {kind: predictor, name: churn}
                     result:
                       environments:
-                        - {predictor: churn, name: staging, revision: 8, generation: 3, runtime: hosted, status: ready}
-                        - {predictor: churn, name: production, revision: 7, generation: 9, runtime: hosted, status: ready}
+                        - {predictor: churn, name: staging, revision: 8, generation: 3, status: ready}
+                        - {predictor: churn, name: production, revision: 7, generation: 9, status: ready}
     post:
       operationId: environments.create
       tags: [hosted]
-      summary: create an environment pointer on a runtime
+      summary: create an environment pointer
       parameters:
         - $ref: "#/components/parameters/project"
         - $ref: "#/components/parameters/predictor"
@@ -1241,7 +1241,7 @@ paths:
                   project: acme
                   request_id: r-b3c4d5e6f708192a3b4c5d6e7f8091a2
                   resource: {kind: predictor, name: churn}
-                  payload: {name: staging, runtime: hosted}
+                  payload: {name: staging}
       responses:
         "200":
           description: an empty pointer until the first promote
@@ -1256,7 +1256,7 @@ paths:
                     project: acme
                     request_id: r-b3c4d5e6f708192a3b4c5d6e7f8091a2
                     resource: {kind: predictor, name: churn}
-                    result: {predictor: churn, name: staging, revision: null, generation: 0, runtime: hosted, status: pending}
+                    result: {predictor: churn, name: staging, revision: null, generation: 0, status: pending}
 
   /v1/projects/{project}/predictors/{name}/environments/{environment}:
     get:
@@ -1281,7 +1281,7 @@ paths:
                     project: acme
                     request_id: r-c4d5e6f708192a3b4c5d6e7f8091a2b3
                     resource: {kind: predictor, name: churn}
-                    result: {predictor: churn, name: production, revision: 7, generation: 9, runtime: hosted, status: ready}
+                    result: {predictor: churn, name: production, revision: 7, generation: 9, status: ready}
 
   /v1/projects/{project}/predictors/{name}/environments/{environment}/promote:
     post:
@@ -1320,7 +1320,7 @@ paths:
                     project: acme
                     request_id: r-d5e6f708192a3b4c5d6e7f8091a2b3c4
                     resource: {kind: predictor, name: churn}
-                    result: {predictor: churn, name: production, revision: 8, generation: 10, runtime: hosted, status: ready}
+                    result: {predictor: churn, name: production, revision: 8, generation: 10, status: ready}
 
   /v1/projects/{project}/predictors/{name}/environments/{environment}/rollback:
     post:
@@ -1359,7 +1359,7 @@ paths:
                     project: acme
                     request_id: r-e6f708192a3b4c5d6e7f8091a2b3c4d5
                     resource: {kind: predictor, name: churn}
-                    result: {predictor: churn, name: production, revision: 7, generation: 11, runtime: hosted, status: ready}
+                    result: {predictor: churn, name: production, revision: 7, generation: 11, status: ready}
 
   /v1/projects/{project}/predictors/{name}/environments/{environment}/metrics:
     get:
@@ -4499,14 +4499,13 @@ components:
     Environment:
       type: object
       description: a pointer to a revision; `generation` guards promote and rollback
-      required: [predictor, name, revision, generation, runtime, status]
+      required: [predictor, name, revision, generation, status]
       additionalProperties: false
       properties:
         predictor: {$ref: "#/components/schemas/Name"}
         name: {$ref: "#/components/schemas/Name"}
         revision: {type: [integer, "null"]}
         generation: {type: integer, minimum: 0}
-        runtime: {$ref: "#/components/schemas/Name"}
         status: {$ref: "#/components/schemas/State"}
 
     EnvironmentReply:
@@ -4536,11 +4535,10 @@ components:
 
     EnvironmentCreate:
       type: object
-      required: [name, runtime]
+      required: [name]
       additionalProperties: false
       properties:
         name: {$ref: "#/components/schemas/Name"}
-        runtime: {$ref: "#/components/schemas/Name"}
 
     EnvironmentCreateRequest:
       allOf:

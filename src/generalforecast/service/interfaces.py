@@ -76,7 +76,7 @@ class AcceptedWrite(TypedDict):
     accepted_at: float
     durably_accepted: bool
     changes: list[ComponentVersions]
-    retry_valid_until: float | None
+    retry_valid_until: float
 
 
 class SnapshotRow(TypedDict):
@@ -104,8 +104,6 @@ class ContextSnapshot(TypedDict):
     event_before: float | None
     rows: list[SnapshotRow]
     source_wait_count: int
-    pending_processing_count: int
-    oldest_unprocessed_at: float | None
 
 
 class EffectStatus(TypedDict):

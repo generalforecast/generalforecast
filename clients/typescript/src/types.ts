@@ -274,7 +274,6 @@ export interface Environment {
   name: Name;
   revision: number | null;
   generation: number;
-  runtime: Name;
   status: State;
 }
 
@@ -602,7 +601,6 @@ export interface EnvironmentListReply extends Envelope {
 
 export interface EnvironmentCreate {
   name: Name;
-  runtime: Name;
 }
 
 export interface EnvironmentCreateRequest extends Envelope {

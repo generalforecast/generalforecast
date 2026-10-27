@@ -224,14 +224,12 @@ class Environment(WireValue):
     name: str
     revision: int | None
     generation: int
-    runtime: str
     status: str = "pending"
 
     def __post_init__(self):
         """Keeps environment identity distinct from the immutable revision."""
         name(self.predictor)
         name(self.name)
-        identifier(self.runtime)
         integer(self.generation, 0)
         if self.revision is not None:
             integer(self.revision)

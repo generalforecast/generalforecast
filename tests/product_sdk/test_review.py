@@ -148,8 +148,8 @@ def test_named_prediction_retains_optional_request_bindings(wire, asynchronous):
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_captured_environment_never_lends_other_environment_its_cas(wire, asynchronous):
-    captured = Environment("risk", "production", 1, 3, "local", "ready")
-    staging = Environment("risk", "staging", 2, 9, "local", "ready")
+    captured = Environment("risk", "production", 1, 3, "ready")
+    staging = Environment("risk", "staging", 2, 9, "ready")
     base = "/predictors/risk/environments/staging"
     for action in ("promote", "rollback"):
         wire.expect("GET", base, staging.to_dict())
@@ -161,7 +161,7 @@ def test_captured_environment_never_lends_other_environment_its_cas(wire, asynch
         )
     wire.expect("GET", base, staging.to_dict())
     wire.expect("GET", "/predictors/risk/environments/production", captured.to_dict())
-    moved = Environment("risk", "production", 2, 4, "local", "ready")
+    moved = Environment("risk", "production", 2, 4, "ready")
     wire.expect("GET", "/predictors/risk/environments/production", moved.to_dict())
     wire.expect(
         "POST",

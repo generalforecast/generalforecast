@@ -177,9 +177,9 @@ def test_predict_and_hosted(suite):
     assert push[-1] == "    Deployed churn revision 8 to staging in 41s"
     assert "Push? [y/N] y" in lines(suite, "push-ask")
     assert lines(suite, "status") == [
-        "environment  revision  status  runtime",
-        "production   6         ready   default",
-        "staging      7         ready   default",
+        "environment  revision  status",
+        "production   6         ready",
+        "staging      7         ready",
     ]
     assert lines(suite, "promote") == [
         "    Promoted churn revision 7 to production in 3.2s"

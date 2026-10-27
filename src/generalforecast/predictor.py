@@ -1406,13 +1406,11 @@ class Predictor:
             write_lock(resolve(spec, root), root)
         return root
 
-    def push(self, env: str = "staging", *, runtime: str | None = None) -> Predictor:
+    def push(self, env: str = "staging") -> Predictor:
         """Deploys a local predictor to a hosted environment and returns it.
 
         Args:
             env: The environment, `staging` or `production`.
-            runtime: The runtime a new environment runs on, `hosted` or
-                `local`; the profile's when None.
         """
         if env not in ENVIRONMENTS:
             raise InvalidInput(
@@ -1426,7 +1424,7 @@ class Predictor:
         assert self._root is not None
         client = self._client()
         with boundary():
-            client.predictors.push(self._root, env=env, runtime=runtime)
+            client.predictors.push(self._root, env=env)
         return Predictor(self.name, env=env, client=client)
 
 

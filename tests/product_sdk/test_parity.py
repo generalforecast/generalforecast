@@ -106,7 +106,7 @@ def test_async_handles_share_the_sync_handles_facts_and_operations():
 
 
 def results(lock: Any, revision: Revision) -> list[tuple[str, str, Any]]:
-    environment = Environment("risk", "staging", 1, 1, "local", "ready").to_dict()
+    environment = Environment("risk", "staging", 1, 1, "ready").to_dict()
     prediction = {
         "model": "general-forecast/tabicl-v2-classifier",
         "task": "classification",
@@ -198,7 +198,7 @@ def calls(authored: Any) -> dict[str, tuple[tuple, dict]]:
         "predictors.environment": (("risk",), {}),
         "predictors.create_environment": (
             ("risk",),
-            {"env": "dev", "runtime": "local"},
+            {"env": "dev"},
         ),
         "predictors.promote": (("risk",), {"revision": 1}),
         "predictors.rollback": (("risk",), {"revision": 1, "expected_generation": 1}),

@@ -16,10 +16,16 @@ The flow, for one revision:
    `data_digest`. A stored version 1 lock is rewritten with `upgrade_lock`.
 2. Gather its rows: the uploaded snapshot for a snapshot context,
    `live_context(lock, snapshot)` for a live one, none for a request one.
-3. `compile_lock(lock, rows)` into a `CompiledPlan`, and
-   `PredictorExecutor().prepare(plan, rows)` to predict in process, or
-   `published_entry(plan)` for gf-server's models file. `lock.digest` is the
-   revision's identity and gf-server's fingerprint.
+3. `served_context(lock, table)` gives the exact rows every path binds:
+   the lock's split, projection to its columns in order, its roles' kinds
+   and a classifier's integer labels; an uploaded snapshot is those rows
+   already and comes back as it is. `compile_lock(lock, rows)` compiles them
+   into a `CompiledPlan`, whose `spec.selection` every binder applies per
+   query. `PredictorExecutor().prepare(plan, rows)` predicts in process;
+   for gf-server, `published_entry(plan)` is the entry (its `strategy` is the
+   selection) and `json_rows(bound_rows(plan, rows))` the rows, in the order
+   gf serve binds them. `lock.digest` is the revision's identity and
+   gf-server's fingerprint.
 4. A request carries `PredictionRequest` fields: queries, a request
    context's rows, and `as_of` for a live context.
 
@@ -75,6 +81,7 @@ from generalforecast.predictors.runtime.requests import (
     request_table,
     temporal,
 )
+from generalforecast.predictors.runtime.tabular import bound_order as bound_rows
 from generalforecast.predictors.spec import PredictorSpec
 from generalforecast.predictors.validation import PredictorError, bytes_digest
 from generalforecast.serve.listener import binary, configuration
@@ -221,6 +228,7 @@ __all__ = [
     "arrow_bytes",
     "binary",
     "bind_request",
+    "bound_rows",
     "bytes_digest",
     "catalog_model",
     "coerce",

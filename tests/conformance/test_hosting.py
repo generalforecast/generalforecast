@@ -64,6 +64,7 @@ RECORDED = (
     "arrow_bytes",
     "binary",
     "bind_request",
+    "bound_rows",
     "bytes_digest",
     "catalog_model",
     "coerce",

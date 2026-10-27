@@ -86,7 +86,7 @@ def test_explicit_empty_environment_never_falls_back_to_production(
                     ("risk",),
                     {"env": "", "revision": 1, "expected_generation": 0},
                 ),
-                (client.predictors.push, (authored,), {"env": "", "runtime": "local"}),
+                (client.predictors.push, (authored,), {"env": ""}),
             ):
                 with pytest.raises(ServiceError):
                     await invoke(operation, *args, **kwargs)
@@ -105,7 +105,7 @@ def test_push_cas_readiness_and_rollback(wire, tmp_path, asynchronous):
     lock = checked_lock(authored)
     assert lock.context_kind == "snapshot" and lock.context["rows"] == 3
     revision = Revision("risk", 1, lock.digest, lock.model, time.time())
-    initial = Environment("risk", "production", None, 0, "local")
+    initial = Environment("risk", "production", None, 0)
     pending = initial.promote(PromoteRequest(1, 0))
     ready = dataclasses.replace(pending, status="ready")
     base = "/predictors/risk"
@@ -123,7 +123,7 @@ def test_push_cas_readiness_and_rollback(wire, tmp_path, asynchronous):
         "POST",
         base + "/environments",
         initial.to_dict(),
-        payload={"name": "production", "runtime": "local"},
+        payload={"name": "production"},
     )
     wire.expect(
         "POST",
@@ -164,9 +164,7 @@ def test_push_cas_readiness_and_rollback(wire, tmp_path, asynchronous):
             wire.url, project="test", api_key="fixture-key"
         )
         try:
-            pushed = await invoke(
-                client.predictors.push, authored, runtime="local", wait=True
-            )
+            pushed = await invoke(client.predictors.push, authored, wait=True)
             assert pushed == revision
             uploaded = next(
                 value for path, value in wire.requests if path.endswith("/snapshots")
@@ -336,9 +334,7 @@ def test_predictions_and_context_transactions(wire, asynchronous):
 @pytest.mark.parametrize("status", ["failed", "pending", "ready"])
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_wait_never_accepts_failure_or_a_superseded_pointer(wire, status, asynchronous):
-    state = Environment(
-        "risk", "production", 2 if status == "ready" else 1, 2, "local", status
-    )
+    state = Environment("risk", "production", 2 if status == "ready" else 1, 2, status)
     wire.expect("GET", "/predictors/risk/environments/production", state.to_dict())
 
     async def run():

@@ -426,16 +426,14 @@ def predictor_environment(
     return decoded(Environment.from_dict, value, "environment")
 
 
-def predictor_create_environment(
-    predictor: str, env: str, runtime: str
-) -> Operation[Environment]:
-    """Binds a runtime separately from predictor content and authentication."""
+def predictor_create_environment(predictor: str, env: str) -> Operation[Environment]:
+    """Creates an environment, a pointer to the revision it serves."""
     value = yield from posted(
         "predictor",
         "predictors",
         predictor,
         "environments",
-        {"name": name(env), "runtime": name(runtime)},
+        {"name": name(env)},
     )
     return decoded(Environment.from_dict, value, "environment")
 
@@ -506,7 +504,6 @@ def predictor_push(
     predictor: str | Path,
     *,
     env: str | None,
-    runtime: str | None,
     wait: bool,
     timeout: float,
 ) -> Operation[Revision]:
@@ -535,18 +532,10 @@ def predictor_push(
     revision = decoded(Revision.from_dict, value, "revision")
     try:
         environment = yield from predictor_environment(client, resource, selected)
-        require(
-            runtime is None or environment.runtime == runtime,
-            "environment is bound to a different runtime",
-        )
     except ServiceError as error:
         if error.status != 404:
             raise
-        chosen = client.profile.runtime if runtime is None else runtime
-        require(chosen is not None, "runtime is required for a new environment")
-        environment = yield from predictor_create_environment(
-            resource, selected, cast(str, chosen)
-        )
+        environment = yield from predictor_create_environment(resource, selected)
     promoted = yield from predictor_move(
         client,
         resource,

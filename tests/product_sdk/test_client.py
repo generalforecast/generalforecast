@@ -68,7 +68,7 @@ def test_predict_uses_the_profile_environment(wire, asynchronous):
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_wait_with_no_time_left_checks_once_then_times_out(wire, asynchronous):
-    pending = Environment("risk", "production", 1, 1, "local", "pending")
+    pending = Environment("risk", "production", 1, 1, "pending")
     wire.expect("GET", "/predictors/risk/environments/production", pending.to_dict())
     with pytest.raises(ServiceError) as error:
         run(asynchronous, wire.url, lambda c: c.predictors.wait("risk", timeout=0))
@@ -98,7 +98,7 @@ def test_wait_raises_wait_timeout_when_the_deadline_passes_during_a_poll(asynchr
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_a_predictor_reports_hosted_facts(wire, asynchronous):
-    environment = Environment("risk", "production", 2, 3, "local", "ready")
+    environment = Environment("risk", "production", 2, 3, "ready")
     wire.expect(
         "GET",
         "/predictors/risk",

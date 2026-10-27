@@ -841,7 +841,6 @@ class Environment(Payload):
     name: Name
     revision: int | None
     generation: int
-    runtime: Name
     status: State
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
@@ -849,7 +848,6 @@ class Environment(Payload):
         Field("name", "name", True, _decode_Name),
         Field("revision", "revision", True, _union(_integer, _null)),
         Field("generation", "generation", True, _integer),
-        Field("runtime", "runtime", True, _decode_Name),
         Field("status", "status", True, _decode_State),
     )
 
@@ -1894,12 +1892,8 @@ class EnvironmentCreate(Payload):
     """The EnvironmentCreate schema."""
 
     name: Name
-    runtime: Name
 
-    FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("name", "name", True, _decode_Name),
-        Field("runtime", "runtime", True, _decode_Name),
-    )
+    FIELDS: ClassVar[tuple[Field, ...]] = (Field("name", "name", True, _decode_Name),)
 
 
 @dataclass(frozen=True, kw_only=True)

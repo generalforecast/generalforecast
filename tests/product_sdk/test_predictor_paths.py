@@ -135,12 +135,12 @@ def test_served_calls_go_through_the_sdk_transport_with_project_and_key(monkeypa
     assert defaults["Authorization"] == "Bearer k-1"
 
 
-def test_push_passes_the_runtime(tmp_path):
+def test_push_names_the_environment_alone(tmp_path):
     root = directory(tmp_path / "churn", rows(), name="churn", id="id")
     client = Recorder()
-    gf.Predictor(root, client=client).push("staging", runtime="hosted")
+    gf.Predictor(root, client=client).push("staging")
     [(_, _, kwargs)] = [call for call in client.calls if call[0] == "push"]
-    assert kwargs == {"env": "staging", "runtime": "hosted"}
+    assert kwargs == {"env": "staging"}
 
 
 def test_save_keeps_the_whole_manifest_and_its_lock(tmp_path, monkeypatch):

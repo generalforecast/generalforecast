@@ -864,7 +864,7 @@ class PredictorCommands:
                     "POST",
                     name,
                     "/environments",
-                    {"name": env, "runtime": self.runtime()},
+                    {"name": env},
                 )
             )
         request = PromoteRequest(revision.number, current.generation)
@@ -882,13 +882,6 @@ class PredictorCommands:
             "revision": revision.to_dict(),
             "environment": ready.to_dict(),
         }
-
-    def runtime(self) -> str:
-        """The runtime a new environment runs on: `GF_RUNTIME`, else the profile's, else `hosted`."""
-        chosen = os.environ.get("GF_RUNTIME") or getattr(
-            self.client.profile, "runtime", None
-        )
-        return chosen or "hosted"
 
     def wait(self, environment: Any) -> Any:
         """Polls the environment until it is ready, for at most `--wait` seconds.
@@ -986,7 +979,7 @@ class PredictorCommands:
                     "POST",
                     name,
                     "/environments",
-                    {"name": env, "runtime": self.runtime()},
+                    {"name": env},
                 )
             )
         request = PromoteRequest(revision, current.generation)
