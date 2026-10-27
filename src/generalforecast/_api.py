@@ -2766,8 +2766,6 @@ class ContextSnapshot(Payload):
     event_before: float | None
     rows: tuple[SnapshotRow, ...]
     source_wait_count: int
-    pending_processing_count: int
-    oldest_unprocessed_at: float | None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("project", "project", True, _decode_Name),
@@ -2779,13 +2777,6 @@ class ContextSnapshot(Payload):
         Field("event_before", "event_before", True, _union(_number, _null)),
         Field("rows", "rows", True, _items(_record(SnapshotRow))),
         Field("source_wait_count", "source_wait_count", True, _integer),
-        Field("pending_processing_count", "pending_processing_count", True, _integer),
-        Field(
-            "oldest_unprocessed_at",
-            "oldest_unprocessed_at",
-            True,
-            _union(_number, _null),
-        ),
     )
 
 

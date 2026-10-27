@@ -53,13 +53,20 @@ DEFAULT_KEY_ENV = "GF_API_KEY"
 DEFAULT_ENVIRONMENT = "production"
 # The bounds of one request's timeout, in seconds.
 MIN_TIMEOUT, MAX_TIMEOUT = 0.01, 300
-PROFILE_FIELDS = ("url", "project", "environment", "runtime", "key_env")
+PROFILE_FIELDS = ("url", "project", "environment", "key_env")
+# Fields earlier releases stored, read and ignored so their profiles still load.
+_RETIRED_FIELDS = ("runtime",)
 _PROFILE_LIMIT = 65536
 _KEY_ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
 
 
 class RelayedError(ServiceError):
     """A service's own short error message, made printable."""
+
+
+def _current(value: dict[str, Any]) -> dict[str, Any]:
+    """A stored profile without the fields earlier releases kept."""
+    return {key: item for key, item in value.items() if key not in _RETIRED_FIELDS}
 
 
 def _invalid_profile() -> ServiceError:
@@ -73,7 +80,6 @@ class Profile:
     url: str = "http://127.0.0.1:8000"
     project: str = "local"
     environment: str = DEFAULT_ENVIRONMENT
-    runtime: str | None = None
     key_env: str | None = DEFAULT_KEY_ENV
 
     def __post_init__(self) -> None:
@@ -81,8 +87,6 @@ class Profile:
         endpoint(self.url)
         name(self.project)
         name(self.environment)
-        if self.runtime is not None:
-            name(self.runtime)
         require(
             self.key_env is None
             or (
@@ -135,10 +139,11 @@ class Profile:
             for profile, value in profiles.items():
                 name(profile)
                 require(
-                    type(value) is dict and not set(value) - set(PROFILE_FIELDS),
+                    type(value) is dict
+                    and not set(value) - {*PROFILE_FIELDS, *_RETIRED_FIELDS},
                     "invalid profile fields; use environment credential references",
                 )
-                cls(**value)
+                cls(**_current(value))
         except (ValueError, KeyError, TypeError, ServiceError):
             raise _invalid_profile() from None
         return profiles
@@ -154,7 +159,7 @@ class Profile:
     ) -> "Profile":
         """Reads canonical CLI profiles; files contain refs, never credential values.
 
-        GF_URL, GF_PROJECT, GF_ENV and GF_RUNTIME override stored values.
+        GF_URL, GF_PROJECT and GF_ENV override stored values.
         """
         env = os.environ if environ is None else environ
         selected = env.get("GF_PROFILE", "default") if profile is None else profile
@@ -162,12 +167,11 @@ class Profile:
         profiles = cls.load_all(path, environ=env)
         if selected not in profiles and not (missing_ok or selected == "default"):
             raise _invalid_profile()
-        value = dict(profiles.get(selected, {}))
+        value = _current(profiles.get(selected, {}))
         for key, variable in (
             ("url", "GF_URL"),
             ("project", "GF_PROJECT"),
             ("environment", "GF_ENV"),
-            ("runtime", "GF_RUNTIME"),
         ):
             if variable in env:
                 value[key] = env[variable]
@@ -182,8 +186,6 @@ class Profile:
         }
         if self.environment != DEFAULT_ENVIRONMENT:
             value["environment"] = self.environment
-        if self.runtime is not None:
-            value["runtime"] = self.runtime
         return value
 
     def save(
@@ -287,7 +289,6 @@ class ConnectionSettings:
             base.url if url is None else url,
             base.project if project is None else project,
             base.environment,
-            base.runtime,
             base.key_env if key_env is None else key_env,
         )
         if explicit is not None:

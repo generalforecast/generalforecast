@@ -1847,8 +1847,6 @@ paths:
                       rows:
                         - {key: '1041', features: {spend: 82.5}, label: 0, feature_version: 3, label_version: 1, feature_accepted_at: 1761990000.0, label_accepted_at: 1762000000.0, event_at: null}
                       source_wait_count: 0
-                      pending_processing_count: 0
-                      oldest_unprocessed_at: null
 
   /v1/projects/{project}/sources:
     get:
@@ -5005,7 +5003,7 @@ components:
 
     ContextSnapshot:
       type: object
-      required: [project, context, target, features, through_sequence, knowledge_at, event_before, rows, source_wait_count, pending_processing_count, oldest_unprocessed_at]
+      required: [project, context, target, features, through_sequence, knowledge_at, event_before, rows, source_wait_count]
       additionalProperties: false
       properties:
         project: {$ref: "#/components/schemas/Name"}
@@ -5019,8 +5017,6 @@ components:
           type: array
           items: {$ref: "#/components/schemas/SnapshotRow"}
         source_wait_count: {type: integer, minimum: 0}
-        pending_processing_count: {type: integer, minimum: 0}
-        oldest_unprocessed_at: {type: [number, "null"]}
 
     ContextSnapshotReply:
       allOf:

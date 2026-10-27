@@ -75,7 +75,7 @@ def test_profile_auth_precedence_and_no_secret_persistence(
     tmp_path, monkeypatch, client_type
 ):
     monkeypatch.delenv("GF_PROFILE", raising=False)
-    for key in ("GF_URL", "GF_PROJECT", "GF_ENV", "GF_RUNTIME"):
+    for key in ("GF_URL", "GF_PROJECT", "GF_ENV"):
         monkeypatch.delenv(key, raising=False)
     config = tmp_path / "config.toml"
     config.touch(mode=0o600)
@@ -460,7 +460,7 @@ def test_resolver_precedence_uses_explicit_mapping_not_process_env(
     }
     settings = ConnectionSettings.resolve(environ=environ)
     assert settings.profile == Profile(
-        "https://profile.example", "from-env", "staging", "cpu", "WORK_KEY"
+        "https://profile.example", "from-env", "staging", "WORK_KEY"
     )
     assert settings.profile_name == "work" and settings.credential_env == "WORK_KEY"
     explicit = ConnectionSettings.resolve(

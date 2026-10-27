@@ -877,8 +877,6 @@ export interface ContextSnapshot {
   event_before: number | null;
   rows: SnapshotRow[];
   source_wait_count: number;
-  pending_processing_count: number;
-  oldest_unprocessed_at: number | null;
 }
 
 export interface ContextSnapshotReply extends Envelope {
