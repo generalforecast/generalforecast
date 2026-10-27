@@ -791,16 +791,25 @@ def test_writers_on_one_table_move_their_ids_past_each_other_closely(catalog) ->
         table.drop()
 
 
-def test_a_table_routed_by_a_column_takes_no_rows_without_ids() -> None:
+def test_rows_without_ids_are_refused_on_a_routed_table() -> None:
+    class Recording:
+        """A handle that takes every insert, as a partition without the ids would."""
+
+        inserted = 0
+
+        def insert(self, *_: Any) -> None:
+            self.inserted += 1
+
     table = engine.Table(
         "routed",
         model="general-forecast/tabicl-v2-classifier",
         target="y",
-        ops=engine.TableOptions(partitions=2, route_by={"column": "f0"}),
+        ops=engine.TableOptions(partitions=2, route_by={"column": "x"}),
         download=False,
     )
-
-    with pytest.raises(InvalidInput, match="routed by a column") as caught:
-        table._insert_unkeyed(cast(Any, object()), np.zeros((2, 1)), np.zeros(2), None)
-
+    handle = Recording()
+    with pytest.raises(InvalidInput, match="routed by 'x'") as caught:
+        table._insert_unkeyed(cast(Any, handle), np.zeros((2, 1)), np.zeros(2), None)
+    # No partition can refuse an id another holds, so nothing is written.
+    assert handle.inserted == 0
     assert caught.value.hint == "give the rows an id column with Schema(id=...)"

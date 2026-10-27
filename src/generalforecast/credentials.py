@@ -9,7 +9,6 @@ workspace, project, key id) always lives in that file. GF_API_KEY overrides
 everything for CI.
 """
 
-import json
 import os
 import shutil
 import subprocess
@@ -21,15 +20,14 @@ from pathlib import Path
 
 from generalforecast._files import private_lock, read_private, write_private
 from generalforecast.service.contracts import ServiceError
+from generalforecast.transport import DEFAULT_SERVER, profiles_in_use
 
-DEFAULT_SERVER = "https://app.generalforecast.com"
 KEYCHAIN_SERVICE = "generalforecast"
 ENV_KEY = "GF_API_KEY"
 # Credential values seen this process, redacted from every output.
 SEEN: set[str] = set()
 # The server and credential source the current command uses, for diagnostics.
 CONNECTION: dict[str, str] = {}
-PROFILE_FLAGS = ("url", "profile", "key_env", "base_url")
 # The largest credentials file read.
 _CREDENTIALS_LIMIT = 65536
 
@@ -40,19 +38,14 @@ def server_url(environ: dict[str, str] | None = None) -> str:
     return (env.get("GF_URL") or DEFAULT_SERVER).rstrip("/")
 
 
-def uses_profiles(args: object, environ: Mapping[str, str] | None = None) -> bool:
-    """Explicit endpoint flags, GF_PROFILE/GF_TOKEN or a saved default profile."""
-    env = os.environ if environ is None else environ
-    if any(getattr(args, flag, None) is not None for flag in PROFILE_FLAGS):
-        return True
-    if env.get("GF_PROFILE") or env.get("GF_TOKEN"):
-        return True
-    path = Path(env.get("GF_CONFIG_PATH") or config_dir(env) / "profiles.json")
-    try:
-        profiles = json.loads(path.expanduser().read_text())
-    except (OSError, ValueError):
-        return False
-    return isinstance(profiles, dict) and "default" in profiles
+def uses_profiles(
+    _args: object = None, environ: Mapping[str, str] | None = None
+) -> bool:
+    """Whether a profile, not the `gf login` store, configures the connection.
+
+    See `transport.profiles_in_use`; the CLI and the SDK resolve alike.
+    """
+    return profiles_in_use(environ=environ)
 
 
 def config_dir(environ: Mapping[str, str] | None = None) -> Path:
@@ -90,6 +83,28 @@ class Credential:
     key: str = field(repr=False)
     source: str
     login: Login | None = None
+
+
+def _checked(login: Login) -> None:
+    """Refuses a login whose fields are not text the file and keychain can hold."""
+    from generalforecast.transport import credential
+
+    optional = ("email", "workspace", "workspace_id")
+    for key, value in asdict(login).items():
+        if key == "key" or (value is None and key in optional):
+            continue
+        try:
+            valid = type(value) is str and bool(value) and bool(value.encode())
+        except UnicodeEncodeError:
+            valid = False
+        if not valid:
+            raise ServiceError(
+                "ValidationError",
+                f"the login's {key.replace('_', ' ')} is not valid text",
+                422,
+                param=key,
+            )
+    credential(login.key or "", "login key")
 
 
 def key_suffix(key: str | None) -> str:
@@ -198,8 +213,12 @@ class CredentialStore:
         )
 
     def save(self, login: Login) -> Login:
-        """Stores the key in the keychain when possible, else in the file."""
-        assert login.key is not None
+        """Stores the key in the keychain when possible, else in the file.
+
+        Every field is checked first, so a login the server sent malformed
+        is refused before the keychain or the file is touched.
+        """
+        _checked(login)
         login.store = (
             "keychain" if self.keychain() and self._keychain_write(login) else "file"
         )

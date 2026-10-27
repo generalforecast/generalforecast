@@ -52,6 +52,7 @@ def test_top_level_exports_are_exactly_the_contract() -> None:
         "Internal",
         "Conflict",
         "Unavailable",
+        "Unsupported",
         "Client",
         "AsyncClient",
         "engine",
@@ -250,10 +251,12 @@ def test_requests_name_columns_and_classes_in_their_errors() -> None:
         and payload["id"] == "customer_id"
     )
     assert "task" not in payload and "options" not in payload
-    assert PredictRequest.declared_payload([{"x": 1}], as_of="2025-01-01") == {
-        "queries": [{"x": 1}],
-        "as_of": "2025-01-01",
-    }
+    # as_of goes on the wire as RFC 3339 UTC, whatever form it was given in.
+    for given in ("2025-01-01", "2025-01-01T02:00:00+02:00", 1735689600):
+        assert PredictRequest.declared_payload([{"x": 1}], as_of=given) == {
+            "queries": [{"x": 1}],
+            "as_of": "2025-01-01T00:00:00Z",
+        }
     with pytest.raises(gf.CapacityExceeded) as caught:
         PredictRequest.build(
             model=MODEL,

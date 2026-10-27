@@ -326,12 +326,16 @@ class PredictRequest:
             "queries": _records(self.queries),
             "inputs": list(self.inputs),
         }
-        for key in ("id", "time", "frequency", "horizon", "as_of"):
+        for key in ("id", "time", "frequency", "horizon"):
             value = getattr(self, key)
             if value is not None:
                 payload[key] = (
                     value if not hasattr(value, "isoformat") else value.isoformat()
                 )
+        if self.as_of is not None:
+            from generalforecast import as_of as instants
+
+            payload["as_of"] = instants.wire(self.as_of)
         if self.series:
             payload["series"] = list(self.series)
         if self.quantiles is not None:
@@ -351,9 +355,9 @@ class PredictRequest:
         if context is not None:
             payload["context"] = _records(tabular.frame(context))
         if as_of is not None:
-            payload["as_of"] = (
-                as_of if not hasattr(as_of, "isoformat") else as_of.isoformat()
-            )
+            from generalforecast import as_of as instants
+
+            payload["as_of"] = instants.wire(as_of)
         return payload
 
 

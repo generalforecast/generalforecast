@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import atexit
+import contextlib
 import json
 import os
 import shutil
@@ -12,6 +14,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -29,6 +32,115 @@ KEY = "ab" * 32
 NEAR_A = np.zeros((2, 5), dtype=np.float32)
 # The five numeric columns `features=5` makes, as a raw create body names them.
 COLUMNS = [{"name": f"f{index}", "kind": "numeric"} for index in range(5)]
+
+# How long a test server may take to answer once started. Its worker first
+# compiles the programs this session's servers recorded, which on a machine
+# busy with other test workers takes minutes rather than seconds.
+STARTUP_SECONDS = float(os.environ.get("GF_TEST_STARTUP_SECONDS", "600"))
+# How long a condition a test waits on may take to hold under the same load,
+# such as a replica catching up after its node starts again.
+SETTLE_SECONDS = float(os.environ.get("GF_TEST_SETTLE_SECONDS", "180"))
+# How long a stopped server may take to drain before it is killed.
+STOP_SECONDS = 60.0
+
+# The process groups of the servers this process started and has not yet
+# stopped, killed at exit, so a test that fails or times out leaves none.
+_RUNNING: set[int] = set()
+
+
+def _spawn(command: list[str], **options) -> subprocess.Popen:
+    """Starts a server in a process group of its own, which holds its workers."""
+    process = subprocess.Popen(command, start_new_session=True, **options)
+    _RUNNING.add(process.pid)
+    return process
+
+
+def _stop(process: subprocess.Popen) -> int:
+    """Stops a server with SIGTERM, then kills its group: workers it left too."""
+    process.terminate()
+    try:
+        code = process.wait(timeout=STOP_SECONDS)
+    except subprocess.TimeoutExpired:
+        _kill(process.pid)
+        code = process.wait()
+    _kill(process.pid)
+    return code
+
+
+def _kill(group: int) -> None:
+    _RUNNING.discard(group)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(group, signal.SIGKILL)
+
+
+@atexit.register
+def _kill_running() -> None:
+    for group in list(_RUNNING):
+        _kill(group)
+
+
+def _session_cache() -> Path:
+    """This process's cache directory for the servers it starts, removed at exit.
+
+    A worker compiles every program the servers before it recorded as it
+    starts, and records live in the cache directory. Shared with every run
+    on the machine, they grow with every shape any test ever asked for, and
+    each start compiles them all; a directory of this session's own keeps a
+    start to what its tests asked for.
+    """
+    global _CACHE
+    if _CACHE is None:
+        _CACHE = Path(tempfile.mkdtemp(prefix="gf-test-cache-"))
+        atexit.register(shutil.rmtree, _CACHE, ignore_errors=True)
+    return _CACHE
+
+
+_CACHE: Path | None = None
+
+
+def server_environment() -> dict[str, str]:
+    """The environment test servers run under, with this session's cache directory.
+
+    JAX's compile cache stays the shared one, so programs a worker compiled
+    in an earlier run load rather than compile again.
+    """
+    from generalforecast.runtime.device import cache_root
+
+    shared = os.environ.get("JAX_COMPILATION_CACHE_DIR") or str(cache_root() / "jax")
+    return {
+        **os.environ,
+        "GF_TEST_KEY": KEY,
+        "PYTHONPATH": str(ROOT),
+        "XDG_CACHE_HOME": str(_session_cache()),
+        "JAX_COMPILATION_CACHE_DIR": shared,
+    }
+
+
+def _ready(process: subprocess.Popen, what: str, probe: Callable[[], object]) -> None:
+    """Waits until `probe` succeeds, at most `STARTUP_SECONDS`.
+
+    Raises:
+        AssertionError: If the process exits first, or the time runs out; the
+            process is killed then.
+    """
+    deadline = time.monotonic() + STARTUP_SECONDS
+    while True:
+        try:
+            probe()
+            return
+        except Exception as error:
+            code = process.poll()
+            if code is not None:
+                _kill(process.pid)
+                raise AssertionError(
+                    f"{what} exited with {code} as it started"
+                ) from error
+            if time.monotonic() > deadline:
+                _stop(process)
+                raise AssertionError(
+                    f"{what} did not answer within {STARTUP_SECONDS:.0f} seconds"
+                ) from error
+        time.sleep(0.2)
 
 
 def build() -> Path:
@@ -120,9 +232,14 @@ host_bytes = {256 << 20}
         return f"{scheme}://localhost:{self.port}"
 
     def start(self) -> Server:
-        environment = {**os.environ, "GF_TEST_KEY": KEY, "PYTHONPATH": str(ROOT)}
-        self.process = subprocess.Popen(
-            [str(self.binary), "run", "--config", str(self.config)], env=environment
+        """Starts the server, and returns once it answers over Flight.
+
+        It listens only once its workers have compiled the programs they
+        recorded, so an answer means the server takes calls at once.
+        """
+        self.process = _spawn(
+            [str(self.binary), "run", "--config", str(self.config)],
+            env=server_environment(),
         )
         if self.trust is None:
             self.client = flight.FlightClient(f"grpc://127.0.0.1:{self.port}")
@@ -134,22 +251,14 @@ host_bytes = {256 << 20}
             self.client = flight.FlightClient(
                 f"grpc+tls://localhost:{self.port}", **options
             )
-        deadline = time.monotonic() + 120
-        while True:
-            try:
-                self.action("health")
-                return self
-            except flight.FlightError:
-                if time.monotonic() > deadline or self.process.poll() is not None:
-                    raise
-                time.sleep(0.2)
+        _ready(self.process, f"gf-server {self.name}", lambda: self.action("health"))
+        return self
 
     def stop(self) -> int:
         """Stops the server with SIGTERM and returns its exit code."""
         code = 0
         if self.process is not None:
-            self.process.terminate()
-            code = self.process.wait(timeout=30)
+            code = _stop(self.process)
             self.process = None
         return code
 
@@ -254,19 +363,16 @@ class Router:
         self.config.write_text(self.settings + sections)
 
     def start(self, check: Callable[[], object]) -> Router:
+        """Starts the router, and returns once `check`, a call through it, succeeds.
+
+        The router serves only once it has learned its nodes' copies.
+        """
         with self.log.open("ab") as log:
-            self.process = subprocess.Popen(
+            self.process = _spawn(
                 [str(self.binary), "run", "--config", str(self.config)], stderr=log
             )
-        deadline = time.monotonic() + 60
-        while True:
-            try:
-                check()
-                return self
-            except Exception:
-                if time.monotonic() > deadline or self.process.poll() is not None:
-                    raise
-                time.sleep(0.2)
+        _ready(self.process, "gf-router", check)
+        return self
 
     def reload(self, nodes: list[Server]) -> None:
         """Rewrites the node list and signals the router to reload it."""
@@ -284,8 +390,7 @@ class Router:
 
     def stop(self) -> None:
         if self.process is not None:
-            self.process.terminate()
-            self.process.wait(timeout=30)
+            _stop(self.process)
             self.process = None
 
     def metric(self, line: str) -> bool:
@@ -300,7 +405,7 @@ class Router:
         return [by_name[name] for name in self.locate(table)]
 
 
-def wait_until(condition: Callable[[], bool], timeout: float = 60) -> None:
+def wait_until(condition: Callable[[], bool], timeout: float = SETTLE_SECONDS) -> None:
     """Polls until a condition holds, treating errors as not yet."""
     deadline = time.monotonic() + timeout
     while True:

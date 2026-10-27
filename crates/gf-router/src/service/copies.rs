@@ -10,7 +10,7 @@
 //! since it began stand over them: a check never takes back a term a write
 //! began meanwhile, nor brings back a table dropped meanwhile.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::PoisonError;
 
 use gf_server::wal::{CreationId, Terms};
@@ -43,6 +43,10 @@ pub(super) struct Copies {
     /// The latest change to each table's copy on a node, by table and node
     /// name, or to a whole table, by its name alone.
     changed: HashMap<(String, Option<String>), u64>,
+    /// The tables each node out of reach held when last answered, by node
+    /// name: its copies are left out of what the router saw, which only the
+    /// nodes that answer say, but its names stay taken.
+    unreachable: HashMap<String, BTreeSet<String>>,
 }
 
 impl Copies {
@@ -74,6 +78,14 @@ impl Copies {
             .get(table)
             .map(|counts| counts.keys().copied().collect())
             .unwrap_or_default()
+    }
+
+    /// Whether a node out of reach held a table under the name when last
+    /// answered, whole or as a partition.
+    pub(super) fn held_out_of_reach(&self, table: &str) -> bool {
+        self.unreachable.values().flatten().any(|name| {
+            name == table || partitions::parse(name).is_some_and(|(owner, _, _)| owner == table)
+        })
     }
 
     /// The stamp a check begins at: changes after it stand over its answers.
@@ -122,10 +134,14 @@ impl Copies {
         }
     }
 
-    /// Forgets every copy of a dropped table.
+    /// Forgets every copy of a dropped table, which a drop makes on every
+    /// node, so no node out of reach still holds it.
     pub(super) fn drop_table(&mut self, table: &str) {
         self.change(table, None);
         self.remove(table);
+        for held in self.unreachable.values_mut() {
+            held.remove(table);
+        }
     }
 
     fn remove(&mut self, table: &str) {
@@ -135,8 +151,21 @@ impl Copies {
     }
 
     /// Takes a check's answers, begun at `since`, in place of what the
-    /// router saw, but for what it changed itself since then.
-    pub(super) fn install(&mut self, mut answered: Tables, since: u64) {
+    /// router saw, but for what it changed itself since then. The nodes in
+    /// `unanswered` keep the names of the tables they held, until they answer.
+    pub(super) fn install(&mut self, mut answered: Tables, since: u64, unanswered: &[&str]) {
+        let mut unreachable: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for &node in unanswered {
+            let mut held = self.unreachable.remove(node).unwrap_or_default();
+            held.extend(
+                self.tables
+                    .iter()
+                    .filter(|(_, copies)| copies.contains_key(node))
+                    .map(|(table, _)| table.clone()),
+            );
+            unreachable.insert(node.to_string(), held);
+        }
+        self.unreachable = unreachable;
         for ((table, node), &stamp) in &self.changed {
             if stamp <= since {
                 continue;
@@ -450,13 +479,13 @@ mod tests {
         copies.update("rows", "a", |copy| *copy = self::copy(2, 1));
         copies.set("rows", "b", copy(2, 1));
 
-        copies.install(answered(&[("rows", "a", copy(1, 0))]), since);
+        copies.install(answered(&[("rows", "a", copy(1, 0))]), since, &[]);
 
         assert_eq!(copies.get("rows", "a"), Some(&copy(2, 1)));
         assert_eq!(copies.get("rows", "b"), Some(&copy(2, 1)));
         // The next check's answers, begun after the write, stand.
         let since = copies.stamp();
-        copies.install(answered(&[("rows", "a", copy(5, 1))]), since);
+        copies.install(answered(&[("rows", "a", copy(5, 1))]), since, &[]);
         assert_eq!(copies.get("rows", "a"), Some(&copy(5, 1)));
         assert_eq!(copies.get("rows", "b"), None);
     }
@@ -471,7 +500,7 @@ mod tests {
         copies.forget("kept", "a");
 
         let stale = [("gone", "a", copy(3, 1)), ("kept", "a", copy(3, 1))];
-        copies.install(answered(&stale), since);
+        copies.install(answered(&stale), since, &[]);
 
         assert!(!copies.contains("gone"));
         assert!(!copies.contains("kept"));
@@ -479,7 +508,7 @@ mod tests {
         let since = copies.stamp();
         copies.drop_table("gone");
         copies.set("gone", "b", copy(1, 0));
-        copies.install(answered(&stale), since);
+        copies.install(answered(&stale), since, &[]);
         assert_eq!(copies.table("gone").map(HashMap::len), Some(1));
         assert_eq!(copies.get("gone", "b"), Some(&copy(1, 0)));
     }
@@ -507,7 +536,31 @@ mod tests {
                 (&name(0, 5), "a", copy(1, 0)),
             ]),
             since,
+            &[],
         );
         assert_eq!(copies.partition_counts("split"), [3, 5]);
+    }
+
+    #[test]
+    fn a_node_out_of_reach_keeps_its_names_taken_until_it_answers() {
+        let mut copies = Copies::default();
+        copies.set("rows", "a", copy(1, 0));
+        copies.set(&partitions::name("split", 0, 2), "b", copy(1, 0));
+
+        // b goes down: its copies leave the view, its names stay taken.
+        let since = copies.stamp();
+        copies.install(answered(&[("rows", "a", copy(1, 0))]), since, &["b"]);
+        assert!(copies.partition_counts("split").is_empty());
+        assert!(copies.held_out_of_reach("split"));
+        assert!(!copies.held_out_of_reach("rows"));
+        // Still down at the next check, it holds them still.
+        let since = copies.stamp();
+        copies.install(answered(&[("rows", "a", copy(1, 0))]), since, &["b"]);
+        assert!(copies.held_out_of_reach("split"));
+
+        // Back, it says for itself what it holds.
+        let since = copies.stamp();
+        copies.install(answered(&[("rows", "a", copy(1, 0))]), since, &[]);
+        assert!(!copies.held_out_of_reach("split"));
     }
 }

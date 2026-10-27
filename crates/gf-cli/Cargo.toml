@@ -1,6 +1,6 @@
 [package]
 name = "gf-cli"
-description = "gf compiled client for the General Forecast API"
+description = "gf: launches the generalforecast command under the Python beside it"
 version = "0.1.12"
 edition.workspace = true
 rust-version.workspace = true
@@ -11,12 +11,8 @@ publish.workspace = true
 name = "gf"
 path = "src/main.rs"
 
-[dependencies]
-clap = { version = "4", features = ["derive", "env"] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-serde = { version = "1", features = ["derive"] }
+[dev-dependencies]
 serde_json = "1"
-serde_yaml = "0.9"
 
 [lints]
 workspace = true

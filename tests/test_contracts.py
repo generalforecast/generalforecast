@@ -30,7 +30,7 @@ HASH = "sha256:" + "a" * 64
         Revision("fraud", 1, HASH, "general-forecast/tabicl-v2-classifier@" + HASH, 1),
         Environment("fraud", "production", 1, 0),
         PromoteRequest(1, 0),
-        ContextVersion("live", "transaction-1", 12, 1, name="events"),
+        ContextVersion("live", 12, 12, 1, name="events"),
         ContextImportRef(
             "events",
             "s3://bucket/events.parquet",

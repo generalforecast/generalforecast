@@ -10,13 +10,7 @@ import threading
 import pytest
 
 from generalforecast import _files
-from generalforecast._files import (
-    create_private,
-    open_private_exclusive,
-    private_lock,
-    read_private,
-    write_private,
-)
+from generalforecast._files import private_lock, read_private, write_private
 from generalforecast.service.contracts import ServiceError
 
 posix = pytest.mark.skipif(
@@ -64,20 +58,6 @@ def test_reads_and_writes_reject_indirect_or_shared_files(tmp_path, kind):
 
 
 @posix
-def test_exclusive_create_never_overwrites_and_cleans_up_failures(tmp_path):
-    path = tmp_path / "key.json"
-    create_private(path, b"first")
-    with pytest.raises(ServiceError) as error:
-        create_private(path, b"second")
-    assert error.value.code == "Conflict" and path.read_bytes() == b"first"
-    failed = tmp_path / "failed.json"
-    with pytest.raises(RuntimeError), open_private_exclusive(failed) as output:
-        output.write(b"partial")
-        raise RuntimeError
-    assert not failed.exists()
-
-
-@posix
 def test_lock_serializes_read_modify_write(tmp_path):
     path = tmp_path / "counter"
     write_private(path, b"0")
@@ -102,7 +82,6 @@ def test_unsupported_platform_fails_typed_without_writing(tmp_path, monkeypatch)
     for call in (
         lambda: read_private(tmp_path / "x", limit=1),
         lambda: write_private(tmp_path / "x", b"x"),
-        lambda: create_private(tmp_path / "x", b"x"),
     ):
         with pytest.raises(ServiceError) as error:
             call()
