@@ -51,6 +51,11 @@ CHRONOS2_QUANTILES = (
     0.95,
     0.99,
 )
+# Levels Timestral publishes (`quantile_knots` in both pinned configs): the
+# same grid as Chronos-2's.
+TIMESTRAL_QUANTILES = CHRONOS2_QUANTILES
+# Levels TimesFM 3 publishes (`quantiles` in the pinned config): the deciles.
+TIMESFM3_QUANTILES = tuple(round(0.1 * step, 1) for step in range(1, 10))
 TABULAR_TYPES = ("boolean", "int64", "float64", "string", "date", "timestamp")
 SERIES_TYPES = ("int64", "float64")
 LICENSE_FILES = ("LICENSE", "NOTICE", "README.md")
@@ -1080,7 +1085,7 @@ _ALL: tuple[ModelEntry, ...] = (
             "timestral",
             # The LICENSE files are pinned; the upstream cards say only "other".
             _pinned(id, revision, "LicenseRef-timestral-license", "LICENSE"),
-            Capability("forecast"),
+            Capability("forecast", quantiles=TIMESTRAL_QUANTILES),
             gates=_HOSTED_GATES,
             checkpoint=short_name(id),
             options=(("symmetric", not suffix),),
@@ -1102,7 +1107,7 @@ _ALL: tuple[ModelEntry, ...] = (
             "LicenseRef-timesfm-non-commercial-license-v1.0",
             "LICENSE",
         ),
-        Capability("forecast"),
+        Capability("forecast", quantiles=TIMESFM3_QUANTILES),
     ),
 )
 if unlicensed := [i.name for i in _ALL if i.gates.remote and not i.hostable]:

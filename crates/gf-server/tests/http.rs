@@ -199,6 +199,48 @@ async fn models_are_listed_and_described_in_envelopes() {
 }
 
 #[tokio::test]
+async fn dotted_catalog_model_ids_name_models_but_not_tables_or_predictors() {
+    let dotted = ServedModel {
+        name: "tabpfn-3.5-classifier".to_string(),
+        reference: "general-forecast/tabpfn-3.5-classifier".to_string(),
+        resolved: "general-forecast/tabpfn-3.5-classifier@5fb6a4c".to_string(),
+        description: json!({"name": "tabpfn-3.5-classifier"}),
+        ..served()
+    };
+    let front = Arc::new(Front::new(
+        vec![served(), dotted],
+        Box::new(Static::new(None)),
+        Surface::SelfHosted,
+        true,
+        RequestBudget::new(1 << 30),
+        Duration::from_secs(30),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    front
+        .start(vec![shard().await], Arc::new(Routes::new(1, 4)))
+        .await
+        .unwrap();
+    let path = "/v1/projects/local/models/tabpfn-3.5-classifier";
+    let (status, _, body) = call(&front, "GET", path, None, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["name"], "tabpfn-3.5-classifier");
+    assert_eq!(
+        body["resource"],
+        json!({"kind": "model", "name": "tabpfn-3.5-classifier"})
+    );
+    for path in [
+        "/v1/projects/local/models/.tabpfn",
+        "/v1/projects/local/models/Tabpfn-3.5",
+        "/v1/projects/local/predictors/scorer.v2",
+        "/v1/projects/team.a/models/tabpfn-3.5-classifier",
+    ] {
+        let (status, _, body) = call(&front, "GET", path, None, &[]).await;
+        assert_eq!(status.as_u16(), 422, "{path}: {body}");
+        assert_eq!(body["error"]["code"], "ValidationError", "{path}");
+    }
+}
+
+#[tokio::test]
 async fn unknown_routes_methods_and_names_get_the_apis_errors() {
     let front = front(Box::new(Static::new(None)), true).await;
     let cases = [
@@ -469,8 +511,10 @@ async fn the_ad_hoc_route_binds_flat_rows_and_answers_a_prediction_result() {
     assert_eq!(result["model"], served().resolved);
     assert_eq!(result["task"], "classification");
     assert_eq!(result["context"]["rows"], 2);
-    assert_eq!(result["context"]["kind"], "request");
-    assert!(result["context"]["as_of"].is_number());
+    assert_eq!(
+        result["context"],
+        json!({"source": "request", "name": null, "version": null, "digest": null, "rows": 2, "as_of": null})
+    );
     assert!(result.get("deployment").is_none());
     assert_eq!(
         result["predictions"],
@@ -745,10 +789,7 @@ fn snapshot_file() -> std::path::PathBuf {
     let batch = RecordBatch::try_from_iter(columns).unwrap();
     static SNAPSHOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let snapshot = SNAPSHOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "gf-http-snapshot-{}-{snapshot}.arrow",
-        std::process::id()
-    ));
+    let path = common::scratch(&format!("http-snapshot-{snapshot}")).join("snapshot.arrow");
     let file = std::fs::File::create(&path).unwrap();
     let mut writer = arrow_ipc::writer::StreamWriter::try_new(file, &batch.schema()).unwrap();
     writer.write(&batch).unwrap();
@@ -820,7 +861,7 @@ async fn snapshot_packages_bind_once_into_a_durable_table() {
         );
         let context = &body["result"]["context"];
         assert_eq!(
-            (&context["kind"], &context["rows"], &context["digest"]),
+            (&context["source"], &context["rows"], &context["digest"]),
             (&json!("snapshot"), &json!(4), &json!("sha256:data"))
         );
     }
@@ -844,7 +885,35 @@ async fn snapshot_packages_bind_once_into_a_durable_table() {
     let described = &body["result"];
     assert_eq!(described["model"], served().resolved);
     assert_eq!(described["target"], "y");
-    assert_eq!(described["inputs"], json!(["x"]));
+    assert_eq!(
+        described["inputs"],
+        json!([{"name": "x", "type": "number", "role": "input"}])
+    );
+    assert_eq!(described["environments"], json!([]));
+    // The API's `Predictor` resource takes no field beyond its own.
+    let fields: Vec<&str> = described
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert!(
+        fields.iter().all(|field| [
+            "name",
+            "environments",
+            "model",
+            "task",
+            "target",
+            "inputs",
+            "id",
+            "time",
+            "series",
+            "context",
+            "lock_digest"
+        ]
+        .contains(field)),
+        "{fields:?}"
+    );
     assert_eq!(
         described["context"],
         json!({"kind": "snapshot", "rows": 4, "digest": "sha256:data"})
@@ -931,7 +1000,7 @@ async fn request_packages_bind_each_context_into_an_ephemeral_table() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let result = &body["result"];
     assert_eq!(
-        (&result["context"]["kind"], &result["context"]["rows"]),
+        (&result["context"]["source"], &result["context"]["rows"]),
         (&json!("request"), &json!(3))
     );
     // Not every query has an id, so none is repeated.
@@ -964,7 +1033,7 @@ async fn request_packages_bind_each_context_into_an_ephemeral_table() {
     .await;
     assert_eq!(
         body["result"]["context"],
-        json!({"kind": "request", "rows": null, "digest": "sha256:data"})
+        json!({"kind": "request", "digest": "sha256:data"})
     );
     let mut payload = predictor_payload(
         "scorer",
@@ -995,15 +1064,17 @@ struct Plane {
     serving: std::sync::atomic::AtomicU64,
     predictors: std::sync::atomic::AtomicUsize,
     records: std::sync::Mutex<Vec<Value>>,
+    /// The `as_of` each lock fetch asked for, or None for the current version.
+    as_ofs: std::sync::Mutex<Vec<Option<String>>>,
 }
 
 fn published(revision: u64) -> Value {
     let context = if revision == 3 { "request" } else { "snapshot" };
     // Revision 4 binds rows a live source captured, which move under one version.
-    let source = if revision == 4 {
-        "live/orders"
+    let (source, as_of) = if revision == 4 {
+        ("live/orders", json!(1_793_088_000))
     } else {
-        "snapshot"
+        ("snapshot", Value::Null)
     };
     let served = json!({
         "name": "scorer",
@@ -1042,7 +1113,7 @@ fn published(revision: u64) -> Value {
     json!({
         "kind": "native",
         "served": served,
-        "context": {"source": source, "version": "sha256:data", "rows": 4, "as_of": null},
+        "context": {"source": source, "version": "sha256:data", "rows": 4, "as_of": as_of},
         "rows": [
             {"id": "a", "x": 0.0, "y": false},
             {"id": "b", "x": 1.0, "y": false},
@@ -1063,6 +1134,11 @@ async fn plane(state: Arc<Plane>) -> String {
         async move {
             assert_eq!(request.headers()["authorization"], "Bearer service-token");
             let path = request.uri().path().to_string();
+            let as_of = request
+                .uri()
+                .query()
+                .and_then(|query| query.strip_prefix("as_of="))
+                .map(str::to_string);
             let body = axum::body::to_bytes(request.into_body(), 1 << 20)
                 .await
                 .unwrap();
@@ -1116,7 +1192,23 @@ async fn plane(state: Arc<Plane>) -> String {
                 .and_then(|tail| tail.strip_suffix(":lock"))
             {
                 state.predictors.fetch_add(1, Ordering::SeqCst);
-                return answer(200, published(revision.parse().unwrap()));
+                state.as_ofs.lock().unwrap().push(as_of.clone());
+                let revision: u64 = revision.parse().unwrap();
+                return match as_of {
+                    // History is kept from 2026 on.
+                    Some(at) if at.starts_with("2025") => answer(
+                        422,
+                        json!({"error": {"code": "ValidationError", "message": "as_of precedes the context's history", "param": "as_of"}}),
+                    ),
+                    // The version that stood then: three of today's four rows.
+                    Some(at) => {
+                        let mut past = published(revision);
+                        past["context"] = json!({"source": {"kind": "live", "name": "orders"}, "version": 6, "digest": null, "as_of": at});
+                        past["rows"].as_array_mut().unwrap().truncate(3);
+                        answer(200, past)
+                    }
+                    None => answer(200, published(revision)),
+                };
             }
             answer(
                 404,
@@ -1220,6 +1312,7 @@ async fn revisions_load_on_demand_evict_and_reload_when_an_environment_moves() {
         serving: 1.into(),
         predictors: 0.into(),
         records: std::sync::Mutex::new(Vec::new()),
+        as_ofs: std::sync::Mutex::new(Vec::new()),
     });
     let origin = plane(state.clone()).await;
     // Room for either predictor, never both.
@@ -1242,7 +1335,7 @@ async fn revisions_load_on_demand_evict_and_reload_when_an_environment_moves() {
         );
         assert_eq!(
             result["context"],
-            json!({"source": "snapshot", "version": "sha256:data", "rows": 4, "as_of": null})
+            json!({"source": "snapshot", "name": null, "version": null, "digest": "sha256:data", "rows": 4, "as_of": null})
         );
         assert_eq!(
             result["model"],
@@ -1314,6 +1407,7 @@ async fn revision_predictions_are_checked_against_the_lock_and_the_key() {
         serving: 1.into(),
         predictors: 0.into(),
         records: std::sync::Mutex::new(Vec::new()),
+        as_ofs: std::sync::Mutex::new(Vec::new()),
     });
     let origin = plane(state.clone()).await;
     let front = revision_front(&origin, 1 << 20).await;
@@ -1777,6 +1871,7 @@ async fn a_prediction_scores_the_environment_its_env_names() {
         serving: 1.into(),
         predictors: 0.into(),
         records: std::sync::Mutex::new(Vec::new()),
+        as_ofs: std::sync::Mutex::new(Vec::new()),
     });
     let origin = plane(state.clone()).await;
     let front = revision_front(&origin, 1 << 20).await;
@@ -1850,6 +1945,7 @@ async fn a_live_revision_is_captured_again_once_its_environment_resolves_again()
         serving: 4.into(),
         predictors: 0.into(),
         records: std::sync::Mutex::new(Vec::new()),
+        as_ofs: std::sync::Mutex::new(Vec::new()),
     });
     let origin = plane(state.clone()).await;
     let front = revision_front(&origin, 1 << 20).await;
@@ -1966,4 +2062,179 @@ async fn a_model_is_found_by_its_bare_name_however_the_server_names_it() {
             "another model is not this one"
         );
     }
+}
+
+#[tokio::test]
+async fn a_binding_whose_log_does_not_restore_is_set_aside_and_bound_again() {
+    let snapshot = snapshot_file();
+    let directory = fresh_directory();
+    let models = || vec![predictor_model("churn", "snapshot", Some(&snapshot))];
+    let (front, shards, _) = restarted(models(), &directory).await;
+    stop(&shards).await;
+    drop(front);
+    // The binding's head is lost, so its log no longer opens.
+    let (table, _) = gf_server::engine::bound_table("sha256:churn").unwrap();
+    std::fs::remove_file(directory.join(format!("{table}.head"))).unwrap();
+
+    let (front, shards, _) = restarted(models(), &directory).await;
+    let payload = predictor_payload("churn", json!([]), json!([{"id": "q", "x": 1.5}]));
+    let (status, _, body) = call(
+        &front,
+        "POST",
+        "/v1/projects/local/predictors/churn/predict",
+        Some(&predictor_envelope("churn", &payload)),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        directory.join(format!("{table}.log")).exists(),
+        "bound again"
+    );
+    assert!(
+        directory.join(format!("{table}.log.unrestorable")).exists(),
+        "the old log is kept aside"
+    );
+    stop(&shards).await;
+    std::fs::remove_file(snapshot).unwrap();
+}
+
+#[tokio::test]
+async fn an_engine_table_the_shard_does_not_hold_is_retried_not_missing() {
+    use gf_server::engine::Engine;
+    let engine = Engine::new(
+        vec![shard().await],
+        Arc::new(Routes::new(1, 4)),
+        RequestBudget::new(1 << 20),
+        Duration::from_secs(5),
+    );
+    let table = gf_server::name::TableName::new("pkg-gone").unwrap();
+    let refused = engine
+        .predict_bound(&table, &[0; 32], vec![0.0], None)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (refused.status, refused.code.as_str()),
+        (503, "ModelUnavailable")
+    );
+}
+
+#[tokio::test]
+async fn a_live_revision_predicts_as_of_a_past_time_from_the_planes_history() {
+    let state = Arc::new(Plane {
+        serving: 4.into(),
+        predictors: 0.into(),
+        records: std::sync::Mutex::new(Vec::new()),
+        as_ofs: std::sync::Mutex::new(Vec::new()),
+    });
+    let origin = plane(state.clone()).await;
+    let front = revision_front(&origin, 1 << 20).await;
+    let route = "/v1/projects/team-a/predictors/scorer/predict";
+    let queries = |as_of: Value| json!({"queries": [{"id": "q", "x": 2.5}], "as_of": as_of});
+
+    // Now: the captured context, its time written as RFC 3339.
+    let (status, body) = score_at(
+        &front,
+        route,
+        SCORER,
+        &json!({"queries": [{"id": "q", "x": 2.5}]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["result"]["context"],
+        json!({"source": "live", "name": "orders", "version": null, "digest": "sha256:data", "rows": 4, "as_of": "2026-10-27T08:00:00Z"})
+    );
+    // As of a past time, in either form a request may give it.
+    for given in [
+        json!("2026-10-26T08:00:00Z"),
+        json!(1_793_001_600),
+        json!("2026-10-26T08:00:00"),
+    ] {
+        let (status, body) = score_at(&front, route, SCORER, &queries(given.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{given}: {body}");
+        assert_eq!(
+            body["result"]["context"],
+            json!({"source": "live", "name": "orders", "version": 6, "digest": null, "rows": 3, "as_of": "2026-10-26T08:00:00Z"}),
+            "{given}"
+        );
+    }
+    assert_eq!(
+        state
+            .as_ofs
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+        ["2026-10-26T08:00:00Z"; 3],
+        "the plane is asked each time, in RFC 3339, and no as_of package is reused"
+    );
+    // A time before the history the plane keeps is its refusal, as it came.
+    let (status, body) = score_at(
+        &front,
+        route,
+        SCORER,
+        &queries(json!("2025-01-01T00:00:00Z")),
+    )
+    .await;
+    assert_eq!(status.as_u16(), 422, "{body}");
+    assert_eq!(
+        (&body["error"]["code"], &body["error"]["param"]),
+        (&json!("ValidationError"), &json!("as_of"))
+    );
+    // A time that is not one is refused before the plane is asked.
+    let asked = state.as_ofs.lock().unwrap().len();
+    let (status, body) = score_at(&front, route, SCORER, &queries(json!("yesterday"))).await;
+    assert_eq!(status.as_u16(), 422, "{body}");
+    assert_eq!(body["error"]["param"], "as_of");
+    assert_eq!(state.as_ofs.lock().unwrap().len(), asked);
+}
+
+#[tokio::test]
+async fn as_of_is_refused_for_a_context_that_is_not_live() {
+    let state = Arc::new(Plane {
+        serving: 1.into(),
+        predictors: 0.into(),
+        records: std::sync::Mutex::new(Vec::new()),
+        as_ofs: std::sync::Mutex::new(Vec::new()),
+    });
+    let origin = plane(state.clone()).await;
+    let front = revision_front(&origin, 1 << 20).await;
+    let payload = json!({"queries": [{"id": "q", "x": 2.5}], "as_of": "2026-10-26T08:00:00Z"});
+    let (status, body) = score_at(
+        &front,
+        "/v1/projects/team-a/predictors/scorer/predict",
+        SCORER,
+        &payload,
+    )
+    .await;
+    assert_eq!(status.as_u16(), 422, "{body}");
+    assert_eq!(
+        (&body["error"]["code"], &body["error"]["param"]),
+        (&json!("ValidationError"), &json!("as_of"))
+    );
+    assert!(
+        state.as_ofs.lock().unwrap().iter().all(Option::is_none),
+        "no past version is asked for"
+    );
+
+    // Nor does a predictor served from its lock take one.
+    let snapshot = snapshot_file();
+    let front = predictor_front(predictor_model("churn", "snapshot", Some(&snapshot))).await;
+    let mut payload = predictor_payload("churn", json!([]), json!([{"id": "q", "x": 1.5}]));
+    for as_of in [json!("2026-10-26T08:00:00Z"), json!("yesterday")] {
+        payload["as_of"] = as_of.clone();
+        let (status, _, body) = call(
+            &front,
+            "POST",
+            "/v1/projects/local/predictors/churn/predict",
+            Some(&predictor_envelope("churn", &payload)),
+            &[],
+        )
+        .await;
+        assert_eq!(status.as_u16(), 422, "{as_of}: {body}");
+        assert_eq!(body["error"]["param"], "as_of", "{as_of}");
+    }
+    std::fs::remove_file(snapshot).unwrap();
 }

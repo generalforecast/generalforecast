@@ -21,6 +21,7 @@ from generalforecast.predictors.validation import (
     name,
     text,
 )
+from generalforecast.predictors.validation import column as column_name
 
 TASKS = frozenset({"classification", "regression", "forecast"})
 CONTEXT_MODES = ("snapshot", "request", "live")
@@ -95,7 +96,7 @@ class PlanInputs:
             "choose include or exclude, not both",
         )
         for column, kind in self.types:
-            text(column)
+            column_name(column)
             ensure(kind in PHYSICAL, "unsupported input type")
         ensure(
             self.missing_values in ("allow", "reject"),
@@ -168,7 +169,7 @@ class ExecutionPlan:
         ensure(self.task is None or self.task in TASKS, "unsupported task")
         for column in (self.target, self.id, self.time, *self.series):
             if column is not None:
-                text(column)
+                column_name(column)
         ensure(
             self.horizon is None
             or (type(self.horizon) is int and 0 < self.horizon <= 10_000),

@@ -4,6 +4,8 @@
 //! A shard driven with a fake worker: table checks, quarantine, hung workers
 //! and the query queue.
 
+mod common;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -47,11 +49,28 @@ const DEFER: u8 = 5;
 const DEFER_EARLY: u8 = 6;
 
 /// Answers every frame the shard sends, in order; steps as `behaviour` says.
-fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notify>) {
+/// Each step's units' actions go to `actions`, in the order sent. Models load
+/// beside the steps, as the worker loads them: `AddModel` is answered at
+/// once, and the model reported loaded later.
+fn fake_worker(
+    stream: UnixStream,
+    behaviour: Arc<AtomicU8>,
+    held: Arc<Notify>,
+    actions: Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    let (mut reader, writer) = stream.into_split();
+    let writer = Arc::new(tokio::sync::Mutex::new(writer));
     tokio::spawn(async move {
         let mut deferred_once: HashSet<u64> = HashSet::new();
-        while let Ok(frame) = Frame::read_from(&mut stream).await {
+        while let Ok(frame) = Frame::read_from(&mut reader).await {
             let reply = if frame.kind() == "step" {
+                actions.lock().unwrap().extend(
+                    frame.header["units"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|unit| unit["action"].as_str().map(str::to_string)),
+                );
                 match behaviour.load(Ordering::Relaxed) {
                     mode @ (DEFER | DEFER_EARLY) => {
                         let tables: Vec<u64> = frame.header["queries"]
@@ -66,18 +85,21 @@ fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notif
                         } else {
                             let keys = tables.iter().map(|table| format!("k{table}")).collect();
                             let compiled = WorkerReply::Compiled { keys }.frame();
-                            if mode == DEFER_EARLY && compiled.write_to(&mut stream).await.is_err()
+                            if mode == DEFER_EARLY
+                                && compiled.write_to(&mut *writer.lock().await).await.is_err()
                             {
                                 return;
                             }
                             if deferring(&frame.header, &tables)
-                                .write_to(&mut stream)
+                                .write_to(&mut *writer.lock().await)
                                 .await
                                 .is_err()
                             {
                                 return;
                             }
-                            if mode == DEFER && compiled.write_to(&mut stream).await.is_err() {
+                            if mode == DEFER
+                                && compiled.write_to(&mut *writer.lock().await).await.is_err()
+                            {
                                 return;
                             }
                             continue;
@@ -96,7 +118,12 @@ fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notif
                                 done: None,
                                 total: None,
                             };
-                            if progress.frame().write_to(&mut stream).await.is_err() {
+                            if progress
+                                .frame()
+                                .write_to(&mut *writer.lock().await)
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -182,6 +209,23 @@ fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notif
                         message: "ValueError: seven classes".to_string(),
                     }
                     .frame(),
+                    // The fake worker never answers loading model "stuck",
+                    // loads "slow" once released and refuses "broken", each
+                    // beside its steps once it answered.
+                    WorkerRequest::AddModel { name, .. } if name == "stuck" => continue,
+                    WorkerRequest::AddModel { name, .. } => {
+                        let (writer, held) = (writer.clone(), held.clone());
+                        tokio::spawn(async move {
+                            if name == "slow" {
+                                held.notified().await;
+                            }
+                            let failure =
+                                (name == "broken").then(|| "OSError: no weights".to_string());
+                            let loaded = WorkerReply::Loaded { name, failure }.frame();
+                            let _ = loaded.write_to(&mut *writer.lock().await).await;
+                        });
+                        WorkerReply::Loading.frame()
+                    }
                     // The fake worker compiles three recorded programs as it
                     // starts, reporting progress after each.
                     WorkerRequest::Allocate { .. } => {
@@ -190,7 +234,12 @@ fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notif
                                 done: None,
                                 total: None,
                             };
-                            if progress.frame().write_to(&mut stream).await.is_err() {
+                            if progress
+                                .frame()
+                                .write_to(&mut *writer.lock().await)
+                                .await
+                                .is_err()
+                            {
                                 return;
                             }
                         }
@@ -204,7 +253,7 @@ fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notif
                     _ => WorkerReply::Ok.frame(),
                 }
             };
-            if reply.write_to(&mut stream).await.is_err() {
+            if reply.write_to(&mut *writer.lock().await).await.is_err() {
                 break;
             }
         }
@@ -339,6 +388,8 @@ struct Harness {
     behaviour: Arc<AtomicU8>,
     held: Arc<Notify>,
     directory: std::path::PathBuf,
+    /// The actions of every unit the shard's steps sent the worker.
+    actions: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 fn name(text: &str) -> TableName {
@@ -351,13 +402,10 @@ fn key() -> EncryptionKey {
 
 async fn shard(settings: ShardSettings) -> Harness {
     static SHARDS: AtomicUsize = AtomicUsize::new(0);
-    let directory = std::env::temp_dir().join(format!(
-        "gf-shard-test-{}-{}",
-        std::process::id(),
+    let directory = common::scratch(&format!(
+        "shard-test-{}",
         SHARDS.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).unwrap();
     shard_in(settings, directory).await
 }
 
@@ -376,7 +424,8 @@ async fn shard_routed(
     let (ours, theirs) = UnixStream::pair().unwrap();
     let behaviour = Arc::new(AtomicU8::new(OK));
     let held = Arc::new(Notify::new());
-    fake_worker(theirs, behaviour.clone(), held.clone());
+    let actions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    fake_worker(theirs, behaviour.clone(), held.clone(), actions.clone());
     let connection = WorkerConnection::fake(
         ours,
         vec![
@@ -385,8 +434,7 @@ async fn shard_routed(
             "bounded".to_string(),
             "capped".to_string(),
         ],
-    )
-    .unwrap();
+    );
     let metrics = Arc::new(Metrics::default());
     let mut shard = Shard::new(
         connection,
@@ -406,6 +454,7 @@ async fn shard_routed(
         behaviour,
         held,
         directory,
+        actions,
     }
 }
 
@@ -946,6 +995,130 @@ async fn a_worker_that_hangs_outside_a_step_is_started_again() {
     assert_eq!(shard.metrics.workers_down.get(), 1);
 }
 
+impl Harness {
+    /// Has the shard's worker load model `name`, answering once it did.
+    fn add_model(&self, name: &str) -> impl Future<Output = Result<(), Code>> + use<> {
+        let commands = self.commands.clone();
+        let name = name.to_string();
+        async move {
+            let (reply, answer) = oneshot::channel();
+            let command = Command::AddModel {
+                name,
+                spec: "catalog/tiny".to_string(),
+                reply,
+            };
+            commands.send(command).await.unwrap();
+            answer.await.unwrap().map_err(|error| status(&error))
+        }
+    }
+
+    async fn models(&self) -> Vec<String> {
+        let (reply, answer) = oneshot::channel();
+        self.commands.send(Command::Models { reply }).await.unwrap();
+        answer.await.unwrap().unwrap()
+    }
+}
+
+#[tokio::test]
+async fn writes_and_reads_go_on_while_the_worker_loads_a_model() {
+    let shard = shard(settings()).await;
+    shard.create(3).await.unwrap();
+    let loading = tokio::spawn(shard.add_model("slow"));
+    let joined = tokio::spawn(shard.add_model("slow"));
+
+    // The worker holds the load, yet the shard takes writes and answers
+    // reads of its tables, its logs and its models meanwhile.
+    let served = tokio::time::timeout(Duration::from_secs(5), async {
+        shard.insert(&[1, 2, 3, 4]).await;
+        assert_eq!(shard.describe().await.rows, 4);
+        assert!(!shard.read_log(0).await.is_empty());
+        shard.models().await
+    })
+    .await
+    .expect("the shard waited for the model to load");
+    assert!(!served.contains(&"slow".to_string()));
+    assert!(!loading.is_finished());
+
+    shard.held.notify_one();
+    let loaded = tokio::time::timeout(Duration::from_secs(5), loading).await;
+    assert_eq!(loaded.expect("loaded").unwrap(), Ok(()));
+    assert_eq!(
+        joined.await.unwrap(),
+        Ok(()),
+        "a second call waits on the first"
+    );
+    assert!(shard.models().await.contains(&"slow".to_string()));
+    assert_eq!(shard.metrics.workers_down.get(), 0);
+}
+
+#[tokio::test]
+async fn a_worker_that_hangs_loading_a_model_is_started_again_and_the_load_fails() {
+    let mut settings = settings();
+    settings.step_timeout = Duration::from_millis(200);
+    let shard = shard(settings).await;
+
+    let failed = tokio::time::timeout(Duration::from_secs(10), shard.add_model("stuck")).await;
+
+    assert_eq!(
+        failed.expect("answered before the timeout"),
+        Err(Code::Internal)
+    );
+    assert_eq!(shard.metrics.workers_down.get(), 1);
+    assert!(!shard.models().await.contains(&"stuck".to_string()));
+}
+
+#[tokio::test]
+async fn steps_for_served_models_run_while_another_model_loads() {
+    let mut settings = settings();
+    settings.step_timeout = Duration::from_millis(200);
+    let shard = shard(settings).await;
+    shard.create(3).await.unwrap();
+    shard.insert(&[1, 2, 3, 4]).await;
+    let loading = tokio::spawn(shard.add_model("slow"));
+
+    // The worker acknowledged the load and loads it beside its steps: the
+    // served model's queries answer, and the load, past the step timeout,
+    // is no hang.
+    let predicted = tokio::time::timeout(Duration::from_secs(5), shard.predict()).await;
+    assert!(predicted.expect("answered while the model loads").is_ok());
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert!(!loading.is_finished());
+    assert_eq!(shard.metrics.workers_down.get(), 0);
+
+    shard.held.notify_one();
+    let loaded = tokio::time::timeout(Duration::from_secs(5), loading).await;
+    assert_eq!(loaded.expect("loaded").unwrap(), Ok(()));
+    assert!(shard.models().await.contains(&"slow".to_string()));
+}
+
+#[tokio::test]
+async fn a_model_the_worker_cannot_load_fails_with_its_reason() {
+    let shard = shard(settings()).await;
+
+    let failed = tokio::time::timeout(Duration::from_secs(5), shard.add_model("broken")).await;
+
+    assert_eq!(failed.expect("answered"), Err(Code::InvalidArgument));
+    assert!(!shard.models().await.contains(&"broken".to_string()));
+}
+
+#[tokio::test]
+async fn a_load_under_way_fails_when_the_worker_starts_again() {
+    let mut settings = settings();
+    settings.step_timeout = Duration::from_millis(200);
+    let shard = shard(settings).await;
+    shard.create(3).await.unwrap();
+    shard.insert(&[1, 2, 3, 4]).await;
+    let loading = tokio::spawn(shard.add_model("slow"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    shard.behaviour.store(HANG, Ordering::Relaxed);
+
+    let _ = tokio::time::timeout(Duration::from_secs(10), shard.predict()).await;
+    let failed = tokio::time::timeout(Duration::from_secs(5), loading).await;
+
+    assert_eq!(failed.expect("answered").unwrap(), Err(Code::Internal));
+    assert_eq!(shard.metrics.workers_down.get(), 1);
+}
+
 #[tokio::test]
 async fn queries_past_the_queue_budget_are_refused() {
     let mut settings = settings();
@@ -1308,8 +1481,7 @@ async fn acknowledged_writes_are_headed_once_the_shard_goes_idle() {
     shard.insert(&[4]).await;
     headed(first_head).await;
 
-    let copy = shard.directory.with_extension("copy");
-    std::fs::create_dir(&copy).unwrap();
+    let copy = common::scratch("shard-copy");
     let copy_log = copy.join("rows.log");
     let copy_head = copy.join("rows.head");
     std::fs::copy(shard.directory.join("rows.log"), &copy_log).unwrap();
@@ -1821,6 +1993,7 @@ fn context(fingerprint: &str, rows: u128) -> RequestContext {
         features: (0..rows).flat_map(|row| [row as f32, 0.0]).collect(),
         targets: Targets::Classes((0..rows).map(|row| (row % 3) as i32).collect()),
         times: None,
+        shared: false,
     }
 }
 
@@ -1861,6 +2034,34 @@ async fn a_request_context_is_kept_in_memory_and_read_again_by_its_fingerprint()
 }
 
 #[tokio::test]
+async fn a_shared_context_is_fit_and_kept_as_a_durable_table_is_and_never_fused() {
+    let shard = shard(settings()).await;
+    shard.infer(context("one", 4)).await.unwrap();
+    let fused = |actions: &[String]| actions.iter().filter(|action| *action == "fuse").count();
+    assert_eq!(
+        fused(&shard.actions.lock().unwrap()),
+        1,
+        "one request's context fits and decodes in one call"
+    );
+    shard.actions.lock().unwrap().clear();
+    let shared = || RequestContext {
+        shared: true,
+        ..context("revision", 4)
+    };
+    for _ in 0..3 {
+        let answered = shard.infer(shared()).await.unwrap();
+        assert_eq!(answered.predictions.rows, 2);
+    }
+    let actions = shard.actions.lock().unwrap().clone();
+    assert_eq!(fused(&actions), 0, "{actions:?}");
+    assert!(
+        !actions.is_empty(),
+        "the shared context's rows were encoded"
+    );
+    assert_eq!(shard.metrics.ephemeral_tables.get(), 2);
+}
+
+#[tokio::test]
 async fn ephemeral_tables_past_the_count_go_least_recently_used_first() {
     let shard = shard(settings()).await;
     for fingerprint in ["a", "b", "c", "d"] {
@@ -1878,9 +2079,7 @@ async fn ephemeral_tables_past_the_count_go_least_recently_used_first() {
 #[tokio::test]
 async fn the_routes_forget_a_context_as_its_table_leaves_the_shard() {
     let routes = Arc::new(Routes::new(1, 16));
-    let directory = std::env::temp_dir().join(format!("gf-shard-routes-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = common::scratch("shard-routes");
     let mut settings = settings();
     settings.ephemeral.tables = 1;
     let shard = shard_routed(settings, directory, Some(routes.clone())).await;

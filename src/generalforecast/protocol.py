@@ -32,7 +32,7 @@ MAX_FRAME_BYTES = 1 << 33
 # The most buffers one frame may claim.
 MAX_BUFFERS = 1 << 20
 # The version of the frames, which the server checks when a worker connects.
-PROTOCOL_VERSION = 13
+PROTOCOL_VERSION = 14
 
 
 @dataclass(frozen=True)
@@ -431,8 +431,9 @@ class FitLimits:
 class AddModel:
     """Loads a model the worker did not start with, under `name`, from `spec`.
 
-    A control: a shard sends it in a `Controls` frame, ahead of the first
-    table that names the model.
+    The worker answers `Loading` at once and loads it beside its steps,
+    then sends `Loaded` with the name, so a shard's steps for the models
+    the worker serves go on meanwhile.
     """
 
     name: str
@@ -486,13 +487,13 @@ class Apply:
 
 @dataclass(frozen=True)
 class Controls:
-    """Models loaded, tables added and removed and tiers' copies and drops, in order.
+    """Tables added and removed and tiers' copies and drops, in order.
 
     A shard sends what one tick asks besides its steps in one frame; the
     worker answers `Done`, or `Controlled` with the requests that failed.
     """
 
-    requests: list[AddModel | AddTable | RemoveTable | Apply]
+    requests: list[AddTable | RemoveTable | Apply]
 
 
 # The trace event a worker records around each step, with the step's number
@@ -577,7 +578,7 @@ _REQUESTS: dict[str, Any] = {
     "record": Record,
 }
 # The requests a `Controls` frame carries.
-_CONTROLS = frozenset({"add_model", "add_table", "remove_table", "apply"})
+_CONTROLS = frozenset({"add_table", "remove_table", "apply"})
 
 
 @dataclass(frozen=True)
@@ -689,6 +690,19 @@ class Compiled:
 
 
 @dataclass(frozen=True)
+class Loading:
+    """The answer to `AddModel`: the worker loads the model beside its steps."""
+
+
+@dataclass(frozen=True)
+class Loaded:
+    """Sent once a model `AddModel` named has loaded, or with why it could not; answers no request."""
+
+    name: str
+    failure: str | None = None
+
+
+@dataclass(frozen=True)
 class Invalid:
     """A check the model refuses, and why."""
 
@@ -725,6 +739,8 @@ Reply = (
     | Warmed
     | Progress
     | Compiled
+    | Loading
+    | Loaded
     | Invalid
     | Failed
     | Controlled
@@ -738,6 +754,8 @@ _REPLIES: dict[type, str] = {
     Warmed: "warmed",
     Progress: "progress",
     Compiled: "compiled",
+    Loading: "loading",
+    Loaded: "loaded",
     Invalid: "invalid",
     Failed: "error",
     Controlled: "controlled",
@@ -769,7 +787,7 @@ def reply(answer: Reply) -> dict[str, Any]:
         fields = {
             key: value for key, value in fields.items() if key not in _SERIES_FIELDS
         }
-    if isinstance(answer, Progress):
+    if isinstance(answer, Progress | Loaded):
         fields = {key: value for key, value in fields.items() if value is not None}
     return {"kind": _REPLIES[type(answer)], **fields}
 

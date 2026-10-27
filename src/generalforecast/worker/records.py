@@ -3,6 +3,8 @@
 
 """What a worker keeps per model and table, and the forms a step's parts come in."""
 
+import threading
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from typing import Any
 
@@ -53,3 +55,37 @@ class _Table:
     # Whether a fit already logged that the state keeps fewer categories than
     # a column holds.
     crowded: bool = False
+
+
+class Memo[Key: Hashable, Value]:
+    """Values a worker measures once per key, however many threads ask.
+
+    The step thread and the threads that ready programs beside steps measure
+    the same models; a key being measured is measured once, under a lock of
+    its own, so a thread asking for it waits for that measure, and one asking
+    for another key does not. A measure that raises keeps nothing, so the
+    next ask measures again.
+    """
+
+    def __init__(self) -> None:
+        """Starts with nothing measured."""
+        self._values: dict[Key, Value] = {}
+        self._guard = threading.Lock()
+        self._measuring: dict[Key, threading.Lock] = {}
+
+    def get(self, key: Key, measure: Callable[[], Value]) -> Value:
+        """The value of `key`, measured with `measure` if no thread has yet."""
+        if key in self._values:
+            return self._values[key]
+        with self._guard:
+            lock = self._measuring.setdefault(key, threading.Lock())
+        with lock:
+            if key not in self._values:
+                self._values[key] = measure()
+        with self._guard:
+            self._measuring.pop(key, None)
+        return self._values[key]
+
+    def __getitem__(self, key: Key) -> Value:
+        """The value of a key measured already."""
+        return self._values[key]

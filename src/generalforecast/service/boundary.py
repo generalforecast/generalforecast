@@ -18,6 +18,7 @@ from generalforecast.service.contracts import (
     VERSION,
     ServiceError,
     fields,
+    model_name,
     name,
     require,
     text,
@@ -129,7 +130,9 @@ class Resource:
             isinstance(self.kind, str) and self.kind in RESOURCE_KINDS,
             "invalid resource kind",
         )
-        name(self.name)
+        # A model is named by its catalog name, which may hold dots; every
+        # chosen resource name keeps the strict rule.
+        (model_name if self.kind == "model" else name)(self.name)
 
 
 @dataclass(frozen=True)
@@ -237,13 +240,6 @@ class Capability:
         else:
             text(self.code, "capability code")
             text(self.reason, "capability reason")
-
-    def enforce(self) -> None:
-        """Raises the same typed unavailable error in local and HTTP journeys."""
-        if self.state != "supported":
-            raise ServiceError(
-                self.code or "Unsupported", self.reason or "unavailable", 501
-            )
 
 
 @dataclass(frozen=True)

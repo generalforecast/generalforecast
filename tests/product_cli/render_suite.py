@@ -316,7 +316,12 @@ def lock(root: Path, stale: Any = None) -> dict:
         _registry.use(None)
     document = yaml.safe_load(path.read_text())
     if stale is not None:
+        from generalforecast.predictors.lock import lock_digest
+
+        # Stale as a lock gf check wrote before something changed: its
+        # digest still matches its content.
         stale(document["predictor"])
+        document["digest"] = lock_digest(document)
         path.write_text(yaml.safe_dump(document, sort_keys=False))
     return document
 

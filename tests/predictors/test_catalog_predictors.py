@@ -18,12 +18,14 @@ import pytest
 
 from generalforecast import hosting
 from generalforecast.models import catalog
-from generalforecast.predictors.models import CatalogResolver
+from generalforecast.predictors.models import CatalogResolver, qualification
 from generalforecast.predictors.runtime.compile import compile_lock
 from generalforecast.predictors.runtime.context import served_context
 from generalforecast.predictors.validation import PredictorError
 from generalforecast.serialization import content_digest
 from generalforecast.serve import models as serve_models
+from generalforecast.service.contracts import ServiceError
+from generalforecast.service.sdk import pushed
 from tests.utils.locks import directory, lock_of
 
 FAMILIES = [
@@ -86,9 +88,23 @@ def test_a_family_resolves_locks_and_serves_by_its_pin(tmp_path, monkeypatch, na
     assert plan.model.model == model and plan.model.digest == pinned
     monkeypatch.setattr(serve_models, "checkpoint", lambda *_, **__: None)
     (tmp_path / "served").mkdir()
-    entry_served = serve_models.served(str(root), tmp_path / "served")
-    assert entry_served["predictor"]["lock_digest"] == lock.digest
-    assert entry_served["resolved"].endswith(f"{name}@{pinned}")
+    runs = qualification(model)
+    assert runs.serve == entry.allows("self-hosted")
+    assert runs.push == entry.gates.predictor
+    if runs.serve:
+        entry_served = serve_models.served(str(root), tmp_path / "served")
+        assert entry_served["predictor"]["lock_digest"] == lock.digest
+        assert entry_served["resolved"].endswith(f"{name}@{pinned}")
+    else:
+        # gf serve refuses what gf check reported it may not run.
+        with pytest.raises(PredictorError, match="not qualified for a self-hosted"):
+            serve_models.served(str(root), tmp_path / "served")
+    if runs.push:
+        assert pushed(root).lock.digest == lock.digest
+    else:
+        with pytest.raises(ServiceError, match="not qualified for hosted") as refused:
+            pushed(root)
+        assert refused.value.code == "ModelResolutionRequired"
     ad_hoc = hosting.ad_hoc_lock({"model": model, **manifest}, rows)
     assert ad_hoc.predictor["model_digest"] == pinned
     if entry.gates.predictor:
@@ -118,3 +134,36 @@ def test_serving_refuses_a_revision_pin_that_moved(tmp_path):
         )
     assert caught.value.code == "ModelMismatch"
     assert Path(root / "gf.lock").is_file()
+
+
+@pytest.mark.parametrize(
+    ("name", "runs"),
+    [
+        ("tabicl-v2-classifier", "gf.Predictor, gf serve and gf push"),
+        ("mitra-2-regressor", "gf.Predictor and gf serve; not qualified for gf push"),
+        (
+            "limix-2-classifier",
+            "gf.Predictor only; not qualified for gf serve or gf push",
+        ),
+    ],
+)
+def test_check_reports_where_a_predictor_runs(tmp_path, capsys, name, runs):
+    import json
+
+    from generalforecast import cli
+
+    model = f"general-forecast/{name}"
+    task = catalog.parse(model).entry.capability.task
+    rows, manifest = _rows(task)
+    root = directory(tmp_path / "predictor", rows, model=model, **manifest)
+    capsys.readouterr()
+    cli.main(["check", str(root)])
+    assert runs in " ".join(capsys.readouterr().err.split())
+    cli.main(["check", "--json", str(root)])
+    reported = json.loads(capsys.readouterr().out)
+    expected = qualification(model)
+    assert reported["runs"] == {
+        "local": True,
+        "serve": expected.serve,
+        "push": expected.push,
+    }

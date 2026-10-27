@@ -7,18 +7,27 @@ on:
   schedule:
     - cron: "0 7 * * 1"
   workflow_dispatch:
+  # From release.yml, in a group of its own run, so a push to the released
+  # branch cannot cancel it.
   workflow_call:
+    inputs:
+      release:
+        description: Run in a concurrency group of this run's own
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 concurrency:
-  group: weekly-${{ github.ref }}
+  group: >-
+    ${{ inputs.release && format('weekly-run-{0}', github.run_id) ||
+    format('weekly-{0}', github.ref) }}
   cancel-in-progress: true
 
 jobs:
   slow:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

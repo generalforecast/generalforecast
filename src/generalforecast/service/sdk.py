@@ -20,7 +20,7 @@ from generalforecast.contracts import (
     PredictorLock,
     Revision,
 )
-from generalforecast.predictors.models import describe
+from generalforecast.predictors.models import qualification
 from generalforecast.predictors.validation import PredictorError
 from generalforecast.service.boundary import (
     JsonObject,
@@ -414,63 +414,6 @@ def prediction_payload(
     return json_object(payload)
 
 
-def one_shot_payload(
-    queries: Any,
-    *,
-    model: str,
-    target: str,
-    context: Any,
-    context_columns: Sequence[str] | None = None,
-    task: str | None = None,
-    features: Sequence[str] | None = None,
-    options: JsonObject | None = None,
-    outputs: Sequence[str] | None = None,
-) -> JsonObject:
-    """Uses catalog task metadata and declared roles, never target-value heuristics."""
-    semantic = json_object({} if options is None else options)
-    if outputs is not None:
-        require(not isinstance(outputs, str), "outputs must be a sequence of names")
-        require(
-            "outputs" not in semantic or semantic["outputs"] == list(outputs),
-            "conflicting output selections",
-        )
-        semantic["outputs"] = list(outputs)
-    if task is None:
-        tasks = describe(model).tasks
-        require(len(tasks) == 1, "provide an explicit model task")
-        task = tasks[0]
-    query_table = table(queries, columns=features)
-    if features is None:
-        require(
-            all(
-                semantic.get(role) is None or type(semantic[role]) is str
-                for role in ("id", "time")
-            ),
-            "invalid role column",
-        )
-        reserved = {target, semantic.get("id"), semantic.get("time")}
-        for role in ("series", "past_inputs", "future_inputs"):
-            columns = semantic.get(role, [])
-            require(type(columns) is list, "role columns must be a list")
-            require(
-                all(type(column) is str for column in columns), "invalid role column"
-            )
-            reserved.update(columns)
-        features = [
-            column for column in query_table.column_names if column not in reserved
-        ]
-    payload = prediction_payload(
-        query_table,
-        context=context,
-        context_columns=context_columns,
-        target=target,
-        features=features,
-        options=semantic,
-    )
-    payload.update(model=model, task=task)
-    return json_object(payload)
-
-
 def captured_environment(
     environment: Environment | None,
     options: dict[str, Any],
@@ -527,33 +470,35 @@ def pushed(predictor: "str | Path") -> Pushed:
 
     Raises:
         ServiceError: `LockRequired` for a missing, version 1 or stale lock;
-            `SnapshotMismatch` for a snapshot that changed since `gf check`.
+            `ModelResolutionRequired` for a model `gf check` reported is not
+            qualified for `gf push`; `SnapshotMismatch` for a snapshot that
+            changed since `gf check`.
     """
     from generalforecast.errors import Error
-    from generalforecast.predictors.lock import lock_document, manifest_digest
+    from generalforecast.predictors.lock import lock_document
+    from generalforecast.predictors.resolution import verified
     from generalforecast.predictors.runtime.context import served_context
     from generalforecast.predictors.spec import load
     from generalforecast.predictors.tables import read_frame
 
     root = Path(predictor)
     try:
+        # The lock must be exactly what gf check writes now, as gf serve and
+        # gf.Predictor require; a forged or stale one never leaves.
+        verified(load(root), root)
         document = lock_document(root)
-        if (root / "gf.yaml").is_file() and document["manifest"] != manifest_digest(
-            load(root)
-        ):
-            raise ServiceError(
-                "LockRequired",
-                f"gf.lock in {root} was written for another gf.yaml; run `gf check` first",
-                422,
-            )
-    except ServiceError:
-        raise
     except Error as error:
-        raise ServiceError(
-            "LockRequired" if error.param == "lock" else error.code,
-            error.message,
-            422,
-        ) from None
+        code = "LockRequired" if error.param == "lock" else error.code
+        if error.reason == "snapshot_changed":
+            code = "SnapshotMismatch"
+        raise ServiceError(code, error.message, 422) from None
+    try:
+        runs = qualification(document["predictor"]["model"])
+    except PredictorError as error:
+        raise ServiceError(error.code, error.message, 422) from None
+    if not runs.push:
+        refused = runs.refusal("push")
+        raise ServiceError(refused.code, refused.message, 422)
     lock = PredictorLock.from_dict(document)
     snapshot = None
     if lock.context_kind == "snapshot":

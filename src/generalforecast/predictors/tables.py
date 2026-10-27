@@ -615,6 +615,12 @@ def _after(
     if until.tzinfo is not None:
         until = until.astimezone(dt.UTC).replace(tzinfo=None)
     column = table[time]
+    if pa.types.is_integer(column.type) or pa.types.is_floating(column.type):
+        message = f"time column `{time}` holds numbers, not dates"
+        hint = "`until` compares dates or timestamps; use `holdout`, or store dates"
+        if error is not None:
+            raise error(message, param="context.until", hint=hint)
+        raise InvalidInput(message=message, param="context.until", hint=hint)
     if pa.types.is_timestamp(column.type) and column.type.tz is not None:
         column = pc.cast(column, pa.timestamp("us", tz="UTC"))
         column = pc.cast(column, pa.timestamp("us"))

@@ -27,19 +27,37 @@ def ensure(condition: Any, message: str, code: str = "InvalidPredictor") -> None
         raise PredictorError(code, message)
 
 
+# The longest literal `gf.yaml` and `gf.lock` hold: a column, a path, a model id.
+TEXT_LIMIT = 512
+# The longest identity string a service request carries: a row key, a
+# request id, an idempotency key.
+IDENTITY_LIMIT = 256
+
+
 def fields(
     value: Any, required: set[str], optional: AbstractSet[str] = frozenset()
 ) -> dict:
-    """Rejects missing and unknown keys, including credentials and runtime placement."""
+    """Rejects missing and unknown keys, including credentials and runtime placement.
+
+    The one shape check: `service.contracts.fields` is this one raising a
+    service error.
+    """
     ensure(type(value) is dict, "expected an object")
-    ensure(required <= value.keys(), "required fields are missing")
+    missing = required - value.keys()
+    ensure(not missing, f"required fields: {sorted(missing)}")
     ensure(value.keys() <= required | optional, "unknown fields are not supported")
+    return value
+
+
+def bounded(value: Any, limit: int = TEXT_LIMIT) -> str:
+    """Checks a nonempty string of at most `limit` characters."""
+    ensure(type(value) is str and 0 < len(value) <= limit, "expected bounded text")
     return value
 
 
 def text(value: Any) -> str:
     """Checks a bounded literal, never an environment expansion or secret value."""
-    ensure(type(value) is str and 0 < len(value) <= 512, "expected bounded text")
+    bounded(value)
     ensure(not any(ord(c) < 32 for c in value), "control characters are not allowed")
     ensure(
         not any(c in value for c in ("${", "{{", "://", "?", "#")),
@@ -52,6 +70,20 @@ def text(value: Any) -> str:
         ),
         "embedded credentials are forbidden",
     )
+    return value
+
+
+def column(value: Any) -> str:
+    """Checks a column name or a class label: any printable text a CSV header or cell holds.
+
+    Unlike `text`, which guards references a service resolves, a column or
+    label is data: `is_vip?`, `item #` and `{{x}}` are fine names.
+    """
+    ensure(
+        type(value) is str and 0 < len(value) <= 512,
+        "column names and labels are 1 to 512 characters",
+    )
+    ensure(not any(ord(c) < 32 for c in value), "control characters are not allowed")
     return value
 
 
@@ -84,7 +116,7 @@ def identifier(value: Any) -> str:
 def names(value: Any) -> tuple[str, ...]:
     """Copies unique ordered column names into an immutable tuple."""
     ensure(type(value) is list, "expected a list of columns")
-    result = tuple(text(item) for item in value)
+    result = tuple(column(item) for item in value)
     ensure(len(set(result)) == len(result), "columns must be unique")
     return result
 

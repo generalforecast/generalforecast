@@ -28,6 +28,7 @@ from generalforecast.predictors.runtime.plan import ExecutionPlan
 from generalforecast.predictors.runtime.schema import infer_schema
 from generalforecast.predictors.validation import NAME, PredictorError, name
 from generalforecast.serve.models import published_entry
+from generalforecast.service.contracts import ServiceError
 from generalforecast.service.sdk import pushed
 from tests.utils.engine import FakeEngine
 from tests.utils.locks import ad_hoc, directory, lock_of
@@ -321,22 +322,35 @@ def test_check_admits_quantiles_as_the_runtime_does(tmp_path, monkeypatch):
         "horizon": 2,
         "quantiles": [0.123],
     }
-    # A model whose catalog entry declares its levels is held to them at check.
-    with pytest.raises(InvalidInput) as caught:
-        directory(tmp_path / "chronos", rows, model=FORECASTER, **manifest)
-    assert "quantile" in caught.value.message
-    # One that publishes them only in its weights is held to them at bind.
+    # Every catalog forecaster declares its levels, so check refuses others
+    # up front rather than leaving it to the first prediction.
+    for model in (
+        FORECASTER,
+        "general-forecast/timesfm-3",
+        "general-forecast/timestral-28m",
+    ):
+        with pytest.raises(InvalidInput) as caught:
+            directory(tmp_path / model.split("/")[1], rows, model=model, **manifest)
+        assert "quantile" in caught.value.message
+    # Binding still holds the loaded weights to the declared levels.
     root = directory(
-        tmp_path / "timesfm", rows, model="general-forecast/timesfm-3", **manifest
+        tmp_path / "deciles",
+        rows,
+        model="general-forecast/timesfm-3",
+        target="units",
+        time="date",
+        series=["store"],
+        horizon=2,
+        quantiles=[0.2, 0.8],
     )
-    FakeEngine((0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)).install(monkeypatch)
+    FakeEngine((0.25, 0.5, 0.75)).install(monkeypatch)
     lock = lock_of(root)
     from generalforecast.predictors.models import CatalogResolver
 
     plan = compile_lock(
         lock, served_context(lock, rows), resolver=CatalogResolver("local")
     )
-    with pytest.raises(Exception, match=r"does not output quantile 0\.123"):
+    with pytest.raises(Exception, match="pinned model capabilities changed"):
         PredictorExecutor(surface="local").prepare(plan, served_context(lock, rows))
 
 
@@ -388,19 +402,31 @@ def test_live_contexts_bind_through_the_one_served_context(tmp_path, monkeypatch
 
 
 def test_context_versions_name_a_live_context_apart_from_its_kind():
-    version = ContextVersion("live", 3, 10, name="events")
+    version = ContextVersion("live", 3, 10, 1761552000.0, name="events")
     assert version.to_dict() == {
         "source": "live",
-        "version": 3,
-        "rows": 10,
-        "as_of": None,
         "name": "events",
+        "version": 3,
+        "digest": None,
+        "rows": 10,
+        "as_of": "2025-10-27T08:00:00Z",
     }
+    assert ContextVersion.from_dict(version.to_dict()) == version
     assert context_version({"source": "live/events", "version": 3}) == ContextVersion(
         "live", 3, name="events"
     )
     with pytest.raises(PredictorError):
         ContextVersion("live/events")
+    digest = "sha256:" + "a" * 64
+    # Earlier forms still decode: gf-server's {kind, digest} and a digest
+    # held as a snapshot's version.
+    for earlier in (
+        {"kind": "snapshot", "rows": 4, "digest": digest, "as_of": 1761552000},
+        {"source": "snapshot", "version": digest, "rows": 4, "as_of": 1761552000},
+    ):
+        assert context_version(earlier) == ContextVersion(
+            "snapshot", rows=4, as_of=1761552000.0, digest=digest
+        )
 
 
 def test_prediction_requests_carry_as_of():
@@ -409,19 +435,37 @@ def test_prediction_requests_carry_as_of():
     )
     assert request.as_of == "2025-01-01T00:00:00Z"
     assert request.to_dict() == {"queries": [{"x": 1}], "as_of": "2025-01-01T00:00:00Z"}
-    with pytest.raises(PredictorError):
+    with pytest.raises(ServiceError) as refused:
         PredictionRequest.from_dict({"queries": [{"x": 1}], "as_of": "soon"})
+    assert (refused.value.code, refused.value.param) == ("ValidationError", "as_of")
 
 
 def test_one_name_rule_for_chosen_names():
     from generalforecast.predictors.spec import NAME as SPEC_NAME
-    from generalforecast.service.contracts import NAME as SERVICE_NAME
+    from generalforecast.service import contracts
 
-    assert SPEC_NAME is NAME is SERVICE_NAME
-    assert name("churn-2") == "churn-2"
-    for bad in ("Churn", "churn_2", "2churn", ""):
+    assert SPEC_NAME is NAME
+    assert name("churn-2") == contracts.name("churn-2") == "churn-2"
+    for bad in ("Churn", "churn_2", "2churn", "", None):
         with pytest.raises(PredictorError):
             name(bad)
+        with pytest.raises(contracts.ServiceError) as caught:
+            contracts.name(bad)
+        assert caught.value.status == 422
+
+
+def test_service_field_checks_are_the_predictor_checks():
+    from generalforecast.service import contracts
+
+    with pytest.raises(contracts.ServiceError, match=r"required fields: \['b'\]"):
+        contracts.fields({"a": 1}, {"a", "b"})
+    with pytest.raises(contracts.ServiceError, match="unknown fields"):
+        contracts.fields({"a": 1, "c": 2}, {"a"})
+    with pytest.raises(contracts.ServiceError, match="expected an object"):
+        contracts.fields([], {"a"})
+    assert contracts.text("k" * 256, "key") == "k" * 256
+    with pytest.raises(contracts.ServiceError, match="invalid key"):
+        contracts.text("k" * 257, "key")
 
 
 def test_the_lock_document_round_trips_through_yaml(tmp_path):
@@ -508,7 +552,7 @@ def test_frozen_checks_and_local_predictors_refuse_a_stale_lock(tmp_path, monkey
     )
     with pytest.raises(InvalidInput) as caught:
         gf.Predictor(root)
-    assert caught.value.message.endswith("is out of date")
+    assert caught.value.message == "snapshot rows differ from gf.lock"
     manifest = root / "gf.yaml"
     manifest.write_text(manifest.read_text() + "selection: {seed: 2}\n")
     with pytest.raises(InvalidInput) as caught:
@@ -564,3 +608,209 @@ def test_a_declared_group_holds_at_most_eight_series_and_one_origin(tmp_path):
     with pytest.raises(InvalidInput) as caught:
         directory(tmp_path / "outside", rows(3), related=["region"], **manifest)
     assert caught.value.param == "related"
+
+
+def test_a_forged_lone_lock_is_held_to_the_model_and_policy(tmp_path):
+    root = directory(tmp_path / "churn", churn(), id="id", context="request")
+    document = yaml.safe_load((root / "gf.lock").read_text())
+    document["predictor"]["selection"].update(
+        strategy="retrieved", core=10**9, neighbors=0
+    )
+    from generalforecast.predictors.lock import lock_digest
+
+    document["digest"] = lock_digest(document)
+    with pytest.raises(PredictorError, match="context cap"):
+        compile_lock(document, None)
+
+
+def test_check_locked_needs_a_current_version_2_lock(tmp_path):
+    from generalforecast import cli
+
+    root = directory(tmp_path / "churn", churn(), id="id")
+    cli.main(["check", "--locked", "-q", str(root)])
+    (root / "gf.lock").unlink()
+    with pytest.raises(SystemExit) as exited:
+        cli.main(["check", "--locked", "-q", str(root)])
+    assert exited.value.code != 0
+    assert not (root / "gf.lock").exists()
+
+
+def test_queries_widen_whole_numbers_and_read_iso_times_on_every_task(tmp_path):
+    from generalforecast.predictors.runtime.compile import validate_queries
+    from generalforecast.predictors.runtime.validation import query_table
+    from tests.utils.locks import compiled
+
+    plan = compiled(
+        tmp_path / "sales",
+        sales(),
+        model=FORECASTER,
+        target="units",
+        time="date",
+        series=["store"],
+        horizon=2,
+        inputs={"future": ["promo"]},
+    )
+    queries = pa.table(
+        {
+            "store": ["north", "north"],
+            "date": ["2025-01-13", "2025-01-14"],
+            "promo": [1, 0],
+        }
+    )
+    read = query_table(plan, plan.schema, queries)
+    assert read["promo"].type == pa.float64()
+    assert read["date"].to_pylist() == [
+        datetime.date(2025, 1, 13),
+        datetime.date(2025, 1, 14),
+    ]
+    with pytest.raises(PredictorError, match="query column 'promo' is string"):
+        query_table(
+            plan, plan.schema, queries.set_column(2, "promo", pa.array(["a", "b"]))
+        )
+    plan = compiled(tmp_path / "churn", churn(), id="id")
+    read = validate_queries(
+        plan, pa.table({"id": [20], "day": ["2025-09-10"], "spend": [3], "note": ["n"]})
+    )
+    assert read["spend"].type == pa.float64()
+
+
+def test_request_contexts_leave_unlabeled_rows_out(tmp_path):
+    root = directory(
+        tmp_path / "scorer",
+        pa.table({"x": [1.0, 2.0], "y": ["a", "b"]}),
+        context="request",
+    )
+    lock = lock_of(root)
+    rows = pa.table({"x": [1, 2, 3, 4], "y": ["a", "", None, "b"]})
+    bound = served_context(lock, rows)
+    assert bound is not None
+    assert bound["y"].to_pylist() == ["a", "b"]
+    # An input checked without rows reads its numbers as float64 on every path.
+    assert bound["x"].type == pa.float64()
+
+
+def test_column_names_and_labels_are_data_not_references(tmp_path):
+    rows = pa.table(
+        {
+            "is_vip?": [float(i) for i in range(12)],
+            "item #": [i % 3 for i in range(12)],
+            "{{y}}": [("a?", "b#")[i % 2] for i in range(12)],
+        }
+    )
+    root = directory(tmp_path / "odd", rows, target="{{y}}")
+    names = [column["name"] for column in lock_of(root).predictor["inputs"]]
+    assert names == ["is_vip?", "item #"]
+    assert lock_of(root).predictor["classes"] == ["a?", "b#"]
+    with pytest.raises(InvalidInput, match="control characters"):
+        name_rows = pa.table({"a\tb": [1.0] * 4, "y": [0, 1] * 2})
+        compile_lock(ad_hoc(name_rows, model=CLASSIFIER, target="y"), name_rows)
+
+
+def test_a_text_covariate_is_refused_by_name(tmp_path):
+    rows = sales().append_column("weather", pa.array(["sun", "rain"] * 12))
+    with pytest.raises(InvalidInput, match="input 'weather' is string"):
+        directory(
+            tmp_path / "w",
+            rows,
+            model=FORECASTER,
+            target="units",
+            time="date",
+            series=["store"],
+            horizon=2,
+            inputs={"past": ["weather"]},
+        )
+
+
+def test_a_forecaster_refuses_splits_it_cannot_predict_and_names_why(tmp_path):
+    forecast: dict[str, Any] = {
+        "model": FORECASTER,
+        "target": "units",
+        "time": "date",
+        "series": ["store"],
+        "horizon": 2,
+    }
+
+    def refused(rows: pa.Table, **manifest: Any) -> InvalidInput:
+        with pytest.raises(InvalidInput) as caught:
+            directory(tmp_path / "f", rows, **{**forecast, **manifest})
+        return caught.value
+
+    # An until that holds out the horizon passes; one that holds out more does not.
+    directory(tmp_path / "ok", sales(), split={"until": "2025-01-11"}, **forecast)
+    error = refused(sales(), split={"until": "2025-01-09"})
+    assert "holds out 4 query rows, not the 2 steps of `horizon`" in error.message
+    assert error.param == "context.until"
+    assert (
+        "random draw" in refused(sales(), split={"holdout": {"fraction": 0.2}}).message
+    )
+    assert refused(sales(), selection={"core": 4}).message == (
+        "`selection` is for tabular models"
+    )
+    assert "`related: []`" in refused(sales(), related=[]).message
+    gap = sales().set_column(
+        2, "units", pa.array([None if i == 4 else float(i) for i in range(24)])
+    )
+    assert refused(gap).message == (
+        "series north has a blank target at 2025-01-05, inside its history"
+    )
+    nameless = sales().set_column(0, "store", pa.array(["north"] * 23 + [None]))
+    assert refused(nameless).message == "series column `store` has missing values"
+    periods = sales().set_column(1, "date", pa.array(list(range(12)) * 2))
+    assert (
+        "holds numbers, not dates"
+        in refused(periods, split={"until": "2025-01-11"}).message
+    )
+
+
+def test_a_series_of_one_time_follows_the_others_step(tmp_path):
+    from generalforecast.predictors import frequency
+
+    day = datetime.date(2025, 1, 1)
+    times = {
+        ("a",): [day + datetime.timedelta(days=d) for d in range(5)],
+        ("b",): [day],
+    }
+    assert frequency.infer(times) == "1d"
+    with pytest.raises(frequency.FrequencyError):
+        frequency.infer({("b",): [day]})
+
+
+def test_a_zoned_origin_steps_through_utc():
+    from zoneinfo import ZoneInfo
+
+    from generalforecast.predictors import frequency
+
+    origin = datetime.datetime(2024, 3, 10, 1, tzinfo=ZoneInfo("America/Los_Angeles"))
+    stepped = frequency.grid(origin, 2, "1h")
+    assert [frequency.instant(t) - frequency.instant(origin) for t in stepped] == [
+        3600.0,
+        7200.0,
+    ]
+
+
+def test_an_input_of_no_recorded_kind_reads_iso_text_as_times(tmp_path):
+    root = directory(
+        tmp_path / "scorer",
+        pa.table(
+            {
+                "seen": [datetime.datetime.fromisoformat("2025-01-01T00:00")] * 2,
+                "tier": ["a", "b"],
+                "y": ["a", "b"],
+            }
+        ),
+        context="request",
+    )
+    rows = pa.table(
+        {
+            "seen": ["2025-01-01T00:00:00Z", "2025-01-02T06:00:00+01:00"],
+            "tier": ["gold", "2025-01-01"],
+            "y": ["a", "b"],
+        }
+    )
+    bound = served_context(lock_of(root), rows)
+    assert bound is not None
+    assert bound["seen"].to_pylist() == [
+        datetime.datetime.fromisoformat("2025-01-01T00:00"),
+        datetime.datetime.fromisoformat("2025-01-02T05:00"),
+    ]
+    assert bound["tier"].type == pa.string()

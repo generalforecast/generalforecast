@@ -188,7 +188,7 @@ def calls(authored: Any) -> dict[str, tuple[tuple, dict]]:
         "sources.get": (("source-1",), {}),
         "sources.pin": (({"path": "a.csv", "format": "csv", "mapping": {}},), {}),
         "models.list": ((), {}),
-        "models.get": (("tabicl-v2-classifier",), {}),
+        "models.get": (("general-forecast/tabicl-v2-classifier",), {}),
         "predictors.list": ((), {}),
         "predictors.get": (("risk",), {"env": "staging"}),
         "predictors.create": (("risk",), {}),
@@ -352,11 +352,6 @@ def identity_calls() -> list[tuple[str, dict]]:
     ]
 
 
-# A revision's lock uses gf.yaml's type names (`bool`, `int`), which the spec's
-# Lock schema does not list; the lock and the spec are reconciled elsewhere.
-_LOCK_ROUTE = re.compile(r"/v1/projects/[^/]+/predictors/[^/]+/revisions")
-
-
 def sent_requests(tmp_path, monkeypatch) -> list[tuple[str, str, Any, bool]]:
     """Every request a client sends for the parity table and every identity action.
 
@@ -406,21 +401,14 @@ def test_every_request_either_client_sends_is_a_route_of_the_spec(
     routes = spec_routes()
     for method, path, body, built in sent_requests(tmp_path, monkeypatch):
         request = spec_request(routes, method, path)
+        # A pushed revision's lock included: gf.lock and the spec's Lock agree.
         if (
             built
             and method == "POST"
             and isinstance(body, dict)
             and request is not None
-            and not _LOCK_ROUTE.fullmatch(path)
         ):
             request.from_payload(body)
-
-
-def test_a_pushed_lock_matches_the_spec(tmp_path, monkeypatch):
-    routes = spec_routes()
-    for method, path, body, _built in sent_requests(tmp_path, monkeypatch):
-        if method == "POST" and _LOCK_ROUTE.fullmatch(path):
-            spec_request(routes, method, path).from_payload(body)
 
 
 class Refusing(Recorder):
@@ -502,3 +490,16 @@ def test_every_versioned_request_goes_through_call(monkeypatch):
     assert sync.keys.list() == []
     assert asyncio.run(asynchronous.keys.list()) == []
     assert seen == [("sync", "GET", "/keys"), ("async", "GET", "/keys")]
+
+
+def test_the_public_sdk_surface_is_declared_and_documented():
+    from generalforecast import client as sync_module
+    from generalforecast import transport
+
+    for module in (sync_module, transport):
+        for name in module.__all__:
+            value = getattr(module, name)
+            if callable(value):
+                assert (value.__doc__ or "").strip(), f"{module.__name__}.{name}"
+    assert {"WORKSPACE_ACTIONS", "workspace_request"} <= set(sync_module.__all__)
+    assert {"Transport", "AsyncTransport", "endpoint"} <= set(transport.__all__)

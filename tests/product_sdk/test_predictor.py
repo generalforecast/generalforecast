@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import math
 from pathlib import Path
 from typing import Any, cast
@@ -52,6 +53,7 @@ def test_top_level_exports_are_exactly_the_contract() -> None:
         "Internal",
         "Conflict",
         "Unavailable",
+        "Unsupported",
         "Client",
         "AsyncClient",
         "engine",
@@ -250,10 +252,12 @@ def test_requests_name_columns_and_classes_in_their_errors() -> None:
         and payload["id"] == "customer_id"
     )
     assert "task" not in payload and "options" not in payload
-    assert PredictRequest.declared_payload([{"x": 1}], as_of="2025-01-01") == {
-        "queries": [{"x": 1}],
-        "as_of": "2025-01-01",
-    }
+    # as_of goes on the wire as RFC 3339 UTC, whatever form it was given in.
+    for given in ("2025-01-01", "2025-01-01T02:00:00+02:00", 1735689600):
+        assert PredictRequest.declared_payload([{"x": 1}], as_of=given) == {
+            "queries": [{"x": 1}],
+            "as_of": "2025-01-01T00:00:00Z",
+        }
     with pytest.raises(gf.CapacityExceeded) as caught:
         PredictRequest.build(
             model=MODEL,
@@ -371,7 +375,13 @@ def test_selection_settings_resolve_against_the_model_cap() -> None:
         tables.seconds("7d") == 7 * 86_400
         and tables.seconds("1h") == 3_600
         and tables.seconds(90) == 90
+        and tables.seconds("15min") == tables.seconds("15m") == 900
     )
+    # One parser with predictor frequencies: no fractional spans, no
+    # calendar alias passed off as its mean length.
+    for spelled in ("1.5h", "MS", "W-MON", "soon"):
+        with pytest.raises(gf.InvalidInput):
+            tables.seconds(spelled, "frequency")
     with pytest.raises(gf.InvalidInput):
         tables.TimeOptions(bucket="soon")
     with pytest.raises(gf.InvalidInput):
@@ -709,3 +719,73 @@ def test_served_predictions_echo_the_id_column(monkeypatch) -> None:
     assert list(frame.columns) == ["id", "label", "p_0", "p_1"]
     assert frame["id"].tolist() == [1297]
     assert posted == ["/predictors/churn/predict"]
+
+
+def test_forecast_eval_scales_each_series_by_its_own_history(monkeypatch) -> None:
+
+    import generalforecast.predictor as predictor_module
+
+    def fake_run(request: PredictRequest, *, download: bool = True) -> pd.DataFrame:
+        return pd.DataFrame({"value": [0.0] * len(request.queries)})
+
+    monkeypatch.setattr(predictor_module, "run_local", fake_run)
+    day = dt.date(2025, 1, 1)
+    # Two series share the first series column's value; their history
+    # arrives out of time order. Each steps by 1 (east) or 4 (west) a day.
+    context = [
+        {
+            "region": "r",
+            "store": store,
+            "date": day + dt.timedelta(days=d),
+            "y": step * d,
+        }
+        for store, step in (("west", 4.0), ("east", 1.0))
+        for d in (3, 0, 2, 1)
+    ]
+    held = [
+        {"region": "r", "store": store, "date": day + dt.timedelta(days=d), "y": 8.0}
+        for store in ("east", "west")
+        for d in (4, 5)
+    ]
+    predictor = gf.Predictor(
+        "general-forecast/chronos-2",
+        target="y",
+        time="date",
+        series=["region", "store"],
+        horizon=2,
+        context=context,
+    )
+    scores = predictor.eval(held).metrics["general-forecast/chronos-2"]
+    # |8 - 0| over each series' naive error: 8 for east, 2 for west.
+    assert scores["mase"] == pytest.approx((8 + 8 + 2 + 2) / 4)
+
+
+def test_predict_sends_large_query_sets_as_several_calls_in_order(monkeypatch) -> None:
+    import generalforecast.predictor as predictor_module
+    from generalforecast.native import models as registry
+    from generalforecast.predictor import _query_batches
+
+    calls = []
+
+    def fake_run(request: PredictRequest, *, download: bool = True) -> pd.DataFrame:
+        calls.append(len(request.queries))
+        return pd.DataFrame({"value": request.queries.column("x").to_pylist()})
+
+    monkeypatch.setattr(predictor_module, "run_local", fake_run)
+    context = [{"x": float(i), "y": float(i)} for i in range(10)]
+    predictor = gf.Predictor(REGRESSOR, target="y", context=context)
+    cap = registry.limits(REGRESSOR).queries
+    queries = pa.table({"x": [float(i) for i in range(2 * cap + cap // 2)]})
+    frame = predictor.predict(queries)
+    # An ad hoc call is held to the model's per-call bound.
+    assert calls == [cap, cap, cap // 2]
+    assert frame["value"].tolist() == queries["x"].to_pylist()
+    # A forecaster's series stay whole within one call; rows come back in order.
+    keys = pa.table({"s": ["a", "b", "a", "c", "b", "c", "a"]})
+    batches = _query_batches(keys, ["s"], 4)
+    assert [b.tolist() for b in batches] == [[0, 2, 6], [1, 3, 4, 5]]
+    assert [b.tolist() for b in _query_batches(keys, [], 3)] == [
+        [0, 1, 2],
+        [3, 4, 5],
+        [6],
+    ]

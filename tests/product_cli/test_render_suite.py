@@ -68,6 +68,7 @@ def test_check(suite):
     assert lines(suite, "check") == [
         "    Resolved orders  classification, 3 inputs, 10,000 context rows, 0 query rows",
         "   Selection retrieved  core 1,500 stratified, 4,500 nearest per query",
+        "        Runs gf.Predictor, gf serve and gf push",
         "  id       order_id                      from gf.yaml",
         "  inputs   amount, items, signup_source  every other column",
         "  target   returned                      from gf.yaml",

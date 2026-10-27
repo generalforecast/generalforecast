@@ -326,12 +326,16 @@ class PredictRequest:
             "queries": _records(self.queries),
             "inputs": list(self.inputs),
         }
-        for key in ("id", "time", "frequency", "horizon", "as_of"):
+        for key in ("id", "time", "frequency", "horizon"):
             value = getattr(self, key)
             if value is not None:
                 payload[key] = (
                     value if not hasattr(value, "isoformat") else value.isoformat()
                 )
+        if self.as_of is not None:
+            from generalforecast import as_of as instants
+
+            payload["as_of"] = instants.wire(self.as_of)
         if self.series:
             payload["series"] = list(self.series)
         if self.quantiles is not None:
@@ -351,9 +355,9 @@ class PredictRequest:
         if context is not None:
             payload["context"] = _records(tabular.frame(context))
         if as_of is not None:
-            payload["as_of"] = (
-                as_of if not hasattr(as_of, "isoformat") else as_of.isoformat()
-            )
+            from generalforecast import as_of as instants
+
+            payload["as_of"] = instants.wire(as_of)
         return payload
 
 
@@ -601,6 +605,43 @@ def regression_metrics(
 def _pinball(y: np.ndarray, q: np.ndarray, level: float) -> float:
     diff = y - q
     return float(np.mean(np.where(diff >= 0, level * diff, (level - 1) * diff)))
+
+
+def _query_batches(
+    table: pa.Table, series: Sequence[str], cap: int
+) -> list[np.ndarray]:
+    """The row indices of each call, at most `cap` rows apiece, in row order.
+
+    With series columns, each series' rows stay in one call, as a
+    forecaster needs a series' whole horizon at once; series are packed in
+    order of first appearance. A series of more than `cap` rows is a call
+    of its own, which the server bounds.
+    """
+    if not series:
+        return [
+            np.arange(start, min(start + cap, table.num_rows))
+            for start in range(0, table.num_rows, cap)
+        ]
+    keys = list(zip(*(table[name].to_pylist() for name in series), strict=True))
+    members: dict[Any, list[int]] = {}
+    for index, key in enumerate(keys):
+        members.setdefault(key, []).append(index)
+    batches: list[list[int]] = [[]]
+    for rows in members.values():
+        if batches[-1] and len(batches[-1]) + len(rows) > cap:
+            batches.append([])
+        batches[-1].extend(rows)
+    return [np.asarray(sorted(rows), dtype=np.int64) for rows in batches if rows]
+
+
+def _when(moment: Any) -> Any:
+    """A time as it sorts: an instant for dates and datetimes, else itself."""
+    from generalforecast.predictors.frequency import instant
+
+    try:
+        return instant(moment)
+    except TypeError:
+        return moment
 
 
 def forecast_metrics(
@@ -879,22 +920,20 @@ class Predictor:
 
     def _load_local(self) -> None:
         """Resolves `gf.yaml` as `gf check` does, without writing `gf.lock`."""
-        from generalforecast.predictors import lock, resolve
+        from generalforecast.predictors import lock, resolve, verified
         from generalforecast.predictors.spec import load
 
         assert self._root is not None
         with boundary():
             spec = load(self._root)
-            resolution = resolve(spec, self._root)
-        if lock.read_lock(self._root) is not None and resolution.lock_changes:
             # A gf.lock beside the manifest is what gf serve and gf push run;
-            # predicting from anything else would answer differently.
-            raise InvalidInput(
-                f"gf.lock in {self._root} is out of date",
-                because="gf.yaml or its snapshot changed since `gf check` wrote it",
-                hint="run `gf check` to update it",
-                param="lock",
-            )
+            # predicting from anything else would answer differently, so it
+            # must be exactly the lock gf check writes now. Without one, the
+            # manifest resolves as gf check would resolve it.
+            if (self._root / lock.LOCK).exists():
+                resolution = verified(spec, self._root)
+            else:
+                resolution = resolve(spec, self._root)
         self._spec, self._resolution = spec, resolution
         self._lock = lock.document(resolution)
         self.name = spec.name
@@ -1074,6 +1113,11 @@ class Predictor:
     def predict(self, queries: Any, context: Any = None, *, as_of: Any = None) -> Any:
         """Scores rows.
 
+        Any number of query rows score: past one call's bound
+        (`contracts.MAX_QUERIES`, or the model's own) they go as several
+        calls, a forecaster's series each whole within one, and come back
+        in the order given.
+
         Args:
             queries: Rows to score: a frame, list of dicts, Arrow table, or a
                 path or URL to a .csv, .parquet or .json file.
@@ -1086,9 +1130,67 @@ class Predictor:
             columns for a classifier, or `value` and `q_<level>` columns for
             a regressor or forecaster.
         """
+        table = tabular.frame(queries)
+        cap = self._query_cap()
+        if table.num_rows <= cap and self._kind in ("local", "catalog"):
+            return self._predict_once(table, context, as_of=as_of)
+        import pandas as pd
+
+        series = self._series_columns()
+        parts, order = [], []
+        pending = list(reversed(_query_batches(table, series, cap)))
+        while pending:
+            rows = pending.pop()
+            try:
+                parts.append(self._predict_once(table.take(rows), context, as_of=as_of))
+            except Error as error:
+                # A reply past the SDK's response bound comes back as a
+                # protocol error; half as many rows answer in half the bytes.
+                halves = _query_batches(
+                    table.take(rows), series, max(1, len(rows) // 2)
+                )
+                if error.code != "ProtocolError" or len(halves) < 2:
+                    raise
+                pending.extend(reversed([rows[half] for half in halves]))
+                continue
+            order.append(rows)
+        frame = parts[0] if len(parts) == 1 else pd.concat(parts, ignore_index=True)
+        placed = np.empty(table.num_rows, dtype=np.int64)
+        placed[np.concatenate(order)] = np.arange(table.num_rows)
+        return frame.iloc[placed].reset_index(drop=True)
+
+    def _query_cap(self) -> int:
+        """Most query rows one call carries: the wire bound, or a model's lower one."""
+        from generalforecast.contracts import MAX_QUERIES
+
+        if self._kind == "catalog" and self.task != "forecast":
+            # An ad hoc call is held to the model's own per-call bound.
+            return max(1, min(MAX_QUERIES, registry.limits(self.model).queries))
+        return MAX_QUERIES
+
+    def _series_columns(self) -> tuple[str, ...]:
+        """A forecaster's series columns, which a batch keeps whole; none otherwise."""
+        if self._kind in ("served", "hosted") and not self.series:
+            facts = self._hosted_facts()
+            if facts.get("task") == "forecast":
+                self.series = tuple(facts.get("series") or ())
+        return tuple(self.series)
+
+    def _predict_once(
+        self, queries: Any, context: Any = None, *, as_of: Any = None
+    ) -> Any:
+        """One prediction call: at most `MAX_QUERIES` query rows."""
         if self._kind in ("local", "catalog") and not (
             self._kind == "local" and self._context_kind == "live"
         ):
+            if (as_of if as_of is not None else self._as_of) is not None:
+                # As gf serve and hosted serving refuse it: only a live
+                # context changes over time.
+                kind = self._context_kind if self._kind == "local" else "request"
+                raise InvalidInput(
+                    f"as_of reads a live context; this predictor's is a {kind} context",
+                    param="as_of",
+                )
             request = self.request(queries, context, as_of=as_of)
             with boundary():
                 return run_local(request, download=self._download)
@@ -1229,24 +1331,35 @@ class Predictor:
         for ref in (self.model, *models):
             model = registry.canonical(ref)
             task = registry.task_of(model)
-            cap = registry.limits(model).queries if task != "forecast" else len(held)
-            frames = []
+            from generalforecast.contracts import MAX_QUERIES
+
+            cap = (
+                MAX_QUERIES
+                if task == "forecast"
+                else max(1, min(MAX_QUERIES, registry.limits(model).queries))
+            )
+            frames, order = [], []
             lock = self._lock if model == self.model else self._lock_for(model)
-            for start in range(0, max(len(held), 1), max(cap, 1)):
+            series = self.series if task == "forecast" else ()
+            for indices in _query_batches(held, series, cap):
                 given = None if self._kind == "local" else context
                 batch = dataclasses.replace(
-                    self.request(held.slice(start, cap), given),
+                    self.request(held.take(indices), given),
                     model=model,
                     task=task,
                     lock=lock,
                 )
-                if start == 0:
+                if not frames:
                     request = batch
                 with boundary():
                     frames.append(run_local(batch, download=self._download))
+                order.append(indices)
             frame = (
                 frames[0] if len(frames) == 1 else pd.concat(frames, ignore_index=True)
             )
+            placed = np.empty(len(frame), dtype=np.int64)
+            placed[np.concatenate(order)] = np.arange(len(frame))
+            frame = frame.iloc[placed].reset_index(drop=True)
             metrics[model] = self._score(request, frame, truth, held)
             key = (
                 registry.short(model)
@@ -1285,24 +1398,33 @@ class Predictor:
         }
         if request.task == "regression":
             return regression_metrics(truth, frame["value"].tolist(), quantiles or None)
-        series_column = request.series[0] if request.series else None
-        history: dict[Any, list[float]] = {}
+
+        # Each series is keyed by every series column, and its history is
+        # in time order, so the naive error scaling MASE is each series' own.
+        def keys(table: pa.Table) -> list[tuple]:
+            columns = [table.column(name).to_pylist() for name in request.series]
+            return list(zip(*columns, strict=True)) if columns else [()] * len(table)
+
         context = request.context
-        keys = (
-            context.column(series_column).to_pylist()
-            if series_column is not None
-            else [None] * len(context)
+        times = (
+            context.column(request.time).to_pylist()
+            if request.time
+            else list(range(len(context)))
         )
-        for key, value in zip(
-            keys, context.column(request.target).to_pylist(), strict=True
+        ordered: dict[tuple, list[tuple[Any, float]]] = {}
+        for key, moment, value in zip(
+            keys(context),
+            times,
+            context.column(request.target).to_pylist(),
+            strict=True,
         ):
             if value is not None:
-                history.setdefault(key, []).append(float(value))
-        held_keys = (
-            held.column(series_column).to_pylist()
-            if series_column is not None
-            else [None] * len(held)
-        )
+                ordered.setdefault(key, []).append((_when(moment), float(value)))
+        history = {
+            key: [value for _, value in sorted(values, key=lambda item: item[0])]
+            for key, values in ordered.items()
+        }
+        held_keys = keys(held)
         if not quantiles:
             quantiles = {0.5: frame["value"].tolist()}
         return forecast_metrics(truth, quantiles, history=history, series=held_keys)

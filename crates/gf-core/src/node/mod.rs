@@ -381,13 +381,19 @@ struct Ledger {
     rebuilds: Vec<(CacheKey, TableId, usize)>,
 }
 
-/// A table's fit as it stood before a step planned its own.
+/// A table's fit as it stood before a step planned its own, which an
+/// unwound plan puts back: the state fit, and what drift and refits are
+/// measured against. The running column sums are not kept: a fit recounts
+/// them from the live rows, which they already sum, so they stand as they
+/// were.
 #[derive(Debug)]
 struct FitMark {
     table: TableId,
     fitted: Option<Epoch>,
     horizon: Option<i64>,
     fitted_latest: Option<i64>,
+    fitted_columns: Option<Fitted>,
+    changed: u64,
 }
 
 /// A region's context a rebuild step encodes, to replace its built one.

@@ -25,7 +25,7 @@ const MAX_FRAME_BYTES: u64 = 1 << 33;
 
 /// The version of the frames the server and its workers exchange, which a
 /// worker reports when it connects: both sides must come from one generalforecast.
-pub const PROTOCOL_VERSION: u32 = 13;
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// The most buffers one frame may claim.
 const MAX_BUFFERS: u32 = 1 << 20;
@@ -667,9 +667,10 @@ pub enum WorkerRequest {
         model: String,
         features: usize,
     },
-    /// Loads a model the worker did not start with, under `name`, from a
-    /// built-in model's repository id: a control,
-    /// sent in a `Controls` frame ahead of the first table naming the model.
+    /// Loads a model the worker did not start with, under `name`, from its
+    /// spec, beside the worker's steps: the worker answers `Loading` at
+    /// once, and sends `Loaded` with the name once the model loaded or
+    /// failed to, so steps for the models it serves go on meanwhile.
     AddModel {
         name: String,
         spec: String,
@@ -704,7 +705,7 @@ pub enum WorkerRequest {
     Apply {
         movements: Value,
     },
-    /// Models loaded, tables added and removed and tiers' copies and drops, carried out in
+    /// Tables added and removed and tiers' copies and drops, carried out in
     /// order: what a shard tick asks of the worker besides its steps, in one
     /// frame. The worker answers `Ok`, or `Controlled` with those that failed.
     Controls {
@@ -807,6 +808,15 @@ pub enum WorkerReply {
     /// keys the step's reply named; it answers no request.
     Compiled {
         keys: Vec<String>,
+    },
+    /// The answer to `AddModel`: the worker loads the model beside its steps.
+    Loading,
+    /// Sent once a model `AddModel` named has loaded, or with why it could
+    /// not; it answers no request.
+    Loaded {
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failure: Option<String>,
     },
     /// A step's predictions, whose values are the frame's buffers, the
     /// tables whose part of the step failed, the seconds the step took the

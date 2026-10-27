@@ -15,8 +15,11 @@ Families converted at load are hashed as upstream bytes before converting, and
 the converted directory records a derived manifest: the upstream content digest
 it came from and the SHA-256 of each file it wrote. Using a converted directory
 verifies that manifest, so a stale or tampered cache never loads silently. Only
-trusted local use reads a directory without hashes, for models whose catalog
-entry records none, or converted directories written before manifests existed.
+trusted local use reads a directory without catalog hashes, for models whose
+entry pins a revision alone, or converted directories written before manifests
+existed. Even those are held to digests (`verify_revision`): each file's
+upstream digest where the Hugging Face cache records one, and on every use the
+digests the files had the first time this machine used that revision.
 """
 
 import contextlib
@@ -207,7 +210,101 @@ def checkpoint(
         () if strict else entry.artifact.license_files,
         remembered=not strict,
     )
+    if not entry.artifact.files:
+        verify_revision(entry, directory)
     return directory
+
+
+def _git_blob(path: Path) -> str:
+    """A file's git blob id: SHA-1 over `blob <size>`, a NUL byte and its bytes."""
+    digest = hashlib.sha1(f"blob {path.stat().st_size}\0".encode())
+    with path.open("rb") as stream:
+        while chunk := stream.read(1 << 20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _upstream_digest(path: Path) -> tuple[str, str] | None:
+    """The digest the hub published for a cached file: `(algorithm, hex)`, or None.
+
+    The Hugging Face cache links each snapshot file to a blob named by the
+    hub's ETag for it at the pinned revision: an LFS file's SHA-256, or a
+    plain file's git blob id (SHA-1). A file outside that layout has none.
+    """
+    if not path.is_symlink():
+        return None
+    name = Path(os.readlink(path)).name
+    if len(name) == 64 and all(c in "0123456789abcdef" for c in name):
+        return "sha256", name
+    if len(name) == 40 and all(c in "0123456789abcdef" for c in name):
+        return "git-blob", name
+    return None
+
+
+def _revisions() -> Path:
+    root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return root / "generalforecast" / "revisions"
+
+
+def verify_revision(entry: ModelEntry, directory: Path) -> None:
+    """Holds a checkpoint pinned by revision alone to the digests its files have.
+
+    The catalog records no file hashes for such a model (its repository is
+    not publicly readable when the catalog is built), so two checks stand
+    in for them:
+
+    - Upstream digests: a file the Hugging Face cache links to a blob named
+      by the hub's digest must hash to it, so bytes that changed after the
+      download are refused.
+    - Trust on first use: the first time this machine uses the revision, the
+      SHA-256 of each file is recorded under
+      `$XDG_CACHE_HOME/generalforecast/revisions`; every later use must
+      find the same bytes, wherever they come from (`GF_CHECKPOINTS` or the
+      cache). The record trusts that first download; it does not prove what
+      upstream published.
+
+    Raises:
+        ArtifactError: `ArtifactMismatch` naming the first file whose bytes
+            differ from either digest.
+    """
+    names = sorted(name for name in _DEFAULT_FILES if (directory / name).is_file())
+    digests: dict[str, str] = {}
+    for name in names:
+        path = directory / name
+        digests[name] = remembered_sha256(path)
+        upstream = _upstream_digest(path)
+        if upstream is None:
+            continue
+        algorithm, expected = upstream
+        actual = digests[name] if algorithm == "sha256" else _git_blob(path)
+        if actual != expected:
+            raise ArtifactError(
+                "ArtifactMismatch",
+                f"checkpoint file {name!r} differs from the digest upstream published",
+            )
+    record = _revisions() / f"{entry.name}@{entry.artifact.revision}.json"
+    try:
+        seen = json.loads(record.read_text())
+    except (OSError, ValueError):
+        seen = None
+    if isinstance(seen, dict):
+        for name, digest in digests.items():
+            if seen.get(name, digest) != digest:
+                raise ArtifactError(
+                    "ArtifactMismatch",
+                    f"checkpoint file {name!r} differs from the one first used at "
+                    f"revision {entry.artifact.revision[:12]}",
+                )
+        if set(digests) <= set(seen):
+            return
+        digests = {**seen, **digests}
+    try:
+        record.parent.mkdir(parents=True, exist_ok=True)
+        part = record.with_suffix(f".{os.getpid()}.part")
+        part.write_text(json.dumps(digests, indent=2, sort_keys=True) + "\n")
+        part.replace(record)
+    except OSError:
+        pass
 
 
 def cached(entry: ModelEntry) -> bool:

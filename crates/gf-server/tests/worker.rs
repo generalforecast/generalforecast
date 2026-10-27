@@ -268,7 +268,7 @@ async fn a_worker_that_cannot_take_its_pools_is_killed_before_the_next_start() {
     use gf_server::config::WorkerConfig;
     use gf_server::worker::{Launch, WorkerConnection};
 
-    let noted = common::fresh_directory().with_extension("pids");
+    let noted = common::scratch("worker").join("pids");
     let _ = std::fs::remove_file(&noted);
     let (ours, theirs) = UnixStream::pair().unwrap();
     // A worker that answers until it is told to stop, which starts the restarts.
@@ -288,7 +288,7 @@ async fn a_worker_that_cannot_take_its_pools_is_killed_before_the_next_start() {
             }
         }
     });
-    let mut connection = WorkerConnection::fake(ours, vec!["tiny".to_string()]).unwrap();
+    let mut connection = WorkerConnection::fake(ours, vec!["tiny".to_string()]);
     let exe = std::env::current_exe().unwrap();
     connection.launch = Launch {
         config: WorkerConfig {
@@ -319,6 +319,13 @@ async fn a_worker_that_cannot_take_its_pools_is_killed_before_the_next_start() {
     })
     .await;
     let text = noted_lines();
+    // Stopped as a server stops it, the shard's last worker goes, and its directory.
+    let (reply, stopped) = tokio::sync::oneshot::channel();
+    shard
+        .send(gf_server::shard::Command::Shutdown { reply })
+        .await
+        .unwrap();
+    let _ = stopped.await;
     drop(shard);
     for pid in pids(&text) {
         // SAFETY: kill(2) takes a process id and a signal, and touches no memory.
@@ -377,9 +384,9 @@ async fn a_stopped_worker_leaves_no_directory_behind() {
     use gf_server::config::WorkerConfig;
     use gf_server::worker::{Launch, WorkerConnection};
 
-    let noted = common::fresh_directory().with_extension("pids");
+    let noted = common::scratch("worker").join("pids");
     let (ours, _theirs) = UnixStream::pair().unwrap();
-    let template = WorkerConnection::fake(ours, vec!["tiny".to_string()]).unwrap();
+    let template = WorkerConnection::fake(ours, vec!["tiny".to_string()]);
     let exe = std::env::current_exe().unwrap();
     let launch = Launch {
         config: WorkerConfig {

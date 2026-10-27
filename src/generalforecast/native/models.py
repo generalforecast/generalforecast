@@ -28,9 +28,11 @@ def _base(ref: str) -> str:
 
 
 def _entry(ref: str) -> ModelEntry:
+    parsed = _catalog.reference(ref)
     try:
-        return _catalog.reference(ref).entry
+        return parsed.entry
     except ModelRefError as error:
+        # A custom model has no catalog entry, nor files the cache holds.
         raise InvalidInput(str(error), param="model") from None
 
 

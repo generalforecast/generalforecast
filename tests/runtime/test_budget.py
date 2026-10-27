@@ -452,3 +452,18 @@ def test_a_program_compiled_unnoted_before_its_first_call_still_counts_its_flops
 
     _run(chunks, summed, items, 8 * items[0].nbytes)
     assert counted[0] > 0
+
+
+def test_a_kinds_first_call_at_a_count_is_seen_though_compiled_before() -> None:
+    doubled = jax.jit(lambda rows: rows * 2)
+    items = np.ones((2, 4), np.float32)
+    _run(Chunks(lambda *_: None), doubled, items, 8 * items[0].nbytes)
+    seen: list[int] = []
+
+    # A later process's worker, its program compiled at start: its first
+    # call is seen once, so the manifest keeps the kind by its last use.
+    chunks = Chunks(lambda *_: None, seen=lambda call: seen.append(call.padded))
+    _run(chunks, doubled, items, 8 * items[0].nbytes)
+    _run(chunks, doubled, items, 8 * items[0].nbytes)
+
+    assert seen == [2]

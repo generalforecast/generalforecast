@@ -29,6 +29,7 @@ impl Shard {
         }
         // The worker forgets every table, so answers still due mean nothing.
         self.controls.clear();
+        self.fail_adding(reason);
         // The worker starts again with only the shard's own tables, so the
         // scratch and ephemeral tables go, and requests waiting on them fail.
         let ephemeral = self.ephemeral.drain();

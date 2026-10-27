@@ -81,6 +81,11 @@ def stop(
     return code
 
 
+def kill(process: subprocess.Popen) -> None:
+    """Kills the process's whole group at once."""
+    _kill_group(process)
+
+
 def _kill_group(process: subprocess.Popen) -> None:
     try:
         os.killpg(process.pid, signal.SIGKILL)

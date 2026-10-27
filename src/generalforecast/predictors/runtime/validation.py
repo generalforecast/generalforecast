@@ -7,9 +7,11 @@ from typing import Any
 
 import pyarrow as pa
 
+from generalforecast.contracts import MAX_QUERIES
 from generalforecast.predictors.models import CatalogResolver
 from generalforecast.predictors.runtime.compile import validate_queries
 from generalforecast.predictors.runtime.compiled import CompiledPlan
+from generalforecast.predictors.runtime.context import conform
 from generalforecast.predictors.runtime.schema import (
     TableSchema,
     infer_schema,
@@ -18,7 +20,7 @@ from generalforecast.predictors.runtime.schema import (
 from generalforecast.predictors.validation import ensure
 from generalforecast.tabular import arrow_bytes, physical_type, table_digest, to_arrow
 
-MAX_QUERY_ROWS = 10_000
+MAX_QUERY_ROWS = MAX_QUERIES
 
 
 def isolated(data: pa.Table, *, max_rows: int = 1_000_000) -> pa.Table:
@@ -134,10 +136,16 @@ def query_table(lock: CompiledPlan, schema: TableSchema, queries: pa.Table) -> p
         required <= set(table.column_names) <= expected.keys(),
         "forecast query columns differ from locked roles",
     )
-    for field, values in zip(table.schema, table.columns, strict=True):
+    for index, (field, values) in enumerate(
+        zip(table.schema, table.columns, strict=True)
+    ):
+        column = expected[field.name]
+        values = conform(values, column.type)
         ensure(
-            physical_type(field.type) == expected[field.name].type,
-            "query physical type differs from lock",
+            values is not None,
+            f"query column {field.name!r} is {physical_type(field.type)}; "
+            f"the lock reads {column.type}",
         )
+        table = table.set_column(index, field.name, values)
         ensure(not values.null_count, "forecast queries cannot contain missing values")
     return table

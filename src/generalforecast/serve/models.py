@@ -157,36 +157,49 @@ def read_lock(path: Path) -> dict[str, Any]:
 def _predictor(path: Path, directory: Path, *, allow_downloads: bool) -> dict[str, Any]:
     """A locked predictor's entry, with a snapshot's context rows written out.
 
-    Beside its `gf.yaml`, the lock must be the one `gf check` writes for it
-    now; the snapshot's context rows must be the ones it locked. The entry
-    is the one hosted serving publishes for the same lock and rows.
+    A directory needs its `gf.yaml`, and its lock must be exactly the one
+    `gf check` writes for it now (`resolution.verified`, as `gf push` and
+    `gf.Predictor` require). A lone `gf.lock` file has no manifest to hold
+    it to; it serves a request-context predictor, admitted as hosted
+    serving admits a pushed lock. The entry is the one hosted serving
+    publishes for the same lock and rows.
     """
-    from generalforecast.predictors.lock import manifest_digest
+    from generalforecast.predictors.resolution import verified
     from generalforecast.predictors.runtime.context import served_context
     from generalforecast.predictors.spec import load
     from generalforecast.predictors.tables import read_frame
 
-    if path.is_dir():
-        root, lock_path = path, path / "gf.lock"
+    if path.is_file() and path.name != "gf.yaml":
+        root, lock_path = path.parent, path
+    else:
+        root = path if path.is_dir() else path.parent
+        lock_path = root / "gf.lock"
         ensure(
             lock_path.is_file(),
             "gf.lock is required; run gf check first",
             "LockRequired",
         )
-    else:
-        root, lock_path = path.parent, path
-    lock = read_lock(lock_path)
-    predictor = lock["predictor"]
-    if (root / "gf.yaml").is_file():
-        try:
-            spec = load(root)
-        except Error as error:
-            raise PredictorError("InvalidPredictor", error.message) from None
         ensure(
-            lock["manifest"] == manifest_digest(spec),
-            "gf.lock was written for another gf.yaml; run gf check",
+            (root / "gf.yaml").is_file(),
+            f"no gf.yaml beside {lock_path}; serve the gf.lock file itself to "
+            "serve a lone request-context lock",
             "LockRequired",
         )
+    lock = read_lock(lock_path)
+    predictor = lock["predictor"]
+    from generalforecast.predictors.models import qualification
+
+    runs = qualification(predictor["model"])
+    if not runs.serve:
+        raise runs.refusal("serve")
+    if (root / "gf.yaml").is_file():
+        try:
+            verified(load(root), root)
+        except Error as error:
+            code = "LockRequired" if error.param == "lock" else "InvalidPredictor"
+            if error.reason == "snapshot_changed":
+                code = "SnapshotMismatch"
+            raise PredictorError(code, error.message) from None
     ref = canonical(predictor["model"])
     _verified(ref, allow_downloads=allow_downloads)
     rows = None
@@ -245,6 +258,7 @@ def published_entry(plan: Any, *, snapshot: Path | None = None) -> dict[str, Any
     step when the lock declares it, and `calendar` a calendar frequency's
     alias (`MS`, `2QE`, `W-MON`), whose UTC periods gf-server counts;
     `related` the lock's declared groups, every series on its own when None.
+    `types` maps each column whose kind the lock records to that kind.
     """
     from generalforecast.predictors import frequency as _frequency
 
@@ -280,6 +294,19 @@ def published_entry(plan: Any, *, snapshot: Path | None = None) -> dict[str, Any
         inputs = list(spec.forecast_inputs)
     selection = spec.selection
     lock_digest = plan.lock_digest or plan.plan_digest
+    # The kinds the lock declares, by column, as `context.typed` reads a
+    # request context with them; gf-server types a context the lock holds
+    # no schema for by the same map.
+    types = {**dict(spec.inputs.types), **dict(spec.role_types)}
+    if spec.target_type is not None:
+        types[spec.target] = spec.target_type
+    if (
+        task == "forecast"
+        and spec.time is not None
+        and spec.time not in types
+        and isinstance(spec.frequency, str)
+    ):
+        types[spec.time] = "timestamp"
     return {
         "name": spec.name,
         "reference": str(ref),
@@ -314,5 +341,6 @@ def published_entry(plan: Any, *, snapshot: Path | None = None) -> dict[str, Any
             if selection is None or task == "forecast"
             else selection.strategy_spec(),
             "max_rows": spec.context.max_rows,
+            "types": types,
         },
     }

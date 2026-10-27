@@ -8,6 +8,13 @@
 public for any other caller. They send no cookies, follow no redirects, read
 no proxy settings from the environment and require HTTPS except on loopback,
 so a credential reaches only the origin it was given for.
+
+Public, and stable across releases, as `__all__` lists: the transports;
+`Profile` and `ConnectionSettings`, the one connection resolution the SDK
+and the CLI share; `endpoint`, `split_url` and `credential`, the checks
+every URL and key passes; and `PLATFORM_PROBE`, `hosted_only` and
+`HostedOnlyError`, how a standalone `gf serve` is told from the hosted
+platform.
 """
 
 import asyncio
@@ -19,7 +26,7 @@ import re
 import ssl
 import time
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Generator, Mapping
 from dataclasses import dataclass, field
 from http.client import HTTPException
 from pathlib import Path
@@ -37,10 +44,7 @@ from urllib.request import (
 import httpx
 
 from generalforecast._files import private_lock, read_private, write_private
-from generalforecast.errors import (
-    printable,  # noqa: F401  (re-exported)
-    wire_fields,
-)
+from generalforecast.errors import wire_fields
 from generalforecast.service.boundary import MAX_BYTES, json_object
 from generalforecast.service.contracts import (
     ServiceError,
@@ -49,7 +53,26 @@ from generalforecast.service.contracts import (
     require,
 )
 
+__all__ = [
+    "DEFAULT_ENVIRONMENT",
+    "DEFAULT_KEY_ENV",
+    "DEFAULT_SERVER",
+    "PLATFORM_PROBE",
+    "AsyncTransport",
+    "ConnectionSettings",
+    "HostedOnlyError",
+    "Profile",
+    "Transport",
+    "credential",
+    "endpoint",
+    "hosted_only",
+    "profiles_in_use",
+    "split_url",
+]
+
 DEFAULT_KEY_ENV = "GF_API_KEY"
+# The hosted service, the endpoint every surface uses unless told otherwise.
+DEFAULT_SERVER = "https://app.generalforecast.com"
 # The environment a service scores when a request names none.
 DEFAULT_ENVIRONMENT = "production"
 # The bounds of one request's timeout, in seconds.
@@ -78,7 +101,7 @@ def _invalid_profile() -> ServiceError:
 class Profile:
     """Non-secret defaults; credentials are referenced by environment variable."""
 
-    url: str = "http://127.0.0.1:8000"
+    url: str = DEFAULT_SERVER
     project: str = "local"
     environment: str = DEFAULT_ENVIRONMENT
     key_env: str | None = DEFAULT_KEY_ENV
@@ -228,18 +251,59 @@ def credential_from_env(
     return "", key_env
 
 
+def profiles_in_use(
+    config_path: str | Path | None = None, *, environ: Mapping[str, str] | None = None
+) -> bool:
+    """Whether connections resolve through a profile rather than `gf login`.
+
+    A profile is in use when GF_PROFILE or GF_TOKEN names one, or a saved
+    `default` profile exists; otherwise the login store, keyed by server,
+    supplies the credential.
+    """
+    env = os.environ if environ is None else environ
+    if env.get("GF_PROFILE") or env.get("GF_TOKEN"):
+        return True
+    return "default" in Profile.load_all(config_path, environ=env, missing_ok=True)
+
+
+def _origin_of(url: str) -> str:
+    parsed = urlsplit(url)
+    return f"{parsed.scheme}://{(parsed.hostname or '').lower()}:{parsed.port or ''}"
+
+
+def _not_logged_in() -> ServiceError:
+    return ServiceError(
+        "NotLoggedIn",
+        "not logged in",
+        401,
+        hint="run `gf login`",
+    )
+
+
 @dataclass(frozen=True)
 class ConnectionSettings:
     """One resolved endpoint, project, profile and optional GF credential.
 
     A profile whose key_env is None, or an explicit base_url, is keyless: no
     Authorization header is sent unless a key is passed for that endpoint.
+
+    Attributes:
+        profile_name: The saved profile used, if any.
+        profile: The endpoint, project and environment.
+        credential_env: The variable the key was read from, if one was.
+        token: The key.
+        source: Where the key came from, for diagnostics: a variable's
+            name, the login store's location, `argument` or None.
+        project_from_key: The project was not configured; a client asks
+            the service which project the key is scoped to.
     """
 
     profile_name: str | None
     profile: Profile
     credential_env: str | None
     token: str | None = field(repr=False)
+    source: str | None = None
+    project_from_key: bool = False
 
     @classmethod
     def resolve(
@@ -256,11 +320,21 @@ class ConnectionSettings:
         environ: Mapping[str, str] | None = None,
         base_url: str | None = None,
     ) -> "ConnectionSettings":
-        """Explicit arguments, then GF_* overrides, then the profile, then defaults.
+        """The one connection resolution the SDK and the CLI share.
 
-        base_url names one endpoint, such as a local `gf serve`, and ignores
-        profiles and ambient GF_* settings so hosted keys never reach it. Only
-        api_key/token, or the variable named by key_env, authenticates it.
+        In order: explicit arguments; a profile (named, GF_PROFILE, GF_TOKEN
+        or a saved `default`) with GF_URL, GF_PROJECT and GF_ENV over it;
+        otherwise GF_URL (or the hosted service) with GF_API_KEY or the
+        `gf login` key stored for that server.
+
+        A key read implicitly from GF_API_KEY or GF_TOKEN belongs to GF_URL
+        (or the hosted service): it is never sent to another origin, such as
+        a local `gf serve` named by `url`. base_url names one endpoint and
+        ignores profiles and ambient GF_* settings; only api_key/token, or
+        the variable named by key_env, authenticates it.
+
+        Raises:
+            ServiceError: `NotLoggedIn` when no key is configured.
         """
         env = os.environ if environ is None else environ
         require(token is None or api_key is None, "use either token or api_key")
@@ -278,11 +352,28 @@ class ConnectionSettings:
             )
             if explicit is None:
                 return cls(None, local, None, None)
-            return cls(None, local, variable, credential(explicit, "API key"))
+            return cls(
+                None,
+                local,
+                variable,
+                credential(explicit, "API key"),
+                variable or "argument",
+            )
+        profiled = (
+            profile is not None
+            or url is not None
+            or key_env is not None
+            or new_profile
+            or config_path is not None
+            or profiles_in_use(environ=env)
+        )
+        if not profiled:
+            return cls._logged_in(project, explicit, env)
         if isinstance(profile, Profile):
-            selected, base = None, profile
+            selected, base, saved = None, profile, True
         else:
             selected = env.get("GF_PROFILE", "default") if profile is None else profile
+            saved = selected in Profile.load_all(config_path, environ=env)
             base = Profile.load(
                 selected, config_path, environ=env, missing_ok=new_profile
             )
@@ -293,22 +384,66 @@ class ConnectionSettings:
             base.key_env if key_env is None else key_env,
         )
         if explicit is not None:
-            value, variable = explicit, None
-        elif resolved.key_env is None:
+            return cls(
+                selected, resolved, None, credential(explicit, "GF API key"), "argument"
+            )
+        if resolved.key_env is None:
             return cls(selected, resolved, None, None)
+        value, variable = credential_from_env(resolved.key_env, env)
+        ambient = (
+            not saved
+            and key_env is None
+            and variable
+            in (
+                DEFAULT_KEY_ENV,
+                "GF_TOKEN",
+            )
+        )
+        home = env.get("GF_URL") or DEFAULT_SERVER
+        if ambient and _origin_of(resolved.url) != _origin_of(home):
+            # An ambient key is for its own server, never this endpoint.
+            return cls(selected, resolved, None, None)
+        return cls(
+            selected, resolved, variable, credential(value, "GF API key"), variable
+        )
+
+    @classmethod
+    def _logged_in(
+        cls, project: str | None, explicit: str | None, env: Mapping[str, str]
+    ) -> "ConnectionSettings":
+        """GF_URL or the hosted service, with GF_API_KEY or the stored `gf login` key."""
+        from generalforecast.credentials import CredentialStore
+
+        server = endpoint(env.get("GF_URL") or DEFAULT_SERVER)
+        store = CredentialStore(dict(env))
+        if explicit is not None:
+            key, variable, source, login = explicit, None, "argument", None
         else:
-            value, variable = credential_from_env(resolved.key_env, env)
-        return cls(selected, resolved, variable, credential(value, "GF API key"))
-
-
-def connection(
-    url, project, token, api_key, profile, config_path, base_url=None
-) -> tuple[Profile, str | None]:
-    """Resolves explicit arguments above environment and non-secret profile."""
-    settings = ConnectionSettings.resolve(
-        url, project, token, api_key, profile, config_path, base_url=base_url
-    )
-    return settings.profile, settings.token
+            found = store.resolve(server)
+            if found is None:
+                raise _not_logged_in()
+            key, source, login = found.key, found.source, found.login
+            variable = source if source == DEFAULT_KEY_ENV else None
+        chosen = (
+            project
+            if project is not None
+            else env.get("GF_PROJECT") or (login.project if login else None)
+        )
+        profile = Profile(
+            server,
+            # A placeholder until a client asks the service for the key's project.
+            "local" if chosen is None else chosen,
+            env.get("GF_ENV") or DEFAULT_ENVIRONMENT,
+            key_env=None,
+        )
+        return cls(
+            None,
+            profile,
+            variable,
+            credential(key, "GF API key"),
+            source,
+            project_from_key=chosen is None,
+        )
 
 
 PLATFORM_PROBE = "/v1/auth/status"
@@ -554,6 +689,36 @@ def _download_failure(status: int, raw: bytes) -> ServiceError:
     )
 
 
+# Every exchange, at DEBUG: method, URL, status or failure, and request id.
+# The SDK leaves it silent; `gf -v` shows it.
+REQUESTS = logging.getLogger("generalforecast.requests")
+
+
+def _logged(method: str, url: str, outcome: object, headers: Mapping[str, str]) -> None:
+    REQUESTS.debug(
+        "%s %s %s %s", method, url, outcome, headers.get("X-GF-Request-ID") or "-"
+    )
+
+
+@dataclass(frozen=True)
+class _Attempt:
+    """One HTTP exchange to make before `end`, reading at most `limit` bytes."""
+
+    method: str
+    path: str
+    data: bytes | None
+    headers: dict[str, str]
+    end: float
+    limit: int
+
+
+@dataclass(frozen=True)
+class _Wait:
+    """A pause between attempts."""
+
+    seconds: float
+
+
 class _Policy:
     """What both transports share: settings, headers, retries and platform detection.
 
@@ -648,26 +813,105 @@ class _Policy:
             and (error.code == "TransportError" or error.status == 503)
         )
 
-    def _probe_needed(self, method: str, path: str, error: ServiceError) -> bool:
-        return (
-            self.platform is None and hosted_only(method, path) and route_missing(error)
-        )
+    def _exchanging(
+        self,
+        method: str,
+        path: str,
+        body: Any,
+        headers: dict[str, str],
+        deadline: float | None,
+        limit: int,
+    ) -> Generator[_Attempt | _Wait, Any, tuple[int, bytes]]:
+        """One request's attempts under one deadline; an unguarded write is never retried."""
+        end = self._end(deadline)
+        _checked_path(path)
+        data = request_data(body)
+        for attempt in range(self.retries + 1):
+            if end - time.monotonic() <= 0:
+                raise _timeout()
+            pause = _Wait(
+                min(self.retry_delay * 2**attempt, max(0.0, end - time.monotonic()))
+            )
+            try:
+                status, raw = yield _Attempt(method, path, data, headers, end, limit)
+            except ServiceError as error:
+                _logged(method, self.url + path, error.code, self._headers | headers)
+                if not self._retry(method, body, attempt, error):
+                    raise
+                yield pause
+                continue
+            _logged(method, self.url + path, status, self._headers | headers)
+            if status == 503 and self._retry(
+                method, body, attempt, _failure(status, _error_object(raw))
+            ):
+                yield pause
+                continue
+            return status, raw
+        raise AssertionError("unreachable")
 
-    def _learn(self, probe: ServiceError | None) -> None:
-        self.platform = platform_from_probe(probe)
+    def _sending(
+        self,
+        method: str,
+        path: str,
+        body: Any,
+        headers: Mapping[str, str] | None,
+        deadline: float | None,
+    ) -> Generator[_Attempt | _Wait, Any, dict[str, Any]]:
+        """`send`, written once: the request, its reply, and the platform it reveals.
 
-    def _explain(self, method: str, path: str, error: ServiceError) -> None:
-        """Raises a missing hosted-only route on a model server as `HostedOnlyError`."""
-        if (
-            self.platform is False
-            and hosted_only(method, path)
-            and route_missing(error)
-        ):
-            raise HostedOnlyError(method, path) from None
-
-    def _answered(self, method: str, path: str) -> None:
+        The platform is learned once, from one probe of `PLATFORM_PROBE` after
+        the first missing hosted-only route. It only explains a missing route
+        as `HostedOnlyError`; it never stops a request from being sent.
+        """
+        try:
+            status, raw = yield from self._exchanging(
+                method, path, body, dict(headers or {}), deadline, MAX_BYTES
+            )
+            value = response_value(status, raw)
+        except _Oversized:
+            raise _too_large() from None
+        except ServiceError as error:
+            if (
+                self.platform is None
+                and hosted_only(method, path)
+                and route_missing(error)
+            ):
+                try:
+                    response_value(
+                        *(
+                            yield from self._exchanging(
+                                "GET", PLATFORM_PROBE, None, {}, deadline, MAX_BYTES
+                            )
+                        )
+                    )
+                    probe = None
+                except ServiceError as answer:
+                    probe = answer
+                self.platform = platform_from_probe(probe)
+            if (
+                self.platform is False
+                and hosted_only(method, path)
+                and route_missing(error)
+            ):
+                raise HostedOnlyError(method, path) from None
+            raise
         if hosted_only(method, path):
             self.platform = True
+        return value
+
+    def _downloading(
+        self, path: str, limit: int, deadline: float | None
+    ) -> Generator[_Attempt | _Wait, Any, bytes]:
+        """`download`, written once."""
+        try:
+            status, raw = yield from self._exchanging(
+                "GET", path, None, {"Accept": "*/*"}, deadline, limit
+            )
+        except _Oversized:
+            raise _download_too_large(limit) from None
+        if not 200 <= status < 300:
+            raise _download_failure(status, raw)
+        return raw
 
 
 class Transport(_Policy):
@@ -708,89 +952,42 @@ class Transport(_Policy):
             ServiceError: The reply's error; `HostedOnlyError` for a hosted
                 route a standalone model server does not serve.
         """
-        try:
-            status, raw = self._exchange(
-                method, path, body, dict(headers or {}), deadline, MAX_BYTES
-            )
-            value = response_value(status, raw)
-        except _Oversized:
-            raise _too_large() from None
-        except ServiceError as error:
-            if self._probe_needed(method, path, error):
-                try:
-                    response_value(
-                        *self._exchange(
-                            "GET", PLATFORM_PROBE, None, {}, deadline, MAX_BYTES
-                        )
-                    )
-                    probe = None
-                except ServiceError as answer:
-                    probe = answer
-                self._learn(probe)
-            self._explain(method, path, error)
-            raise
-        self._answered(method, path)
-        return value
+        return self._drive(self._sending(method, path, body, headers, deadline))
 
     def download(
         self, path: str, *, limit: int, deadline: float | None = None
     ) -> bytes:
         """GETs a resource's bytes; more than `limit` of them is `CapacityExceeded`."""
-        try:
-            status, raw = self._exchange(
-                "GET", path, None, {"Accept": "*/*"}, deadline, limit
-            )
-        except _Oversized:
-            raise _download_too_large(limit) from None
-        if not 200 <= status < 300:
-            raise _download_failure(status, raw)
-        return raw
+        return self._drive(self._downloading(path, limit, deadline))
 
     def close(self) -> None:
         """Prevents further requests; urllib closes each response after reading."""
         self.closed = True
 
-    def _exchange(
-        self,
-        method: str,
-        path: str,
-        body: Any,
-        headers: dict[str, str],
-        deadline: float | None,
-        limit: int,
-    ) -> tuple[int, bytes]:
-        """Uses a single deadline; never retries an unguarded mutation."""
-        end = self._end(deadline)
-        _checked_path(path)
-        data = request_data(body)
-        for attempt in range(self.retries + 1):
-            if end - time.monotonic() <= 0:
-                raise _timeout()
+    def _drive[T](self, steps: Generator[_Attempt | _Wait, Any, T]) -> T:
+        """Runs attempts and waits in this thread, throwing failures back in."""
+        result: Any = None
+        failure: BaseException | None = None
+        while True:
             try:
-                try:
-                    status, raw = self._send_once(
-                        method, path, data, headers, end, limit
+                step = steps.send(result) if failure is None else steps.throw(failure)
+            except StopIteration as stop:
+                return stop.value
+            result, failure = None, None
+            try:
+                if isinstance(step, _Wait):
+                    time.sleep(step.seconds)
+                else:
+                    result = self._send_once(
+                        step.method,
+                        step.path,
+                        step.data,
+                        step.headers,
+                        step.end,
+                        step.limit,
                     )
-                except ServiceError as error:
-                    _logged(
-                        method, self.url + path, error.code, self._headers | headers
-                    )
-                    raise
-                _logged(method, self.url + path, status, self._headers | headers)
-                if status == 503:
-                    error = _failure(status, _error_object(raw))
-                    if self._retry(method, body, attempt, error):
-                        self._pause(attempt, end)
-                        continue
-                return status, raw
-            except ServiceError as error:
-                if not self._retry(method, body, attempt, error):
-                    raise
-                self._pause(attempt, end)
-        raise AssertionError("unreachable")
-
-    def _pause(self, attempt: int, end: float) -> None:
-        time.sleep(min(self.retry_delay * 2**attempt, max(0, end - time.monotonic())))
+            except (ServiceError, _Oversized) as error:
+                failure = error
 
     def _send_once(self, method, path, data, headers, end, limit):
         request = Request(
@@ -855,17 +1052,6 @@ class Transport(_Policy):
         return status, bytes(raw)
 
 
-# Every exchange, at DEBUG: method, URL, status or failure, and request id.
-# The SDK leaves it silent; `gf -v` shows it.
-REQUESTS = logging.getLogger("generalforecast.requests")
-
-
-def _logged(method: str, url: str, outcome: object, headers: Mapping[str, str]) -> None:
-    REQUESTS.debug(
-        "%s %s %s %s", method, url, outcome, headers.get("X-GF-Request-ID") or "-"
-    )
-
-
 def _error_object(raw: bytes) -> Any:
     try:
         value = json.loads(raw)
@@ -912,92 +1098,40 @@ class AsyncTransport(_Policy):
         deadline: float | None = None,
     ) -> dict[str, Any]:
         """Sends one request and returns the reply's JSON object; see `Transport.send`."""
-        try:
-            status, raw = await self._exchange(
-                method, path, body, dict(headers or {}), deadline, MAX_BYTES
-            )
-            value = response_value(status, raw)
-        except _Oversized:
-            raise _too_large() from None
-        except ServiceError as error:
-            if self._probe_needed(method, path, error):
-                try:
-                    response_value(
-                        *await self._exchange(
-                            "GET", PLATFORM_PROBE, None, {}, deadline, MAX_BYTES
-                        )
-                    )
-                    probe = None
-                except ServiceError as answer:
-                    probe = answer
-                self._learn(probe)
-            self._explain(method, path, error)
-            raise
-        self._answered(method, path)
-        return value
+        return await self._drive(self._sending(method, path, body, headers, deadline))
 
     async def download(
         self, path: str, *, limit: int, deadline: float | None = None
     ) -> bytes:
         """GETs a resource's bytes; more than `limit` of them is `CapacityExceeded`."""
-        try:
-            status, raw = await self._exchange(
-                "GET", path, None, {"Accept": "*/*"}, deadline, limit
-            )
-        except _Oversized:
-            raise _download_too_large(limit) from None
-        if not 200 <= status < 300:
-            raise _download_failure(status, raw)
-        return raw
+        return await self._drive(self._downloading(path, limit, deadline))
 
-    async def _exchange(
-        self,
-        method: str,
-        path: str,
-        body: Any,
-        headers: dict[str, str],
-        deadline: float | None,
-        limit: int,
-    ) -> tuple[int, bytes]:
-        """Enforces an overall timeout including retry delays and streaming reads."""
-        end = self._end(deadline)
-        _checked_path(path)
-        data = request_data(body)
-        remaining = end - time.monotonic()
-        if remaining <= 0:
-            raise _timeout()
-        try:
-            async with asyncio.timeout(remaining):
-                for attempt in range(self.retries + 1):
-                    try:
-                        try:
-                            status, raw = await self._send_once(
-                                method, path, data, headers, limit
-                            )
-                        except ServiceError as error:
-                            _logged(
-                                method,
-                                self.url + path,
-                                error.code,
-                                self._headers | headers,
-                            )
-                            raise
-                        _logged(
-                            method, self.url + path, status, self._headers | headers
+    async def _drive[T](self, steps: Generator[_Attempt | _Wait, Any, T]) -> T:
+        """Awaits attempts and waits, each bounded by the request's deadline."""
+        result: Any = None
+        failure: BaseException | None = None
+        while True:
+            try:
+                step = steps.send(result) if failure is None else steps.throw(failure)
+            except StopIteration as stop:
+                return stop.value
+            result, failure = None, None
+            try:
+                if isinstance(step, _Wait):
+                    await asyncio.sleep(step.seconds)
+                    continue
+                remaining = step.end - time.monotonic()
+                if remaining <= 0:
+                    raise _timeout()
+                try:
+                    async with asyncio.timeout(remaining):
+                        result = await self._send_once(
+                            step.method, step.path, step.data, step.headers, step.limit
                         )
-                        if status == 503:
-                            error = _failure(status, _error_object(raw))
-                            if self._retry(method, body, attempt, error):
-                                await asyncio.sleep(self.retry_delay * 2**attempt)
-                                continue
-                        return status, raw
-                    except ServiceError as error:
-                        if not self._retry(method, body, attempt, error):
-                            raise
-                    await asyncio.sleep(self.retry_delay * 2**attempt)
-        except TimeoutError:
-            raise _timeout() from None
-        raise AssertionError("unreachable")
+                except TimeoutError:
+                    raise _timeout() from None
+            except (ServiceError, _Oversized) as error:
+                failure = error
 
     async def _send_once(self, method, path, data, headers, limit):
         if self.closed:

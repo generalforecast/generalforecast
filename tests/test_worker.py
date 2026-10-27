@@ -16,7 +16,7 @@ from generalforecast.constants import STACK_CHUNK
 from generalforecast.models.conformance import table as conformance_table
 from generalforecast.models.tabicl.model import tabicl_functions
 from generalforecast.worker import Worker, _stacked
-from tests.models.conformance.cases import FEATURES
+from tests.models.conformance.cases import CASES, FEATURES
 from tests.models.tabicl.tiny import tiny_tabicl
 
 
@@ -154,3 +154,206 @@ def test_dropping_every_program_forgets_the_counts_each_kind_compiled_for() -> N
 
     assert not any(worker._chunks._counts.values())
     assert list(worker.run(step([0]))) == [0]
+
+
+def test_a_drop_ends_the_page_embeds_a_table_has_not_compiled_yet() -> None:
+    import time
+
+    worker = Worker(slot_bytes=4096)
+    data, step = _fused(worker, 1)
+    worker.run(step([0]))
+    table = worker._tables[0]
+    features = np.asarray(data.features)[:16]
+    targets = np.asarray(data.targets)[:16]
+    compiled: list[str] = []
+
+    def compile_event(event: str, duration_secs: float, **details: Any) -> None:
+        if event == "/jax/core/compile/backend_compile_duration":
+            compiled.append(details.get("fun_name", ""))
+
+    # No quiet gap comes, so every queued compile waits.
+    worker.programs.quiet = 3600.0
+    jax.config.update("jax_enable_compilation_cache", False)
+    jax.monitoring.register_event_duration_secs_listener(compile_event)
+    try:
+        worker._compile_embeds(0, table.num_classes, (table.state, features, targets))
+        assert compiled == []
+        started = time.perf_counter()
+        worker.programs.drop()
+        assert time.perf_counter() - started < 5
+    finally:
+        jax.monitoring.unregister_event_duration_listener(compile_event)
+        jax.config.update("jax_enable_compilation_cache", True)
+    assert compiled == []
+
+
+def test_a_measure_threads_share_runs_once_and_holds_up_no_other() -> None:
+    import threading
+
+    from generalforecast.worker.records import Memo
+
+    memo: Memo[str, int] = Memo()
+    started, release = threading.Event(), threading.Event()
+    measured: list[str] = []
+
+    def slow() -> int:
+        measured.append("slow")
+        started.set()
+        assert release.wait(10)
+        return 1
+
+    threads = [threading.Thread(target=memo.get, args=("slow", slow)) for _ in range(2)]
+    threads[0].start()
+    assert started.wait(10)
+    threads[1].start()
+    # Another key measures while the first is still measuring.
+    assert memo.get("fast", lambda: 2) == 2
+    release.set()
+    for thread in threads:
+        thread.join()
+
+    assert measured == ["slow"]
+    assert memo["slow"] == 1
+
+
+def test_a_measure_that_raises_is_taken_again() -> None:
+    from generalforecast.worker.records import Memo
+
+    memo: Memo[str, int] = Memo()
+    attempts: list[int] = []
+
+    def flaky() -> int:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise ValueError("no memory analysis yet")
+        return 3
+
+    with pytest.raises(ValueError):
+        memo.get("key", flaky)
+    assert memo.get("key", flaky) == 3
+    assert len(attempts) == 2
+
+
+def test_a_start_compiles_the_most_recently_used_programs_and_the_rest_ahead(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from generalforecast.worker import ahead
+
+    # Two programs at start, so the test compiles few.
+    started = 2
+    monkeypatch.setattr(ahead, "STARTED_PROGRAMS", started)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    first = Worker(slot_bytes=4096, compile_ahead=False)
+    _, step = _fused(first, 1)
+    # As `worker_process` loads models: by spec, so their calls are recorded.
+    first._specs[0] = "tiny-tabicl"
+    first.run(step([0]))
+    manifest = first.programs.manifest("tiny-tabicl")
+    assert manifest is not None
+    # Each kind as if it took 8 items too: four programs each to start with.
+    for kind in list(manifest.read().kinds):
+        manifest.add(kind, 8)
+    recorded = manifest.read()
+    total = sum(recorded.programs(kind) for kind in recorded.kinds)
+    assert total > started
+
+    later = Worker(slot_bytes=4096)
+    later.add_model(0, tabicl_functions, tiny_tabicl(regression=False))
+    later._specs[0] = "tiny-tabicl"
+    later.allocate(256, 0, 0)
+    later.programs.quiet = 3600.0
+    reported: list[tuple[int, int]] = []
+
+    later.warm_start(lambda done, of: reported.append((done, of)))
+
+    assert later.programs.warmed == started
+    assert reported[-1] == (started, started)
+    # The rest wait to compile ahead while the worker serves.
+    assert len(later.programs._later) == total - started
+    later.programs.drop()
+
+
+def test_a_worker_loads_a_model_beside_its_steps_and_reports_it_by_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import queue
+    import threading
+
+    from generalforecast import worker_process
+    from generalforecast.models import registry
+
+    release = threading.Event()
+
+    def load(spec: str) -> tuple[Any, Any]:
+        if spec == "broken":
+            raise OSError("no weights")
+        assert release.wait(10)
+        return tabicl_functions, tiny_tabicl(regression=False)
+
+    monkeypatch.setattr(registry, "load_engine_model", load)
+    worker = Worker(slot_bytes=4096, compile_cache=False, compile_ahead=False)
+    worker.add_model(0, tabicl_functions, tiny_tabicl(regression=False))
+    worker.allocate(16, 0, 0)
+    names = {"served": 0}
+    sent: queue.Queue[dict[str, Any]] = queue.Queue()
+    loads = worker_process._Loads(worker, names, sent.put, lambda *_: None)
+
+    def answer(header: dict[str, Any]) -> dict[str, Any]:
+        replied, _ = worker_process._answer(
+            worker, names, lambda *_: None, header, [], loads=loads
+        )()
+        loads.start()
+        return replied
+
+    loading = answer({"kind": "add_model", "name": "slow", "spec": "tiny"})
+    assert loading == {"kind": "loading"}
+    # The served model's requests are answered while the other loads.
+    profiled = answer({"kind": "profile", "model": "served", "features": 5})
+    assert profiled["kind"] == "profile"
+    assert sent.empty() and "slow" not in names
+
+    release.set()
+    assert sent.get(timeout=10) == {"kind": "loaded", "name": "slow"}
+    assert names["slow"] == 1
+    assert answer({"kind": "add_model", "name": "broken", "spec": "broken"}) == {
+        "kind": "loading"
+    }
+    assert sent.get(timeout=10) == {
+        "kind": "loaded",
+        "name": "broken",
+        "failure": "OSError: no weights",
+    }
+    assert "broken" not in names
+
+
+def _kept_state(case: Any, fused: bool) -> Any:
+    """The state a worker keeps for a table of 300 rows, fit with its queries or alone."""
+    worker = Worker(slot_bytes=4096, compile_ahead=False, compile_cache=False)
+    worker.add_model(0, case.functions(), case.build(0))
+    worker.allocate(256, 0, 0)
+    data = conformance_table(case.regression, rows=300, queries=6, features=FEATURES)
+    worker.add_table(0, 0, data.num_classes, FEATURES)
+    features, targets = np.asarray(data.features), np.asarray(data.targets)
+    rows = np.arange(300, dtype=np.uint32)
+    if fused:
+        key = CacheKey(0, 0, 0, "context", 1)
+        unit = protocol.Unit(0, key, rows, "fuse", [], features, targets)
+        queries = np.asarray(data.queries)
+        batch = protocol.QueryBatch(0, 0, 0, queries, [0] * len(queries))
+        worker.run(protocol.Step([], [], [], [unit], [batch]))
+    else:
+        fit = protocol.Fit(0, 0, rows, features, targets, [])
+        worker.run(protocol.Step([], [fit], [], [], []))
+    return worker._tables[0].state
+
+
+@pytest.mark.parametrize("case", CASES, ids=[case.name for case in CASES])
+def test_a_context_fit_with_its_queries_keeps_the_state_a_fit_alone_would(
+    case: Any,
+) -> None:
+    fused, alone = _kept_state(case, True), _kept_state(case, False)
+
+    # To the bit, so a context reused after its first answer reads the state
+    # a fit of it alone would, whichever came first.
+    for kept, fit in zip(jax.tree.leaves(fused), jax.tree.leaves(alone), strict=True):
+        assert np.asarray(kept).tobytes() == np.asarray(fit).tobytes()

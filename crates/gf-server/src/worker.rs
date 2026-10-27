@@ -46,6 +46,14 @@ const EXIT: Duration = Duration::from_secs(5);
 /// A worker's reply to one frame, or why there is none.
 pub type Reply = Result<Frame, String>;
 
+/// A model the worker loaded beside its steps, or failed to, by its name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Loaded {
+    pub name: String,
+    /// Why the model could not load, if it could not.
+    pub failure: Option<String>,
+}
+
 /// Frames whose buffers total at least this many bytes travel through shared memory.
 const SHARED_BYTES: usize = 1 << 20;
 
@@ -187,6 +195,8 @@ pub struct Pipeline {
     /// Keys of programs compiled beside steps, not yet taken, and a wake
     /// for each report of them.
     compiled: Arc<(Mutex<Vec<String>>, Notify)>,
+    /// Models loaded beside steps, not yet taken, and a wake for each.
+    loaded: Arc<(Mutex<Vec<Loaded>>, Notify)>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
     /// Where shared frames go, made at the first one.
@@ -233,6 +243,8 @@ impl Pipeline {
         let progressing = Arc::clone(&progressed);
         let compiled: Arc<(Mutex<Vec<String>>, Notify)> = Arc::default();
         let compiling = Arc::clone(&compiled);
+        let loaded: Arc<(Mutex<Vec<Loaded>>, Notify)> = Arc::default();
+        let loading = Arc::clone(&loaded);
         let reader = tokio::spawn(async move {
             // The worker's last warm-up report, so each counts once.
             let mut reported = (0, 0);
@@ -260,6 +272,15 @@ impl Pipeline {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .extend(keys);
+                    wake.notify_one();
+                    continue;
+                }
+                if let Ok(WorkerReply::Loaded { name, failure }) = WorkerReply::of(&frame) {
+                    let (loads, wake) = &*loading;
+                    loads
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .push(Loaded { name, failure });
                     wake.notify_one();
                     continue;
                 }
@@ -302,6 +323,7 @@ impl Pipeline {
             stopper,
             progressed,
             compiled,
+            loaded,
             reader,
             writer,
             shared: None,
@@ -414,6 +436,16 @@ impl Pipeline {
     /// Waits for the worker to report programs compiled beside its steps.
     pub async fn compiled(&self) {
         self.compiled.1.notified().await;
+    }
+
+    /// Waits for the worker to report a model it loaded beside its steps.
+    pub async fn loaded(&self) {
+        self.loaded.1.notified().await;
+    }
+
+    /// The models the worker reported loaded, or failing to, since last asked.
+    pub fn take_loaded(&self) -> Vec<Loaded> {
+        std::mem::take(&mut *self.loaded.0.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
     /// The keys of programs the worker reported compiled since last asked.
@@ -762,13 +794,10 @@ impl WorkerConnection {
 
     /// A connection to a worker on the other end of `stream`, for tests that
     /// stand in for the worker process. Killing it closes the pipeline as an
-    /// exit would; starting it again fails, since there is no command.
-    ///
-    /// # Errors
-    ///
-    /// If a directory for the connection cannot be made.
-    pub fn fake(stream: UnixStream, models: Vec<String>) -> Result<Self, String> {
-        let directory = Private::new(&std::env::temp_dir()).map_err(|error| error.to_string())?;
+    /// exit would; starting it again fails, since there is no command. It
+    /// has no socket, so no directory of its own.
+    #[must_use]
+    pub fn fake(stream: UnixStream, models: Vec<String>) -> Self {
         let pipeline = Pipeline::new(stream, std::env::temp_dir(), Compiling::default());
         let stopper = pipeline.stopper.clone();
         let (stop, stopping) = oneshot::channel::<Stop>();
@@ -776,7 +805,7 @@ impl WorkerConnection {
             let _ = stopping.await;
             stopper.stop("the worker exited (killed)");
         });
-        Ok(Self {
+        Self {
             pipeline,
             launch: Launch {
                 index: 0,
@@ -799,13 +828,13 @@ impl WorkerConnection {
             },
             exited,
             stop: Some(stop),
-            directory: Some(directory),
+            directory: None,
             models,
             device_memory: 1 << 30,
             device_bytes: 1 << 29,
             host_bytes: 1 << 28,
             row_memory_bytes: 1 << 28,
-        })
+        }
     }
 
     /// Kills the worker, if it is still running, and waits for it to exit,

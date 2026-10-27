@@ -1,16 +1,22 @@
 name: Release
 
 # Builds wheels for macOS on Apple silicon and Linux on x86_64 and arm64, with
-# the versioned gf-native client. A v* tag that matches pyproject.toml's version
+# the gf launcher beside Python. A v* tag that matches pyproject.toml's version
 # publishes them to PyPI through Trusted Publishing and attaches them to the
 # tag's GitHub release. Wheels are built only once every CI check passes on
 # the tagged tree, and nothing is published, attached or uploaded until the
-# tests marked slow pass too. Actions are pinned by commit.
+# tests marked slow pass too. Actions are pinned by commit, and the build
+# tools and images by version.
 
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+
+# One release of a ref at a time, never cancelled: a second waits its turn.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # Every job of ci.yml, whatever the tag's commit changed.
@@ -30,7 +36,7 @@ jobs:
       contents: read
 
   version:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
@@ -52,17 +58,20 @@ jobs:
         include:
           - runner: macos-15
             target: aarch64-apple-darwin
+            image: ""
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
+            image: quay.io/pypa/manylinux_2_28_x86_64:2026.10.10-1@sha256:4131ddd7acb9c6c966af02fe7e71edc51e078c2d41f475966697676430bfa2ae
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
+            image: quay.io/pypa/manylinux_2_28_aarch64:2026.10.10-1@sha256:abd1230aa9e4058a74b89d27cd14ba18c0db036d7bfe6e6f219a29ea63c24eb6
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # The versioned client is the wheel's executable beside Python; the
-      # server and router `gf serve` runs ride inside the package, off PATH.
+      # The gf launcher is the wheel's executable beside Python; the server
+      # and router `gf serve` runs ride inside the package, off PATH.
       - if: runner.os == 'macOS'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - if: runner.os == 'macOS'
@@ -70,7 +79,9 @@ jobs:
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.target }}
+          maturin-version: "v1.15.0"
           manylinux: "2_28"
+          container: ${{ matrix.image }}
           args: --release --locked --out dist
           before-script-linux: scripts/stage_servers.sh
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
@@ -101,7 +112,7 @@ jobs:
   assets:
     needs: [wheels, slow]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
     steps:
@@ -121,7 +132,7 @@ jobs:
   pypi:
     needs: [wheels, slow]
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment:
       name: pypi
       url: https://pypi.org/project/generalforecast/

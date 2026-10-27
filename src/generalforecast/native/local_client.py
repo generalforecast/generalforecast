@@ -4,6 +4,7 @@
 """`LocalClient`: the table client on this process's engine."""
 
 import functools
+import threading
 import uuid
 from typing import Any, Literal, Self, override
 
@@ -13,6 +14,27 @@ from generalforecast.native.remote import RemoteClient, RemoteSeriesTable, Remot
 
 LocalTable = RemoteTable
 LocalSeriesTable = RemoteSeriesTable
+
+
+class _Holders:
+    """How many open clients share one namespace: a client and the gated twins made of it."""
+
+    def __init__(self) -> None:
+        """One holder, the client that made the namespace."""
+        self._count = 1
+        self._lock = threading.Lock()
+
+    def join(self) -> None:
+        """Counts one more holder."""
+        with self._lock:
+            self._count += 1
+
+    def leave(self) -> bool:
+        """Counts one holder fewer; whether it was the last."""
+        with self._lock:
+            self._count -= 1
+            return self._count == 0
+
 
 # gf-server's memory settings, by `LocalClient`'s argument, at their defaults.
 _TIERS: dict[str, Any] = {
@@ -85,16 +107,19 @@ class LocalClient(RemoteClient):
         location, token = self._engine.serve()
         super().__init__(location, token)
         self._namespace = f"local-{uuid.uuid4().hex[:16]}-"
+        self._holders = _Holders()
 
     def gated(self, allow_downloads: bool) -> "LocalClient":
         """This client under another download gate, seeing the same tables.
 
         It shares this client's connection, namespace and remembered tables,
         so a table one makes the other opens; only the models it loads may or
-        may not download their files. Closing either closes both.
+        may not download their files. The tables and the connection go once
+        every client sharing them has closed.
         """
         if allow_downloads == self._allow_downloads:
             return self
+        self._holders.join()
         other = object.__new__(LocalClient)
         other.__dict__.update(self.__dict__)
         other._allow_downloads = allow_downloads
@@ -111,7 +136,13 @@ class LocalClient(RemoteClient):
         return f"<LocalClient: {len(self.tables())} tables>"
 
     def close(self) -> None:
-        """Drops this client's tables, and stops an engine it started."""
+        """Drops this client's tables, and stops an engine it started.
+
+        A client sharing its tables with gated twins leaves them to the
+        twins until the last of them closes.
+        """
+        if not self._holders.leave():
+            return
         for name in self.tables():
             self.drop_table(name)
         super().close()

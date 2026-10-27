@@ -50,7 +50,7 @@ SCOPE = Scope("local", "r-conformance")
 TINY = {
     "general-forecast/tabicl-v2-classifier": "tests/tabicl-classifier",
     "general-forecast/tabicl-v2-regressor": "tests/tabicl-regressor",
-    "general-forecast/timestral-28m": "tests/timestral-forecaster",
+    "general-forecast/timestral-28m": "tests/timestral-catalog-forecaster",
     "general-forecast/chronos-2": "tests/chronos2-catalog-forecaster",
 }
 RELATIVE, ABSOLUTE = 1e-5, 1e-6
@@ -194,14 +194,19 @@ def _same(left: Any, right: Any, at: str = "") -> None:
         assert type(left) is type(right) and left == right, (at, left, right)
 
 
-def _predicted(server: Served, predictor: str, queries: pa.Table) -> list[dict]:
-    """The rows a served predictor answers for `queries` on its predict route."""
+def _predicted(
+    server: Served, predictor: str, queries: pa.Table, context: pa.Table | None = None
+) -> list[dict]:
+    """The rows a served predictor answers for `queries` (and a request context) on its predict route."""
+    payload: dict[str, Any] = {"queries": queries.to_pylist()}
+    if context is not None:
+        payload["context"] = context.to_pylist()
     body = {
         "api_version": "gf/v1",
         "project": "local",
         "request_id": f"r-{predictor}",
         "resource": {"kind": "predictor", "name": predictor},
-        "payload": {"queries": queries.to_pylist()},
+        "payload": payload,
     }
     status, envelope = server.post(
         f"/v1/projects/local/predictors/{predictor}/predict",

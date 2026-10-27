@@ -43,6 +43,10 @@ impl Shard {
         let step = match scheduled {
             Ok(Some(step)) => step,
             Ok(None) => return measured,
+            // A table whose planning fails has its own requests refused
+            // above; what is left is the cache refusing a rebuild no request
+            // asked for, which fails what waits rather than leave it waiting
+            // on a rebuild that keeps failing.
             Err(error) => {
                 self.fail_all(&ServerError::from(error));
                 return false;

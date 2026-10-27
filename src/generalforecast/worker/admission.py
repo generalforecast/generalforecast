@@ -54,27 +54,26 @@ class Admission:
 
     def profile(self: "Worker", model: int, features: int) -> MemoryProfile:
         """A loaded model's sizes for tables with `features` columns, as stored."""
-        if (model, features) not in self._profiles:
-            entry = self._tabular(model)
-            cache_dtype = None if self._settings is None else self._settings.cache_dtype
-            self._profiles[model, features] = self._measured(
+        entry = self._tabular(model)
+        cache_dtype = None if self._settings is None else self._settings.cache_dtype
+        return self._profiles.get(
+            (model, features),
+            lambda: self._measured(
                 model,
                 ("profile", features),
                 lambda: memory_profile(
                     entry.functions, entry.parameters, features, cache_dtype
                 ),
-            )
-        return self._profiles[model, features]
+            ),
+        )
 
     def series_profile(self: "Worker", model: int) -> SeriesBytes:
         """A loaded forecaster's cache bytes per row and patch, as stored."""
-        if model not in self._series_profiles:
-            entry = self._series(model)
-            cache_dtype = None if self._settings is None else self._settings.cache_dtype
-            self._series_profiles[model] = series_bytes(
-                entry.functions, entry.parameters, cache_dtype
-            )
-        return self._series_profiles[model]
+        entry = self._series(model)
+        cache_dtype = None if self._settings is None else self._settings.cache_dtype
+        return self._series_profiles.get(
+            model, lambda: series_bytes(entry.functions, entry.parameters, cache_dtype)
+        )
 
     def _fits_device_series(self: "Worker", model: int, rows: int, steps: int) -> None:
         """Refuses a group whose cache alone would not fit the device's memory.
@@ -123,20 +122,22 @@ class Admission:
 
     def _series_layout(self: "Worker", model: int, rows: int) -> CacheLayout:
         """How a forecaster's caches pack into slots, for groups of `rows` padded rows."""
-        if (model, rows) not in self._series_layouts:
-            entry = self._series(model)
-            cache_dtype = None if self._settings is None else self._settings.cache_dtype
-            self._series_layouts[model, rows] = series_layout(
+        entry = self._series(model)
+        cache_dtype = None if self._settings is None else self._settings.cache_dtype
+        return self._series_layouts.get(
+            (model, rows),
+            lambda: series_layout(
                 entry.functions, entry.parameters, rows, self._slot_bytes, cache_dtype
-            )
-        return self._series_layouts[model, rows]
+            ),
+        )
 
     def decode_profile(self: "Worker", model: int) -> WorkingProfile:
         """A loaded model's decode of its smallest query chunk, measured once."""
-        if model not in self._decodes:
-            entry = self._tabular(model)
-            cache_dtype = None if self._settings is None else self._settings.cache_dtype
-            self._decodes[model] = self._measured(
+        entry = self._tabular(model)
+        cache_dtype = None if self._settings is None else self._settings.cache_dtype
+        return self._decodes.get(
+            model,
+            lambda: self._measured(
                 model,
                 ("decode", self._size(1)),
                 lambda: decode_profile(
@@ -146,8 +147,8 @@ class Admission:
                     self._size(1),
                     cache_dtype,
                 ),
-            )
-        return self._decodes[model]
+            ),
+        )
 
     def encode_profile(
         self: "Worker", model: int, features: int, fit: bool = False
@@ -158,28 +159,27 @@ class Admission:
         XLA cannot measure it.
         """
         widths = encode_widths(features)
-        if (model, fit, widths) not in self._encodes:
-            entry = self._tabular(model)
-            cache_dtype = None if self._settings is None else self._settings.cache_dtype
+        entry = self._tabular(model)
+        cache_dtype = None if self._settings is None else self._settings.cache_dtype
 
-            def measure() -> EncodeProfile | None:
-                try:
-                    return encode_profile(
-                        entry.functions, entry.parameters, fit, cache_dtype, widths
-                    )
-                except Exception as error:  # noqa: BLE001
-                    logger.warning(
-                        "could not measure the model's encode at widths %s (%s); "
-                        "each context's is measured at its own size",
-                        widths,
-                        error,
-                    )
-                    return None
+        def measure() -> EncodeProfile | None:
+            try:
+                return encode_profile(
+                    entry.functions, entry.parameters, fit, cache_dtype, widths
+                )
+            except Exception as error:  # noqa: BLE001
+                logger.warning(
+                    "could not measure the model's encode at widths %s (%s); "
+                    "each context's is measured at its own size",
+                    widths,
+                    error,
+                )
+                return None
 
-            self._encodes[model, fit, widths] = self._measured(
-                model, ("encode_profile", fit, widths), measure
-            )
-        return self._encodes[model, fit, widths]
+        return self._encodes.get(
+            (model, fit, widths),
+            lambda: self._measured(model, ("encode_profile", fit, widths), measure),
+        )
 
     def encode_bytes(
         self: "Worker", model: int, features: int, rows: int, fit: bool = False
@@ -197,15 +197,15 @@ class Admission:
             profile = self.encode_profile(model, features, fit)
             if profile is not None:
                 return profile.working_bytes(per_row, rows)
-        key = (model, fit, features, rows)
-        if key not in self._encode_bytes:
+        entry = self._tabular(model)
+
+        def measure() -> int | None:
             self._remember(model, ("encode", features, rows, fit))
-            entry = self._tabular(model)
             try:
                 cache_dtype = (
                     None if self._settings is None else self._settings.cache_dtype
                 )
-                measured = self._measured(
+                return self._measured(
                     model,
                     ("encode", features, rows, fit),
                     lambda: encode_bytes(
@@ -223,24 +223,25 @@ class Admission:
                     "refused only by their decode",
                     error,
                 )
-                measured = None
+                return None
             except Exception as error:
                 raise ValueError(
                     f"could not compile the encode of a context of {rows} rows to "
                     f"measure it ({error}); use a strategy that reads fewer rows, "
                     "such as neighbors, or a device with more memory"
                 ) from error
-            self._encode_bytes[key] = measured
-        return self._encode_bytes[key]
+
+        return self._encode_bytes.get((model, fit, features, rows), measure)
 
     def fit_profile(self: "Worker", model: int, features: int) -> FitProfile:
         """What a loaded model's fit takes for tables with `features` columns, measured once."""
-        if (model, features) not in self._fit_profiles:
-            entry = self._tabular(model)
-            self._fit_profiles[model, features] = fit_profile(
+        entry = self._tabular(model)
+        return self._fit_profiles.get(
+            (model, features),
+            lambda: fit_profile(
                 entry.functions, entry.parameters, features, self._fit_cache
-            )
-        return self._fit_profiles[model, features]
+            ),
+        )
 
     def fit_rows(self: "Worker", model: int, features: int) -> tuple[int, int]:
         """The most rows a fit takes within the call budget, for tables with `features` columns.
@@ -305,8 +306,6 @@ class Admission:
             ValueError: If the model refuses such a table, so it is refused
                 when created rather than at its first fit.
         """
-        if (model, num_classes, features) in self._checked:
-            return
         size = self._size(1)
 
         def check() -> bool:
@@ -323,8 +322,12 @@ class Admission:
 
         # Tracing the model takes most of a second, so a table it accepted is
         # remembered for later processes; one it refuses is traced again.
-        self._measured(model, ("check", num_classes, features, size), check)
-        self._checked.add((model, num_classes, features))
+        self._checked.get(
+            (model, num_classes, features),
+            lambda: self._measured(
+                model, ("check", num_classes, features, size), check
+            ),
+        )
 
     def layout(self: "Worker", model: int, features: int) -> CacheLayout:
         """How a loaded model's contexts pack into slots, for tables with `features` columns.
@@ -332,10 +335,11 @@ class Admission:
         Raises:
             ValueError: If a slot cannot hold one of the model's context rows.
         """
-        if (model, features) not in self._layouts:
-            entry = self._tabular(model)
-            cache_dtype = None if self._settings is None else self._settings.cache_dtype
-            self._layouts[model, features] = self._measured(
+        entry = self._tabular(model)
+        cache_dtype = None if self._settings is None else self._settings.cache_dtype
+        return self._layouts.get(
+            (model, features),
+            lambda: self._measured(
                 model,
                 ("layout", features),
                 lambda: cache_layout(
@@ -345,8 +349,8 @@ class Admission:
                     self._slot_bytes,
                     cache_dtype,
                 ),
-            )
-        return self._layouts[model, features]
+            ),
+        )
 
     def _fits_device(self: "Worker", unit: Unit) -> None:
         """Refuses a unit whose encode, or whose context and decode, would not fit the device.

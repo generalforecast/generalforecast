@@ -46,12 +46,21 @@ mod tests {
     use super::*;
     use crate::config::Config;
 
+    /// A directory removed when the test ends, whether it passes or not.
+    struct Scratch(std::path::PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn the_starter_configuration_loads() {
         let directory =
-            std::env::temp_dir().join(format!("gf-router-setup-{}", std::process::id()));
-        std::fs::create_dir_all(&directory).unwrap();
-        let path = directory.join("router.toml");
+            Scratch(std::env::temp_dir().join(format!("gf-router-setup-{}", std::process::id())));
+        std::fs::create_dir_all(&directory.0).unwrap();
+        let path = directory.0.join("router.toml");
         let nodes = [
             "http://127.0.0.1:8816".to_string(),
             "http://127.0.0.1:8817".to_string(),

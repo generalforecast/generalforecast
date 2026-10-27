@@ -180,3 +180,53 @@ def test_a_long_flag_timeout_is_bounded_like_every_request():
         assert call(url, "/v1/auth/status", timeout=600, token="gf_k" * 4) == {
             "ok": True
         }
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("interval", "abc"),
+        ("interval", 10**9),
+        ("interval", 0),
+        ("interval", True),
+        ("expires_in", 10**9),
+        ("device_code", None),
+        ("verification_uri", ""),
+    ],
+)
+def test_a_grant_outside_the_rfc_or_its_bounds_is_refused(field, value):
+    replies = deque([(200, GRANT | {field: value})])
+    with server(replies, []) as url:
+        flow, sleeps = login(url)
+        with pytest.raises(ServiceError) as error:
+            flow.start("laptop")
+    assert error.value.code == "ProtocolError" and not sleeps
+
+
+def test_polling_never_sleeps_past_the_codes_expiry():
+    replies = deque(
+        [refusal("AuthorizationPending", "waiting", 400)] * 3
+        + [refusal("SlowDown", "slower", 400)] * 2
+    )
+    with server(replies, []) as url:
+        flow, sleeps = login(url)
+        with pytest.raises(ServiceError) as error:
+            flow.wait(GRANT | {"interval": 5, "expires_in": 24})
+    assert error.value.code == "ExpiredToken"
+    assert sum(sleeps) == 24 and max(sleeps) <= 15
+
+
+@pytest.mark.parametrize("status", [500, 401, 403])
+def test_a_pending_reason_keeps_polling_only_with_its_status(status):
+    body = {
+        "error": {
+            "code": "Unauthorized" if status != 500 else "Internal",
+            "message": "waiting for browser approval",
+            "reason": "authorization_pending",
+        }
+    }
+    with server(deque([(status, body)]), []) as url:
+        flow, sleeps = login(url)
+        with pytest.raises(ServiceError) as error:
+            flow.wait(GRANT)
+    assert error.value.status == status and len(sleeps) == 1

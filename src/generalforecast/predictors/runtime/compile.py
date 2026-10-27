@@ -7,11 +7,11 @@ from dataclasses import replace
 from typing import Any
 
 import pyarrow as pa
-import pyarrow.compute as pc
 
 from generalforecast.predictors.models import CatalogResolver, ModelResolver
 from generalforecast.predictors.runtime.capabilities import admit
 from generalforecast.predictors.runtime.compiled import CompiledPlan
+from generalforecast.predictors.runtime.context import conform
 from generalforecast.predictors.runtime.plan import ExecutionPlan
 from generalforecast.predictors.runtime.schema import (
     infer_schema,
@@ -165,13 +165,14 @@ def validate_queries(plan: CompiledPlan, data: Any) -> pa.Table:
         zip(table.schema, table.columns, strict=True)
     ):
         column = expected[field.name]
-        actual = physical_type(field.type)
-        if actual == "int64" and column.type == "float64":
-            table = table.set_column(
-                index, field.name, pc.cast(array, pa.float64(), safe=True)
-            )
-            actual = "float64"
-        ensure(actual == column.type, "query physical type differs from lock")
+        conformed = conform(array, column.type)
+        ensure(
+            conformed is not None,
+            f"query column {field.name!r} is {physical_type(field.type)}; "
+            f"the lock reads {column.type}",
+        )
+        table = table.set_column(index, field.name, conformed)
+        array = conformed
         if column.role == "input":
             ensure(
                 not array.null_count
