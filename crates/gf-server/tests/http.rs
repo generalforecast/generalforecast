@@ -199,6 +199,48 @@ async fn models_are_listed_and_described_in_envelopes() {
 }
 
 #[tokio::test]
+async fn dotted_catalog_model_ids_name_models_but_not_tables_or_predictors() {
+    let dotted = ServedModel {
+        name: "tabpfn-3.5-classifier".to_string(),
+        reference: "general-forecast/tabpfn-3.5-classifier".to_string(),
+        resolved: "general-forecast/tabpfn-3.5-classifier@5fb6a4c".to_string(),
+        description: json!({"name": "tabpfn-3.5-classifier"}),
+        ..served()
+    };
+    let front = Arc::new(Front::new(
+        vec![served(), dotted],
+        Box::new(Static::new(None)),
+        Surface::SelfHosted,
+        true,
+        RequestBudget::new(1 << 30),
+        Duration::from_secs(30),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    front
+        .start(vec![shard().await], Arc::new(Routes::new(1, 4)))
+        .await
+        .unwrap();
+    let path = "/v1/projects/local/models/tabpfn-3.5-classifier";
+    let (status, _, body) = call(&front, "GET", path, None, &[]).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["name"], "tabpfn-3.5-classifier");
+    assert_eq!(
+        body["resource"],
+        json!({"kind": "model", "name": "tabpfn-3.5-classifier"})
+    );
+    for path in [
+        "/v1/projects/local/models/.tabpfn",
+        "/v1/projects/local/models/Tabpfn-3.5",
+        "/v1/projects/local/predictors/scorer.v2",
+        "/v1/projects/team.a/models/tabpfn-3.5-classifier",
+    ] {
+        let (status, _, body) = call(&front, "GET", path, None, &[]).await;
+        assert_eq!(status.as_u16(), 422, "{path}: {body}");
+        assert_eq!(body["error"]["code"], "ValidationError", "{path}");
+    }
+}
+
+#[tokio::test]
 async fn unknown_routes_methods_and_names_get_the_apis_errors() {
     let front = front(Box::new(Static::new(None)), true).await;
     let cases = [

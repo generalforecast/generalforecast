@@ -100,16 +100,63 @@ pub(super) fn check_endpoint(headers: &HeaderMap, hosts: &[String]) -> Result<()
     Ok(())
 }
 
-/// An envelope's resource name: a plain name, or for a model its canonical
-/// id `general-forecast/<name>`, kept as sent.
+/// An envelope's resource name: a plain name, or for a model its name or
+/// canonical id, kept as sent.
 fn resource_name(kind: &str, value: &str) -> Result<String, ApiError> {
-    match value.strip_prefix(&format!("{}/", catalog::ORG)) {
-        Some(bare) if kind == "model" => {
-            name(bare)?;
-            Ok(value.to_string())
-        }
-        _ => name(value),
+    if kind == "model" {
+        require(model_id(value) || model_name(value), "invalid model id")?;
+        return Ok(value.to_string());
     }
+    name(value)
+}
+
+/// Whether `value` is a catalog model id, the one grammar the catalog's
+/// `generalforecast.service.contracts.MODEL_ID` has: an organization, a
+/// lowercase letter then up to 62 letters, digits or `-`; `/`; a model
+/// name as `model_name` reads it; then optionally `@sha256:<64 hex>`, `@`
+/// digits and `*` digits, in that order.
+pub(super) fn model_id(value: &str) -> bool {
+    let Some((organization, rest)) = value.split_once('/') else {
+        return false;
+    };
+    let end = rest.find(['@', '*']).unwrap_or(rest.len());
+    let (bare, mut suffix) = rest.split_at(end);
+    if let Some(pin) = suffix.strip_prefix("@sha256:") {
+        let hex = pin
+            .bytes()
+            .take(64)
+            .take_while(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte))
+            .count();
+        if hex < 64 {
+            return false;
+        }
+        suffix = &pin[64..];
+    }
+    for mark in ['@', '*'] {
+        if let Some(count) = suffix.strip_prefix(mark) {
+            let digits = count.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 {
+                return false;
+            }
+            suffix = &count[digits..];
+        }
+    }
+    name(organization).is_ok() && model_name(bare) && suffix.is_empty()
+}
+
+/// Whether `value` is a catalog model's name, as `model_id` has it after
+/// the `/` and as `GET models/{model}` takes it: a lowercase letter or
+/// digit, then up to 62 lowercase letters, digits, `.` or `-`, such as
+/// `tabpfn-3.5-classifier`. Table and predictor names stay `name`'s.
+pub(super) fn model_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    value.len() <= 63
+        && bytes
+            .next()
+            .is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-'
+        })
 }
 
 /// Whether an envelope's resource name names the route's resource; a model's
@@ -250,7 +297,11 @@ pub(super) fn resolve(method: &Method, path: &str) -> Result<(String, Action, St
         Action::List => "models".to_string(),
         Action::Predictors => "predictors".to_string(),
         Action::AdHoc => "ad-hoc".to_string(),
-        Action::Get | Action::Predictor | Action::PredictorPredict => name(tail[1])?,
+        Action::Get => {
+            require(model_name(tail[1]), "invalid model name")?;
+            tail[1].to_string()
+        }
+        Action::Predictor | Action::PredictorPredict => name(tail[1])?,
     };
     Ok((project, action, resource))
 }
@@ -427,4 +478,41 @@ pub(super) fn parse_envelope(body: &[u8]) -> Result<(Scope, Value), ApiError> {
         name: resource_name,
     };
     Ok((scope, object["payload"].clone()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{model_id, model_name, name};
+
+    #[test]
+    fn model_ids_follow_the_catalogs_grammar() {
+        let digest = "a".repeat(64);
+        for id in [
+            "general-forecast/tabpfn-3.5-classifier".to_string(),
+            "general-forecast/tabicl-v2-classifier@4*2".to_string(),
+            format!("general-forecast/tabpfn-3.5-regressor@sha256:{digest}"),
+            format!("general-forecast/tabpfn-3.5-regressor@sha256:{digest}@8*3"),
+            "general-forecast/2-stage".to_string(),
+        ] {
+            assert!(model_id(&id), "{id}");
+        }
+        for id in [
+            "tabpfn-3.5-classifier",
+            "general-forecast/",
+            "General-forecast/tabpfn",
+            "general.forecast/tabpfn",
+            "general-forecast/.tabpfn",
+            "general-forecast/tabpfn/3",
+            "general-forecast/tabpfn@",
+            "general-forecast/tabpfn*",
+            "general-forecast/tabpfn@sha256:abc",
+            "general-forecast/tabpfn*2@4",
+            "general-forecast/tabpfn@4x",
+        ] {
+            assert!(!model_id(id), "{id}");
+        }
+        assert!(model_name("tabpfn-3.5-classifier"));
+        assert!(!model_name(&"a".repeat(64)));
+        assert!(name("tabpfn-3.5-classifier").is_err(), "names stay strict");
+    }
 }
