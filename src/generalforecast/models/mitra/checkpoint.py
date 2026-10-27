@@ -37,14 +37,11 @@ PUBLISHED = {
     "general-forecast/mitra-classifier": Published(
         "autogluon/mitra-classifier", "c425e9fa0910a6be1c494321792e7ba2a1367b1a"
     ),
-    "general-forecast/mitra-regressor": Published(
-        "autogluon/mitra-regressor", "5f277aa8f69042d39d6ac3612aed18bb9279bd95"
-    ),
     # The upstream revisions the general-forecast mirrors were converted from.
     "general-forecast/mitra-2-classifier": Published(
         "autogluon/mitra-classifier-2", "edada0d20759c58ada8c8605c25f22f6e98ea5f0"
     ),
-    "mitra-2-regressor": Published(
+    "general-forecast/mitra-2-regressor": Published(
         "autogluon/mitra-regressor-2", "246c7d310fff04296a2388df5f448e3ffe809283"
     ),
 }
