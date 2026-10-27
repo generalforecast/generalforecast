@@ -86,6 +86,21 @@ class LocalClient(RemoteClient):
         super().__init__(location, token)
         self._namespace = f"local-{uuid.uuid4().hex[:16]}-"
 
+    def gated(self, allow_downloads: bool) -> "LocalClient":
+        """This client under another download gate, seeing the same tables.
+
+        It shares this client's connection, namespace and remembered tables,
+        so a table one makes the other opens; only the models it loads may or
+        may not download their files. Closing either closes both.
+        """
+        if allow_downloads == self._allow_downloads:
+            return self
+        other = object.__new__(LocalClient)
+        other.__dict__.update(self.__dict__)
+        other._allow_downloads = allow_downloads
+        other._engine = self._engine.gated(self._engine.surface, allow_downloads)
+        return other
+
     def __reduce__(self) -> tuple[Any, ...]:
         """Pickles as the settings to make a new, empty client with."""
         return functools.partial(

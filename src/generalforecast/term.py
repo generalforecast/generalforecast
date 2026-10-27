@@ -5,9 +5,10 @@
 
 One renderer draws every surface the CLI shows: status lines with a
 right-aligned verb, lock change lines, the three error shapes, tables, and
-the interactive prompts `gf init` uses. Results go to stdout; status lines,
-prompts and errors go to stderr. Colour is on only when the stream is a
-terminal and `NO_COLOR` is unset.
+the interactive prompts `gf init` uses. Results go to stdout and only
+`generalforecast.render` writes them; status lines, prompts and errors go to
+stderr. Colour is on only when the stream is a terminal and `NO_COLOR` is
+unset.
 """
 
 from __future__ import annotations
@@ -16,9 +17,12 @@ import os
 import re
 import select
 import sys
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import IO, Any
+
+from generalforecast.errors import Error, InvalidInput
 
 # Status verbs are right-aligned in this many columns.
 VERB_WIDTH = 12
@@ -27,10 +31,13 @@ LABEL_WIDTH = 13
 # Ends every frame a raw prompt draws. The cursor stays hidden while a frame is
 # up, and whatever reads the terminal knows the frame is whole once it arrives.
 FRAME_END = "\x1b[?25l"
-# The default rendering width when the terminal does not report one.
+# The rendering size when the terminal does not report one.
 WIDTH = 100
+HEIGHT = 24
 # Lock change keys (model, input, selection, target, context) share one column.
 LOCK_KEY_WIDTH = len("selection")
+# Seconds a raw prompt waits for the rest of an escape sequence.
+ESCAPE_SECONDS = 0.05
 
 _CODES = {
     "bold": "1",
@@ -81,20 +88,50 @@ def plural(value: int, noun: str) -> str:
     return f"{count(value)} {noun}{'' if value == 1 else 's'}"
 
 
-def columns(stream: IO[str] | None = None) -> int:
-    """The terminal width, or `WIDTH` when it is unknown."""
+def size(stream: IO[str] | None = None) -> os.terminal_size:
+    """The terminal's columns and lines, or `WIDTH` by `HEIGHT` when unknown."""
     try:
-        return os.get_terminal_size((stream or sys.stderr).fileno()).columns
+        return os.get_terminal_size((stream or sys.stderr).fileno())
     except (OSError, ValueError, AttributeError):
-        return WIDTH
+        return os.terminal_size((WIDTH, HEIGHT))
 
 
 _ANSI = re.compile(r"\x1b\[[0-9;]*m|\x1b\]8;;[^\x1b]*\x1b\\")
 
 
+def _width(character: str) -> int:
+    if unicodedata.combining(character) or unicodedata.category(character) == "Cf":
+        return 0
+    return 2 if unicodedata.east_asian_width(character) in ("W", "F") else 1
+
+
 def visible(text: str) -> int:
-    """The printed width of text that may carry ANSI codes."""
-    return len(_ANSI.sub("", text))
+    """The columns text takes on a terminal, ANSI codes aside."""
+    return sum(_width(character) for character in _ANSI.sub("", text))
+
+
+def pad(text: str, width: int) -> str:
+    """Text padded with spaces to `width` printed columns."""
+    return text + " " * max(width - visible(text), 0)
+
+
+def clip(text: str, width: int) -> str:
+    """Text cut to at most `width` printed columns, its ANSI codes kept whole."""
+    shown, used, at = [], 0, 0
+    for match in _ANSI.finditer(text):
+        for character in text[at : match.start()]:
+            used += _width(character)
+            if used > width:
+                return "".join(shown) + ("\x1b[0m" if "\x1b[" in text else "")
+            shown.append(character)
+        shown.append(match.group(0))
+        at = match.end()
+    for character in text[at:]:
+        used += _width(character)
+        if used > width:
+            return "".join(shown) + ("\x1b[0m" if "\x1b[" in text else "")
+        shown.append(character)
+    return "".join(shown)
 
 
 def suggest(word: str, choices: Iterable[str]) -> str | None:
@@ -117,8 +154,10 @@ class Pointer:
     width: int = 1
 
 
-class Aborted(Exception):
-    """The user pressed Escape in a prompt; nothing is written."""
+class Aborted(Error):
+    """The user declined, pressed Escape or left a question unanswered; nothing changed."""
+
+    code = "Aborted"
 
 
 @dataclass(frozen=True)
@@ -176,7 +215,7 @@ class Output:
         stream.flush()
 
     def line(self, text: str = "") -> None:
-        """One line of a result on stdout."""
+        """One line of a result on stdout; only `generalforecast.render` calls it."""
         self._write(text, self.out)
 
     def say(self, text: str = "", *, force: bool = False) -> None:
@@ -209,7 +248,7 @@ class Output:
         tail = "" if seconds is None else f" in {globals()['seconds'](seconds)}"
         self._write(f"{head} {message}{tail}", self.err)
 
-    def verb(self, verb: str, text: str, detail: str | None = None, **_: Any) -> None:
+    def verb(self, verb: str, text: str, detail: str | None = None) -> None:
         """`status` with an optional two-space-separated detail."""
         self.status(verb, text if detail is None else f"{text}  {detail}")
 
@@ -299,14 +338,14 @@ class Output:
         )
         carets = self.style("^" * max(where.width, 1), "bold", "red")
         label = f" {where.label}" if where.label else ""
-        pad = " " * max(where.column - 1, 0)
-        self._write(f"{gutter} {quiet('|')} {pad}{carets}{label}", self.err)
+        lead = " " * visible(where.source[: max(where.column - 1, 0)])
+        self._write(f"{gutter} {quiet('|')} {lead}{carets}{label}", self.err)
 
     def warning(self, text: str) -> None:
         """A `warning:` line."""
         self._write(f"{self.style('warning:', 'bold', 'yellow')} {text}", self.err)
 
-    def hint(self, text: str, **_: Any) -> None:
+    def hint(self, text: str) -> None:
         """A `hint:` line on its own."""
         self._labelled("hint", text, "bold")
 
@@ -321,13 +360,17 @@ class Output:
         align: Sequence[str] | None = None,
         header: Sequence[str] | None = None,
         stream: IO[str] | None = None,
+        force: bool = False,
     ) -> None:
         """Rows of cells, each column padded to its widest cell.
 
         `align` gives `<` or `>` per column (default left). A header row is
-        aligned like the values beneath it.
+        aligned like the values beneath it. A table on stderr is commentary,
+        dropped under `-q` unless forced; one on stdout is a result.
         """
         stream = self.err if stream is None else stream
+        if stream is self.err and self.quiet and not force:
+            return
         every = [list(header), *map(list, rows)] if header else list(map(list, rows))
         if not every:
             return
@@ -341,8 +384,8 @@ class Output:
             cells = []
             for i in range(ncol):
                 cell = row[i] if i < len(row) else ""
-                pad = " " * (widths[i] - visible(cell))
-                cells.append(pad + cell if kinds[i] == ">" else cell + pad)
+                fill = " " * (widths[i] - visible(cell))
+                cells.append(fill + cell if kinds[i] == ">" else cell + fill)
             self._write(" " * indent + (" " * gap).join(cells).rstrip(), stream)
 
     def fields(self, pairs: Sequence[tuple[str, str]], *, indent: int = 2) -> None:
@@ -351,7 +394,7 @@ class Output:
 
 
 class Prompter:
-    """Asks `gf init`'s questions one at a time.
+    """Asks `gf init`'s questions one at a time, and asks to confirm a change.
 
     On a terminal the prompt is a selector drawn in raw mode: `>` marks the
     cursor, up and down move it, space toggles a multi-select row, Enter
@@ -381,11 +424,8 @@ class Prompter:
             )
         self.interactive = interactive and not yes and not no_input
 
-    def _unavailable(self, label: str, flag: str) -> Exception:
-        from generalforecast.cli import Error
-
-        return Error(
-            "ValidationError",
+    def _unavailable(self, label: str, flag: str) -> Error:
+        return InvalidInput(
             f"{label.lower()} could not be inferred and no terminal is attached",
             hint=f"pass '{flag}', or run without --no-input in a terminal",
             param=flag.lstrip("-"),
@@ -396,7 +436,11 @@ class Prompter:
     ) -> Any:
         """One value from `options`, with the row at `default` pre-selected."""
         if not options:
-            raise self._unavailable(label, flag)
+            raise InvalidInput(
+                f"no column can be the {label.lower()}",
+                hint=f"pass '{flag}' with a column of the table",
+                param=flag.lstrip("-"),
+            )
         if self.yes:
             chosen = options[default]
         elif not self.interactive:
@@ -416,9 +460,14 @@ class Prompter:
         flag: str,
         selected: Iterable[int] = (),
     ) -> list[Any]:
-        """Several values from `options`, with `selected` rows toggled on first."""
+        """Several values from `options`, with `selected` rows toggled on first.
+
+        With no options there is nothing to ask, and the answer is none.
+        """
         picked = set(selected)
-        if self.yes:
+        if not options:
+            indexes: list[int] = []
+        elif self.yes:
             indexes = sorted(picked)
         elif not self.interactive:
             if self.no_input:
@@ -437,26 +486,75 @@ class Prompter:
         *,
         flag: str,
         note: Callable[[str], str] | None = None,
+        check: Callable[[str], str | None] | None = None,
     ) -> str:
-        """One typed line, pre-filled with `default`; `note` shows a quiet aside."""
+        """One typed line, pre-filled with `default`.
+
+        `check` names what is wrong with a value, or returns None for a good
+        one: a terminal shows the problem beside the line and keeps editing,
+        and typed input raises it. `note` is a quiet aside on a good value.
+        """
+
+        def problem(value: str) -> str | None:
+            return check(value) if check is not None else None
+
+        def aside(value: str) -> str:
+            return note(value) if note is not None and problem(value) is None else ""
+
         if self.yes:
             value = default
         elif not self.interactive:
             if self.no_input:
                 raise self._unavailable(label, flag)
-            self.out.say(f"{label} [{default}]: ", force=True)
-            read = self.stdin.readline()
-            if not read:
-                raise Aborted()
-            value = read.strip() or default
+            value = self._answer(
+                f"{label} [{default}]: ",
+                Aborted(
+                    f"{label.lower()} was not answered",
+                    hint=f"pass '{flag}', or answer on stdin",
+                ),
+            )
+            value = value or default
+            wrong = problem(value)
+            if wrong is not None:
+                raise InvalidInput(
+                    f"{label.lower()} {wrong}",
+                    hint=f"pass '{flag}'",
+                    param=label.lower(),
+                )
         else:
-            value = self._edit(label, default, note)
-        self.out.collapsed(
-            label, value if note is None else f"{value}  {note(value)}".rstrip()
-        )
+            value = self._edit(label, default, aside, problem)
+        self.out.collapsed(label, f"{value}  {aside(value)}".rstrip())
         return value
 
+    def confirm(self, question: str, *, flag: str = "--yes") -> None:
+        """Asks `question [y/N]` on stderr; raises `Aborted` unless the answer is yes."""
+        if self.yes:
+            return
+        unanswered = Aborted(
+            f"`{question}` needs an answer",
+            hint=f"pass {flag} to go ahead without asking",
+        )
+        if self.no_input:
+            raise unanswered
+        answer = self._answer(f"{question} [y/N] ", unanswered)
+        if answer.lower() not in ("y", "yes"):
+            raise Aborted("cancelled; nothing was changed")
+
     # -- plain fallback ----------------------------------------------------
+
+    def _answer(self, prompt: str, unanswered: Aborted) -> str:
+        """One line read from stdin after `prompt`; `unanswered` when stdin ends.
+
+        The prompt's line is ended either way, so what follows starts a line.
+        """
+        self.out.err.write(prompt)
+        self.out.err.flush()
+        read = self.stdin.readline()
+        if not read:
+            self.out.err.write("\n")
+            self.out.err.flush()
+            raise unanswered
+        return read.strip()
 
     def _plain(self, label: str, options: Sequence[Option], default: int) -> Option:
         err = self.out.err
@@ -465,12 +563,12 @@ class Prompter:
             err.write(
                 f"  {i}. {option.text}{'  ' + option.detail if option.detail else ''}\n"
             )
-        err.write(f"Choose [{default + 1}]: ")
-        err.flush()
-        read = self.stdin.readline()
-        if not read:
-            raise Aborted()
-        text = read.strip()
+        text = self._answer(
+            f"Choose [{default + 1}]: ",
+            Aborted(
+                f"{label.lower()} was not chosen", hint="answer on stdin, or pass --yes"
+            ),
+        )
         if not text:
             return options[default]
         if text.isdigit() and 1 <= int(text) <= len(options):
@@ -478,11 +576,7 @@ class Prompter:
         for option in options:
             if option.text == text:
                 return option
-        from generalforecast.cli import Error
-
-        raise Error(
-            "ValidationError", f"`{text}` is not one of the {label.lower()} choices"
-        )
+        raise InvalidInput(f"`{text}` is not one of the {label.lower()} choices")
 
     def _plain_many(
         self, label: str, options: Sequence[Option], picked: set[int]
@@ -492,14 +586,13 @@ class Prompter:
         for i, option in enumerate(options, 1):
             mark = "x" if i - 1 in picked else " "
             err.write(f"  {i}. [{mark}] {option.text}\n")
-        err.write(
-            "Choose (comma-separated numbers or names, Enter keeps the marked rows): "
+        text = self._answer(
+            "Choose (comma-separated numbers or names, Enter keeps the marked rows): ",
+            Aborted(
+                f"{label.lower()} were not chosen",
+                hint="answer on stdin, or pass --yes",
+            ),
         )
-        err.flush()
-        read = self.stdin.readline()
-        if not read:
-            raise Aborted()
-        text = read.strip()
         if not text:
             return sorted(picked)
         names = {option.text: i for i, option in enumerate(options)}
@@ -510,32 +603,52 @@ class Prompter:
             elif part in names:
                 chosen.append(names[part])
             else:
-                from generalforecast.cli import Error
-
-                raise Error(
-                    "ValidationError",
-                    f"`{part}` is not one of the {label.lower()} choices",
+                raise InvalidInput(
+                    f"`{part}` is not one of the {label.lower()} choices"
                 )
         return sorted(set(chosen))
 
     # -- raw terminal ------------------------------------------------------
 
+    def _byte(self, fd: int, *, wait: bool) -> bytes:
+        if not wait and not select.select([fd], [], [], ESCAPE_SECONDS)[0]:
+            return b""
+        return os.read(fd, 1)
+
     def _key(self) -> str:
+        """One key: a character, `up`, `down`, `escape` or `other`.
+
+        A character is read whole, however many UTF-8 bytes it takes. An
+        escape sequence is read to its final byte, so keys such as Delete or
+        Home leave nothing behind.
+        """
         fd = self.stdin.fileno()
-        char = os.read(fd, 1).decode("utf-8", "replace")
-        if char != "\x1b":
-            return char
-        if select.select([fd], [], [], 0.05)[0]:
-            rest = os.read(fd, 2).decode("utf-8", "replace")
-            if rest == "[A":
-                return "up"
-            if rest == "[B":
-                return "down"
-            return "other"
-        return "escape"
+        first = self._byte(fd, wait=True)
+        if first != b"\x1b":
+            lead = first[0] if first else 0
+            extra = (
+                3 if lead >= 0xF0 else 2 if lead >= 0xE0 else 1 if lead >= 0xC0 else 0
+            )
+            data = first
+            for _ in range(extra):
+                data += self._byte(fd, wait=False)
+            return data.decode("utf-8", "replace")
+        kind = self._byte(fd, wait=False)
+        if not kind:
+            return "escape"
+        sequence = kind
+        if kind in (b"[", b"O"):
+            while True:
+                byte = self._byte(fd, wait=False)
+                sequence += byte
+                if not byte or 0x40 <= byte[0] <= 0x7E:
+                    break
+        return {b"[A": "up", b"OA": "up", b"[B": "down", b"OB": "down"}.get(
+            sequence, "other"
+        )
 
     def _raw_session(
-        self, draw: Callable[[], int], handle: Callable[[str], bool]
+        self, draw: Callable[[int, int], list[str]], handle: Callable[[str], bool]
     ) -> None:
         import termios
         import tty
@@ -543,19 +656,23 @@ class Prompter:
         fd = self.stdin.fileno()
         saved = termios.tcgetattr(fd)
         err = self.out.err
-        drawn = 0
         try:
             tty.setcbreak(fd)
             while True:
-                drawn = draw()
-                err.write(FRAME_END)
+                columns, lines = size(err)
+                # Every line fits the width, so the cursor climbs exactly
+                # as many lines as the frame took.
+                frame = [
+                    clip(line, max(columns - 1, 1)) for line in draw(columns, lines)
+                ]
+                err.write("".join(f"{line}\n" for line in frame) + FRAME_END)
                 err.flush()
                 key = self._key()
-                err.write(f"\x1b[{drawn}A\r\x1b[J" if drawn else "\r\x1b[J")
-                if key in ("\x03", "\x04"):
+                err.write(f"\x1b[{len(frame)}A\r\x1b[J" if frame else "\r\x1b[J")
+                if key == "\x03":
                     raise KeyboardInterrupt
-                if key == "escape":
-                    raise Aborted()
+                if key in ("escape", "\x04"):
+                    raise Aborted("cancelled; nothing was written")
                 if handle(key):
                     break
         finally:
@@ -571,21 +688,26 @@ class Prompter:
         *,
         multi: set[int] | None,
     ) -> list[int]:
-        err = self.out.err
-        width = max(len(option.text) for option in options)
+        width = max(visible(option.text) for option in options)
         state = {"cursor": default}
 
-        def draw() -> int:
-            err.write(f"{label}\n")
-            for i, option in enumerate(options):
+        def draw(columns: int, lines: int) -> list[str]:
+            # The rows that fit under the label, scrolled to keep the cursor in view.
+            room = max(lines - 2, 1)
+            first = min(
+                max(state["cursor"] - room // 2, 0), max(len(options) - room, 0)
+            )
+            frame = [label]
+            for i in range(first, min(first + room, len(options))):
+                option = options[i]
                 cursor = ">" if i == state["cursor"] else " "
                 mark = "" if multi is None else ("[x] " if i in multi else "[ ] ")
-                text = f"{mark}{option.text}".ljust(width + len(mark))
+                text = pad(f"{mark}{option.text}", width + len(mark))
                 detail = (
                     f"    {self.out.quiet_text(option.detail)}" if option.detail else ""
                 )
-                err.write(f"  {cursor} {text}{detail}\n")
-            return len(options) + 1
+                frame.append(f"  {cursor} {text}{detail}")
+            return frame
 
         def handle(key: str) -> bool:
             if key in ("up", "k"):
@@ -601,18 +723,28 @@ class Prompter:
         self._raw_session(draw, handle)
         return sorted(multi) if multi is not None else [state["cursor"]]
 
-    def _edit(self, label: str, default: str, note: Callable[[str], str] | None) -> str:
-        err = self.out.err
+    def _edit(
+        self,
+        label: str,
+        default: str,
+        aside: Callable[[str], str],
+        problem: Callable[[str], str | None],
+    ) -> str:
         state = {"text": default}
 
-        def draw() -> int:
-            aside = f"  {self.out.quiet_text(note(state['text']))}" if note else ""
-            err.write(f"{label.ljust(LABEL_WIDTH)}{state['text']}{aside}\n")
-            return 1
+        def draw(columns: int, lines: int) -> list[str]:
+            wrong = problem(state["text"])
+            shown = (
+                self.out.style(wrong, "red", stream=self.out.err)
+                if wrong is not None
+                else self.out.quiet_text(aside(state["text"]))
+            )
+            tail = f"  {shown}" if shown else ""
+            return [f"{label.ljust(LABEL_WIDTH)}{state['text']}{tail}"]
 
         def handle(key: str) -> bool:
             if key in ("\r", "\n"):
-                return True
+                return problem(state["text"]) is None
             if key in ("\x7f", "\b"):
                 state["text"] = state["text"][:-1]
             elif len(key) == 1 and key.isprintable():

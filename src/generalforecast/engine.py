@@ -38,7 +38,7 @@ import sys
 import tempfile
 import threading
 import weakref
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple, Protocol
 
@@ -200,6 +200,46 @@ def _unpinned(ref: ModelRef) -> str:
     return str(replace(ref, digest=None))
 
 
+class _Models:
+    """The models every worker serves, each loaded once.
+
+    Models load side by side, each under a lock of its own, so a model that
+    takes minutes to load holds up only the callers waiting for it; a model
+    already loaded takes no lock at all.
+    """
+
+    def __init__(self, add: Callable[[str, str], None]) -> None:
+        """Loads through `add`, which has every worker load a spec under a name."""
+        self._add = add
+        self._loaded: set[str] = set()
+        self._guard = threading.Lock()
+        self._loading: dict[str, threading.Lock] = {}
+
+    def ensure(self, name: str, spec: str) -> None:
+        """Has every worker load `spec` under `name`, unless they serve it already.
+
+        Raises:
+            ModelRefError: If the workers cannot load it.
+        """
+        if name in self._loaded:
+            return
+        from generalforecast import _core
+
+        with self._guard:
+            lock = self._loading.setdefault(name, threading.Lock())
+        with lock:
+            if name in self._loaded:
+                return
+            try:
+                self._add(name, spec)
+            except _core.RequestError as error:
+                code, message, _ = error.args
+                raise ModelRefError(code, message) from None
+            self._loaded.add(name)
+        with self._guard:
+            self._loading.pop(name, None)
+
+
 class _Shared:
     """What engines with different gates share: the shards and the models loaded."""
 
@@ -214,8 +254,7 @@ class _Shared:
         self.data = tempfile.mkdtemp(prefix="gf-engine-")
         self.shards: Shards = _core.Engine(configuration(self.data, cpu_threads, tiers))
         self.specs = {_unpinned(parse(name)): spec for name, spec in models.items()}
-        self.loaded: set[str] = set()
-        self.loading = threading.Lock()
+        self.models = _Models(self.shards.add_model)
         self._closer = weakref.finalize(self, _close, self.shards, self.data)
 
     def close(self) -> None:
@@ -294,16 +333,7 @@ class LocalEngine:
         Returns:
             The name the workers serve it by.
         """
-        from generalforecast import _core
-
-        with self._shared.loading:
-            if name not in self._shared.loaded:
-                try:
-                    self._shared.shards.add_model(name, name)
-                except _core.RequestError as error:
-                    code, message, _ = error.args
-                    raise ModelRefError(code, message) from None
-                self._shared.loaded.add(name)
+        self._shared.models.ensure(name, name)
         return name
 
     def load(self, ref: ModelRef) -> str:
@@ -320,8 +350,6 @@ class LocalEngine:
                 workers cannot load it.
             ArtifactError: If its files are missing or do not match their pins.
         """
-        from generalforecast import _core
-
         admit(ref, self.surface)
         name = _unpinned(ref)
         spec = self._shared.specs.get(name)
@@ -331,14 +359,7 @@ class LocalEngine:
             checkpoint(
                 ref.entry, surface=self.surface, allow_downloads=self.allow_downloads
             )
-        with self._shared.loading:
-            if name not in self._shared.loaded:
-                try:
-                    self._shared.shards.add_model(name, spec or name)
-                except _core.RequestError as error:
-                    code, message, _ = error.args
-                    raise ModelRefError(code, message) from None
-                self._shared.loaded.add(name)
+        self._shared.models.ensure(name, spec or name)
         return name
 
     def tabular(self, ref: ModelRef, request: TabularRequest) -> np.ndarray:  # noqa: D102

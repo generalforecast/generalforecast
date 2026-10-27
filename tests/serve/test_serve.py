@@ -23,6 +23,8 @@ from generalforecast.serve.models import served
 from generalforecast.service.boundary import Scope
 from generalforecast.service.catalog import CatalogService
 from generalforecast.tabular import arrow_bytes
+from tests.serve.processes import assert_exited as _assert_exited
+from tests.serve.processes import children as _children
 from tests.utils.locks import directory, lock_of
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -254,22 +256,6 @@ def test_ctrl_c_stops_the_server_and_its_workers_quietly():
     _assert_exited(workers)
 
 
-def _children(pid):
-    listed = subprocess.run(
-        ["pgrep", "-P", str(pid)], capture_output=True, text=True, check=False
-    )
-    return [int(child) for child in listed.stdout.split()]
-
-
-def _assert_exited(pids):
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline:
-        if not any(Path(f"/proc/{pid}").exists() for pid in pids):
-            return
-        time.sleep(0.1)
-    raise AssertionError(f"workers still running: {pids}")
-
-
 @pytest.mark.slow
 def test_public_bind_without_a_key_warns():
     port = _port()
@@ -292,13 +278,20 @@ def test_public_bind_without_a_key_warns():
 
 
 def test_unservable_targets_fail_before_listening(tmp_path):
+    # A server that is never started: the target fails first.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gf-server").write_text("#!/bin/sh\nexit 99\n")
+    (bin_dir / "gf-server").chmod(0o755)
+    environment = {k: v for k, v in os.environ.items() if k not in CLEAN}
+    environment["PATH"] = f"{bin_dir}{os.pathsep}{environment['PATH']}"
     result = subprocess.run(
         [sys.executable, "-m", "generalforecast.serve", str(tmp_path / "missing")],
         check=False,
         capture_output=True,
         text=True,
         cwd=ROOT,
-        env={k: v for k, v in os.environ.items() if k not in CLEAN},
+        env=environment,
         timeout=300,
     )
     assert result.returncode == 1
@@ -577,10 +570,18 @@ def test_verbose_asks_gf_server_for_its_progress_lines(monkeypatch):
 
     from generalforecast.serve.listener import _environment
 
+    def flags(**given):
+        return argparse.Namespace(
+            **({"verbose": False, "quiet": False, "json": False} | given)
+        )
+
     monkeypatch.delenv("GF_LOG", raising=False)
-    quiet = _environment(argparse.Namespace(verbose=False), GF_LOG_KEY="k")
-    assert "GF_LOG" not in quiet
+    monkeypatch.delenv("GF_EVENTS", raising=False)
+    quiet = _environment(flags(), GF_LOG_KEY="k")
+    assert "GF_LOG" not in quiet and "GF_EVENTS" not in quiet
     assert quiet["GF_LOG_KEY"] == "k"
-    assert _environment(argparse.Namespace(verbose=True))["GF_LOG"] == "info"
+    assert _environment(flags(verbose=True))["GF_LOG"] == "info"
+    assert _environment(flags(quiet=True))["GF_LOG"] == "error"
+    assert _environment(flags(json=True))["GF_EVENTS"] == "json"
     monkeypatch.setenv("GF_LOG", "debug")
-    assert _environment(argparse.Namespace(verbose=True))["GF_LOG"] == "debug"
+    assert _environment(flags(verbose=True))["GF_LOG"] == "debug"

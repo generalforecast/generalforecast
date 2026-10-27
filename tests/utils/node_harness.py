@@ -32,7 +32,7 @@ from generalforecast.keys import Key, keys_of
 from generalforecast.models import registry
 from generalforecast.models.contract import TabularFunctions, TabularProperties
 from generalforecast.models.series import SeriesFunctions
-from generalforecast.native.client import (  # noqa: F401
+from generalforecast.native.handles import (  # noqa: F401
     _REBUILD_WAIT,
     _SERIES,
     Definition,
@@ -55,7 +55,6 @@ from generalforecast.native.client import (  # noqa: F401
     _duration,
     _filled,
     _given,
-    _implied,
     _labels_of,
     _levels,
     _rebuild_of,
@@ -65,6 +64,7 @@ from generalforecast.native.client import (  # noqa: F401
     _times,
     _vector,
     _wait_of,
+    implied_levels,
 )
 from generalforecast.runtime.budget import MemoryBudget
 from generalforecast.runtime.device import DeviceSettings, default_settings
@@ -847,7 +847,9 @@ class LocalClient:
                 scale_rows=scale_rows,
                 summary=summary,
                 retrieval_categoricals=retrieval_categoricals,
-                quantile_levels=None if count else _implied(properties.num_outputs),
+                quantile_levels=None
+                if count
+                else implied_levels(properties.num_outputs),
             )
             table = self._tables[name] = LocalTable(self, table_id, definition)
             return table

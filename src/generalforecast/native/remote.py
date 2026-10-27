@@ -6,16 +6,18 @@
 import asyncio
 import contextlib
 import functools
+import inspect
 import ipaddress
 import json
+import re
 import threading
 import urllib.parse
 import uuid
 import warnings
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
-from typing import Any, Self, override
+from typing import Any, Concatenate, Self, overload, override
 
 import numpy as np
 
@@ -27,11 +29,12 @@ from generalforecast.columns import (
     prepare,
 )
 from generalforecast.keys import Key, Keys, key_of_spec, keys_of, spec_of_key
-from generalforecast.native.client import (
+from generalforecast.native.handles import (
     _REBUILD_WAIT,
     Answer,
     Definition,
     Described,
+    DuplicateKey,
     PastCap,
     Rebuild,
     RebuildWait,
@@ -72,6 +75,26 @@ def _errors() -> Iterator[None]:
         raise PermissionError(str(error)) from error
 
 
+# How a server refuses a write adding a key it holds: gf-core's
+# `TableError::DuplicateKey`, which leaves the table unchanged. The key is a
+# number or digest, or the key as given, quoted, once named.
+_DUPLICATE = re.compile(
+    r"row key (?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|\S+) already exists"
+)
+
+
+@contextlib.contextmanager
+def _duplicates() -> Iterator[None]:
+    """Raises a write refused for a key the table holds as `DuplicateKey`."""
+    try:
+        yield
+    except ValueError as error:
+        found = _DUPLICATE.search(str(error))
+        if isinstance(error, DuplicateKey) or found is None:
+            raise
+        raise DuplicateKey(found.group(0)) from error
+
+
 # Bytes of rows per Flight message, well under the servers' 64 MiB limit.
 _BATCH_BYTES = 16 << 20
 
@@ -110,6 +133,44 @@ def _split(batch: Any) -> list[Any]:
     return [batch.slice(start, rows) for start in starts]
 
 
+def _put(
+    client: "RemoteClient",
+    kind: str,
+    name: str,
+    batch: Any,
+    naming: contextlib.AbstractContextManager[None],
+    missing_ok: bool = False,
+) -> None:
+    """Sends one write of a table's batch under an id of its own, retried once.
+
+    `naming` re-raises the server's errors naming keys as the caller gave
+    them; a write refused for a key the table holds raises `DuplicateKey`.
+    """
+    from pyarrow import flight
+
+    descriptor = flight.FlightDescriptor.for_path(kind, client._wire(name))
+    options = client._write_options(uuid.uuid4().hex, missing_ok)
+
+    def put() -> None:
+        writer, _ = client._flight.do_put(descriptor, batch.schema, options)
+        for part in _split(batch):
+            writer.write_batch(part)
+        writer.close()
+
+    with _duplicates(), naming, _errors():
+        _retry_once(put)
+
+
+def _answer_of(result: Any) -> Answer:
+    """What answered a table's predictions or forecasts, from their reply's metadata."""
+    metadata = result.schema.metadata or {}
+    epoch = metadata.get(b"generalforecast.epoch")
+    return Answer(
+        epoch=None if epoch is None else int(epoch),
+        gpu_seconds=float(metadata.get(b"generalforecast.gpu_seconds", 0.0)),
+    )
+
+
 class RemoteTable(Table):
     """A table on a server."""
 
@@ -142,24 +203,11 @@ class RemoteTable(Table):
     def _put(
         self, kind: str, wide: Any, columns: dict[str, Any], missing_ok: bool = False
     ) -> None:
-        """Sends one write of these columns under an id of its own, retried once."""
+        """Sends one write of these columns; see `_put`."""
         import pyarrow as pa
-        from pyarrow import flight
 
         batch = pa.RecordBatch.from_pydict(columns)
-        descriptor = flight.FlightDescriptor.for_path(
-            kind, self._client._wire(self.name)
-        )
-        options = self._client._write_options(uuid.uuid4().hex, missing_ok)
-
-        def put() -> None:
-            writer, _ = self._client._flight.do_put(descriptor, batch.schema, options)
-            for part in _split(batch):
-                writer.write_batch(part)
-            writer.close()
-
-        with wide.naming(), _errors():
-            _retry_once(put)
+        _put(self._client, kind, self.name, batch, wide.naming(), missing_ok)
 
     @override
     def insert(
@@ -276,22 +324,8 @@ class RemoteSeriesTable(SeriesTable):
         self._client = client
 
     def _put(self, kind: str, batch: Any, missing_ok: bool = False) -> None:
-        """Writes a batch to the server under the kind's descriptor, once."""
-        from pyarrow import flight
-
-        descriptor = flight.FlightDescriptor.for_path(
-            kind, self._client._wire(self.name)
-        )
-        options = self._client._write_options(uuid.uuid4().hex, missing_ok)
-
-        def put() -> None:
-            writer, _ = self._client._flight.do_put(descriptor, batch.schema, options)
-            for part in _split(batch):
-                writer.write_batch(part)
-            writer.close()
-
-        with self._naming(), _errors():
-            _retry_once(put)
+        """Sends one write of a batch; see `_put`."""
+        _put(self._client, kind, self.name, batch, self._naming(), missing_ok)
 
     def _change(self, kind: str, rows: Any) -> None:
         import pyarrow as pa
@@ -409,23 +443,9 @@ class RemoteSeriesTable(SeriesTable):
             listed = ",".join(repr(level) for level in levels)
             headers.append((b"gf-quantiles", listed.encode()))
         options = flight.FlightCallOptions(headers=headers)
-        descriptor = flight.FlightDescriptor.for_path(
-            "forecast", self._client._wire(self.name)
-        )
-        with self._naming(), _errors():
-            writer, reader = self._client._flight.do_exchange(descriptor, options)
-            writer.begin(batch.schema)
-            for part in _split(batch):
-                writer.write_batch(part)
-            writer.done_writing()
-            result = reader.read_all()
-            writer.close()
-        metadata = result.schema.metadata or {}
-        epoch = metadata.get(b"generalforecast.epoch")
-        self.last_answer = Answer(
-            epoch=None if epoch is None else int(epoch),
-            gpu_seconds=float(metadata.get(b"generalforecast.gpu_seconds", 0.0)),
-        )
+        with self._naming():
+            result = self._client._exchanged("forecast", self.name, batch, options)
+        self.last_answer = _answer_of(result)
         # The server interpolates the levels asked, so the long batch's
         # quantile columns are the forecast's last axis.
         values = np.column_stack(
@@ -735,12 +755,7 @@ class RemoteClient:
                 **({"roles": roles.spec()} if roles is not None else {}),
             },
         )
-        described = self._describe(name)
-        with self._lock:
-            table = self._known.get(name)
-            if table is None:
-                table = self._known[name] = RemoteTable(self, described)
-        return table
+        return self._remember(self._describe(name))
 
     def _create_series_table(
         self,
@@ -813,21 +828,33 @@ class RemoteClient:
         return Described.of(reply)
 
     def table(self, name: str) -> RemoteTable:
-        """A table on the server, by name.
+        """A table on the server, by name, as it is now.
 
         Raises:
             KeyError: If there is no such table.
             TypeError: If the table holds series; `series_table` gives it.
         """
-        described = self._describe(name)
+        return self._remember(self._describe(name))
+
+    def _remember(self, described: Described) -> RemoteTable:
+        """The table a description describes, remembered for predictions.
+
+        The table remembered keeps its last answer while its definition holds;
+        one the server holds under another definition, as when it was dropped
+        and made again, takes its place.
+        """
+        fresh = RemoteTable(self, described)
         with self._lock:
-            table = self._known.get(name)
-            if table is None:
-                table = self._known[name] = RemoteTable(self, described)
-        return table
+            known = self._known.get(fresh.name)
+            if known is None or known.definition != fresh.definition:
+                known = self._known[fresh.name] = fresh
+        return known
 
     def series_table(self, name: str) -> RemoteSeriesTable:
-        """A table of series on the server, by name.
+        """A table of series on the server, by name, as it is now.
+
+        The table remembered keeps the series keys written through it while
+        its definition holds; one made again under another takes its place.
 
         Raises:
             KeyError: If there is no such table.
@@ -836,10 +863,11 @@ class RemoteClient:
         reply = self._reply(name)
         if not reply.get("series"):
             raise TypeError(f"table {name!r} holds rows, not series; use table")
+        definition = _series_definition_of(reply)
         with self._lock:
             table = self._known_series.get(name)
-            if table is None:
-                table = RemoteSeriesTable(self, _series_definition_of(reply))
+            if table is None or table.definition != definition:
+                table = RemoteSeriesTable(self, definition)
                 self._known_series[name] = table
         return table
 
@@ -915,8 +943,6 @@ class RemoteClient:
         try:
             return self._predict(known, rows, before, levels)
         except (KeyError, ValueError):
-            with self._lock:
-                self._known.pop(name, None)
             fresh = self.table(name)
             if fresh.definition == known.definition:
                 raise
@@ -945,12 +971,7 @@ class RemoteClient:
                 if levels is None
                 else np.empty((0, len(levels)), np.float32)
             )
-        metadata = result.schema.metadata or {}
-        epoch = metadata.get(b"generalforecast.epoch")
-        table.last_answer = Answer(
-            epoch=None if epoch is None else int(epoch),
-            gpu_seconds=float(metadata.get(b"generalforecast.gpu_seconds", 0.0)),
-        )
+        table.last_answer = _answer_of(result)
         return np.column_stack([column.to_numpy() for column in result.columns])
 
     def _contexts(
@@ -983,7 +1004,6 @@ class RemoteClient:
     ) -> Any:
         """The server's answer to queries sent with `command`, or None for none."""
         import pyarrow as pa
-        from pyarrow import flight
 
         prepared, rows = prepare(queries, table.columns)
         if rows == 0:
@@ -1004,20 +1024,88 @@ class RemoteClient:
                 ),
             )
         batch = pa.RecordBatch.from_pydict(columns)
-        descriptor = flight.FlightDescriptor.for_path(command, self._wire(table.name))
+        return self._exchanged(command, table.name, batch, options)
+
+    def _exchanged(self, command: str, name: str, batch: Any, options: Any) -> Any:
+        """The server's whole reply to one table's batch sent with `command`."""
+        from pyarrow import flight
+
+        descriptor = flight.FlightDescriptor.for_path(command, self._wire(name))
         with _errors():
             writer, reader = self._flight.do_exchange(descriptor, options)
-            writer.begin(batch.schema)
-            for part in _split(batch):
-                writer.write_batch(part)
-            writer.done_writing()
-            result = reader.read_all()
+            try:
+                writer.begin(batch.schema)
+                for part in _split(batch):
+                    writer.write_batch(part)
+                writer.done_writing()
+                result = reader.read_all()
+            except BaseException:
+                # The stream failed already; its first error is the one to raise.
+                with contextlib.suppress(Exception):
+                    writer.close()
+                raise
             writer.close()
         return result
 
 
+class _Awaited[**P, R]:
+    """A coroutine method that runs the wrapped table's method of its name off the event loop.
+
+    Each takes its synchronous twin's name, signature and docstring, the one
+    its interface documents, so the two cannot drift apart.
+    """
+
+    def __init__(self, method: Callable[Concatenate[Any, P], R]) -> None:
+        """Wraps `method`, which the wrapped table has under the same name."""
+        self.__doc__ = inspect.getdoc(method)
+        self._name: str = getattr(method, "__name__", "")
+        signature = inspect.signature(method)
+        self.__signature__ = signature.replace(
+            parameters=list(signature.parameters.values())[1:]
+        )
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        """Checks the method keeps its twin's name."""
+        if name != self._name:
+            raise TypeError(f"{owner.__name__}.{name} wraps {self._name!r}")
+        self._qualname = f"{owner.__qualname__}.{name}"
+
+    @overload
+    def __get__(self, instance: None, owner: type | None = None) -> Self: ...
+
+    @overload
+    def __get__(
+        self, instance: object, owner: type | None = None
+    ) -> Callable[P, Coroutine[Any, Any, R]]: ...
+
+    def __get__(
+        self, instance: object | None, owner: type | None = None
+    ) -> "Self | Callable[P, Coroutine[Any, Any, R]]":
+        """The coroutine method of a wrapping table, or this wrapper on its class."""
+        if instance is None:
+            return self
+        name = self._name
+        table: Any = instance
+
+        async def run(*arguments: P.args, **options: P.kwargs) -> R:
+            method = getattr(table._table, name)
+            return await table._client._run(
+                functools.partial(method, *arguments, **options)
+            )
+
+        run.__name__, run.__qualname__ = name, self._qualname
+        run.__doc__ = self.__doc__
+        # Functions take a signature through their attributes, as inspect reads it.
+        run.__dict__["__signature__"] = self.__signature__
+        return run
+
+
 class AsyncRemoteTable:
-    """A table on a server, with coroutines; see `Table` for each call."""
+    """A table on a server, with coroutines; see `Table` for each call.
+
+    Each coroutine runs `RemoteTable`'s method of its name on the client's
+    threads, with its arguments.
+    """
 
     def __init__(self, client: "AsyncRemoteClient", table: RemoteTable) -> None:
         """Wraps a table of the client's synchronous twin."""
@@ -1031,97 +1119,31 @@ class AsyncRemoteTable:
         """The client's endpoint, or the table's name."""
         return repr(self._table).replace("RemoteTable", "AsyncRemoteTable", 1)
 
-    async def describe(self) -> Described:
-        """The table as it is now; see `Table.describe`."""
-        return await self._client._run(self._table.describe)
-
     @property
     def features(self) -> int:
         """Number of feature columns."""
         return len(self.columns)
-
-    async def insert(
-        self, keys: Iterable[Key], features: Any, targets: Any, times: Any = None
-    ) -> None:
-        """`RemoteTable.insert`, awaited off the event loop."""
-        await self._client._run(self._table.insert, keys, features, targets, times)
-
-    async def update(
-        self, keys: Iterable[Key], features: Any, targets: Any, times: Any = None
-    ) -> None:
-        """`RemoteTable.update`, awaited off the event loop."""
-        await self._client._run(self._table.update, keys, features, targets, times)
-
-    async def upsert(
-        self, keys: Iterable[Key], features: Any, targets: Any, times: Any = None
-    ) -> None:
-        """`RemoteTable.upsert`, awaited off the event loop."""
-        await self._client._run(self._table.upsert, keys, features, targets, times)
-
-    async def label(self, keys: Iterable[Key], targets: Any) -> None:
-        """`RemoteTable.label`, awaited off the event loop."""
-        await self._client._run(self._table.label, keys, targets)
-
-    async def delete(self, keys: Iterable[Key], missing_ok: bool = False) -> None:
-        """`RemoteTable.delete`, awaited off the event loop."""
-        await self._client._run(self._table.delete, keys, missing_ok)
-
-    async def truncate(self) -> None:
-        """`RemoteTable.truncate`, awaited off the event loop."""
-        await self._client._run(self._table.truncate)
-
-    async def predict(
-        self,
-        queries: Any,
-        before: Any = None,
-        *,
-        quantiles: Sequence[float] | None = None,
-    ) -> np.ndarray:
-        """`RemoteTable.predict`, awaited off the event loop."""
-        return await self._client._run(
-            lambda: self._table.predict(queries, before, quantiles=quantiles)
-        )
-
-    async def predict_given(
-        self,
-        queries: Any,
-        contexts: Sequence[Iterable[Key]],
-        *,
-        quantiles: Sequence[float] | None = None,
-    ) -> np.ndarray:
-        """`RemoteTable.predict_given`, awaited off the event loop."""
-        return await self._client._run(
-            lambda: self._table.predict_given(queries, contexts, quantiles=quantiles)
-        )
-
-    async def contexts(self, queries: Any, before: Any = None) -> list[np.ndarray]:
-        """`RemoteTable.contexts`, awaited off the event loop."""
-        return await self._client._run(self._table.contexts, queries, before)
-
-    async def region_churn(self, queries: Any) -> np.ndarray:
-        """`RemoteTable.region_churn`, awaited off the event loop."""
-        return await self._client._run(self._table.region_churn, queries)
 
     @property
     def last_answer(self) -> Answer | None:
         """What answered the table's latest predictions; see `Table.last_answer`."""
         return self._table.last_answer
 
-    async def refit(self) -> None:
-        """`RemoteTable.refit`, awaited off the event loop."""
-        await self._client._run(self._table.refit)
-
-    async def set_strategy(self, strategy: Strategy) -> None:
-        """`RemoteTable.set_strategy`, awaited off the event loop."""
-        await self._client._run(self._table.set_strategy, strategy)
-
-    async def compact(self) -> None:
-        """`RemoteTable.compact`, awaited off the event loop."""
-        await self._client._run(self._table.compact)
-
-    async def vocabularies(self) -> dict[str, list[str]]:
-        """Each categorical column's words, in code order."""
-        return await self._client._run(self._table.vocabularies)
+    describe = _Awaited(RemoteTable.describe)
+    insert = _Awaited(RemoteTable.insert)
+    update = _Awaited(RemoteTable.update)
+    upsert = _Awaited(RemoteTable.upsert)
+    label = _Awaited(RemoteTable.label)
+    delete = _Awaited(RemoteTable.delete)
+    truncate = _Awaited(RemoteTable.truncate)
+    predict = _Awaited(RemoteTable.predict)
+    predict_given = _Awaited(RemoteTable.predict_given)
+    contexts = _Awaited(RemoteTable.contexts)
+    region_churn = _Awaited(RemoteTable.region_churn)
+    refit = _Awaited(RemoteTable.refit)
+    set_strategy = _Awaited(RemoteTable.set_strategy)
+    compact = _Awaited(RemoteTable.compact)
+    vocabularies = _Awaited(RemoteTable.vocabularies)
 
     async def labels(self) -> list[str] | None:
         """A classifier's labels in code order; see `Table.labels`."""
@@ -1133,7 +1155,11 @@ class AsyncRemoteTable:
 
 
 class AsyncRemoteSeriesTable:
-    """A table of series on a server, with coroutines; see `SeriesTable` for each call."""
+    """A table of series on a server, with coroutines; see `SeriesTable` for each call.
+
+    Each coroutine runs `RemoteSeriesTable`'s method of its name on the
+    client's threads, with its arguments.
+    """
 
     def __init__(self, client: "AsyncRemoteClient", table: RemoteSeriesTable) -> None:
         """Wraps a table of the client's synchronous twin."""
@@ -1156,58 +1182,14 @@ class AsyncRemoteSeriesTable:
         """What answered the table's latest forecasts; see `SeriesTable.last_answer`."""
         return self._table.last_answer
 
-    async def insert(self, rows: Any) -> None:
-        """`RemoteSeriesTable.insert`, awaited off the event loop."""
-        await self._client._run(self._table.insert, rows)
-
-    async def upsert(self, rows: Any) -> None:
-        """`RemoteSeriesTable.upsert`, awaited off the event loop."""
-        await self._client._run(self._table.upsert, rows)
-
-    async def delete(self, rows: Any, missing_ok: bool = False) -> None:
-        """`RemoteSeriesTable.delete`, awaited off the event loop."""
-        await self._client._run(self._table.delete, rows, missing_ok)
-
-    async def truncate(self) -> None:
-        """`RemoteSeriesTable.truncate`, awaited off the event loop."""
-        await self._client._run(self._table.truncate)
-
-    async def known_series(self) -> list[Any]:
-        """`RemoteSeriesTable.known_series`, awaited off the event loop."""
-        return await self._client._run(self._table.known_series)
-
-    async def forecast(
-        self,
-        series: Iterable[Key],
-        horizon: int | None = None,
-        before: Any = None,
-        *,
-        quantiles: Sequence[float] | None = None,
-    ) -> np.ndarray:
-        """`RemoteSeriesTable.forecast`, awaited off the event loop."""
-        return await self._client._run(
-            lambda: self._table.forecast(series, horizon, before, quantiles=quantiles)
-        )
-
-    async def forecast_given(
-        self,
-        series: Iterable[Key],
-        groups: Sequence[Iterable[Key]],
-        horizon: int | None = None,
-        before: Any = None,
-        *,
-        quantiles: Sequence[float] | None = None,
-    ) -> np.ndarray:
-        """`RemoteSeriesTable.forecast_given`, awaited off the event loop."""
-        return await self._client._run(
-            lambda: self._table.forecast_given(
-                series, groups, horizon, before, quantiles=quantiles
-            )
-        )
-
-    async def vocabularies(self) -> dict[str, list[str]]:
-        """Each categorical covariate's words, in code order."""
-        return await self._client._run(self._table.vocabularies)
+    insert = _Awaited(RemoteSeriesTable.insert)
+    upsert = _Awaited(RemoteSeriesTable.upsert)
+    delete = _Awaited(RemoteSeriesTable.delete)
+    truncate = _Awaited(RemoteSeriesTable.truncate)
+    forecast = _Awaited(RemoteSeriesTable.forecast)
+    forecast_given = _Awaited(RemoteSeriesTable.forecast_given)
+    vocabularies = _Awaited(RemoteSeriesTable.vocabularies)
+    known_series = _Awaited(RemoteSeriesTable.known_series)
 
     async def count(self) -> int:
         """Number of observations."""

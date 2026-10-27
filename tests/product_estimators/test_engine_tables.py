@@ -5,7 +5,7 @@
 
 import json
 from collections.abc import Iterator
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -382,7 +382,7 @@ def test_series_tables_open_and_attach_with_exists_open(catalog) -> None:
 
 
 def test_descriptions_carry_a_routed_table_s_partitions() -> None:
-    from generalforecast.native.client import Described
+    from generalforecast.native.handles import Described
 
     reply = {
         "name": "routed",
@@ -439,3 +439,252 @@ def test_open_keeps_the_retrieval_settings_of_an_adaptive_table(catalog) -> None
         assert described.retrieval_categoricals == "one_hot"
     finally:
         table.drop()
+
+
+def _unkeyed(count: int, seed: int) -> pd.DataFrame:
+    return _rows(count, seed).drop(columns=["k"])
+
+
+def test_rows_without_ids_never_replace_rows_after_a_table_is_opened(catalog) -> None:
+    table = engine.Table(
+        "unkeyed",
+        model="general-forecast/tabicl-v2-classifier",
+        target="y",
+        download=False,
+    )
+    try:
+        table.insert(_unkeyed(20, seed=0))
+        table.delete(range(5))
+        assert len(table) == 15
+        again = engine.Table.open("unkeyed", download=False)
+        # Ids 15 to 19 are held, though only 15 rows are; the new rows take
+        # ids no row holds rather than replace those.
+        again.insert(_unkeyed(5, seed=1))
+        assert len(again) == 20
+        same = engine.Table(
+            "unkeyed",
+            model="general-forecast/tabicl-v2-classifier",
+            target="y",
+            download=False,
+            exists="open",
+        )
+        same.insert(_unkeyed(3, seed=2))
+        assert len(same) == 23
+        # The table that made it carries on from its own ids, past the others'.
+        table.insert(_unkeyed(2, seed=3))
+        assert len(table) == 25
+    finally:
+        table.drop()
+
+
+def test_tables_made_under_one_download_gate_open_under_the_other(catalog) -> None:
+    table = engine.Table(
+        "gated",
+        model="general-forecast/tabicl-v2-classifier",
+        schema=engine.Schema(target="y", id="k"),
+        download=False,
+    )
+    try:
+        table.insert(_rows())
+        again = engine.Table.open("gated", download=True)
+        assert len(again) == 32
+        same = engine.Table(
+            "gated",
+            model="general-forecast/tabicl-v2-classifier",
+            schema=engine.Schema(target="y", id="k"),
+            download=True,
+            exists="open",
+        )
+        same.insert(_rows(4, seed=7).assign(k=np.arange(100, 104)))
+        assert len(table) == 36
+    finally:
+        table.drop()
+
+
+def test_series_predict_takes_future_rows_without_the_target(catalog) -> None:
+    schema = engine.SeriesSchema(
+        target="units", time="t", series="item", frequency=1, known=["price"]
+    )
+    table = engine.SeriesTable(
+        "future",
+        model="general-forecast/chronos-2",
+        schema=schema,
+        horizon=3,
+        download=False,
+    )
+    try:
+        table.insert(_observations("shoes", 0, 1))
+        future = pd.DataFrame({"item": ["shoes"] * 3, "t": [20, 21, 22], "price": 3.0})
+        forecast = table.predict(future)
+        assert forecast["item"].tolist() == ["shoes"] * 3
+        assert forecast["step"].tolist() == [1, 2, 3]
+        assert np.isfinite(forecast["value"]).all()
+        # The future rows wait unobserved for the observations that replace them.
+        assert len(table) == 23
+        table.insert(_observations("shoes", 20, 2).head(1))
+        assert len(table) == 23
+    finally:
+        table.drop()
+
+
+def _served(*models: str) -> tuple[str, str]:
+    """The process engine's Flight endpoint, its workers serving these models."""
+    from generalforecast.models.catalog import parse
+
+    local = engine.local()
+    for model in models:
+        local.load(parse(model))
+    return local.serve()
+
+
+def test_a_client_sees_a_table_another_made_again_as_it_is_now(catalog) -> None:
+    from generalforecast.native.remote import RemoteClient
+
+    location, token = _served(
+        "general-forecast/tabicl-v2-classifier", "general-forecast/chronos-2"
+    )
+    first, second = RemoteClient(location, token), RemoteClient(location, token)
+    try:
+        made = first._create_table(
+            "remade",
+            model="general-forecast/tabicl-v2-classifier",
+            features=2,
+            classes=2,
+        )
+        assert first.table("remade") is made
+        second.drop_table("remade")
+        second._create_table(
+            "remade",
+            model="general-forecast/tabicl-v2-classifier",
+            features=3,
+            classes=2,
+        )
+
+        remade = first.table("remade")
+
+        assert remade is not made
+        assert len(remade.columns) == 3
+        assert first.table("remade") is remade
+        series = second._create_series_table(
+            "remade-series",
+            model="general-forecast/chronos-2",
+            series="item",
+            time="t",
+            target="units",
+            step=1,
+        )
+        assert first.series_table("remade-series").definition == series.definition
+        first.drop_table("remade-series")
+        first._create_series_table(
+            "remade-series",
+            model="general-forecast/chronos-2",
+            series="item",
+            time="t",
+            target="units",
+            step=2,
+        )
+        assert second.series_table("remade-series").step == 2
+    finally:
+        for name in ("remade", "remade-series"):
+            first.drop_table(name)
+        first.close()
+        second.close()
+
+
+def _calls(kind: type) -> set[str]:
+    """A table class's public methods, its properties left out."""
+    import inspect
+
+    return {
+        name
+        for name, value in inspect.getmembers(kind)
+        if not name.startswith("_") and inspect.isfunction(value)
+    }
+
+
+def test_async_tables_wrap_every_call_of_their_twins() -> None:
+    import inspect
+
+    from generalforecast.native.remote import (
+        AsyncRemoteSeriesTable,
+        AsyncRemoteTable,
+        RemoteSeriesTable,
+        RemoteTable,
+    )
+
+    for twin, wrapper in (
+        (RemoteTable, AsyncRemoteTable),
+        (RemoteSeriesTable, AsyncRemoteSeriesTable),
+    ):
+        assert _calls(twin) <= set(dir(wrapper))
+        for name in _calls(twin) & set(vars(wrapper)):
+            assert getattr(wrapper, name).__doc__ == inspect.getdoc(getattr(twin, name))
+            assert getattr(wrapper, name).__doc__
+    bound = AsyncRemoteTable.__dict__["predict"].__get__(object())
+    assert list(inspect.signature(bound).parameters) == [
+        "queries",
+        "before",
+        "quantiles",
+    ]
+    assert bound.__qualname__ == "AsyncRemoteTable.predict"
+
+
+def test_async_tables_run_their_twins_calls(catalog) -> None:
+    import asyncio
+
+    from generalforecast.native.remote import AsyncRemoteClient, RemoteClient
+
+    location, token = _served("general-forecast/tabicl-v2-classifier")
+    features = np.random.default_rng(0).normal(size=(16, 2)).astype(np.float32)
+    targets = (np.arange(16) % 2).astype(np.int32)
+
+    async def run() -> tuple[np.ndarray, np.ndarray, int]:
+        async with AsyncRemoteClient(RemoteClient(location, token)) as client:
+            table = await client._create_table(
+                "awaited",
+                model="general-forecast/tabicl-v2-classifier",
+                features=2,
+                classes=2,
+            )
+            try:
+                await table.insert(np.arange(16), features, targets)
+                await table.delete([3])
+                return (
+                    await table.predict(features[:2]),
+                    await table.predict(features[:2], quantiles=None),
+                    await table.count(),
+                )
+            finally:
+                await client.drop_table("awaited")
+
+    predicted, again, count = asyncio.run(run())
+
+    assert predicted.shape == (2, 2) and count == 15
+    np.testing.assert_array_equal(predicted, again)
+
+
+def test_rows_without_ids_refuse_a_collision_on_a_partitioned_table() -> None:
+    from generalforecast.native.handles import DuplicateKey
+
+    class Refusing:
+        """A handle refusing every insert, as a partition holding the ids would."""
+
+        inserted = 0
+
+        def insert(self, *_: Any) -> None:
+            self.inserted += 1
+            raise DuplicateKey("row key 0 already exists")
+
+    table = engine.Table(
+        "split",
+        model="general-forecast/tabicl-v2-classifier",
+        target="y",
+        ops=engine.TableOptions(partitions=2),
+        download=False,
+    )
+    handle = Refusing()
+    with pytest.raises(InvalidInput, match="holds rows under the ids") as caught:
+        table._insert_unkeyed(cast(Any, handle), np.zeros((2, 1)), np.zeros(2), None)
+    # Ids moved on would write again the rows earlier partitions took.
+    assert handle.inserted == 1
+    assert caught.value.hint == "give the rows an id column with Schema(id=...)"

@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from generalforecast._core import Node, Step
-from generalforecast.native.client import Answer
+from generalforecast.native.handles import Answer
 from generalforecast.worker import Worker
 
 

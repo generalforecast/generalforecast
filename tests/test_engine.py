@@ -12,8 +12,8 @@ import numpy as np
 import pytest
 
 from generalforecast import _core
-from generalforecast.engine import Labeled, LocalEngine
-from generalforecast.models.catalog import parse
+from generalforecast.engine import Labeled, LocalEngine, _Models
+from generalforecast.models.catalog import ModelRefError, parse
 from tests.utils.engine import tabular_request
 
 REF = parse("general-forecast/tabicl-v2-classifier")
@@ -119,3 +119,73 @@ def test_the_engine_process_imports_no_model_code():
         [sys.executable, "-c", script], capture_output=True, text=True, check=False
     )
     assert done.returncode == 0, done.stderr[-2000:]
+
+
+def test_a_model_loading_holds_up_neither_loaded_models_nor_other_loads():
+    """Loading one model takes no lock a loaded model's callers or another load wait on."""
+    slow_started, slow_released = threading.Event(), threading.Event()
+    added: list[str] = []
+
+    def add(name: str, spec: str) -> None:
+        if name == "slow":
+            slow_started.set()
+            assert slow_released.wait(10)
+        added.append(name)
+
+    models = _Models(add)
+    models.ensure("loaded", "loaded")
+    loading = threading.Thread(target=models.ensure, args=("slow", "slow"))
+    loading.start()
+    try:
+        assert slow_started.wait(10)
+        done = threading.Event()
+
+        def callers() -> None:
+            models.ensure("loaded", "loaded")
+            models.ensure("other", "other")
+            done.set()
+
+        threading.Thread(target=callers).start()
+        assert done.wait(5), "a loaded model or another load waited on the slow one"
+    finally:
+        slow_released.set()
+        loading.join()
+    assert added == ["loaded", "other", "slow"]
+    models.ensure("slow", "slow")
+    assert added.count("slow") == 1
+
+
+def test_callers_of_one_model_wait_for_its_single_load():
+    started, release = threading.Event(), threading.Event()
+    added: list[str] = []
+
+    def add(name: str, spec: str) -> None:
+        started.set()
+        assert release.wait(10)
+        added.append(name)
+
+    models = _Models(add)
+    first = threading.Thread(target=models.ensure, args=("m", "m"))
+    second = threading.Thread(target=models.ensure, args=("m", "m"))
+    first.start()
+    assert started.wait(10)
+    second.start()
+    release.set()
+    first.join()
+    second.join()
+    assert added == ["m"]
+
+
+def test_a_load_the_workers_refuse_is_tried_again():
+    attempts: list[str] = []
+
+    def add(name: str, spec: str) -> None:
+        attempts.append(name)
+        if len(attempts) == 1:
+            raise _core.RequestError("UnknownModel", "no such model", None)
+
+    models = _Models(add)
+    with pytest.raises(ModelRefError, match="no such model"):
+        models.ensure("m", "m")
+    models.ensure("m", "m")
+    assert attempts == ["m", "m"]
