@@ -1860,30 +1860,29 @@ fn context_declared() -> ApiError {
         .hint("drop context: this predictor's context is pinned in its lock")
 }
 
-/// A declared predictor's body: `queries`, and `context` only when the lock
-/// says each request brings it; what the manifest declares is refused.
-async fn predictor_predict(
-    front: &Front,
-    served: &ServedModel,
+/// What a predictor's lock declares, which its predict body may not give.
+const DECLARED: [&str; 9] = [
+    "target",
+    "inputs",
+    "model",
+    "task",
+    "features",
+    "options",
+    "quantiles",
+    "outputs",
+    "id",
+];
+
+/// The `served_predict` call a declared predictor's body makes: its
+/// `queries`, with `context` only when the lock says each request brings
+/// it, and `snapshot`'s rows when the lock pins them; what the lock
+/// declares is refused by name.
+fn declared_call(
     predictor: &ServedPredictor,
     payload: &Value,
-    charge: Charge,
+    snapshot: impl FnOnce() -> Result<Value, ApiError>,
 ) -> Result<Value, ApiError> {
-    refuse_fields(
-        payload,
-        &[
-            "target",
-            "inputs",
-            "model",
-            "task",
-            "features",
-            "options",
-            "quantiles",
-            "outputs",
-            "id",
-        ],
-        "is declared by the predictor",
-    )?;
+    refuse_fields(payload, &DECLARED, "is declared by the predictor")?;
     let body = fields(payload, &["queries"], &["context", "as_of"])?;
     let context = match predictor.context {
         ContextMode::Request => body.get("context").cloned().ok_or_else(|| {
@@ -1896,7 +1895,7 @@ async fn predictor_predict(
             if body.contains_key("context") {
                 return Err(context_declared());
             }
-            json!([])
+            snapshot()?
         }
     };
     let inputs: Vec<&str> = match &predictor.forecast {
@@ -1912,12 +1911,24 @@ async fn predictor_predict(
         }
         None => predictor.inputs.iter().map(String::as_str).collect(),
     };
-    let call = json!({
+    Ok(json!({
         "target": predictor.target,
         "inputs": inputs,
         "context": context,
         "queries": body["queries"],
-    });
+    }))
+}
+
+/// A predictor served here from its lock: a snapshot predictor's rows are
+/// bound at startup, so its body brings none.
+async fn predictor_predict(
+    front: &Front,
+    served: &ServedModel,
+    predictor: &ServedPredictor,
+    payload: &Value,
+    charge: Charge,
+) -> Result<Value, ApiError> {
+    let call = declared_call(predictor, payload, || Ok(json!([])))?;
     served_predict(front, served, predictor, &call, charge).await
 }
 
@@ -2676,12 +2687,6 @@ async fn native_predict(
     payload: &Value,
     charge: Charge,
 ) -> Result<Value, ApiError> {
-    refuse_fields(
-        payload,
-        &["target", "inputs", "model", "task", "features", "options"],
-        "is declared by the predictor",
-    )?;
-    let body = fields(payload, &["queries"], &["context", "as_of"])?;
     let failed = || ApiError::new("InternalError", "request failed safely", 500);
     let predictor = served.predictor.as_ref().ok_or_else(failed)?;
     let base = front
@@ -2695,38 +2700,17 @@ async fn native_predict(
                 503,
             )
         })?;
-    require(
-        body["queries"]
-            .as_array()
-            .is_some_and(|queries| (1..=MAX_QUERY_ROWS).contains(&queries.len())),
-        "queries must contain 1..10000 rows",
-    )?;
-    let context = match predictor.context {
-        ContextMode::Request => body.get("context").cloned().ok_or_else(|| {
-            ApiError::validation(
-                "context is required: this predictor takes its context with each request",
-            )
-            .param("context")
-        })?,
-        ContextMode::Snapshot => {
-            if body.contains_key("context") {
-                return Err(context_declared());
-            }
-            Value::Array(rows.ok_or_else(failed)?.to_vec())
-        }
-    };
+    // A revision's snapshot rows come with it, so they bind with each request.
+    let call = declared_call(predictor, payload, || {
+        rows.map(|rows| Value::Array(rows.to_vec()))
+            .ok_or_else(failed)
+    })?;
     let mut ephemeral = served.clone();
     ephemeral.worker.clone_from(&base.worker);
     let mut bound = predictor.clone();
     bound.context = ContextMode::Request;
     bound.snapshot = None;
     ephemeral.predictor = Some(bound.clone());
-    let call = json!({
-        "target": predictor.target,
-        "inputs": predictor.inputs,
-        "context": context,
-        "queries": body["queries"],
-    });
     let mut result = served_predict(front, &ephemeral, &bound, &call, charge).await?;
     if predictor.context == ContextMode::Snapshot
         && let Some(captured) = captured
