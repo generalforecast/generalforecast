@@ -24,10 +24,13 @@ pytestmark = pytest.mark.slow
 
 # The tiny model the engine's workers load for each catalog model, so catalog
 # tests run its admission, export and native paths without its checkpoint.
+CLASSIFIER = "general-forecast/tabicl-v2-classifier"
+REGRESSOR = "general-forecast/tabicl-v2-regressor"
+FORECASTER = "general-forecast/chronos-2"
 CATALOG = {
-    "tabicl-v2-classifier": "tests/tabicl-classifier",
-    "tabicl-v2-regressor": "tests/tabicl-regressor",
-    "chronos-2": "tests/chronos2-catalog-forecaster",
+    CLASSIFIER: "tests/tabicl-classifier",
+    REGRESSOR: "tests/tabicl-regressor",
+    FORECASTER: "tests/chronos2-catalog-forecaster",
 }
 
 
@@ -36,12 +39,12 @@ def catalog() -> Iterator[None]:
     """The process engine, loading each catalog model's tiny spec in its workers.
 
     It does not claim the tiny checkpoints are the published ones; estimators
-    given no client connect to it afresh, and never download.
+    given no client connect to it afresh. Estimators may download by default,
+    and a model whose spec is registered here never does.
     """
     tiny = LocalEngine(models=CATALOG)
 
     def local(surface: Any = "local", allow_downloads: bool = False) -> LocalEngine:
-        assert not allow_downloads
         return tiny.gated(surface, allow_downloads)
 
     with pytest.MonkeyPatch.context() as patch:
@@ -51,16 +54,16 @@ def catalog() -> Iterator[None]:
     tiny.close()
 
 
-def test_regressor_cross_validation_uses_fold_local_context():
+def test_regressor_cross_validation_uses_fold_local_context(catalog):
     features = np.random.default_rng(0).normal(size=(24, 3)).astype(np.float32)
     target = features.sum(axis=1)
-    estimator = Regressor("tests/tabicl-regressor")
+    estimator = Regressor(REGRESSOR)
     scores = cross_val_score(estimator, features, target, cv=2)
     assert scores.shape == (2,) and np.isfinite(scores).all()
     assert not estimator.__sklearn_is_fitted__()
 
 
-def test_byte_string_columns_predict_as_their_text():
+def test_byte_string_columns_predict_as_their_text(catalog):
     protocols = np.array(["tcp", "udp", "icmp"])[np.arange(24) % 3]
     numbers = np.random.default_rng(0).normal(size=24).astype(np.float32)
     text = pa.table({"protocol": protocols, "x": numbers})
@@ -68,7 +71,7 @@ def test_byte_string_columns_predict_as_their_text():
         0, "protocol", pa.array(np.char.encode(protocols), pa.binary())
     )
     target = numbers + np.arange(24) % 3
-    model = "tests/tabicl-regressor"
+    model = REGRESSOR
     from_bytes = Regressor(model).fit(raw, target)
     from_text = Regressor(model).fit(text, target)
     np.testing.assert_allclose(
@@ -80,9 +83,9 @@ def test_byte_string_columns_predict_as_their_text():
     "covariates,shared", [(False, False), (True, False), (True, True)]
 )
 def test_forecaster_matches_native_grouped_series_and_preserves_context(
-    tmp_path, covariates, shared
+    catalog, tmp_path, covariates, shared
 ):
-    model = "tests/chronos2-forecaster"
+    model = FORECASTER
     context = pa.table(
         {
             "store": ["a"] * 8 + ["b"] * 8,
@@ -149,8 +152,8 @@ def test_forecaster_matches_native_grouped_series_and_preserves_context(
             restored.predict_quantiles(future), quantiles, atol=1e-5
         )
         restored.close()
-        with pytest.raises(PredictorError, match="custom native"):
-            estimator.save(tmp_path / "invalid", name="custom")
+        saved = estimator.save(tmp_path / "saved", name="saved")
+        assert saved.task == "forecast"
     finally:
         client.drop_table("independent")
         estimator.close()
@@ -226,16 +229,16 @@ def test_catalog_forecaster_uses_shared_covariate_rows(catalog, tmp_path, shared
     restored.close()
 
 
-def test_local_context_beyond_package_capacity_runs_but_never_exports(
+def test_a_fitted_context_exports_with_the_selection_its_size_resolves(
     catalog, tmp_path
 ):
     features = np.random.default_rng(1).normal(size=(1100, 2))
     estimator = Regressor().fit(features, features.sum(axis=1))
     assert np.isfinite(estimator.predict(features[:3])).all()
-    with pytest.raises(PredictorError) as error:
-        estimator.save(tmp_path / "large", name="large")
-    assert error.value.code == "CapacityExceeded"
-    assert not (tmp_path / "large").exists()
+    estimator.save(tmp_path / "large", name="large")
+    lock = yaml.safe_load((tmp_path / "large" / "gf.lock").read_text())["predictor"]
+    assert lock["context"]["rows"] == 1100
+    assert lock["selection"]["strategy"] == "exact"
     estimator.close()
 
 

@@ -17,7 +17,7 @@ from generalforecast.predictors import frequency as _frequency
 from generalforecast.predictors.models import CatalogResolver
 from generalforecast.predictors.runtime.plan import ExecutionPlan
 from generalforecast.predictors.runtime.schema import infer_schema
-from generalforecast.predictors.validation import ensure
+from generalforecast.predictors.validation import PredictorError, ensure
 from generalforecast.tabular import arrow_bytes, read_table, to_arrow
 
 
@@ -52,12 +52,23 @@ def forecast(
         return _frequency.coordinate(value, cadence)
 
     history, rows = context.to_pylist(), queries.to_pylist()
-    identities = list(
-        dict.fromkeys(tuple(row[name] for name in spec.series) for row in history)
-    )
+    identities = {
+        key: index
+        for index, key in enumerate(
+            dict.fromkeys(tuple(row[name] for name in spec.series) for row in history)
+        )
+    }
 
     def identity(row):
-        return f"gfseries:{identities.index(tuple(row[name] for name in spec.series))}"
+        key = tuple(row[name] for name in spec.series)
+        if key not in identities:
+            shown = ", ".join(
+                f"{n}={v!r}" for n, v in zip(spec.series, key, strict=True)
+            )
+            raise PredictorError(
+                "UnknownSeries", f"series {shown} is not in the fitted context"
+            )
+        return f"gfseries:{identities[key]}"
 
     origin = max(instant(row[spec.time]) for row in history)
     step: float | int = _frequency.step(cadence)
@@ -200,12 +211,14 @@ def export_predictor(
         manifest["horizon"] = spec.horizon
         if spec.quantiles:
             manifest["quantiles"] = list(spec.quantiles)
+        # A covariate the estimator reads as both past and known-future is one
+        # channel; the manifest names it once, as a future input.
+        past = [
+            column for column in spec.past_inputs if column not in spec.future_inputs
+        ]
         covariates = {
             key: list(columns)
-            for key, columns in (
-                ("past", spec.past_inputs),
-                ("future", spec.future_inputs),
-            )
+            for key, columns in (("past", past), ("future", spec.future_inputs))
             if columns
         }
         if covariates:
