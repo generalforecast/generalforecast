@@ -1688,7 +1688,7 @@ async fn restarted(
 }
 
 #[tokio::test]
-async fn a_restart_keeps_a_snapshot_predictors_bound_table_and_drops_stale_ones() {
+async fn a_restart_binds_a_snapshot_predictor_again_where_it_finds_its_table() {
     let snapshot = snapshot_file();
     let directory = fresh_directory();
     let logs = |directory: &std::path::Path| {
@@ -1723,21 +1723,23 @@ async fn a_restart_keeps_a_snapshot_predictors_bound_table_and_drops_stale_ones(
     stop(&shards).await;
     drop(front);
 
-    // The next start serves `churn` alone, from the table it bound before.
+    // The next start serves `churn` alone, binding it again over the table
+    // it bound before; the other's table is kept, and Flight's, as any table
+    // no predictor of the front binds.
     let (front, shards, flight) = restarted(
         vec![predictor_model("churn", "snapshot", Some(&snapshot))],
         &directory,
     )
     .await;
-    assert!(
-        flight.is_empty(),
-        "Flight never serves a bound table: {flight:?}"
-    );
+    let (retired, _) = gf_server::engine::bound_table("sha256:retired").unwrap();
+    assert_eq!(flight, vec![retired.as_str().to_string()]);
     let (status, _, body) = predict(front.clone()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["result"]["context"]["rows"], json!(4));
     let (table, _) = gf_server::engine::bound_table("sha256:churn").unwrap();
-    assert_eq!(logs(&directory), vec![format!("{table}.log")]);
+    let mut kept = vec![format!("{table}.log"), format!("{retired}.log")];
+    kept.sort();
+    assert_eq!(logs(&directory), kept);
     stop(&shards).await;
     std::fs::remove_file(snapshot).unwrap();
 }
@@ -1869,4 +1871,43 @@ async fn a_live_revision_is_captured_again_once_its_environment_resolves_again()
         2,
         "a live source's rows are captured again"
     );
+}
+
+#[tokio::test]
+async fn an_introspection_its_callers_left_still_ends_and_answers_the_next_one() {
+    use std::sync::atomic::Ordering;
+
+    use gf_server::http::Introspect;
+    let (plane, asked) = introspection_plane(
+        json!({"active": true, "project": "team-a", "permissions": [], "expires": null}),
+        Duration::from_millis(200),
+    )
+    .await;
+    let keys = Introspect::new(&plane, "service-token".to_string()).unwrap();
+    // The caller goes away as soon as the call is under way.
+    let left = tokio::time::timeout(Duration::ZERO, keys.verify(Some("Bearer left"))).await;
+    assert!(left.is_err());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        asked.load(Ordering::SeqCst),
+        1,
+        "the call ran without its caller"
+    );
+    let principal = keys.verify(Some("Bearer left")).await.unwrap();
+    assert_eq!(principal.project.as_deref(), Some("team-a"));
+    assert_eq!(asked.load(Ordering::SeqCst), 1, "its answer was cached");
+}
+
+#[tokio::test]
+async fn a_body_that_states_no_length_is_refused_before_it_is_read() {
+    let front = front(Box::new(Static::new(None)), true).await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/projects/local/predict")
+        .header("host", "127.0.0.1:8000")
+        .header("content-type", "application/json")
+        .body(Body::from(envelope("ad-hoc", &adhoc_payload()).to_string()))
+        .unwrap();
+    let response = router(front).oneshot(request).await.unwrap();
+    assert_eq!(response.status().as_u16(), 411);
 }

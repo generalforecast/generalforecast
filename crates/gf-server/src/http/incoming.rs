@@ -144,21 +144,26 @@ pub fn owns(method: &Method, path: &str) -> bool {
     if matches!(path, "/livez" | "/healthz" | "/readyz") {
         return true;
     }
-    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    // Segments are read as an upstream would read them, escapes decoded; a
+    // path that had any is the front's, which `resolve` refuses, rather than
+    // a spelling of one of its routes an upstream might take for it.
+    let escaped = path.contains('%');
+    let parts: Vec<String> = path
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .map(|part| percent_decoded(part).to_ascii_lowercase())
+        .collect();
+    let parts: Vec<&str> = parts.iter().map(String::as_str).collect();
     let [api, projects, _, tail @ ..] = parts.as_slice() else {
         return false;
     };
-    if !api.eq_ignore_ascii_case("v1") || !projects.eq_ignore_ascii_case("projects") {
+    if *api != "v1" || *projects != "projects" {
         return false;
     }
-    // An escaped segment could spell any route once decoded; it is refused
-    // here rather than proxied.
-    if tail.iter().any(|part| part.contains('%')) {
+    if escaped && !tail.is_empty() {
         return true;
     }
-    let lower: Vec<String> = tail.iter().map(|part| part.to_ascii_lowercase()).collect();
-    let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
-    route(method, &lower)
+    route(method, tail)
         .is_some_and(|action| action != Action::Predictors && action != Action::Predictor)
 }
 
@@ -184,6 +189,17 @@ pub fn internal(path: &str) -> bool {
     path.split('/')
         .find(|part| !part.is_empty())
         .is_some_and(|first| percent_decoded(first).eq_ignore_ascii_case(INTERNAL))
+}
+
+/// Whether `path` has a `.` or `..` segment, plain or escaped, which an
+/// upstream's URL parser would resolve away, so a route the front refuses
+/// or owns could reach the upstream under another spelling; such a path is
+/// refused before it is routed.
+#[must_use]
+pub fn dotted(path: &str) -> bool {
+    path.split('/')
+        .map(percent_decoded)
+        .any(|part| part == "." || part == "..")
 }
 
 /// `segment` with its `%XX` escapes decoded; an escape that is not one is

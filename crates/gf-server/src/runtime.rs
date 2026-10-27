@@ -168,11 +168,10 @@ pub async fn start(
 /// Serves every table logged under `tables` from its log, until
 /// `interrupted`, and answers where the tables Flight serves went.
 ///
-/// A table a snapshot predictor's rows are bound into is restored on the
-/// shard its fingerprint names, where binding looks for it, when it is one
-/// of `bound`, the front's; with a front, any other is a binding no
-/// predictor served now needs, and is dropped. Without a front none is
-/// served, and their logs stay. Flight never serves bound tables.
+/// A table one of `bound`, the front's snapshot predictors, binds its rows
+/// into is restored on the shard its fingerprint names, where binding
+/// finds it to bind again, and Flight does not serve it. Every other table
+/// is Flight's, as it was before.
 ///
 /// # Errors
 ///
@@ -200,21 +199,10 @@ pub async fn restore(
         let definition = replay.definition().clone();
         let name = definition.name.clone();
         let rotate = replay.needs_rotation();
-        let binding = engine::is_bound(&name);
-        let shard = match (binding, bound) {
-            (false, _) => index % shards.len(),
-            (true, Some(bound)) => match bound.get(&name) {
-                Some(fingerprint) => engine::bound_shard(fingerprint, shards.len()),
-                None => index % shards.len(),
-            },
-            (true, None) => {
-                tracing::info!(
-                    table = name.as_str(),
-                    "not serving a predictor's bound table without the Models API"
-                );
-                continue;
-            }
-        };
+        let fingerprint = bound.and_then(|bound| bound.get(&name));
+        let shard = fingerprint.map_or(index % shards.len(), |fingerprint| {
+            engine::bound_shard(fingerprint, shards.len())
+        });
         let restored = ask(&shards[shard], |reply| Command::Restore {
             replay: Box::new(replay),
             reply,
@@ -229,26 +217,6 @@ pub async fn restore(
                 continue;
             }
         };
-        if binding && !bound.is_some_and(|bound| bound.contains_key(&name)) {
-            let table = name.clone();
-            match ask(&shards[shard], |reply| Command::Release {
-                table,
-                keep: false,
-                reply,
-            })
-            .await?
-            {
-                Ok(()) => tracing::info!(
-                    table = name.as_str(),
-                    "dropped a bound table no served predictor needs"
-                ),
-                Err(error) => tracing::error!(
-                    table = name.as_str(),
-                    "dropping a bound table no served predictor needs: {error}"
-                ),
-            }
-            continue;
-        }
         if rotate {
             // Rewrites the log under the current key before it takes writes.
             let table = name.clone();
@@ -259,7 +227,7 @@ pub async fn restore(
             );
         }
         tracing::info!(table = name.as_str(), shard, "restored");
-        if !binding {
+        if fingerprint.is_none() {
             placement.insert(
                 name,
                 Placement {

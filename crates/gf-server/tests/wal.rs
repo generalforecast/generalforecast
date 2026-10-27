@@ -1186,3 +1186,26 @@ fn a_page_of_entries_stops_at_its_byte_bound_past_its_first_entry() {
     assert_eq!(page.len(), 2);
     assert_eq!(page, all[..2]);
 }
+
+#[test]
+fn a_log_whose_head_names_records_is_refused_not_freed_when_cut_inside_its_definition() {
+    let directory = tempdir();
+    let path = directory.join("payments.log");
+    let keys = Keys::only(key(7));
+    drop(written(&path, &records()));
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(26)
+        .unwrap();
+    assert!(matches!(
+        Log::open(&path, &keys).err(),
+        Some(LogError::Head(_))
+    ));
+    assert!(setup::open_log(&path, &keys).unwrap().is_none());
+    assert!(
+        path.exists(),
+        "a log that lost acknowledged records stays where it is"
+    );
+}

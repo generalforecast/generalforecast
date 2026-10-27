@@ -124,13 +124,13 @@ async fn a_delete_action_holds_its_keys_against_the_request_budget() {
 }
 
 #[tokio::test]
-async fn quantile_levels_are_bounded_and_ordered_as_the_models_api_bounds_them() {
+async fn quantile_levels_are_bounded_as_the_models_api_bounds_them() {
     let mut client = client(1 << 30, TOKEN).await;
     // Past the Models API's most levels, and small enough for a header.
     let many: Vec<String> = (1..=120)
         .map(|k| format!("{:.4}", k as f64 / 121.0))
         .collect();
-    for levels in [many.join(","), "0.9,0.1".to_string(), "0.5,0.5".to_string()] {
+    for levels in [many.join(","), "0.5,1.5".to_string(), "0.5,".to_string()] {
         client.add_header(QUANTILES, &levels).unwrap();
         let descriptor = FlightDescriptor::new_path(vec!["predict".into(), "rows".into()]);
         let messages = stream::iter([Ok(FlightData::new().with_descriptor(descriptor))]);

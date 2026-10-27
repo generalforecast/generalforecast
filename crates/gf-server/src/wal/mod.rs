@@ -1069,11 +1069,15 @@ impl Replay {
             torn: None,
             done: false,
         };
-        // The definition is synced before a creation is acknowledged, so a
-        // log that ends inside it holds nothing anyone was told was kept.
+        // A creation writes its head through the definition alone, then the
+        // definition, and is acknowledged once that is synced; so a log whose
+        // head names no more ends inside it only when the creation never
+        // finished. One whose head names more lost acknowledged entries.
+        let unfinished = head.length <= 1;
         let frame = match entries.next_entry() {
             Ok(Some(plain)) => Frame::from_bytes(&plain)?,
-            Ok(None) | Err(LogError::Head(_)) => return Err(LogError::Unfinished),
+            Ok(None) | Err(LogError::Head(_)) if unfinished => return Err(LogError::Unfinished),
+            Ok(None) => return Err(LogError::Malformed("the log has no definition".to_string())),
             Err(error) => return Err(error),
         };
         let definition = definition_from(&frame)?;

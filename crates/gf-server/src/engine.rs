@@ -352,9 +352,9 @@ impl Engine {
 
     /// Writes labeled rows, once, into a durable table on the shard their
     /// fingerprint names; answers the table's quantile levels, if it
-    /// predicts values. A table a previous start bound and restored there is
-    /// kept when it holds these rows' definition and count, filled when it
-    /// is empty, and bound again otherwise.
+    /// predicts values. A table an earlier start bound and restored there
+    /// is bound again, since rows the binder of then encoded need not be
+    /// the rows this one encodes.
     #[allow(clippy::too_many_arguments)]
     pub async fn bind(
         &self,
@@ -376,44 +376,34 @@ impl Engine {
         }))
         .map_err(|_| failed())?;
         let shard = self.durable(fingerprint);
-        let created = self
-            .exchange(shard, |reply| Command::Create {
-                definition: definition.clone(),
+        let create = |definition| {
+            move |reply| Command::Create {
+                definition,
                 terms: Terms::default(),
                 reply,
-            })
-            .await?;
-        let levels = match created {
+            }
+        };
+        let levels = match self.exchange(shard, create(definition.clone())).await? {
             Ok(levels) => levels,
             Err(ServerError::Exists(_)) => {
-                let described = self
-                    .exchange(shard, |reply| Command::Describe {
-                        table: table.clone(),
-                        reply,
-                    })
-                    .await??;
-                let same = described.definition.model == definition.model
-                    && described.definition.columns == definition.columns
-                    && described.definition.classes == definition.classes;
-                if same && described.rows == rows as u64 {
-                    return Ok(described.levels);
-                }
-                if !same || described.rows != 0 {
-                    self.exchange(shard, |reply| Command::Release {
+                let released = self
+                    .exchange(shard, |reply| Command::Release {
                         table: table.clone(),
                         keep: false,
                         reply,
                     })
-                    .await??;
-                    self.exchange(shard, |reply| Command::Create {
-                        definition,
-                        terms: Terms::default(),
-                        reply,
-                    })
-                    .await??
-                } else {
-                    described.levels
+                    .await?;
+                if let Err(error) = released {
+                    return Err(ApiError::new(
+                        "InternalError",
+                        format!(
+                            "table {table} is on disk from an earlier start but cannot be \
+                             bound again: {error}"
+                        ),
+                        500,
+                    ));
                 }
+                self.exchange(shard, create(definition)).await??
             }
             Err(error) => return Err(error.into()),
         };
@@ -582,10 +572,14 @@ pub fn bound_table(lock_digest: &str) -> Option<(TableName, [u8; 32])> {
     Some((name, fingerprint))
 }
 
-/// Whether `table` is a name `bound_table` gives.
+/// Whether `table` takes the prefix `bound_table` names tables with, in
+/// any case, as a filesystem that ignores case would read it.
 #[must_use]
 pub fn is_bound(table: &TableName) -> bool {
-    table.as_str().starts_with(BOUND_PREFIX)
+    table
+        .as_str()
+        .get(..BOUND_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(BOUND_PREFIX))
 }
 
 /// The shard of `shards` a bound table with `fingerprint` lives on.

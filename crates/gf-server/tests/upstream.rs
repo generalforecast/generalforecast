@@ -17,7 +17,7 @@ use axum::response::Response;
 use futures::StreamExt;
 use gf_core::catalog::Surface;
 use gf_server::budget::RequestBudget;
-use gf_server::http::{Front, Static, internal, owns, router};
+use gf_server::http::{Front, Static, dotted, internal, owns, router};
 use gf_server::upstream::Upstream;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -144,6 +144,7 @@ fn the_fronts_routes_are_owned_however_they_are_spelled() {
         (Method::POST, "/v1/projects/p/predictors/x/predict"),
         (Method::POST, "/v1/projects/p/Predictors/x/PREDICT"),
         (Method::GET, "/v1/projects/p/%6dodels"),
+        (Method::POST, "/v1/proj%65cts/p/predict"),
     ] {
         assert!(owns(&method, path), "{method} {path}");
     }
@@ -463,4 +464,50 @@ async fn the_upstream_is_ready_only_while_its_readyz_answers_200() {
     )
     .unwrap();
     assert!(!upstream.ready().await);
+}
+
+#[test]
+fn dot_segments_are_recognized_however_they_are_escaped() {
+    for path in [
+        "/./internal/v1/keys:introspect",
+        "/%2e/internal/v1/keys:introspect",
+        "/v1/../internal/v1/keys:introspect",
+        "/v1/projects/p/x/%2E%2e/predict",
+    ] {
+        assert!(dotted(path), "{path}");
+    }
+    for path in [
+        "/v1/projects/p/predict",
+        "/v1/projects/p/.hidden",
+        "/v1/projects/p/a..b",
+    ] {
+        assert!(!dotted(path), "{path}");
+    }
+}
+
+#[tokio::test]
+async fn no_spelling_of_a_route_reaches_the_upstream_as_another() {
+    let (origin, front) = origin_and_front().await;
+    for path in [
+        "/./internal/v1/keys:introspect",
+        "/%2e/internal/v1/keys:introspect",
+        "/v1/../internal/v1/keys:introspect",
+        "/v1/projects/p/x/../predict",
+        "/v1/proj%65cts/p/predict",
+    ] {
+        // Sent as written, without the client resolving its dot segments.
+        let mut stream = tokio::net::TcpStream::connect(front.trim_start_matches("http://"))
+            .await
+            .unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: x\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).await.unwrap();
+        assert!(!answer.contains("x-upstream"), "{path}: {answer}");
+        assert!(answer.starts_with("HTTP/1.1 4"), "{path}: {answer}");
+    }
+    assert_eq!(origin.hits.load(Ordering::SeqCst), 0);
 }

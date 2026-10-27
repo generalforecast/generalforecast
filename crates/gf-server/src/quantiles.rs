@@ -7,8 +7,9 @@
 use gf_core::request::MAX_LEVELS;
 
 /// The levels a comma-separated list names: at most `MAX_LEVELS` of them,
-/// each strictly between 0 and 1 and above the one before, as the Models
-/// API takes them too.
+/// as many as the Models API takes, each strictly between 0 and 1. They
+/// keep the order the caller gave, which names its answer's columns, as
+/// the Python client sends them.
 ///
 /// # Errors
 ///
@@ -24,9 +25,6 @@ pub fn parse_levels(text: &str) -> Result<Vec<f64>, String> {
     }
     if levels.iter().any(|level| !(*level > 0.0 && *level < 1.0)) {
         return Err("quantile levels are strictly between 0 and 1".to_string());
-    }
-    if levels.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err("quantile levels strictly increase".to_string());
     }
     Ok(levels)
 }
@@ -70,8 +68,10 @@ mod tests {
     use super::{MAX_LEVELS, parse_levels};
 
     #[test]
-    fn levels_are_bounded_in_count_and_strictly_increase() {
+    fn levels_are_bounded_in_count_and_range_and_keep_their_order() {
         assert_eq!(parse_levels("0.1, 0.5,0.9"), Ok(vec![0.1, 0.5, 0.9]));
+        assert_eq!(parse_levels("0.5,0.15"), Ok(vec![0.5, 0.15]));
+        assert_eq!(parse_levels("0.5,0.5"), Ok(vec![0.5, 0.5]));
         let most: Vec<String> = (1..=MAX_LEVELS)
             .map(|k| format!("{}", k as f64 / 100.0))
             .collect();
@@ -86,7 +86,7 @@ mod tests {
             parse_levels(&many.join(",")).is_err(),
             "past the most levels"
         );
-        for refused in ["", "0.5,0.5", "0.9,0.1", "0", "1", "x", "0.5,", "nan"] {
+        for refused in ["", "0", "1", "x", "0.5,", "nan", "-0.1"] {
             assert!(parse_levels(refused).is_err(), "{refused:?}");
         }
     }

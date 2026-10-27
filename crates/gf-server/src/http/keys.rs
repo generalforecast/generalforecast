@@ -135,14 +135,16 @@ pub struct Introspect {
     client: reqwest::Client,
     url: Arc<str>,
     token: Arc<str>,
-    cache: Mutex<HashMap<[u8; 32], Cached>>,
-    asking: Mutex<HashMap<[u8; 32], Asking>>,
+    cache: Arc<Mutex<HashMap<[u8; 32], Cached>>>,
+    asking: Arc<Mutex<HashMap<[u8; 32], Asking>>>,
 }
 
 /// An introspection answer, and until when it is trusted.
 type Cached = (Option<Principal>, Instant);
 
-/// An introspection call under way, which every request presenting its key awaits.
+/// An introspection call under way, which every request presenting its key
+/// awaits. It runs on a task of its own, so it ends, caches its answer and
+/// leaves the calls under way however many of its waiters go away.
 type Asking = Shared<BoxFuture<'static, Result<(Option<Principal>, Duration), ApiError>>>;
 
 /// What the introspection endpoint answers for a valid key.
@@ -176,8 +178,8 @@ impl Introspect {
             client,
             url: format!("{}/internal/v1/keys:introspect", base.trim_end_matches('/')).into(),
             token: token.into(),
-            cache: Mutex::new(HashMap::new()),
-            asking: Mutex::new(HashMap::new()),
+            cache: Arc::default(),
+            asking: Arc::default(),
         })
     }
 
@@ -189,52 +191,64 @@ impl Introspect {
             .map(|(principal, _)| principal.clone())
     }
 
-    /// Caches an answer. A full cache sheds what has expired, then the
-    /// refused keys, which a caller presenting random keys fills it with,
-    /// and only then the valid keys it still holds.
-    fn remember(&self, verifier: [u8; 32], principal: Option<Principal>, ttl: Duration) {
-        let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
-        if cache.len() >= CACHED_KEYS {
-            let now = Instant::now();
-            cache.retain(|_, (_, until)| *until > now);
-        }
-        if cache.len() >= CACHED_KEYS {
-            cache.retain(|_, (principal, _)| principal.is_some());
-        }
-        if cache.len() >= CACHED_KEYS {
-            cache.clear();
-        }
-        cache.insert(verifier, (principal, Instant::now() + ttl));
-    }
-
-    /// The introspection call for `verifier`: the one under way, or a new one.
+    /// The introspection call for `verifier`: the one under way, or a new
+    /// one, which caches its answer and forgets itself once it ends.
     fn asking(&self, verifier: [u8; 32]) -> Asking {
         let mut asking = self.asking.lock().unwrap_or_else(PoisonError::into_inner);
-        asking
-            .entry(verifier)
-            .or_insert_with(|| {
-                ask(
-                    self.client.clone(),
-                    self.url.clone(),
-                    self.token.clone(),
-                    verifier,
-                )
-                .boxed()
-                .shared()
-            })
-            .clone()
-    }
-
-    /// Forgets a finished call, unless a later one for the key took its place.
-    fn asked(&self, verifier: &[u8; 32], call: &Asking) {
-        let mut asking = self.asking.lock().unwrap_or_else(PoisonError::into_inner);
-        if asking
-            .get(verifier)
-            .is_some_and(|current| current.ptr_eq(call))
-        {
-            asking.remove(verifier);
+        if let Some(call) = asking.get(&verifier) {
+            return call.clone();
         }
+        let (client, url, token) = (self.client.clone(), self.url.clone(), self.token.clone());
+        let (cache, calls) = (self.cache.clone(), self.asking.clone());
+        // Forgetting the call waits for this lock, so it follows the insert below.
+        let task = tokio::spawn(async move {
+            let answered = ask(client, url, token, verifier).await;
+            if let Ok((principal, ttl)) = &answered {
+                remember(&cache, verifier, principal.clone(), *ttl);
+            }
+            calls
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&verifier);
+            answered
+        });
+        let call = async move {
+            task.await.unwrap_or_else(|_| {
+                Err(ApiError::new(
+                    "CredentialUnavailable",
+                    "cannot check API keys now",
+                    503,
+                ))
+            })
+        }
+        .boxed()
+        .shared();
+        asking.insert(verifier, call.clone());
+        call
     }
+}
+
+/// Caches an answer. A full cache sheds what has expired, then the refused
+/// keys, which a caller presenting random keys fills it with, and only then
+/// the valid keys it still holds.
+fn remember(
+    cache: &Mutex<HashMap<[u8; 32], Cached>>,
+    verifier: [u8; 32],
+    principal: Option<Principal>,
+    ttl: Duration,
+) {
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    if cache.len() >= CACHED_KEYS {
+        let now = Instant::now();
+        cache.retain(|_, (_, until)| *until > now);
+    }
+    if cache.len() >= CACHED_KEYS {
+        cache.retain(|_, (principal, _)| principal.is_some());
+    }
+    if cache.len() >= CACHED_KEYS {
+        cache.clear();
+    }
+    cache.insert(verifier, (principal, Instant::now() + ttl));
 }
 
 /// Asks the control plane who `verifier`'s key is, and for how long to trust the answer.
@@ -289,14 +303,7 @@ impl KeyStore for Introspect {
             let verifier = digest(presented(authorization)?);
             let principal = match self.cached(&verifier) {
                 Some(principal) => principal,
-                None => {
-                    let call = self.asking(verifier);
-                    let answered = call.clone().await;
-                    self.asked(&verifier, &call);
-                    let (principal, ttl) = answered?;
-                    self.remember(verifier, principal.clone(), ttl);
-                    principal
-                }
+                None => self.asking(verifier).await?.0,
             };
             principal.ok_or_else(|| ApiError::unauthorized("invalid API key"))
         })

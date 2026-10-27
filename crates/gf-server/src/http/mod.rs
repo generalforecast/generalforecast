@@ -60,7 +60,7 @@ mod predictions;
 use incoming::{
     check_endpoint, check_headers, check_origin, environment, names_match, parse_envelope, resolve,
 };
-pub use incoming::{internal, owns};
+pub use incoming::{dotted, internal, owns};
 pub use keys::{Introspect, KeyStore, Principal, Static};
 pub(crate) use predictions::snapshot_rows;
 use predictions::{adhoc_predict_with, dispatch};
@@ -234,7 +234,7 @@ impl From<RequestError> for ApiError {
 impl From<ServerError> for ApiError {
     fn from(error: ServerError) -> Self {
         let (status, code, message) = error.http();
-        if status >= 500 && !matches!(error, ServerError::Busy(_)) {
+        if matches!(error, ServerError::Internal(_)) {
             tracing::error!("inference failed: {error}");
         }
         Self::new(code, message, status)
@@ -643,6 +643,9 @@ fn failure(scope: Option<&Scope>, error: &ApiError) -> Response {
 }
 
 async fn handle(State(front): State<Arc<Front>>, request: Request) -> Response {
+    if dotted(request.uri().path()) {
+        return failure(None, &ApiError::validation("invalid request target"));
+    }
     if internal(request.uri().path()) {
         return failure(None, &ApiError::new("NotFound", "route not found", 404));
     }
@@ -710,6 +713,15 @@ async fn answer(
             .filter(|length| length.bytes().all(|byte| byte.is_ascii_digit()))
             .and_then(|length| length.parse::<usize>().ok())
             .ok_or_else(|| ApiError::new("ValidationError", "invalid HTTP message", 400))?,
+        // The budget is charged by the length a body states before it is read,
+        // so a body that states none, as HTTP/2 allows, is refused.
+        None if parts.method == Method::POST => {
+            return Err(ApiError::new(
+                "LengthRequired",
+                "a request body states its Content-Length",
+                411,
+            ));
+        }
         None => 0,
     };
     if length > MAX_BYTES {
