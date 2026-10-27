@@ -4,7 +4,7 @@
 //! `gf-router run --config router.toml`: forwards clients to the nodes that
 //! serve their tables. `init` writes a starter configuration, and `check`
 //! looks at the configuration and reaches each node. People reach these
-//! through `gf serve --node`, `gf serve --config` and `gf serve --check`.
+//! through `gf admin router init`, `check` and `serve`.
 //!
 //! SIGHUP reloads the node list, the replica count, and the client tokens and
 //! quotas; tables move to match.
@@ -227,8 +227,8 @@ fn init(
     } else {
         println!("each node lists the replication token in replication_tokens");
     }
-    println!("next: gf serve --check --config {}", path.display());
-    println!("      gf serve --config {}", path.display());
+    println!("next: gf admin router check --config {}", path.display());
+    println!("      gf admin router serve --config {}", path.display());
     Ok(())
 }
 
