@@ -35,6 +35,7 @@ from generalforecast.models.series import (
     SeriesFunctions,
     SeriesGroup,
     SeriesProperties,
+    median_index,
     padded_horizon,
 )
 from generalforecast.nn.attention import (
@@ -389,7 +390,7 @@ def _quantiles(
     """
     rows, patches, _ = tokens.shape
     levels = model.quantiles
-    middle = levels.index(0.5)
+    middle = median_index(levels)
     raw = residual_block(model.head, tokens).astype(jnp.float32)
     raw = raw.reshape(rows, patches, model.patch, len(levels))
     widths = [0.0] * len(levels)
@@ -467,7 +468,7 @@ def _refine(
     if patches <= 1:
         return quantiles
     anchor = _scale_of(model, state)
-    median = quantiles[..., model.quantiles.index(0.5)].reshape(
+    median = quantiles[..., median_index(model.quantiles)].reshape(
         -1, patches, model.patch
     )
     sinh_median = (median - anchor.loc[:, None, None]) / anchor.scale[:, None, None]
@@ -682,7 +683,7 @@ def _feedback(
     future_observed: Bool[Array, " rows steps"],
 ) -> tuple[Float[Array, " rows steps"], Bool[Array, " rows steps"]]:
     """What a block adds to the context: medians, known futures, or blanks."""
-    median = quantiles[..., model.quantiles.index(0.5)]
+    median = quantiles[..., median_index(model.quantiles)]
     median = jnp.where(jnp.isfinite(median) & (jnp.abs(median) < EXTREME), median, 0.0)
     known, past = (roles == KNOWN)[:, None], (roles == PAST)[:, None]
     values = jnp.where(known, future, jnp.where(past, 0.0, median))

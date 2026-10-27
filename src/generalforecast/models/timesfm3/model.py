@@ -36,6 +36,7 @@ from generalforecast.models.series import (
     SeriesFunctions,
     SeriesGroup,
     SeriesProperties,
+    median_index,
     padded_horizon,
 )
 from generalforecast.nn.attention import (
@@ -430,7 +431,7 @@ def _refined(
     """
     rows, patches, _ = raw.shape
     rolls = model.output_patch // model.patch
-    middle = len(model.quantiles) // 2
+    middle = median_index(model.quantiles)
 
     def medians(outputs: Array) -> Array:
         return outputs.reshape(

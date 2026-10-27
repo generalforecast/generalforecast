@@ -12,6 +12,7 @@ attention caches, the slot layout, the pools, compiled programs and the frame
 protocol.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol
 
@@ -171,6 +172,26 @@ class SeriesFunctions(NamedTuple):
     decode: Decode | None
     extend: Extend | None
     properties: Properties
+
+
+def median_index(levels: Sequence[float]) -> int:
+    """Where the median, level 0.5, sits among a forecaster's quantile levels.
+
+    Forecasters that feed their medians back or fan their quantiles out from
+    it find it by its level, since a grid need not put it in the middle.
+
+    Args:
+        levels: The quantile levels.
+
+    Returns:
+        The median's index.
+
+    Raises:
+        ValueError: If no level is 0.5.
+    """
+    if 0.5 not in levels:
+        raise ValueError(f"the quantile levels {tuple(levels)} have no median, 0.5")
+    return list(levels).index(0.5)
 
 
 def padded_horizon(values: Array, steps: int, fill: float | bool) -> Array:

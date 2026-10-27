@@ -15,8 +15,18 @@ from generalforecast.models.timesfm3.checkpoint import (
     check_supported,
     timesfm_from_state,
 )
-from generalforecast.models.timesfm3.model import encode, timesfm_functions
-from tests.models.timesfm3.tiny import PATCH, tiny_checkpoint, tiny_timesfm
+from generalforecast.models.timesfm3.model import (
+    Moments,
+    _refined,
+    encode,
+    timesfm_functions,
+)
+from tests.models.timesfm3.tiny import (
+    OUTPUT_PATCH,
+    PATCH,
+    tiny_checkpoint,
+    tiny_timesfm,
+)
 
 
 def test_unsupported_settings_raise() -> None:
@@ -68,3 +78,31 @@ def test_encode_refuses_known_covariates() -> None:
     assert bool((data.roles == KNOWN).any())
     with pytest.raises(ValueError, match="known covariate"):
         encode(tiny_timesfm(), data)
+
+
+def test_the_horizon_frames_follow_the_median_by_its_level() -> None:
+    # Nine levels, as the tiny head emits, with the median off the middle.
+    levels = (0.1, 0.2, 0.3, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95)
+    state, settings = tiny_checkpoint()
+    model = timesfm_from_state(state, {**settings, "quantiles": list(levels)})
+    rows, steps = 2, OUTPUT_PATCH // PATCH
+    # No values seen yet, in a frame of scale 1.
+    zeros = jnp.zeros(rows, jnp.float32)
+    start = Moments(zeros, zeros, zeros + 1)
+    # The median predicts 3 at every step; every other level predicts 100.
+    last = jnp.full((rows, OUTPUT_PATCH, len(levels)), 100.0)
+    last = last.at[..., levels.index(0.5)].set(3.0).reshape(rows, -1)
+    raw = jnp.broadcast_to(last[:, None], (rows, steps, last.shape[-1]))
+
+    frames = _refined(model, start, last, raw)
+
+    np.testing.assert_allclose(frames.mean, 3.0)
+    np.testing.assert_allclose(frames.deviation, 0.0)
+
+
+def test_a_grid_without_a_median_is_refused_at_load() -> None:
+    state, settings = tiny_checkpoint()
+    levels = [0.1, 0.2, 0.3, 0.4, 0.45, 0.6, 0.7, 0.8, 0.9]
+
+    with pytest.raises(NotImplementedError, match="must hold the median"):
+        timesfm_from_state(state, {**settings, "quantiles": levels})

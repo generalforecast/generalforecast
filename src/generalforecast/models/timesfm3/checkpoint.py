@@ -160,6 +160,9 @@ def check_supported(settings: dict[str, Any]) -> None:
     )
     if settings.get("output_patch_len", 0) % max(settings.get("input_patch_len", 1), 1):
         raise NotImplementedError("TimesFM output patches must be whole input patches")
+    # The horizon's frames follow the median, which the model finds by its level.
+    if 0.5 not in settings.get("quantiles", ()):
+        raise NotImplementedError("TimesFM quantiles must hold the median")
 
 
 def _norm(state: dict[str, Array], name: str) -> RMSNormParameters:
