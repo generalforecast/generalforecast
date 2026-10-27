@@ -32,6 +32,7 @@ from generalforecast.models.series import (
     SeriesProperties,
 )
 from generalforecast.nn.attention import AttentionCache
+from generalforecast.runtime.device import to_cache_dtype
 from generalforecast.runtime.paging import cache_layout
 from generalforecast.runtime.shapes import pad_rows
 
@@ -51,6 +52,7 @@ def table(
     queries: int = 8,
     features: int = 5,
     seed: int = 0,
+    classes: int = 3,
 ) -> Table:
     """A random table with a missing value in the context and in the queries.
 
@@ -60,9 +62,10 @@ def table(
         queries: Query rows.
         features: Columns.
         seed: The random seed.
+        classes: Classes of a classifier, which the context rows cycle through.
 
     Returns:
-        The table, with three classes for a classifier.
+        The table.
     """
     generator = np.random.default_rng(seed)
     context = generator.normal(size=(rows, features)).astype(np.float32)
@@ -73,8 +76,9 @@ def table(
         targets = jnp.asarray(np.nansum(context, axis=1), dtype=jnp.float32)
         num_classes = 0
     else:
-        targets = jnp.asarray(generator.permutation(np.arange(rows) % 3), jnp.int32)
-        num_classes = 3
+        labels = generator.permutation(np.arange(rows) % classes)
+        targets = jnp.asarray(labels, jnp.int32)
+        num_classes = classes
     return Table(jnp.asarray(context), targets, jnp.asarray(query_rows), num_classes)
 
 
@@ -83,20 +87,27 @@ def predict(
     model: Any,
     data: Table,
     num_rows: int | jax.Array | None = None,
+    categorical: jax.Array | None = None,
 ) -> jax.Array:
-    """The five contract calls in the order the engine makes them.
+    """The five contract calls in the order, and with the arguments, the engine makes them.
 
     Args:
         functions: The model's contract calls.
         model: Its parameters.
         data: The table.
         num_rows: Real context rows, the rest padding, if any.
+        categorical: Which columns hold category codes, if any.
 
     Returns:
         The query rows' predictions.
     """
     state, context_rows = functions.fit(
-        model, data.features, data.targets, data.num_classes, num_rows=num_rows
+        model,
+        data.features,
+        data.targets,
+        data.num_classes,
+        num_rows=num_rows,
+        categorical=categorical,
     )
     cache = functions.encode(
         model, state, context_rows, data.targets, num_rows=num_rows
@@ -136,6 +147,21 @@ def padded(data: Table, context_size: int, query_size: int, seed: int = 0) -> Ta
     )
 
 
+def coded(data: Table, column: int) -> tuple[Table, jax.Array]:
+    """The table with `column` holding category codes, and the mask that says so.
+
+    The context holds codes 0 to 3 and a missing one; the queries a code the
+    context lacks, as the engine's tables give unseen categories.
+    """
+    context, queries = np.array(data.features), np.array(data.queries)
+    context[:, column] = np.arange(len(context)) % 4
+    context[1, column] = np.nan
+    queries[:, column] = np.arange(len(queries)) % 5
+    mask = jnp.zeros(context.shape[1], bool).at[column].set(True)
+    changed = data._replace(features=jnp.asarray(context), queries=jnp.asarray(queries))
+    return changed, mask
+
+
 def close(actual: Any, expected: Any, tolerance: float = 1e-5) -> None:
     """Raises unless two trees of arrays match within `tolerance`."""
     jax.tree.map(
@@ -161,41 +187,106 @@ def check(
     *,
     features: int = 5,
     tolerance: float = 1e-5,
+    cache_drift: float = 5e-2,
 ) -> None:
     """Runs a model through every way the engine calls it, on random tables.
 
-    Checks that its properties describe its outputs and need only parameter
-    shapes; that `fit` returns the context rows `embed` would; that rows embed
-    and queries decode apart as together; that it jits; that padding past
-    `num_rows`, garbage and NaN included, reaches no real row; that columns
-    constant or empty in the context are left out; that tables batch with
-    `jax.vmap`;
-    that `decode` reads only the keys a cache's mask allows; and that its
-    caches page by rows.
+    Checks that its calls take the arguments the engine passes, a categorical
+    mask among them; that its properties describe its outputs and need only
+    parameter shapes; that `fit` returns the context rows `embed` would; that
+    rows embed and queries decode apart as together; that it jits; that
+    padding past `num_rows`, garbage and NaN included, reaches no real row;
+    that columns constant or empty in the context are left out; that tables
+    batch with `jax.vmap`; that `decode` reads only the keys a cache's mask
+    allows within its length; that it serves every class count up to its
+    slots; and that its caches page by rows. What its properties and
+    functions claim is checked too: that it reads stored caches, scales and
+    all; that it takes context rows without a target; that `decode_reading`
+    decodes as `decode`; and that `crowded_categories` counts columns.
 
     Args:
         functions: The model's contract calls.
         parameters: Its parameters.
         features: Columns of the random tables.
         tolerance: How far results may move between equivalent calls.
+        cache_drift: How far a float16, bfloat16 or int8 cache may move
+            predictions of a model that reads stored caches: probabilities,
+            or medians per target deviation.
 
     Raises:
-        AssertionError: Naming the first check the model fails.
+        AssertionError: Naming the first check the model fails, whether its
+            results differ or one of its calls raises.
     """
-    properties = functions.properties(parameters)
+    try:
+        properties = functions.properties(parameters)
+    except Exception as error:
+        raise AssertionError(f"properties: {_reason(error)}") from error
     _require(
         isinstance(properties, TabularProperties),
-        "properties must return TabularProperties",
+        "properties: properties must return TabularProperties",
     )
     regression = properties.regression
+    limits = Limits(features, tolerance, cache_drift)
     for name, run in _CHECKS:
         try:
-            run(functions, parameters, properties, regression, features, tolerance)
+            run(functions, parameters, properties, regression, limits)
         except AssertionError as error:
             raise AssertionError(f"{name}: {error}") from None
+        except Exception as error:
+            raise AssertionError(f"{name}: {_reason(error)}") from error
 
 
-def _properties(functions, model, properties, regression, features, tolerance):
+class Limits(NamedTuple):
+    """The table width and tolerances a check runs with."""
+
+    features: int
+    tolerance: float
+    cache_drift: float
+
+
+def _reason(error: Exception) -> str:
+    """A call's error, as a failed check reports it."""
+    return f"a call raised {type(error).__name__}: {error}"
+
+
+def _fit(
+    functions: TabularFunctions,
+    model: Any,
+    data: Table,
+    num_rows: int | jax.Array | None = None,
+    categorical: jax.Array | None = None,
+) -> tuple[Any, jax.Array]:
+    """`fit`, with every argument the engine passes it."""
+    return functions.fit(
+        model,
+        data.features,
+        data.targets,
+        data.num_classes,
+        num_rows=num_rows,
+        categorical=categorical,
+    )
+
+
+def _calls(functions, model, properties, regression, limits):
+    """The calls take the arguments the engine passes, a categorical mask among them.
+
+    The engine passes `fit` its row count and categorical mask, None or not,
+    and `encode` its row count, by keyword; padding stays invisible with
+    category codes in the table.
+    """
+    data, mask = coded(table(regression, features=limits.features), 0)
+    for categorical in (None, mask):
+        predictions = predict(functions, model, data, categorical=categorical)
+        _require(bool(np.isfinite(predictions).all()), "predictions are not finite")
+    small = coded(table(regression, rows=20, queries=6, features=limits.features), 0)[0]
+    close(
+        predict(functions, model, padded(small, 32, 8), 20, mask)[:6],
+        predict(functions, model, small, categorical=mask),
+        limits.tolerance,
+    )
+
+
+def _properties(functions, model, properties, regression, limits):
     """Properties describe the outputs, and follow from parameter shapes alone."""
     abstract = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), model)
     _require(
@@ -203,10 +294,8 @@ def _properties(functions, model, properties, regression, features, tolerance):
         "properties must follow from parameter shapes alone",
     )
     hash(properties)
-    data = table(regression, features=features)
-    state, context_rows = functions.fit(
-        model, data.features, data.targets, data.num_classes
-    )
+    data = table(regression, features=limits.features)
+    state, context_rows = _fit(functions, model, data)
     query_rows = functions.embed(model, state, data.queries)
     predictions = predict(functions, model, data)
     _require(
@@ -219,22 +308,28 @@ def _properties(functions, model, properties, regression, features, tolerance):
         f"embed returned query rows of shape {query_rows.shape}, unlike the "
         f"context's {context_rows.shape}",
     )
-    columns = properties.num_outputs if regression else data.num_classes
+    _outputs(properties, data, predictions, limits.tolerance)
+
+
+def _outputs(
+    properties: TabularProperties, data: Table, predictions: jax.Array, tolerance: float
+) -> None:
+    """Predictions have a column per class or quantile, and classes' sum to 1."""
+    columns = properties.num_outputs if properties.regression else data.num_classes
     _require(
         predictions.shape == (data.queries.shape[0], columns),
         f"postprocess returned predictions of shape {predictions.shape}, "
         f"not ({data.queries.shape[0]}, {columns})",
     )
-    if not regression:
+    _require(bool(np.isfinite(predictions).all()), "predictions are not finite")
+    if not properties.regression:
         close(predictions.sum(axis=-1), jnp.ones(data.queries.shape[0]), tolerance)
 
 
-def _fit_embeds(functions, model, properties, regression, features, tolerance):
+def _fit_embeds(functions, model, properties, regression, limits):
     """`fit` returns the context rows `embed` would, and rows embed apart as together."""
-    data = table(regression, features=features)
-    state, context_rows = functions.fit(
-        model, data.features, data.targets, data.num_classes
-    )
+    data = table(regression, features=limits.features)
+    state, context_rows = _fit(functions, model, data)
     close(context_rows, functions.embed(model, state, data.features, data.targets))
     apart = jnp.concatenate(
         [
@@ -242,16 +337,14 @@ def _fit_embeds(functions, model, properties, regression, features, tolerance):
             functions.embed(model, state, data.queries[3:]),
         ]
     )
-    close(apart, functions.embed(model, state, data.queries), tolerance)
+    close(apart, functions.embed(model, state, data.queries), limits.tolerance)
 
 
-def _decodes_apart(functions, model, properties, regression, features, tolerance):
+def _decodes_apart(functions, model, properties, regression, limits):
     """Queries decode apart as together."""
-    data = table(regression, features=features)
-    state, context_rows = functions.fit(
-        model, data.features, data.targets, data.num_classes
-    )
-    cache = functions.encode(model, state, context_rows, data.targets)
+    data = table(regression, features=limits.features)
+    state, context_rows = _fit(functions, model, data)
+    cache = functions.encode(model, state, context_rows, data.targets, num_rows=None)
     query_rows = functions.embed(model, state, data.queries)
     together = functions.decode(model, state, cache, query_rows)
     apart = jnp.concatenate(
@@ -260,12 +353,12 @@ def _decodes_apart(functions, model, properties, regression, features, tolerance
             functions.decode(model, state, cache, query_rows[3:]),
         ]
     )
-    close(apart, together, tolerance)
+    close(apart, together, limits.tolerance)
 
 
-def _jits(functions, model, properties, regression, features, tolerance):
+def _jits(functions, model, properties, regression, limits):
     """The contract calls compile with `jax.jit`."""
-    data = table(regression, features=features)
+    data = table(regression, features=limits.features)
     jitted = TabularFunctions(
         fit=jax.jit(functions.fit, static_argnames="num_classes"),
         embed=jax.jit(functions.embed),
@@ -274,19 +367,18 @@ def _jits(functions, model, properties, regression, features, tolerance):
         postprocess=jax.jit(functions.postprocess),
         properties=functions.properties,
     )
-    close(predict(jitted, model, data), predict(functions, model, data), tolerance)
+    close(
+        predict(jitted, model, data), predict(functions, model, data), limits.tolerance
+    )
 
 
-def _padding(functions, model, properties, regression, features, tolerance):
+def _padding(functions, model, properties, regression, limits):
     """Padding past `num_rows`, garbage and NaN included, reaches no real row."""
-    data = table(regression, rows=20, queries=6, features=features)
+    tolerance = limits.tolerance
+    data = table(regression, rows=20, queries=6, features=limits.features)
     pad = padded(data, context_size=32, query_size=8)
-    state, context_rows = functions.fit(
-        model, data.features, data.targets, data.num_classes
-    )
-    padded_state, padded_rows = functions.fit(
-        model, pad.features, pad.targets, data.num_classes, num_rows=20
-    )
+    state, context_rows = _fit(functions, model, data)
+    padded_state, padded_rows = _fit(functions, model, pad, num_rows=20)
     close(padded_state, state, tolerance)
     close(padded_rows[:20], context_rows, tolerance)
     close(
@@ -296,14 +388,14 @@ def _padding(functions, model, properties, regression, features, tolerance):
     )
 
 
-def _constant_columns(functions, model, properties, regression, features, tolerance):
+def _constant_columns(functions, model, properties, regression, limits):
     """Columns constant or empty in the context are left out of predictions.
 
     Upstream preprocessing drops them, so what they hold, in the context or
     in the queries, changes nothing. The reference tests check that the rest
     predicts as upstream does without them.
     """
-    data = table(regression, features=features)
+    data = table(regression, features=limits.features)
     context, queries = np.array(data.features), np.array(data.queries)
     context[:, 0] = np.nan
     context[:, 1] = 5.0
@@ -322,13 +414,13 @@ def _constant_columns(functions, model, properties, regression, features, tolera
     changed = Table(
         jnp.asarray(context), data.targets, jnp.asarray(queries), data.num_classes
     )
-    close(predictions, predict(functions, model, changed), tolerance)
+    close(predictions, predict(functions, model, changed), limits.tolerance)
 
 
-def _vmap(functions, model, properties, regression, features, tolerance):
+def _vmap(functions, model, properties, regression, limits):
     """Tables of different sizes, padded to one, batch with `jax.vmap`."""
     tables = [
-        table(regression, rows=rows, queries=6, features=features, seed=seed)
+        table(regression, rows=rows, queries=6, features=limits.features, seed=seed)
         for rows, seed in ((20, 0), (27, 1))
     ]
     pads = [padded(data, 32, 8, seed) for seed, data in enumerate(tables)]
@@ -344,13 +436,19 @@ def _vmap(functions, model, properties, regression, features, tolerance):
     rows = jnp.asarray([20, 27], dtype=jnp.int32)
     batched = jax.vmap(one)(context, targets, queries, rows)
     for index, data in enumerate(tables):
-        close(batched[index, :6], predict(functions, model, data), tolerance)
+        close(batched[index, :6], predict(functions, model, data), limits.tolerance)
 
 
-def _mask(functions, model, properties, regression, features, tolerance):
-    """`decode` reads only the keys a cache's mask allows."""
-    data = table(regression, rows=24, queries=4, features=features)
-    state, rows = functions.fit(model, data.features, data.targets, data.num_classes)
+def _mask(functions, model, properties, regression, limits):
+    """`decode` reads only the keys a cache's mask allows, within its length.
+
+    The engine joins units' contexts under a mask of the keys each query
+    reads, and gives a unit that reads its whole context a mask over the
+    call's padded rows, which only its length bounds.
+    """
+    tolerance = limits.tolerance
+    data = table(regression, rows=24, queries=4, features=limits.features)
+    state, rows = _fit(functions, model, data)
     first = functions.encode(model, state, rows[:12], data.targets[:12])
     second = functions.encode(model, state, rows[12:], data.targets[12:])
     queries = functions.embed(model, state, data.queries)
@@ -368,20 +466,135 @@ def _mask(functions, model, properties, regression, features, tolerance):
             mask=mask,
         )
 
-    joined = jax.tree.map(
-        join, first, second, is_leaf=lambda node: isinstance(node, AttentionCache)
-    )
+    joined = _caches(join, first, second)
     outputs = functions.decode(model, state, joined, queries)
     close(outputs[:2], functions.decode(model, state, first, queries[:2]), tolerance)
     close(outputs[2:], functions.decode(model, state, second, queries[2:]), tolerance)
+    # Padding like the real rows but labeled otherwise, which would move
+    # predictions if a query read it.
+    copies = data.targets[:8]
+    relabeled = copies + 10 if regression else (copies + 1) % data.num_classes
+    pad = data._replace(
+        features=jnp.concatenate([data.features, data.features[:8][::-1]]),
+        targets=jnp.concatenate([data.targets, relabeled[::-1]]),
+    )
+    state, rows = _fit(functions, model, pad, num_rows=24)
+    cache = functions.encode(model, state, rows, pad.targets, num_rows=24)
+    queries = functions.embed(model, state, pad.queries)
+    every = jnp.ones((queries.shape[0], rows.shape[0]), bool)
+    close(
+        functions.decode(
+            model, state, _caches(lambda c: c._replace(mask=every), cache), queries
+        ),
+        functions.decode(model, state, cache, queries),
+        tolerance,
+    )
 
 
-def _pages(functions, model, properties, regression, features, tolerance):
+def _caches(change: Any, *caches: Any) -> Any:
+    """Each attention cache of a context cache, changed."""
+    return jax.tree.map(
+        change, *caches, is_leaf=lambda node: isinstance(node, AttentionCache)
+    )
+
+
+def _class_counts(functions, model, properties, regression, limits):
+    """A classifier serves any class count up to its slots, not only three."""
+    if regression:
+        return
+    slots = properties.class_slots
+    for classes in sorted({2, min(slots, 7), min(slots, 32)}):
+        data = table(False, features=limits.features, classes=classes)
+        _outputs(properties, data, predict(functions, model, data), limits.tolerance)
+
+
+def _stored(functions, model, properties, regression, limits):
+    """A model that reads stored caches reads them as the runtime stores them, scales and all."""
+    if not properties.stored_cache:
+        return
+    data = table(regression, rows=40, queries=12, features=limits.features)
+    state, rows = _fit(functions, model, data)
+    cache = functions.encode(model, state, rows, data.targets)
+    queries = functions.embed(model, state, data.queries)
+
+    def predictions(cache: Any) -> jax.Array:
+        outputs = functions.decode(model, state, cache, queries)
+        return functions.postprocess(model, state, outputs)
+
+    exact = predictions(cache)
+    for dtype in ("float16", "bfloat16", "int8"):
+        moved = jnp.abs(predictions(to_cache_dtype(cache, jnp.dtype(dtype))) - exact)
+        if regression:
+            middle = exact.shape[-1] // 2
+            drift = float(jnp.max(moved[:, middle]) / jnp.std(data.targets))
+        else:
+            drift = float(jnp.max(moved))
+        _require(
+            drift <= limits.cache_drift,
+            f"a {dtype} cache moves predictions by {drift:.3g}, past "
+            f"{limits.cache_drift}",
+        )
+
+
+def _unlabeled(functions, model, properties, regression, limits):
+    """A model that takes context rows without a target does, padding still invisible."""
+    if not properties.unlabeled_context:
+        return
+    data = table(regression, rows=20, queries=6, features=limits.features)
+    unknown = jnp.nan if regression else -1
+    data = data._replace(targets=data.targets.at[jnp.asarray([2, 9])].set(unknown))
+    predictions = predict(functions, model, data)
+    _outputs(properties, data, predictions, limits.tolerance)
+    close(
+        predict(functions, model, padded(data, 32, 8), num_rows=20)[:6],
+        predictions,
+        limits.tolerance,
+    )
+
+
+def _reading(functions, model, properties, regression, limits):
+    """`decode_reading` decodes as `decode`, whatever reads the cache's parts."""
+    if functions.decode_reading is None:
+        return
+    data = table(regression, features=limits.features)
+    state, rows = _fit(functions, model, data)
+    cache = functions.encode(model, state, rows, data.targets)
+    queries = functions.embed(model, state, data.queries)
+
+    def read(after: Any, part: Any) -> Any:
+        return part(cache)
+
+    close(
+        functions.decode_reading(model, state, read, queries),
+        functions.decode(model, state, cache, queries),
+        limits.tolerance,
+    )
+
+
+def _crowded(functions, model, properties, regression, limits):
+    """`crowded_categories` counts columns, of one state or of states stacked."""
+    count = functions.crowded_categories
+    if count is None:
+        return
+    data, mask = coded(table(regression, features=limits.features), 0)
+    for categorical in (None, mask):
+        state, _ = _fit(functions, model, data, categorical=categorical)
+        stacked = jax.tree.map(lambda leaf: jnp.stack([leaf, leaf]), state)
+        for fitted in (state, stacked):
+            crowded = count(fitted)
+            _require(
+                type(crowded) is int and 0 <= crowded <= limits.features,
+                f"crowded_categories returned {crowded!r}, not a column count",
+            )
+
+
+def _pages(functions, model, properties, regression, limits):
     """Caches are trees of `AttentionCache`s with rows first, so they page by rows."""
-    cache_layout(functions, model, features, slot_bytes=1 << 20)
+    cache_layout(functions, model, limits.features, slot_bytes=1 << 20)
 
 
 _CHECKS = [
+    ("calls", _calls),
     ("properties", _properties),
     ("fit and embed", _fit_embeds),
     ("decoding apart", _decodes_apart),
@@ -390,6 +603,11 @@ _CHECKS = [
     ("constant columns", _constant_columns),
     ("vmap", _vmap),
     ("masks", _mask),
+    ("class counts", _class_counts),
+    ("stored caches", _stored),
+    ("unlabeled context", _unlabeled),
+    ("decode reading", _reading),
+    ("crowded categories", _crowded),
     ("paging", _pages),
 ]
 
@@ -496,18 +714,24 @@ def check_series(
         tolerance: How far results may move between equivalent calls.
 
     Raises:
-        AssertionError: Naming the first check the model fails.
+        AssertionError: Naming the first check the model fails, whether its
+            results differ or one of its calls raises.
     """
-    properties = functions.properties(parameters)
+    try:
+        properties = functions.properties(parameters)
+    except Exception as error:
+        raise AssertionError(f"properties: {_reason(error)}") from error
     _require(
         isinstance(properties, SeriesProperties),
-        "properties must return SeriesProperties",
+        "properties: properties must return SeriesProperties",
     )
     for name, run in _SERIES_CHECKS:
         try:
             run(functions, parameters, properties, tolerance)
         except AssertionError as error:
             raise AssertionError(f"{name}: {error}") from None
+        except Exception as error:
+            raise AssertionError(f"{name}: {_reason(error)}") from error
 
 
 def _series_properties(functions, model, properties, tolerance):

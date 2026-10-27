@@ -83,7 +83,8 @@ class Fit(Protocol):
 
     A fit on more rows than a call embeds keeps only the state and embeds
     pages with `embed` as they are read, so the state must not depend on the
-    rows `fit` returns: computed from them, XLA cannot drop them.
+    rows `fit` returns: computed from them, XLA cannot drop them. The engine
+    always passes `num_rows` and `categorical` by keyword, None or not.
     """
 
     def __call__(
@@ -139,6 +140,9 @@ class Decode(Protocol):
     Every attention over the cache must honor each `AttentionCache`'s `length`
     and, when set, its `mask`: the engine decodes queries that read different
     parts of one context together, and the mask says which keys each reads.
+    A query reads only the keys both allow: a mask may allow rows past the
+    length, as one does for a unit that reads its whole context;
+    `generalforecast.nn.attention.keys_read` counts the keys a query reads.
     """
 
     def __call__(self, model: Any, state: Any, cache: Any, rows: Array, /) -> Array:

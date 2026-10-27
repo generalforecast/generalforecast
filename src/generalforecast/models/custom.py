@@ -88,7 +88,8 @@ def checked(spec: str) -> Model:
 
     Raises:
         ModelRefError: As `load`; `InvalidModel` naming the contract check
-            the model fails, if it fails one.
+            the model fails, if it fails one, its results differing or one
+            of its calls raising.
     """
     functions, parameters = load(spec)
     from generalforecast.models import conformance
@@ -100,11 +101,13 @@ def checked(spec: str) -> Model:
         else:
             conformance.check(functions, parameters)
     except AssertionError as error:
-        name = str(error).split(":", 1)[0]
+        name, _, detail = str(error).partition(":")
+        reason = detail.strip().splitlines()[0] if detail.strip() else "it fails"
         raise ModelRefError(
             "InvalidModel",
-            f"custom model {spec!r} fails the contract's `{name}` check; run "
-            "generalforecast.models.conformance.check on it for the report",
+            f"custom model {spec!r} fails the contract's `{name}` check: "
+            f"{reason}; run generalforecast.models.conformance.check on it for "
+            "the report",
         ) from None
     return functions, parameters
 
