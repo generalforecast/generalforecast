@@ -100,32 +100,31 @@ impl TableState {
 
     /// Builds the restored table's pages, once its last row is back.
     pub(super) fn finish_restore(&mut self) -> Result<(), NodeError> {
-        let Restoring {
-            layout,
-            mut pages,
-            members,
-            ..
-        } = self.restoring.take().expect("a restore is under way");
-        if self.spec.series.is_some() {
-            // Its rows came back on one page without a layout; the series
-            // index places them.
-            self.reprint();
-            return Ok(());
+        let restoring = self.restoring.as_ref().expect("a restore is under way");
+        // Its pages are built before the restore ends, so a layout that does
+        // not build them leaves the table being restored, taking no request,
+        // until a restore begins again.
+        if self.spec.series.is_none() {
+            let mut paged = Vec::with_capacity(restoring.members.len());
+            for (page, rows) in &restoring.members {
+                let layout = restoring
+                    .pages
+                    .get(page)
+                    .ok_or(NodeError::Restore("a row's page has no layout"))?;
+                paged.push((layout.clone(), rows.clone()));
+            }
+            if paged.len() != restoring.pages.len() {
+                return Err(NodeError::Restore("a page's layout has no rows"));
+            }
+            if self.standardizer.is_none() && !paged.is_empty() {
+                return Err(NodeError::Restore("rows come back without a scaling"));
+            }
+            let layout = restoring.layout.index.clone();
+            self.index = PageIndex::restore(self.dimensions, self.spec.page_size, layout, paged)?;
         }
-        let mut paged = Vec::with_capacity(members.len());
-        for (page, rows) in members {
-            let page = pages
-                .remove(&page)
-                .ok_or(NodeError::Restore("a row's page has no layout"))?;
-            paged.push((page, rows));
-        }
-        if !pages.is_empty() {
-            return Err(NodeError::Restore("a page's layout has no rows"));
-        }
-        if self.standardizer.is_none() && !paged.is_empty() {
-            return Err(NodeError::Restore("rows come back without a scaling"));
-        }
-        self.index = PageIndex::restore(self.dimensions, self.spec.page_size, layout.index, paged)?;
+        // A table of series came back on one page without a layout; the
+        // series index places its rows.
+        self.restoring = None;
         self.reprint();
         Ok(())
     }
@@ -272,7 +271,9 @@ impl Node {
     /// # Errors
     ///
     /// If the rows or their layout are malformed, or continue no restore; the
-    /// table is then left as the records found it.
+    /// table is then left as the records found it. A last record whose
+    /// layout does not build the table's pages leaves it being restored,
+    /// taking no request, until a restore begins again.
     pub fn restore(
         &mut self,
         table: TableId,

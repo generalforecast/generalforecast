@@ -125,8 +125,9 @@ impl Node {
     /// Completes a step as `complete_except` does, except that the tables
     /// `deferred` names wait for a program the worker compiles beside its
     /// steps, by its key. Their parts are undone as a failed part's, but
-    /// their requests queue again, and steps leave them out until `compiled`
-    /// names the key, unless it already did.
+    /// their query requests queue again, and steps leave them out until
+    /// `compiled` names the key, unless it already did. A step answers its
+    /// forecasts whatever the worker does with their table's part.
     pub fn complete_deferring(
         &mut self,
         step: &Step,

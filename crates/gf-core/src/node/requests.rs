@@ -83,6 +83,14 @@ impl Node {
         if state.table.is_empty() {
             return Err(NodeError::EmptyTable(table));
         }
+        let given: Vec<Given> = given
+            .iter()
+            .map(|rows| {
+                rows.iter()
+                    .map(|row| state.table.key(row).expect("given rows are live"))
+                    .collect()
+            })
+            .collect();
         let request = RequestId(self.next_request);
         self.next_request += 1;
         let state = self.state(table)?;

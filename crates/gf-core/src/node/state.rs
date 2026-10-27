@@ -363,14 +363,20 @@ impl TableState {
             // for a model that reads no such rows, reads nothing.
             let live = self.given.as_ref().map(|_| self.served().rows());
             let given = self.given.take();
+            let rows = given.as_ref().map(|given| self.given_rows(given));
             let (mut kept, mut kept_given, mut offset) = (Vec::new(), Vec::new(), 0);
             for (request, queries, cutoffs) in std::mem::take(&mut self.pending) {
                 let count = queries.len() / width;
                 let contexts = given.as_ref().map(|given| &given[offset..offset + count]);
+                let gone = rows
+                    .as_ref()
+                    .zip(live.as_ref())
+                    .is_some_and(|(rows, live)| {
+                        rows[offset..offset + count]
+                            .iter()
+                            .any(|context| (context & live).is_empty())
+                    });
                 offset += count;
-                let gone = contexts.zip(live.as_ref()).is_some_and(|(contexts, live)| {
-                    contexts.iter().any(|context| (context & live).is_empty())
-                });
                 let error = if gone {
                     Some(NodeError::Given)
                 } else {
@@ -395,8 +401,17 @@ impl TableState {
         refused
     }
 
-    /// Moves the pending requests, and the forecasts, to the steps in flight,
-    /// each given request with its contexts.
+    /// The rows of given contexts, those of their keys the table holds.
+    pub(super) fn given_rows(&self, given: &[Given]) -> Vec<Context> {
+        given
+            .iter()
+            .map(|keys| keys.iter().filter_map(|&key| self.table.row(key)).collect())
+            .collect()
+    }
+
+    /// Moves the pending requests to the steps in flight, each given
+    /// request with its contexts, and drops the forecasts, which a step
+    /// answers whatever the worker does with its part.
     pub(super) fn schedule_pending(&mut self) {
         let width = self.spec.features;
         let mut given = self.given.take().map(Vec::into_iter);
@@ -410,29 +425,38 @@ impl TableState {
                 None => self.scheduled.queries.push((request, queries, cutoffs)),
             }
         }
-        self.scheduled.forecasts.append(&mut self.forecasts);
+        self.forecasts.clear();
     }
 
     /// Queues again requests of a step whose part the worker deferred,
     /// ahead of those that came after them.
     pub(super) fn queue_again(&mut self, requests: Scheduled) {
-        let Scheduled {
-            mut queries,
-            given,
-            mut forecasts,
-        } = requests;
-        // Behind a pending given batch, as requests that come meanwhile wait.
-        if self.given.is_some() {
-            self.later.splice(0..0, queries);
-        } else {
-            queries.append(&mut self.pending);
-            self.pending = queries;
+        let Scheduled { mut queries, given } = requests;
+        match &mut self.given {
+            // A pending given batch: given requests join it ahead of its
+            // own, and the others wait behind it, as requests that come
+            // meanwhile do.
+            Some(batch) => {
+                self.later.splice(0..0, queries);
+                let mut pending = Vec::with_capacity(given.len() + self.pending.len());
+                let mut contexts = Vec::new();
+                for (request, queries, given) in given {
+                    pending.push((request, queries, None));
+                    contexts.extend(given);
+                }
+                contexts.append(batch);
+                *batch = contexts;
+                pending.append(&mut self.pending);
+                self.pending = pending;
+            }
+            None => {
+                queries.append(&mut self.pending);
+                self.pending = queries;
+                for request in given.into_iter().rev() {
+                    self.givens.push_front(request);
+                }
+            }
         }
-        for request in given.into_iter().rev() {
-            self.givens.push_front(request);
-        }
-        forecasts.append(&mut self.forecasts);
-        self.forecasts = forecasts;
         self.generation += 1;
         self.promote();
     }
@@ -680,34 +704,6 @@ impl TableState {
         self.rows.push(&features, &targets.bits(), &keys)?;
         self.table = table;
         self.times = times;
-        // Given contexts name rows by id, so they follow their rows to the
-        // ids the renumbering gave them, in key order.
-        let ids: HashMap<RowId, RowId> = rows
-            .iter()
-            .enumerate()
-            .map(|(renumbered, &row)| {
-                let renumbered = u32::try_from(renumbered).expect("row ids are u32");
-                (row, RowId(renumbered))
-            })
-            .collect();
-        let follow = |context: &mut Context| {
-            *context = context
-                .iter()
-                .filter_map(|row| ids.get(&row).copied())
-                .collect();
-        };
-        let queued = self.givens.iter_mut().flat_map(|(_, _, given)| given);
-        let scheduled = self
-            .scheduled
-            .given
-            .iter_mut()
-            .flat_map(|(_, _, given)| given);
-        self.given
-            .iter_mut()
-            .flatten()
-            .chain(queued)
-            .chain(scheduled)
-            .for_each(follow);
         self.reprint();
         if self.spec.series.is_some() {
             // A table of series places no rows in pages.

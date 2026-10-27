@@ -158,10 +158,10 @@ struct TableState {
     /// may since have gone or moved, so a cutoff at or before it refits.
     fitted_latest: Option<i64>,
     /// The context of each query of its one pending request, if they were given.
-    given: Option<Vec<Context>>,
+    given: Option<Vec<Given>>,
     /// Requests with given contexts waiting for the table's pending requests
     /// to be planned; they go before requests that wait for another state.
-    givens: std::collections::VecDeque<(RequestId, Vec<f32>, Vec<Context>)>,
+    givens: std::collections::VecDeque<(RequestId, Vec<f32>, Vec<Given>)>,
     /// Whether the last step served given requests, whose turn is then over.
     gave: bool,
     /// Counts changes to the table or its requests, so a plan made for them
@@ -269,15 +269,18 @@ pub struct Node {
     parts: PlanParts,
 }
 
-/// A table's requests in the steps in flight, kept until their steps
+/// A given context, by the keys of its rows: a renumbering or a restore
+/// gives rows new ids, so the rows are found when the context is planned.
+type Given = Vec<RowKey>;
+
+/// A table's query requests in the steps in flight, kept until their steps
 /// complete, so those of a part the worker defers queue again; see
 /// `Node::complete_deferring`.
 #[derive(Debug, Default)]
 struct Scheduled {
     queries: Vec<(RequestId, Vec<f32>, Option<Vec<i64>>)>,
     /// Requests with given contexts, which queue again with them.
-    given: Vec<(RequestId, Vec<f32>, Vec<Context>)>,
-    forecasts: Vec<(RequestId, SeriesRequest)>,
+    given: Vec<(RequestId, Vec<f32>, Vec<Given>)>,
 }
 
 impl Scheduled {
@@ -290,9 +293,6 @@ impl Scheduled {
         (taken.given, self.given) = std::mem::take(&mut self.given)
             .into_iter()
             .partition(|(request, _, _)| of(*request));
-        (taken.forecasts, self.forecasts) = std::mem::take(&mut self.forecasts)
-            .into_iter()
-            .partition(|(request, _)| of(*request));
         taken
     }
 }

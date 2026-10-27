@@ -674,8 +674,8 @@ impl Node {
                     Some((generation, planned)) if generation == state.generation => planned,
                     _ if state.given.is_some() => {
                         let since = self.parts.start();
-                        let planned =
-                            plan_given(&snapshot, state.given.as_ref().expect("matched above"));
+                        let given = state.given.as_ref().expect("matched above");
+                        let planned = plan_given(&snapshot, &state.given_rows(given));
                         self.parts.add("retrieve", since);
                         planned?
                     }

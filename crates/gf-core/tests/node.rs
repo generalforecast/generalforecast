@@ -5390,3 +5390,81 @@ fn a_context_a_step_in_flight_moves_counts_against_the_budget() {
     let tables: Vec<TableId> = step.queries().iter().map(|batch| batch.table).collect();
     assert_eq!(tables, [other]);
 }
+
+#[test]
+fn a_given_context_queued_through_a_restore_reads_the_rows_of_its_keys() {
+    // Written in reverse, so the restored rows take other ids than the copy's.
+    let mut original = node(64);
+    let table = original.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(48);
+    let reversed: Vec<usize> = (0..48).rev().collect();
+    let features: Vec<f32> = reversed
+        .iter()
+        .flat_map(|&row| features[row * 2..row * 2 + 2].to_vec())
+        .collect();
+    let Targets::Classes(labels) = targets else {
+        unreachable!("rows are classified")
+    };
+    let labels = Targets::Classes(reversed.iter().map(|&row| labels[row]).collect());
+    let keys: Vec<u128> = reversed.iter().map(|&row| keys[row]).collect();
+    original.insert(table, &keys, &features, labels).unwrap();
+    let compaction = original.compaction(table).unwrap();
+
+    let mut copy = node(64);
+    let restored = copy.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(8);
+    copy.insert(restored, &keys, &features, targets).unwrap();
+    let given = [RowId(0)].into_iter().collect();
+    copy.submit_given(restored, &A, vec![given]).unwrap();
+    let (rows, layout) = part(&compaction, 0, compaction.rows.keys.len());
+    copy.restore(restored, &rows, &layout, Some(&compaction.table))
+        .unwrap();
+
+    let step = run(&mut copy);
+    let read = copy.rows_of(restored, &step.units()[0].rows).unwrap();
+    assert_eq!(read.keys, [0]);
+}
+
+#[test]
+fn a_restore_whose_layout_does_not_build_leaves_the_table_restoring() {
+    let mut original = node(64);
+    let table = original.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(48);
+    original.insert(table, &keys, &features, targets).unwrap();
+    let compaction = original.compaction(table).unwrap();
+    let (records, layout) = part(&compaction, 0, compaction.rows.keys.len());
+    let mut renumbered = compaction.table.clone();
+    renumbered.index.next_page = 0;
+
+    let mut copy = node(64);
+    let restored = copy.create_table(spec(NEAREST)).unwrap();
+    let (keys, features, targets) = rows(8);
+    copy.insert(restored, &keys, &features, targets).unwrap();
+    let request = copy.submit(restored, &A).unwrap();
+    assert!(
+        copy.restore(restored, &records, &layout, Some(&renumbered))
+            .is_err()
+    );
+    assert!(copy.schedule().unwrap().is_none());
+    assert!(copy.take_refused().is_empty());
+
+    copy.restore(restored, &records, &layout, Some(&compaction.table))
+        .unwrap();
+    assert_eq!(run(&mut copy).queries()[0].request, request);
+}
+
+#[test]
+fn deferred_given_requests_go_ahead_of_those_given_since() {
+    let mut node = node(64);
+    let table = table(&mut node, Strategy::Exact, 32);
+    node.compiled(vec!["k".to_string()]);
+    let rows: gf_core::context::Context = [RowId(1), RowId(2)].into_iter().collect();
+    let first = node.submit_given(table, &A, vec![rows.clone()]).unwrap();
+    let step = node.schedule().unwrap().expect("a step");
+    let second = node.submit_given(table, &B, vec![rows]).unwrap();
+    node.complete_deferring(&step, &HashSet::new(), &[(table, "k".to_string())]);
+
+    let step = run(&mut node);
+    let requests: Vec<RequestId> = step.queries().iter().map(|batch| batch.request).collect();
+    assert_eq!(requests, [first, second]);
+}
