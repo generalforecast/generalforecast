@@ -600,9 +600,7 @@ impl ForecastPredictor {
         {
             return Err(RequestError::new(
                 "CapacityExceeded",
-                format!(
-                    "a related group holds {largest} series; at most {most} forecast together"
-                ),
+                format!("a related group holds {largest} series; at most {most} forecast together"),
                 422,
             ));
         }
