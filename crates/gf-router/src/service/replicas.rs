@@ -318,7 +318,14 @@ impl Router {
         }
         let tables: Vec<String> = {
             let mut copies = self.copies.lock().unwrap_or_else(PoisonError::into_inner);
-            copies.install(answered, since);
+            let unanswered: Vec<&str> = cluster
+                .nodes
+                .iter()
+                .zip(&up)
+                .filter(|(_, up)| !**up)
+                .map(|(node, _)| node.name.as_str())
+                .collect();
+            copies.install(answered, since, &unanswered);
             self.creations
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)

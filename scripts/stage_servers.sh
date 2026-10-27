@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # Builds the binaries a release wheel carries and stages them where maturin
-# packs them: the versioned gf-native client beside Python, and gf-server and
+# packs them: the gf launcher, as gf-native, beside Python, and gf-server and
 # gf-router, which `gf serve` runs, inside the package, off PATH. Run from the
 # repository root before `maturin build`; gf's release and the hosted plane's
 # image build both stage wheels with it.

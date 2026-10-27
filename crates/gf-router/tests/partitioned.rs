@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,6 +18,7 @@ use arrow_flight::{
 };
 use futures::{Stream, TryStreamExt, stream};
 use gf_router::partitions;
+use gf_router::placement::Placement;
 use gf_router::service::{Cluster, Node, Router, Timeouts};
 use gf_server::action::{CopyLength, LogLengths};
 use gf_server::auth::Scope;
@@ -48,6 +50,8 @@ struct Fake {
     /// Each delete the node took.
     deleted: Arc<Mutex<Vec<Deleted>>>,
     made: Arc<Mutex<u64>>,
+    /// Set while the node is out of reach: it answers nothing.
+    down: Arc<AtomicBool>,
 }
 
 impl Fake {
@@ -143,6 +147,9 @@ impl FlightService for Fake {
         &self,
         request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
+        if self.down.load(Ordering::Relaxed) {
+            return Err(Status::unavailable("the node is down"));
+        }
         let action = request.into_inner();
         let body: Value = serde_json::from_slice(&action.body).unwrap_or(Value::Null);
         let answer = self.answer(&action.r#type, &body)?;
@@ -228,20 +235,32 @@ async fn serve(fake: &Fake) -> String {
 
 /// A router over one node, which has learned what the node holds.
 async fn router(address: &str) -> Router {
+    router_over(&[address]).await
+}
+
+/// A router over nodes `node-0` on, one copy of each table, which has
+/// learned what the nodes hold.
+async fn router_over(addresses: &[&str]) -> Router {
     let timeouts = Timeouts {
         call: Duration::from_secs(5),
         write: Duration::from_secs(5),
     };
-    let channel = Channel::from_shared(address.to_string())
-        .unwrap()
-        .connect_lazy();
-    let node = Node::new(
-        "node-0".to_string(),
-        FlightServiceClient::new(channel),
-        MetadataValue::from_static("Bearer replicator"),
-        timeouts,
-    );
-    let router = Router::new(Cluster::new(vec![node], 1));
+    let nodes = addresses
+        .iter()
+        .enumerate()
+        .map(|(index, address)| {
+            let channel = Channel::from_shared(address.to_string())
+                .unwrap()
+                .connect_lazy();
+            Node::new(
+                format!("node-{index}"),
+                FlightServiceClient::new(channel),
+                MetadataValue::from_static("Bearer replicator"),
+                timeouts,
+            )
+        })
+        .collect();
+    let router = Router::new(Cluster::new(nodes, 1));
     router.prepare().await;
     router
 }
@@ -437,4 +456,126 @@ async fn a_router_learns_another_routers_drop_and_new_table_at_its_check() {
         .await
         .unwrap();
     assert_eq!(described[0]["partitions"], json!(3));
+}
+
+#[tokio::test]
+async fn two_creates_of_one_name_through_one_router_make_one_table() {
+    let fake = Fake::default();
+    let router = router(&serve(&fake).await).await;
+
+    for (index, (first, second)) in [(None, Some(3)), (Some(2), Some(3)), (None, None)]
+        .into_iter()
+        .enumerate()
+    {
+        let name = format!("race-{index}");
+        let (one, other) = tokio::join!(
+            create(&router, &name, first),
+            create(&router, &name, second)
+        );
+        let codes = [one, other].map(|made| made.err().map(|status| status.code()));
+        assert!(
+            codes.contains(&None) && codes.contains(&Some(Code::AlreadyExists)),
+            "{name}: {codes:?}"
+        );
+        let held = fake.tables.lock().unwrap().clone();
+        let serving: BTreeMap<_, _> = held
+            .keys()
+            .filter(|table| {
+                *table == &name
+                    || partitions::parse(table).is_some_and(|(owner, _, _)| owner == name)
+            })
+            .map(|table| {
+                (
+                    table.clone(),
+                    partitions::parse(table).map(|(_, _, count)| count),
+                )
+            })
+            .collect();
+        let counts: std::collections::BTreeSet<_> = serving.values().collect();
+        assert_eq!(counts.len(), 1, "{name}: {serving:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_name_a_node_out_of_reach_holds_stays_taken() {
+    let (first, second) = (Fake::default(), Fake::default());
+    let (one, other) = (serve(&first).await, serve(&second).await);
+    // Names the up node ranks first, so a create of them could go ahead there.
+    let placement = Placement::new(vec!["node-0".to_string(), "node-1".to_string()]);
+    let mut names = (0..).map(|index| format!("held-{index}"));
+    let mut ranked_up = || names.find(|name| placement.primary(name) == 0).unwrap();
+    let (whole, split) = (ranked_up(), ranked_up());
+    second.make(&whole, definition(&whole, None));
+    second.make(&partitions::name(&split, 0, 2), definition(&split, None));
+    let router = router_over(&[&one, &other]).await;
+
+    second.down.store(true, Ordering::Relaxed);
+    router.prepare().await;
+
+    for (name, partitions) in [(&whole, None), (&split, None), (&whole, Some(2))] {
+        let refused = create(&router, name, partitions).await.unwrap_err();
+        assert_eq!(refused.code(), Code::AlreadyExists, "{name} {partitions:?}");
+    }
+    assert!(first.tables.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn dropping_a_partitioned_table_already_gone_is_not_found() {
+    let fake = Fake::default();
+    let router = router(&serve(&fake).await).await;
+    create(&router, "gone", Some(2)).await.unwrap();
+    // Dropped through another router, before this one's next check.
+    fake.tables.lock().unwrap().clear();
+
+    let refused = act(&router, &Scope::All, "drop_table", json!({"table": "gone"}))
+        .await
+        .unwrap_err();
+
+    assert_eq!(refused.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn writes_follow_the_route_the_table_has_now() {
+    let fake = Fake::default();
+    let address = serve(&fake).await;
+    let (first, second) = (router(&address).await, router(&address).await);
+    let mut routed = definition("orders", Some(2));
+    routed["route_by"] = json!({"column": "amount"});
+    act(&first, &Scope::All, "create_table", routed)
+        .await
+        .unwrap();
+    second.prepare().await;
+    let delete = json!({"table": "orders", "keys": [7]});
+    act(&second, &Scope::All, "delete", delete.clone())
+        .await
+        .unwrap();
+    assert_eq!(fake.deleted.lock().unwrap().len(), 2);
+    // The second router reads the route at the partitions' copies as it
+    // last saw them, writing nothing.
+    second.prepare().await;
+    act(
+        &second,
+        &Scope::All,
+        "delete",
+        json!({"table": "orders", "keys": []}),
+    )
+    .await
+    .unwrap();
+
+    // Made again unrouted with the same count, while the second router has
+    // not checked since: its view of the partitions is the old table's.
+    act(
+        &first,
+        &Scope::All,
+        "drop_table",
+        json!({"table": "orders"}),
+    )
+    .await
+    .unwrap();
+    create(&first, "orders", Some(2)).await.unwrap();
+    fake.deleted.lock().unwrap().clear();
+    act(&second, &Scope::All, "delete", delete).await.unwrap();
+
+    let owner = partitions::name("orders", partitions::of(7, 2), 2);
+    assert_eq!(*fake.deleted.lock().unwrap(), [(owner, vec![7])]);
 }
