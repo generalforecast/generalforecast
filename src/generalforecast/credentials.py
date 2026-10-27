@@ -92,6 +92,28 @@ class Credential:
     login: Login | None = None
 
 
+def _checked(login: Login) -> None:
+    """Refuses a login whose fields are not text the file and keychain can hold."""
+    from generalforecast.transport import credential
+
+    optional = ("email", "workspace", "workspace_id")
+    for key, value in asdict(login).items():
+        if key == "key" or (value is None and key in optional):
+            continue
+        try:
+            valid = type(value) is str and bool(value) and bool(value.encode())
+        except UnicodeEncodeError:
+            valid = False
+        if not valid:
+            raise ServiceError(
+                "ValidationError",
+                f"the login's {key.replace('_', ' ')} is not valid text",
+                422,
+                param=key,
+            )
+    credential(login.key or "", "login key")
+
+
 def key_suffix(key: str | None) -> str:
     """`gf_...a91f`: enough to recognize a key without revealing it."""
     return f"{key[:3]}...{key[-4:]}" if key and len(key) > 12 else "unknown"
@@ -198,8 +220,12 @@ class CredentialStore:
         )
 
     def save(self, login: Login) -> Login:
-        """Stores the key in the keychain when possible, else in the file."""
-        assert login.key is not None
+        """Stores the key in the keychain when possible, else in the file.
+
+        Every field is checked first, so a login the server sent malformed
+        is refused before the keychain or the file is touched.
+        """
+        _checked(login)
         login.store = (
             "keychain" if self.keychain() and self._keychain_write(login) else "file"
         )
