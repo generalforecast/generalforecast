@@ -198,6 +198,98 @@ def test_generated_module_names_the_bad_field():
     assert wrong.value.param == "queries[0].x"
 
 
+MODEL = "general-forecast/tabicl-v2-classifier"
+ROWS = [{"customer_id": 1041, "spend": 82.5, "plan": "pro"}]
+CONTEXT = [
+    {"customer_id": 1, "spend": 10.0, "plan": "free", "churned": 1},
+    {"customer_id": 2, "spend": 95.0, "plan": "pro", "churned": 0},
+]
+
+
+def envelope(name, payload):
+    return {
+        "api_version": _api.VERSION,
+        "project": "acme",
+        "request_id": "r-payload",
+        "resource": {"kind": "predictor", "name": name},
+        "payload": payload,
+    }
+
+
+@pytest.mark.parametrize("field", ["inputs", "model", "task"])
+def test_a_declared_predictors_payload_refuses_what_its_manifest_declares(field):
+    payload = {"queries": ROWS, field: ["spend"] if field == "inputs" else "churned"}
+    with pytest.raises(_api.PayloadError) as refused:
+        _api.QueriesRequest.from_payload(envelope("churn", payload))
+    assert refused.value.param == "payload." + field
+
+
+def test_a_declared_predictors_payload_is_queries_context_and_as_of():
+    request = _api.QueriesRequest.from_payload(
+        envelope(
+            "churn",
+            {"queries": ROWS, "context": CONTEXT, "as_of": "2026-10-24T05:00:00Z"},
+        )
+    )
+    assert request.payload.as_of == "2026-10-24T05:00:00Z"
+    assert request.payload.to_payload()["context"] == CONTEXT
+    with pytest.raises(_api.PayloadError) as empty:
+        _api.Queries.from_payload({})
+    assert empty.value.param == "queries"
+
+
+@pytest.mark.parametrize("field", ["model", "context", "queries"])
+def test_an_ad_hoc_payload_requires_model_context_and_queries(field):
+    payload = {"model": MODEL, "target": "churned", "context": CONTEXT, "queries": ROWS}
+    del payload[field]
+    with pytest.raises(_api.PayloadError) as refused:
+        _api.ManifestRequest.from_payload(envelope("ad-hoc", payload))
+    assert refused.value.param == "payload." + field
+
+
+@pytest.mark.parametrize("field", ["task", "options", "features", "data", "name"])
+def test_an_ad_hoc_payload_has_no_task_options_or_retired_words(field):
+    payload = {
+        "model": MODEL,
+        "target": "churned",
+        "context": CONTEXT,
+        "queries": ROWS,
+        field: "classification" if field == "task" else {},
+    }
+    with pytest.raises(_api.PayloadError) as refused:
+        _api.Manifest.from_payload(payload)
+    assert refused.value.param == field
+
+
+def test_an_ad_hoc_payload_takes_the_manifests_input_and_frequency_forms():
+    manifest = _api.Manifest.from_payload(
+        {
+            "model": "general-forecast/chronos-2",
+            "target": "units",
+            "time": "date",
+            "series": ["sku"],
+            "frequency": "1d",
+            "horizon": 7,
+            "inputs": {"past": [], "future": ["price"]},
+            "context": CONTEXT,
+            "queries": ROWS,
+        }
+    )
+    assert isinstance(manifest.inputs, _api.Inputs)
+    assert manifest.inputs.future == ("price",)
+    assert manifest.quantiles is None
+    listed = _api.Manifest.from_payload(
+        {**manifest.to_payload(), "inputs": ["price"], "frequency": 86400}
+    )
+    assert listed.inputs == ("price",) and listed.frequency == 86400
+
+
+def test_health_and_readiness_answer_the_same_unenveloped_reply():
+    assert ROUTES["health"].path == "/healthz"
+    assert ROUTES["ready"].path == "/readyz"
+    assert ROUTES["health"].reply is ROUTES["ready"].reply is _api.Health
+
+
 def test_regenerating_changes_nothing(tmp_path):
     for path, text in generate.render().items():
         assert path.read_text() == text, f"{path.relative_to(ROOT)} is stale"
