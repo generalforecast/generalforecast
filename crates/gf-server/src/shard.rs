@@ -229,6 +229,14 @@ struct Pending {
     arrived: Instant,
 }
 
+/// A query a table took, before its caller waits on it: its id, table and
+/// query bytes, which `queue_pending` holds against the queue.
+struct Submitted {
+    request: RequestId,
+    table: TableId,
+    bytes: u64,
+}
+
 /// A change to a table's rows, or to its fitted state.
 #[derive(Clone, Debug)]
 pub enum Write {
@@ -1501,16 +1509,9 @@ impl Shard {
                 trace,
                 reply,
             } => match self.infer(*context, asked).await {
-                Ok((request, pending, levels)) => {
+                Ok((submitted, levels)) => {
                     let (answered, answer) = oneshot::channel();
-                    self.queue_pending(
-                        request,
-                        Pending {
-                            reply: answered,
-                            trace,
-                            ..pending
-                        },
-                    );
+                    self.queue_pending(submitted, answered, trace);
                     // A caller that goes away closes the queued reply, so the
                     // abandoned query leaves the queue as a prediction's does.
                     tokio::spawn(relay(answer, reply, levels));
@@ -1527,20 +1528,8 @@ impl Shard {
                 trace,
                 reply,
             } => {
-                let _ = match self.submit_given(&table, rows, given).await {
-                    Ok((request, pending)) => {
-                        self.queue_pending(
-                            request,
-                            Pending {
-                                reply,
-                                trace,
-                                ..pending
-                            },
-                        );
-                        Ok(())
-                    }
-                    Err(error) => reply.send(Err(error)),
-                };
+                let submitted = self.submit_given(&table, rows, given).await;
+                self.admit(submitted, reply, trace);
             }
             Command::Forecast {
                 table,
@@ -1554,20 +1543,7 @@ impl Shard {
                 let submitted = self.usable(&table).and_then(|id| {
                     self.submit_forecast(id, &table, series, before, horizon, groups)
                 });
-                let _ = match submitted {
-                    Ok((request, pending)) => {
-                        self.queue_pending(
-                            request,
-                            Pending {
-                                reply,
-                                trace,
-                                ..pending
-                            },
-                        );
-                        Ok(())
-                    }
-                    Err(error) => reply.send(Err(error)),
-                };
+                self.admit(submitted, reply, trace);
             }
             Command::Predict {
                 table,
@@ -1581,20 +1557,7 @@ impl Shard {
                 let resolved = self.resolve(&table, &mut features, &strings);
                 let submitted =
                     resolved.and_then(|()| self.submit(&table, features, before, given));
-                let _ = match submitted {
-                    Ok((request, pending)) => {
-                        self.queue_pending(
-                            request,
-                            Pending {
-                                reply,
-                                trace,
-                                ..pending
-                            },
-                        );
-                        Ok(())
-                    }
-                    Err(error) => reply.send(Err(error)),
-                };
+                self.admit(submitted, reply, trace);
             }
         }
     }
@@ -1672,7 +1635,7 @@ impl Shard {
         table: &str,
         rows: ModelRows,
         given: Given,
-    ) -> Result<(RequestId, Pending), ServerError> {
+    ) -> Result<Submitted, ServerError> {
         self.usable(table)?;
         let definition = self.tables[table].definition.clone();
         let width = definition.features();
@@ -1793,17 +1756,11 @@ impl Shard {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let request = self.node.submit_given(id, &queries, contexts)?;
-        let (reply, _) = oneshot::channel();
-        Ok((
+        Ok(Submitted {
             request,
-            Pending {
-                reply,
-                trace: String::new(),
-                table: id,
-                bytes: queries.len() as u64 * 4,
-                arrived: Instant::now(),
-            },
-        ))
+            table: id,
+            bytes: queries.len() as u64 * 4,
+        })
     }
 
     /// Queues queries against a request context's ephemeral table, making
@@ -1812,7 +1769,7 @@ impl Shard {
         &mut self,
         context: RequestContext,
         asked: Asked,
-    ) -> Result<(RequestId, Pending, Option<Vec<f64>>), ServerError> {
+    ) -> Result<(Submitted, Option<Vec<f64>>), ServerError> {
         let RequestContext {
             fingerprint,
             definition,
@@ -1853,7 +1810,7 @@ impl Shard {
             .ephemeral
             .get(id)
             .and_then(|table| table.levels.clone());
-        let (request, pending) = match asked {
+        let submitted = match asked {
             Asked::Rows(queries) => self.enqueue(id, name.as_str(), queries, None, None)?,
             Asked::Forecast {
                 series,
@@ -1862,7 +1819,7 @@ impl Shard {
                 groups,
             } => self.submit_forecast(id, name.as_str(), series, before, horizon, groups)?,
         };
-        Ok((request, pending, levels))
+        Ok((submitted, levels))
     }
 
     /// Serves an ephemeral table in memory, without a log, and adds its rows.
@@ -2073,7 +2030,7 @@ impl Shard {
         features: Vec<f32>,
         before: Option<Vec<i64>>,
         given: Option<Vec<Vec<u128>>>,
-    ) -> Result<(RequestId, Pending), ServerError> {
+    ) -> Result<Submitted, ServerError> {
         let id = self.usable(table)?;
         self.enqueue(id, table, features, before, given)
     }
@@ -2086,7 +2043,7 @@ impl Shard {
         features: Vec<f32>,
         before: Option<Vec<i64>>,
         given: Option<Vec<Vec<u128>>>,
-    ) -> Result<(RequestId, Pending), ServerError> {
+    ) -> Result<Submitted, ServerError> {
         if let Some(reason) = self.quarantined.get(&id) {
             return Err(ServerError::Invalid(format!(
                 "table {table:?} takes no queries: it failed {FAILURES} steps running \
@@ -2111,17 +2068,11 @@ impl Shard {
             Some(contexts) => self.node.submit_keys(id, &features, &contexts)?,
             None => self.node.submit_before(id, &features, before.as_deref())?,
         };
-        let (reply, _) = oneshot::channel();
-        Ok((
+        Ok(Submitted {
             request,
-            Pending {
-                reply,
-                trace: String::new(),
-                table: id,
-                bytes,
-                arrived: Instant::now(),
-            },
-        ))
+            table: id,
+            bytes,
+        })
     }
 
     /// Queues a forecast of series, as `submit` queues queries.
@@ -2141,7 +2092,7 @@ impl Shard {
         before: Option<Vec<i64>>,
         horizon: NonZeroUsize,
         groups: Option<Vec<Vec<u64>>>,
-    ) -> Result<(RequestId, Pending), ServerError> {
+    ) -> Result<Submitted, ServerError> {
         if let Some(reason) = self.quarantined.get(&id) {
             return Err(ServerError::Invalid(format!(
                 "table {table:?} takes no forecasts: it failed {FAILURES} steps running \
@@ -2187,17 +2138,11 @@ impl Shard {
             horizon,
             groups.as_deref(),
         )?;
-        let (reply, _) = oneshot::channel();
-        Ok((
+        Ok(Submitted {
             request,
-            Pending {
-                reply,
-                trace: String::new(),
-                table: id,
-                bytes,
-                arrived: Instant::now(),
-            },
-        ))
+            table: id,
+            bytes,
+        })
     }
 
     /// Brings the memory gauges up to date: the cache and row gauges, which
@@ -2246,10 +2191,39 @@ impl Shard {
     }
 
     /// Queues a request for its answer, pinning the ephemeral table it reads.
-    fn queue_pending(&mut self, request: RequestId, pending: Pending) {
-        self.queued_bytes += pending.bytes;
-        self.ephemeral.pin(pending.table);
-        self.pending.insert(request, pending);
+    fn queue_pending(&mut self, submitted: Submitted, reply: Reply<Predictions>, trace: String) {
+        let Submitted {
+            request,
+            table,
+            bytes,
+        } = submitted;
+        self.queued_bytes += bytes;
+        self.ephemeral.pin(table);
+        self.pending.insert(
+            request,
+            Pending {
+                reply,
+                trace,
+                table,
+                bytes,
+                arrived: Instant::now(),
+            },
+        );
+    }
+
+    /// Queues a query a table took, or answers why it did not take it.
+    fn admit(
+        &mut self,
+        submitted: Result<Submitted, ServerError>,
+        reply: Reply<Predictions>,
+        trace: String,
+    ) {
+        match submitted {
+            Ok(submitted) => self.queue_pending(submitted, reply, trace),
+            Err(error) => {
+                let _ = reply.send(Err(error));
+            }
+        }
     }
 
     /// Kills the worker and starts it again in the background: requests in
