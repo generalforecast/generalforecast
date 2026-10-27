@@ -359,3 +359,18 @@ def test_a_first_chunk_that_fails_raises_its_own_error(wire, asynchronous):
         )
     assert not isinstance(caught.value, PartialWrite)
     assert isinstance(caught.value, gf.NotFound)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_model_is_read_by_its_canonical_id(wire, asynchronous):
+    wire.expect("GET", "/models/tabicl-v2-classifier", {"name": "tabicl-v2-classifier"})
+    model = run(
+        asynchronous,
+        wire.url,
+        lambda c: c.models.get("general-forecast/tabicl-v2-classifier"),
+    )
+    assert model == {"name": "tabicl-v2-classifier"}
+    with pytest.raises(ServiceError) as refused:
+        run(asynchronous, wire.url, lambda c: c.models.get("tabicl-v2-classifier"))
+    assert refused.value.param == "model"
+    assert refused.value.hint == "use general-forecast/tabicl-v2-classifier"

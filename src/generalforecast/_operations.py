@@ -21,6 +21,7 @@ operation, which may handle it, as `push` handles a missing predictor.
 from __future__ import annotations
 
 import hashlib
+import re
 import time
 import uuid
 from collections.abc import Callable, Generator, Mapping, Sequence
@@ -238,6 +239,30 @@ def listed(kind: ResourceKind, collection: str) -> Operation[list[JsonObject]]:
 def got(kind: ResourceKind, collection: str, resource: str) -> Operation[JsonObject]:
     """`GET /{collection}/{name}`: one project-qualified resource."""
     return (yield Call("GET", f"/{collection}/{name(resource)}", kind, resource))
+
+
+# A catalog model id, `general-forecast/<name>`, with an optional variant.
+_MODEL_ID = re.compile(r"general-forecast/([a-z0-9][a-z0-9.-]{0,62})(?:@\S+)?")
+
+
+def model_got(model: str) -> Operation[JsonObject]:
+    """`GET /models/{name}`: one catalog model, named by its canonical id.
+
+    The path takes the id's name, since a path segment holds no `/`; a bare
+    name is refused with the canonical id, as every surface refuses it.
+    """
+    found = _MODEL_ID.fullmatch(model) if isinstance(model, str) else None
+    if found is None:
+        bare = isinstance(model, str) and "/" not in model and bool(model)
+        raise InputError(
+            "ValidationError",
+            f"`{model}` is not a catalog model id",
+            param="model",
+            hint=f"use general-forecast/{model}"
+            if bare
+            else "model ids are general-forecast/<name>",
+        )
+    return (yield from got("model", "models", found.group(1)))
 
 
 def posted(

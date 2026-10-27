@@ -114,6 +114,7 @@ def wire():
                     kind = {
                         "predictors": "predictor",
                         "contexts": "context",
+                        "models": "model",
                     }[parts[4]]
                     resource = parts[5] if len(parts) > 5 else parts[4]
                     request = Request(

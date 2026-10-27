@@ -188,7 +188,7 @@ def calls(authored: Any) -> dict[str, tuple[tuple, dict]]:
         "sources.get": (("source-1",), {}),
         "sources.pin": (({"path": "a.csv", "format": "csv", "mapping": {}},), {}),
         "models.list": ((), {}),
-        "models.get": (("tabicl-v2-classifier",), {}),
+        "models.get": (("general-forecast/tabicl-v2-classifier",), {}),
         "predictors.list": ((), {}),
         "predictors.get": (("risk",), {"env": "staging"}),
         "predictors.create": (("risk",), {}),

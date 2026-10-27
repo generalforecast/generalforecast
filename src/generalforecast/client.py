@@ -348,6 +348,10 @@ class Models(Collection):
     kind: ResourceKind = "model"
     collection = "models"
 
+    def get(self, resource: str) -> Mapping[str, Any]:
+        """Gets one catalog model by its canonical id, `general-forecast/<name>`."""
+        return self.client._run(ops.model_got(resource))
+
 
 class Predictors(Collection):
     """Hosted predictors: immutable revisions and environments."""
