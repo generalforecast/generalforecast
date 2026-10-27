@@ -16,6 +16,7 @@ from typing import IO, Any
 
 import jax
 import jax.numpy as jnp
+from jax.typing import DTypeLike
 
 from generalforecast import term
 from generalforecast.constants import ATTENTION_BLOCK_CHUNK
@@ -462,7 +463,7 @@ def with_precision(function: Callable[..., Any], precision: str) -> Callable[...
     return traced
 
 
-def cast_floating(tree: Any, dtype: jnp.dtype) -> Any:
+def cast_floating(tree: Any, dtype: DTypeLike) -> Any:
     """Casts the floating-point arrays in `tree` to `dtype`, leaving the rest.
 
     Args:
@@ -526,7 +527,7 @@ def with_summary_chunk(model: Any, cells: int | None) -> Any:
     )
 
 
-def to_cache_dtype(cache: Any, dtype: jnp.dtype) -> Any:
+def to_cache_dtype(cache: Any, dtype: DTypeLike) -> Any:
     """Converts a context cache to a storage dtype.
 
     Floating dtypes cast. `int8` quantizes each row and head's keys and values

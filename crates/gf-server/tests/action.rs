@@ -26,6 +26,10 @@ fn actions_are_parsed_once_with_what_they_need() {
     assert!(parsed.needs_lease() && parsed.changes_rows() && !parsed.needs_replication());
     let lease = action("lease", json!({"seconds": 5.0, "holder": "router"}));
     assert!(FlightAction::parse(&lease).unwrap().needs_replication());
+    let known = action("known_series", json!({"table": "sales"}));
+    let parsed = FlightAction::parse(&known).unwrap();
+    assert_eq!(parsed.table().map(|table| table.as_str()), Some("sales"));
+    assert!(!parsed.needs_lease() && !parsed.changes_rows() && !parsed.needs_replication());
 
     let refused = |kind: &str, body: serde_json::Value| {
         FlightAction::parse(&action(kind, body)).unwrap_err().code()

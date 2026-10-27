@@ -343,7 +343,7 @@ class LocalSeriesTable(SeriesTable):
             raise KeyError(f"table {self.name!r} does not exist")
 
     def _change(self, kind: Literal["insert", "upsert"], rows: Any) -> None:
-        stamps, keys = self._placed(rows)
+        stamps, keys, _ = self._placed(rows)
         if not len(keys):
             return
         prepared, count = prepare(rows, (*self.columns, Column(self.target)))
@@ -372,7 +372,7 @@ class LocalSeriesTable(SeriesTable):
         self._change("upsert", rows)
 
     def delete(self, rows: Any, missing_ok: bool = False) -> None:
-        _, keys = self._placed(rows)
+        _, keys, _ = self._placed(rows)
         if not len(keys):
             return
         with self._client._lock, self._naming():
