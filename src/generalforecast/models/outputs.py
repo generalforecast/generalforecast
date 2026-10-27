@@ -1,14 +1,14 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""How every surface orders classes, spells their keys and reads quantiles.
+"""How every surface spells class keys and reads quantiles.
 
 The local SDK, predictors and the Models API all present a model's outputs the
-same way: classes in one order, keyed by one spelling, and quantile levels read
-from the model's own output grid. Standard library only.
+same way: classes keyed by one spelling, and quantile levels read from the
+model's own output grid. Standard library only.
 """
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Sequence
 from typing import Any
 
 # Quantiles returned when a caller asks for none.
@@ -16,17 +16,6 @@ DEFAULT_QUANTILES = (0.1, 0.5, 0.9)
 # A regressor's outputs: quantile levels k/1000 for k = 1 .. 999.
 REGRESSION_STEP = 0.001
 REGRESSION_LEVELS = 999
-
-
-def class_order(labels: Iterable[Any]) -> tuple:
-    """The classes a set of labels has, in the order outputs list them.
-
-    Booleans are always `(False, True)`; other labels sort.
-    """
-    seen = set(labels)
-    if seen and all(type(label) is bool for label in seen):
-        return (False, True)
-    return tuple(sorted(seen))
 
 
 def class_key(label: Any) -> str:
