@@ -307,10 +307,6 @@ class Ahead:
                 shape,
             )
 
-    def wait_warm(self: "Worker") -> None:
-        """Waits for every compile started in the background."""
-        self.programs.wait()
-
     def _defers(self: "Worker", unit: Unit, arguments: tuple) -> bool:
         """Whether a fused unit waits for its program, readied beside steps.
 

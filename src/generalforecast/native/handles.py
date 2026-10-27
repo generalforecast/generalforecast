@@ -519,6 +519,10 @@ class Table(abc.ABC):
                 or None among string labels; see `label`.
             times: Each row's time as an integer, such as epoch seconds, for
                 queries with a cutoff. Rows without one are visible to every query.
+
+        Raises:
+            DuplicateKey: If a key is one the table holds already; the write
+                is refused whole, and the table is left as it was.
         """
 
     @abc.abstractmethod
@@ -857,6 +861,10 @@ class SeriesTable(abc.ABC):
                 value, inserted ahead of the series, or a gap. Times lie on
                 each series' grid, whole steps apart; a time a series already
                 holds is refused, as `upsert` replaces it.
+
+        Raises:
+            DuplicateKey: If a time is one its series holds already; the
+                write is refused whole, and the table is left as it was.
         """
 
     @abc.abstractmethod

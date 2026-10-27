@@ -464,7 +464,7 @@ fn table_rows<'a>(
 }
 
 /// Keys from Python: a C-contiguous (n, 2) array of each key's low and high
-/// 64 bits, as `generalforecast.native.client` lays out 128-bit keys.
+/// 64 bits, as `generalforecast.keys` lays out 128-bit keys.
 fn wide_keys(keys: &PyReadonlyArray2<'_, u64>) -> PyResult<Vec<u128>> {
     if keys.as_array().ncols() != 2 {
         return Err(invalid(
