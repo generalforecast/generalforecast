@@ -142,12 +142,23 @@ pub fn init_logging() {
     let logs = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_ansi(colour(
+            std::io::stderr().is_terminal(),
+            std::env::var_os("NO_COLOR").as_deref(),
+        ))
         .with_writer(std::io::stderr);
     if std::env::var("GF_LOG_FORMAT").is_ok_and(|format| format == "json") {
         logs.json().init();
     } else {
         logs.init();
     }
+}
+
+/// Whether logs are coloured: on a terminal alone, and not where `NO_COLOR`
+/// holds anything, as no-color.org asks.
+#[must_use]
+pub fn colour(terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    terminal && no_color.is_none_or(std::ffi::OsStr::is_empty)
 }
 
 /// The level logged without `GF_LOG`: `warn` on a terminal, `info` elsewhere.

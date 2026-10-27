@@ -2330,6 +2330,10 @@ impl Shard {
         }
     }
 
+    /// Takes a started worker in place of the one that stopped: sizes its
+    /// pools and serves it every table. A worker that cannot take them is
+    /// killed before the next start, so it holds neither its device memory
+    /// nor its disk file against the worker started after it.
     async fn adopt(&mut self, worker: WorkerConnection) -> Result<(), String> {
         if worker.models != self.worker.models {
             return Err(format!(
@@ -2338,6 +2342,15 @@ impl Shard {
             ));
         }
         self.worker = worker;
+        let configured = self.configure().await;
+        if configured.is_err() {
+            self.worker.kill().await;
+        }
+        configured
+    }
+
+    /// Sizes the worker's pools and serves it every table.
+    async fn configure(&mut self) -> Result<(), String> {
         self.allocate().await?;
         for entry in self.tables.values() {
             self.worker

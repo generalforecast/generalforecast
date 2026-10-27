@@ -25,3 +25,17 @@ fn traces_parse_and_pass_on_their_id() {
         assert_eq!(Trace::parse(invalid), None, "{invalid}");
     }
 }
+
+#[test]
+fn logs_are_coloured_on_a_terminal_alone_and_never_under_no_color() {
+    use std::ffi::OsStr;
+
+    use gf_server::trace::colour;
+    assert!(colour(true, None));
+    assert!(
+        colour(true, Some(OsStr::new(""))),
+        "an empty NO_COLOR is unset"
+    );
+    assert!(!colour(true, Some(OsStr::new("1"))));
+    assert!(!colour(false, None), "a pipe gets no escape codes");
+}

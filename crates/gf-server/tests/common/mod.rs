@@ -98,7 +98,12 @@ pub async fn shard_in(directory: std::path::PathBuf) -> mpsc::Sender<Command> {
     let (ours, theirs) = UnixStream::pair().unwrap();
     fake_worker(theirs);
     let connection = WorkerConnection::fake(ours, vec!["tiny".to_string()]).unwrap();
-    let settings = ShardSettings {
+    shard_over(connection, directory).await
+}
+
+/// A small shard's settings, its steps waiting a minute for their worker.
+pub fn settings() -> ShardSettings {
+    ShardSettings {
         device_bytes: 64 << 20,
         host_bytes: 64 << 20,
         row_memory_bytes: 64 << 20,
@@ -117,7 +122,15 @@ pub async fn shard_in(directory: std::path::PathBuf) -> mpsc::Sender<Command> {
             bytes: 1 << 20,
             idle: Duration::from_secs(300),
         },
-    };
+    }
+}
+
+/// A shard over `connection`, logging its tables under `directory`.
+pub async fn shard_over(
+    connection: WorkerConnection,
+    directory: std::path::PathBuf,
+) -> mpsc::Sender<Command> {
+    let settings = settings();
     std::fs::create_dir_all(&directory).unwrap();
     let key = EncryptionKey::from_hex(&"ab".repeat(32)).unwrap();
     let mut shard = Shard::new(
