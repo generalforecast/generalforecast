@@ -54,10 +54,10 @@ mod incoming;
 mod keys;
 mod predictions;
 
+pub use incoming::{ambiguous, internal, owns};
 use incoming::{
     check_endpoint, check_headers, check_origin, environment, names_match, parse_envelope, resolve,
 };
-pub use incoming::{dotted, internal, owns};
 pub use keys::{Introspect, KeyStore, Principal, Static};
 pub(crate) use predictions::snapshot_rows;
 use predictions::{adhoc_predict_with, dispatch};
@@ -658,7 +658,7 @@ fn failure(scope: Option<&Scope>, error: &ApiError) -> Response {
 }
 
 async fn handle(State(front): State<Arc<Front>>, request: Request) -> Response {
-    if dotted(request.uri().path()) {
+    if ambiguous(request.uri().path()) {
         return failure(None, &ApiError::validation("invalid request target"));
     }
     if internal(request.uri().path()) {

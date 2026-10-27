@@ -191,15 +191,19 @@ pub fn internal(path: &str) -> bool {
         .is_some_and(|first| percent_decoded(first).eq_ignore_ascii_case(INTERNAL))
 }
 
-/// Whether `path` has a `.` or `..` segment, plain or escaped, which an
-/// upstream's URL parser would resolve away, so a route the front refuses
-/// or owns could reach the upstream under another spelling; such a path is
-/// refused before it is routed.
+/// Whether `path` could reach an upstream as another route than the front
+/// reads it as: a `.` or `..` segment, plain or escaped, which the
+/// upstream's URL parser resolves away, or a separator, `/` or `\`, escaped
+/// inside a segment, or a backslash, which it may take for one. Such a path
+/// is refused before it is routed, so neither `/internal` nor a route the
+/// front owns reaches the upstream under another spelling.
 #[must_use]
-pub fn dotted(path: &str) -> bool {
-    path.split('/')
-        .map(percent_decoded)
-        .any(|part| part == "." || part == "..")
+pub fn ambiguous(path: &str) -> bool {
+    path.contains('\\')
+        || path
+            .split('/')
+            .map(percent_decoded)
+            .any(|part| part == "." || part == ".." || part.contains('/') || part.contains('\\'))
 }
 
 /// `segment` with its `%XX` escapes decoded; an escape that is not one is
