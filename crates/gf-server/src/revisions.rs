@@ -55,6 +55,56 @@ pub enum Published {
     },
 }
 
+/// What a revision's bound context was captured from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SourceKind {
+    /// Rows locked with the revision, which never move.
+    Snapshot,
+    /// A source whose rows move under the same context version, so a held
+    /// revision is captured again once its environment's resolution lapses.
+    Live,
+    /// A kind this server does not know, held as a snapshot is.
+    Other,
+}
+
+/// Where a revision's bound context came from: its kind, and the source's
+/// name where it has one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextSource {
+    pub kind: SourceKind,
+    pub name: Option<String>,
+}
+
+impl ContextSource {
+    /// The source a published context names under `source`: the explicit
+    /// pair `{"kind": ..., "name": ...}`, or the text the control plane
+    /// writes, a kind alone or `<kind>/<name>`. None where it names none.
+    #[must_use]
+    pub fn of(context: &Value) -> Option<Self> {
+        let source = context.get("source")?;
+        let (kind, name) = match source {
+            Value::Object(pair) => (
+                pair.get("kind")?.as_str()?,
+                pair.get("name").and_then(Value::as_str),
+            ),
+            Value::String(text) => match text.split_once('/') {
+                Some((kind, name)) => (kind, Some(name)),
+                None => (text.as_str(), None),
+            },
+            _ => return None,
+        };
+        let kind = match kind {
+            "snapshot" => SourceKind::Snapshot,
+            "live" => SourceKind::Live,
+            _ => SourceKind::Other,
+        };
+        Some(Self {
+            kind,
+            name: name.filter(|name| !name.is_empty()).map(str::to_string),
+        })
+    }
+}
+
 /// One prediction, as the control plane's metrics and events count it.
 #[derive(Clone, Debug, Serialize)]
 pub struct Record {
@@ -294,10 +344,13 @@ impl Revisions {
         self.loads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let now = Instant::now();
-        let live = matches!(
-            &published,
-            Published::Native { context: Some(context), .. } if context["source"] == "live"
-        );
+        let live = match &published {
+            Published::Native {
+                context: Some(context),
+                ..
+            } => ContextSource::of(context).is_some_and(|source| source.kind == SourceKind::Live),
+            Published::Native { context: None, .. } => false,
+        };
         let published = std::sync::Arc::new(published);
         self.cache.lock().expect("revision cache").insert(
             key,
@@ -485,5 +538,41 @@ mod tests {
         assert!(cache.get(&key(1), now + Duration::from_secs(1)).is_some());
         assert!(cache.get(&key(1), now + Duration::from_secs(5)).is_none());
         assert_eq!(cache.bytes, 0);
+    }
+
+    #[test]
+    fn a_context_source_reads_as_an_explicit_pair_or_as_the_planes_text() {
+        let source = |value: Value| ContextSource::of(&json!({"source": value}));
+        let live = |name: Option<&str>| {
+            Some(ContextSource {
+                kind: SourceKind::Live,
+                name: name.map(str::to_string),
+            })
+        };
+        assert_eq!(source(json!("live/orders")), live(Some("orders")));
+        assert_eq!(
+            source(json!({"kind": "live", "name": "orders"})),
+            live(Some("orders"))
+        );
+        assert_eq!(source(json!("live")), live(None));
+        assert_eq!(source(json!({"kind": "live"})), live(None));
+        assert_eq!(source(json!("live/")), live(None));
+        assert_eq!(
+            source(json!("snapshot")).map(|source| source.kind),
+            Some(SourceKind::Snapshot)
+        );
+        // A name that starts like a kind is not that kind.
+        for other in [
+            json!("liveliness/x"),
+            json!("dataset"),
+            json!({"kind": "lived"}),
+        ] {
+            assert_eq!(
+                source(other).map(|source| source.kind),
+                Some(SourceKind::Other)
+            );
+        }
+        assert_eq!(ContextSource::of(&json!({"rows": 4})), None);
+        assert_eq!(source(json!(7)), None);
     }
 }

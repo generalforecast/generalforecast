@@ -878,7 +878,7 @@ async fn snapshot_packages_bind_once_into_a_durable_table() {
         ),
         (
             predictor_payload("churn", json!([]), json!([{"x": "high"}])),
-            "column \"x\" holds values that are not float64",
+            "column \"x\" is declared float64, which takes numbers, but a row holds a string",
             None,
         ),
         (
@@ -999,6 +999,12 @@ struct Plane {
 
 fn published(revision: u64) -> Value {
     let context = if revision == 3 { "request" } else { "snapshot" };
+    // Revision 4 binds rows a live source captured, which move under one version.
+    let source = if revision == 4 {
+        "live/orders"
+    } else {
+        "snapshot"
+    };
     let served = json!({
         "name": "scorer",
         "reference": "tabicl-v2-classifier",
@@ -1036,7 +1042,7 @@ fn published(revision: u64) -> Value {
     json!({
         "kind": "native",
         "served": served,
-        "context": {"source": "snapshot", "version": "sha256:data", "rows": 4, "as_of": null},
+        "context": {"source": source, "version": "sha256:data", "rows": 4, "as_of": null},
         "rows": [
             {"id": "a", "x": 0.0, "y": false},
             {"id": "b", "x": 1.0, "y": false},
@@ -1832,4 +1838,35 @@ async fn a_locally_served_predictor_has_no_environments_to_name() {
     .await;
     assert_eq!(status.as_u16(), 422, "{body}");
     assert_eq!(body["error"]["param"], "env");
+}
+
+#[tokio::test]
+async fn a_live_revision_is_captured_again_once_its_environment_resolves_again() {
+    use std::sync::atomic::Ordering;
+
+    let state = Arc::new(Plane {
+        serving: 4.into(),
+        predictors: 0.into(),
+        records: std::sync::Mutex::new(Vec::new()),
+    });
+    let origin = plane(state.clone()).await;
+    let front = revision_front(&origin, 1 << 20).await;
+    let queries = json!({"queries": [{"id": "q", "x": 2.5}]});
+    for _ in 0..2 {
+        let (status, body) = score(&front, "environments/prod", SCORER, &queries).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    assert_eq!(
+        state.predictors.load(Ordering::SeqCst),
+        1,
+        "held while it resolves"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (status, body) = score(&front, "environments/prod", SCORER, &queries).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        state.predictors.load(Ordering::SeqCst),
+        2,
+        "a live source's rows are captured again"
+    );
 }
