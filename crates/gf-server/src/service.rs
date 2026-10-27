@@ -37,7 +37,7 @@
 //! A write is logged only while this node holds its lease, if writes need one,
 //! and while its table is at the term a router named in `gf-term`, if any.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -48,7 +48,7 @@ use std::time::{Duration, Instant};
 use arrow_array::builder::{FixedSizeBinaryBuilder, ListBuilder};
 use arrow_array::{
     Array, ArrayRef, FixedSizeBinaryArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, UInt64Array,
+    RecordBatch, StringArray, UInt64Array,
 };
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
@@ -84,7 +84,9 @@ use crate::shard::{
     Command, Description, Fence, Incoming, Lease, Lineage, LogLength, ServerError, Write,
 };
 use crate::trace::{Trace, traced};
-use crate::wal::{CreationId, Durability, LogEntry, Rows, TableDefinition, Terms, decode};
+use crate::wal::{
+    CreationId, Durability, GivenKey, LogEntry, Rows, SeriesKey, TableDefinition, Terms, decode,
+};
 use gf_core::columns::{self, Cells, Column, ColumnKind, Strings};
 
 type Boxed<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -1538,6 +1540,11 @@ fn changes(
         }
         strings.push((placement.columns.len(), labels_given));
     }
+    let series = if placement.series.is_some() && !labels_only {
+        series_keys(batches, &keys)?
+    } else {
+        Vec::new()
+    };
     Ok(Incoming {
         rows: Rows {
             keys,
@@ -1546,12 +1553,69 @@ fn changes(
             times: times(batches, "time")?.map(|times| times.into_iter().map(Some).collect()),
             id,
             words: Vec::new(),
+            series,
             writes: Vec::new(),
             layout: None,
             table: None,
         },
         strings,
     })
+}
+
+/// The series the observations of a write to a table of series belong to,
+/// each once: its digest, the high half of its observations' row keys, and
+/// its key as the client gave it, which column `"series_key"` holds per
+/// observation as the JSON of a `GivenKey`, plain or dictionary-encoded text.
+/// A key that does not digest to its observations' series is refused.
+fn series_keys(batches: &[RecordBatch], keys: &[u128]) -> Result<Vec<SeriesKey>, Status> {
+    let mut named = Vec::new();
+    let mut seen = HashSet::new();
+    let mut row = 0;
+    for batch in batches {
+        let column = column(batch, "series_key")?;
+        if !matches!(
+            column.data_type(),
+            DataType::Utf8 | DataType::LargeUtf8 | DataType::Dictionary(..)
+        ) {
+            return Err(invalid(
+                "column \"series_key\" holds each observation's series key as text",
+            ));
+        }
+        let texts = arrow_cast::cast(column, &DataType::Utf8)
+            .map_err(|error| invalid(format!("column \"series_key\": {error}")))?;
+        let texts = texts
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("cast to utf8");
+        for index in 0..texts.len() {
+            let Some(key) = keys.get(row) else {
+                return Err(invalid("every observation needs a key"));
+            };
+            row += 1;
+            let digest = (key >> 64) as u64;
+            if !seen.insert(digest) {
+                continue;
+            }
+            if texts.is_null(index) {
+                return Err(invalid("a series key cannot be missing"));
+            }
+            let given: GivenKey = serde_json::from_str(texts.value(index)).map_err(|error| {
+                invalid(format!(
+                    "column \"series_key\" holds each series' key as the JSON of its kind and \
+                     value: {error}"
+                ))
+            })?;
+            let series = SeriesKey { digest, key: given };
+            series
+                .check()
+                .map_err(|error| invalid(format!("column \"series_key\": {error}")))?;
+            named.push(series);
+        }
+    }
+    if row != keys.len() {
+        return Err(invalid("every observation needs a series key"));
+    }
+    Ok(named)
 }
 
 /// The series a forecast batch names, by their keys' 64-bit digests: a uint64
@@ -2604,6 +2668,7 @@ impl Service {
                     regions,
                     vocabularies,
                     labels,
+                    series,
                 } = self
                     .ask(placement.shard, |reply| Command::Describe { table, reply })
                     .await?;
@@ -2627,6 +2692,9 @@ impl Service {
                 if let Some(rows) = effective_fit_rows {
                     described["effective_fit_rows"] = json!(rows);
                 }
+                if let Some(count) = series {
+                    described["series_count"] = json!(count);
+                }
                 described["region_stats"] = json!(regions.map(|stats| json!({
                     "regions": stats.regions,
                     "mean_rows": stats.mean_rows,
@@ -2640,6 +2708,16 @@ impl Service {
                     "overdue_seconds": stats.overdue.as_secs_f64(),
                 })));
                 results(vec![described])
+            }
+            FlightAction::KnownSeries(table) => {
+                let (placement, _routed) = self.routed(&table).await?;
+                let keys = self
+                    .ask(placement.shard, |reply| Command::KnownSeries {
+                        table,
+                        reply,
+                    })
+                    .await?;
+                results(vec![json!(keys)])
             }
             FlightAction::Truncate(table) => {
                 let (placement, _routed) = self.routed(&table).await?;
@@ -2894,6 +2972,7 @@ impl FlightService for Service {
         let actions = [
             "create_table",
             "describe",
+            "known_series",
             "delete",
             "truncate",
             "refit",

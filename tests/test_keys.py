@@ -7,7 +7,7 @@ import uuid
 import numpy as np
 import pytest
 
-from generalforecast.keys import keys_of
+from generalforecast.keys import key_of_spec, keys_of, spec_of_key
 
 
 def _wide(halves: np.ndarray) -> list[int]:
@@ -92,3 +92,26 @@ def test_series_keys_pack_the_series_digest_over_the_time() -> None:
     assert digests[0] == keys_of(["shoes"]).halves[0, 0]
     with pytest.raises(ValueError, match="expected 2 times"):
         series_keys(["a", "b"], [1])
+
+
+def test_keys_as_given_round_trip_through_their_specs() -> None:
+    token = uuid.UUID(int=(1 << 127) + 5)
+    for key, spec in [
+        (7, {"kind": "integer", "value": "7"}),
+        (-(1 << 100), {"kind": "integer", "value": str(-(1 << 100))}),
+        ("acct-9", {"kind": "string", "value": "acct-9"}),
+        (b"\x00\xff", {"kind": "bytes", "value": "00ff"}),
+        (token, {"kind": "uuid", "value": str(token)}),
+    ]:
+        assert spec_of_key(key) == spec
+        assert key_of_spec(spec) == key
+        assert type(key_of_spec(spec)) is type(key)
+    assert spec_of_key(np.int64(3)) == {"kind": "integer", "value": "3"}
+    with pytest.raises(TypeError, match="not a boolean"):
+        spec_of_key(True)
+    with pytest.raises(TypeError, match="not float"):
+        spec_of_key(1.5)
+    with pytest.raises(ValueError, match="unknown key kind"):
+        key_of_spec({"kind": "float", "value": "1.5"})
+    with pytest.raises(ValueError, match="not a key"):
+        key_of_spec({"kind": "integer"})

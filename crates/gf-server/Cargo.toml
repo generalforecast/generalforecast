@@ -1,7 +1,7 @@
 [package]
 name = "gf-server"
 description = "generalforecast's server: Arrow Flight API, write-ahead log, and Python workers"
-version = "0.1.11"
+version = "0.1.12"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -19,6 +19,7 @@ arrow-ipc = "60"
 arrow-schema = "60"
 arrow-select = "60"
 axum = "0.8"
+blake2 = "0.10"
 bytes = "1"
 chacha20poly1305 = "0.10"
 clap = { version = "4", features = ["derive"] }
