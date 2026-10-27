@@ -5144,9 +5144,18 @@ fn a_page_whose_rows_fail_to_read_is_embedded_by_the_next_step() {
         .unwrap();
     node.submit(table, &A).unwrap();
 
+    // The table's request is refused with the read's error, and asked again.
     flaky.fail_after(0);
-    assert!(matches!(node.schedule(), Err(NodeError::Rows(_))));
+    let request = node.submit(table, &A).unwrap();
+    assert!(matches!(node.schedule(), Ok(None)));
+    let refused = node.take_refused();
+    assert!(
+        refused
+            .iter()
+            .any(|(id, error)| *id == request && matches!(error, NodeError::Rows(_)))
+    );
     flaky.heal();
+    node.submit(table, &A).unwrap();
     let step = run(&mut node);
 
     let page = step
@@ -5167,10 +5176,13 @@ fn a_fused_fit_whose_rows_fail_to_read_is_fit_again() {
     node.set_single_use(table).unwrap();
     node.submit(table, &A).unwrap();
 
-    // The fit reads the rows, then the unit fails to read them again.
+    // The fit reads the rows, then the unit fails to read them again; the
+    // request is refused with the read's error, and asked again.
     flaky.fail_after(1);
-    assert!(matches!(node.schedule(), Err(NodeError::Rows(_))));
+    assert!(matches!(node.schedule(), Ok(None)));
+    assert!(matches!(node.take_refused()[..], [(_, NodeError::Rows(_))]));
     flaky.heal();
+    node.submit(table, &A).unwrap();
     let step = run(&mut node);
 
     assert_eq!(actions(&step), [Action::Fuse]);
@@ -5514,4 +5526,28 @@ fn a_tables_row_id_cap_refuses_the_insert_past_it() {
     // No cap reaches past the most ids any table assigns.
     node.set_row_ids(table, NonZeroU64::MAX).unwrap();
     assert_eq!(node.ids_left(table).unwrap(), ROW_IDS - 12);
+}
+
+#[test]
+fn a_table_whose_rows_cannot_be_read_fails_its_own_requests_alone() {
+    let flaky = Flaky::new();
+    let (mut node, failing) = spilling(spec(Strategy::Exact), flaky.clone(), "failing.rows");
+    let kept = node.create_table(spec(Strategy::Exact)).unwrap();
+    for table in [failing, kept] {
+        let (keys, features, targets) = rows(32);
+        node.insert(table, &keys, &features, targets).unwrap();
+    }
+    // The failing table's rows never read again.
+    flaky.fail_after(0);
+    let lost = node.submit(failing, &A).unwrap();
+    node.submit(kept, &A).unwrap();
+
+    let step = node.schedule().unwrap().expect("the kept table's step");
+    assert!(step.queries().iter().all(|batch| batch.table == kept));
+    assert!(matches!(node.take_refused()[..], [(id, NodeError::Rows(_))] if id == lost));
+    // Nothing of the failing table stays queued to fail the next schedule.
+    node.fail(&step);
+    node.submit(kept, &A).unwrap();
+    assert!(node.schedule().unwrap().is_some());
+    assert!(node.take_refused().is_empty());
 }
