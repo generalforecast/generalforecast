@@ -5551,3 +5551,33 @@ fn a_table_whose_rows_cannot_be_read_fails_its_own_requests_alone() {
     assert!(node.schedule().unwrap().is_some());
     assert!(node.take_refused().is_empty());
 }
+
+#[test]
+fn a_fit_unwound_with_its_step_leaves_drift_measured_against_the_last_one() {
+    let flaky = Flaky::new();
+    let (mut node, table) = spilling(spec(Strategy::Exact), flaky.clone(), "baseline.rows");
+    let (keys, features, targets) = rows(32);
+    node.insert(table, &keys, &features, targets).unwrap();
+    node.set_single_use(table).unwrap();
+    node.submit(table, &A).unwrap();
+    run(&mut node);
+    node.update(
+        table,
+        &[0, 1],
+        &[0.5, 0.5, 0.25, 0.25],
+        Targets::Classes(vec![1, 1]),
+    )
+    .unwrap();
+    node.refit(table).unwrap();
+    let before = node.compaction_source(table).unwrap().table;
+
+    // The fused fit reads the rows, then its unit fails to, so the step unwinds.
+    flaky.fail_after(1);
+    node.submit(table, &A).unwrap();
+    assert!(matches!(node.schedule(), Ok(None)));
+    flaky.heal();
+
+    let after = node.compaction_source(table).unwrap().table;
+    assert_eq!(after.changed, before.changed);
+    assert_eq!(after.fitted, before.fitted);
+}

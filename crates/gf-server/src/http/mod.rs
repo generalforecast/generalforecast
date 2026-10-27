@@ -568,10 +568,9 @@ impl Front {
         self.keys.auth()
     }
 
-    /// The served models' names.
-    #[must_use]
     /// What this server serves, predictors by name and catalog models by
     /// canonical id.
+    #[must_use]
     pub fn names(&self) -> Vec<String> {
         self.models
             .iter()
@@ -996,8 +995,7 @@ impl Front {
             .ok_or_else(ApiError::not_served)
     }
 
-    /// Admits a payload's model only if it is exactly the reference served,
-    /// variant and all.
+    /// The engine inference runs through, once the shards are up.
     fn engine(&self) -> Result<&Engine, ApiError> {
         self.engine.get().ok_or_else(not_ready)
     }

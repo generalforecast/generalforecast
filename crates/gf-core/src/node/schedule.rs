@@ -32,6 +32,8 @@ pub(super) fn schedule_table(
         fitted: state.fitted,
         horizon: state.horizon,
         fitted_latest: state.fitted_latest,
+        fitted_columns: state.fitted_columns.clone(),
+        changed: state.changed,
     });
     if state.fitted != Some(state.epoch) {
         state.horizon = wanted;

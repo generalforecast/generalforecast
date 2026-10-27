@@ -119,7 +119,7 @@ impl EncryptionKey {
     /// message sealed under it, as hex.
     #[must_use]
     pub fn id(&self) -> String {
-        crate::setup::hex(&self.id_bytes())
+        gf_core::request::hex(&self.id_bytes())
     }
 
     /// The key's id, as a log's header names it.
@@ -1040,7 +1040,7 @@ impl Replay {
         }
         let id: [u8; KEY_ID] = header[MAGIC.len() + 2..].try_into().expect("sized");
         let (key, current) = keys.find(&id).ok_or_else(|| LogError::Key {
-            id: crate::setup::hex(&id),
+            id: gf_core::request::hex(&id),
         })?;
         let head = read_head(path, &table, keys)?;
         let mut entries = Entries {

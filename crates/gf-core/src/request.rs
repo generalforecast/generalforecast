@@ -673,13 +673,16 @@ impl Inference {
     }
 }
 
-/// A fingerprint as lowercase hex.
+/// Bytes, such as a fingerprint, as lowercase hex.
 #[must_use]
-pub fn hex(fingerprint: &[u8; 32]) -> String {
-    fingerprint
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
         .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+        .fold(String::with_capacity(bytes.len() * 2), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 /// How a request is parsed: the surface it is served on, its bounds, and

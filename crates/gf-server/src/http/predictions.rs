@@ -148,9 +148,6 @@ fn forecasting_unserved() -> ApiError {
     )
 }
 
-/// The `/predictions` body for a catalog model: flat rows, bound as an
-/// inference request whose context is the rows with a target, then
-/// answered as the shared `PredictionResult`.
 /// Refuses the fields of `payload` named in `fields`, each with `reason`
 /// after its name, so a caller learns which field to drop.
 fn refuse_fields(payload: &Value, fields: &[&str], reason: &str) -> Result<(), ApiError> {

@@ -402,7 +402,7 @@ fn body<'a, T: Deserialize<'a>>(action: &'a Action) -> Result<T, Status> {
 /// What is wrong with it.
 pub fn check_write_id(id: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > WRITE_ID_BYTES {
-        return Err(format!("a write id is 1 to {WRITE_ID_BYTES} characters"));
+        return Err(format!("a write id is 1 to {WRITE_ID_BYTES} bytes"));
     }
     Ok(())
 }
