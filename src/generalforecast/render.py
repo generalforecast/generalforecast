@@ -185,7 +185,6 @@ def _status(args: argparse.Namespace, result: dict, out: term.Output) -> None:
                 "environment": e.get("name"),
                 "revision": e.get("revision"),
                 "status": e.get("status"),
-                "runtime": e.get("runtime"),
             }
             for e in environments
         ],

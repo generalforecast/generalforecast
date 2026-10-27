@@ -20,7 +20,7 @@ use gf_core::node::Targets;
 use gf_core::predictor::{self, Encoder};
 use gf_core::request::{self, AlignedGroup, Forecast, Label, Tabular};
 use gf_core::route;
-use serde_json::json;
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot};
 
@@ -130,6 +130,7 @@ impl Engine {
             request.context.clone(),
             request.targets.clone(),
             request.usable_rows(),
+            None,
         )?;
         let answered = self
             .ask(
@@ -338,6 +339,7 @@ impl Engine {
                 context.features,
                 context.targets,
                 context.rows,
+                predictor.strategy.as_ref(),
             )
             .await?;
         Ok(Bound {
@@ -354,7 +356,9 @@ impl Engine {
     /// fingerprint names; answers the table's quantile levels, if it
     /// predicts values. A table an earlier start bound and restored there
     /// is bound again, since rows the binder of then encoded need not be
-    /// the rows this one encodes.
+    /// the rows this one encodes. `strategy` is the selection each query's
+    /// context is drawn by, as a predictor's lock resolves it; exact when
+    /// None.
     #[allow(clippy::too_many_arguments)]
     pub async fn bind(
         &self,
@@ -366,15 +370,17 @@ impl Engine {
         features: Vec<f32>,
         targets: Targets,
         rows: usize,
+        strategy: Option<&Value>,
     ) -> Result<Option<Vec<f64>>, ApiError> {
-        let failed = || ApiError::new("InternalError", "request failed safely", 500);
-        let definition: TableDefinition = serde_json::from_value(json!({
-            "name": table.as_str(),
-            "model": model,
-            "columns": columns::numeric(width),
-            "classes": classes,
-        }))
-        .map_err(|_| failed())?;
+        let definition: TableDefinition = serde_json::from_value(definition(
+            table.as_str(),
+            model,
+            width,
+            classes,
+            strategy,
+            None,
+        ))
+        .map_err(|_| ApiError::validation("invalid predictor selection"))?;
         let shard = self.durable(fingerprint);
         let create = |definition| {
             move |reply| Command::Create {
@@ -559,6 +565,31 @@ impl Engine {
     }
 }
 
+/// A bound context's table definition: numeric columns of the encoded
+/// width, and the predictor's selection strategy when it has one.
+fn definition(
+    name: &str,
+    model: &str,
+    width: usize,
+    classes: usize,
+    strategy: Option<&Value>,
+    durability: Option<&str>,
+) -> Value {
+    let mut definition = json!({
+        "name": name,
+        "model": model,
+        "columns": columns::numeric(width),
+        "classes": classes,
+    });
+    if let Some(strategy) = strategy {
+        definition["strategy"] = strategy.clone();
+    }
+    if let Some(durability) = durability {
+        definition["durability"] = json!(durability);
+    }
+    definition
+}
+
 /// The first part of the name of every table a snapshot predictor's rows
 /// are bound into, which Flight clients may not create.
 pub const BOUND_PREFIX: &str = "pkg-";
@@ -588,7 +619,9 @@ pub fn bound_shard(fingerprint: &[u8; 32], shards: usize) -> usize {
     route::shard_of(fingerprint, shards)
 }
 
-/// A tabular context in the ephemeral table its fingerprint names.
+/// A tabular context in the ephemeral table its fingerprint names, drawn
+/// per query by `strategy` when a predictor's lock selects; exact when None.
+#[allow(clippy::too_many_arguments)]
 pub fn rows_context(
     model: &str,
     fingerprint: &[u8; 32],
@@ -597,15 +630,18 @@ pub fn rows_context(
     features: Vec<f32>,
     targets: Targets,
     rows: usize,
+    strategy: Option<&Value>,
 ) -> Result<RequestContext, ApiError> {
-    let definition: TableDefinition = serde_json::from_value(json!({
-        "name": format!("ctx-{}", request::hex(fingerprint)),
-        "model": model,
-        "columns": columns::numeric(width),
-        "classes": classes,
-        "durability": "ephemeral",
-    }))
-    .map_err(|_| ApiError::new("InternalError", "request failed safely", 500))?;
+    let name = format!("ctx-{}", request::hex(fingerprint));
+    let definition: TableDefinition = serde_json::from_value(definition(
+        &name,
+        model,
+        width,
+        classes,
+        strategy,
+        Some("ephemeral"),
+    ))
+    .map_err(|_| ApiError::validation("invalid predictor selection"))?;
     Ok(RequestContext {
         fingerprint: *fingerprint,
         definition,

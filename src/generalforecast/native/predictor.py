@@ -3,7 +3,6 @@
 
 """Portable fitted context and faithful declarative export for native estimators."""
 
-import datetime
 import os
 import shutil
 import tempfile
@@ -18,7 +17,7 @@ from generalforecast.predictors import frequency as _frequency
 from generalforecast.predictors.models import CatalogResolver
 from generalforecast.predictors.runtime.plan import ExecutionPlan
 from generalforecast.predictors.runtime.schema import infer_schema
-from generalforecast.predictors.validation import ensure
+from generalforecast.predictors.validation import PredictorError, ensure
 from generalforecast.tabular import arrow_bytes, read_table, to_arrow
 
 
@@ -37,48 +36,42 @@ def forecast(
 ) -> np.ndarray:
     """Uses the admitted native grouped kernel with one shared row per covariate.
 
-    `frequency` is the step in seconds (periods for integer times), or a
-    frequency spelling; times of a calendar alias such as `MS` become the
-    ordinals of their periods, which the model steps through one at a time.
+    `frequency` is the plan's frequency when it declares none: a number of
+    periods or seconds, or a spelling. Times sit on its axis as
+    `frequency.coordinate` places them, in UTC: a calendar alias such as
+    `MS` steps through period ordinals one at a time.
     """
     from generalforecast.models.catalog import parse
     from generalforecast.models.outputs import quantile_index
     from generalforecast.service.catalog import forecast_request
     from generalforecast.service.catalog_forecast import checked
 
-    calendar = isinstance(frequency, str) and _frequency.is_calendar(frequency)
-    if isinstance(frequency, str) and not calendar:
-        frequency = _frequency.seconds(frequency) or 0.0
+    cadence = spec.frequency if spec.frequency is not None else frequency
 
     def instant(value):
-        if calendar:
-            return _frequency.ordinal(value, frequency)
-        if isinstance(value, datetime.datetime):
-            return float(value.timestamp())
-        if isinstance(value, datetime.date):
-            return float((value - datetime.date(1970, 1, 1)).days * 86400)
-        return value
+        return _frequency.coordinate(value, cadence)
 
     history, rows = context.to_pylist(), queries.to_pylist()
-    identities = list(
-        dict.fromkeys(tuple(row[name] for name in spec.series) for row in history)
-    )
+    identities = {
+        key: index
+        for index, key in enumerate(
+            dict.fromkeys(tuple(row[name] for name in spec.series) for row in history)
+        )
+    }
 
     def identity(row):
-        return f"gfseries:{identities.index(tuple(row[name] for name in spec.series))}"
+        key = tuple(row[name] for name in spec.series)
+        if key not in identities:
+            shown = ", ".join(
+                f"{n}={v!r}" for n, v in zip(spec.series, key, strict=True)
+            )
+            raise PredictorError(
+                "UnknownSeries", f"series {shown} is not in the fitted context"
+            )
+        return f"gfseries:{identities[key]}"
 
     origin = max(instant(row[spec.time]) for row in history)
-    if calendar:
-        counted = _frequency.CALENDAR.fullmatch(str(frequency))
-        assert counted is not None
-        step: float | int = int(counted.group(1) or 1)
-    else:
-        assert isinstance(frequency, float | int)
-        step = (
-            int(frequency)
-            if type(origin) is int and float(frequency).is_integer()
-            else frequency
-        )
+    step: float | int = _frequency.step(cadence)
     groups: dict[str, list[int]] = {}
     for index, row in enumerate(rows):
         groups.setdefault(identity(row), []).append(index)
@@ -162,18 +155,14 @@ def admitted_spec(
     """Resolves metadata and validates all context rows without executing weights."""
     pin = CatalogResolver().resolve(model, offline=True)
     ensure(task in pin.tasks, "model does not support estimator task")
-    spec = ExecutionPlan.from_dict(
-        {
-            "name": "estimator",
-            "model": pin.resolved,
-            "task": task,
-            "target": target,
-            "context": "context.arrow",
-            "outputs": ["label", "probabilities"]
-            if task == "classification"
-            else ["value", "quantiles"],
-            **options,
-        }
+    options.setdefault(
+        "outputs",
+        ["label", "probabilities"]
+        if task == "classification"
+        else ["value", "quantiles"],
+    )
+    spec = ExecutionPlan.build(
+        "estimator", pin.resolved, task=task, target=target, **options
     )
     infer_schema(spec, pin, task, table)
     ensure(
@@ -222,10 +211,18 @@ def export_predictor(
         manifest["horizon"] = spec.horizon
         if spec.quantiles:
             manifest["quantiles"] = list(spec.quantiles)
-        if spec.past_inputs:
-            manifest["past"] = list(spec.past_inputs)
-        if spec.future_inputs:
-            manifest["future"] = list(spec.future_inputs)
+        # A covariate the estimator reads as both past and known-future is one
+        # channel; the manifest names it once, as a future input.
+        past = [
+            column for column in spec.past_inputs if column not in spec.future_inputs
+        ]
+        covariates = {
+            key: list(columns)
+            for key, columns in (("past", past), ("future", spec.future_inputs))
+            if columns
+        }
+        if covariates:
+            manifest["inputs"] = covariates
     elif spec.inputs.include is not None:
         manifest["inputs"] = list(spec.inputs.include)
     manifest["context"] = {"snapshot": SNAPSHOT}

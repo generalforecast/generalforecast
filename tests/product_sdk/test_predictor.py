@@ -534,7 +534,7 @@ def test_local_predictors_read_the_manifest_and_split_the_snapshot(
     assert (predictor.context.kind, predictor.context.rows) == ("snapshot", 4)
     assert (
         repr(predictor)
-        == f"Predictor(churn, model={MODEL}, inputs=?, context=snapshot 4 rows, env=None)"
+        == f"Predictor(churn, model={MODEL}, inputs=2, context=snapshot 4 rows, env=None)"
     )
     request = predictor.request(
         [{"customer_id": 9, "spend": 1.0, "plan": "a", "note": "q"}]

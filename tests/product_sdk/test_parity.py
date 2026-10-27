@@ -106,7 +106,7 @@ def test_async_handles_share_the_sync_handles_facts_and_operations():
 
 
 def results(lock: Any, revision: Revision) -> list[tuple[str, str, Any]]:
-    environment = Environment("risk", "staging", 1, 1, "local", "ready").to_dict()
+    environment = Environment("risk", "staging", 1, 1, "ready").to_dict()
     prediction = {
         "model": "general-forecast/tabicl-v2-classifier",
         "task": "classification",
@@ -198,7 +198,7 @@ def calls(authored: Any) -> dict[str, tuple[tuple, dict]]:
         "predictors.environment": (("risk",), {}),
         "predictors.create_environment": (
             ("risk",),
-            {"env": "dev", "runtime": "local"},
+            {"env": "dev"},
         ),
         "predictors.promote": (("risk",), {"revision": 1}),
         "predictors.rollback": (("risk",), {"revision": 1, "expected_generation": 1}),
@@ -419,11 +419,6 @@ def test_every_request_either_client_sends_is_a_route_of_the_spec(
             request.from_payload(body)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="gf.lock writes gf.yaml type names (bool, int) that the spec's Lock "
-    "schema does not list; reconcile predictors/lock.py with api/openapi.yaml",
-)
 def test_a_pushed_lock_matches_the_spec(tmp_path, monkeypatch):
     routes = spec_routes()
     for method, path, body, _built in sent_requests(tmp_path, monkeypatch):

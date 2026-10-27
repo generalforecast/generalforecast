@@ -1,7 +1,13 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Aligned grouped forecast contexts, with explicit complete future query rows."""
+"""Aligned grouped forecast contexts, with explicit complete future query rows.
+
+Times sit on their frequency's axis, `frequency.coordinate`: UTC seconds for
+a span, the period ordinal for a calendar alias such as `MS`, so a model
+stepping by `frequency.step` sees evenly spaced times. gf-server's binder
+(`predictors.rs`) places them the same way.
+"""
 
 from dataclasses import dataclass
 from typing import Any
@@ -11,9 +17,9 @@ import pyarrow as pa
 
 from generalforecast.engine import LocalEngine, ModelOutputError
 from generalforecast.models.catalog import V1_POLICY, ModelRef
-from generalforecast.models.grouping import instant
 from generalforecast.models.outputs import DEFAULT_QUANTILES, quantile_index, quantiles
-from generalforecast.predictors.runtime.lock import ExecutionLock
+from generalforecast.predictors import frequency as _frequency
+from generalforecast.predictors.runtime.compiled import CompiledPlan
 from generalforecast.predictors.runtime.schema import TableSchema
 from generalforecast.predictors.validation import ensure
 from generalforecast.service.catalog import forecast_request
@@ -37,7 +43,7 @@ class ForecastContext:
     @classmethod
     def build(
         cls,
-        lock: ExecutionLock,
+        lock: CompiledPlan,
         model: tuple[LocalEngine, ModelRef],
         table: pa.Table,
         schema: TableSchema,
@@ -59,11 +65,13 @@ class ForecastContext:
             "grouped forecast supports at most eight explicitly related series",
             "CapacityExceeded",
         )
+        assert spec.frequency is not None
+        cadence = spec.frequency
         ends: dict[tuple, int | float] = {}
         rows = []
         for index, row in enumerate(table.to_pylist()):
             identity = tuple(row[name] for name in spec.series)
-            moment = instant(row[spec.time])
+            moment = _frequency.coordinate(row[spec.time], cadence)
             ends[identity] = max(moment, ends.get(identity, moment))
             rows.append(
                 {
@@ -82,12 +90,7 @@ class ForecastContext:
             "related series must share the same forecast origin",
         )
         origin = next(iter(ends.values()))
-        assert schema.frequency is not None
-        step = (
-            int(schema.frequency)
-            if type(origin) is int and schema.frequency.is_integer()
-            else schema.frequency
-        )
+        step = _frequency.step(cadence)
         query = {
             "key": "warm",
             "series": "gfseries:0",
@@ -118,7 +121,7 @@ class ForecastContext:
         return cls(identities, origin, step, request)
 
     def predict(
-        self, lock: ExecutionLock, model: tuple[LocalEngine, ModelRef], table: pa.Table
+        self, lock: CompiledPlan, model: tuple[LocalEngine, ModelRef], table: pa.Table
     ) -> dict[str, Any]:
         """Aligns future rows and forecasts the queried series of the bound group."""
         spec = lock.spec
@@ -130,7 +133,9 @@ class ForecastContext:
             identity = tuple(row[name] for name in spec.series)
             ensure(identity in self.identities, "query series is missing from context")
             series = self.identities.index(identity)
-            offset = (instant(row[spec.time]) - self.origin) / self.step - 1
+            assert spec.frequency is not None
+            moment = _frequency.coordinate(row[spec.time], spec.frequency)
+            offset = (moment - self.origin) / self.step - 1
             position = round(offset)
             ensure(
                 abs(offset - position) < 1e-6 and 0 <= position < spec.horizon,

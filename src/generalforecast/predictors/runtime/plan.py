@@ -1,130 +1,142 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Immutable authored intent, independent of runtime, credentials and environment."""
+"""The execution plan: what the runtime binds, derived from a lock, never parsed from YAML.
 
-import re
-from dataclasses import dataclass
+`gf.yaml` is parsed once, by `generalforecast.predictors.spec`; `gf check`
+resolves it into `gf.lock`. `ExecutionPlan.from_lock` reads the plan the
+runtime compiles from that lock, so `gf.Predictor`, `gf serve` and hosted
+serving bind the same plan from the same document. The estimators build
+plans directly for their own fitted contexts.
+"""
+
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from generalforecast.predictors import frequency as _frequency
-from generalforecast.predictors.files import relative
+from generalforecast.predictors.selection import SelectionInfo
 from generalforecast.predictors.validation import (
     PredictorError,
     ensure,
-    fields,
-    integer,
     name,
-    names,
     text,
 )
-from generalforecast.tabular import DECLARED_TYPES
 
 TASKS = frozenset({"classification", "regression", "forecast"})
+CONTEXT_MODES = ("snapshot", "request", "live")
+OUTPUTS = {
+    "classification": ("label", "probabilities"),
+    "regression": ("value", "quantiles"),
+    "forecast": ("value", "quantiles"),
+}
 
 
 @dataclass(frozen=True)
 class PlanContext:
-    """Request, immutable snapshot or live context binding."""
+    """Where the plan's context rows come from.
+
+    Attributes:
+        mode: `snapshot`, `request` or `live`.
+        name: A live context's name.
+        max_rows: The most context rows one request may carry.
+    """
 
     mode: str = "request"
-    source: str | None = None
-    order_by: str | None = None
-    selection: str = "all"
+    name: str | None = None
     max_rows: int | None = None
 
-    @classmethod
-    def from_dict(cls, value: Any = None) -> "PlanContext":
-        """Normalizes short context syntax without fetching a source."""
-        if value is None:
-            return cls()
-        if type(value) is str:
-            value = {"source": value}
-        fields(value, {"source"}, {"order_by", "selection", "max_rows"})
-        source = text(value["source"])
-        if source == "request":
-            ensure(len(value) == 1, "request context has no selection policy")
-            return cls()
-        if source.startswith("live/"):
-            name(source.removeprefix("live/"))
-            mode = "live"
-        else:
-            source = relative(source)
-            mode = "snapshot"
-        order = text(value["order_by"]) if "order_by" in value else None
-        selection = value.get("selection", "all")
-        ensure(selection in ("all", "most_recent"), "unsupported context selection")
-        maximum = integer(value["max_rows"]) if "max_rows" in value else None
+    def __post_init__(self) -> None:
+        """Checks the mode and its fields."""
+        ensure(self.mode in CONTEXT_MODES, "unsupported context mode")
         ensure(
-            (selection == "all" and maximum is None)
-            or (
-                selection == "most_recent" and order is not None and maximum is not None
-            ),
-            "bounded context requires explicit most_recent ordering and max_rows",
+            (self.mode == "live") == (self.name is not None),
+            "a live context, and only one, is named",
         )
-        return cls(mode, source, order, selection, maximum)
+        if self.name is not None:
+            name(self.name)
+        ensure(
+            self.max_rows is None or (type(self.max_rows) is int and self.max_rows > 0),
+            "max_rows must be a positive integer",
+        )
+        ensure(
+            self.max_rows is None or self.mode == "request",
+            "max_rows bounds request contexts only",
+        )
 
     def to_dict(self) -> dict:
-        """Serializes normalized portable source intent."""
-        if self.mode == "request":
-            return {"source": "request"}
-        result = {"source": self.source or "request", "selection": self.selection}
-        if self.order_by is not None:
-            result["order_by"] = self.order_by
-        if self.max_rows is not None:
-            result["max_rows"] = self.max_rows
-        return result
+        """The context as the plan digest hashes it."""
+        return {"mode": self.mode, "name": self.name, "max_rows": self.max_rows}
 
 
 @dataclass(frozen=True)
 class PlanInputs:
-    """Feature selection and explicit semantic overrides, not semantic guesses."""
+    """A tabular plan's input columns and their declared kinds.
+
+    Attributes:
+        include: The input columns in order; None takes every column without
+            a role, less `exclude`.
+        exclude: Columns left out of the inferred inputs.
+        types: Each column's kind, in the vocabulary of
+            `generalforecast.predictors.tables`, as the lock records it.
+        missing_values: `allow` or `reject` missing input values.
+    """
 
     include: tuple[str, ...] | None = None
     exclude: tuple[str, ...] = ()
     types: tuple[tuple[str, str], ...] = ()
     missing_values: str = "allow"
 
-    @classmethod
-    def from_dict(cls, value: Any) -> "PlanInputs":
-        """Rejects contradictory selections and unknown physical or semantic types."""
-        fields(value, set(), {"include", "exclude", "types", "missing_values"})
+    def __post_init__(self) -> None:
+        """Rejects contradictory selections and unknown kinds."""
+        from generalforecast.predictors.tables import PHYSICAL
+
         ensure(
-            not ("include" in value and "exclude" in value),
+            self.include is None or not self.exclude,
             "choose include or exclude, not both",
         )
-        types = value.get("types", {})
-        ensure(type(types) is dict, "input types must be an object")
-        for column, kind in types.items():
+        for column, kind in self.types:
             text(column)
-            ensure(
-                type(kind) is str and kind in DECLARED_TYPES, "unsupported input type"
-            )
-        missing = value.get("missing_values", "allow")
-        ensure(missing in ("allow", "reject"), "unsupported missing-value policy")
-        return cls(
-            names(value["include"]) if "include" in value else None,
-            names(value.get("exclude", [])),
-            tuple(sorted(types.items())),
-            missing,
+            ensure(kind in PHYSICAL, "unsupported input type")
+        ensure(
+            self.missing_values in ("allow", "reject"),
+            "unsupported missing-value policy",
         )
 
     def to_dict(self) -> dict:
-        """Copies the feature contract into JSON-compatible values."""
-        result: dict = {
+        """The inputs as the plan digest hashes them."""
+        return {
+            "include": None if self.include is None else list(self.include),
+            "exclude": list(self.exclude),
             "types": dict(self.types),
             "missing_values": self.missing_values,
         }
-        if self.include is not None:
-            result["include"] = list(self.include)
-        elif self.exclude:
-            result["exclude"] = list(self.exclude)
-        return result
 
 
 @dataclass(frozen=True)
 class ExecutionPlan:
-    """A normalized functional predictor intent; build via from_dict for validation."""
+    """A normalized predictor intent, validated on construction.
+
+    Attributes:
+        name: The predictor's name.
+        model: The catalog model, as `ModelPin.resolved` or a canonical id.
+        task: `classification`, `regression` or `forecast`, or None to take
+            the model's one task.
+        target: The target column.
+        target_type: The target's kind, when the lock knows it.
+        id: The id column, which predictions echo.
+        context: Where context rows come from.
+        inputs: The tabular input columns.
+        time: The time column.
+        series: A forecaster's series columns.
+        horizon: A forecaster's steps.
+        frequency: A forecaster's normalized frequency.
+        past_inputs: A forecaster's covariates known up to the origin.
+        future_inputs: A forecaster's covariates each query brings ahead.
+        quantiles: The output levels of a regressor or forecaster.
+        outputs: The outputs predictions carry; the task's when empty.
+        selection: The resolved context selection; exact when None.
+        role_types: The kinds of the id, time and series columns.
+    """
 
     name: str
     model: str
@@ -142,198 +154,198 @@ class ExecutionPlan:
     future_inputs: tuple[str, ...] = ()
     quantiles: tuple[float, ...] = ()
     outputs: tuple[str, ...] = ()
-    cpu: int | None = None
-    memory: str | None = None
-    min_replicas: int = 1
-    max_replicas: int = 1
-    region: str | None = None
-    residency: tuple[str, ...] = ()
+    selection: SelectionInfo | None = None
+    role_types: tuple[tuple[str, str], ...] = field(default=())
 
-    @classmethod
-    def from_dict(cls, value: Any) -> "ExecutionPlan":
-        """Validates every level with no credentials, executable code or runtime binding."""
-        fields(
-            value,
-            {"name", "model"},
-            {
-                "plan_version",
-                "task",
-                "target",
-                "id",
-                "context",
-                "inputs",
-                "time",
-                "series",
-                "horizon",
-                "frequency",
-                "past_inputs",
-                "future_inputs",
-                "quantiles",
-                "outputs",
-                "compute",
-                "scaling",
-                "placement",
-            },
-        )
+    def __post_init__(self) -> None:
+        """Validates every field; no credentials, code or runtime binding."""
+        name(self.name)
+        text(self.model)
+        ensure(self.task is None or self.task in TASKS, "unsupported task")
+        for column in (self.target, self.id, self.time, *self.series):
+            if column is not None:
+                text(column)
         ensure(
-            type(value.get("plan_version", 1)) is int
-            and value.get("plan_version", 1) == 1,
-            "unsupported plan version",
+            self.horizon is None
+            or (type(self.horizon) is int and 0 < self.horizon <= 10_000),
+            "horizon must be a positive integer",
         )
-        task = value.get("task")
+        levels = self.quantiles
         ensure(
-            task is None or (type(task) is str and task in TASKS), "unsupported task"
-        )
-        target = value.get("target")
-        target_type = None
-        if type(target) is dict:
-            fields(target, {"column"}, {"type"})
-            target_type = target.get("type")
-            ensure(
-                target_type is None
-                or (type(target_type) is str and target_type in DECLARED_TYPES),
-                "unsupported target type",
-            )
-            target = target["column"]
-        if target is not None:
-            text(target)
-        compute = fields(value.get("compute", {}), set(), {"cpu", "memory"})
-        cpu = integer(compute["cpu"], 1, 256) if "cpu" in compute else None
-        memory = compute.get("memory")
-        ensure(
-            memory is None
-            or (type(memory) is str and re.fullmatch(r"[1-9][0-9]*(?:Mi|Gi)", memory)),
-            "memory must be a positive Mi or Gi quantity",
-        )
-        scaling = fields(
-            value.get("scaling", {}), set(), {"min_replicas", "max_replicas"}
-        )
-        minimum = integer(scaling.get("min_replicas", 1), 0, 100)
-        maximum = integer(scaling.get("max_replicas", 1), 1, 100)
-        ensure(minimum <= maximum, "min_replicas exceeds max_replicas")
-        placement = fields(value.get("placement", {}), set(), {"region", "residency"})
-        region = text(placement["region"]) if "region" in placement else None
-        residency = names(placement.get("residency", []))
-        ensure(
-            not residency or region is None or region in residency,
-            "placement region conflicts with residency",
-        )
-        levels = value.get("quantiles", [])
-        ensure(
-            type(levels) is list
-            and len(levels) <= 99
+            len(levels) <= 99
             and all(type(q) in (int, float) and 0 < q < 1 for q in levels),
             "quantiles must be inside (0, 1)",
         )
-        ensure(levels == sorted(set(levels)), "quantiles must be unique and sorted")
-        frequency = value.get("frequency")
-        if frequency is not None:
-            ensure(
-                type(frequency) in (float, int, str)
-                and (type(frequency) is str or 0 < frequency < 1e12),
-                "frequency must be a positive period step or fixed duration",
-            )
+        ensure(
+            list(levels) == sorted(set(levels)), "quantiles must be unique and sorted"
+        )
+        if self.frequency is not None:
             try:
-                frequency = _frequency.normalize(frequency)
-            except ValueError:
+                normalized = _frequency.normalize(self.frequency)
+            except (TypeError, ValueError):
                 raise PredictorError(
                     "ValidationError",
                     "frequency must be a positive period step or fixed duration",
                 ) from None
-            value = {**value, "frequency": frequency}
-        result = cls(
-            name(value["name"]),
-            text(value["model"]),
-            task,
-            target,
-            target_type,
-            text(value["id"]) if "id" in value else None,
-            PlanContext.from_dict(value.get("context")),
-            PlanInputs.from_dict(value.get("inputs", {})),
-            text(value["time"]) if "time" in value else None,
-            names(value.get("series", [])),
-            integer(value["horizon"]) if "horizon" in value else None,
-            frequency,
-            names(value.get("past_inputs", [])),
-            names(value.get("future_inputs", [])),
-            tuple(float(q) for q in levels),
-            names(value.get("outputs", [])),
-            cpu,
-            memory,
-            minimum,
-            maximum,
-            region,
-            residency,
-        )
+            object.__setattr__(self, "frequency", normalized)
         roles = [
             column
-            for column in (
-                result.target,
-                result.id,
-                result.time,
-                *result.series,
-            )
+            for column in (self.target, self.id, self.time, *self.series)
             if column is not None
         ]
         ensure(len(set(roles)) == len(roles), "column roles must be disjoint")
         ensure(
-            not set(roles) & set(result.forecast_inputs),
+            not set(roles) & set(self.forecast_inputs),
             "forecast inputs cannot overlap target, ID, time or series roles",
         )
         ensure(
-            result.context.mode == "request" or result.target is not None,
+            not set(self.forecast_inputs) & set(self.inputs.include or ()),
+            "a column is a tabular input or a forecast covariate, not both",
+        )
+        ensure(
+            self.context.mode == "request" or self.target is not None,
             "snapshot and live context require an explicit target",
         )
-        return result
+
+    @classmethod
+    def from_lock(cls, lock: Any) -> "ExecutionPlan":
+        """The plan a `gf.lock` (version 2) describes.
+
+        Args:
+            lock: A `contracts.PredictorLock` or its document.
+
+        Each input's role is the lock's: `input` for a tabular model, `past`
+        or `future` for a forecaster, so no consumer re-derives roles.
+        """
+        document = lock.to_dict() if hasattr(lock, "to_dict") else lock
+        predictor = document["predictor"]
+        inputs = predictor["inputs"]
+        context = predictor["context"]
+        task = predictor["task"]
+        role_types = [
+            (column, kind)
+            for column, kind in (
+                (predictor.get("id"), predictor.get("id_type")),
+                (predictor.get("time"), predictor.get("time_type")),
+                *zip(
+                    predictor.get("series") or (),
+                    predictor.get("series_types") or (),
+                    strict=False,
+                ),
+            )
+            if column is not None and kind is not None
+        ]
+        return cls(
+            name=predictor["name"],
+            model=predictor["model"],
+            task=task,
+            target=predictor["target"],
+            target_type=predictor.get("target_type"),
+            id=predictor.get("id"),
+            context=PlanContext(
+                context["kind"],
+                context.get("name") if context["kind"] == "live" else None,
+                context.get("max_rows"),
+            ),
+            inputs=PlanInputs(
+                include=tuple(
+                    column["name"] for column in inputs if column["role"] == "input"
+                ),
+                types=tuple(
+                    (column["name"], column["type"])
+                    for column in inputs
+                    if column.get("type") is not None
+                ),
+            ),
+            time=predictor.get("time"),
+            series=tuple(predictor.get("series") or ()),
+            horizon=predictor.get("horizon"),
+            frequency=predictor.get("frequency"),
+            past_inputs=tuple(
+                column["name"] for column in inputs if column["role"] == "past"
+            ),
+            future_inputs=tuple(
+                column["name"] for column in inputs if column["role"] == "future"
+            ),
+            quantiles=tuple(float(q) for q in predictor.get("quantiles") or ()),
+            outputs=tuple(predictor["outputs"]),
+            selection=SelectionInfo.from_dict(predictor["selection"]),
+            role_types=tuple(role_types),
+        )
+
+    @classmethod
+    def build(
+        cls,
+        name: str,
+        model: str,
+        *,
+        task: str | None = None,
+        target: str | None = None,
+        mode: str = "snapshot",
+        inputs: Any = None,
+        time: str | None = None,
+        series: Any = (),
+        horizon: int | None = None,
+        frequency: Any = None,
+        past_inputs: Any = (),
+        future_inputs: Any = (),
+        quantiles: Any = (),
+        outputs: Any = (),
+    ) -> "ExecutionPlan":
+        """A plan from Python values, as the estimators describe their fitted contexts.
+
+        `inputs` is a list of tabular input columns, or None for every column
+        without a role.
+        """
+        return cls(
+            name=name,
+            model=model,
+            task=task,
+            target=target,
+            context=PlanContext(mode),
+            inputs=PlanInputs(include=None if inputs is None else tuple(inputs)),
+            time=time,
+            series=tuple(series),
+            horizon=horizon,
+            frequency=frequency,
+            past_inputs=tuple(past_inputs),
+            future_inputs=tuple(future_inputs),
+            quantiles=tuple(float(q) for q in quantiles),
+            outputs=tuple(outputs),
+        )
 
     @property
     def forecast_inputs(self) -> tuple[str, ...]:
         """Lists each forecast channel once, in past then future declaration order."""
         return tuple(dict.fromkeys((*self.past_inputs, *self.future_inputs)))
 
+    def with_outputs(self, task: str) -> "ExecutionPlan":
+        """The plan with its task's outputs when it names none."""
+        return self if self.outputs else replace(self, outputs=OUTPUTS[task])
+
     def to_dict(self) -> dict:
-        """Returns a fresh normalized manifest, suitable for stable content hashing."""
-        result: dict = {
-            "plan_version": 1,
+        """A fresh normalized plan, the content its digest hashes."""
+        return {
+            "plan_version": 2,
             "name": self.name,
             "model": self.model,
+            "task": self.task,
+            "target": self.target,
+            "target_type": self.target_type,
+            "id": self.id,
             "context": self.context.to_dict(),
             "inputs": self.inputs.to_dict(),
-            "scaling": {
-                "min_replicas": self.min_replicas,
-                "max_replicas": self.max_replicas,
-            },
+            "time": self.time,
+            "series": list(self.series),
+            "horizon": self.horizon,
+            "frequency": self.frequency,
+            "past_inputs": list(self.past_inputs),
+            "future_inputs": list(self.future_inputs),
+            "quantiles": list(self.quantiles),
+            "outputs": list(self.outputs),
+            "selection": None if self.selection is None else self.selection.to_dict(),
+            "role_types": dict(self.role_types),
         }
-        for key in ("task", "id", "time", "horizon", "frequency"):
-            if (value := getattr(self, key)) is not None:
-                result[key] = value
-        if self.target is not None:
-            result["target"] = {
-                "column": self.target,
-                **({"type": self.target_type} if self.target_type else {}),
-            }
-        for key in ("series", "past_inputs", "future_inputs", "quantiles", "outputs"):
-            if value := getattr(self, key):
-                result[key] = list(value)
-        if self.cpu is not None or self.memory is not None:
-            result["compute"] = {
-                key: value
-                for key, value in {"cpu": self.cpu, "memory": self.memory}.items()
-                if value is not None
-            }
-        if self.region is not None or self.residency:
-            result["placement"] = {
-                **({"region": self.region} if self.region else {}),
-                **({"residency": list(self.residency)} if self.residency else {}),
-            }
-        return result
 
 
-def parse_plan(value: Any) -> "ExecutionPlan":
-    """Parses an authored catalog spec; a mapping `model` is not a catalog model."""
-    if type(value) is dict and type(value.get("model")) is dict:
-        raise PredictorError(
-            "InvalidPredictor",
-            "model must be a catalog model id such as general-forecast/x",
-        )
-    return ExecutionPlan.from_dict(value)
+__all__ = ["OUTPUTS", "ExecutionPlan", "PlanContext", "PlanInputs"]

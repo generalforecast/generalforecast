@@ -6,9 +6,17 @@ from pathlib import Path
 import pytest
 import yaml
 
+from generalforecast.contracts import LOCK_VERSION, PredictorLock, parse_lock
 from generalforecast.errors import InvalidInput
 from generalforecast.predictors import load, load_lock, resolve, write_lock
-from generalforecast.predictors.lock import changes, document
+from generalforecast.predictors.lock import (
+    changes,
+    document,
+    lock_digest,
+    upgrade,
+    validate,
+)
+from generalforecast.predictors.validation import PredictorError
 from tests.predictors.conftest import MODEL, write_context, write_manifest
 
 
@@ -16,7 +24,9 @@ def test_lock_shape(churn: Path):
     resolution = resolve(load(churn), churn)
     path = write_lock(resolution, churn)
     value = yaml.safe_load(path.read_text())
-    assert value["lock_version"] == 1
+    assert value["lock_version"] == LOCK_VERSION == 2
+    assert list(value) == ["lock_version", "digest", "manifest", "predictor", "model"]
+    assert value["digest"] == lock_digest(value)
     predictor = value["predictor"]
     assert list(predictor) == [
         "name",
@@ -28,13 +38,15 @@ def test_lock_shape(churn: Path):
         "classes",
         "id",
         "id_type",
+        "outputs",
         "inputs",
         "context",
         "selection",
     ]
     assert predictor["model"] == MODEL
     assert predictor["model_digest"] == resolution.model_digest
-    assert predictor["inputs"][0] == {"name": "spend", "type": "float"}
+    assert predictor["outputs"] == ["label", "probabilities"]
+    assert predictor["inputs"][0] == {"name": "spend", "type": "float", "role": "input"}
     assert predictor["context"] == {
         "kind": "snapshot",
         "path": "context.csv",
@@ -43,15 +55,19 @@ def test_lock_shape(churn: Path):
         "query_rows": 20,
     }
     assert predictor["selection"] == {
+        "strategy": "exact",
         "core": None,
         "neighbors": 0,
         "kind": "stratified",
+        "recent": None,
+        "seed": 0,
     }
     assert set(value["model"]["files"]) == {
         "LICENSE",
         "config.json",
         "model.safetensors",
     }
+    assert parse_lock(value).digest == value["digest"]
 
 
 def test_lock_changes_against_previous(churn: Path):
@@ -75,17 +91,41 @@ def test_lock_changes_against_previous(churn: Path):
     assert resolve(load(churn), churn).lock_changes == ()
 
 
+def test_every_setting_that_changes_predictions_changes_the_lock(churn: Path):
+    write_lock(resolve(load(churn), churn), churn)
+    base = (
+        f"model: {MODEL}\ntarget: churned\nid: customer_id\n"
+        "inputs: {exclude: [note]}\ncontext: {snapshot: context.csv}\n"
+    )
+    for extra, key in (
+        ("selection: {seed: 9}\n", "selection.seed"),
+        ("selection: {kind: random}\n", "selection.kind"),
+        ("resources: {accelerator: L40S}\n", "resources.accelerator"),
+    ):
+        write_manifest(churn, base + extra)
+        found = resolve(load(churn), churn).lock_changes
+        assert any(change[1] == key for change in found), (extra, found)
+        with pytest.raises(InvalidInput) as caught:
+            resolve(load(churn), churn, locked=True)
+        assert caught.value.message == "gf.lock is out of date"
+
+
 def test_changes_table():
     base = document(_resolution())
     assert changes(None, base) == ()
     assert changes(base, base) == ()
     other = yaml.safe_load(yaml.safe_dump(base))
     other["predictor"]["selection"] = {
+        "strategy": "retrieved",
         "core": 1000,
         "neighbors": 3000,
         "kind": "stratified",
+        "recent": None,
+        "seed": 0,
     }
-    other["predictor"]["inputs"].append({"name": "signup_source", "type": "category"})
+    other["predictor"]["inputs"].append(
+        {"name": "signup_source", "type": "category", "role": "input"}
+    )
     other["predictor"]["model_digest"] = "sha256:" + "0" * 64
     other["predictor"]["id"] = "customer_id"
     result = changes(base, other)
@@ -103,11 +143,8 @@ def test_changes_table():
 
 
 def _resolution():
-    from generalforecast.predictors.resolution import (
-        ContextInfo,
-        Resolution,
-        SelectionInfo,
-    )
+    from generalforecast.predictors.resolution import ContextInfo, Resolution
+    from generalforecast.predictors.selection import SelectionInfo
 
     return Resolution(
         name="churn",
@@ -121,13 +158,16 @@ def _resolution():
         time=None,
         series=(),
         inputs=(("spend", "float"), ("plan", "category")),
+        input_roles=("input", "input"),
         inferred={},
         context=ContextInfo("snapshot", 1840, 212, "sha256:" + "a" * 64),
-        selection=SelectionInfo(None, 0, "stratified"),
+        selection=SelectionInfo("exact"),
+        outputs=("label", "probabilities"),
+        manifest="sha256:" + "b" * 64,
     )
 
 
-def test_load_lock_is_frozen(churn: Path):
+def test_load_lock_is_frozen_and_notices_any_manifest_edit(churn: Path):
     with pytest.raises(InvalidInput) as caught:
         load_lock(churn)
     assert caught.value.hint == "run `gf check` to write it"
@@ -136,37 +176,58 @@ def test_load_lock_is_frozen(churn: Path):
     (churn / "context.csv").unlink()
     frozen = load_lock(churn)
     assert frozen.inputs == resolution.inputs
+    assert frozen.input_roles == resolution.input_roles
     assert frozen.context == resolution.context
     assert frozen.selection == resolution.selection
     assert frozen.pinned == resolution.pinned
+    # An edit that keeps name, model and target still makes the lock stale.
     write_manifest(
-        churn, f"model: {MODEL}\ntarget: plan\ncontext: {{snapshot: context.csv}}\n"
+        churn,
+        f"model: {MODEL}\ntarget: churned\nid: customer_id\n"
+        "inputs:\n  exclude: [note, plan]\ncontext:\n  snapshot: context.csv\n",
     )
+    with pytest.raises(InvalidInput) as caught:
+        load_lock(churn)
+    assert caught.value.message == "gf.lock was written for another gf.yaml"
+    assert caught.value.hint == "run `gf check` to update it"
+
+
+def test_a_version_1_lock_asks_for_gf_check(churn: Path):
+    (churn / "gf.lock").write_text("lock_version: 1\npredictor: {name: churn}\n")
     with pytest.raises(InvalidInput) as caught:
         load_lock(churn)
     assert (
         caught.value.message
-        == "gf.lock was written for `target: churned`, and gf.yaml now says `target: plan`"
+        == "gf.lock is version 1; run `gf check` to write version 2"
     )
-
-
-def test_old_lock_is_replaced_without_diff(churn: Path):
-    (churn / "gf.lock").write_text("lock_version: 1\npackage: abc\n")
     resolution = resolve(load(churn), churn)
     assert resolution.lock_changes == ()
     write_lock(resolution, churn)
-    assert yaml.safe_load((churn / "gf.lock").read_text())["lock_version"] == 1
+    assert yaml.safe_load((churn / "gf.lock").read_text())["lock_version"] == 2
+    with pytest.raises(PredictorError) as refused:
+        parse_lock({"lock_version": 1, "predictor": {}, "model": {}})
+    assert refused.value.code == "UnsupportedLockVersion"
 
 
-def test_upgrade_guards_the_model_digest(churn: Path):
+def test_a_tampered_lock_is_refused_by_its_digest(churn: Path):
+    value = document(resolve(load(churn), churn))
+    value["predictor"]["target"] = "plan"
+    with pytest.raises(PredictorError) as caught:
+        validate(value)
+    assert caught.value.code == "LockMismatch"
+
+
+def test_a_catalog_model_change_needs_upgrade(churn: Path):
     resolution = resolve(load(churn), churn)
     write_lock(resolution, churn)
     value = yaml.safe_load((churn / "gf.lock").read_text())
     value["predictor"]["model_digest"] = "sha256:" + "1" * 64
+    body = {key: item for key, item in value.items() if key != "digest"}
+    value["digest"] = lock_digest(body)
     (churn / "gf.lock").write_text(yaml.safe_dump(value, sort_keys=False))
-    kept = resolve(load(churn), churn)
-    assert kept.model_digest == "sha256:" + "1" * 64
-    assert not any(change[1] == "model_digest" for change in kept.lock_changes)
+    with pytest.raises(InvalidInput) as caught:
+        resolve(load(churn), churn)
+    assert caught.value.hint == "run `gf check --upgrade` to pin the new artifact"
     upgraded = resolve(load(churn), churn, upgrade=True)
     assert (
         "~",
@@ -174,3 +235,58 @@ def test_upgrade_guards_the_model_digest(churn: Path):
         "sha256:" + "1" * 64,
         resolution.model_digest,
     ) in upgraded.lock_changes
+    assert upgraded.files == resolution.files
+
+
+def test_version_1_locks_upgrade_to_what_they_served():
+    v1 = {
+        "lock_version": 1,
+        "predictor": {
+            "name": "sales",
+            "model": "general-forecast/chronos-2",
+            "model_digest": "sha256:" + "c" * 64,
+            "task": "forecast",
+            "target": "units",
+            "target_type": "float",
+            "time": "date",
+            "series": ["sku"],
+            "frequency": "1d",
+            "horizon": 7,
+            "quantiles": [0.1, 0.5, 0.9],
+            "inputs": [
+                {"name": "promo", "type": "int"},
+                {"name": "price", "type": "float", "role": "future"},
+            ],
+            "context": {"kind": "request"},
+            "selection": {"core": None, "neighbors": 0, "kind": "stratified"},
+        },
+        "model": {"files": {"model.safetensors": "d" * 64}},
+    }
+    upgraded = upgrade(v1)
+    predictor = upgraded["predictor"]
+    assert upgraded["lock_version"] == 2 and upgraded["manifest"] is None
+    assert [column["role"] for column in predictor["inputs"]] == ["past", "future"]
+    assert predictor["outputs"] == ["value", "quantiles"]
+    assert predictor["selection"]["strategy"] == "exact"
+    assert predictor["time_type"] is None and predictor["series_types"] == [None]
+    assert PredictorLock.from_dict(upgraded).digest == upgraded["digest"]
+    regression = upgrade(
+        {
+            "lock_version": 1,
+            "predictor": {
+                "name": "price",
+                "model": "general-forecast/tabicl-v2-regressor",
+                "model_digest": "sha256:" + "e" * 64,
+                "task": "regression",
+                "target": "y",
+                "target_type": "float",
+                "inputs": [{"name": "x", "type": "float"}],
+                "context": {"kind": "request"},
+                "selection": {"core": 100, "neighbors": 20, "kind": "random"},
+            },
+            "model": {"files": {}},
+        }
+    )
+    assert regression["predictor"]["outputs"] == ["value"]
+    assert regression["predictor"]["inputs"][0]["role"] == "input"
+    assert regression["predictor"]["selection"]["core"] == 100

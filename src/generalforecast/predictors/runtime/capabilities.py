@@ -79,7 +79,6 @@ def admit(spec: Any, pin: Any, task: str, outputs: tuple[str, ...]) -> None:
         ensure(
             not any(
                 (
-                    spec.time,
                     spec.series,
                     spec.horizon,
                     spec.frequency,
@@ -87,7 +86,7 @@ def admit(spec: Any, pin: Any, task: str, outputs: tuple[str, ...]) -> None:
                     spec.future_inputs,
                 )
             ),
-            "time and series roles require forecast task",
+            "series, horizon, frequency and covariate roles require a forecast task",
         )
     policy = V1_POLICY
     refused = policy.admits(ModelRef(pin.repository, pin.codes, pin.estimators))

@@ -3,6 +3,7 @@
 
 """sklearn adapters over the existing optimized native tabular and series engine."""
 
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -31,7 +32,7 @@ from generalforecast.native.sklearn_shim import (
 from generalforecast.predictors import frequency as _frequency
 from generalforecast.predictors.models import describe, for_task
 from generalforecast.predictors.runtime.plan import ExecutionPlan
-from generalforecast.predictors.runtime.schema import infer_schema
+from generalforecast.predictors.runtime.schema import infer_schema, observed_frequency
 from generalforecast.predictors.validation import ensure
 from generalforecast.tabular import physical_type, to_arrow
 
@@ -155,16 +156,15 @@ class Forecaster(RegressorMixin, BaseEstimator):
             features = [column for column in features if column != self.target]
         pin = describe(self.model)
         ensure("forecast" in pin.tasks, "model does not support forecasting")
-        spec = ExecutionPlan.from_dict(
-            {
-                "name": "estimator",
-                "model": pin.resolved,
-                "task": "forecast",
-                "target": self.target,
-                "context": "context.arrow",
-                **self._intent(),
-            }
+        spec = ExecutionPlan.build(
+            "estimator",
+            pin.resolved,
+            task="forecast",
+            target=self.target,
+            **self._intent(),
         )
+        if spec.frequency is None:
+            spec = replace(spec, frequency=observed_frequency(spec, table))
         schema = infer_schema(spec, pin, "forecast", table)
         identities = tuple(
             dict.fromkeys(
@@ -218,9 +218,9 @@ class Forecaster(RegressorMixin, BaseEstimator):
             )
         self._spec = spec
         self._identities = identities
-        assert schema.frequency is not None
+        assert schema.frequency is not None and spec.frequency is not None
         self._frequency = schema.frequency
-        self._step = spec.frequency if spec.frequency is not None else schema.frequency
+        self._step = spec.frequency
         self._clock = clock
         self.n_features_in_ = len(features)
         self.feature_names_in_ = np.asarray(features, dtype=object)

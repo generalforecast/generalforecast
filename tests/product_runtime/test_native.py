@@ -11,9 +11,7 @@ import pyarrow as pa
 import pytest
 
 from generalforecast.predictors.runtime import PredictorExecutor
-from generalforecast.predictors.runtime.compile import compile_dir
 from generalforecast.predictors.runtime.forecast import ForecastContext
-from generalforecast.predictors.runtime.lock import ExecutionLock
 from tests.product_runtime.test_executor import checked
 
 pytestmark = pytest.mark.slow
@@ -36,7 +34,7 @@ def test_real_tabicl_prepare_predict_and_isolated_patch(tmp_path, task):
         id="id",
         model="general-forecast/tabicl-v2-classifier"
         if task == "classification"
-        else "tabicl-regressor",
+        else "general-forecast/tabicl-v2-regressor",
         outputs=["label", "probabilities"]
         if task == "classification"
         else ["value", "quantiles"],
@@ -62,7 +60,7 @@ def test_real_tabicl_prepare_predict_and_isolated_patch(tmp_path, task):
         model=locked.spec.model,
         outputs=list(locked.outputs),
     )
-    patched = executor.prepare(second.lock, changed)
+    patched = executor.prepare(second, changed)
     assert patched.predict(q).to_pylist() != before.to_pylist()
     assert old.predict(q).equals(before)
 
@@ -122,9 +120,7 @@ def test_real_schema_free_request_multiclass_categories_and_datetime(tmp_path):
             "y": ["low", "medium", "high"] * 3,
         }
     )
-    checked(tmp_path, context, context="request", id="id")
-    lock = compile_dir(tmp_path, upgrade=True)
-    assert isinstance(lock, ExecutionLock)
+    lock = checked(tmp_path, context, context="request", id="id")
     assert lock.schema.columns == ()
     prepared = PredictorExecutor().prepare(lock, None)
     queries = pa.table(
@@ -206,7 +202,7 @@ def test_real_forecast_date_axis_preserves_out_of_order_rows(tmp_path):
         {"time": [datetime.date(2026, 1, 18), datetime.date(2026, 1, 17)]}
     )
     output = prepared.predict(queries)
-    assert output.column_names == ["value"] and output.num_rows == 2
+    assert output.column_names == ["value", "quantiles"] and output.num_rows == 2
     assert np.isfinite(output["value"].to_numpy()).all()
     chronological = prepared.predict(queries.take(pa.array([1, 0])))
     assert output["value"].to_pylist() == chronological["value"].to_pylist()[::-1]

@@ -1,14 +1,19 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The alpha predictor contract, independent of runtime provisioning."""
+"""The service contract: wire errors, field checks and request limits.
+
+Every service surface, `gf serve`, the hosted plane and the SDK, raises and
+reads these errors and validates request fields with these checks. Names
+follow `generalforecast.predictors.validation.NAME`, the one rule for the
+names people choose.
+"""
 
 import math
 import re
 import threading
 import time
-from dataclasses import dataclass
-from typing import Any, Required, TypedDict
+from typing import Any
 
 # The wire vocabulary lives with `Error`; services import it from here too.
 from generalforecast.errors import (  # noqa: F401
@@ -17,11 +22,9 @@ from generalforecast.errors import (  # noqa: F401
     public_code,
     reason_of,
 )
+from generalforecast.predictors.validation import NAME
 
 VERSION = "gf/v1"
-MODEL = "general-forecast/tabicl-v2-classifier"
-PIN = "5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b"
-NAME = re.compile(r"[a-z][a-z0-9-]{0,62}")
 
 
 class ServiceError(Error):
@@ -109,7 +112,7 @@ def model_id(value: Any) -> str:
 
 
 def name(value: Any) -> str:
-    """Validates a stable resource name."""
+    """Validates a chosen name by the one rule, `predictors.validation.NAME`."""
     require(
         isinstance(value, str) and NAME.fullmatch(value) is not None, "invalid name"
     )
@@ -129,72 +132,6 @@ def number(value: Any, low: float, high: float, field: str) -> float:
         f"{field} must be between {low} and {high}",
     )
     return value
-
-
-@dataclass(frozen=True)
-class ModelPin:
-    """A curated model and its immutable Hugging Face commit."""
-
-    repository: str
-    revision: str
-
-    @classmethod
-    def parse(cls, value: Any) -> "ModelPin":
-        """Rejects arbitrary code paths and mutable aliases."""
-        fields(value, {"repository", "revision"})
-        require(
-            value["repository"] == MODEL,
-            "only the native TabICL classifier is supported",
-        )
-        require(
-            isinstance(value["revision"], str)
-            and re.fullmatch(r"[0-9a-f]{40}", value["revision"]) is not None,
-            "model.revision must be a 40-character lowercase commit",
-        )
-        return cls(**value)
-
-
-class Row(TypedDict, total=False):
-    """Immutable feature observation; omitted label is unknown."""
-
-    id: Required[str]
-    features: Required[dict[str, float]]
-    label: bool
-    source_at: str
-    label_available_at: str
-
-
-class Label(TypedDict, total=False):
-    """A delayed outcome bound to an existing immutable observation."""
-
-    id: Required[str]
-    label: Required[bool]
-    label_available_at: str
-
-
-class Freshness(TypedDict):
-    """Accepted-update progress, separate from source/context age."""
-
-    accepted_sequence: int
-    processed_sequence: int
-    pending_updates: int
-    oldest_pending_at: float | None
-    update_lag_seconds: float
-    max_update_lag_seconds: float
-    context_age_seconds: float | None
-    max_label_delay_seconds: float | None
-
-
-class Score(TypedDict):
-    """A score and provenance, never a business action."""
-
-    id: str
-    probabilities: dict[str, float]
-    predictor_revision: int
-    model: dict[str, str]
-    context: str
-    serving_sequence: int
-    freshness: Freshness
 
 
 class RateLimit:

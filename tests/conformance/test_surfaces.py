@@ -34,7 +34,6 @@ from generalforecast.client import Client
 from generalforecast.engine import LocalEngine
 from generalforecast.predictors import load, resolve, write_lock
 from generalforecast.predictors.runtime import PredictorExecutor
-from generalforecast.predictors.runtime.compile import compile_dir
 from generalforecast.serve import listener
 from generalforecast.serve import models as serve_models
 from generalforecast.service.boundary import Scope
@@ -239,20 +238,6 @@ def history(task: str) -> pa.Table:
 )
 def test_packages_answer_alike(tmp_path, engine, model, task):
     data = history(task)
-    root = tmp_path / "predictor"
-    root.mkdir()
-    spec = {
-        "name": "scorer",
-        "model": model,
-        "context": "history.arrow",
-        "target": "y",
-        "id": "id",
-    }
-    (root / "gf.yaml").write_text(yaml.safe_dump(spec))
-    (root / "history.arrow").write_bytes(arrow_bytes(data))
-    lock = compile_dir(root)
-    queries = data.drop(["y"]).slice(2, 4)
-    expected = PredictorExecutor().prepare(lock, data).predict(queries)
     served_root = tmp_path / "served"
     served_root.mkdir()
     (served_root / "gf.yaml").write_text(
@@ -268,12 +253,25 @@ def test_packages_answer_alike(tmp_path, engine, model, task):
     )
     (served_root / "history.arrow").write_bytes(arrow_bytes(data))
     write_lock(resolve(load(served_root), served_root), served_root)
+    queries = data.drop(["y"]).slice(2, 4)
+    expected = _hosted(served_root, data).predict(queries)
     server = Served(build(), str(served_root))
     try:
         predictions = _predicted(server, "scorer", queries)
     finally:
         server.stop()
     _same(predictions, expected.to_pylist(), "predictor")
+
+
+def _hosted(root, data):
+    """The predictor hosted serving prepares for the directory's lock and snapshot."""
+    from generalforecast.predictors.runtime.compile import compile_lock
+    from generalforecast.predictors.runtime.context import served_context
+    from tests.utils.locks import lock_of
+
+    lock = lock_of(root)
+    rows = served_context(lock, data)
+    return PredictorExecutor().prepare(compile_lock(lock, rows), rows)
 
 
 def series_history() -> pa.Table:
@@ -295,31 +293,6 @@ def series_history() -> pa.Table:
 
 def test_package_forecasts_answer_alike(tmp_path, engine):
     data = series_history()
-    root = tmp_path / "predictor"
-    root.mkdir()
-    spec = {
-        "name": "planner",
-        "model": "general-forecast/chronos-2",
-        "context": "history.arrow",
-        "target": "sales",
-        "time": "day",
-        "series": ["store"],
-        "horizon": 2,
-        "past_inputs": ["footfall"],
-        "future_inputs": ["promo"],
-        "outputs": ["value", "quantiles"],
-    }
-    (root / "gf.yaml").write_text(yaml.safe_dump(spec))
-    (root / "history.arrow").write_bytes(arrow_bytes(data))
-    lock = compile_dir(root)
-    queries = pa.table(
-        {
-            "store": ["south", "north", "north", "south"],
-            "day": [13, 12, 13, 12],
-            "promo": [1.0, 0.0, 1.0, 0.0],
-        }
-    )
-    expected = PredictorExecutor().prepare(lock, data).predict(queries)
     served_root = tmp_path / "served"
     served_root.mkdir()
     (served_root / "gf.yaml").write_text(
@@ -339,6 +312,14 @@ def test_package_forecasts_answer_alike(tmp_path, engine):
     )
     (served_root / "history.arrow").write_bytes(arrow_bytes(data))
     write_lock(resolve(load(served_root), served_root), served_root)
+    queries = pa.table(
+        {
+            "store": ["south", "north", "north", "south"],
+            "day": [13, 12, 13, 12],
+            "promo": [1.0, 0.0, 1.0, 0.0],
+        }
+    )
+    expected = _hosted(served_root, data).predict(queries)
     server = Served(build(), str(served_root))
     try:
         predictions = _predicted(server, "planner", queries)

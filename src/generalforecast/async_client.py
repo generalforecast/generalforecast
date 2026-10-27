@@ -403,7 +403,7 @@ class Models(Collection):
 
 
 class Predictors(Collection):
-    """Hosted predictors: immutable revisions and runtime-bound environments."""
+    """Hosted predictors: immutable revisions and environments."""
 
     kind: ResourceKind = "predictor"
     collection = "predictors"
@@ -427,7 +427,7 @@ class Predictors(Collection):
         return await self.client._run(ops.predictor_revision(predictor, number))
 
     async def environments(self, predictor: str) -> tuple[Environment, ...]:
-        """Lists runtime-bound environment pointers and their actual states."""
+        """Lists environment pointers and their actual states."""
         return await self.client._run(ops.predictor_environments(predictor))
 
     async def environment(
@@ -438,13 +438,9 @@ class Predictors(Collection):
             ops.predictor_environment(self.client, predictor, env, deadline)
         )
 
-    async def create_environment(
-        self, predictor: str, *, env: str, runtime: str
-    ) -> Environment:
-        """Binds a runtime separately from predictor content and authentication."""
-        return await self.client._run(
-            ops.predictor_create_environment(predictor, env, runtime)
-        )
+    async def create_environment(self, predictor: str, *, env: str) -> Environment:
+        """Creates an environment, a pointer to the revision it serves."""
+        return await self.client._run(ops.predictor_create_environment(predictor, env))
 
     async def promote(
         self,
@@ -507,7 +503,6 @@ class Predictors(Collection):
         predictor: str | Path,
         *,
         env: str | None = None,
-        runtime: str | None = None,
         wait: bool = False,
         timeout: float = 120,
     ) -> Revision:
@@ -517,7 +512,6 @@ class Predictors(Collection):
                 self.client,
                 predictor,
                 env=env,
-                runtime=runtime,
                 wait=wait,
                 timeout=timeout,
             )

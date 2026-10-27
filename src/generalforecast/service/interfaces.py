@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Stage-zero ports, not a second server or a claim of implemented backends.
+"""The ports a predictor service implements: data, sources, models, operators, identity, execution.
 
-Owners implement these methods in the modules listed in replacement-contracts.md.
-The final adapter authorizes, invokes a port and wraps its result with boundary.py.
+`gf serve` and hosted serving implement them; an adapter authorizes a
+request, invokes a port and wraps its result with `service.boundary`.
+`NativeExecutor` is the one execution port: `PredictorExecutor` implements
+it in process, binding a `CompiledPlan`. These are part of the hosting API,
+`generalforecast.hosting`.
 """
 
 from collections.abc import Iterator
@@ -22,7 +25,7 @@ from generalforecast.service.boundary import JsonObject, Scope
 if TYPE_CHECKING:
     import pyarrow as pa
 
-    from generalforecast.predictors.runtime.lock import ExecutionLock
+    from generalforecast.predictors.runtime.compiled import CompiledPlan
 
 WriteOperation = Literal[
     "create_features",
@@ -73,7 +76,7 @@ class AcceptedWrite(TypedDict):
     accepted_at: float
     durably_accepted: bool
     changes: list[ComponentVersions]
-    retry_valid_until: float | None
+    retry_valid_until: float
 
 
 class SnapshotRow(TypedDict):
@@ -101,8 +104,6 @@ class ContextSnapshot(TypedDict):
     event_before: float | None
     rows: list[SnapshotRow]
     source_wait_count: int
-    pending_processing_count: int
-    oldest_unprocessed_at: float | None
 
 
 class EffectStatus(TypedDict):
@@ -234,30 +235,6 @@ class ModelPort(Protocol):
         ...
 
 
-class OperatorPort(Protocol):
-    """D: local-state lifecycle proof, not hosted placement or recovery."""
-
-    def doctor(self, scope: Scope) -> JsonObject:
-        """Returns redacted runtime/state/capability checks."""
-        ...
-
-
-class IdentityPort(Protocol):
-    """E: authentication is separate from routing and project selection."""
-
-    def authenticate(self, token: str) -> JsonObject:
-        """Returns a redacted principal; never echoes tokens or secret material."""
-        ...
-
-    def authorize(self, principal: JsonObject, scope: Scope, permission: str) -> None:
-        """Checks project and action on EVERY request, including read/list."""
-        ...
-
-    def manage(self, scope: Scope, action: str, payload: JsonObject) -> JsonObject:
-        """Executes integration-allowlisted identity/key/secret metadata actions."""
-        ...
-
-
 @runtime_checkable
 class PreparedExecution(Protocol):
     """One published worker lifecycle, shared by native and isolated executions.
@@ -315,7 +292,7 @@ class NativeExecutor(Protocol):
     """Trusted curated-model loading; never accepts uploaded Python code."""
 
     def prepare(
-        self, lock: "ExecutionLock", context: "pa.Table | None"
+        self, lock: "CompiledPlan", context: "pa.Table | None"
     ) -> PreparedExecution:
-        """Admit a lock, load verified weights and bind any snapshot context."""
+        """Admit a compiled plan, load verified weights and bind any snapshot context."""
         ...

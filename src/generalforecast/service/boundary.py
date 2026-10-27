@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Additive local-suite envelope, shared by HTTP and in-process adapters.
+"""The `gf/v1` request and result envelope, shared by HTTP and in-process adapters.
 
-Parsing is not authorization or domain admission. Existing alpha contracts stay
-unchanged until their replacements are wired and proven by integration.
+`gf serve`, hosted serving and the SDK parse and write the same envelope.
+Parsing is not authorization or domain admission; each adapter authorizes
+after parsing.
 """
 
 import json
@@ -264,26 +265,3 @@ class Artifact:
             and re.fullmatch(r"sha256:[0-9a-f]{64}", self.digest) is not None,
             "digest must be sha256:<64 lowercase hex>",
         )
-
-
-@dataclass(frozen=True)
-class ServingEffect:
-    """One data acceptance bound to one desired predictor revision."""
-
-    project: str
-    context: str
-    write_id: str
-    sequence: int
-    predictor: str
-    revision: int
-
-    def __post_init__(self) -> None:
-        """Prevents a global sequence from masquerading as a serving receipt."""
-        for value in (self.project, self.context, self.predictor):
-            name(value)
-        text(self.write_id, "write_id")
-        for value in (self.sequence, self.revision):
-            require(
-                type(value) is int and 0 < value <= MAX_INTEGER,
-                "effect version must be positive integer",
-            )

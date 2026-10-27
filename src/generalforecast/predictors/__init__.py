@@ -13,8 +13,8 @@ if TYPE_CHECKING:
     from generalforecast.predictors.lock import write_lock as write_lock
     from generalforecast.predictors.resolution import ContextInfo as ContextInfo
     from generalforecast.predictors.resolution import Resolution as Resolution
-    from generalforecast.predictors.resolution import SelectionInfo as SelectionInfo
     from generalforecast.predictors.resolution import resolve as resolve
+    from generalforecast.predictors.selection import SelectionInfo as SelectionInfo
     from generalforecast.predictors.spec import PredictorSpec as PredictorSpec
     from generalforecast.predictors.spec import load as load
     from generalforecast.predictors.spec import write_manifest as write_manifest
@@ -49,7 +49,7 @@ _MODULES = {
     "task_for": "generalforecast.predictors.tables",
     "Resolution": "generalforecast.predictors.resolution",
     "ContextInfo": "generalforecast.predictors.resolution",
-    "SelectionInfo": "generalforecast.predictors.resolution",
+    "SelectionInfo": "generalforecast.predictors.selection",
     "resolve": "generalforecast.predictors.resolution",
     "write_lock": "generalforecast.predictors.lock",
     "load_lock": "generalforecast.predictors.lock",

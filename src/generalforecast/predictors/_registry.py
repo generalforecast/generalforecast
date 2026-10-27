@@ -59,8 +59,7 @@ class CatalogRegistry:
         return catalog.limits(ref)
 
     def pin(self, ref: str) -> models.ModelPin:
-        parsed = catalog.parse(self.canonical(ref))
-        return models.project(parsed.entry, parsed, catalog.V1_POLICY)
+        return models.CatalogResolver("local").resolve(self.canonical(ref))
 
     def confirm(self, ref: str) -> None:
         models.CatalogResolver().resolve(self.canonical(ref), offline=False)
@@ -112,6 +111,18 @@ def canonical(ref: Any) -> str:
         ) from None
 
 
+class _Resolver:
+    """The installed registry as the `ModelResolver` compilation takes."""
+
+    def resolve(self, requested: str, *, offline: bool = True) -> models.ModelPin:
+        return pin(requested, online=not offline)
+
+
+def resolver() -> models.ModelResolver:
+    """The installed registry's pins, for compiling a manifest as `gf check` does."""
+    return _Resolver()
+
+
 def task_of(ref: Any) -> Task:
     """Whether the model classifies, regresses or forecasts."""
     return registry().task_of(canonical(ref))
@@ -125,13 +136,19 @@ def limits(ref: Any) -> Limits:
 def pin(ref: Any, *, online: bool = False) -> models.ModelPin:
     """The artifact and capability a lock records for a model.
 
+    The built-in registry pins through `models.CatalogResolver` on the local
+    surface, the admission `gf.Predictor` and `gf serve` compile with: a
+    model must have a published artifact digest. Hosted serving admits
+    through the same resolver with the hosted predictor gate as well.
+
     Args:
         ref: The model reference.
         online: Also confirm the pin against the upstream registry.
 
     Raises:
         InvalidInput: If the reference is not a catalog id.
-        models.PredictorError: If `online` and the upstream registry disagrees.
+        models.PredictorError: If the model is not qualified for predictors,
+            or `online` and the upstream registry disagrees.
     """
     id = canonical(ref)
     pin = registry().pin(id)

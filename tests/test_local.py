@@ -1860,8 +1860,10 @@ def test_time_buckets_keep_later_rows_off_earlier_pages() -> None:
 
 def test_tables_naming_a_model_share_its_weights(monkeypatch) -> None:
     loads = []
-    load = registry.load
-    monkeypatch.setattr(registry, "load", lambda spec: loads.append(spec) or load(spec))
+    load = registry.load_engine_model
+    monkeypatch.setattr(
+        registry, "load_engine_model", lambda spec: loads.append(spec) or load(spec)
+    )
     client = node_harness.local()
 
     for name in ("first", "second"):
@@ -3121,10 +3123,23 @@ def test_sampling_costs_a_step_loop_a_few_percent_at_most(
     assert overhead < 0.15
 
 
-def test_public_tables_take_frames_and_answer_frames() -> None:
+def test_public_tables_take_frames_and_answer_frames(monkeypatch) -> None:
     import pandas as pd
 
     from generalforecast import engine
+    from generalforecast.engine import LocalEngine
+
+    # Public tables name catalog models; this engine runs the catalog id on
+    # the tiny spec, as the conformance tests do.
+    catalog_id = "general-forecast/tabicl-v2-classifier"
+    regressor_id = "general-forecast/tabicl-v2-regressor"
+    tiny = LocalEngine(models={catalog_id: TABICL, regressor_id: TABICL_REGRESSOR})
+    monkeypatch.setattr(
+        "generalforecast.engine.local",
+        lambda surface="local", allow_downloads=False: tiny.gated(
+            surface, allow_downloads
+        ),
+    )
 
     rows = pd.DataFrame(
         {
@@ -3135,7 +3150,7 @@ def test_public_tables_take_frames_and_answer_frames() -> None:
     )
     table = engine.Table(
         "public-frames",
-        model=TABICL,
+        model=catalog_id,
         schema=engine.Schema(target="y", id="k"),
         ops=engine.TableOptions(page_size=PAGE),
         client=generalforecast.local(),
@@ -3167,7 +3182,7 @@ def test_public_tables_take_frames_and_answer_frames() -> None:
         table.drop()
     regressor = engine.Table(
         "public-regressor",
-        model=TABICL_REGRESSOR,
+        model=regressor_id,
         target="y",
         selection=engine.Retrieved(core=None, neighbors=0),
         client=generalforecast.local(),

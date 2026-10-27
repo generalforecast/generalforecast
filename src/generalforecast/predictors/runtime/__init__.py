@@ -1,16 +1,23 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Verified in-process predictor execution, without HTTP, persistence or identity."""
+"""Verified in-process predictor execution, without HTTP, persistence or identity.
+
+`PredictorExecutor.prepare` binds a `CompiledPlan` (see `compile_lock`) and
+its context rows; the prepared predictor scores queries. `gf.Predictor`
+runs local and ad hoc predictors through it, and hosted serving runs pushed
+revisions through it, so both bind and score the same way.
+"""
 
 from dataclasses import dataclass
+from typing import Literal
 
 import pyarrow as pa
 
 from generalforecast.engine import LocalEngine
 from generalforecast.models.catalog import ModelRef
+from generalforecast.predictors.runtime.compiled import CompiledPlan
 from generalforecast.predictors.runtime.forecast import ForecastContext
-from generalforecast.predictors.runtime.lock import ExecutionLock
 from generalforecast.predictors.runtime.schema import TableSchema
 from generalforecast.predictors.runtime.tabular import TabularContext
 from generalforecast.predictors.runtime.validation import (
@@ -23,7 +30,11 @@ from generalforecast.service.contracts import ServiceError
 from generalforecast.service.interfaces import ResourceFree
 
 
-def _load(lock: ExecutionLock, allow_downloads: bool) -> tuple[LocalEngine, ModelRef]:
+def _load(
+    lock: CompiledPlan,
+    allow_downloads: bool,
+    surface: Literal["predictor", "local"] = "predictor",
+) -> tuple[LocalEngine, ModelRef]:
     """The process engine and the locked model, verified against its pins, for predictors."""
     from generalforecast import engine as engines
     from generalforecast.models.artifacts import ArtifactError
@@ -31,7 +42,7 @@ def _load(lock: ExecutionLock, allow_downloads: bool) -> tuple[LocalEngine, Mode
 
     pin = lock.model
     ref = ModelRef(pin.repository, pin.codes, pin.estimators, pin.digest)
-    engine = engines.local("predictor", allow_downloads)
+    engine = engines.local(surface, allow_downloads)
     try:
         engine.load(ref)
     except ArtifactError as error:
@@ -41,7 +52,7 @@ def _load(lock: ExecutionLock, allow_downloads: bool) -> tuple[LocalEngine, Mode
     return engine, ref
 
 
-def _bind(lock: ExecutionLock, model: tuple[LocalEngine, ModelRef], context: pa.Table):
+def _bind(lock: CompiledPlan, model: tuple[LocalEngine, ModelRef], context: pa.Table):
     table, schema = context_table(lock, context)
     engine = ForecastContext if lock.task == "forecast" else TabularContext
     rows = table.num_rows
@@ -63,7 +74,7 @@ class PreparedPredictor(ResourceFree):
     lifecycle is the explicit resource-free one.
     """
 
-    lock: ExecutionLock
+    lock: CompiledPlan
     _model: tuple[LocalEngine, ModelRef]
     _context: TabularContext | ForecastContext | None
     _schema: TableSchema
@@ -119,23 +130,37 @@ class PreparedPredictor(ResourceFree):
 class PredictorExecutor:
     """The curated engine adapter; operators may inject a separate admitted executor."""
 
-    def __init__(self, *, allow_downloads: bool = False) -> None:
-        """Keeps online artifact acquisition an explicit host-operator decision."""
+    def __init__(
+        self,
+        *,
+        allow_downloads: bool = False,
+        surface: Literal["predictor", "local"] = "predictor",
+    ) -> None:
+        """Keeps online artifact acquisition an explicit host-operator decision.
+
+        `surface` is the qualification gate models must pass: `predictor`
+        for hosted serving, `local` for `gf.Predictor` on the user's machine
+        (`models.CatalogResolver`).
+        """
+        from generalforecast.predictors.models import CatalogResolver
+
         self.allow_downloads = allow_downloads
+        self.surface = surface
+        self.resolver = CatalogResolver(surface)
 
     def prepare(
-        self, lock: ExecutionLock, context: pa.Table | None
+        self, lock: CompiledPlan, context: pa.Table | None
     ) -> PreparedPredictor:
         """Admits immutable content, loads hash-verified weights and warms bound context."""
         try:
-            lock = admit(lock)
+            lock = admit(lock, self.resolver)
             mode = lock.spec.context.mode
             ensure(
                 (context is None) == (mode == "request"),
                 "bound context is required only for snapshot and live-context predictors",
                 "ContextRequired",
             )
-            model = _load(lock, self.allow_downloads)
+            model = _load(lock, self.allow_downloads, self.surface)
             bound, schema, rows = None, lock.schema, None
             if context is not None:
                 bound, schema, rows = _bind(lock, model, context)

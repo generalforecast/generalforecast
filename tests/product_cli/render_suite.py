@@ -494,7 +494,7 @@ class FakePredictor:
             inputs=(("spend", "float"), ("plan", "text"), ("signups", "int")),
             inferred={},
             context=ContextInfo("snapshot", 1840, 212, None),
-            selection=SelectionInfo(None, 0, "stratified"),
+            selection=SelectionInfo("exact"),
         )
 
     def eval(
@@ -583,7 +583,6 @@ class FakeClient:
                         "name": "production",
                         "revision": 6,
                         "generation": 3,
-                        "runtime": "default",
                         "status": "ready",
                     },
                     {
@@ -591,7 +590,6 @@ class FakeClient:
                         "name": "staging",
                         "revision": 7,
                         "generation": 5,
-                        "runtime": "default",
                         "status": "ready",
                     },
                 ]
@@ -616,7 +614,6 @@ class FakeClient:
                 "name": env,
                 "revision": revision,
                 "generation": self.generation,
-                "runtime": "default",
                 "status": "ready",
             }
         if path.startswith("/predictors/") and "/revisions/" in path:

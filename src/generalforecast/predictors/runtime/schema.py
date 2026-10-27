@@ -3,9 +3,7 @@
 
 """Physical schema inspection and explicit target, feature and time contracts."""
 
-import datetime
 from dataclasses import dataclass
-from itertools import pairwise
 from typing import Any
 
 import pyarrow as pa
@@ -17,7 +15,7 @@ from generalforecast.predictors.models import ModelPin
 from generalforecast.predictors.runtime.plan import (
     ExecutionPlan,
 )
-from generalforecast.predictors.validation import ensure, fields, text
+from generalforecast.predictors.validation import PredictorError, ensure, fields, text
 from generalforecast.tabular import PHYSICAL_TYPES, physical_type, to_arrow
 
 pc: Any = _compute
@@ -130,114 +128,72 @@ class TableSchema:
         )
 
 
-def _compatible(actual: str, declared: str) -> bool:
-    return (
-        actual == declared
-        or (declared == "category" and actual in ("string", "int64", "boolean"))
-        or (declared == "numeric" and actual in ("int64", "float64"))
-        or (declared == "datetime" and actual in ("date", "timestamp"))
+def _failure(error: Any) -> PredictorError:
+    """A frequency or kind refusal as the runtime raises it."""
+    because = getattr(error, "because", None)
+    message = getattr(error, "message", str(error))
+    return PredictorError(
+        getattr(error, "code", "InvalidPredictor"),
+        f"{message}: {because}" if because else message,
     )
 
 
-def declared_seconds(frequency: str | float | None) -> float | None:
-    """A spec's declared frequency in time units: periods, or seconds for "7d"."""
-    return _frequency_module.seconds(frequency)
-
-
-def _frequency(spec: ExecutionPlan, table: pa.Table) -> float:
+def series_times(spec: ExecutionPlan, table: pa.Table) -> dict[tuple, list]:
+    """Each series' times, by the values of the plan's series columns."""
+    assert spec.time is not None
     buckets: dict[tuple, list] = {}
     for row in table.select([*spec.series, spec.time]).to_pylist():
         key = tuple(row[column] for column in spec.series)
-        instant = row[spec.time]
         ensure(
-            instant is not None and all(value is not None for value in key),
+            all(value is not None for value in key),
             "forecast time and series cannot be missing",
         )
-        ensure(
-            type(instant) in (int, float, datetime.date, datetime.datetime),
-            "forecast time must be numeric, date or timestamp",
-        )
-        if isinstance(instant, datetime.datetime):
-            instant = instant.timestamp()
-        elif isinstance(instant, datetime.date):
-            instant = (instant - datetime.date(1970, 1, 1)).days * 86400
-        buckets.setdefault(key, []).append(instant)
-    steps = set()
-    for values in buckets.values():
-        ensure(
-            len(values) >= 2, "each forecast series needs two times to verify frequency"
-        )
-        for left, right in pairwise(sorted(values)):
-            ensure(right > left, "duplicate forecast time within a series")
-            steps.add(float(right - left))
-    if spec.frequency is not None and _frequency_module.is_calendar(spec.frequency):
-        # Calendar steps differ in length; each series walks the offset instead.
-        for values in buckets.values():
-            stamps = [
-                datetime.datetime.fromtimestamp(value, datetime.UTC).replace(
-                    tzinfo=None
-                )
-                for value in sorted(values)
-            ]
-            ensure(
-                _frequency_module.regular(stamps, spec.frequency),
-                "declared frequency differs from observed times",
-            )
-        declared = declared_seconds(spec.frequency)
-        assert declared is not None
-        return declared
-    ensure(
-        len(steps) == 1,
-        "forecast frequency is irregular; resample explicitly",
-        "AmbiguousFrequency",
-    )
-    observed = steps.pop()
-    if spec.frequency is not None:
-        declared = declared_seconds(spec.frequency)
-        ensure(observed == declared, "declared frequency differs from observed times")
-    return observed
+        buckets.setdefault(key, []).append(row[spec.time])
+    return buckets
+
+
+def observed_frequency(spec: ExecutionPlan, table: pa.Table) -> str | int | float:
+    """The frequency a forecaster's rows follow, held to the plan's when it declares one.
+
+    One rule for every path, `frequency.check` and `frequency.infer`: within
+    each series, times are distinct and one step apart.
+    """
+    times = series_times(spec, table)
+    try:
+        if spec.frequency is not None:
+            _frequency_module.check(times, spec.frequency)
+            return spec.frequency
+        return _frequency_module.infer(times)
+    except _frequency_module.FrequencyError as error:
+        raise _failure(error) from None
+
+
+def _declared(kind: str | None, physical: str) -> str | None:
+    """The binder's override for a column of `kind` stored as `physical`."""
+    from generalforecast.errors import InvalidInput
+    from generalforecast.predictors.tables import semantic
+
+    try:
+        return semantic(kind, physical)
+    except InvalidInput:
+        raise PredictorError(
+            "SchemaChanged", "declared type differs from physical data"
+        ) from None
 
 
 def infer_schema(
     spec: ExecutionPlan, pin: ModelPin, task: str, data: Any | None
 ) -> TableSchema:
-    """Infers physical structure from all bounded rows and refuses semantic ambiguity."""
-    if data is None:
-        ensure(
-            spec.context.mode == "request" or bool(spec.inputs.types),
-            "live contexts require declared physical types or explicit schema data",
-            "SchemaRequired",
-        )
-        if not spec.inputs.types:
-            return TableSchema()
-        ensure(
-            spec.target is not None and spec.target_type is not None,
-            "typed schema requires target column and type",
-        )
-        assert spec.target is not None and spec.target_type is not None
-        types = dict(spec.inputs.types)
-        ensure(
-            all(
-                type(value) is str and value in PHYSICAL_TYPES
-                for value in types.values()
-            ),
-            "schema without data requires physical types",
-        )
-        types[spec.target] = spec.target_type
-        ensure(
-            spec.target_type in ("boolean", "int64", "float64", "string"),
-            "invalid target physical type",
-        )
-        source = [(column, kind, True) for column, kind in types.items()]
-        table = None
-    else:
-        table = to_arrow(data)
-        ensure(table.num_rows > 0, "context is empty", "EmptyContext")
-        source = [
-            (field.name, physical_type(field.type), column.null_count > 0)
-            for field, column in zip(table.schema, table.columns, strict=True)
-        ]
-    available = {column for column, _, _ in source}
+    """Infers physical structure from all bounded rows and refuses semantic ambiguity.
+
+    Without rows, a request or live context's schema is the lock's kinds in
+    their `tables.PHYSICAL` storage; one whose lock knows no kinds is
+    schema-free, and the rows it binds give its schema.
+    """
+    from generalforecast.predictors.tables import PHYSICAL
+
+    kinds = dict(spec.inputs.types)
+    role_kinds = dict(spec.role_types)
     roles = {
         spec.target: "target",
         spec.id: "id",
@@ -247,15 +203,61 @@ def infer_schema(
         **dict.fromkeys(spec.future_inputs, "future"),
     }
     roles.pop(None, None)
+    if data is None:
+        ensure(
+            spec.context.mode != "snapshot",
+            "a snapshot plan compiles against its rows",
+            "SchemaRequired",
+        )
+        typed = (
+            spec.target is not None
+            and spec.target_type is not None
+            and all(
+                column in kinds
+                for column in (*(spec.inputs.include or ()), *spec.forecast_inputs)
+            )
+            and all(
+                column in role_kinds
+                for column in (spec.id, spec.time, *spec.series)
+                if column is not None
+            )
+        )
+        if not typed:
+            # A request or live context's rows give its schema when they bind.
+            return TableSchema()
+        assert spec.target is not None and spec.target_type is not None
+        names = [
+            *(column for column in (spec.id, spec.time) if column is not None),
+            *spec.series,
+            *(spec.inputs.include or ()),
+            *spec.forecast_inputs,
+            spec.target,
+        ]
+        source = [
+            (
+                column,
+                PHYSICAL[
+                    spec.target_type
+                    if column == spec.target
+                    else role_kinds.get(column) or kinds[column]
+                ],
+                True,
+            )
+            for column in names
+        ]
+        table = None
+    else:
+        table = to_arrow(data)
+        ensure(table.num_rows > 0, "context is empty", "EmptyContext")
+        source = [
+            (field.name, physical_type(field.type), column.null_count > 0)
+            for field, column in zip(table.schema, table.columns, strict=True)
+        ]
+    available = {column for column, _, _ in source}
     ensure(roles.keys() <= available, "declared role column is missing")
     ensure(
-        set(spec.inputs.exclude) <= available
-        and set(dict(spec.inputs.types)) <= available,
+        set(spec.inputs.exclude) <= available,
         "input override column is missing",
-    )
-    ensure(
-        not set(spec.inputs.exclude) & roles.keys(),
-        "cannot exclude a required role column",
     )
     included = spec.inputs.include
     if included is not None:
@@ -264,8 +266,7 @@ def infer_schema(
             "inputs include unknown or reserved role columns",
         )
     columns = []
-    overrides = dict(spec.inputs.types)
-    for column, kind, nullable in source:
+    for column, physical, nullable in source:
         text(column)
         role = roles.get(
             column,
@@ -274,14 +275,14 @@ def infer_schema(
             and column not in spec.inputs.exclude
             else "excluded",
         )
-        declared = spec.target_type if role == "target" else overrides.get(column)
-        if declared is not None:
-            ensure(
-                _compatible(kind, declared), "declared type differs from physical data"
-            )
+        declared = (
+            _declared(kinds.get(column), physical)
+            if role in ("input", "past", "future")
+            else None
+        )
         if role in ("input", "past", "future"):
             ensure(
-                kind in pin.input_types,
+                physical in pin.input_types,
                 "model does not support an input physical type",
                 "UnsupportedCapability",
             )
@@ -291,15 +292,7 @@ def infer_schema(
                 "missing inputs are not supported by this contract",
                 "MissingValues",
             )
-        columns.append(
-            ColumnSchema(
-                column,
-                kind,
-                nullable,
-                role,
-                declared if declared in ("category", "numeric", "datetime") else None,
-            )
-        )
+        columns.append(ColumnSchema(column, physical, nullable, role, declared))
     features = [column for column in columns if column.role == "input"]
     feature_count = sum(
         DATETIME_PARTS
@@ -376,26 +369,19 @@ def infer_schema(
             "forecast covariates must be explicitly declared as past_inputs or future_inputs",
         )
         if table is not None:
-            frequency = _frequency(spec, table)
+            cadence = observed_frequency(spec, table)
         else:
             ensure(
                 spec.frequency is not None,
                 "live forecast requires explicit frequency without schema data",
             )
-            value = spec.frequency
-            assert value is not None
-            if isinstance(value, str):
-                frequency = float(
-                    int(value[:-1])
-                    * {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[value[-1]]
-                )
-            else:
-                frequency = float(value)
+            cadence = spec.frequency
+        assert cadence is not None
+        frequency = float(_frequency_module.step(cadence))
     else:
         ensure(
             not any(
                 (
-                    spec.time,
                     spec.series,
                     spec.horizon,
                     spec.frequency,
@@ -403,7 +389,7 @@ def infer_schema(
                     spec.future_inputs,
                 )
             ),
-            "time and series semantics require a forecast task",
+            "series semantics require a forecast task",
         )
     return TableSchema(
         tuple(columns),
@@ -416,32 +402,25 @@ def infer_schema(
 
 
 def select_context(spec: ExecutionPlan, data: Any, pin: ModelPin) -> pa.Table:
-    """Applies an explicit ordering policy, never arbitrary first-N truncation."""
+    """The rows the plan binds, held to its selection's bounds.
+
+    An exact selection binds every row and so stays within the model's row
+    cap; a retrieved or adaptive one leaves each query's rows to the engine.
+    A request context also stays within its declared `max_rows`.
+    """
     table = to_arrow(data)
     context = spec.context
-    if context.selection == "most_recent":
+    if context.max_rows is not None:
         ensure(
-            context.order_by in table.column_names, "context ordering column is missing"
+            table.num_rows <= context.max_rows,
+            "context exceeds the predictor's max_rows",
+            "CapacityExceeded",
         )
-        order = table[context.order_by]
-        ensure(order.null_count == 0, "context ordering cannot contain missing values")
-        keys = [(context.order_by, "ascending")]
-        if pc.count_distinct(order).as_py() != table.num_rows:
-            ensure(
-                spec.id is not None and spec.id in table.column_names,
-                "tied context ordering requires an explicit unique ID",
-            )
-            ensure(
-                table[spec.id].null_count == 0
-                and pc.count_distinct(table[spec.id]).as_py() == table.num_rows,
-                "context tie-breaker ID must be unique",
-            )
-            keys.append((spec.id, "ascending"))
-        table = table.take(pc.sort_indices(table, sort_keys=keys))
-        table = table.slice(max(0, table.num_rows - context.max_rows))
-    ensure(
-        table.num_rows <= pin.max_context_rows,
-        "context exceeds model limit; declare an explicit ordered selection",
-        "CapacityExceeded",
-    )
+    strategy = spec.selection.strategy if spec.selection is not None else "exact"
+    if strategy == "exact" or spec.task == "forecast":
+        ensure(
+            table.num_rows <= pin.max_context_rows,
+            "context exceeds model limit; declare an explicit selection",
+            "CapacityExceeded",
+        )
     return table

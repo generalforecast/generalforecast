@@ -55,10 +55,27 @@ def text(value: Any) -> str:
     return value
 
 
+# The one rule for the names people choose: predictors, live contexts and
+# environments. `gf.yaml`, `gf.lock`, the SDK and every service route check it.
+NAME = re.compile(r"[a-z][a-z0-9-]{0,62}")
+# Opaque identifiers the platform issues or operators configure, such as
+# projects, runtimes and secret names, which may also hold capitals and `_`.
+IDENTIFIER = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}")
+
+
 def name(value: Any) -> str:
-    """Checks a route-safe resource name."""
+    """Checks a chosen name: lowercase letters, digits and hyphens, starting with a letter."""
     ensure(
-        type(value) is str and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}", value),
+        type(value) is str and NAME.fullmatch(value) is not None,
+        "names use lowercase letters, digits and hyphens, starting with a letter",
+    )
+    return value
+
+
+def identifier(value: Any) -> str:
+    """Checks a route-safe opaque identifier, such as a project or a secret's name."""
+    ensure(
+        type(value) is str and IDENTIFIER.fullmatch(value) is not None,
         "invalid resource name",
     )
     return value

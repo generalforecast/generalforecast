@@ -1,7 +1,21 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Reading context tables: column kinds, role candidates and the query split."""
+"""Reading context tables: column kinds, role candidates and the query split.
+
+A column has one kind, the vocabulary `gf.yaml`'s `inputs.types` and `gf.lock`
+use: `int`, `float`, `0/1`, `category`, `text`, `timestamp` or `bool`.
+`kind_of` reads it from a column's values. Two documented translations
+leave it:
+
+- `PHYSICAL` is the Arrow storage a kind takes when no rows say otherwise,
+  as a request or live context's schema is compiled from the lock alone.
+  With rows, the storage is the rows' own (`tabular.physical_type`).
+- `semantic` is the override the predictor binder reads when a kind encodes
+  otherwise than its storage does: an integer column of `category` kind is
+  encoded as categories, not numbers. `columns.ENCODINGS` gives each
+  storage's encoding, `columns.KIND_ENCODINGS` each kind's.
+"""
 
 import datetime as dt
 from collections.abc import Sequence
@@ -226,6 +240,43 @@ def kind_of(values: pa.ChunkedArray, present: pa.ChunkedArray, distinct: int) ->
     )
 
 
+# The Arrow storage a kind takes in a schema compiled without rows.
+PHYSICAL = {
+    "int": "int64",
+    "float": "float64",
+    "0/1": "int64",
+    "category": "string",
+    "text": "string",
+    "timestamp": "timestamp",
+    "bool": "boolean",
+}
+
+
+def semantic(kind: str | None, physical: str) -> str | None:
+    """The binder's override for a kind stored as `physical`, or None when the storage encodes it.
+
+    Raises:
+        InvalidInput: For a kind the storage cannot hold, such as a `float`
+            column stored as text.
+    """
+    from generalforecast.columns import ENCODINGS, KIND_ENCODINGS
+
+    if kind is None or KIND_ENCODINGS[kind] == ENCODINGS[physical]:
+        return None
+    encoding = KIND_ENCODINGS[kind]
+    if encoding == "categorical" and physical in ("int64", "boolean"):
+        return "category"
+    if encoding == "numeric" and physical == "boolean":
+        return None
+    if encoding == "boolean" and physical in ("string", "int64"):
+        return "category"
+    raise InvalidInput(
+        message=f"a column stored as {physical} cannot be read as {kind}",
+        param="inputs.types",
+        hint="declare a type its values hold, or convert the column",
+    )
+
+
 def _binary(present: pa.ChunkedArray, distinct: int) -> bool:
     if not 1 <= distinct <= 2:
         return False
@@ -325,11 +376,18 @@ def task_for(column: ColumnInfo, rows: int) -> str:
 
 
 def split(frame: Any, spec: PredictorSpec) -> tuple[pa.Table, pa.Table]:
-    """Divides snapshot rows into context and queries.
+    """Divides snapshot rows into context and queries, by the one rule every path applies.
 
-    Rows whose target is empty are the queries. Failing that, rows at or after
-    `context.until` are. Failing that, the `context.holdout` draw is. Otherwise
-    every row is context and the query table is empty.
+    Rows whose target is empty are always queries. A declared split then
+    partitions the labeled rows: with `context.until`, labeled rows at or
+    after that time are queries too; with `context.holdout`, a seeded random
+    `fraction` of the labeled rows is. The context is every other labeled
+    row. `gf check`, `gf.Predictor`, `gf eval`, `gf serve`, `gf push` and
+    hosted serving all split through here, so they agree on every row.
+
+    The holdout draw is `numpy.random.default_rng(seed).permutation` over the
+    labeled rows in file order; its first `round(fraction * labeled)` rows
+    are the queries.
 
     Raises:
         InvalidInput: If the target or time column is missing.
@@ -342,52 +400,108 @@ def split(frame: Any, spec: PredictorSpec) -> tuple[pa.Table, pa.Table]:
             param="target",
             hint=f"the context has {', '.join(table.column_names)}",
         )
-    empty = pc.is_null(_blank_to_null(table[spec.target]))
-    if pc.any(empty).as_py():
-        return table.filter(pc.invert(empty)), table.filter(empty)
-    if spec.context.until is not None:
-        return _split_until(table, spec)
-    if spec.context.holdout is not None:
-        holdout = spec.context.holdout
-        count = round(holdout.fraction * table.num_rows)
-        order = np.random.RandomState(holdout.seed).permutation(table.num_rows)
-        queries = np.sort(order[:count])
-        context = np.sort(order[count:])
-        return table.take(pa.array(context)), table.take(pa.array(queries))
-    return table, table.slice(0, 0)
+    return split_by(
+        table,
+        spec.target,
+        time=spec.time,
+        until=spec.context.until,
+        holdout=spec.context.holdout,
+        error=spec.error,
+    )
 
 
-def _split_until(table: pa.Table, spec: PredictorSpec) -> tuple[pa.Table, pa.Table]:
-    if spec.time is None or spec.time not in table.column_names:
-        raise spec.error(
-            f"time column `{spec.time}` is not in the context"
-            if spec.time
-            else "`until` needs a `time` column to compare against",
-            param="time" if spec.time else "context.until",
-            hint=f"the context has {', '.join(table.column_names)}",
+def split_by(
+    table: pa.Table,
+    target: str,
+    *,
+    time: str | None = None,
+    until: str | None = None,
+    holdout: Any = None,
+    error: Any = None,
+) -> tuple[pa.Table, pa.Table]:
+    """`split` from its settings alone, as a lock records them.
+
+    Args:
+        table: The snapshot rows.
+        target: The target column.
+        time: The time column `until` compares against.
+        until: An ISO date or timestamp; labeled rows at or after it are queries.
+        holdout: A `Holdout`, or a mapping with `fraction` and `seed`.
+        error: Builds the `InvalidInput` for a missing time column, pointing
+            at the manifest when there is one.
+    """
+    if target not in table.column_names:
+        message = f"target column `{target}` is not in the context"
+        hint = f"the context has {', '.join(table.column_names)}"
+        if error is not None:
+            raise error(message, param="target", hint=hint)
+        raise InvalidInput(message=message, param="target", hint=hint)
+    empty = pc.is_null(_blank_to_null(table[target]))
+    labeled = pc.invert(empty)
+    queried = empty
+    if until is not None:
+        queried = pc.or_(empty, _after(table, time, until, error))
+    elif holdout is not None:
+        fraction, seed = _holdout_of(holdout)
+        rows = np.flatnonzero(labeled.to_numpy(zero_copy_only=False))
+        order = np.random.default_rng(seed).permutation(len(rows))
+        held = np.zeros(table.num_rows, dtype=bool)
+        held[rows[order[: round(fraction * len(rows))]]] = True
+        queried = pc.or_(empty, pa.array(held))
+    queried = pc.fill_null(queried, False)
+    return table.filter(pc.invert(queried)), table.filter(queried)
+
+
+def _holdout_of(holdout: Any) -> tuple[float, int]:
+    if isinstance(holdout, dict):
+        return float(holdout["fraction"]), int(holdout.get("seed", 0))
+    return float(holdout.fraction), int(holdout.seed)
+
+
+def _after(
+    table: pa.Table, time: str | None, value: str, error: Any
+) -> pa.ChunkedArray:
+    """Whether each row's time is at or after `until`, in UTC."""
+    if time is None or time not in table.column_names:
+        message = (
+            f"time column `{time}` is not in the context"
+            if time
+            else "`until` needs a `time` column to compare against"
         )
-    until = until_timestamp(spec.context.until)
+        param = "time" if time else "context.until"
+        hint = f"the context has {', '.join(table.column_names)}"
+        if error is not None:
+            raise error(message, param=param, hint=hint)
+        raise InvalidInput(message=message, param=param, hint=hint)
+    until = until_timestamp(value)
     assert until is not None
-    column = table[spec.time]
-    try:
-        stamps = pc.cast(column, pa.timestamp("us", tz=until.tzinfo and "UTC"))
-    except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
-        raise spec.error(
-            f"time column `{spec.time}` has no timestamps",
-            param="time",
-            hint="store times as ISO dates or timestamps",
-        ) from None
     if until.tzinfo is not None:
-        until = until.astimezone(dt.UTC)
-    after = pc.fill_null(pc.greater_equal(stamps, pa.scalar(until, stamps.type)), False)
-    return table.filter(pc.invert(after)), table.filter(after)
+        until = until.astimezone(dt.UTC).replace(tzinfo=None)
+    column = table[time]
+    if pa.types.is_timestamp(column.type) and column.type.tz is not None:
+        column = pc.cast(column, pa.timestamp("us", tz="UTC"))
+        column = pc.cast(column, pa.timestamp("us"))
+    try:
+        stamps = pc.cast(column, pa.timestamp("us"))
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+        message = f"time column `{time}` has no timestamps"
+        hint = "store times as ISO dates or timestamps"
+        if error is not None:
+            raise error(message, param="time", hint=hint) from None
+        raise InvalidInput(message=message, param="time", hint=hint) from None
+    return pc.fill_null(
+        pc.greater_equal(stamps, pa.scalar(until, pa.timestamp("us"))), False
+    )
 
 
 __all__ = [
     "KINDS",
+    "PHYSICAL",
     "ColumnInfo",
     "TableInfo",
     "inspect_frame",
     "inspect_table",
+    "semantic",
     "split",
+    "split_by",
 ]

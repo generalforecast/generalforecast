@@ -19,7 +19,7 @@ from generalforecast.models.outputs import (
     quantile_index,
     quantiles,
 )
-from generalforecast.predictors.runtime.lock import ExecutionLock
+from generalforecast.predictors.runtime.compiled import CompiledPlan
 from generalforecast.predictors.runtime.schema import TableSchema
 from generalforecast.predictors.validation import PredictorError
 from generalforecast.service.contracts import ServiceError
@@ -29,6 +29,32 @@ from generalforecast.tabular import arrow_bytes
 def _refused(error: _core.RequestError) -> PredictorError:
     code, message, _ = error.args
     return PredictorError(code, message)
+
+
+def strategy(lock: CompiledPlan) -> str | None:
+    """The engine strategy the plan's selection binds with, as JSON; exact when None."""
+    selection = lock.spec.selection
+    return None if selection is None else json.dumps(selection.strategy_spec())
+
+
+def bound_order(lock: CompiledPlan, table: pa.Table) -> pa.Table:
+    """The context rows in the order the binder writes them: by time, when they have one.
+
+    A retrieved selection's neighbors lean to the newest rows by their order
+    in the bound table, so every path binds a snapshot or live context
+    oldest first; `gf serve` writes its snapshot rows in this order too. A
+    request context binds in the order its rows come.
+    """
+    time = lock.spec.time
+    if (
+        time is None
+        or time not in table.column_names
+        or lock.spec.context.mode == "request"
+    ):
+        # A request context binds in the order the call sends, as gf-server
+        # binds a request's rows.
+        return table
+    return table.sort_by([(time, "ascending")])
 
 
 @dataclass(frozen=True)
@@ -48,7 +74,7 @@ class TabularContext:
     @classmethod
     def build(
         cls,
-        lock: ExecutionLock,
+        lock: CompiledPlan,
         model: tuple[LocalEngine, ModelRef],
         table: pa.Table,
         schema: TableSchema,
@@ -56,6 +82,7 @@ class TabularContext:
         """Binds the labeled rows through `gf_core::predictor`, then as a table."""
         target = lock.spec.target
         assert target is not None
+        table = bound_order(lock, table)
         try:
             context = _core.bind_predictor(
                 json.dumps(schema.to_dict()).encode("utf-8"),
@@ -77,11 +104,11 @@ class TabularContext:
             context,
             classes,
             tuple(lock.spec.quantiles or DEFAULT_QUANTILES),
-            engine.bind(ref, labeled),
+            engine.bind(ref, labeled, strategy(lock)),
         )
 
     def predict(
-        self, lock: ExecutionLock, model: tuple[LocalEngine, ModelRef], table: pa.Table
+        self, lock: CompiledPlan, model: tuple[LocalEngine, ModelRef], table: pa.Table
     ) -> dict[str, Any]:
         """Scores the query rows in their order, in steps the engine shares."""
         try:

@@ -39,6 +39,27 @@ import numpy as np
 ColumnKind = Literal["numeric", "categorical", "boolean", "datetime", "retrieval"]
 KINDS: tuple[ColumnKind, ...] = get_args(ColumnKind)
 
+# Each Arrow storage's encoding, as `tabular.physical_type` names storages.
+ENCODINGS: dict[str, ColumnKind] = {
+    "int64": "numeric",
+    "float64": "numeric",
+    "boolean": "boolean",
+    "string": "categorical",
+    "date": "datetime",
+    "timestamp": "datetime",
+}
+# Each column kind's encoding, in the kinds `gf.yaml` and `gf.lock` name
+# (`generalforecast.predictors.tables`).
+KIND_ENCODINGS: dict[str, ColumnKind] = {
+    "int": "numeric",
+    "float": "numeric",
+    "0/1": "numeric",
+    "category": "categorical",
+    "text": "categorical",
+    "timestamp": "datetime",
+    "bool": "boolean",
+}
+
 # Names the fixed columns of writes and queries take, so no feature column may.
 RESERVED = frozenset({"key", "target", "time", "before"})
 
@@ -209,14 +230,19 @@ def _arrow_kind(field: Any) -> ColumnKind:
     kind = field.type
     if pa.types.is_dictionary(kind):
         return "categorical"
-    if pa.types.is_string(kind) or pa.types.is_large_string(kind):
-        return "categorical"
-    if pa.types.is_boolean(kind):
-        return "boolean"
-    if pa.types.is_timestamp(kind) or pa.types.is_date(kind):
-        return "datetime"
-    if pa.types.is_integer(kind) or pa.types.is_floating(kind):
-        return "numeric"
+    if pa.types.is_large_string(kind):
+        kind = pa.string()
+    storage = {
+        pa.types.is_string: "string",
+        pa.types.is_boolean: "boolean",
+        pa.types.is_timestamp: "timestamp",
+        pa.types.is_date: "date",
+        pa.types.is_integer: "int64",
+        pa.types.is_floating: "float64",
+    }
+    for test, physical in storage.items():
+        if test(kind):
+            return ENCODINGS[physical]
     raise ValueError(f"column {field.name!r} is {kind}, which no column kind holds")
 
 
