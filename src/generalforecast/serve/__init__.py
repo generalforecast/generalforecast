@@ -9,6 +9,6 @@ holds no accounts, revisions or database; put auth beyond a single bearer
 key and versioning in front of it.
 """
 
-from generalforecast.serve.listener import add_arguments, main, run
+from generalforecast.serve.listener import main, serve
 
-__all__ = ["add_arguments", "main", "run"]
+__all__ = ["main", "serve"]

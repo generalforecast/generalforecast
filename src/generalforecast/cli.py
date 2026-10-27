@@ -3,16 +3,17 @@
 
 """The `gf` command: predictors on this machine and on the hosted service.
 
-Twelve commands in three groups plus `admin`. Human output follows one
-grammar (status lines, lock changes, three error shapes) drawn by
-`generalforecast.term`; `--json` prints results and errors as JSON objects
-instead. Help and version print without importing the SDK.
+Fifteen commands in three groups. Commands print status lines on stderr and
+return their result; `generalforecast.render` alone writes results on
+stdout, for a person or, under `--json`, as one JSON object. Every failure,
+including one while writing the result, goes through `present`, which
+prints it in one of the three error shapes or as a JSON error object. Help
+and version print without importing the SDK.
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import re
 import sys
@@ -26,67 +27,32 @@ from generalforecast.command_specs import (
     ADMIN_ACTIONS,
     ADMIN_HELP,
     ADMIN_NOUNS,
+    ADMIN_PREDICTOR_NOUNS,
+    ADMIN_SERVE_ACTIONS,
     CLOSING,
     COMMAND_HELP,
     COMMANDS,
     CONTEXT_ACTIONS,
+    DEFAULT_ENV,
     GROUPS,
     MODEL_ACTIONS,
+    NODE_CONFIG,
+    NODE_DATA,
+    READY_SECONDS,
+    ROUTER_CONFIG,
+    SERVE_HOST,
+    SERVE_PORT,
+    TABLE_PORT,
     TAGLINE,
-    UNNAMED_ACTIONS,
 )
+from generalforecast.errors import Error
 
-JSON = False
-ARGS: argparse.Namespace | None = None
-_OUT: term.Output | None = None
-_ARGV: list[str] = []
 DEFAULT_TIMEOUT = 40.0
-DEFAULT_ENV = "production"
-
-try:  # contract: provided by session D
-    from generalforecast.errors import Error
-except ImportError:
-
-    class Error(Exception):  # type: ignore[no-redef]
-        """A failure the CLI shows in one of its three shapes.
-
-        `line` and `column` point into `path` (default `gf.yaml`) for shape
-        two; `because`, `limit` and `actual` make shape three.
-        """
-
-        def __init__(
-            self,
-            code: str,
-            message: str,
-            *,
-            param: str | None = None,
-            hint: str | None = None,
-            limit: int | None = None,
-            actual: int | None = None,
-            request_id: str | None = None,
-            because: str | None = None,
-            line: int | None = None,
-            column: int | None = None,
-            path: str | None = None,
-        ) -> None:
-            """Keeps every field the error object and the renderer read."""
-            super().__init__(message)
-            self.code, self.message = code, message
-            self.param, self.hint = param, hint
-            self.limit, self.actual = limit, actual
-            self.request_id, self.because = request_id, because
-            self.line, self.column, self.path = line, column, path
-
-        def __str__(self) -> str:
-            """The CLI's error shape without colour."""
-            lines = [f"error: {self.message}"]
-            if self.because:
-                lines.append(f"  because: {self.because}")
-            if self.hint:
-                lines.append(f"  hint: {self.hint}")
-            if self.request_id:
-                lines.append(f"  request {self.request_id}")
-            return "\n".join(lines)
+# The exit code of a command line the parser rejected, and of one cut short
+# by Ctrl-C or by a reader that closed its end of the pipe.
+USAGE_EXIT = 2
+INTERRUPTED_EXIT = 130
+BROKEN_PIPE_EXIT = 141
 
 
 def version() -> str:
@@ -100,19 +66,18 @@ def version() -> str:
         return "0.0.0"
 
 
-def output() -> term.Output:
-    """The current invocation's renderer."""
-    return _OUT if _OUT is not None else term.Output()
-
-
 # -- parser ---------------------------------------------------------------
 
 
 class _Parser(argparse.ArgumentParser):
-    """argparse with the contract's help layout and error grammar."""
+    """argparse with the contract's help layout and error grammar.
+
+    Flags are never abbreviated: a prefix that works today would change
+    meaning the day a flag sharing it is added.
+    """
 
     def __init__(self, *args: Any, add_help: bool = True, **options: Any) -> None:
-        super().__init__(*args, add_help=False, **options)
+        super().__init__(*args, add_help=False, allow_abbrev=False, **options)
         if add_help:
             self.add_argument(
                 "-h", "--help", action="help", default=SUPPRESS, help="Print help"
@@ -126,16 +91,23 @@ class _Parser(argparse.ArgumentParser):
 
     def error(self, message: str) -> NoReturn:
         text, tip, hint = _usage_problem(self, message)
-        raise Usage(text, tip=tip, hint=hint, prog=self.prog)
+        raise Usage(text, tip=tip, hint=None if tip else hint)
 
 
-class Usage(Exception):
-    """A command line the parser rejected."""
+class Usage(Error):
+    """A command line the parser rejected; `tip` names a near miss."""
 
-    def __init__(self, message: str, *, tip: str | None, hint: str | None, prog: str):
+    code = "UsageError"
+
+    def __init__(
+        self, message: str, *, tip: str | None = None, hint: str | None = None
+    ):
         """Keeps the message, a near-miss tip and the usage hint."""
-        super().__init__(message)
-        self.message, self.tip, self.hint, self.prog = message, tip, hint, prog
+        super().__init__(message, hint=hint)
+        self.tip = tip
+
+
+_GLOBALS = {"json", "quiet", "verbose", "timeout"}
 
 
 def _globals(*, root: bool) -> _Parser:
@@ -173,8 +145,80 @@ def _globals(*, root: bool) -> _Parser:
     return parent
 
 
+def _early(argv: Sequence[str]) -> argparse.Namespace:
+    """`--json`, `-q` and `-v` as the parser reads them, before the full parse.
+
+    A command line the full parser rejects still needs them, to print its
+    usage error as JSON or not; this reads only those flags, the same way.
+    """
+    early = _Parser(add_help=False)
+    early.add_argument("--json", action="store_true")
+    early.add_argument("-q", "--quiet", action="store_true")
+    early.add_argument("-v", "--verbose", action="store_true")
+    try:
+        return early.parse_known_args(list(argv))[0]
+    except Usage:
+        return argparse.Namespace(json=False, quiet=False, verbose=False)
+
+
 def _columns(text: str) -> list[str]:
     return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def _listen(p: argparse.ArgumentParser, *, port: int, what: str) -> None:
+    """`--host` and `--port`: where a server listens."""
+    p.add_argument(
+        "--host",
+        default=SERVE_HOST,
+        metavar="<HOST>",
+        help=f"The address {what} listens on (default: {SERVE_HOST})",
+    )
+    p.add_argument(
+        "--port",
+        type=int,
+        default=port,
+        metavar="<PORT>",
+        help=f"The port {what} listens on (default: {port})",
+    )
+
+
+def _offline(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--offline",
+        action="store_true",
+        help="Fail instead of downloading model weights",
+    )
+
+
+def _config(p: argparse.ArgumentParser, what: str) -> None:
+    p.add_argument(
+        "--config",
+        type=Path,
+        metavar="<FILE>",
+        required=True,
+        help=f"The {what} configuration file",
+    )
+
+
+def _wait(p: argparse.ArgumentParser) -> None:
+    p.add_argument(
+        "--wait",
+        type=float,
+        default=READY_SECONDS,
+        metavar="<SECONDS>",
+        help=f"Seconds to wait for the environment to be ready (default: {READY_SECONDS:g})",
+    )
+
+
+def _env(
+    p: argparse.ArgumentParser, what: str, *, default: str | None = DEFAULT_ENV
+) -> None:
+    p.add_argument(
+        "--env",
+        default=default,
+        metavar="<E>",
+        help=f"{what} (default: {DEFAULT_ENV})",
+    )
 
 
 def parser() -> _Parser:
@@ -196,10 +240,28 @@ def parser() -> _Parser:
         text = help or COMMAND_HELP[name]
         return subs.add_parser(name, help=text, description=text, parents=shared)
 
+    def nested(p: _Parser, metavar: str) -> argparse._SubParsersAction:
+        dest = "noun" if metavar == "<NOUN>" else "action"
+        return p.add_subparsers(dest=dest, metavar=metavar, parser_class=_Parser)
+
+    def action(group: argparse._SubParsersAction, name: str, text: str) -> _Parser:
+        return group.add_parser(name, help=text, description=text, parents=shared)
+
     def directory(
         p: _Parser, *, what: str = "The predictor directory (default: .)"
     ) -> None:
         p.add_argument("directory", nargs="?", default=".", metavar="DIR", help=what)
+
+    def reference(
+        p: _Parser, *, metavar: str = "DIR|NAME", what: str | None = None
+    ) -> None:
+        p.add_argument(
+            "target",
+            nargs="?",
+            default=".",
+            metavar=metavar,
+            help=what or "A predictor directory or a hosted name (default: .)",
+        )
 
     p = command("init")
     directory(p, what="Where to write gf.yaml (default: .)")
@@ -300,39 +362,19 @@ def parser() -> _Parser:
     )
 
     p = command("serve")
-    p.add_argument(
-        "target",
-        nargs="?",
-        default=".",
+    reference(
+        p,
         metavar="DIR|MODEL",
-        help="A predictor directory or a catalog model (default: .)",
+        what="A predictor directory, its gf.lock, or a catalog model (default: .)",
     )
-    p.add_argument(
-        "--host",
-        default="127.0.0.1",
-        metavar="<HOST>",
-        help="The address to listen on (default: 127.0.0.1)",
-    )
-    p.add_argument(
-        "--port",
-        type=int,
-        default=8000,
-        metavar="<PORT>",
-        help="The port to listen on (default: 8000)",
-    )
-    p.add_argument(
-        "--offline",
-        action="store_true",
-        help="Fail instead of downloading model weights",
-    )
+    _listen(p, port=SERVE_PORT, what="the Models API")
+    _offline(p)
 
     p = command("predict")
-    p.add_argument(
-        "target",
-        nargs="?",
-        default=".",
-        metavar="DIR|NAME",
-        help="A predictor directory, a served URL or a hosted name (default: .)",
+    reference(
+        p,
+        what="A predictor directory, a served URL, a catalog model or a hosted name "
+        "(default: .)",
     )
     p.add_argument(
         "--queries", metavar="<FILE>", required=True, help="The rows to score"
@@ -346,20 +388,15 @@ def parser() -> _Parser:
         "--target",
         dest="target_column",
         metavar="<C>",
-        help="The column to predict, for a bare catalog model",
+        help="The column to predict; a catalog model needs it",
     )
     p.add_argument(
         "--inputs",
         metavar="<C,C>",
         type=_columns,
-        help="The columns the model may read, for a bare catalog model",
+        help="The columns the model may read",
     )
-    p.add_argument(
-        "--env",
-        default=DEFAULT_ENV,
-        metavar="<E>",
-        help=f"The hosted environment (default: {DEFAULT_ENV})",
-    )
+    _env(p, "The hosted environment, for a hosted name", default=None)
     p.add_argument(
         "--output",
         metavar="<FILE>",
@@ -371,31 +408,15 @@ def parser() -> _Parser:
 
     p = command("push")
     directory(p)
-    p.add_argument(
-        "--env",
-        default=DEFAULT_ENV,
-        metavar="<E>",
-        help=f"The environment to deploy to (default: {DEFAULT_ENV})",
-    )
+    _env(p, "The environment to deploy to")
+    _wait(p)
     p.add_argument("--yes", action="store_true", help="Push without asking")
 
     p = command("status")
-    p.add_argument(
-        "target",
-        nargs="?",
-        default=".",
-        metavar="DIR|NAME",
-        help="A predictor directory or a hosted name (default: .)",
-    )
+    reference(p)
 
     p = command("promote")
-    p.add_argument(
-        "target",
-        nargs="?",
-        default=".",
-        metavar="DIR|NAME",
-        help="A predictor directory or a hosted name (default: .)",
-    )
+    reference(p)
     p.add_argument(
         "--from",
         dest="source",
@@ -410,35 +431,23 @@ def parser() -> _Parser:
         metavar="<E>",
         help=f"The environment to point (default: {DEFAULT_ENV})",
     )
+    _wait(p)
 
     p = command("rollback")
-    p.add_argument(
-        "target",
-        nargs="?",
-        default=".",
-        metavar="DIR|NAME",
-        help="A predictor directory or a hosted name (default: .)",
-    )
-    p.add_argument(
-        "--env",
-        default=DEFAULT_ENV,
-        metavar="<E>",
-        help=f"The environment to point (default: {DEFAULT_ENV})",
-    )
+    reference(p)
+    _env(p, "The environment to point")
     p.add_argument(
         "--revision",
         type=int,
         metavar="<N>",
         help="The revision to point at (default: the one before)",
     )
+    _wait(p)
 
-    model = command("model")
-    actions = model.add_subparsers(
-        dest="action", metavar="<COMMAND>", parser_class=_Parser
-    )
-    for action, text in MODEL_ACTIONS:
-        q = actions.add_parser(action, help=text, description=text, parents=shared)
-        if action == "list":
+    model = nested(command("model"), "<COMMAND>")
+    for name, text in MODEL_ACTIONS:
+        q = action(model, name, text)
+        if name == "list":
             q.add_argument(
                 "--task",
                 choices=["classification", "regression", "forecast"],
@@ -451,21 +460,18 @@ def parser() -> _Parser:
                 help="A catalog model, general-forecast/<name>",
             )
 
-    context = command("context")
-    actions = context.add_subparsers(
-        dest="action", metavar="<COMMAND>", parser_class=_Parser
-    )
-    for action, text in CONTEXT_ACTIONS:
-        q = actions.add_parser(action, help=text, description=text, parents=shared)
+    context = nested(command("context"), "<COMMAND>")
+    for name, text in CONTEXT_ACTIONS:
+        q = action(context, name, text)
         q.add_argument("name", metavar="NAME", help="The live context")
-        if action == "create":
+        if name == "create":
             q.add_argument(
                 "--file",
                 metavar="<FILE>",
                 required=True,
                 help="The context config, JSON or YAML",
             )
-        elif action in ("append", "label"):
+        elif name in ("append", "label"):
             q.add_argument(
                 "file", metavar="FILE", help="The rows, as .csv, .parquet or .json"
             )
@@ -475,7 +481,7 @@ def parser() -> _Parser:
                 required=True,
                 help="The column that identifies a row",
             )
-            if action == "label":
+            if name == "label":
                 q.add_argument(
                     "--target",
                     metavar="<C>",
@@ -488,169 +494,101 @@ def parser() -> _Parser:
                 help="Make the write idempotent under this id",
             )
 
-    admin = command("admin")
-    nouns = admin.add_subparsers(dest="noun", metavar="<NOUN>", parser_class=_Parser)
+    nouns = nested(command("admin"), "<NOUN>")
     for noun in ADMIN_NOUNS:
-        text = ADMIN_HELP[noun]
-        n = nouns.add_parser(noun, help=text, description=text, parents=shared)
+        n = action(nouns, noun, ADMIN_HELP[noun])
         if noun in ADMIN_ACTIONS:
-            acts = n.add_subparsers(
-                dest="action", metavar="<ACTION>", parser_class=_Parser
-            )
-            for action, line in ADMIN_ACTIONS[noun]:
-                a = acts.add_parser(action, help=line, description=line, parents=shared)
-                if (
-                    action not in UNNAMED_ACTIONS or noun == "runtimes"
-                ) and noun != "sso":
-                    a.add_argument("name", metavar="NAME", help=f"The {noun}")
-                a.add_argument("--file", metavar="<FILE>", help="A JSON or YAML body")
+            acts = nested(n, "<ACTION>")
+            for spec in ADMIN_ACTIONS[noun]:
+                a = action(acts, spec.name, spec.help)
+                if spec.target is not None:
+                    a.add_argument("name", metavar="NAME", help=f"The {spec.target}")
+                if spec.body:
+                    a.add_argument(
+                        "--file",
+                        metavar="<FILE>",
+                        required=True,
+                        help="The request, as JSON or YAML; - reads stdin",
+                    )
+                if spec.destructive:
+                    a.add_argument(
+                        "--yes", action="store_true", help="Go ahead without asking"
+                    )
+                if noun == "audit":
+                    a.add_argument(
+                        "--after",
+                        type=int,
+                        default=0,
+                        metavar="<N>",
+                        help="Start after this event (default: 0)",
+                    )
+                    a.add_argument(
+                        "--limit",
+                        type=int,
+                        default=100,
+                        metavar="<N>",
+                        help="Show at most this many events, up to 100 (default: 100)",
+                    )
+        elif noun in ADMIN_SERVE_ACTIONS:
+            acts = nested(n, "<ACTION>")
+            config = NODE_CONFIG if noun == "node" else ROUTER_CONFIG
+            for name, text in ADMIN_SERVE_ACTIONS[noun]:
+                a = action(acts, name, text)
+                if name != "init":
+                    _config(a, f"{noun}'s")
+                    if name == "serve" and noun == "node":
+                        _offline(a)
+                    continue
                 a.add_argument(
-                    "--yes", action="store_true", help="Confirm a destructive action"
+                    "--path",
+                    type=Path,
+                    default=Path(config),
+                    metavar="<FILE>",
+                    help=f"Where to write the configuration (default: {config})",
                 )
-        elif noun == "node":
-            acts = n.add_subparsers(
-                dest="action", metavar="<ACTION>", parser_class=_Parser
-            )
-            a = acts.add_parser(
-                "serve",
-                help="Serve one node of a cluster",
-                description="Serve one node of a cluster",
-                parents=shared,
-            )
-            a.add_argument(
-                "target",
-                nargs="?",
-                default=".",
-                metavar="DIR|MODEL",
-                help="A predictor directory or a catalog model (default: .)",
-            )
-            a.add_argument(
-                "--node",
-                action="append",
-                metavar="<NAME>",
-                help="A node of the cluster (repeatable)",
-            )
-            a.add_argument(
-                "--config",
-                type=Path,
-                metavar="<FILE>",
-                help="Run from this configuration file",
-            )
-            a.add_argument(
-                "--init",
-                type=Path,
-                metavar="<FILE>",
-                help="Write a configuration file here and exit",
-            )
-            a.add_argument(
-                "--force",
-                action="store_true",
-                help="Let --init overwrite an existing file",
-            )
-            a.add_argument(
-                "--check",
-                action="store_true",
-                help="Validate the configuration and exit",
-            )
-            a.add_argument(
-                "--request-timeout",
-                type=float,
-                default=60.0,
-                metavar="<SECONDS>",
-                help="Seconds a request may take (default: 60)",
-            )
-            a.add_argument(
-                "--host",
-                default="127.0.0.1",
-                metavar="<HOST>",
-                help="The address to listen on (default: 127.0.0.1)",
-            )
-            a.add_argument(
-                "--port",
-                type=int,
-                default=8000,
-                metavar="<PORT>",
-                help="The port to listen on (default: 8000)",
-            )
-            a.add_argument(
-                "--offline",
-                action="store_true",
-                help="Fail instead of downloading model weights",
-            )
-        elif noun == "router":
-            acts = n.add_subparsers(
-                dest="action", metavar="<ACTION>", parser_class=_Parser
-            )
-            a = acts.add_parser(
-                "serve",
-                help="Route requests to nodes",
-                description="Route requests to nodes",
-                parents=shared,
-            )
-            a.add_argument(
-                "--upstream",
-                action="append",
-                default=[],
-                metavar="<URL>",
-                help="A node to route to (repeatable)",
-            )
-            a.add_argument(
-                "--host",
-                default="127.0.0.1",
-                metavar="<HOST>",
-                help="The address to listen on (default: 127.0.0.1)",
-            )
-            a.add_argument(
-                "--port",
-                type=int,
-                default=8000,
-                metavar="<PORT>",
-                help="The port to listen on (default: 8000)",
-            )
-            a.add_argument(
-                "--request-timeout",
-                type=float,
-                default=60.0,
-                metavar="<SECONDS>",
-                help="Seconds a routed request may take (default: 60)",
-            )
-        elif noun == "logs":
-            n.add_argument(
-                "target",
-                nargs="?",
-                default=".",
-                metavar="DIR|NAME",
-                help="A predictor directory or a hosted name (default: .)",
-            )
-            n.add_argument(
-                "--env",
-                default=DEFAULT_ENV,
-                metavar="<E>",
-                help=f"The environment (default: {DEFAULT_ENV})",
-            )
-        elif noun == "diff":
-            n.add_argument(
-                "target",
-                nargs="?",
-                default=".",
-                metavar="DIR",
-                help="The predictor directory (default: .)",
-            )
-            n.add_argument(
-                "--env",
-                default=DEFAULT_ENV,
-                metavar="<E>",
-                help=f"The environment to compare with (default: {DEFAULT_ENV})",
-            )
+                _listen(a, port=TABLE_PORT, what=f"the {noun}")
+                if noun == "node":
+                    a.add_argument(
+                        "--data",
+                        type=Path,
+                        default=Path(NODE_DATA),
+                        metavar="<DIR>",
+                        help=f"Where the node keeps its tables (default: {NODE_DATA})",
+                    )
+                    a.add_argument(
+                        "--model",
+                        action="append",
+                        default=[],
+                        metavar="<NAME=MODEL>",
+                        help="A model to serve, as NAME=general-forecast/<name> "
+                        "(repeatable; default: the TabICL models)",
+                    )
+                else:
+                    a.add_argument(
+                        "--node",
+                        action="append",
+                        required=True,
+                        metavar="<URL>",
+                        help="A node's address, like http://127.0.0.1:8816 (repeatable)",
+                    )
+                a.add_argument(
+                    "--force", action="store_true", help="Overwrite an existing file"
+                )
         elif noun == "delete":
-            n.add_argument(
-                "target",
-                nargs="?",
-                default=".",
-                metavar="DIR|NAME",
-                help="A predictor directory or a hosted name (default: .)",
-            )
+            reference(n)
             n.add_argument("--yes", action="store_true", help="Delete without asking")
+        else:
+            reference(
+                n,
+                metavar="DIR" if noun == "diff" else "DIR|NAME",
+                what="The predictor directory (default: .)" if noun == "diff" else None,
+            )
+            _env(
+                n,
+                "The environment to compare with"
+                if noun == "diff"
+                else "The environment",
+            )
 
     p = command("help", help="Print help for a command")
     p.add_argument(
@@ -674,7 +612,7 @@ def root_help(out: term.Output) -> str:
         )
         lines.append("")
     lines.append(out.style("Options:", "bold", "green"))
-    lines.extend(_option_lines(parser(), out, globals_only=True, root=True))
+    lines.extend(_option_lines(parser(), out, globals_only=True))
     lines.extend(["", CLOSING, ""])
     return "\n".join(lines)
 
@@ -689,15 +627,11 @@ def _flag_text(action: argparse.Action) -> str:
 
 
 def _is_global(action: argparse.Action) -> bool:
-    return action.dest in {"json", "quiet", "verbose", "timeout"}
+    return action.dest in _GLOBALS
 
 
 def _option_lines(
-    p: argparse.ArgumentParser,
-    out: term.Output,
-    *,
-    globals_only: bool,
-    root: bool = False,
+    p: argparse.ArgumentParser, out: term.Output, *, globals_only: bool
 ) -> list[str]:
     actions = [
         a
@@ -801,15 +735,7 @@ def command_help(p: argparse.ArgumentParser, out: term.Output) -> str:
         lines.append("")
     lines.append(out.style("Global options:", "bold", "green"))
     lines.extend(_option_lines(p, out, globals_only=True))
-    lines.extend(
-        [
-            "",
-            CLOSING.replace("<command>", p.prog.removeprefix("gf ").split(" ")[0])
-            if False
-            else CLOSING,
-            "",
-        ]
-    )
+    lines.extend(["", CLOSING, ""])
     return "\n".join(lines)
 
 
@@ -840,6 +766,7 @@ def _usage_problem(
     p: argparse.ArgumentParser, message: str
 ) -> tuple[str, str | None, str | None]:
     """Argparse's message as `(error, tip, hint)`, never echoing a secret-looking value."""
+    argv = _ARGV
     usage_hint = (
         "run 'gf --help' for the list of commands"
         if p.prog == "gf"
@@ -848,7 +775,7 @@ def _usage_problem(
     choice = re.search(r"invalid choice: '([^']*)'", message)
     if choice:
         word, names = choice.group(1), _choices(p)
-        prior = _ARGV[: _ARGV.index(word)] if word in _ARGV else []
+        prior = argv[: argv.index(word)] if word in argv else []
         if prior and prior[-1].startswith("-") and prior[-1] not in _flags(p):
             flag = prior[-1].split("=", 1)[0]
             match = term.suggest(flag, _flags(p))
@@ -869,7 +796,7 @@ def _usage_problem(
     extra = re.match(r"unrecognized arguments: (.*)", message)
     if extra:
         first = extra.group(1).split()[0]
-        words = [w for w in _ARGV if not w.startswith("-")]
+        words = [w for w in argv if not w.startswith("-")]
         deepest = p
         for n in range(len(words), 0, -1):
             found = _find(p, words[:n])
@@ -886,11 +813,8 @@ def _usage_problem(
                 match and f"a similar argument exists: '{match}'",
                 usage_hint,
             )
-        return (
-            f"unexpected argument `{first if re.fullmatch(r'[\\w./-]{1,40}', first) else '...'}`",
-            None,
-            usage_hint,
-        )
+        shown = first if re.fullmatch(r"[\w./-]{1,40}", first) else "..."
+        return f"unexpected argument `{shown}`", None, usage_hint
     required = re.match(r"the following arguments are required: (.*)", message)
     if required:
         names = [n.strip() for n in required.group(1).split(",")]
@@ -961,57 +885,22 @@ def _usage_problem(
     return message, None, usage_hint
 
 
-# -- results and errors ---------------------------------------------------
-
-
-def redact(value: Any) -> Any:
-    """Removes secret response fields and known credential values."""
-    from generalforecast.credentials import SEEN
-
-    if isinstance(value, dict):
-        return {
-            redact(key): "[redacted]"
-            if re.search(
-                r"(?i)(token|password|secret_value|credential_value|authorization|private_key)",
-                key,
-            )
-            else redact(item)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [redact(item) for item in value]
-    if isinstance(value, str):
-        values = SEEN | {
-            os.environ.get(env, "")
-            for env in (
-                "GF_API_KEY",
-                "GF_TOKEN",
-                "GF_PLATFORM_TOKEN",
-                "GF_MODAL_KEY",
-                "GF_MODAL_SECRET",
-            )
-        }
-        for secret in sorted(values, key=len, reverse=True):
-            if secret:
-                value = value.replace(secret, "[redacted]")
-        return value
-    return value
-
-
-def emit(value: dict, *, error: bool = False) -> None:
-    """One JSON object on stdout (results) or stderr (errors)."""
-    print(
-        json.dumps(redact(value), allow_nan=False, ensure_ascii=False),
-        file=sys.stderr if error else sys.stdout,
-        flush=True,
-    )
+# -- errors ---------------------------------------------------------------
 
 
 def error_object(error: BaseException) -> dict[str, Any]:
-    """The `--json` error object: code, message and the optional fields it carries."""
-    code = getattr(error, "code", None) or "Internal"
+    """The `--json` error object, shaped as the service's.
+
+    `code` is one of the contract's wire codes, with the specific name in
+    `reason`, so a local failure and a service reply read the same way.
+    """
+    from generalforecast.account import wire_code
+
+    code, reason = wire_code(error)
     message = getattr(error, "message", None) or str(error) or "internal error"
     body: dict[str, Any] = {"code": code, "message": message}
+    if reason is not None:
+        body["reason"] = reason
     for field in ("param", "hint", "limit", "actual", "request_id"):
         value = getattr(error, field, None)
         if value is not None:
@@ -1019,131 +908,164 @@ def error_object(error: BaseException) -> dict[str, Any]:
     return {"error": body}
 
 
-def _pointer(error: BaseException) -> term.Pointer | None:
-    """The `-->` block for an error that carries a line and column into a file."""
+def _pointer(error: BaseException, root: Path) -> term.Pointer | None:
+    """The `-->` block for an error that carries a line and column into a file.
+
+    A relative path is the manifest's, so it is read from the predictor
+    directory the command named.
+    """
     line, column = getattr(error, "line", None), getattr(error, "column", None)
     if not line or not column:
         return None
     path = getattr(error, "path", None) or "gf.yaml"
-    root = Path(
-        getattr(ARGS, "directory", None) or getattr(ARGS, "target", None) or "."
-    )
-    candidates = (
-        [Path(path), root / path] if not Path(path).is_absolute() else [Path(path)]
-    )
     source = ""
-    for candidate in candidates:
-        try:
-            source = candidate.read_text().splitlines()[line - 1]
-            break
-        except (OSError, IndexError, UnicodeDecodeError):
-            continue
+    try:
+        source = (root / path).expanduser().read_text().splitlines()[line - 1]
+    except (OSError, IndexError, UnicodeDecodeError):
+        pass
     match = re.match(r"[^\s,\]\}#]+", source[column - 1 :]) if source else None
-    width = len(match.group(0)) if match else 1
+    width = term.visible(match.group(0)) if match else 1
     label = getattr(error, "because", None) or ""
     return term.Pointer(path, line, column, source, label, width)
 
 
 def _oserror(error: OSError) -> Error:
+    from generalforecast.errors import InvalidInput, NotFound
+
     filename = getattr(error, "filename", None)
-    reason = (error.strerror or type(error).__name__).lower()
-    if filename:
-        return Error(
-            "NotFound" if isinstance(error, FileNotFoundError) else "InvalidInput",
-            f"cannot read `{filename}`: {reason}",
-        )
-    return Error("InvalidInput", reason)
+    reason = error.strerror or str(error) or type(error).__name__
+    reason = reason[:1].lower() + reason[1:]
+    if filename is not None:
+        kind = NotFound if isinstance(error, FileNotFoundError) else InvalidInput
+        return kind(f"cannot open `{filename}`: {reason}")
+    return InvalidInput(reason)
 
 
-def present(error: BaseException, out: term.Output) -> int:
-    """Prints any failure in the contract's grammar and returns the exit code."""
-    if isinstance(error, term.Aborted):
-        return 1
-    if isinstance(error, KeyboardInterrupt):
-        if JSON:
-            emit(
-                {"error": {"code": "Interrupted", "message": "interrupted"}}, error=True
-            )
-        else:
-            out.say(force=True)
-            out.error("interrupted")
-        return 130
-    if isinstance(error, Usage):
-        if JSON:
-            emit(
-                {"error": {"code": "UsageError", "message": redact(error.message)}},
-                error=True,
-            )
-        else:
-            out.error(
-                redact(error.message),
-                tip=error.tip,
-                hint=None if error.tip else error.hint,
-            )
-        return 2
-    if isinstance(error, OSError) and not hasattr(error, "code"):
-        error = _oserror(error)
-    known = isinstance(error, Error) or (
-        hasattr(error, "code") and hasattr(error, "message")
+def _known(error: BaseException) -> bool:
+    """Whether a failure says what went wrong, rather than being our bug."""
+    return isinstance(error, Error) or (
+        isinstance(getattr(error, "code", None), str)
+        and isinstance(getattr(error, "message", None), str)
     )
-    if not known:
+
+
+def _silence_stdout() -> None:
+    """Points stdout at /dev/null, so the interpreter's last flush cannot fail."""
+    try:
+        null = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(null, sys.stdout.fileno())
+        os.close(null)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def present(
+    error: BaseException,
+    out: term.Output,
+    *,
+    json: bool = False,
+    root: Path = Path("."),
+) -> int:
+    """Prints any failure in the contract's grammar and returns the exit code."""
+    from generalforecast.render import emit, redact
+
+    if isinstance(error, BrokenPipeError):
+        _silence_stdout()
+        return BROKEN_PIPE_EXIT
+    exit_code = 1
+    if isinstance(error, KeyboardInterrupt):
+        error, exit_code = Error("interrupted", code="Interrupted"), INTERRUPTED_EXIT
+        if not json:
+            out.say(force=True)
+    elif isinstance(error, Usage):
+        exit_code = USAGE_EXIT
+    elif isinstance(error, OSError) and not _known(error):
+        error = _oserror(error)
+    if not _known(error):
         if out.verbose:
             import traceback
 
             out.say("".join(traceback.format_exception(error)).rstrip(), force=True)
-        if JSON:
-            emit(
-                {
-                    "error": {
-                        "code": "Internal",
-                        "message": "internal error",
-                        "hint": "run again with -v",
-                    }
-                },
-                error=True,
+        error = Error("internal error", code="Internal", hint="run again with -v")
+    try:
+        if json:
+            emit(error_object(error), error=True)
+            return exit_code
+        hint = getattr(error, "hint", None)
+        tip = getattr(error, "tip", None)
+        pointer = _pointer(error, root)
+        because = getattr(error, "because", None)
+        limit, actual = getattr(error, "limit", None), getattr(error, "actual", None)
+        if because is None and limit is not None and actual is not None:
+            because = (
+                f"the limit is {term.count(limit)}; "
+                f"the request sent {term.count(actual)}"
             )
-        else:
-            out.error("internal error", hint="run again with -v")
-        return 1
-    if JSON:
-        emit(error_object(error), error=True)
-        return 1
-    pointer = _pointer(error)
-    hint = getattr(error, "hint", None)
-    if hint is None and getattr(error, "code", None) == "NotLoggedIn":
-        hint = "run `gf login`"
-    if hint is None and str(getattr(error, "message", "")).startswith(
+        if hint is None:
+            hint = _unauthorized_hint(error)
+        out.error(
+            redact(str(getattr(error, "message", error))),
+            hint=None if tip else hint,
+            because=None if pointer is not None else because,
+            tip=tip,
+            pointer=pointer,
+            request_id=getattr(error, "request_id", None),
+        )
+    except BrokenPipeError:
+        return BROKEN_PIPE_EXIT
+    return exit_code
+
+
+def _unauthorized_hint(error: BaseException) -> str | None:
+    """What to do about a refused credential, from the contract's code and reason."""
+    from generalforecast.account import wire_code
+
+    code, reason = wire_code(error)
+    if code != "Unauthorized":
+        return None
+    if reason in (
+        "not_logged_in",
+        "expired_token",
+        "invalid_login",
+        "credential_inactive",
+    ):
+        return "run `gf login`"
+    message = str(getattr(error, "message", ""))
+    if reason in ("forbidden", "access_denied") or message.startswith(
         "permission denied"
     ):
-        hint = "run `gf login` again, or use a key that has this permission"
-    because = getattr(error, "because", None)
-    limit, actual = getattr(error, "limit", None), getattr(error, "actual", None)
-    if because is None and limit is not None and actual is not None:
-        because = (
-            f"the limit is {term.count(limit)}; the request sent {term.count(actual)}"
-        )
-    out.error(
-        redact(str(getattr(error, "message", error))),
-        hint=hint,
-        because=None if pointer is not None else because,
-        pointer=pointer,
-        request_id=getattr(error, "request_id", None),
-    )
-    return 1
+        return "run `gf login` again, or use a key that has this permission"
+    return None
 
 
 # -- dispatch -------------------------------------------------------------
 
+# The command line being parsed, for the near-miss tips of usage errors.
+_ARGV: list[str] = []
 
-def run(argv: Sequence[str]) -> dict | None:
-    """Parses and runs one command, returning its result for `--json`."""
-    global ARGS
-    root = parser()
-    args = root.parse_args(list(argv))
-    ARGS = args
-    out = output()
+
+def _incomplete(root: _Parser, args: argparse.Namespace) -> None:
+    """Rejects a group named without its action, as argparse leaves it to us."""
+    path = [args.command]
+    if args.command in ("model", "context"):
+        path.append(args.action)
+    elif args.command == "admin":
+        path.append(args.noun)
+        if args.noun is not None and args.noun not in ADMIN_PREDICTOR_NOUNS:
+            path.append(args.action)
+    if None in path:
+        known = path[: path.index(None)]
+        sub = _find(root, known)
+        assert sub is not None
+        nested = _subparsers(sub)
+        assert nested is not None
+        sub.error(f"the following arguments are required: {nested.metavar}")
+
+
+def run(args: argparse.Namespace, root: _Parser, out: term.Output) -> dict | None:
+    """Runs one parsed command and returns its result."""
     if args.command is None:
-        sys.stdout.write(root_help(term.Output(out=sys.stdout, err=sys.stdout)))
+        out.out.write(root_help(term.Output(out=out.out, err=out.out)))
         return None
     if args.command == "help":
         topic = _find(root, args.topic)
@@ -1153,43 +1075,18 @@ def run(argv: Sequence[str]) -> dict | None:
                 raise Usage(
                     f"unknown command `{args.topic[0]}`",
                     tip=match and f"a similar command exists: '{match}'",
-                    hint="run 'gf --help' for the list of commands",
-                    prog="gf",
+                    hint=None if match else "run 'gf --help' for the list of commands",
                 )
             topic = root
-        sys.stdout.write(topic.format_help())
+        out.out.write(topic.format_help())
         return None
-    for group_name in ("model", "context", "admin"):
-        if (
-            args.command == group_name
-            and getattr(args, "action" if group_name != "admin" else "noun", None)
-            is None
-        ):
-            sub = _find(root, [group_name])
-            assert sub is not None
-            nested = _subparsers(sub)
-            metavar = nested.metavar if nested is not None else "<COMMAND>"
-            sub.error(f"the following arguments are required: {metavar}")
-    if args.command == "admin" and args.noun in ADMIN_ACTIONS and args.action is None:
-        sub = _find(root, ["admin", args.noun])
-        assert sub is not None
-        sub.error("the following arguments are required: <ACTION>")
-    if (
-        args.command == "admin"
-        and args.noun in ("node", "router")
-        and args.action is None
-    ):
-        sub = _find(root, ["admin", args.noun])
-        assert sub is not None
-        sub.error("the following arguments are required: <ACTION>")
+    _incomplete(root, args)
     if args.command in ("login", "logout", "whoami"):
         from generalforecast import account
 
-        return (
-            getattr(account, args.command)(args, out)
-            if args.command != "whoami"
-            else account.whoami(args)
-        )
+        if args.command == "whoami":
+            return account.whoami(args)
+        return getattr(account, args.command)(args, out)
     if args.command in ("model", "context", "admin"):
         from generalforecast.commands import execute
 
@@ -1201,36 +1098,41 @@ def run(argv: Sequence[str]) -> dict | None:
 
 def main(argv: Sequence[str] | None = None) -> None:
     """Runs one command; failures print in the error grammar and exit nonzero."""
-    global JSON, _OUT, _ARGV
+    global _ARGV
     _ARGV = list(sys.argv[1:] if argv is None else argv)
-    argv = _ARGV
-    if argv in (["-V"], ["--version"]):
-        sys.stdout.write(f"gf {version()}\n")
-        return
-    if argv in ([], ["-h"], ["--help"], ["help"]):
-        sys.stdout.write(root_help(term.Output(out=sys.stdout, err=sys.stdout)))
-        return
-    flags = set(argv[: argv.index("--")] if "--" in argv else argv)
-    JSON = "--json" in flags
-    _OUT = term.Output(
-        quiet=JSON or bool(flags & {"-q", "--quiet"}),
-        verbose=bool(flags & {"-v", "--verbose"}),
-    )
+    flags = _early(_ARGV)
+    json = flags.json
+    out = term.Output(quiet=flags.json or flags.quiet, verbose=flags.verbose)
+    args: argparse.Namespace | None = None
     try:
-        result = run(argv)
+        root = parser()
+        args = root.parse_args(_ARGV)
+        json = args.json
+        out = term.Output(quiet=args.json or args.quiet, verbose=args.verbose)
+        result = run(args, root, out)
+        if result is not None:
+            from generalforecast.render import emit, render
+
+            if json:
+                emit(result)
+            else:
+                render(args, result, out)
+        sys.stdout.flush()
     except SystemExit:
+        # Help and version print through argparse, which ignores a closed
+        # pipe; the flush finds it.
+        try:
+            sys.stdout.flush()
+        except BrokenPipeError:
+            _silence_stdout()
+            raise SystemExit(BROKEN_PIPE_EXIT) from None
         raise
     except BaseException as error:  # noqa: BLE001
-        raise SystemExit(present(error, _OUT)) from None
-    if result is None:
-        return
-    if JSON:
-        emit(result)
-    else:
-        from generalforecast.render import render
-
-        assert ARGS is not None
-        render(ARGS, result, _OUT)
+        # An error's file is the manifest of the predictor the command named.
+        named = vars(args) if args is not None else {}
+        where = named.get("directory") or named.get("target") or "."
+        manifests = Path(where) if "://" not in where else Path(".")
+        raise SystemExit(present(error, out, json=json, root=manifests)) from None
 
 
 if __name__ == "__main__":

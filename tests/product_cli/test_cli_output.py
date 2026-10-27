@@ -115,7 +115,12 @@ def test_retired_flags_and_commands_are_gone(monkeypatch):
         code, stdout, stderr = gf("--json", command, monkeypatch=monkeypatch)
         assert code == 2 and not stdout
         assert json.loads(stderr) == {
-            "error": {"code": "UsageError", "message": f"unknown command `{command}`"}
+            "error": {
+                "code": "ValidationError",
+                "reason": "usage_error",
+                "message": f"unknown command `{command}`",
+                "hint": "run 'gf --help' for the list of commands",
+            }
         }
     _, stdout, _ = gf("serve", "--help", monkeypatch=monkeypatch)
     for flag in ("--node", "--config", "--init", "--upstream", "--force"):
