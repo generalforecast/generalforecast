@@ -77,6 +77,7 @@ ALLOWED: dict[str, tuple[str, ...]] = {
         "id",
         "time",
         "series",
+        "related",
         "frequency",
         "horizon",
         "quantiles",
@@ -177,6 +178,12 @@ class PredictorSpec:
         id: The id role column, if any.
         time: The time role column, if any.
         series: The series role columns.
+        related: Which series a forecaster forecasts jointly: None (each
+            series on its own, the default), `()` for every series as one
+            group (`related: all`), or the series columns whose values name
+            each group (`related: [store]`). A group holds at most
+            `ServingPolicy.group_series` series, which share one origin and
+            their known-future values.
         frequency: A forecaster's cadence, such as `1d`, or seconds as a number.
         horizon: How many steps a forecaster predicts.
         quantiles: A forecaster's or regressor's output levels.
@@ -197,6 +204,7 @@ class PredictorSpec:
     id: str | None = None
     time: str | None = None
     series: tuple[str, ...] = ()
+    related: tuple[str, ...] | None = None
     frequency: str | int | float | None = None
     horizon: int | None = None
     quantiles: tuple[float, ...] = ()
@@ -267,6 +275,8 @@ class PredictorSpec:
                 value[key] = getattr(self, key)
         if self.series:
             value["series"] = list(self.series)
+        if self.related is not None:
+            value["related"] = list(self.related) if self.related else "all"
         if self.frequency is not None:
             value["frequency"] = self.frequency
         if self.horizon is not None:
@@ -511,6 +521,7 @@ def _parse(value: Any, default_name: str | None, marks: Marks) -> PredictorSpec:
     id_ = top.text("id")
     time = top.text("time")
     series = top.texts("series")
+    related = _related(top)
     frequency = _frequency(top)
     horizon = top.integer("horizon", 1, 10_000)
     quantiles = _quantiles(top)
@@ -549,6 +560,7 @@ def _parse(value: Any, default_name: str | None, marks: Marks) -> PredictorSpec:
         id=id_,
         time=time,
         series=series,
+        related=related,
         frequency=frequency,
         horizon=horizon,
         quantiles=quantiles,
@@ -564,6 +576,21 @@ def _parse(value: Any, default_name: str | None, marks: Marks) -> PredictorSpec:
     )
     validate(spec)
     return spec
+
+
+def _related(top: _Fields) -> tuple[str, ...] | None:
+    value = top.get("related")
+    if value is None:
+        return None
+    if value == "all":
+        return ()
+    if type(value) is list:
+        return top.texts("related", "`all` or a list of series columns")
+    raise top.fail(
+        "related",
+        "`related` must be `all` or a list of series columns",
+        hint="write `related: all`, or `related: [store]` to forecast each store's series together",
+    )
 
 
 def _frequency(top: _Fields) -> str | int | float | None:
@@ -897,6 +924,14 @@ def validate(spec: PredictorSpec) -> None:
                 hint="add `time: date` and `frequency: 1d`, or pick a tabular model\n"
                 "with `gf model list --task classification`",
             )
+        if spec.related:
+            outside = [column for column in spec.related if column not in spec.series]
+            if outside:
+                raise spec.error(
+                    f"`related` names `{outside[0]}`, which is not a series column",
+                    param="related",
+                    hint="name series columns, or write `related: all`",
+                )
         if spec.horizon is None:
             raise spec.error(
                 f"predictor {spec.name} has no `horizon`",
@@ -921,6 +956,13 @@ def validate(spec: PredictorSpec) -> None:
                     hint=f"remove `{key}`, or pick a forecast model with "
                     "`gf model list --task forecast`",
                 )
+        if spec.related is not None:
+            raise spec.error(
+                "`related` is for forecast models",
+                param="related",
+                because=f"{spec.model} is a {task} model",
+                hint="remove `related`",
+            )
         if spec.series:
             raise spec.error(
                 "`series` is for forecast models",

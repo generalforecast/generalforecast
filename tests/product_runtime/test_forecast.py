@@ -33,8 +33,8 @@ def context():
     )
 
 
-@pytest.fixture
-def engine(tmp_path, context, monkeypatch):
+@pytest.fixture(params=[None, "all"], ids=["independent", "related"])
+def engine(request, tmp_path, context, monkeypatch):
     fake = FakeEngine(CHRONOS2_QUANTILES).install(monkeypatch)
 
     def forecast(ref, request):
@@ -54,6 +54,7 @@ def engine(tmp_path, context, monkeypatch):
         horizon=2,
         future_inputs=["promo"],
         outputs=["value", "quantiles"],
+        **({"related": request.param} if request.param else {}),
     )
     return PredictorExecutor().prepare(locked, context)
 
@@ -129,6 +130,11 @@ def test_bad_forecast_queries_are_typed(engine, case):
     elif case == "target_leak":
         q = q.append_column("y", pa.array([1.0] * 4))
     elif case == "future_disagrees":
+        if engine.lock.spec.related is None:
+            # Series on their own each have their own known-future values.
+            changed = q.set_column(2, "promo", pa.array([0.0, 1.0, 2.0, 1.0]))
+            assert engine.predict(changed).num_rows == 4
+            return
         q = q.set_column(2, "promo", pa.array([0.0, 1.0, 2.0, 1.0]))
     elif case == "future_missing":
         q = q.drop(["promo"])
@@ -153,6 +159,7 @@ def test_irregular_context_and_covariate_disagreement_fail_before_ready(
         horizon=2,
         frequency=1,
         future_inputs=["promo"],
+        related="all",
     )
     changed = context.set_column(1, "time", pa.array([0, 1, 2, 4, 0, 1, 2, 3]))
     with pytest.raises(ServiceError) as error:

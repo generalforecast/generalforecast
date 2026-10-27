@@ -243,7 +243,8 @@ def published_entry(plan: Any, *, snapshot: Path | None = None) -> dict[str, Any
     serving binds a live context's captured rows as a snapshot. A forecast
     entry's `frequency` is the step on the time axis, `declared` the same
     step when the lock declares it, and `calendar` a calendar frequency's
-    alias (`MS`, `2QE`, `W-MON`), whose UTC periods gf-server counts.
+    alias (`MS`, `2QE`, `W-MON`), whose UTC periods gf-server counts;
+    `related` the lock's declared groups, every series on its own when None.
     """
     from generalforecast.predictors import frequency as _frequency
 
@@ -274,6 +275,7 @@ def published_entry(plan: Any, *, snapshot: Path | None = None) -> dict[str, Any
             "calendar": spec.frequency
             if _frequency.is_calendar(spec.frequency)
             else None,
+            "related": None if spec.related is None else list(spec.related),
         }
         inputs = list(spec.forecast_inputs)
     selection = spec.selection

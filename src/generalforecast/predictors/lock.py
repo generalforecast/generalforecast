@@ -17,6 +17,8 @@ know what a predictor is. Version 2:
       id, id_type                 # when the manifest names an id
       time, time_type             # when it names a time
       series, series_types        # a forecaster's series columns and their kinds
+      related                     # a forecaster's declared groups: [] is one group,
+                                  # else the series columns naming each group
       frequency, horizon          # a forecaster's
       quantiles                   # a regressor's or forecaster's output levels
       outputs                     # what predictions carry
@@ -85,6 +87,7 @@ OPTIONAL_FIELDS = frozenset(
         "time_type",
         "series",
         "series_types",
+        "related",
         "frequency",
         "horizon",
         "quantiles",
@@ -136,6 +139,8 @@ def document(resolution: Resolution) -> dict[str, Any]:
     if resolution.task == "forecast":
         predictor["frequency"] = resolution.frequency
         predictor["horizon"] = resolution.horizon
+        if resolution.related is not None:
+            predictor["related"] = list(resolution.related)
     if resolution.task != "classification":
         predictor["quantiles"] = list(resolution.quantiles)
     predictor["outputs"] = list(resolution.outputs)
@@ -266,10 +271,17 @@ def validate(value: Any) -> dict[str, Any]:
             "frequency" in predictor and "horizon" in predictor and "time" in predictor,
             "a forecaster's lock has time, frequency and horizon",
         )
+        related = predictor.get("related", [])
+        ensure(
+            type(related) is list
+            and set(related) <= set(predictor.get("series", []))
+            and len(set(related)) == len(related),
+            "`related` names series columns",
+        )
     else:
         ensure(
-            not {"frequency", "horizon", "series"} & predictor.keys(),
-            "only a forecaster's lock has frequency, horizon and series",
+            not {"frequency", "horizon", "series", "related"} & predictor.keys(),
+            "only a forecaster's lock has frequency, horizon, series and related",
         )
     ensure(
         ("quantiles" in predictor) == (task != "classification"),
@@ -425,6 +437,8 @@ def upgrade(value: Any) -> dict[str, Any]:
     if task == "forecast":
         predictor["frequency"] = source.get("frequency")
         predictor["horizon"] = source.get("horizon")
+        # Version 1 forecast every series of a predictor as one group.
+        predictor["related"] = []
         predictor["quantiles"] = list(source.get("quantiles") or (0.1, 0.5, 0.9))
         predictor["outputs"] = ["value", "quantiles"]
     elif task == "regression":
@@ -694,6 +708,7 @@ def resolution_of(value: dict[str, Any], spec: PredictorSpec | None) -> Resoluti
         time_type=predictor.get("time_type"),
         series=tuple(predictor.get("series", ())),
         series_types=tuple(predictor.get("series_types", ())),
+        related=tuple(predictor["related"]) if "related" in predictor else None,
         inputs=tuple((item["name"], item["type"]) for item in predictor["inputs"]),
         input_roles=tuple(item["role"] for item in predictor["inputs"]),
         inferred=MappingProxyType({}),

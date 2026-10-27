@@ -104,6 +104,7 @@ export interface Manifest {
   inputs?: string[] | Inputs;
   time?: string;
   series?: string[];
+  related?: "all" | string[];
   frequency?: string | number;
   horizon?: number;
   quantiles?: number[];
@@ -250,6 +251,7 @@ export interface Resolution {
   time_type?: Kind | null;
   series?: string[];
   series_types?: Array<Kind | null>;
+  related?: string[];
   frequency?: string | number;
   horizon?: number;
   quantiles?: number[];
@@ -875,8 +877,6 @@ export interface ContextSnapshot {
   event_before: number | null;
   rows: SnapshotRow[];
   source_wait_count: number;
-  pending_processing_count: number;
-  oldest_unprocessed_at: number | null;
 }
 
 export interface ContextSnapshotReply extends Envelope {

@@ -3,13 +3,14 @@
 
 """Physical schema inspection and explicit target, feature and time contracts."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import pyarrow as pa
 import pyarrow.compute as _compute
 
 from generalforecast.columns import DATETIME_PARTS
+from generalforecast.models.catalog import V1_POLICY
 from generalforecast.predictors import frequency as _frequency_module
 from generalforecast.predictors.models import ModelPin
 from generalforecast.predictors.runtime.plan import (
@@ -150,6 +151,68 @@ def series_times(spec: ExecutionPlan, table: pa.Table) -> dict[tuple, list]:
         )
         buckets.setdefault(key, []).append(row[spec.time])
     return buckets
+
+
+def series_groups(
+    spec: Any, identities: list[tuple]
+) -> tuple[list[int], list[tuple[int, ...]]]:
+    """Each series' group, and each group's series, by the plan's `related`.
+
+    With no `related`, each series is its own group. `related: all` makes
+    one group of every series; related series columns make a group of the
+    series that share their values. Groups and their series are in the
+    order the series first appear.
+
+    Raises:
+        PredictorError: `CapacityExceeded` for a group of more series than
+            `ServingPolicy.group_series`.
+    """
+    if spec.related is None:
+        return list(range(len(identities))), [
+            (index,) for index in range(len(identities))
+        ]
+    positions = [spec.series.index(column) for column in spec.related]
+    keys: dict[tuple, int] = {}
+    group_of = [
+        keys.setdefault(tuple(identity[at] for at in positions), len(keys))
+        for identity in identities
+    ]
+    groups: list[list[int]] = [[] for _ in keys]
+    for series, group in enumerate(group_of):
+        groups[group].append(series)
+    largest = max((len(members) for members in groups), default=0)
+    ensure(
+        largest <= V1_POLICY.group_series,
+        f"a related group holds {largest} series; at most "
+        f"{V1_POLICY.group_series} forecast together",
+        "CapacityExceeded",
+    )
+    return group_of, [tuple(members) for members in groups]
+
+
+def check_groups(spec: ExecutionPlan, table: pa.Table) -> None:
+    """Holds a forecaster's declared groups to their bounds: a size, one origin each.
+
+    Raises:
+        PredictorError: `CapacityExceeded` for a group past
+            `ServingPolicy.group_series`, or for related series whose last
+            times differ.
+    """
+    if spec.related is None:
+        return
+    assert spec.frequency is not None
+    times = series_times(spec, table)
+    identities = list(times)
+    _, groups = series_groups(spec, identities)
+    ends = [
+        max(_frequency_module.coordinate(value, spec.frequency) for value in times[key])
+        for key in identities
+    ]
+    for members in groups:
+        ensure(
+            len({ends[series] for series in members}) == 1,
+            "related series must share the same forecast origin",
+        )
 
 
 def observed_frequency(spec: ExecutionPlan, table: pa.Table) -> str | int | float:
@@ -370,6 +433,7 @@ def infer_schema(
         )
         if table is not None:
             cadence = observed_frequency(spec, table)
+            check_groups(replace(spec, frequency=cadence), table)
         else:
             ensure(
                 spec.frequency is not None,

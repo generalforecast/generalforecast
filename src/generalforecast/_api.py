@@ -441,6 +441,7 @@ class Manifest(Payload):
     inputs: tuple[str, ...] | Inputs | None = None
     time: str | None = None
     series: tuple[str, ...] | None = None
+    related: Literal["all"] | tuple[str, ...] | None = None
     frequency: str | float | None = None
     horizon: int | None = None
     quantiles: tuple[float, ...] | None = None
@@ -456,6 +457,7 @@ class Manifest(Payload):
         Field("inputs", "inputs", False, _union(_items(_text), _record(Inputs))),
         Field("time", "time", False, _text),
         Field("series", "series", False, _items(_text)),
+        Field("related", "related", False, _union(_literal("all"), _items(_text))),
         Field(
             "frequency",
             "frequency",
@@ -781,6 +783,7 @@ class Resolution(Payload):
     time_type: Kind | None = None
     series: tuple[str, ...] | None = None
     series_types: tuple[Kind | None, ...] | None = None
+    related: tuple[str, ...] | None = None
     frequency: str | float | None = None
     horizon: int | None = None
     quantiles: tuple[float, ...] | None = None
@@ -804,6 +807,7 @@ class Resolution(Payload):
             False,
             _items(_union(_decode_Kind, _null)),
         ),
+        Field("related", "related", False, _items(_text)),
         Field("frequency", "frequency", False, _union(_text, _number)),
         Field("horizon", "horizon", False, _integer),
         Field("quantiles", "quantiles", False, _items(_number)),
@@ -2762,8 +2766,6 @@ class ContextSnapshot(Payload):
     event_before: float | None
     rows: tuple[SnapshotRow, ...]
     source_wait_count: int
-    pending_processing_count: int
-    oldest_unprocessed_at: float | None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("project", "project", True, _decode_Name),
@@ -2775,13 +2777,6 @@ class ContextSnapshot(Payload):
         Field("event_before", "event_before", True, _union(_number, _null)),
         Field("rows", "rows", True, _items(_record(SnapshotRow))),
         Field("source_wait_count", "source_wait_count", True, _integer),
-        Field("pending_processing_count", "pending_processing_count", True, _integer),
-        Field(
-            "oldest_unprocessed_at",
-            "oldest_unprocessed_at",
-            True,
-            _union(_number, _null),
-        ),
     )
 
 

@@ -55,10 +55,17 @@ class ModelPin:
     estimators: int | None = None
 
     @property
+    def model(self) -> str:
+        """The catalog id, `general-forecast/<name>`; the repository may be upstream's."""
+        from generalforecast.models.catalog import ORGANIZATION
+
+        return f"{ORGANIZATION}/{self.name}"
+
+    @property
     def resolved(self) -> str:
         """A portable content-addressed model reference, never a moving alias."""
         return (
-            f"{self.repository}@{self.digest}"
+            f"{self.model}@{self.digest}"
             + (f"@{self.codes}" if self.codes is not None else "")
             + (f"*{self.estimators}" if self.estimators is not None else "")
         )
@@ -130,19 +137,22 @@ class ModelPin:
             "model revision must be an immutable upstream commit",
         )
         hash_value(value["digest"])
-        ensure(
-            type(value["files"]) is dict and bool(value["files"]),
-            "model requires artifact file hashes",
-        )
+        ensure(type(value["files"]) is dict, "model artifact files map paths to hashes")
         from generalforecast.predictors.files import relative
 
         for path, hashed in value["files"].items():
             relative(path)
             hash_value("sha256:" + hashed)
-        expected = digest(value["files"])
+        # One pin with `catalog.Artifact.digest`: the file manifest's digest,
+        # or the upstream commit's for a model published without file hashes.
+        expected = digest(
+            value["files"]
+            if value["files"]
+            else {"repository": value["repository"], "revision": value["revision"]}
+        )
         ensure(
             expected == value["digest"],
-            "model artifact digest does not match file manifest",
+            "model artifact digest does not match its pin",
             "ModelMismatch",
         )
         for key in ("tasks", "outputs", "input_types"):
@@ -234,11 +244,6 @@ def describe(requested: str) -> ModelPin:
         raise PredictorError(error.code, str(error)) from None
     if ref.custom:
         raise PredictorError("UnsupportedModel", custom_refused(ref.name))
-    ensure(
-        bool(ref.entry.artifact.files),
-        f"{ref.entry.name} has no pinned files to describe",
-        "ModelResolutionRequired",
-    )
     return project(ref.entry, ref, V1_POLICY)
 
 

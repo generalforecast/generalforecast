@@ -1847,8 +1847,6 @@ paths:
                       rows:
                         - {key: '1041', features: {spend: 82.5}, label: 0, feature_version: 3, label_version: 1, feature_accepted_at: 1761990000.0, label_accepted_at: 1762000000.0, event_at: null}
                       source_wait_count: 0
-                      pending_processing_count: 0
-                      oldest_unprocessed_at: null
 
   /v1/projects/{project}/sources:
     get:
@@ -3678,6 +3676,15 @@ components:
             - $ref: "#/components/schemas/Inputs"
         time: {type: string}
         series: {type: array, items: {type: string}}
+        related:
+          description: |
+            which series forecast jointly, at most 8 to a group: `all`, or the
+            series columns whose values name each group; every series forecasts
+            on its own when left out
+          oneOf:
+            - {type: string, enum: [all]}
+            - type: array
+              items: {type: string}
         frequency:
           oneOf:
             - {type: string, pattern: "^[1-9][0-9]*(s|min|h|d|w)$"}
@@ -3914,6 +3921,13 @@ components:
             oneOf:
               - $ref: "#/components/schemas/Kind"
               - type: "null"
+        related:
+          type: array
+          items: {type: string}
+          description: |
+            a forecaster's declared groups: empty for one group of every
+            series, else the series columns whose values name each group;
+            absent, every series forecasts on its own
         frequency: {type: [string, number]}
         horizon: {type: integer, minimum: 1}
         quantiles: {type: array, items: {type: number, exclusiveMinimum: 0, exclusiveMaximum: 1}}
@@ -4989,7 +5003,7 @@ components:
 
     ContextSnapshot:
       type: object
-      required: [project, context, target, features, through_sequence, knowledge_at, event_before, rows, source_wait_count, pending_processing_count, oldest_unprocessed_at]
+      required: [project, context, target, features, through_sequence, knowledge_at, event_before, rows, source_wait_count]
       additionalProperties: false
       properties:
         project: {$ref: "#/components/schemas/Name"}
@@ -5003,8 +5017,6 @@ components:
           type: array
           items: {$ref: "#/components/schemas/SnapshotRow"}
         source_wait_count: {type: integer, minimum: 0}
-        pending_processing_count: {type: integer, minimum: 0}
-        oldest_unprocessed_at: {type: [number, "null"]}
 
     ContextSnapshotReply:
       allOf:

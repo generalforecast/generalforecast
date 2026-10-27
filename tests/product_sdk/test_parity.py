@@ -43,7 +43,7 @@ def public(value: Any) -> dict[str, Any]:
 
 
 def clients() -> tuple[Client, AsyncClient]:
-    profile = Profile(URL, "test", environment="staging", runtime="local")
+    profile = Profile(URL, "test", environment="staging")
     return Client(profile=profile, api_key="fixture-key"), AsyncClient(
         profile=profile, api_key="fixture-key"
     )

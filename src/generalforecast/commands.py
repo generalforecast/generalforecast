@@ -100,7 +100,6 @@ def connection_for(args: argparse.Namespace) -> ConnectionSettings:
             server,
             project or "default",
             os.environ.get("GF_ENV", "production"),
-            os.environ.get("GF_RUNTIME"),
             key_env=None,
         )
         env = ENV_KEY if found.source == ENV_KEY else None

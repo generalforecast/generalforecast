@@ -26,11 +26,8 @@ use futures::FutureExt;
 use futures::future::{BoxFuture, Shared};
 use gf_core::catalog::{self, Surface};
 
-use gf_core::forecasting::KNOWN;
 use gf_core::node::Targets;
-use gf_core::request::{
-    self, ErrorDetail, Forecast, Inference, Label, Limits, Options, RequestError,
-};
+use gf_core::request::{self, ErrorDetail, Inference, Label, Limits, Options, RequestError};
 use serde::Deserialize;
 use serde::de::{self, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value, json};
@@ -349,11 +346,10 @@ pub struct Front {
     warm: OnceLock<Vec<Value>>,
 }
 
-/// A forecast predictor's context: its series aligned, and their forecast
-/// request parsed, once.
+/// A forecast predictor's context: its series aligned once, and checked as
+/// a forecast request of every series.
 struct SeriesBound {
     context: predictors::ForecastContext,
-    forecast: Forecast,
     rows: usize,
 }
 
@@ -1006,8 +1002,8 @@ impl Front {
         self.engine.get().ok_or_else(not_ready)
     }
 
-    /// Aligns a forecast predictor's context and parses its group's forecast
-    /// request, as `ForecastContext.build` does in process.
+    /// Aligns a forecast predictor's series and checks the forecast request
+    /// of every one of them, as `ForecastContext.build` does in process.
     fn bind_series(
         &self,
         served: &ServedModel,
@@ -1031,19 +1027,31 @@ impl Front {
             rows,
             frequency,
         )?;
-        let bytes = serde_json::to_vec(&context.request).map_err(|_| failed())?;
-        let options = Options {
-            surface: self.surface,
-            limits: Limits::Predictor,
-            levels: None,
-        };
-        let Inference::Forecast(parsed) = request::parse(&bytes, &options)? else {
+        let zeros: Map<String, Value> = forecast
+            .future_inputs
+            .iter()
+            .map(|name| (name.clone(), json!(vec![0.0; forecast.horizon])))
+            .collect();
+        let every = (0..context.identities.len())
+            .map(|series| (series, zeros.clone()))
+            .collect();
+        let bytes = serde_json::to_vec(&context.request(&every)).map_err(|_| failed())?;
+        let Inference::Forecast(_) = request::parse(&bytes, &self.predictor_options())? else {
             return Err(failed());
         };
         Ok(SeriesBound {
             context,
-            forecast: parsed,
             rows: rows.num_rows(),
         })
+    }
+
+    /// How a predictor's own forecast requests parse: under its lock's
+    /// bounds, not a Models API request's.
+    fn predictor_options(&self) -> Options<'_> {
+        Options {
+            surface: self.surface,
+            limits: Limits::Predictor,
+            levels: None,
+        }
     }
 }
