@@ -874,32 +874,26 @@ impl ServedPredictor {
             .collect()
     }
 
-    /// A column's type as the API names it: by the kind the lock declares,
-    /// else by its locked storage, else a number.
-    fn column_type(&self, name: &str) -> &'static str {
-        let declared = self.types.get(name).map(|kind| match kind.as_str() {
-            "category" => "category",
-            "text" => "text",
-            "timestamp" => "timestamp",
-            "bool" => "boolean",
-            _ => "number",
-        });
-        let stored = || {
-            self.schema
-                .columns
-                .iter()
-                .find(|column| column.name == name)
-                .map(
-                    |column| match (column.physical.as_str(), column.semantic.as_deref()) {
-                        (_, Some("category")) | ("string", _) => "category",
-                        ("boolean", _) => "boolean",
-                        ("date", _) => "date",
-                        ("timestamp", _) => "timestamp",
-                        _ => "number",
-                    },
-                )
-        };
-        declared.or_else(stored).unwrap_or("number")
+    /// A column's kind, in the one vocabulary `gf.lock` and the API's `Kind`
+    /// use: the kind the lock declares, else the kind its locked storage
+    /// holds, else null for a column a lock checked without rows never saw.
+    fn column_type(&self, name: &str) -> Option<&str> {
+        if let Some(kind) = self.types.get(name) {
+            return Some(kind.as_str());
+        }
+        self.schema
+            .columns
+            .iter()
+            .find(|column| column.name == name)
+            .map(
+                |column| match (column.physical.as_str(), column.semantic.as_deref()) {
+                    (_, Some("category")) | ("string", _) => "category",
+                    ("boolean", _) => "bool",
+                    ("date" | "timestamp", _) => "timestamp",
+                    ("int64", _) => "int",
+                    _ => "float",
+                },
+            )
     }
 
     /// Whether each request names its own features and target, because the

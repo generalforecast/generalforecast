@@ -104,7 +104,11 @@ class Series:
             for index in whole.get(item, []) + cached.get(item, []):
                 forecast = forecasts[index]
                 row = forecast.target * (1 + features)
-                results[index] = outputs[row, : forecast.horizon]
+                # Quantile levels ascend, so their values must too: a model
+                # whose heads cross is rearranged (sorted per step), which
+                # never raises any level's pinball loss. Every path, in
+                # process, gf serve and hosted, forecasts through here.
+                results[index] = np.sort(outputs[row, : forecast.horizon], axis=-1)
 
         self._forecast_whole(units, forecasts, groups, whole, keep)
         self._decode_series(units, cached, keep)

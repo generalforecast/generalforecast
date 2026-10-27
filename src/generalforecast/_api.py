@@ -996,6 +996,19 @@ class Artifact(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class ModelVariant(Payload):
+    """A catalog variant's ensemble, `@K` codes and `*N` estimators."""
+
+    codes: int
+    estimators: int
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("codes", "codes", True, _integer),
+        Field("estimators", "estimators", True, _integer),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class Capability(Payload):
     """The Capability schema."""
 
@@ -1034,11 +1047,13 @@ class Model(Payload):
     license: str
     runtime: Literal["cpu", "gpu"]
     artifact: Artifact
-    bounds: dict[str, int | float | None]
+    bounds: dict[str, tuple[float, ...] | int | float | None]
     capabilities: tuple[Capability, ...]
     limits: Limits
     warm_shapes: tuple[Shape, ...]
     artifact_verification: str | None = None
+    license_source: str | None = None
+    variant: ModelVariant | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("model", "model", True, _text),
@@ -1050,7 +1065,14 @@ class Model(Payload):
         Field("runtime", "runtime", True, _literal("cpu", "gpu")),
         Field("artifact", "artifact", True, _record(Artifact)),
         Field("artifact_verification", "artifact_verification", False, _text),
-        Field("bounds", "bounds", True, _mapping(_union(_integer, _number, _null))),
+        Field("license_source", "license_source", False, _text),
+        Field("variant", "variant", False, _record(ModelVariant)),
+        Field(
+            "bounds",
+            "bounds",
+            True,
+            _mapping(_union(_items(_number), _union(_integer, _number, _null))),
+        ),
         Field("capabilities", "capabilities", True, _items(_record(Capability))),
         Field("limits", "limits", True, _record(Limits)),
         Field("warm_shapes", "warm_shapes", True, _items(_record(Shape))),

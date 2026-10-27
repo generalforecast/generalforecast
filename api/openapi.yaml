@@ -198,11 +198,11 @@ paths:
         `context` and `queries` are required; `inputs`, `id`, `time`,
         `series`, `frequency`, `horizon`, `quantiles`, `outputs` and
         `selection` take the manifest's names and defaults. There is no `task`
-        (the model determines it) and no `options` object. Every limit error
-        carries `limit` and `actual` and names the model in `message`. A text
-        column where numbers are required names the column, for example
-        `column plan has text values; this route takes numeric inputs` with
-        `param: "inputs.plan"`.
+        (the model determines it) and no `options` object. The rows bind as a
+        request context's do, so text and category inputs are read as the
+        model reads them in process, and a forecaster's `inputs` may split
+        into `past` and `future`. Every limit error carries `limit` and
+        `actual` and names the model in `message`.
       parameters:
         - $ref: "#/components/parameters/project"
       requestBody:
@@ -268,20 +268,6 @@ paths:
                       - {spend: 95.0, churned: 0}
                     queries:
                       - {spend: 82.5}
-              text:
-                value:
-                  api_version: gf/v1
-                  project: acme
-                  request_id: r-4d5e6f708192a3b4c5d6e7f8091a2b3c
-                  resource: {kind: predictor, name: ad-hoc}
-                  payload:
-                    model: general-forecast/tabicl-v2-regressor
-                    target: spend
-                    context:
-                      - {plan: free, spend: 10.0}
-                      - {plan: pro, spend: 95.0}
-                    queries:
-                      - {plan: pro}
       responses:
         "200":
           description: one prediction per query, in query order
@@ -333,17 +319,6 @@ paths:
                       message: model tabicl-v2-classifier is not a catalog id
                       param: model
                       hint: use general-forecast/tabicl-v2-classifier
-                text:
-                  value:
-                    api_version: gf/v1
-                    project: acme
-                    request_id: r-4d5e6f708192a3b4c5d6e7f8091a2b3c
-                    resource: {kind: predictor, name: ad-hoc}
-                    error:
-                      code: ValidationError
-                      message: column plan has text values; this route takes numeric inputs
-                      param: inputs.plan
-                      hint: encode `plan` as numbers, or use general-forecast/tabicl-v2-classifier
                 capacity:
                   value:
                     api_version: gf/v1
@@ -3977,10 +3952,17 @@ components:
         runtime: {type: string, enum: [cpu, gpu]}
         artifact: {$ref: "#/components/schemas/Artifact"}
         artifact_verification: {type: string}
+        license_source: {type: string, description: where a forecaster's license is pinned}
+        variant: {$ref: "#/components/schemas/ModelVariant"}
         bounds:
           type: object
-          description: the model's own caps, before this server's limits
-          additionalProperties: {type: [integer, number, "null"]}
+          description: |
+            the model's own caps, before this server's limits; a forecaster's
+            `quantiles` lists the levels it outputs
+          additionalProperties:
+            oneOf:
+              - {type: array, items: {type: number}}
+              - {type: [integer, number, "null"]}
         capabilities:
           type: array
           items: {$ref: "#/components/schemas/Capability"}
@@ -3988,6 +3970,15 @@ components:
         warm_shapes:
           type: array
           items: {$ref: "#/components/schemas/Shape"}
+
+    ModelVariant:
+      type: object
+      description: a catalog variant's ensemble, `@K` codes and `*N` estimators
+      required: [codes, estimators]
+      additionalProperties: false
+      properties:
+        codes: {type: integer, minimum: 1}
+        estimators: {type: integer, minimum: 1}
 
     Artifact:
       type: object

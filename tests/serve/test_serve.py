@@ -225,14 +225,21 @@ def test_the_ad_hoc_route_predicts_and_names_what_it_refuses(server):
     ]:
         status, body = predict(url, adhoc_payload(**{field: value}))
         assert (status, body["error"]["param"]) == (422, field), body
+    # Text is a category, as in process; a column mixing it with numbers
+    # is refused by name.
+    status, body = predict(
+        url,
+        adhoc_payload(
+            context=[{"x": "low", "y": False}, {"x": "high", "y": True}],
+            queries=[{"id": "a", "x": "low"}],
+        ),
+    )
+    assert status == 200, body
     status, body = predict(
         url, adhoc_payload(context=[{"x": "low", "y": False}, {"x": 3.0, "y": True}])
     )
     assert status == 422
-    assert body["error"]["message"] == (
-        "column x has text values; this route takes numeric inputs"
-    )
-    assert body["error"]["param"] == "inputs.x"
+    assert body["error"]["message"].startswith('column "x"'), body
     status, body = predict(url, adhoc_payload(queries=[{"x": 1.5}] * 10_001))
     assert status == 422
     assert body["error"]["code"] == "CapacityExceeded"
@@ -401,7 +408,7 @@ def test_snapshot_predictor_binds_once_and_answers_predictions(predictor_dir):
         assert status == 200
         [described] = body["result"]["predictors"]
         assert described["name"] == "churn"
-        assert described["inputs"] == [{"name": "x", "type": "number", "role": "input"}]
+        assert described["inputs"] == [{"name": "x", "type": "float", "role": "input"}]
         assert described["environments"] == []
         assert described["model"].startswith(f"{MODEL}@sha256:")
         digest = lock_of(predictor_dir).data_digest

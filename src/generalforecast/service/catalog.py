@@ -166,8 +166,6 @@ class CatalogService:
                     "covariates": V1_POLICY.covariates,
                     "quantiles": list(entry.capability.quantiles),
                 },
-                "covariate_policy": "shared-within-query-group",
-                "time_axis": "all integer periods or all floating UTC seconds",
                 "capabilities": [
                     asdict(Capability(capability, "supported"))
                     for capability in (

@@ -576,16 +576,18 @@ async fn the_ad_hoc_route_refuses_bare_model_ids_and_retired_fields_by_name() {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{field}: {body}");
         assert_eq!(body["error"]["param"], field, "{body}");
     }
-    // A text column is named, with the rule.
+    // A column mixing text and numbers is named: text is a category, as
+    // in process, so its numbers cannot be read as one.
     let mut text = good.clone();
     text["context"][0]["x"] = json!("low");
     let (status, _, body) = call(&front, "POST", path, Some(&envelope("ad-hoc", &text)), &[]).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(
-        body["error"]["message"],
-        "column x has text values; this route takes numeric inputs"
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.starts_with("column \"x\"")),
+        "{body}"
     );
-    assert_eq!(body["error"]["param"], "inputs.x");
     // Too many queries carry the limit, what was sent, and the model.
     let policy = &gf_core::catalog::catalog().policy;
     let mut many = good.clone();
@@ -887,7 +889,7 @@ async fn snapshot_packages_bind_once_into_a_durable_table() {
     assert_eq!(described["target"], "y");
     assert_eq!(
         described["inputs"],
-        json!([{"name": "x", "type": "number", "role": "input"}])
+        json!([{"name": "x", "type": "float", "role": "input"}])
     );
     assert_eq!(described["environments"], json!([]));
     // The API's `Predictor` resource takes no field beyond its own.

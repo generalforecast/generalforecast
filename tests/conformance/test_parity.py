@@ -318,6 +318,17 @@ def _outputs(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return _records(frame[names].reset_index(drop=True))
 
 
+def _ascending(frame: pd.DataFrame) -> None:
+    """Every row's quantiles rise with their levels, as every path rearranges them."""
+    levels = sorted(
+        (float(column[2:]), column)
+        for column in frame.columns
+        if column.startswith("q_")
+    )
+    for row in frame[[column for _, column in levels]].itertuples(index=False):
+        assert list(row) == sorted(row), row
+
+
 def _cli(
     root: Path, queries: pa.Table, monkeypatch: Any, context: pa.Table | None = None
 ) -> pd.DataFrame:
@@ -418,6 +429,7 @@ def test_every_path_predicts_the_same_and_knows_the_same_lock(
 
     expected = _outputs(local)
     assert expected
+    _ascending(local)
     for name, frame in (
         ("cli", command),
         ("hosted", hosted_frame),

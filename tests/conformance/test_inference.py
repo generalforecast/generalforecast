@@ -57,8 +57,8 @@ def test_classifier_predictions_follow_query_order_with_ids_and_probabilities(se
 
 
 def test_ad_hoc_classifier_uses_only_the_listed_inputs(server):
-    # Numeric inputs: gf serve's ad hoc route takes no text inputs, so the
-    # unlisted text column `note` is one it would otherwise refuse.
+    # The unlisted column `note` is left out: only `spend` and `seats` are
+    # inputs, so a query's `note` cannot change its prediction.
     context = [
         {
             "spend": float(i),
@@ -76,8 +76,17 @@ def test_ad_hoc_classifier_uses_only_the_listed_inputs(server):
         "queries": [{"spend": 4.0, "seats": 1, "note": "x"}],
     }
     result = scored(server, "/predict", "ad-hoc", payload)
-    assert (result["context"]["kind"], result["context"]["rows"]) == ("request", 12)
+    assert (result["context"]["source"], result["context"]["rows"]) == ("request", 12)
     [row] = result["predictions"]
+    noted = scored(
+        server,
+        "/predict",
+        "ad-hoc",
+        {**payload, "queries": [{"spend": 4.0, "seats": 1, "note": "other"}]},
+    )
+    [other] = noted["predictions"]
+    assert other["label"] == row["label"]
+    assert other["probabilities"] == pytest.approx(row["probabilities"], rel=1e-5)
     assert type(row["label"]) is bool and "id" not in row
     status, body = server.call(
         "POST",

@@ -51,17 +51,19 @@ use crate::upstream::Upstream;
 use arrow_array::RecordBatch;
 use gf_core::predictor;
 
+mod adhoc;
 mod incoming;
 mod keys;
 mod predictions;
 
+use adhoc::adhoc_predict_with;
 pub use incoming::{ambiguous, internal, owns};
 use incoming::{
     check_endpoint, check_headers, check_origin, environment, names_match, parse_envelope, resolve,
 };
 pub use keys::{Introspect, KeyStore, Principal, Static};
+use predictions::dispatch;
 pub(crate) use predictions::snapshot_rows;
-use predictions::{adhoc_predict_with, dispatch};
 
 /// The API version every envelope carries.
 pub const VERSION: &str = "gf/v1";
@@ -342,9 +344,9 @@ pub struct Front {
     upstream: Option<Upstream>,
     /// The deployed revisions predicted from, if any are.
     revisions: Option<Revisions>,
-    /// The shape buckets compiled at startup, which `GET models` reports as
-    /// `warm_shapes`.
-    warm: OnceLock<Vec<Value>>,
+    /// The shape buckets compiled at startup, by the model's resolved id,
+    /// which `GET models` reports as each model's `warm_shapes`.
+    warm: OnceLock<Vec<(String, Value)>>,
 }
 
 /// A forecast predictor's context: its series aligned once, and checked as
@@ -439,12 +441,14 @@ impl Front {
                     );
                     continue;
                 }
-                shapes.push(json!({
-                    "model": served.resolved,
-                    "context_rows": context_rows,
-                    "inputs": WARM_INPUTS,
-                    "queries": queries,
-                }));
+                shapes.push((
+                    served.resolved.clone(),
+                    json!({
+                        "context_rows": context_rows,
+                        "inputs": WARM_INPUTS,
+                        "queries": queries,
+                    }),
+                ));
             }
         }
         let count = shapes.len();
@@ -940,7 +944,15 @@ impl Front {
             "queries": policy.query_rows,
             "inputs": policy.features,
         });
-        description["warm_shapes"] = json!(self.warm.get().cloned().unwrap_or_default());
+        let warmed: Vec<&Value> = self
+            .warm
+            .get()
+            .into_iter()
+            .flatten()
+            .filter(|(model, _)| *model == served.resolved)
+            .map(|(_, shape)| shape)
+            .collect();
+        description["warm_shapes"] = json!(warmed);
         description
     }
 

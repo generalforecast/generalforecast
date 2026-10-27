@@ -136,16 +136,8 @@ pub(super) async fn dispatch(
                 None => Err(error),
             },
         },
-        Action::AdHoc => adhoc_predict(front, &payload, charge).await,
+        Action::AdHoc => adhoc_predict_with(front, front.engine()?, &payload, charge).await,
     }
-}
-
-fn forecasting_unserved() -> ApiError {
-    ApiError::new(
-        "ValidationError",
-        "this server answers tabular models; forecasters are served by the Python engine",
-        422,
-    )
 }
 
 /// Refuses the fields of `payload` named in `fields`, each with `reason`
@@ -184,7 +176,7 @@ const DECLARED: [&str; 9] = [
 /// `queries`, with `context` only when the lock says each request brings
 /// it, and `snapshot`'s rows when the lock pins them; what the lock
 /// declares is refused by name.
-fn declared_call(
+pub(super) fn declared_call(
     predictor: &ServedPredictor,
     payload: &Value,
     snapshot: impl FnOnce() -> Result<Value, ApiError>,
@@ -252,212 +244,16 @@ async fn predictor_predict(
         return Err(not_live(&served.name, predictor.context.kind()));
     }
     let call = declared_call(predictor, payload, || Ok(json!([])))?;
-    served_predict(front, served, predictor, &call, charge, false).await
-}
-
-/// The ad hoc route's body: a manifest fragment (`model`, `target`, and
-/// optionally `inputs`, `id`, `quantiles`, `outputs`; `selection` is refused) with the
-/// `context` and `queries` rows, for a catalog model served here.
-async fn adhoc_predict(front: &Front, payload: &Value, charge: Charge) -> Result<Value, ApiError> {
-    adhoc_predict_with(front, front.engine()?, payload, charge).await
-}
-
-pub(super) async fn adhoc_predict_with(
-    front: &Front,
-    engine: &Engine,
-    payload: &Value,
-    charge: Charge,
-) -> Result<Value, ApiError> {
-    refuse_fields(
-        payload,
-        &["task"],
-        "is not a field: the model determines the task",
-    )?;
-    refuse_fields(
-        payload,
-        &["options"],
-        "is not a field: id, quantiles and outputs are top-level fields",
-    )?;
-    refuse_fields(payload, &["features"], "is spelled inputs")?;
-    let body = fields(
-        payload,
-        &["model", "target", "context", "queries"],
-        &[
-            "inputs",
-            "id",
-            "time",
-            "series",
-            "frequency",
-            "horizon",
-            "quantiles",
-            "outputs",
-            "selection",
-        ],
-    )?;
-    let model = catalog::canonical(body["model"].as_str(), front.surface)?;
-    if model.entry.task == catalog::Task::Forecast {
-        return Err(forecasting_unserved());
-    }
-    let served = front.serving(&model)?;
-    let task = match model.entry.task {
-        catalog::Task::Classification => "classification",
-        _ => "regression",
-    };
-    for field in ["time", "series", "frequency", "horizon"] {
-        if body.contains_key(field) {
-            return Err(ApiError::validation(format!(
-                "{field} is a forecast field; {} is a {task} model",
-                model.canonical_id()
-            ))
-            .param(field));
-        }
-    }
-    if body.contains_key("selection") {
-        // A selection resolves against a model's row cap as `gf check`
-        // resolves it; this route binds every row, so it refuses one rather
-        // than drop it. A predictor's lock carries its resolved selection.
-        return Err(ApiError::validation(
-            "selection is resolved into a predictor's gf.lock; serve a predictor to select rows",
-        )
-        .param("selection"));
-    }
-    let target = &body["target"];
-    let target_name = target
-        .as_str()
-        .filter(|target| !target.is_empty())
-        .ok_or_else(|| ApiError::validation("target must name a column").param("target"))?;
-    let (Some(rows), Some(queries)) = (body["context"].as_array(), body["queries"].as_array())
-    else {
-        return Err(ApiError::validation(
-            "context and queries must be lists of rows",
-        ));
-    };
-    require(
-        rows.iter().chain(queries).all(Value::is_object),
-        "rows must be objects",
-    )?;
-    let id = match body.get("id") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(id)) => Some(id.as_str()),
-        Some(_) => return Err(ApiError::validation("id must name a column").param("id")),
-    };
-    let inputs: Vec<Value> = match body.get("inputs") {
-        None | Some(Value::Null) => rows
-            .first()
-            .and_then(Value::as_object)
-            .map(|row| {
-                row.keys()
-                    .filter(|column| column.as_str() != target_name && Some(column.as_str()) != id)
-                    .map(|column| json!(column))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        Some(Value::Array(inputs)) if inputs.iter().all(Value::is_string) => inputs.clone(),
-        Some(_) => {
-            return Err(
-                ApiError::validation("inputs must be a list of column names").param("inputs"),
-            );
-        }
-    };
-    if inputs.is_empty() {
-        return Err(ApiError::validation(
-            "no input columns: the context rows need a column besides the target",
-        )
-        .param("inputs"));
-    }
-    let features = &inputs;
-    let outputs: Vec<String> = match body.get("outputs") {
-        Some(Value::Array(outputs)) if !outputs.is_empty() => outputs
-            .iter()
-            .map(|output| output.as_str().map(str::to_string))
-            .collect::<Option<_>>()
-            .ok_or_else(|| ApiError::validation("model does not support requested outputs"))?,
-        Some(Value::Array(_)) | None => {
-            if task == "classification" {
-                vec!["label".into(), "probabilities".into()]
-            } else {
-                vec!["value".into()]
-            }
-        }
-        Some(_) => {
-            return Err(ApiError::validation(
-                "model does not support requested outputs",
-            ));
-        }
-    };
-    let unique: std::collections::HashSet<&String> = outputs.iter().collect();
-    require(
-        unique.len() == outputs.len()
-            && outputs.iter().all(|output| served.outputs.contains(output)),
-        "model does not support requested outputs",
-    )?;
-    let levels = body.get("quantiles");
-    require(
-        levels.is_none() || outputs.iter().any(|output| output == "quantiles"),
-        "quantiles require the quantiles output",
-    )?;
-    let select = |row: &Value| -> Value {
-        Value::Object(
-            features
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|feature| {
-                    (
-                        feature.to_string(),
-                        row.get(feature).cloned().unwrap_or(Value::Null),
-                    )
-                })
-                .collect(),
-        )
-    };
-    let context: Vec<Value> = rows
-        .iter()
-        .enumerate()
-        .filter(|(_, row)| row.get(target_name).is_some_and(|label| !label.is_null()))
-        .map(|(index, row)| json!({"key": index.to_string(), "features": select(row), "label": row[target_name]}))
-        .collect();
-    let keyed: Vec<Value> = queries
-        .iter()
-        .enumerate()
-        .map(|(index, row)| json!({"key": index.to_string(), "features": select(row)}))
-        .collect();
-    let mut request_options = Map::new();
-    if task == "regression" {
-        request_options.insert(
-            "quantiles".into(),
-            levels.cloned().unwrap_or_else(|| json!(DEFAULT_QUANTILES)),
-        );
-    }
-    let request = json!({
-        "model": body["model"],
-        "task": task,
-        "target": target,
-        "features": features,
-        "context": context,
-        "queries": keyed,
-        "options": request_options,
-    });
-    let bytes = serde_json::to_vec(&request)
-        .map_err(|_| ApiError::new("InternalError", "request failed safely", 500))?;
-    let Inference::Tabular(parsed) = request::parse(&bytes, &Options::request(front.surface))?
-    else {
-        return Err(forecasting_unserved());
-    };
-    let inferred = engine.tabular(&served.worker, &parsed, charge).await?;
-    let predictions = prediction_rows(
-        &parsed.classes,
-        &parsed.levels,
-        &inferred,
-        &outputs,
-        queries,
-        id,
-    )?;
-    Ok(prediction_result(
-        &served.resolved,
-        task,
-        &Used::request(parsed.usable_rows()),
-        predictions,
-    ))
+    served_predict(
+        front,
+        front.engine()?,
+        served,
+        predictor,
+        &call,
+        charge,
+        false,
+    )
+    .await
 }
 
 /// The `/predictions` rows: the id column, if every query has it, then
@@ -645,8 +441,9 @@ fn prediction_result(model: &str, task: &str, used: &Used, predictions: Vec<Valu
 /// own bound context.
 /// A request-context predictor's rows bind as `shared` says, which
 /// `RequestContext::shared` explains.
-async fn served_predict(
+pub(super) async fn served_predict(
     front: &Front,
+    engine: &Engine,
     served: &ServedModel,
     predictor: &ServedPredictor,
     payload: &Value,
@@ -674,7 +471,7 @@ async fn served_predict(
     )?;
     if let Some(forecast) = &predictor.forecast {
         return series_predict(
-            front, served, predictor, forecast, body, &features, queries, context, charge,
+            front, engine, served, predictor, forecast, body, &features, queries, context, charge,
         )
         .await;
     }
@@ -713,7 +510,7 @@ async fn served_predict(
             let encoded = bound
                 .encoder
                 .encode(&predictors::records(&predictor.schema.columns, queries)?)?;
-            let inferred = front.engine()?.predicted(bound, encoded).await?;
+            let inferred = engine.predicted(bound, encoded).await?;
             (
                 inferred,
                 bound.classes.clone(),
@@ -755,8 +552,7 @@ async fn served_predict(
                 predictor.strategy.as_ref(),
                 shared,
             )?;
-            let inferred = front
-                .engine()?
+            let inferred = engine
                 .ask(context, Asked::Rows(encoded), &fingerprint)
                 .await?;
             (inferred, bound.classes, Used::request(bound.rows))
@@ -798,6 +594,7 @@ pub(crate) fn snapshot_rows(predictor: &ServedPredictor) -> Result<RecordBatch, 
 #[allow(clippy::too_many_arguments)]
 async fn series_predict(
     front: &Front,
+    engine: &Engine,
     served: &ServedModel,
     predictor: &ServedPredictor,
     forecast: &ForecastPredictor,
@@ -886,10 +683,7 @@ async fn series_predict(
     let Inference::Forecast(parsed) = request::parse(&bytes, &front.predictor_options())? else {
         return Err(failed());
     };
-    let answers = front
-        .engine()?
-        .forecast_request(&served.worker, &parsed)
-        .await?;
+    let answers = engine.forecast_request(&served.worker, &parsed).await?;
     drop(charge);
     let invalid = || {
         ApiError::new(
@@ -1126,7 +920,16 @@ async fn native_predict(
     bound.snapshot = None;
     ephemeral.predictor = Some(bound.clone());
     let shared = predictor.context != ContextMode::Request;
-    let mut result = served_predict(front, &ephemeral, &bound, &call, charge, shared).await?;
+    let mut result = served_predict(
+        front,
+        front.engine()?,
+        &ephemeral,
+        &bound,
+        &call,
+        charge,
+        shared,
+    )
+    .await?;
     if predictor.context == ContextMode::Snapshot
         && let Some(captured) = captured
     {

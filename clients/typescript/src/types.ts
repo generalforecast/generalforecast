@@ -356,6 +356,12 @@ export interface Artifact {
   [key: string]: unknown;
 }
 
+/** a catalog variant's ensemble, `@K` codes and `*N` estimators */
+export interface ModelVariant {
+  codes: number;
+  estimators: number;
+}
+
 export interface Capability {
   name: string;
   state: "supported" | "unsupported" | "unconfigured";
@@ -378,7 +384,9 @@ export interface Model {
   runtime: "cpu" | "gpu";
   artifact: Artifact;
   artifact_verification?: string;
-  bounds: Record<string, number | number | null>;
+  license_source?: string;
+  variant?: ModelVariant;
+  bounds: Record<string, number[] | number | number | null>;
   capabilities: Capability[];
   limits: Limits;
   warm_shapes: Shape[];
