@@ -1,0 +1,21 @@
+{
+  "about": "Text in a date column and the days since 1970-01-01 it names, null for text a date column refuses: YYYY-MM-DD alone, as Python's cast of text to a date reads it. gf-server's iso_date reads each the same.",
+  "cases": [
+    ["2025-05-31", 20239],
+    ["1970-01-01", 0],
+    ["2024-02-29", 19782],
+    ["1969-12-31", -1],
+    ["2025-05-31T00:00:00", null],
+    ["2025-05-31T00:00:00.000", null],
+    ["2025-05-31T00:00:00Z", null],
+    ["2025-05-31T05:00:00", null],
+    ["2025-05-31T23:59:59+05:00", null],
+    ["2025-05-31 00:00", null],
+    ["2023-02-29", null],
+    ["2025-13-01", null],
+    ["2025-5-31", null],
+    ["20250531", null],
+    ["", null],
+    ["gold", null]
+  ]
+}

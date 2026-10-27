@@ -835,3 +835,20 @@ def test_iso_text_reads_as_gf_server_reads_it():
         except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
             read = None
         assert read == micros, text
+
+
+def test_date_text_reads_as_gf_server_reads_it():
+    from pathlib import Path
+
+    from generalforecast.predictors.runtime.context import conform
+
+    fixture = Path(__file__).resolve().parents[2] / "crates/gf-server/tests/fixtures"
+    cases = json.loads((fixture / "iso_dates.json").read_text())["cases"]
+    epoch = datetime.date(1970, 1, 1)
+    for text, days in cases:
+        read = conform(pa.chunked_array([[text]]), "date")
+        if days is None:
+            assert read is None, text
+        else:
+            assert read is not None, text
+            assert (read.to_pylist()[0] - epoch).days == days, text

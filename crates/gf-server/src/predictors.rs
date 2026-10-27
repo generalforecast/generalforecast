@@ -1039,6 +1039,7 @@ fn mistyped(name: &str, physical: &str, value: &Value) -> RequestError {
         "int64" => "whole numbers",
         "float64" => "numbers",
         "timestamp" => "ISO 8601 strings or whole microseconds since 1970 in UTC",
+        "date" => "dates written YYYY-MM-DD",
         _ => "strings",
     };
     RequestError::new(
@@ -1072,6 +1073,15 @@ fn typed<T>(
 /// the one Python's `_timestamps` reads.
 fn iso_time(text: &str) -> Option<(i64, bool)> {
     iso_micros(text, Grammar::Value)
+}
+
+/// A date cell's days since 1970-01-01: `YYYY-MM-DD` and nothing more, a
+/// date the calendar has, as Python's cast of text to a date reads it.
+fn iso_date(text: &str) -> Option<i64> {
+    (text.len() == 10)
+        .then(|| iso_time(text))
+        .flatten()
+        .map(|(micros, _)| micros.div_euclid(gf_core::civil::MICROS_PER_DAY))
 }
 
 /// Whether JSON values are all ISO 8601 times by `iso_time`, every one
@@ -1179,10 +1189,21 @@ pub fn records(columns: &[SchemaColumn], rows: &[Value]) -> Result<RecordBatch, 
                 )?)),
             ),
             "timestamp" => (DataType::Utf8, Arc::new(timestamps(name, &cells)?)),
-            "string" | "date" => (
+            "string" => (
                 DataType::Utf8,
                 Arc::new(StringArray::from(typed(name, physical, &cells, |value| {
                     value.as_str().map(str::to_string)
+                })?)),
+            ),
+            // A date is `YYYY-MM-DD` alone, as Python casts text to a date:
+            // no time of day and no offset (see `iso_date`).
+            "date" => (
+                DataType::Utf8,
+                Arc::new(StringArray::from(typed(name, physical, &cells, |value| {
+                    value
+                        .as_str()
+                        .filter(|text| iso_date(text).is_some())
+                        .map(str::to_string)
                 })?)),
             ),
             _ => {
@@ -1247,6 +1268,16 @@ mod tests {
         ])));
         assert!(!times(json!(["2025-01-01", "gold"])));
         assert!(!times(json!([])));
+    }
+
+    #[test]
+    fn date_text_reads_as_python_casts_it() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/iso_dates.json")).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let text = case[0].as_str().unwrap();
+            assert_eq!(super::iso_date(text), case[1].as_i64(), "{text:?}");
+        }
     }
 
     #[test]
