@@ -762,10 +762,11 @@ class SeriesTable(abc.ABC):
         self._names: dict[int, Any] = {}
 
     def known_series(self) -> list[Any]:
-        """The keys of every series this table has taken observations for, as given.
+        """The keys of the table's series as given, in the order it first saw them.
 
-        The table keeps the keys of the series written through it, in the order
-        it first saw them.
+        A table on a server keeps them with its observations, so a client that
+        opens the table later gets them too; this process's table keeps those
+        written through it.
         """
         return list(self._names.values())
 
@@ -777,17 +778,16 @@ class SeriesTable(abc.ABC):
             self._names.setdefault(digest, given)
         return digests
 
-    def _placed(self, rows: Any) -> tuple[np.ndarray, np.ndarray]:
-        """Each observation's time and row key, from a frame."""
+    def _placed(self, rows: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Each observation's time, row key and series key as given, from a frame."""
         (series, times), count = pick(rows, (self.series, self.time))
         stamps = _times(times, count, self.times)
         assert stamps is not None
         digests, keys = series_keys(series, stamps)
-        for digest, given in zip(
-            digests.tolist(), keys_of(series).given.tolist(), strict=True
-        ):
-            self._names.setdefault(digest, given)
-        return stamps, keys
+        given = keys_of(series).given
+        for digest, key in zip(digests.tolist(), given.tolist(), strict=True):
+            self._names.setdefault(digest, key)
+        return stamps, keys, given
 
     @contextlib.contextmanager
     def _naming(self) -> Iterator[None]:

@@ -659,6 +659,65 @@ def test_strings_booleans_and_times_are_coded_on_the_server(server: Server) -> N
     np.testing.assert_allclose(raw, expected, rtol=1e-5, atol=1e-5)
 
 
+def test_series_keys_are_kept_on_the_server_and_survive_a_restart(
+    server: Server,
+) -> None:
+    client = _connect(server)
+    settings: dict[str, Any] = {
+        "series": "item",
+        "time": "t",
+        "target": "units",
+        "step": 10,
+        "horizon": 3,
+    }
+    remote = client.create_series_table("named", model="tiny-forecaster", **settings)
+    times = list(range(100, 160, 10))
+    units = np.arange(6, dtype=np.float32)
+    assert remote.known_series() == []
+    remote.insert({"item": ["shoes"] * 6, "t": times, "units": units})
+    remote.insert(
+        {
+            "item": ["socks"] * 6 + ["shoes"],
+            "t": [*times, 160],
+            "units": [*units, 6.0],
+        }
+    )
+    # The server keeps each series' key with its observations, in the order
+    # it first saw them, and a client that connects later reads them.
+    assert remote.known_series() == ["shoes", "socks"]
+    assert _connect(server).series_table("named").known_series() == ["shoes", "socks"]
+    assert client._reply("named")["series_count"] == 2
+    expected = remote.forecast(["shoes", "socks"], before=160)
+    # Keys of every kind come back as they were given.
+    token = uuid.UUID(int=12345)
+    typed = client.create_series_table("typed", model="tiny-forecaster", **settings)
+    typed.insert({"item": [7, token, b"\x01", -3], "t": [100] * 4, "units": units[:4]})
+    assert typed.known_series() == [7, token, b"\x01", -3]
+
+    # The log carries the keys, through a compaction and a restart.
+    client._action("compact", {"table": "named"})
+    server.stop()
+    server.start()
+    reopened = _connect(server).series_table("named")
+    assert reopened.known_series() == ["shoes", "socks"]
+    np.testing.assert_allclose(
+        reopened.forecast(reopened.known_series(), before=160), expected, rtol=1e-5
+    )
+    assert _connect(server).series_table("typed").known_series() == [
+        7,
+        token,
+        b"\x01",
+        -3,
+    ]
+    # A truncated table holds no series, and a table of rows names none.
+    reopened.truncate()
+    assert reopened.known_series() == []
+    assert len(reopened) == 0
+    plain = _connect(server).create_table("plain", model="tiny", features=5, classes=3)
+    with pytest.raises(ValueError, match="holds rows, not series"):
+        plain._client._action("known_series", {"table": "plain"})
+
+
 def test_series_tables_forecast_on_a_server_as_locally(server: Server) -> None:
 
     settings: dict[str, Any] = {

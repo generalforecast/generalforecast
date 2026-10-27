@@ -314,11 +314,13 @@ def test_series_tables_open_and_attach_with_exists_open(catalog) -> None:
         again.insert(_observations("socks", 4, 2))
         forecast = again.forecast(["shoes", "socks"])
         assert forecast["item"].tolist() == ["shoes"] * 3 + ["socks"] * 3
-        with pytest.raises(InvalidInput) as unnamed:
-            again.forecast()
-        assert unnamed.value.message == (
-            "table reopened-series was opened, so name the series to forecast"
-        )
+        # The engine keeps the series' keys with their observations, so an
+        # opened table forecasts them all, in the order they were first inserted.
+        every = again.forecast()
+        assert every["item"].tolist() == ["shoes"] * 3 + ["socks"] * 3
+        pd.testing.assert_frame_equal(every, forecast)
+        fresh = engine.SeriesTable.open("reopened-series", download=False)
+        assert fresh.forecast()["item"].tolist() == ["shoes"] * 3 + ["socks"] * 3
         with pytest.raises(InvalidInput) as wrong:
             engine.Table.open("reopened-series", download=False)
         assert wrong.value.message == (

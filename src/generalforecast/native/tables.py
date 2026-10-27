@@ -1168,7 +1168,6 @@ class SeriesTable:
         self._exists = _exists(exists)
         self._table: _NativeSeriesTable | None = None
         self._times: str | None = None
-        self._attached = False
 
     @classmethod
     def open(cls, name: str, *, client: Any = None, download: bool = True) -> Self:
@@ -1176,9 +1175,9 @@ class SeriesTable:
 
         The schema, horizon and grouping come from the engine, as the table
         was made, so the table takes inserts and forecasts at once. Forecasts
-        report the model's own quantile levels. The engine keeps series by
-        digest, so an opened table does not know the keys of the series it
-        holds: `forecast` needs them named.
+        report the model's own quantile levels. The engine keeps the keys of
+        the series with their observations, so `forecast` without names
+        forecasts every series the table holds.
 
         Args:
             name: The table's name.
@@ -1255,10 +1254,9 @@ class SeriesTable:
         return True
 
     def _attach(self, handle: Any) -> None:
-        """Takes the engine's table as this one; its series stay unnamed."""
+        """Takes the engine's table as this one."""
         self._table = handle
         self._times = handle.definition.times
-        self._attached = True
 
     def __repr__(self) -> str:  # noqa: D105
         return (
@@ -1384,12 +1382,6 @@ class SeriesTable:
 
     def _all_series(self) -> list[Any]:
         assert self._table is not None
-        if self._attached:
-            raise InvalidInput(
-                f"table {self.name} was opened, so name the series to forecast",
-                hint="the engine keeps series by digest, and an opened table "
-                "learns their keys only from the rows written through it",
-            )
         with boundary():
             keys = self._table.known_series()
         if not keys:
@@ -1425,7 +1417,6 @@ class SeriesTable:
             with boundary():
                 client.drop_table(self.name)
             self._table = None
-            self._attached = False
 
     def close(self) -> None:
         """Alias of `drop`."""
