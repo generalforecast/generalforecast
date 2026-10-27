@@ -45,7 +45,8 @@ export type ManifestFragment = Omit<Manifest, "context" | "queries"> & {
 export interface PredictOptions {
   queries: Queries["queries"];
   context?: Queries["context"];
-  asOf?: string;
+  /** for a live context, the instant to read it as of: RFC 3339 text, epoch seconds or a Date */
+  asOf?: string | number | Date;
   /** the hosted environment whose revision scores the queries; `production` if left out */
   env?: string;
 }
@@ -68,6 +69,8 @@ export interface LabelOptions {
 /** An API error: the server's `error` object plus the request id from the envelope. */
 export class GFError extends Error {
   readonly code: ErrorCode;
+  /** the service's finer reason behind `code`, in snake case, such as `authorization_pending` */
+  readonly reason: string | undefined;
   readonly param: string | undefined;
   readonly hint: string | undefined;
   readonly limit: number | undefined;
@@ -79,6 +82,7 @@ export class GFError extends Error {
     super(error.message);
     this.name = "GFError";
     this.code = error.code;
+    this.reason = error.reason ?? undefined;
     this.param = error.param;
     this.hint = error.hint;
     this.limit = error.limit;
@@ -246,7 +250,9 @@ export class Predictors {
   async predict(name: string, options: PredictOptions): Promise<Result> {
     const payload: Queries = { queries: options.queries };
     if (options.context !== undefined) payload.context = options.context;
-    if (options.asOf !== undefined) payload.as_of = options.asOf;
+    if (options.asOf !== undefined) {
+      payload.as_of = options.asOf instanceof Date ? options.asOf.toISOString() : options.asOf;
+    }
     return this.client.call<Result>(
       ROUTES["predictors.predict"],
       { project: this.client.project, name },

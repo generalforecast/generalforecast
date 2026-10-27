@@ -5,6 +5,12 @@
 
 Every operation is defined once, in `generalforecast._operations`; this client
 runs its steps in the calling thread, and `AsyncClient` awaits the same steps.
+
+Public, and stable across releases: `Client`, `PartialWrite`, and the
+identity action table a hosted service must serve, `WORKSPACE_ACTIONS`
+(each action's method, path template and resource name) with
+`workspace_request`, which binds one action and its payload to the request
+`Client.identity.manage` sends.
 """
 
 import time
@@ -29,6 +35,7 @@ from generalforecast.contracts import (
     Revision,
 )
 from generalforecast.service.boundary import JsonObject, ResourceKind
+from generalforecast.service.contracts import require
 from generalforecast.service.interfaces import (
     AcceptedWrite,
     ContextSnapshot,
@@ -44,7 +51,7 @@ from generalforecast.service.sdk import (
     Snapshot,
     WriteReceipt,
 )
-from generalforecast.transport import Profile, Transport, connection
+from generalforecast.transport import ConnectionSettings, Profile, Transport
 
 __all__ = ["WORKSPACE_ACTIONS", "Client", "PartialWrite", "workspace_request"]
 
@@ -71,17 +78,34 @@ class Client:
         profile: str | Profile | None = None,
         config_path: str | Path | None = None,
         base_url: str | None = None,
+        settings: ConnectionSettings | None = None,
         **transport_options: Any,
     ) -> None:
-        """Resolves scoped GF_API_KEY/profile auth without persisting credentials.
+        """Resolves the connection as the CLI does, without persisting credentials.
 
-        base_url targets one endpoint, such as a local `gf serve`, with no
-        credential unless api_key is given; profiles and GF_* are not read.
+        A profile (named, GF_PROFILE, GF_TOKEN or a saved `default`), else
+        GF_URL or the hosted service with GF_API_KEY or the `gf login` key;
+        see `ConnectionSettings.resolve`. base_url targets one endpoint, such
+        as a local `gf serve`, with no credential unless api_key is given.
+        `settings` is a connection resolved already, such as the CLI's, in
+        place of the other connection arguments.
         """
-        self.profile, key = connection(
-            url, project, token, api_key, profile, config_path, base_url
+        if settings is None:
+            settings = ConnectionSettings.resolve(
+                url, project, token, api_key, profile, config_path, base_url=base_url
+            )
+        else:
+            require(
+                (url, project, token, api_key, profile, config_path, base_url)
+                == (None,) * 7,
+                "pass settings or connection arguments, not both",
+            )
+        self.profile = settings.profile
+        # None until the service says which project an unscoped key is for.
+        self.project: str | None = (
+            None if settings.project_from_key else settings.profile.project
         )
-        self.project = self.profile.project
+        key = settings.token
         self._transport = Transport(self.profile.url, token=key, **transport_options)
         self.contexts = Contexts(self)
         self.sources = Sources(self)
@@ -177,8 +201,9 @@ class Client:
         Every operation's calls go through here, so this one method sends
         each versioned request a client makes.
         """
+        project = self.project if self.project is not None else self._scope()
         prepared = ops.prepare(
-            self.project,
+            project,
             Call(method, path, kind, resource, payload, global_route, params, deadline),
         )
         value = self._transport.send(
@@ -226,11 +251,21 @@ class Client:
                 params=step.params,
                 deadline=step.deadline,
             )
-        prepared = ops.prepare(self.project, step)
+        project = self.project if self.project is not None else self._scope()
+        prepared = ops.prepare(project, step)
         value = self._transport.send(
             prepared.method, prepared.path, prepared.body, prepared.headers
         )
         return ops.answer(prepared, value)
+
+    def _scope(self) -> str:
+        """The project an unscoped key is for, asked of the service once."""
+        prepared = ops.prepare(ops.UNSCOPED, ops.KEY_SCOPE)
+        value = self._transport.send(
+            prepared.method, prepared.path, prepared.body, prepared.headers
+        )
+        self.project = ops.key_project(ops.answer(prepared, value))
+        return self.project
 
 
 class Listing:
@@ -347,6 +382,10 @@ class Models(Collection):
 
     kind: ResourceKind = "model"
     collection = "models"
+
+    def get(self, resource: str) -> Mapping[str, Any]:
+        """Gets one catalog model by its canonical id, `general-forecast/<name>`."""
+        return self.client._run(ops.model_got(resource))
 
 
 class Predictors(Collection):
