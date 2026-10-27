@@ -146,6 +146,105 @@ def masked_moments(
     return mean, jnp.sqrt(variance).astype(values.dtype)
 
 
+# Standardized values are clipped here, then soft-clipped this many deviations
+# from their mean; deviations below the epsilon are floored to it.
+CLIP = 100.0
+SIGMA = 4.0
+EPSILON = 1e-6
+
+
+class Standardizer(NamedTuple):
+    """Each column's standardization and soft bounds, as TabICL and Kumo Tabular fit them.
+
+    Values are centered and scaled, clipped to `CLIP`, and past a bound keep
+    only the logarithm of their size beyond it.
+
+    Attributes:
+        center: Each column's mean.
+        center_low: What rounding the mean to the values' dtype left out, so
+            values near it center as a float64 mean centers them.
+        scale: Each column's deviation plus `EPSILON`.
+        lower: Each standardized column's lower soft bound.
+        upper: Each standardized column's upper soft bound.
+    """
+
+    center: Array
+    center_low: Array
+    scale: Array
+    lower: Array
+    upper: Array
+
+
+def standardize(
+    standardizer: Standardizer, values: Float[Array, " rows features"]
+) -> Float[Array, " rows features"]:
+    """Centers and scales values, clipped to `CLIP`; NaN stays NaN."""
+    return _standardized(
+        values, standardizer.center, standardizer.center_low, standardizer.scale
+    )
+
+
+def _standardized(values: Array, center: Array, low: Array, scale: Array) -> Array:
+    return jnp.clip(((values - center) - low) / scale, -CLIP, CLIP)
+
+
+def soft_clip(
+    standardizer: Standardizer, standardized: Float[Array, " rows features"]
+) -> Float[Array, " rows features"]:
+    """Standardized values past a bound keep only the logarithm of their size beyond it."""
+    magnitude = jnp.log1p(jnp.abs(standardized))
+    clipped = jnp.maximum(standardizer.lower - magnitude, standardized)
+    return jnp.minimum(standardizer.upper + magnitude, clipped)
+
+
+def fit_standardizer(
+    values: Float[Array, " rows features"],
+    present: Bool[Array, " rows features"],
+    counted: Bool[Array, " rows features"],
+    spread: Float[Array, " features"] | None = None,
+) -> Standardizer:
+    """Fits the standardization and the soft bounds, in two passes for the bounds.
+
+    The bounds are `SIGMA` deviations about the standardized values' mean,
+    fit again without the values past the first pass's; a column with none
+    inside keeps the first pass's.
+
+    Args:
+        values: Context columns.
+        present: Which values the center and deviation are of.
+        counted: Which standardized values the bounds are fit to; a value not
+            present among them counts as 0, as an imputed mean standardizes.
+        spread: What the deviation is multiplied by before `EPSILON` is added,
+            or None for 1.
+
+    Returns:
+        The standardizer.
+    """
+    stats = masked_stats(values, present)
+    deviation = stats.deviation if spread is None else stats.deviation * spread
+    scale = deviation + EPSILON
+    standardized = _standardized(values, stats.center, stats.center_low, scale)
+    standardized = jnp.where(present, standardized, 0)
+    mean, deviation = precise_moments(standardized, counted, ddof=1)
+    deviation = jnp.maximum(deviation, EPSILON)
+    inside = (
+        counted
+        & (standardized >= mean - SIGMA * deviation)
+        & (standardized <= mean + SIGMA * deviation)
+    )
+    kept_mean, kept_deviation = precise_moments(standardized, inside, ddof=1)
+    kept = inside.any(axis=0)
+    mean = jnp.where(kept, kept_mean, mean)
+    deviation = jnp.where(kept, jnp.maximum(kept_deviation, EPSILON), deviation)
+    return Standardizer(
+        stats.center,
+        stats.center_low,
+        scale,
+        mean - SIGMA * deviation,
+        mean + SIGMA * deviation,
+    )
+
+
 class Columns(NamedTuple):
     """The columns a model reads, first, then the ones it leaves out.
 
