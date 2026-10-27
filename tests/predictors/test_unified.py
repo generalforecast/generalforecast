@@ -852,3 +852,38 @@ def test_date_text_reads_as_gf_server_reads_it():
         else:
             assert read is not None, text
             assert (read.to_pylist()[0] - epoch).days == days, text
+
+
+def test_a_prepared_request_predictor_reads_its_context_as_every_path_does(
+    tmp_path, monkeypatch
+):
+    from generalforecast.predictors.runtime.requests import request_table
+
+    FakeEngine().install(monkeypatch)
+    root = directory(
+        tmp_path / "scorer",
+        pa.table(
+            {"x": [0.5, 1.5], "seen": ["2025-01-01T00:00:00Z"] * 2, "y": [1.0, 2.5]}
+        ),
+        context="request",
+        model="general-forecast/tabicl-v2-regressor",
+    )
+    lock = lock_of(root)
+    plan = compile_lock(lock, None)
+    prepared = PredictorExecutor().prepare(plan, None)
+    # JSON rows as a request carries them: whole numbers, ISO text and a
+    # row with no label, straight from request_table.
+    raw = request_table(
+        [
+            {"x": 1, "seen": "2025-01-01T00:00:00Z", "y": 1.0},
+            {"x": 2, "seen": "2025-01-02T00:00:00Z", "y": 3.0},
+            {"x": 3, "seen": "2025-01-03T00:00:00Z", "y": None},
+        ],
+        plan,
+        max_rows=100,
+    )
+    queries = pa.table({"x": [1.5], "seen": ["2025-01-04T00:00:00Z"]})
+    read = served_context(lock, raw)
+    assert prepared.predict(queries, context=raw).equals(
+        prepared.predict(queries, context=read)
+    )

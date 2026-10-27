@@ -153,6 +153,46 @@ def labeled(table: pa.Table, target: str) -> pa.Table:
     return table.filter(present)
 
 
+def plan_predictor(spec: Any) -> dict[str, Any]:
+    """An execution plan's lock `predictor` keys, as `served_context` reads them.
+
+    A compiled plan keeps what its lock said of its columns: the inputs in
+    order with their kinds and roles, the id, time and series with theirs,
+    the target's kind and the frequency.
+    """
+    kinds = dict(spec.inputs.types)
+    roles = dict(spec.role_types)
+    if spec.task == "forecast":
+        inputs = [
+            {"name": name, "type": kinds.get(name), "role": "future"}
+            if name in spec.future_inputs
+            else {"name": name, "type": kinds.get(name), "role": "past"}
+            for name in spec.forecast_inputs
+        ]
+    else:
+        inputs = [
+            {"name": name, "type": kinds.get(name), "role": "input"}
+            for name in spec.inputs.include or ()
+        ]
+    predictor: dict[str, Any] = {
+        "task": spec.task,
+        "target": spec.target,
+        "target_type": spec.target_type,
+        "inputs": inputs,
+        "context": {"kind": spec.context.mode},
+    }
+    for key in ("id", "time"):
+        if getattr(spec, key):
+            predictor[key] = getattr(spec, key)
+            predictor[f"{key}_type"] = roles.get(getattr(spec, key))
+    if spec.series:
+        predictor["series"] = list(spec.series)
+        predictor["series_types"] = [roles.get(column) for column in spec.series]
+    if spec.frequency is not None:
+        predictor["frequency"] = spec.frequency
+    return predictor
+
+
 def live_context(lock: Any, snapshot: Any) -> tuple[pa.Table, Any]:
     """A live context's rows as a predictor binds them, and the version they read.
 
@@ -308,6 +348,7 @@ __all__ = [
     "json_rows",
     "labeled",
     "live_context",
+    "plan_predictor",
     "project",
     "served_context",
     "snapshot_context",

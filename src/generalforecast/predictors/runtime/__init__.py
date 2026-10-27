@@ -17,6 +17,7 @@ import pyarrow as pa
 from generalforecast.engine import LocalEngine
 from generalforecast.models.catalog import ModelRef
 from generalforecast.predictors.runtime.compiled import CompiledPlan
+from generalforecast.predictors.runtime.context import plan_predictor, served_context
 from generalforecast.predictors.runtime.forecast import ForecastContext
 from generalforecast.predictors.runtime.schema import TableSchema
 from generalforecast.predictors.runtime.tabular import TabularContext
@@ -101,7 +102,14 @@ class PreparedPredictor(ResourceFree):
                     self.lock.spec.target is not None,
                     "schema-free request context requires explicit target binding",
                 )
-                bound, schema, rows = _bind(self.lock, self._model, context)
+                # The rows bind as served_context reads them on every path
+                # (kinds, whole-number widening, ISO times, unlabeled rows
+                # left out), whether or not the caller read them so first.
+                rows_read = served_context(
+                    {"predictor": plan_predictor(self.lock.spec)}, context
+                )
+                assert rows_read is not None
+                bound, schema, rows = _bind(self.lock, self._model, rows_read)
             else:
                 ensure(
                     context is None, "a bound predictor's context cannot be overridden"
