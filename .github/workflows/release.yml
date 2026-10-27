@@ -66,25 +66,13 @@ jobs:
       - if: runner.os == 'macOS'
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - if: runner.os == 'macOS'
-        run: |
-          cargo build --release --locked -p gf-cli --bin gf -p gf-server --bin gf-server -p gf-router --bin gf-router
-          mkdir -p wheel-data/scripts
-          cp target/release/gf wheel-data/scripts/gf-native
-          mkdir -p src/generalforecast/bin
-          cp target/release/gf-server target/release/gf-router src/generalforecast/bin/
-          sed -i '' 's/^# data = "wheel-data"/data = "wheel-data"/' pyproject.toml
+        run: scripts/stage_servers.sh
       - uses: PyO3/maturin-action@e83996d129638aa358a18fbd1dfb82f0b0fb5d3b # v1.51.0
         with:
           target: ${{ matrix.target }}
           manylinux: "2_28"
           args: --release --locked --out dist
-          before-script-linux: |
-            cargo build --release --locked -p gf-cli --bin gf -p gf-server --bin gf-server -p gf-router --bin gf-router
-            mkdir -p wheel-data/scripts
-            cp target/release/gf wheel-data/scripts/gf-native
-            mkdir -p src/generalforecast/bin
-            cp target/release/gf-server target/release/gf-router src/generalforecast/bin/
-            sed -i 's/^# data = "wheel-data"/data = "wheel-data"/' pyproject.toml
+          before-script-linux: scripts/stage_servers.sh
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: "0.8.0"
