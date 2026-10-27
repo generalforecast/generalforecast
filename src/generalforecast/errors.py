@@ -33,7 +33,8 @@ WIRE_ERROR_CODES = frozenset(
 )
 """The OpenAPI `ErrorCode` enum: the only codes a GF service puts on the wire."""
 
-# Codes that name their wire code whatever status they are raised with.
+# Codes that name their wire code whatever status they are raised with. This
+# is the services' wire contract: a change here changes what they send.
 _PUBLIC_BY_CODE: dict[str, str] = {
     **dict.fromkeys(
         (
@@ -47,9 +48,6 @@ _PUBLIC_BY_CODE: dict[str, str] = {
             "LinkConfirmationRequired",
             "WaitlistRequired",
             "CredentialInactive",
-            "CredentialUnavailable",
-            "CredentialsUnavailable",
-            "Unauthenticated",
             "AuthorizationPending",
         ),
         "Unauthorized",
@@ -63,14 +61,7 @@ _PUBLIC_BY_CODE: dict[str, str] = {
         ),
         "Conflict",
     ),
-    **dict.fromkeys(
-        (
-            "RateLimited",
-            "ContextCapacityExceeded",
-            "QueryCapacityExceeded",
-        ),
-        "CapacityExceeded",
-    ),
+    **dict.fromkeys(("RateLimited", "ContextCapacityExceeded"), "CapacityExceeded"),
     **dict.fromkeys(
         (
             "NotReady",
@@ -84,6 +75,22 @@ _PUBLIC_BY_CODE: dict[str, str] = {
         ),
         "ModelNotReady",
     ),
+    "InternalError": "Internal",
+}
+
+# Categories of codes raised on this side of the wire, which a service never
+# sends: an unreachable or silent service, a closed client, a model's own
+# fault, and the engine's refusals named by what they refuse. Every other
+# code takes its wire code's category.
+_LOCAL_CATEGORY: dict[str, str] = {
+    "TransportError": "Unavailable",
+    "Timeout": "Unavailable",
+    "ClientClosed": "InvalidInput",
+    "AmbiguousReference": "AmbiguousReference",
+    "ModelOutputError": "Internal",
+    "Unauthenticated": "Unauthorized",
+    "UnknownModel": "NotFound",
+    "QueryCapacityExceeded": "CapacityExceeded",
     **dict.fromkeys(
         (
             "InvalidInput",
@@ -98,21 +105,8 @@ _PUBLIC_BY_CODE: dict[str, str] = {
             "ContextRequired",
             "EmptyContext",
         ),
-        "ValidationError",
+        "InvalidInput",
     ),
-    "UnknownModel": "NotFound",
-    "InternalError": "Internal",
-}
-
-# Failures met on this side of the wire, whose category is not their wire
-# code's: an unreachable or silent service, a closed client, a model's own
-# fault. A service never sends these codes.
-_LOCAL_CATEGORY: dict[str, str] = {
-    "TransportError": "Unavailable",
-    "Timeout": "Unavailable",
-    "ClientClosed": "InvalidInput",
-    "AmbiguousReference": "AmbiguousReference",
-    "ModelOutputError": "Internal",
 }
 
 
@@ -133,7 +127,7 @@ def public_code(code: str, status: int | None) -> str:
         return "Unauthorized"
     if status == 409:
         return "Conflict"
-    if status in (413, 429):
+    if status == 429:
         return "CapacityExceeded"
     if status == 503:
         return "ModelNotReady"
@@ -412,6 +406,8 @@ def category(code: str, status: int | None = None) -> type[Error]:
         return _BY_NAME[local]
     if code in _BY_NAME:
         return _BY_NAME[code]
+    if status == 413:
+        return CapacityExceeded
     if status is None and not known_code(code) and not code.endswith("NotFound"):
         return InvalidInput
     return _BY_WIRE[public_code(code, status)]

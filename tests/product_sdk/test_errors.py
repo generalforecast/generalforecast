@@ -48,6 +48,22 @@ def test_a_service_error_is_the_error_of_the_category_its_code_names(
         raise error
 
 
+@pytest.mark.parametrize(
+    "code,status,wire",
+    [
+        ("CredentialUnavailable", 503, "ModelNotReady"),
+        ("Unauthenticated", 400, "ValidationError"),
+        ("InvalidPredictor", 503, "ModelNotReady"),
+        ("QueryCapacityExceeded", 413, "ValidationError"),
+        ("UnknownModel", 422, "ValidationError"),
+    ],
+)
+def test_sdk_categories_never_change_what_a_service_sends(code, status, wire):
+    # The SDK's own code names pick categories locally; the wire folding is
+    # the services' contract and stays as it was.
+    assert ServiceError(code, "message", status).public == wire
+
+
 def test_wire_form_and_reason_are_unchanged_for_services():
     folded = ServiceError("AuthorizationPending", "waiting for browser approval", 400)
     assert folded.public_body() == {
