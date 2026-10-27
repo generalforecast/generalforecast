@@ -9,7 +9,7 @@ boolean or datetime columns keeps them, with byte strings read as UTF-8 text: it
 kinds, as `generalforecast.columns.infer` reads them, and queries are frames like it. Each estimator holds one table: fitting again, `close`, or
 the estimator going away drops it. A fitted estimator keeps the rows it was fit
 on, so it pickles, as joblib's workers need, and makes its table again where it
-is unpickled. They need the `sklearn` extra: `pip install generalforecast[sklearn]`.
+is unpickled.
 """
 
 import contextlib
