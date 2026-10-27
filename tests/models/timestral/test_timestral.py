@@ -24,6 +24,7 @@ from generalforecast.models.timestral.model import (
     extend,
     timestral_functions,
 )
+from generalforecast.runtime.device import to_cache_dtype
 from tests.models.timestral.tiny import (
     BLOCK_SIZE,
     CONTEXT,
@@ -104,7 +105,7 @@ def test_decode_past_the_context_limit_forecasts_as_forecast_does(
     horizon = 4 * BLOCK_SIZE * PATCH + PATCH
     cache = encode(model, data)
     if paged:
-        # Read back from a bucket that the limit caps, as the worker stores it.
+        # Read back padded past its real patches, as the worker reads a bucket.
         cache = paged_series(cache, _grows(cache), CONTEXT // PATCH - patches + 1)
 
     np.testing.assert_allclose(
@@ -138,3 +139,12 @@ def test_paged_caches_of_different_lengths_decode_together_past_the_limit() -> N
             rtol=1e-5,
             atol=1e-5,
         )
+
+
+def test_a_reduced_precision_cache_keeps_the_context_values_exact() -> None:
+    cache = encode(tiny_timestral(), group(steps=4 * PATCH, horizon=PATCH, known=False))
+
+    stored = to_cache_dtype(cache, jnp.dtype("float16"))
+
+    assert stored.values.dtype == jnp.int32
+    np.testing.assert_array_equal(stored.values, cache.values)

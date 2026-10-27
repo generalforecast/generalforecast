@@ -164,7 +164,9 @@ class TimestralCache:
             observed ones and those after a row's first.
         values: The context's values as the network reads them, `(patches,
             rows, patch)`: the window `decode` runs whole once fed-back
-            medians would pass the context limit, as `forecast` does.
+            medians would pass the context limit, as `forecast` does. They
+            are kept as the bits of their float32 values, so a cache stored
+            in a reduced precision keeps them exact.
         observed: Which of `values` are observed.
         statistics: The context's running moments per row at its last step.
         lowest: The lowest observed value per row, or infinity for none.
@@ -182,7 +184,7 @@ class TimestralCache:
 
     time: tuple[AttentionCache, ...]
     valid: Bool[Array, " patches rows"]
-    values: Float[Array, " patches rows patch"]
+    values: Int[Array, " patches rows patch"]
     observed: Bool[Array, " patches rows patch"]
     statistics: Welford
     lowest: Float[Array, " rows"]
@@ -788,7 +790,9 @@ def _grow(
         jax.tree.map(lambda leaf: leaf.swapaxes(0, 1), layer) for layer in caches
     )
     last = jax.tree.map(lambda leaf: leaf[:, -1], running)
-    raw = _by_patch(model, values)
+    raw = jax.lax.bitcast_convert_type(
+        _by_patch(model, values.astype(jnp.float32)), jnp.int32
+    )
     seen = _by_patch(model, observed)
     if cache is None:
         lowest, highest, nonnegative = _range(values, observed)
@@ -910,7 +914,8 @@ def decode(
     real = real_patches(cache.time)
     stored = cache.valid.shape[0] * model.patch
     start = stored if real is None else real * model.patch
-    values, observed = _by_row(cache.values), _by_row(cache.observed)
+    values = jax.lax.bitcast_convert_type(_by_row(cache.values), jnp.float32)
+    observed = _by_row(cache.observed)
     blocks = []
     done = 0
     while done < horizon:
@@ -923,6 +928,9 @@ def decode(
             _window_block, model, cache, values, observed, start + done - limit, steps
         )
         # The fed-back medians pass the limit only if the stored patches would.
+        # A cache read back from slots says its real patches only when traced,
+        # so its groups choose apart; decoded together under `jax.vmap`, each
+        # such block runs both ways.
         if stored + done <= limit:
             quantiles = cached()
         elif real is None:
