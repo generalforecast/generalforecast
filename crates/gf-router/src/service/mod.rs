@@ -157,9 +157,11 @@ impl Router {
 
     /// Sets the client tokens, by digest, each reaching the tables its scope
     /// names, and their quotas, as at start and when the configuration is reloaded.
+    /// A token's bucket goes on from what it held, so a reload refills none.
     pub fn set_clients(&self, tokens: HashMap<[u8; 32], Scope>, quotas: Quotas) {
-        *self.clients.write().unwrap_or_else(PoisonError::into_inner) =
-            Arc::new(Clients { tokens, quotas });
+        let mut clients = self.clients.write().unwrap_or_else(PoisonError::into_inner);
+        let quotas = quotas.continuing(&clients.quotas);
+        *clients = Arc::new(Clients { tokens, quotas });
     }
 
     /// Promotes a replica once a primary has been out of reach for `after`,

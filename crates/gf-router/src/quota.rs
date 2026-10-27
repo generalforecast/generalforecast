@@ -65,6 +65,37 @@ impl Quotas {
         }
     }
 
+    /// These quotas, going on from the buckets `previous` holds for the
+    /// tokens both limit, as a reload of the configuration does: a bucket
+    /// keeps what it had, so a reload refills none, and holds no more than
+    /// its new burst.
+    #[must_use]
+    pub fn continuing(self, previous: &Self) -> Self {
+        let previous = previous
+            .buckets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let buckets = previous
+            .iter()
+            .filter_map(|(token, bucket)| {
+                let &limit = self.limits.get(token)?;
+                let available = bucket.available.min(f64::from(limit.burst));
+                Some((
+                    *token,
+                    TokenBucket {
+                        limit,
+                        available,
+                        updated: bucket.updated,
+                    },
+                ))
+            })
+            .collect();
+        Self {
+            limits: self.limits,
+            buckets: Mutex::new(buckets),
+        }
+    }
+
     /// Counts a call against the quota of the token with this digest.
     ///
     /// # Errors
