@@ -5486,3 +5486,32 @@ fn a_table_says_how_many_row_ids_it_has_left_as_its_writes_count_them() {
     node.remove_table(table).unwrap();
     assert!(node.ids_left(table).is_err());
 }
+
+#[test]
+fn a_tables_row_id_cap_refuses_the_insert_past_it() {
+    use gf_core::table::ROW_IDS;
+    let mut node = node(64);
+    let table = table(&mut node, Strategy::Exact, 10);
+    node.set_row_ids(table, NonZeroU64::new(12).unwrap())
+        .unwrap();
+    assert_eq!(node.ids_left(table).unwrap(), 2);
+    let (_, features, targets) = rows(3);
+    let refused = node
+        .insert(table, &[100, 101, 102], &features, targets)
+        .unwrap_err();
+    assert!(
+        matches!(refused, NodeError::Table(TableError::Full)),
+        "{refused:?}"
+    );
+    assert_eq!(
+        node.len(table).unwrap(),
+        10,
+        "a refused insert changes nothing"
+    );
+    let (_, features, targets) = rows(2);
+    node.insert(table, &[100, 101], &features, targets).unwrap();
+    assert_eq!(node.ids_left(table).unwrap(), 0);
+    // No cap reaches past the most ids any table assigns.
+    node.set_row_ids(table, NonZeroU64::MAX).unwrap();
+    assert_eq!(node.ids_left(table).unwrap(), ROW_IDS - 12);
+}

@@ -16,11 +16,12 @@ impl TableState {
     /// How many more rows can be inserted, counting the dead ids a sparse
     /// table frees when it is renumbered before its next insert.
     pub(super) fn ids_left(&self) -> u64 {
-        if self.sparse() {
-            ROW_IDS - self.table.len()
+        let used = if self.sparse() {
+            self.table.len()
         } else {
-            self.table.ids_left()
-        }
+            self.table.ids_used()
+        };
+        self.row_ids.saturating_sub(used)
     }
 
     /// One row's features.

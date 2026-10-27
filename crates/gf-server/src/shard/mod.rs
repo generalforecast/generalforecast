@@ -2501,7 +2501,11 @@ impl Shard {
             .map(ToString::to_string)
             .unwrap_or_default();
         let sealer = Arc::new(RowSealer::new(&self.key, &definition.name, &creation));
+        let row_ids = definition.config().map_err(ServerError::Invalid)?.row_ids;
         let id = self.node.create_table_on_disk(spec, &rows, sealer)?;
+        if let Some(row_ids) = row_ids {
+            self.node.set_row_ids(id, row_ids)?;
+        }
         self.add_to_worker(id, definition).await?;
         Ok((id, outputs, levels))
     }
