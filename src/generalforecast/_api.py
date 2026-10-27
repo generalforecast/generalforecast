@@ -291,7 +291,8 @@ class ErrorCode(StrEnum):
 
     ValidationError 422, NotFound 404, Unauthorized 401, CapacityExceeded 422,
     ModelNotReady 503, Internal 500, Conflict 409 (a compare-and-swap on a stale
-    generation)
+    generation), Unsupported 501 (an operation this server does not offer, such as a
+    hosted route on gf serve)
     """
 
     ValidationError = "ValidationError"
@@ -301,6 +302,7 @@ class ErrorCode(StrEnum):
     ModelNotReady = "ModelNotReady"
     Internal = "Internal"
     Conflict = "Conflict"
+    Unsupported = "Unsupported"
 
 
 @dataclass(frozen=True, kw_only=True)

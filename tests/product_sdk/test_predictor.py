@@ -52,6 +52,7 @@ def test_top_level_exports_are_exactly_the_contract() -> None:
         "Internal",
         "Conflict",
         "Unavailable",
+        "Unsupported",
         "Client",
         "AsyncClient",
         "engine",

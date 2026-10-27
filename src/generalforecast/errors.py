@@ -6,7 +6,7 @@
 One hierarchy for the SDK, the clients, the CLI, the engine boundary and the
 services. Every error is an `Error` of one category: `InvalidInput`,
 `NotFound`, `Unauthorized`, `CapacityExceeded`, `ModelNotReady`, `Conflict`,
-`Internal`, `AmbiguousReference` or `Unavailable`. An error made from a code,
+`Internal`, `AmbiguousReference`, `Unavailable` or `Unsupported`. An error made from a code,
 such as `ServiceError("WriteConflict", ..., 409)`, takes the category its
 code and status name, so `except gf.Conflict` catches it whichever layer
 raised it. The HTTP error object (section 5 of the interface contract) maps
@@ -29,6 +29,7 @@ WIRE_ERROR_CODES = frozenset(
         "ModelNotReady",
         "Internal",
         "Conflict",
+        "Unsupported",
     ]
 )
 """The OpenAPI `ErrorCode` enum: the only codes a GF service puts on the wire."""
@@ -69,7 +70,6 @@ _PUBLIC_BY_CODE: dict[str, str] = {
             "RuntimeUnavailable",
             "ProviderUnavailable",
             "SingleWriterUnavailable",
-            "Timeout",
             "WaitTimeout",
             "PredictorTimeout",
         ),
@@ -129,7 +129,10 @@ def public_code(code: str, status: int | None) -> str:
         return "Conflict"
     if status == 429:
         return "CapacityExceeded"
-    if status == 503:
+    if status == 501:
+        return "Unsupported"
+    # A service that is down or answered too late: retry shortly.
+    if status in (503, 504):
         return "ModelNotReady"
     if status is not None and status >= 500:
         return "Internal"
@@ -387,6 +390,14 @@ class Unavailable(Error):
     _category = True
 
 
+class Unsupported(Error):
+    """An operation this server or platform does not offer, such as a hosted route on gf serve."""
+
+    code = "Unsupported"
+    default_status = 501
+    _category = True
+
+
 class Internal(Error):
     """Our fault; always carries a request id when it came from a server."""
 
@@ -403,6 +414,7 @@ _BY_WIRE: dict[str, type[Error]] = {
     "ModelNotReady": ModelNotReady,
     "Conflict": Conflict,
     "Internal": Internal,
+    "Unsupported": Unsupported,
 }
 _BY_NAME: dict[str, type[Error]] = {
     "InvalidInput": InvalidInput,
@@ -414,6 +426,8 @@ _BY_NAME: dict[str, type[Error]] = {
 
 def category(code: str, status: int | None = None) -> type[Error]:
     """The category of an error raised with `code` and `status`."""
+    if status == 501:
+        return Unsupported
     local = _LOCAL_CATEGORY.get(code)
     if local is not None:
         return _BY_NAME[local]
@@ -479,6 +493,7 @@ __all__ = [
     "NotFound",
     "Unauthorized",
     "Unavailable",
+    "Unsupported",
     "boundary",
     "category",
     "convert",

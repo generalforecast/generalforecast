@@ -3479,11 +3479,12 @@ components:
 
     ErrorCode:
       type: string
-      enum: [ValidationError, NotFound, Unauthorized, CapacityExceeded, ModelNotReady, Internal, Conflict]
+      enum: [ValidationError, NotFound, Unauthorized, CapacityExceeded, ModelNotReady, Internal, Conflict, Unsupported]
       description: |
         ValidationError 422, NotFound 404, Unauthorized 401, CapacityExceeded
         422, ModelNotReady 503, Internal 500, Conflict 409 (a compare-and-swap
-        on a stale generation)
+        on a stale generation), Unsupported 501 (an operation this server
+        does not offer, such as a hosted route on gf serve)
 
     Error:
       type: object

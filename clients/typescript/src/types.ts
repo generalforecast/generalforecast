@@ -35,9 +35,10 @@ export interface Envelope {
 /**
  * ValidationError 422, NotFound 404, Unauthorized 401, CapacityExceeded 422,
  * ModelNotReady 503, Internal 500, Conflict 409 (a compare-and-swap on a stale
- * generation)
+ * generation), Unsupported 501 (an operation this server does not offer, such as a
+ * hosted route on gf serve)
  */
-export const ERROR_CODES = ["ValidationError", "NotFound", "Unauthorized", "CapacityExceeded", "ModelNotReady", "Internal", "Conflict"] as const;
+export const ERROR_CODES = ["ValidationError", "NotFound", "Unauthorized", "CapacityExceeded", "ModelNotReady", "Internal", "Conflict", "Unsupported"] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 
 /**
