@@ -16,7 +16,6 @@ import stat
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import BinaryIO
 
 from generalforecast.service.contracts import ServiceError
 
@@ -151,42 +150,6 @@ def write_private(path: str | os.PathLike[str], data: bytes) -> None:
         raise
     finally:
         os.close(directory)
-
-
-@contextlib.contextmanager
-def open_private_exclusive(path: str | os.PathLike[str]) -> Iterator[BinaryIO]:
-    """Creates a new 0600 file; removes it if the caller's block fails."""
-    _supported()
-    target = Path(path)
-    directory = _directory(target)
-    try:
-        try:
-            fd = os.open(
-                target.name,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW | _CLOEXEC,
-                0o600,
-                dir_fd=directory,
-            )
-        except FileExistsError:
-            raise ServiceError("Conflict", "private file already exists", 409) from None
-        try:
-            with os.fdopen(fd, "wb") as output:
-                yield output
-                output.flush()
-                os.fsync(output.fileno())
-            os.fsync(directory)
-        except BaseException:
-            with contextlib.suppress(FileNotFoundError):
-                os.unlink(target.name, dir_fd=directory)
-            raise
-    finally:
-        os.close(directory)
-
-
-def create_private(path: str | os.PathLike[str], data: bytes) -> None:
-    """Creates path exclusively with mode 0600 and fsyncs the data."""
-    with open_private_exclusive(path) as output:
-        output.write(data)
 
 
 @contextlib.contextmanager

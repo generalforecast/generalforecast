@@ -30,14 +30,14 @@ from generalforecast.command_specs import (
     NAME_FIELDS,
     admin_action,
 )
-from generalforecast.credentials import CONNECTION, uses_profiles
+from generalforecast.credentials import CONNECTION
 from generalforecast.credentials import SEEN as _CREDENTIAL_VALUES
 from generalforecast.errors import InvalidInput
 from generalforecast.service.boundary import JsonObject
 from generalforecast.service.contracts import name
 from generalforecast.service.sdk import Snapshot
 from generalforecast.tabular import file_format, read_table, table_digest
-from generalforecast.transport import ConnectionSettings, Profile
+from generalforecast.transport import ConnectionSettings
 
 # The largest table a command reads from disk.
 MAX_DATA_BYTES = 128 * 1024 * 1024
@@ -76,51 +76,18 @@ def read_data(path: str, root: Path):
 
 
 def connection_for(args: argparse.Namespace) -> ConnectionSettings:
-    """GF_API_KEY or the `gf login` key for GF_URL (default: the hosted service).
+    """The connection the SDK resolves: a profile, else GF_URL with GF_API_KEY or the `gf login` key.
 
-    `GF_PROFILE`, `GF_TOKEN` or a saved default profile resolve through the
-    SDK's profile resolver instead.
+    See `ConnectionSettings.resolve`; the CLI records where it came from.
     """
-    from generalforecast.account import not_logged_in
-    from generalforecast.credentials import ENV_KEY, CredentialStore, server_url
-    from generalforecast.transport import credential
-
     CONNECTION.clear()
-    if not uses_profiles(args):
-        server = server_url()
-        found = CredentialStore().resolve(server)
-        if found is None:
-            raise not_logged_in()
-        CONNECTION.update(server=server, source=found.source)
-        project = os.environ.get("GF_PROJECT") or (
-            found.login.project if found.login else None
-        )
-        CONNECTION["project_pending"] = "" if project else "1"
-        profile = Profile(
-            server,
-            project or "default",
-            os.environ.get("GF_ENV", "production"),
-            key_env=None,
-        )
-        env = ENV_KEY if found.source == ENV_KEY else None
-        return ConnectionSettings(None, profile, env, credential(found.key, "API key"))
     settings = ConnectionSettings.resolve()
     CONNECTION.update(
         server=settings.profile.url,
-        source=settings.credential_env or "profile",
-        project_pending="",
+        source=settings.source or "profile",
+        project_pending="1" if settings.project_from_key else "",
     )
     return settings
-
-
-def _key_project(server: str, key: str) -> str:
-    """The project a bare GF_API_KEY is scoped to, asked of the server once."""
-    client = Client(profile=Profile(server, "local", key_env=None), token=key)
-    scoped = client.identity.manage("auth.status").get("key") or {}
-    project = scoped.get("project")
-    if not isinstance(project, str):
-        raise InvalidInput("set GF_PROJECT for this API key")
-    return project
 
 
 def client_for(
@@ -157,44 +124,12 @@ def client_for(
                 "cannot load the TLS configuration",
                 hint="check GF_TLS_CA and GF_TLS_IDENTITY",
             ) from None
-    if CONNECTION.get("project_pending") and token:
-        return _KeyScopedClient(
-            key=token,
-            profile=settings.profile,
-            token=token,
-            timeout=args.timeout,
-            tls_context=context,
-            **provider,
-        )
     return Client(
-        profile=settings.profile,
-        token=token,
+        settings=settings,
         timeout=args.timeout,
         tls_context=context,
         **provider,
     )
-
-
-class _KeyScopedClient(Client):
-    """A bare GF_API_KEY learns its project from the server on first use."""
-
-    def __init__(self, *args: Any, key: str, **kwargs: Any) -> None:
-        """Defers the project lookup so building a client never touches the network."""
-        self._key, self._project, self._ready = key, None, False
-        super().__init__(*args, **kwargs)
-        self._ready = True
-
-    @property
-    def project(self) -> str:
-        """The key's project, asked of the server once."""
-        if self._project is None:
-            self._project = _key_project(self.profile.url, self._key)
-        return self._project
-
-    @project.setter
-    def project(self, value: str) -> None:
-        if self._ready:
-            self._project = value
 
 
 def upload_snapshot(client: Client, table) -> dict:

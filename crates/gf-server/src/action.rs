@@ -395,14 +395,14 @@ fn body<'a, T: Deserialize<'a>>(action: &'a Action) -> Result<T, Status> {
         .map_err(|error| Status::invalid_argument(format!("bad {} body: {error}", action.r#type)))
 }
 
-/// Checks a client's id for a write: 1 to 64 characters.
+/// Checks a client's id for a write: 1 to 64 bytes of UTF-8.
 ///
 /// # Errors
 ///
 /// What is wrong with it.
 pub fn check_write_id(id: &str) -> Result<(), String> {
     if id.is_empty() || id.len() > WRITE_ID_BYTES {
-        return Err(format!("a write id is 1 to {WRITE_ID_BYTES} characters"));
+        return Err(format!("a write id is 1 to {WRITE_ID_BYTES} bytes"));
     }
     Ok(())
 }

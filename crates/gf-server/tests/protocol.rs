@@ -3,6 +3,8 @@
 
 //! Frames between the server and its workers, and strategy specs.
 
+mod common;
+
 use gf_core::planner::{Core, CoreKind, Recency, Strategy};
 use gf_server::protocol::{Frame, ModelProfile, StrategySpec, WorkerReply, outcome_from};
 use serde_json::json;
@@ -94,7 +96,7 @@ fn shared_frames_carry_their_buffers_in_a_file() {
         header: json!({"kind": "step"}),
         buffers: vec![vec![1, 2, 3], Vec::new(), vec![4, 5]],
     };
-    let path = std::env::temp_dir().join(format!("gf-test-{}.frame", std::process::id()));
+    let path = common::scratch("frame").join("shared.frame");
 
     let shared = frame.shared(&path).unwrap();
 

@@ -25,6 +25,7 @@ from generalforecast.errors import (
     NotFound,
     Unauthorized,
     Unavailable,
+    Unsupported,
 )
 
 if TYPE_CHECKING:
@@ -60,6 +61,7 @@ __all__ = [
     "Regressor",
     "Unauthorized",
     "Unavailable",
+    "Unsupported",
     "__version__",
     "engine",
     "errors",

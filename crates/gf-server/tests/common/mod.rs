@@ -79,14 +79,45 @@ pub fn fake_worker(mut stream: UnixStream) {
     });
 }
 
+/// The directories `scratch` made, which the process removes as it exits.
+static SCRATCH: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Removes every directory `scratch` made; run as the test process exits.
+extern "C" fn remove_scratch() {
+    let made = SCRATCH
+        .lock()
+        .map(|mut made| std::mem::take(&mut *made))
+        .unwrap_or_default();
+    for directory in made {
+        let _ = std::fs::remove_dir_all(directory);
+    }
+}
+
+/// A new directory under the system's temporary directory, named for
+/// `name`, this process and a count, and removed with everything in it as
+/// the test process exits, however its tests ended. Shards and files the
+/// tests leave running keep it until then.
+pub fn scratch(name: &str) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    static REGISTERED: std::sync::Once = std::sync::Once::new();
+    // SAFETY: atexit stores a function pointer, run once as the process exits.
+    REGISTERED.call_once(|| unsafe {
+        libc::atexit(remove_scratch);
+    });
+    let index = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!("gf-{name}-{}-{index}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    SCRATCH
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(directory.clone());
+    directory
+}
+
 /// A directory of its own for each shard a test starts.
 pub fn fresh_directory() -> std::path::PathBuf {
-    static SHARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let shard = SHARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let directory =
-        std::env::temp_dir().join(format!("gf-http-test-{}-{shard}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
-    directory
+    scratch("http-test")
 }
 
 pub async fn shard() -> mpsc::Sender<Command> {
@@ -97,7 +128,7 @@ pub async fn shard() -> mpsc::Sender<Command> {
 pub async fn shard_in(directory: std::path::PathBuf) -> mpsc::Sender<Command> {
     let (ours, theirs) = UnixStream::pair().unwrap();
     fake_worker(theirs);
-    let connection = WorkerConnection::fake(ours, vec!["tiny".to_string()]).unwrap();
+    let connection = WorkerConnection::fake(ours, vec!["tiny".to_string()]);
     shard_over(connection, directory).await
 }
 

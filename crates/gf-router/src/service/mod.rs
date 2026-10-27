@@ -97,6 +97,27 @@ const SHIP_TIMEOUT: Duration = Duration::from_secs(600);
 /// Tables a check repairs at once, so one slow shipment holds up no others.
 const REPAIRS: usize = 8;
 
+/// A table name held while it is made; the name's lock is forgotten once
+/// no create holds or waits for it.
+struct Creating {
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+    names: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    table: String,
+}
+
+impl Drop for Creating {
+    fn drop(&mut self) {
+        drop(self.held.take());
+        let mut names = self.names.lock().unwrap_or_else(PoisonError::into_inner);
+        if names
+            .get(&self.table)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            names.remove(&self.table);
+        }
+    }
+}
+
 /// The client tokens by digest, the tables each reaches, and their quotas.
 struct Clients {
     tokens: HashMap<[u8; 32], Scope>,
@@ -129,6 +150,9 @@ pub struct Router {
     /// it, with the copy of that partition it was read from: the strategy
     /// its predictions assemble by, and its route if it has one.
     definitions: Arc<Mutex<HashMap<String, (TableCopy, TableDefinition)>>>,
+    /// Per table name, held while it is made, so two creates of one name
+    /// through this router never both pass the check that it is free.
+    creating: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl Router {
@@ -151,6 +175,7 @@ impl Router {
                 quotas: Quotas::new(HashMap::new()),
             }))),
             definitions: Arc::default(),
+            creating: Arc::default(),
         }
     }
 
@@ -346,6 +371,23 @@ impl Router {
             .is_some_and(|lock| Arc::strong_count(lock) == 1)
         {
             lifecycles.remove(table);
+        }
+    }
+
+    /// Holds the name `table` while a create of it runs; another create of
+    /// the name waits for it, then finds the name taken or free.
+    async fn creating(&self, table: &str) -> Creating {
+        let lock = self
+            .creating
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(table.to_string())
+            .or_default()
+            .clone();
+        Creating {
+            held: Some(lock.lock_owned().await),
+            names: self.creating.clone(),
+            table: table.to_string(),
         }
     }
 

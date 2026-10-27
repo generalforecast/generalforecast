@@ -6,6 +6,9 @@
 //! looks at the configuration and reaches each node. People reach these
 //! through `gf admin router init`, `check` and `serve`.
 //!
+//! `run --parent-fd <N>`, or `GF_PARENT_FD=<N>`, stops the router once the
+//! process that started it is gone, as `gf_server::parent` describes.
+//!
 //! SIGHUP reloads the node list, the replica count, and the client tokens and
 //! quotas; tables move to match.
 
@@ -43,6 +46,13 @@ enum Subcommand {
         /// The configuration file.
         #[arg(long)]
         config: PathBuf,
+        /// An inherited file descriptor: the read end of a pipe whose write
+        /// end only the parent process holds. Once the parent exits, however
+        /// it dies, the router stops as on SIGTERM. The environment variable
+        /// GF_PARENT_FD names one when this flag does not; the flag wins if
+        /// both are given.
+        #[arg(long, value_name = "N")]
+        parent_fd: Option<i32>,
     },
     /// Writes a starter configuration for a router over a few nodes.
     Init {
@@ -181,7 +191,14 @@ async fn reload(router: Router, path: PathBuf, mut running: Config) {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     match Arguments::parse().command {
-        Subcommand::Run { config } => run(config).await,
+        Subcommand::Run { config, parent_fd } => {
+            // An fd that cannot be watched is a usage error, as clap's own are.
+            let parent = gf_server::parent::named(parent_fd).unwrap_or_else(|error| {
+                eprintln!("gf-router: {error}");
+                std::process::exit(2);
+            });
+            run(config, parent).await
+        }
         Subcommand::Init {
             path,
             listen,
@@ -335,7 +352,7 @@ async fn lease_report(node: &Node, config: &Config) -> Result<String, String> {
     }
 }
 
-async fn run(path: PathBuf) -> Result<(), Box<dyn Error>> {
+async fn run(path: PathBuf, parent: Option<std::os::fd::OwnedFd>) -> Result<(), Box<dyn Error>> {
     gf_server::trace::init_logging();
     gf_server::trace::abort_on_panic();
     let config = Config::load(&path)?;
@@ -410,17 +427,27 @@ async fn run(path: PathBuf) -> Result<(), Box<dyn Error>> {
     tracing::info!(%address, nodes = config.nodes.len(), replicas = config.replicas, "routing");
     server
         .add_service(router.into_server())
-        .serve_with_shutdown(address, shutdown())
+        .serve_with_shutdown(address, shutdown(parent))
         .await?;
     Ok(())
 }
 
-/// Resolves on Ctrl-C or SIGTERM.
-async fn shutdown() {
+/// Resolves on Ctrl-C or SIGTERM, or once the parent `parent` names is gone;
+/// see `gf_server::parent`.
+async fn shutdown(parent: Option<std::os::fd::OwnedFd>) {
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("signal handler");
+    let parent_gone = async move {
+        match parent {
+            Some(fd) => {
+                let _ = gf_server::parent::gone(fd).await;
+            }
+            None => std::future::pending().await,
+        }
+    };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
         _ = terminate.recv() => {}
+        () = parent_gone => {}
     }
 }

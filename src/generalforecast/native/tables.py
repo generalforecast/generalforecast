@@ -1048,12 +1048,24 @@ class Table(_Held[_NativeTable]):
         ids move past them, each move twice the last, until they are free.
         A router writes a partitioned table's partitions one after another,
         so a refusal there may follow rows already written, which ids moved
-        on would write twice; such a table refuses the rows instead.
+        on would write twice; such a table refuses the rows instead. A table
+        routed by a column takes no rows without ids at all: a row goes to
+        the partition its column names, which cannot tell that another
+        partition holds its id, so a taken id would be written twice.
 
         Raises:
-            InvalidInput: If the ids collide on a partitioned table, or no
-                free run of ids is left below the integers an id takes.
+            InvalidInput: If the table is routed, the ids collide on a
+                partitioned table, or no free run of ids is left below the
+                integers an id takes.
         """
+        if self.ops.partitions > 1 and self.ops.route_by is not None:
+            raise InvalidInput(
+                f"table {self.name} is routed by {self.ops.route_by['column']!r}, "
+                "so its rows need ids of their own",
+                because="each row goes to the partition its column names, which "
+                "cannot tell that another partition already holds the id it would take",
+                hint="give the rows an id column with Schema(id=...)",
+            )
         count = len(inputs)
         move = max(count, self._next_id, 1)
         while self._next_id + count <= _LAST_ID:

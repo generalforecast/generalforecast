@@ -266,12 +266,13 @@ def _queries(root: Path) -> pa.Table:
 
 def _request(root: Path) -> tuple[pa.Table, pa.Table]:
     """A request-context predictor's call: the labeled rows, and the rows to predict."""
-    import pyarrow.compute as pc
-
     document = yaml.safe_load((root / "gf.lock").read_text())["predictor"]
     rows = pq.read_table(root / "rows.parquet")
-    blank = pc.is_null(rows[document["target"]])
-    return rows.filter(pc.invert(blank)), rows.filter(blank)
+    blank = pa.array([value is None for value in rows[document["target"]].to_pylist()])
+    labeled = pa.array(
+        [value is not None for value in rows[document["target"]].to_pylist()]
+    )
+    return rows.filter(labeled), rows.filter(blank)
 
 
 def _records(frame: Any) -> list[dict[str, Any]]:

@@ -53,6 +53,7 @@ def test_top_level_exports_are_exactly_the_contract() -> None:
         "Internal",
         "Conflict",
         "Unavailable",
+        "Unsupported",
         "Client",
         "AsyncClient",
         "engine",
@@ -251,15 +252,12 @@ def test_requests_name_columns_and_classes_in_their_errors() -> None:
         and payload["id"] == "customer_id"
     )
     assert "task" not in payload and "options" not in payload
-    # as_of goes out in RFC 3339 UTC however it is given (contract C1).
-    naive = dt.datetime(2025, 1, 1)  # noqa: DTZ001 (a naive time is UTC)
-    for given in ("2025-01-01T01:00:00+01:00", 1735689600, naive):
+    # as_of goes on the wire as RFC 3339 UTC, whatever form it was given in.
+    for given in ("2025-01-01", "2025-01-01T02:00:00+02:00", 1735689600):
         assert PredictRequest.declared_payload([{"x": 1}], as_of=given) == {
             "queries": [{"x": 1}],
             "as_of": "2025-01-01T00:00:00Z",
         }
-    with pytest.raises(gf.InvalidInput):
-        PredictRequest.declared_payload([{"x": 1}], as_of="2025-01-01")
     with pytest.raises(gf.CapacityExceeded) as caught:
         PredictRequest.build(
             model=MODEL,
@@ -724,7 +722,6 @@ def test_served_predictions_echo_the_id_column(monkeypatch) -> None:
 
 
 def test_forecast_eval_scales_each_series_by_its_own_history(monkeypatch) -> None:
-    import datetime as dt
 
     import generalforecast.predictor as predictor_module
 

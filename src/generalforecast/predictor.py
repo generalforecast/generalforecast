@@ -333,9 +333,9 @@ class PredictRequest:
                     value if not hasattr(value, "isoformat") else value.isoformat()
                 )
         if self.as_of is not None:
-            from generalforecast.contracts import format_as_of, parse_as_of
+            from generalforecast import as_of as instants
 
-            payload["as_of"] = format_as_of(parse_as_of(self.as_of))
+            payload["as_of"] = instants.wire(self.as_of)
         if self.series:
             payload["series"] = list(self.series)
         if self.quantiles is not None:
@@ -355,10 +355,9 @@ class PredictRequest:
         if context is not None:
             payload["context"] = _records(tabular.frame(context))
         if as_of is not None:
-            from generalforecast.contracts import format_as_of, parse_as_of
+            from generalforecast import as_of as instants
 
-            # Checked here as every server checks it, and sent in RFC 3339.
-            payload["as_of"] = format_as_of(parse_as_of(as_of))
+            payload["as_of"] = instants.wire(as_of)
         return payload
 
 

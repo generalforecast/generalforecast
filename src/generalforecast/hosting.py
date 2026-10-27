@@ -62,7 +62,8 @@ Exports:
             and the decoder of current and stored forms).
         PredictionRequest, PredictionResult: a prediction call and reply.
         parse_as_of, format_as_of: `as_of` as requests carry it and replies
-            write it (contract C1).
+            write it (contract C1): `generalforecast.as_of.parse` and
+            `format`, the one reading gf serve, the SDK and gf-server share.
     Compiling and predicting
         compile_lock, CompiledPlan: a lock and its rows, compiled.
         served_context, live_context, bound_rows, json_rows: the rows a
@@ -101,6 +102,8 @@ recorded surface (`tests/conformance/test_hosting.py`) changes with it.
 import sys
 from typing import Any
 
+from generalforecast.as_of import format as format_as_of
+from generalforecast.as_of import parse as parse_as_of
 from generalforecast.contracts import (
     ContextImportRef,
     ContextVersion,
@@ -111,10 +114,8 @@ from generalforecast.contracts import (
     PromoteRequest,
     Revision,
     context_version,
-    format_as_of,
     lock_digest,
     lock_name,
-    parse_as_of,
     parse_lock,
 )
 from generalforecast.errors import Error

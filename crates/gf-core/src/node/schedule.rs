@@ -32,6 +32,8 @@ pub(super) fn schedule_table(
         fitted: state.fitted,
         horizon: state.horizon,
         fitted_latest: state.fitted_latest,
+        fitted_columns: state.fitted_columns.clone(),
+        changed: state.changed,
     });
     if state.fitted != Some(state.epoch) {
         state.horizon = wanted;
@@ -276,10 +278,16 @@ impl Node {
     /// whose requests would read what a step in flight encodes or fits waits
     /// for that step, since if it fails the worker never holds them.
     ///
+    /// A table whose planning fails, as when its rows cannot be read, has
+    /// every request it holds refused with that error, see `take_refused`,
+    /// and the step is planned again without it, so one table's failure
+    /// never fails another's requests nor comes back at every schedule.
+    ///
     /// # Errors
     ///
-    /// If the cache refuses an operation for a reason other than room. The
-    /// requests stay queued, and nothing of the step is left pinned or admitted.
+    /// If the cache refuses an operation for a reason other than room while
+    /// rebuilding regions, which no request asked for. The requests stay
+    /// queued, and nothing of the step is left pinned or admitted.
     pub fn schedule(&mut self) -> Result<Option<Step>, NodeError> {
         self.parts = PlanParts::new(self.parts.timed);
         let since = self.parts.start();
@@ -344,11 +352,25 @@ impl Node {
         let mut step = Step::default();
         let mut scheduled = Vec::new();
         let mut ledger = Ledger::default();
-        let planned = self.plan_step(&waiting, &mut step, &mut scheduled, &mut ledger, now);
+        let mut planning = None;
+        let planned = self.plan_step(
+            &waiting,
+            &mut step,
+            &mut scheduled,
+            &mut ledger,
+            now,
+            &mut planning,
+        );
         if let Err(error) = planned {
             let dropped = self.unwind(ledger, step);
             self.drops.extend(dropped);
-            return Err(error);
+            let Some(state) = planning.and_then(|id| self.tables.get_mut(&id)) else {
+                return Err(error);
+            };
+            let refused = state.take_requests();
+            self.refused
+                .extend(refused.into_iter().map(|request| (request, error)));
+            return self.schedule();
         }
         let Some(&first) = scheduled.first() else {
             return Ok(None);
@@ -614,7 +636,8 @@ impl Node {
             .collect()
     }
 
-    /// Adds each waiting table's requests to the step while the budget allows.
+    /// Adds each waiting table's requests to the step while the budget
+    /// allows; `planning` names the table an error is the planning of.
     pub(super) fn plan_step(
         &mut self,
         waiting: &[TableId],
@@ -622,10 +645,13 @@ impl Node {
         scheduled: &mut Vec<TableId>,
         ledger: &mut Ledger,
         now: Instant,
+        planning: &mut Option<TableId>,
     ) -> Result<(), NodeError> {
         let mut budget = self.budget();
         let slot_bytes = budget.slot_bytes;
         for &id in waiting {
+            // The table an error below is the planning of.
+            *planning = Some(id);
             // Planning costs time, so tables wait without it once the budget is
             // spent, or while a step in flight fits them.
             if (!scheduled.is_empty() && budget.spent()) || self.flight.fitting.contains(&id) {

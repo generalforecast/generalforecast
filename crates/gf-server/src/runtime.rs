@@ -194,6 +194,7 @@ pub async fn restore(
         let Some(replay) =
             setup::open_log(path, keys).map_err(|error| format!("{}: {error}", path.display()))?
         else {
+            set_aside_binding(path, bound);
             continue;
         };
         let definition = replay.definition().clone();
@@ -214,6 +215,7 @@ pub async fn restore(
             Ok(levels) => levels,
             Err(error) => {
                 tracing::error!(table = name.as_str(), "not serving a table: {error}");
+                set_aside_binding(path, bound);
                 continue;
             }
         };
@@ -242,6 +244,32 @@ pub async fn restore(
         }
     }
     Ok(placement)
+}
+
+/// Sets aside the log at `path` if it holds one of `bound`, the front's
+/// bindings, which did not restore: its rows are bound again from the
+/// predictor's snapshot, which the log in place would refuse. Any other
+/// table's log stays where it is, for an operator to look at.
+fn set_aside_binding(path: &Path, bound: Option<&HashMap<TableName, [u8; 32]>>) {
+    let binding = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| TableName::new(stem).ok())
+        .is_some_and(|name| bound.is_some_and(|bound| bound.contains_key(&name)));
+    if !binding || !path.exists() {
+        return;
+    }
+    match crate::wal::set_aside(path, "unrestorable") {
+        Ok(aside) => tracing::warn!(
+            log = %path.display(),
+            aside = %aside.display(),
+            "set aside a predictor's binding that did not restore; it is bound again"
+        ),
+        Err(error) => tracing::error!(
+            log = %path.display(),
+            "setting aside a predictor's binding that did not restore: {error}"
+        ),
+    }
 }
 
 /// Sends `shard` a command and waits for its answer.

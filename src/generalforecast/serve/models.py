@@ -258,6 +258,7 @@ def published_entry(plan: Any, *, snapshot: Path | None = None) -> dict[str, Any
     step when the lock declares it, and `calendar` a calendar frequency's
     alias (`MS`, `2QE`, `W-MON`), whose UTC periods gf-server counts;
     `related` the lock's declared groups, every series on its own when None.
+    `types` maps each column whose kind the lock records to that kind.
     """
     from generalforecast.predictors import frequency as _frequency
 
@@ -293,6 +294,19 @@ def published_entry(plan: Any, *, snapshot: Path | None = None) -> dict[str, Any
         inputs = list(spec.forecast_inputs)
     selection = spec.selection
     lock_digest = plan.lock_digest or plan.plan_digest
+    # The kinds the lock declares, by column, as `context.typed` reads a
+    # request context with them; gf-server types a context the lock holds
+    # no schema for by the same map.
+    types = {**dict(spec.inputs.types), **dict(spec.role_types)}
+    if spec.target_type is not None:
+        types[spec.target] = spec.target_type
+    if (
+        task == "forecast"
+        and spec.time is not None
+        and spec.time not in types
+        and isinstance(spec.frequency, str)
+    ):
+        types[spec.time] = "timestamp"
     return {
         "name": spec.name,
         "reference": str(ref),
@@ -327,5 +341,6 @@ def published_entry(plan: Any, *, snapshot: Path | None = None) -> dict[str, Any
             if selection is None or task == "forecast"
             else selection.strategy_spec(),
             "max_rows": spec.context.max_rows,
+            "types": types,
         },
     }

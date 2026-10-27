@@ -7,6 +7,13 @@ export const VERSION = "gf/v1";
 export type Name = string;
 
 /**
+ * a catalog model's name, its id without `general-forecast/`, such as
+ * `tabpfn-3.5-classifier`; unlike a chosen resource name it may start with a digit and
+ * hold dots
+ */
+export type ModelName = string;
+
+/**
  * a catalog model id, `general-forecast/<name>`, with an optional variant suffix
  * (`@4*2`) or digest pin (`@sha256:<digest>`)
  */
@@ -35,9 +42,10 @@ export interface Envelope {
 /**
  * ValidationError 422, NotFound 404, Unauthorized 401, CapacityExceeded 422,
  * ModelNotReady 503, Internal 500, Conflict 409 (a compare-and-swap on a stale
- * generation)
+ * generation), Unsupported 501 (an operation this server does not offer, such as a
+ * hosted route on gf serve)
  */
-export const ERROR_CODES = ["ValidationError", "NotFound", "Unauthorized", "CapacityExceeded", "ModelNotReady", "Internal", "Conflict"] as const;
+export const ERROR_CODES = ["ValidationError", "NotFound", "Unauthorized", "CapacityExceeded", "ModelNotReady", "Internal", "Conflict", "Unsupported"] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 
 /**
@@ -119,13 +127,21 @@ export interface ManifestRequest extends Envelope {
 }
 
 /**
+ * for a live context, score against the rows accepted at or before this instant: an RFC
+ * 3339 time (one with no offset is UTC), or a number of seconds since the epoch.
+ * Anything else is a `ValidationError` whose `param` is `as_of`. A snapshot or request
+ * context refuses it the same way.
+ */
+export type AsOfRequest = string | number;
+
+/**
  * the declared predictor payload; `context` only when the manifest declares `context:
  * {request: ...}`
  */
 export interface Queries {
   queries: Row[];
   context?: Row[];
-  as_of?: string;
+  as_of?: AsOfRequest;
 }
 
 export interface QueriesRequest extends Envelope {
@@ -134,12 +150,26 @@ export interface QueriesRequest extends Envelope {
 
 export type ContextKind = "snapshot" | "request" | "live";
 
-/** the context a prediction actually used */
+/**
+ * an instant as every reply carries it: an RFC 3339 UTC string such as
+ * `2026-10-27T08:00:00Z`, or null
+ */
+export type AsOf = string | null;
+
+/**
+ * the context a prediction actually used, the same shape from gf serve and the hosted
+ * platform. `source` is the context's kind; `name` names a live context; `version` is a
+ * live context's accepted sequence; `digest` is a snapshot's content digest; `rows`
+ * counts the rows read; `as_of` is the instant a live context was read as of. Each
+ * field a source does not have is null.
+ */
 export interface ContextInfo {
-  kind: ContextKind;
+  source: ContextKind;
+  name: Name | null;
+  version: number | null;
+  digest: Digest | null;
   rows: number;
-  digest?: Digest;
-  as_of?: string;
+  as_of: AsOf;
 }
 
 /**
@@ -159,8 +189,9 @@ export interface Result {
   model: ModelId;
   task: Task;
   context: ContextInfo;
-  revision?: number;
-  environment?: Name;
+  predictor?: Name | null;
+  revision?: number | null;
+  environment?: Name | null;
   predictions: Prediction[];
 }
 
@@ -181,11 +212,6 @@ export interface Shape {
   queries: number;
   inputs: number;
   classes?: number;
-}
-
-export interface Input {
-  name: string;
-  type: ColumnType;
 }
 
 /**
@@ -291,16 +317,17 @@ export interface Predictor {
   created_at?: number;
   latest_revision?: number | null;
   environments: Environment[];
+  lock_digest?: Digest;
   model?: ModelId;
   model_digest?: Digest;
   task?: Task;
   target?: string;
-  target_type?: ColumnType;
-  classes?: string[];
+  target_type?: Kind | null;
+  classes?: Array<string | number | boolean>;
   id?: string;
   time?: string;
   series?: string[];
-  inputs?: Input[];
+  inputs?: LockInput[];
   context?: ContextLock;
   selection?: ResolvedSelection;
   limits?: Limits;
@@ -627,7 +654,7 @@ export interface ServingContext {
   source: string;
   version: number | string | null;
   rows: number;
-  as_of: number | null;
+  as_of: AsOf;
   accepted_version: number | string | null;
   serving_version: number | string | null;
   freshness_lag_seconds: number | null;

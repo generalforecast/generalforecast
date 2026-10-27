@@ -35,6 +35,9 @@ from generalforecast.transport import HostedOnlyError, RelayedError, response_va
         ("TransportError", 503, gf.Unavailable),
         ("Timeout", 504, gf.Unavailable),
         ("ClientClosed", 400, gf.InvalidInput),
+        ("UnsupportedOperation", 501, gf.Unsupported),
+        ("UnsupportedCapability", 501, gf.Unsupported),
+        ("Unsupported", 501, gf.Unsupported),
     ],
 )
 def test_a_service_error_is_the_error_of_the_category_its_code_names(
@@ -191,3 +194,26 @@ def test_a_service_code_is_kept_as_raised_and_client_only_codes_are_not_believed
         response_value(200, b"<html>")
     assert (garbled.value.code, garbled.value.status) == ("ProtocolError", 502)
     assert isinstance(garbled.value, gf.Internal)
+
+
+def test_unsupported_operations_have_their_own_category_and_wire_code():
+    from generalforecast.transport import HostedOnlyError
+
+    hosted = HostedOnlyError("GET", "/v1/projects/p/keys")
+    assert isinstance(hosted, gf.Unsupported) and not isinstance(hosted, gf.Internal)
+    assert hosted.public == "Unsupported"
+    assert hosted.error() == {
+        "code": "Unsupported",
+        "message": hosted.message,
+        "reason": "unsupported_operation",
+    }
+    decoded = errors.from_wire({"code": "Unsupported", "message": "no"}, status=501)
+    assert type(decoded) is gf.Unsupported
+
+
+def test_timeout_has_one_meaning():
+    # A deadline that passed with no answer is Unavailable, raised by a client;
+    # a service's 504 folds to ModelNotReady by its status, not by that code.
+    timeout = ServiceError("Timeout", "request deadline exceeded", 504)
+    assert isinstance(timeout, gf.Unavailable) and timeout.public == "ModelNotReady"
+    assert "Timeout" not in errors._PUBLIC_BY_CODE
