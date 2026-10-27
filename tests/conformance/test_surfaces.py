@@ -13,14 +13,12 @@ tests use: gf-server's worker loads them by spec, and the in-process engine
 loads them under the same catalog references.
 """
 
-import atexit
 import json
 import math
 import os
 import shutil
 import socket
 import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -88,9 +86,9 @@ class Served:
     def __init__(
         self, binary: Path, target: str, *, metrics: str | None = None
     ) -> None:
-        # Removed in `stop`, and at exit should a test die first.
-        self.directory = Path(tempfile.mkdtemp(prefix="gf-conformance-"))
-        atexit.register(shutil.rmtree, self.directory, ignore_errors=True)
+        # As `gf serve` makes it: removed in `stop`, or once this process
+        # exits, however it exits.
+        self.directory, self._holder = listener.private_directory()
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(serve_models, "checkpoint", lambda *_, **__: None)
             model = serve_models.served(target, self.directory)
@@ -150,6 +148,7 @@ class Served:
             processes.stop(self.process, timeout=60)
         finally:
             shutil.rmtree(self.directory, ignore_errors=True)
+            os.close(self._holder)
 
 
 @pytest.fixture(scope="module")

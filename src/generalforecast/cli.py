@@ -278,7 +278,8 @@ def parser() -> _Parser:
             nargs="?",
             default=".",
             metavar=metavar,
-            help=what or "A predictor directory or a hosted name (default: .)",
+            help=what
+            or "A path to a predictor directory, or a hosted name (default: .)",
         )
 
     p = command("init")
@@ -393,8 +394,8 @@ def parser() -> _Parser:
     p = command("predict")
     reference(
         p,
-        what="A predictor directory, a served URL, a catalog model or a hosted name "
-        "(default: .)",
+        what="A path to a predictor directory, a served URL, a catalog model or a "
+        "hosted name (default: .)",
     )
     p.add_argument(
         "--queries", metavar="<FILE>", required=True, help="The rows to score"

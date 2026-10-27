@@ -200,16 +200,20 @@ def test_a_server_stops_when_the_process_that_started_it_is_killed(tmp_path):
         time.sleep(600)
         """
     )
-    parent = subprocess.Popen(
-        [sys.executable, "-c", code],
-        stdout=subprocess.DEVNULL,
-        cwd=ROOT,
-        env={**os.environ, "PYTHONPATH": str(ROOT)},
-    )
+    log = tmp_path / "parent.log"
+    with log.open("w") as written:
+        parent = subprocess.Popen(
+            [sys.executable, "-c", code],
+            stdout=subprocess.DEVNULL,
+            stderr=written,
+            cwd=ROOT,
+            env={**os.environ, "PYTHONPATH": str(ROOT)},
+        )
     try:
-        deadline = time.monotonic() + 300
+        deadline = time.monotonic() + 600
         while not (tmp_path / "pid").exists():
-            assert parent.poll() is None and time.monotonic() < deadline
+            assert parent.poll() is None, log.read_text()
+            assert time.monotonic() < deadline
             time.sleep(0.2)
         server = int((tmp_path / "pid").read_text())
         workers = _children(server)

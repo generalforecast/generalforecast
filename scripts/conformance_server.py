@@ -19,8 +19,9 @@ the server's.
 Once /readyz answers 200 it prints one JSON line, `{"url", "token",
 "project"}`, which `GF_CONFORMANCE_URL`, `GF_CONFORMANCE_TOKEN` and
 `GF_CONFORMANCE_PROJECT` take, and runs until it is signalled. Everything it
-wrote is in a temporary directory removed on exit, and the server's whole
-process group is killed with it.
+wrote is in a private directory `gf serve` would make, removed once this
+script exits however it exits, and the server, started as the tests start
+theirs, exits with it.
 
     python scripts/conformance_server.py [--binary target/debug/gf-server]
 """
@@ -30,11 +31,11 @@ import datetime
 import json
 import os
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -48,6 +49,7 @@ sys.path.insert(0, str(ROOT))
 
 from generalforecast.serve import listener
 from generalforecast.serve import models as serve_models
+from tests.utils import processes
 from tests.utils.locks import directory
 
 PROJECT = "local"
@@ -176,18 +178,6 @@ def binary(given: str | None) -> Path:
     return target / "debug" / "gf-server"
 
 
-def stop(process: subprocess.Popen[bytes]) -> None:
-    """Ends the server and its workers, which share its process group."""
-    if process.poll() is not None:
-        return
-    os.killpg(process.pid, signal.SIGTERM)
-    try:
-        process.wait(60)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-
-
 def main() -> None:
     """Serves the stack until signalled, then removes everything it made."""
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -197,8 +187,8 @@ def main() -> None:
     token = secrets.token_hex(16)
     # SIGTERM unwinds like Ctrl-C, so the cleanup below runs either way.
     signal.signal(signal.SIGTERM, signal.default_int_handler)
-    with tempfile.TemporaryDirectory(prefix="gf-conformance-") as name:
-        root = Path(name)
+    root, _ = listener.private_directory()
+    try:
         served = entries(root)
         (root / "models.json").write_text(json.dumps(served))
         url = f"http://127.0.0.1:{_port()}"
@@ -219,12 +209,11 @@ def main() -> None:
             PYTHONPATH=str(ROOT),
             **{listener.API_KEY_ENV: token},
         )
-        process = subprocess.Popen(
+        process = processes.start(
             [str(program), "run", "--config", str(config)],
             env=environment,
             # Its own JSON events go to stderr: stdout carries only the line above.
             stdout=sys.stderr,
-            start_new_session=True,
         )
         try:
             ready(url, process)
@@ -235,7 +224,9 @@ def main() -> None:
         except KeyboardInterrupt:
             pass
         finally:
-            stop(process)
+            processes.stop(process, timeout=60)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":
