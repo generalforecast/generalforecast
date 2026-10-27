@@ -13,8 +13,11 @@
 //! new row enters only if it hashes below the members of its stratum. Rows
 //! hash by key, not by row id, and rows at equal distances tie to the lower
 //! key, so which rows a plan picks does not depend on the order they were
-//! written in. The retrieval scaling that distances are measured in still
-//! does; see `regions`.
+//! written in. Two things still do: the retrieval scaling distances are
+//! measured in (see `regions`), and which of the rows at one time a recency
+//! window or `among` keeps, since rows at one time count as later by row id
+//! (see `TimeIndex::latest`). A renumbering gives rows their ids in key order,
+//! so copies built from one snapshot keep the same ones.
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -628,7 +631,19 @@ struct Builder<'a> {
     ranked: HashMap<u64, Ranking>,
 }
 
-impl Builder<'_> {
+impl<'a> Builder<'a> {
+    /// A builder of an empty plan against `snapshot`, with the caller's
+    /// ranking of its live rows if it keeps one.
+    fn new(snapshot: &'a Snapshot, ranking: Option<&'a Ranking>) -> Self {
+        Self {
+            snapshot,
+            plan: Plan::default(),
+            ids: HashMap::new(),
+            ranking,
+            ranked: HashMap::new(),
+        }
+    }
+
     /// The live rows ranked under `seed`: the caller's, or one made once.
     fn ranking(&mut self, live: &Context, seed: u64, keys: &dyn Keys) -> &Ranking {
         match self.ranking {
@@ -912,13 +927,7 @@ pub fn plan_with(
     }
     let snapshot = source.snapshot;
     let live = snapshot.rows();
-    let mut builder = Builder {
-        snapshot,
-        plan: Plan::default(),
-        ids: HashMap::new(),
-        ranking: source.ranking,
-        ranked: HashMap::new(),
-    };
+    let mut builder = Builder::new(snapshot, source.ranking);
     // Queries by window: those reading every live row, then each window in
     // turn, so nested windows grow one into the next.
     let mut groups: BTreeMap<Option<usize>, Vec<usize>> = BTreeMap::new();
@@ -1056,13 +1065,7 @@ pub fn draw_core(
 ) -> Result<Context, PlanError> {
     let live = source.snapshot.rows();
     let key = (allowed != &live).then(|| source.snapshot.fingerprint(allowed));
-    let mut builder = Builder {
-        snapshot: source.snapshot,
-        plan: Plan::default(),
-        ids: HashMap::new(),
-        ranking: source.ranking,
-        ranked: HashMap::new(),
-    };
+    let mut builder = Builder::new(source.snapshot, source.ranking);
     Ok(builder.core(core, &live, allowed, key, cores, source)?)
 }
 
@@ -1076,13 +1079,7 @@ pub fn draw_core(
 /// `PlanError::Given` if a query's context holds no live rows.
 pub fn plan_given(snapshot: &Snapshot, given: &[Context]) -> Result<Plan, PlanError> {
     let live = snapshot.rows();
-    let mut builder = Builder {
-        snapshot,
-        plan: Plan::default(),
-        ids: HashMap::new(),
-        ranking: None,
-        ranked: HashMap::new(),
-    };
+    let mut builder = Builder::new(snapshot, None);
     let mut planned = Vec::with_capacity(given.len());
     for rows in given {
         let rows = rows & &live;
