@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
 use crate::config::Config;
-use crate::wal::{self, EncryptionKey, Keys, Log, LogError, Replay, TableDefinition};
+use crate::definition::TableDefinition;
+use crate::wal::{self, EncryptionKey, Keys, Log, LogError, Replay};
 
 /// What a starter configuration says.
 pub struct Starter {
@@ -32,7 +33,19 @@ pub struct Starter {
 pub fn random_hex(bytes: usize) -> Result<String, String> {
     let mut buffer = vec![0u8; bytes];
     getrandom::fill(&mut buffer).map_err(|error| error.to_string())?;
-    Ok(buffer.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(hex(&buffer))
+}
+
+/// Bytes as lowercase hex.
+#[must_use]
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes
+        .iter()
+        .fold(String::with_capacity(bytes.len() * 2), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
 }
 
 /// Writes a file only its owner may read, as a configuration holding tokens is.

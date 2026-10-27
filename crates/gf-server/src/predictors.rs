@@ -18,6 +18,7 @@ use arrow_array::cast::AsArray;
 use arrow_array::types::{Float64Type, Int64Type, TimestampMillisecondType};
 use arrow_array::{
     ArrayRef, BooleanArray, Float64Array, Int64Array, RecordBatch, RecordBatchOptions, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow_cast::cast;
 use arrow_ipc::reader::StreamReader;
@@ -448,7 +449,12 @@ impl ForecastPredictor {
             .filter(|column| allowed.contains(&column.name.as_str()))
             .cloned()
             .collect();
-        records(&columns, queries).map_err(|_| refused("query physical type differs from lock"))
+        records(&columns, queries).map_err(|error| {
+            refused(&format!(
+                "query physical type differs from lock: {}",
+                error.message
+            ))
+        })
     }
 
     /// Places each query row on its series and horizon step, with the known
@@ -610,67 +616,137 @@ pub fn inferred(features: &[String], target: &str, rows: &[Value]) -> Schema {
     }
 }
 
-fn mistyped(name: &str, physical: &str) -> RequestError {
+/// Refuses a column whose row holds `value`, which its declared type does
+/// not take, naming both.
+fn mistyped(name: &str, physical: &str, value: &Value) -> RequestError {
+    let held = match value {
+        Value::Bool(_) => "a boolean",
+        Value::Number(number) if number.is_i64() || number.is_u64() => "a whole number",
+        Value::Number(_) => "a number with a fraction",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "an object",
+        Value::Null => "null",
+    };
+    let takes = match physical {
+        "boolean" => "true or false",
+        "int64" => "whole numbers",
+        "float64" => "numbers",
+        "timestamp" => "ISO 8601 strings or whole microseconds since 1970 in UTC",
+        _ => "strings",
+    };
     RequestError::new(
         "ValidationError",
-        format!("column {name:?} holds values that are not {physical}"),
+        format!(
+            "column {name:?} is declared {physical}, which takes {takes}, but a row holds {held}"
+        ),
         422,
     )
 }
 
+/// A column's cells, each its row's value or None where the row lacks it,
+/// as `read` takes them; the first a column's type does not take is refused.
+fn typed<T>(
+    name: &str,
+    physical: &str,
+    cells: &[Option<&Value>],
+    read: impl Fn(&Value) -> Option<T>,
+) -> Result<Vec<Option<T>>, RequestError> {
+    cells
+        .iter()
+        .map(|cell| {
+            cell.map(|value| read(value).ok_or_else(|| mistyped(name, physical, value)))
+                .transpose()
+        })
+        .collect()
+}
+
+/// A timestamp column's cells as ISO 8601 strings, the binder's datetime
+/// columns parse: strings as given, and whole numbers, which the declared
+/// type counts in microseconds since 1970 in UTC, written out.
+fn timestamps(name: &str, cells: &[Option<&Value>]) -> Result<StringArray, RequestError> {
+    let failed = |error: arrow_schema::ArrowError| {
+        RequestError::new(
+            "ValidationError",
+            format!("column {name:?} holds a time that cannot be written out: {error}"),
+            422,
+        )
+    };
+    let micros = TimestampMicrosecondArray::from(
+        cells
+            .iter()
+            .map(|cell| cell.and_then(Value::as_i64))
+            .collect::<Vec<_>>(),
+    )
+    .with_timezone("+00:00");
+    let written = cast(&micros, &DataType::Utf8).map_err(failed)?;
+    let written = written.as_string::<i32>();
+    cells
+        .iter()
+        .enumerate()
+        .map(|(row, cell)| match cell {
+            None => Ok(None),
+            Some(Value::String(text)) => Ok(Some(text.clone())),
+            Some(value) if value.as_i64().is_some() => Ok(Some(written.value(row).to_string())),
+            Some(value) => Err(mistyped(name, "timestamp", value)),
+        })
+        .collect()
+}
+
 /// JSON rows as Arrow columns of the schema's types, null where a row
 /// lacks the column; dates and timestamps stay ISO strings, which the
-/// binder's datetime columns parse.
+/// binder's datetime columns parse, and a timestamp may be given as the
+/// whole microseconds since 1970 its declared type counts.
 ///
 /// # Errors
 ///
-/// `ValidationError` for a value of another type than its column's, or a
-/// column of a type JSON does not carry.
+/// `ValidationError` naming the column, its declared type and what a row
+/// holds, for a value its type does not take, or a column of a type JSON
+/// does not carry.
 pub fn records(columns: &[SchemaColumn], rows: &[Value]) -> Result<RecordBatch, RequestError> {
     let mut fields = Vec::with_capacity(columns.len());
     let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
     for column in columns {
         let name = column.name.as_str();
         let physical = column.physical.as_str();
-        let cells = rows
+        let cells: Vec<Option<&Value>> = rows
             .iter()
-            .map(|row| row.get(name).filter(|value| !value.is_null()));
+            .map(|row| row.get(name).filter(|value| !value.is_null()))
+            .collect();
         let (data_type, array): (DataType, ArrayRef) = match physical {
             "boolean" => (
                 DataType::Boolean,
-                Arc::new(
-                    cells
-                        .map(|cell| cell.map(|value| value.as_bool().ok_or(())).transpose())
-                        .collect::<Result<BooleanArray, ()>>()
-                        .map_err(|()| mistyped(name, physical))?,
-                ),
+                Arc::new(BooleanArray::from(typed(
+                    name,
+                    physical,
+                    &cells,
+                    Value::as_bool,
+                )?)),
             ),
             "int64" => (
                 DataType::Int64,
-                Arc::new(
-                    cells
-                        .map(|cell| cell.map(|value| value.as_i64().ok_or(())).transpose())
-                        .collect::<Result<Int64Array, ()>>()
-                        .map_err(|()| mistyped(name, physical))?,
-                ),
+                Arc::new(Int64Array::from(typed(
+                    name,
+                    physical,
+                    &cells,
+                    Value::as_i64,
+                )?)),
             ),
             "float64" => (
                 DataType::Float64,
-                Arc::new(
-                    cells
-                        .map(|cell| cell.map(|value| value.as_f64().ok_or(())).transpose())
-                        .collect::<Result<Float64Array, ()>>()
-                        .map_err(|()| mistyped(name, physical))?,
-                ),
+                Arc::new(Float64Array::from(typed(
+                    name,
+                    physical,
+                    &cells,
+                    Value::as_f64,
+                )?)),
             ),
-            "string" | "date" | "timestamp" => (
+            "timestamp" => (DataType::Utf8, Arc::new(timestamps(name, &cells)?)),
+            "string" | "date" => (
                 DataType::Utf8,
-                Arc::new(
-                    cells
-                        .map(|cell| cell.map(|value| value.as_str().ok_or(())).transpose())
-                        .collect::<Result<StringArray, ()>>()
-                        .map_err(|()| mistyped(name, physical))?,
-                ),
+                Arc::new(StringArray::from(typed(name, physical, &cells, |value| {
+                    value.as_str().map(str::to_string)
+                })?)),
             ),
             _ => {
                 return Err(RequestError::new(

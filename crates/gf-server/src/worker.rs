@@ -61,20 +61,15 @@ impl Private {
     /// If the directory cannot be made.
     pub fn new(parent: &std::path::Path) -> std::io::Result<Self> {
         use std::os::unix::fs::DirBuilderExt;
-        let mut suffix = [0u8; 8];
-        getrandom::fill(&mut suffix).map_err(|error| std::io::Error::other(error.to_string()))?;
-        let suffix: String = suffix.iter().map(|byte| format!("{byte:02x}")).collect();
+        let suffix = crate::setup::random_hex(8).map_err(std::io::Error::other)?;
         let path = parent.join(format!("gf-{}-{suffix}", std::process::id()));
         std::fs::DirBuilder::new().mode(0o700).create(&path)?;
         Ok(Self(path))
     }
 
     /// Removes directories left under `parent` by servers that were killed
-    /// before they could, where the process table says which are gone.
+    /// before they could, those whose process is no longer running.
     pub fn remove_stale(parent: &std::path::Path) {
-        if !std::path::Path::new("/proc/self").exists() {
-            return;
-        }
         let Ok(entries) = std::fs::read_dir(parent) else {
             return;
         };
@@ -86,12 +81,15 @@ impl Private {
             let Some(pid) = rest
                 .split('-')
                 .next()
-                .and_then(|pid| pid.parse::<u32>().ok())
+                .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+                .filter(|&pid| pid > 0)
             else {
                 continue;
             };
-            if pid != std::process::id() && !std::path::Path::new(&format!("/proc/{pid}")).exists()
-            {
+            let stale = entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && u32::try_from(pid).is_ok_and(|pid| pid != std::process::id())
+                && !process_running(pid);
+            if stale {
                 tracing::info!(path = %entry.path().display(), "removing a stale worker directory");
                 let _ = std::fs::remove_dir_all(entry.path());
             }
@@ -899,6 +897,15 @@ impl WorkerConnection {
     pub async fn request(&mut self, frame: &Frame) -> Reply {
         self.pipeline.request(frame).await
     }
+}
+
+/// Whether process `pid` exists, as a signal to it that sends nothing
+/// finds: one another user runs counts, since it refuses the signal rather
+/// than lacking a process.
+fn process_running(pid: libc::pid_t) -> bool {
+    // SAFETY: signal 0 only checks the process exists, and touches no memory.
+    let found = unsafe { libc::kill(pid, 0) } == 0;
+    found || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 /// Sends SIGTERM to `child`; false if it has no process id, as after it exited.
