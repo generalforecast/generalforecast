@@ -75,6 +75,82 @@ def _batch_table(
     return pa.Table.from_batches(accepted, schema=schema)
 
 
+def _parquet_bounds(metadata: Any, *, max_rows: int, max_bytes: int) -> None:
+    """Holds a Parquet file's metadata to the budget before any page decodes.
+
+    Every count is the uploader's to write, so each is checked against the
+    others: the row groups' rows add up to the file's, and the column
+    chunks' uncompressed sizes, not a row group's optional total, bound the
+    bytes. Decoding then counts what each batch really holds.
+    """
+    rows = size = 0
+    for index in range(metadata.num_row_groups):
+        group = metadata.row_group(index)
+        ensure(group.num_rows >= 0, "invalid Parquet row group", "InvalidTable")
+        rows += group.num_rows
+        for column in range(group.num_columns):
+            chunk = group.column(column)
+            ensure(
+                chunk.total_uncompressed_size >= 0,
+                "invalid Parquet column chunk",
+                "InvalidTable",
+            )
+            size += chunk.total_uncompressed_size
+    ensure(
+        rows == metadata.num_rows and rows <= max_rows,
+        "source exceeds row limit"
+        if rows == metadata.num_rows
+        else "Parquet row counts disagree",
+        "CapacityExceeded" if rows == metadata.num_rows else "InvalidTable",
+    )
+    ensure(
+        size <= max_bytes,
+        "uncompressed Parquet source exceeds byte limit",
+        "CapacityExceeded",
+    )
+
+
+def _expanded_batches(
+    batches: Iterable[pa.RecordBatch],
+    schema: pa.Schema,
+    *,
+    max_rows: int,
+    max_bytes: int,
+) -> pa.Table:
+    """Batches with dictionary columns, costed as their values and then decoded.
+
+    Each batch's size counts every dictionary index at its value's length
+    before the batch is kept; the table comes back with plain columns.
+    """
+    rows = size = 0
+    accepted: list[pa.Table] = []
+    for batch in batches:
+        table = pa.Table.from_batches([batch])
+        rows += table.num_rows
+        size += _expanded_nbytes(table)
+        ensure(
+            rows <= max_rows and size <= max_bytes,
+            "decoded source exceeds row or byte limit",
+            "CapacityExceeded",
+        )
+        accepted.append(_plain(table))
+    if not accepted:
+        return schema.empty_table()
+    return pa.concat_tables(accepted)
+
+
+def _plain(table: pa.Table) -> pa.Table:
+    """The table with each dictionary column decoded to its value type."""
+    for index, field in enumerate(table.schema):
+        if pa.types.is_dictionary(field.type):
+            table = table.set_column(
+                index,
+                field.name,
+                table.column(index).cast(field.type.value_type),
+            )
+    return table
+
+
 def _expanded_nbytes(table: pa.Table) -> int:
     """The table's bytes once each dictionary column is replaced by its values.
 
@@ -353,25 +429,28 @@ def read_table(
             )
         elif format in ("parquet", "pq"):
             source = parquet.ParquetFile(stream)
-            ensure(
-                source.metadata.num_rows <= max_rows,
-                "source exceeds row limit",
-                "CapacityExceeded",
-            )
-            ensure(
-                sum(
-                    source.metadata.row_group(i).total_byte_size
-                    for i in range(source.metadata.num_row_groups)
+            _parquet_bounds(source.metadata, max_rows=max_rows, max_bytes=max_bytes)
+            schema = source.schema_arrow
+            # Text and binary columns stay dictionary-encoded until each
+            # batch's expanded size is costed, so a few bytes of dictionary
+            # never decode into more than the budget.
+            texts = [
+                field.name
+                for field in source.schema_arrow
+                if pa.types.is_string(field.type)
+                or pa.types.is_large_string(field.type)
+                or pa.types.is_binary(field.type)
+                or pa.types.is_large_binary(field.type)
+            ]
+            if texts:
+                source = parquet.ParquetFile(
+                    pa.BufferReader(data), read_dictionary=texts
                 )
-                <= max_bytes,
-                "uncompressed Parquet source exceeds byte limit",
-                "CapacityExceeded",
+            batches = source.iter_batches(
+                batch_size=min(max_rows, 4096), use_threads=False
             )
-            table = _batch_table(
-                source.iter_batches(batch_size=min(max_rows, 65536), use_threads=False),
-                source.schema_arrow,
-                max_rows=max_rows,
-                max_bytes=max_bytes,
+            table = _expanded_batches(
+                batches, schema, max_rows=max_rows, max_bytes=max_bytes
             )
         elif format in ("arrow", "ipc", "feather"):
             if format == "feather":

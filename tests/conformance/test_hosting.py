@@ -19,20 +19,17 @@ SOURCE = Path(__file__).resolve().parents[2] / "src" / "generalforecast"
 RECORDED = (
     "ALIASES",
     "AcceptedWrite",
+    "CONTEXT_ROWS_KEY",
     "Capability",
     "CatalogService",
     "CompiledPlan",
     "ContextImportRef",
-    "ContextSnapshot",
     "ContextVersion",
     "Environment",
     "Error",
-    "ExecutionPlan",
     "ImportOutcome",
     "InputError",
     "JsonObject",
-    "LOCK_VERSION",
-    "ModelPin",
     "ModelPort",
     "ModelRefError",
     "Mutation",
@@ -45,14 +42,12 @@ RECORDED = (
     "PredictorExecutor",
     "PredictorLock",
     "PreparedExecution",
-    "PreparedPredictor",
     "PromoteRequest",
     "RateLimit",
     "Request",
     "Resource",
     "ResourceKind",
     "Revision",
-    "RuntimePlan",
     "Scope",
     "ServiceError",
     "SnapshotRow",
@@ -63,7 +58,6 @@ RECORDED = (
     "ad_hoc_lock",
     "arrow_bytes",
     "binary",
-    "bind_request",
     "bound_rows",
     "bytes_digest",
     "catalog_model",
@@ -71,9 +65,11 @@ RECORDED = (
     "compile_lock",
     "configuration",
     "context_version",
+    "document_digest",
     "entries",
     "failure",
     "fields",
+    "format_as_of",
     "json_object",
     "json_rows",
     "limits",
@@ -83,10 +79,12 @@ RECORDED = (
     "model_id",
     "name",
     "number",
+    "parse_as_of",
     "parse_body",
     "parse_lock",
     "parse_model",
     "pin",
+    "prefetch_catalog",
     "published_entry",
     "read_table",
     "request_table",
@@ -95,8 +93,6 @@ RECORDED = (
     "served_context",
     "success",
     "table_digest",
-    "task_of",
-    "temporal",
     "text",
     "to_arrow",
     "unique_object",
@@ -128,3 +124,20 @@ def test_hosting_imports_nothing_hosted_and_no_private_predictor_module():
         module for module in imported if module.startswith("generalforecast.hosted")
     ]
     assert "generalforecast.server" not in imported
+
+
+def test_every_export_is_documented_in_the_module():
+    import re
+
+    documented = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", hosting.__doc__ or ""))
+    assert not [name for name in hosting.__all__ if name not in documented]
+
+
+def test_the_image_prefetch_is_a_hosting_entry_point(monkeypatch):
+    from generalforecast.service import catalog_artifacts
+
+    calls = []
+    monkeypatch.setattr(catalog_artifacts, "preload", lambda: calls.append(1))
+    assert hosting._main(["prefetch"]) == 0
+    assert calls == [1]
+    assert hosting._main([]) == 2

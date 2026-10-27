@@ -195,11 +195,6 @@ class CatalogService:
         }
 
 
-def create_catalog() -> CatalogService:
-    """Zero-arg provider factory with explicitly authorized pinned model downloads."""
-    return CatalogService(allow_downloads=True)
-
-
 def quantile_levels(value: object) -> list[float]:
     """Validates requested quantile levels: strictly increasing, inside (0, 1)."""
     try:

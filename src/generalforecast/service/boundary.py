@@ -241,13 +241,6 @@ class Capability:
             text(self.code, "capability code")
             text(self.reason, "capability reason")
 
-    def enforce(self) -> None:
-        """Raises the same typed unavailable error in local and HTTP journeys."""
-        if self.state != "supported":
-            raise ServiceError(
-                self.code or "Unsupported", self.reason or "unavailable", 501
-            )
-
 
 @dataclass(frozen=True)
 class Artifact:

@@ -193,3 +193,96 @@ def test_whole_number_floats_keep_integer_labels():
         "a",
         "b",
     ]
+
+
+def _store_sales(stores: int = 3, days: int = 20, *, ragged: bool = False) -> pa.Table:
+    import datetime as dt
+
+    rows: dict[str, list] = {"date": [], "store": [], "sales": []}
+    for store in range(stores):
+        for day in range(days - (store if ragged else 0)):
+            rows["date"].append(dt.date(2024, 1, 1) + dt.timedelta(days=day))
+            rows["store"].append(f"s{store}")
+            rows["sales"].append(float(10 + store + day % 7))
+    return pa.table(rows)
+
+
+def test_target_candidates_follow_the_task():
+    from generalforecast.predictors import target_candidates
+
+    sales = inspect_frame(_store_sales())
+    assert target_candidates(sales, "forecast") == ("sales",)
+    assert target_candidates(sales, "regress") == ("sales",)
+    assert target_candidates(sales, "classify") == ("store",)
+    housing = inspect_frame(
+        pa.table(
+            {
+                "house_id": list(range(40)),
+                "rooms": [1 + i % 5 for i in range(40)],
+                "area": [50.0 + i % 9 for i in range(40)],
+                "zone": [("a", "b")[i % 2] for i in range(40)],
+                "price": [100.0 + 3 * i for i in range(40)],
+            }
+        )
+    )
+    # Floats before ints, later before earlier; never the id.
+    assert target_candidates(housing, "regress") == ("price", "area", "rooms")
+    assert target_candidates(housing, "classify") == ("zone", "rooms")
+    labeled = inspect_frame(
+        pa.table({"y": [1, 2, 3, 1] * 10, "x": [0.5 * i for i in range(40)]})
+    )
+    assert target_candidates(labeled, "regression")[0] == "y"
+    texts = inspect_frame(pa.table({"note": [f"n{i}" for i in range(40)]}))
+    assert target_candidates(texts, "classify") == ()
+    with pytest.raises(ValueError, match="unknown task"):
+        target_candidates(sales, "cluster")
+
+
+def test_default_until_holds_out_exactly_the_horizon_of_every_series():
+    import datetime as dt
+
+    from generalforecast.predictors import default_until
+    from generalforecast.predictors.tables import split_by
+
+    table = _store_sales()
+    until = default_until(table, time="date", series=["store"], horizon=4)
+    assert until == "2024-01-17"
+    context, queries = split_by(table, "sales", time="date", until=until)
+    assert queries.group_by("store").aggregate([("sales", "count")])[
+        "sales_count"
+    ].to_pylist() == [4, 4, 4]
+    assert context.num_rows == 3 * 16
+    # One frequency given; one series; timestamps give a UTC timestamp.
+    hourly = pa.table(
+        {"ts": [dt.datetime(2024, 3, 9, h, tzinfo=dt.UTC) for h in range(10)]}
+    )
+    assert (
+        default_until(hourly, time="ts", series=[], horizon=3, frequency="1h")
+        == "2024-03-09T07:00:00"
+    )
+    # Ragged ends leave some series a partial horizon; too few times; a gap.
+    assert (
+        default_until(
+            _store_sales(ragged=True), time="date", series=["store"], horizon=4
+        )
+        is None
+    )
+    assert (
+        default_until(_store_sales(days=4), time="date", series=["store"], horizon=4)
+        is None
+    )
+    gappy = _store_sales(stores=1).filter(pa.array([i != 5 for i in range(20)]))
+    assert default_until(gappy, time="date", series=["store"], horizon=4) is None
+
+
+def test_predictor_local_reads_a_bare_name_as_a_directory(tmp_path, monkeypatch):
+    from generalforecast.errors import NotFound
+    from generalforecast.predictor import Predictor
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "churn").mkdir()
+    with pytest.raises(NotFound, match=r"no gf\.yaml in `churn`") as raised:
+        Predictor.local("churn")
+    assert "gf init" in str(raised.value.hint)
+    with pytest.raises(NotFound, match="no directory"):
+        Predictor.local("absent")

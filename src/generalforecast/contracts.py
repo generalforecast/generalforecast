@@ -6,7 +6,7 @@
 import datetime
 from dataclasses import MISSING, asdict, dataclass, is_dataclass, replace
 from dataclasses import fields as dataclass_fields
-from typing import Any, Protocol, Self
+from typing import Any, Self
 from urllib.parse import urlsplit
 
 import pyarrow as pa
@@ -23,9 +23,11 @@ from generalforecast.predictors.validation import (
     name,
     text,
 )
-from generalforecast.service.boundary import Scope
 
 API_PREFIX = "/v1"
+# Most query rows one prediction call carries, on every surface; the SDK
+# sends more as several calls.
+MAX_QUERIES = 10_000
 STATES = frozenset({"pending", "building", "ready", "failed", "stopped"})
 TASKS = ("classification", "regression", "forecast")
 CONTEXT_KINDS = ("snapshot", "request", "live")
@@ -342,7 +344,8 @@ def context_version(value: dict) -> ContextVersion:
     predictor API's `{kind, rows, digest?, name?, as_of?}`, where the kind is
     the source, and a source spelled `live/<name>`.
     """
-    if type(value) is dict and "kind" in value and "source" not in value:
+    ensure(type(value) is dict, "a context is an object")
+    if "kind" in value and "source" not in value:
         body = dict(fields(value, {"kind"}, {"rows", "digest", "as_of", "name"}))
         return ContextVersion(
             source=body["kind"],
@@ -384,7 +387,7 @@ class PredictionRequest(WireValue):
         """Checks the rows and the time."""
         ensure(
             type(self.queries) is tuple
-            and 0 < len(self.queries) <= 10_000
+            and 0 < len(self.queries) <= MAX_QUERIES
             and all(type(row) is dict for row in self.queries),
             "queries must contain 1..10000 rows",
         )
@@ -558,32 +561,6 @@ class RuntimePlan(WireValue):
                 "UnsupportedCapability",
             )
 
-    @classmethod
-    def for_lock(
-        cls,
-        lock: "PredictorLock",
-        *,
-        runtime: str,
-        environment: str,
-        secret_refs: tuple[str, ...] = (),
-    ) -> "RuntimePlan":
-        """Compiles portable placement without creating infrastructure or identities."""
-        lock = parse_lock(lock.to_dict())
-        return cls(
-            runtime,
-            environment,
-            lock.digest,
-            lock.predictor["model_digest"],
-            lock.data_digest,
-            None,
-            (),
-            1,
-            "2Gi",
-            1,
-            1,
-            secret_refs,
-        )
-
 
 @dataclass(frozen=True)
 class PredictionResult:
@@ -702,24 +679,3 @@ class PredictionResult:
         if body.get("context") is not None:
             body["context"] = context_version(body["context"])
         return cls(**body)
-
-
-class RevisionStore(Protocol):
-    """Durable scoped revision and environment port implemented by the API owner."""
-
-    def create(
-        self,
-        scope: Scope,
-        predictor: str,
-        lock: "PredictorLock",
-        *,
-        snapshot: str | None = None,
-    ) -> Revision:
-        """Persists immutable revision identity and authenticated snapshot binding."""
-        ...
-
-    def promote(
-        self, scope: Scope, predictor: str, environment: str, request: PromoteRequest
-    ) -> Environment:
-        """Atomically updates one pointer after authorization and runtime admission."""
-        ...

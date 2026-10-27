@@ -333,6 +333,143 @@ def _targets(columns: Sequence[ColumnInfo]) -> tuple[str, ...]:
     return tuple(name for _, _, _, name in sorted(ranked))
 
 
+# Tasks by the names the CLI and the lock use.
+_TASKS = {
+    "classify": "classify",
+    "classification": "classify",
+    "regress": "regress",
+    "regression": "regress",
+    "forecast": "forecast",
+}
+# Share of distinct values past which a text-like column reads as an id.
+_NEAR_UNIQUE = 0.9
+
+
+def target_candidates(info: TableInfo, task: str) -> tuple[str, ...]:
+    """The columns that can be `task`'s target, best first; empty if none.
+
+    Never an id candidate, a timestamp, a free-text column or a near-unique
+    text or integer column (an id in all but name). A column named like a
+    target (`label`, `outcome`, `y`) ranks first. For `regress` and
+    `forecast` only numeric columns qualify: floats before ints, then later
+    columns before earlier ones, as datasets usually put the target last.
+    For `classify` only low-cardinality columns do: 0/1 flags, booleans,
+    categories, then ints with few values (`task_for`), in file order.
+
+    Args:
+        info: What `inspect_table` or `inspect_frame` learned.
+        task: `classify`, `regress` or `forecast` (or `classification`,
+            `regression`).
+
+    Raises:
+        ValueError: For another task.
+    """
+    if (wanted := _TASKS.get(task)) is None:
+        raise ValueError(f"unknown task `{task}`")
+    excluded = {*info.ids, *info.times}
+    ranked: list[tuple[int, int, int, str]] = []
+    for index, column in enumerate(info.columns):
+        if column.name in excluded or column.distinct < 2:
+            continue
+        present = info.rows - column.empty
+        near_unique = present > 0 and column.distinct >= _NEAR_UNIQUE * present
+        named = 0 if _named_like(column.name, TARGET_NAMES) else 1
+        if wanted == "classify":
+            tiers = {"0/1": 0, "bool": 1, "category": 2, "int": 3}
+            tier = tiers.get(column.kind)
+            if tier is None or (column.kind == "int" and near_unique):
+                continue
+            if tier == 3 and task_for(column, info.rows) != "classification":
+                continue
+            ranked.append((named, tier, index, column.name))
+        else:
+            tier = {"float": 0, "int": 1}.get(column.kind)
+            if tier is None or (column.kind == "int" and near_unique):
+                continue
+            if _named_like(column.name, ID_NAMES):
+                continue
+            ranked.append((named, tier, -index, column.name))
+    return tuple(name for *_, name in sorted(ranked))
+
+
+def default_until(
+    table: pa.Table,
+    *,
+    time: str,
+    series: Sequence[str],
+    horizon: int,
+    frequency: str | None = None,
+) -> str | None:
+    """The `context.until` that holds out exactly `horizon` steps of every series.
+
+    `table` is the labeled history (rows with a target); each series' last
+    `horizon` times, one frequency step apart, become the queries `gf check`
+    locks and `gf eval` scores, so the two agree. A series that ends before
+    the cutoff holds out nothing, which `gf check` admits; any other count
+    it refuses.
+
+    Args:
+        table: The labeled rows.
+        time: The time column.
+        series: The series columns; none for a single series.
+        horizon: The steps each series holds out.
+        frequency: The series' frequency in any spelling; inferred through
+            `frequency.infer` when None.
+
+    Returns:
+        The cutoff as an ISO-8601 date (for dates) or UTC timestamp, or None
+        when no one cutoff holds out `horizon` steps of every series: a
+        series has no more than `horizon` times, the times follow no single
+        frequency, or the series end at times that leave some of them a
+        partial horizon.
+    """
+    from generalforecast.predictors import frequency as _frequency
+
+    if horizon < 1 or time not in table.column_names:
+        return None
+    column = table[time]
+    if pa.types.is_string(column.type) or pa.types.is_large_string(column.type):
+        try:
+            column = pc.cast(column, pa.timestamp("us"))
+        except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+            return None
+    keys = (
+        list(zip(*(table[name].to_pylist() for name in series), strict=True))
+        if series
+        else [()] * table.num_rows
+    )
+    times: dict[tuple, list[Any]] = {}
+    for key, value in zip(keys, column.to_pylist(), strict=True):
+        times.setdefault(tuple(key), []).append(value)
+    try:
+        if frequency is None:
+            _frequency.infer(times)
+        else:
+            _frequency.check(times, frequency)
+    except (_frequency.FrequencyError, TypeError, ValueError):
+        return None
+    ordered = {
+        key: sorted(values, key=_frequency.instant) for key, values in times.items()
+    }
+    if any(len(values) <= horizon for values in ordered.values()):
+        return None
+    cutoff = max(
+        (values[-horizon] for values in ordered.values()), key=_frequency.instant
+    )
+    at = _frequency.instant(cutoff)
+    for values in ordered.values():
+        held = sum(_frequency.instant(value) >= at for value in values)
+        if held not in (0, horizon):
+            return None
+    if isinstance(cutoff, dt.datetime):
+        if cutoff.tzinfo is not None:
+            cutoff = cutoff.astimezone(dt.UTC).replace(tzinfo=None)
+        return cutoff.isoformat()
+    if isinstance(cutoff, dt.date):
+        return cutoff.isoformat()
+    return None
+
+
 def whole_numbers(values: pa.ChunkedArray) -> pa.ChunkedArray | None:
     """A float column cast to int64 when every present value is a whole number.
 
@@ -478,6 +615,12 @@ def _after(
     if until.tzinfo is not None:
         until = until.astimezone(dt.UTC).replace(tzinfo=None)
     column = table[time]
+    if pa.types.is_integer(column.type) or pa.types.is_floating(column.type):
+        message = f"time column `{time}` holds numbers, not dates"
+        hint = "`until` compares dates or timestamps; use `holdout`, or store dates"
+        if error is not None:
+            raise error(message, param="context.until", hint=hint)
+        raise InvalidInput(message=message, param="context.until", hint=hint)
     if pa.types.is_timestamp(column.type) and column.type.tz is not None:
         column = pc.cast(column, pa.timestamp("us", tz="UTC"))
         column = pc.cast(column, pa.timestamp("us"))
@@ -499,9 +642,11 @@ __all__ = [
     "PHYSICAL",
     "ColumnInfo",
     "TableInfo",
+    "default_until",
     "inspect_frame",
     "inspect_table",
     "semantic",
     "split",
     "split_by",
+    "target_candidates",
 ]

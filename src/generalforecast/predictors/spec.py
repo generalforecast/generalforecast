@@ -584,6 +584,13 @@ def _related(top: _Fields) -> tuple[str, ...] | None:
         return None
     if value == "all":
         return ()
+    if value == []:
+        raise top.fail(
+            "related",
+            "`related: []` names no series columns",
+            hint="write `related: all` to forecast every series together, or "
+            "`related: [store]` to group them",
+        )
     if type(value) is list:
         return top.texts("related", "`all` or a list of series columns")
     raise top.fail(
@@ -932,6 +939,20 @@ def validate(spec: PredictorSpec) -> None:
                     param="related",
                     hint="name series columns, or write `related: all`",
                 )
+        if spec.context.holdout is not None:
+            raise spec.error(
+                "a forecaster's queries are each series' next steps, not a random draw",
+                param="context.holdout",
+                hint="use `context.until: <date>` to hold out each series' last "
+                "`horizon` steps, or leave the targets of future rows blank",
+            )
+        if spec.selection is not None:
+            raise spec.error(
+                "`selection` is for tabular models",
+                param="selection",
+                because=f"{spec.model} reads each series' own history",
+                hint="remove `selection`",
+            )
         if spec.horizon is None:
             raise spec.error(
                 f"predictor {spec.name} has no `horizon`",

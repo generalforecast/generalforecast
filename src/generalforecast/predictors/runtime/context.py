@@ -14,10 +14,12 @@ nowhere else. Selection, the rows each query reads from these, is the lock's
 from typing import Any
 
 import pyarrow as pa
-import pyarrow.compute as pc
+import pyarrow.compute as _compute
 
 from generalforecast.predictors.validation import PredictorError, ensure
 from generalforecast.tabular import physical_type, table_digest, to_arrow
+
+pc: Any = _compute  # ty cannot see Arrow's generated compute functions
 
 
 def context_columns(predictor: dict[str, Any]) -> list[str]:
@@ -122,7 +124,7 @@ def served_context(lock: Any, table: pa.Table | None) -> pa.Table | None:
     present = [
         column for column in context_columns(predictor) if column in table.column_names
     ]
-    return typed(
+    rows = typed(
         project(
             table,
             present,
@@ -131,6 +133,24 @@ def served_context(lock: Any, table: pa.Table | None) -> pa.Table | None:
         ),
         predictor,
     )
+    return labeled(rows, predictor["target"])
+
+
+def labeled(table: pa.Table, target: str) -> pa.Table:
+    """The rows whose target has a value: a blank or missing one is never context.
+
+    A snapshot's unlabeled rows are its queries (`tables.split`); a request
+    or live context's carry nothing to learn from, so every binder leaves
+    them out alike.
+    """
+    from generalforecast.predictors.tables import _blank_to_null
+
+    if target not in table.column_names:
+        return table
+    present = pc.is_valid(_blank_to_null(table[target]))
+    if pc.all(present).as_py() is not False:
+        return table
+    return table.filter(present)
 
 
 def live_context(lock: Any, snapshot: Any) -> tuple[pa.Table, Any]:
@@ -198,9 +218,12 @@ def typed(table: pa.Table, predictor: dict[str, Any]) -> pa.Table:
 
     JSON carries times as ISO text and whole numbers as integers; a column
     the lock calls a timestamp is read as one, in UTC, and a `float` column
-    of integers widens to float64.
+    of integers widens to float64. An input whose kind the lock does not
+    record (one checked without rows) reads whole numbers as float64 and
+    text that is all ISO times as UTC timestamps, on every path.
     """
     kinds = {column["name"]: column.get("type") for column in predictor["inputs"]}
+    inputs = set(kinds)
     for key, kind in (("id", "id_type"), ("time", "time_type")):
         if predictor.get(key):
             kinds[predictor[key]] = predictor.get(kind)
@@ -221,8 +244,21 @@ def typed(table: pa.Table, predictor: dict[str, Any]) -> pa.Table:
         try:
             if kind == "timestamp" and storage == "string":
                 values = _timestamps(values)
-            elif kind == "float" and storage == "int64":
+            elif storage == "int64" and (
+                kind == "float" or (kind is None and name in inputs)
+            ):
+                # A lock without an input's kind (one checked without rows)
+                # reads its numbers as float64 on every path, whichever a
+                # call's first values look like.
                 values = pc.cast(values, pa.float64())
+            elif storage == "string" and kind is None and name in inputs:
+                # ISO text in an input of no recorded kind reads as UTC
+                # timestamps when every value is one, as `gf check` infers
+                # a snapshot column's kind; other text stays text.
+                try:
+                    values = _timestamps(values)
+                except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                    continue
             else:
                 continue
         except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
@@ -231,6 +267,30 @@ def typed(table: pa.Table, predictor: dict[str, Any]) -> pa.Table:
             ) from None
         table = table.set_column(index, name, values)
     return table
+
+
+def conform(values: Any, expected: str) -> Any:
+    """A query column in the storage its locked column takes, or None when it cannot be.
+
+    Every path reads queries this way, local, `gf serve` and hosted alike:
+    whole numbers widen to float64, and ISO text reads as a UTC timestamp
+    or a date, as JSON carries them. Nothing narrows.
+    """
+    actual = physical_type(values.type) if values.type != pa.null() else None
+    if actual == expected:
+        return values
+    try:
+        if actual == "int64" and expected == "float64":
+            return pc.cast(values, pa.float64())
+        if actual == "string" and expected == "timestamp":
+            return _timestamps(values)
+        if actual == "string" and expected == "date":
+            return pc.cast(values, pa.date32())
+        if actual == "date" and expected == "timestamp":
+            return pc.cast(values, pa.timestamp("us"))
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+        return None
+    return None
 
 
 def _timestamps(values: Any) -> Any:
@@ -243,8 +303,10 @@ def _timestamps(values: Any) -> Any:
 
 
 __all__ = [
+    "conform",
     "context_columns",
     "json_rows",
+    "labeled",
     "live_context",
     "project",
     "served_context",

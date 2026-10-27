@@ -29,6 +29,10 @@ from generalforecast.predictors.validation import PredictorError, ensure
 from generalforecast.service.contracts import ServiceError
 from generalforecast.service.interfaces import ResourceFree
 
+# The schema metadata key of a prediction table naming how many context rows
+# the call read, as ASCII digits.
+CONTEXT_ROWS_KEY = b"generalforecast.context_rows"
+
 
 def _load(
     lock: CompiledPlan,
@@ -111,7 +115,7 @@ class PreparedPredictor(ResourceFree):
             for name in self.lock.outputs:
                 columns[name] = outputs[name]
             return pa.table(columns).replace_schema_metadata(
-                {b"generalforecast.context_rows": str(rows).encode("ascii")}
+                {CONTEXT_ROWS_KEY: str(rows).encode("ascii")}
             )
         except ServiceError:
             raise
@@ -179,4 +183,4 @@ class PredictorExecutor:
             ) from None
 
 
-__all__ = ["PredictorExecutor", "PreparedPredictor"]
+__all__ = ["CONTEXT_ROWS_KEY", "PredictorExecutor", "PreparedPredictor"]

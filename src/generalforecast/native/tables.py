@@ -16,7 +16,6 @@ import abc
 import datetime
 import json
 import math
-import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import Any, ClassVar, Literal, Self, override
@@ -48,12 +47,14 @@ from generalforecast.predictors import frequency
 Kind = Literal["random", "stratified", "balanced", "diverse"]
 Exists = Literal["error", "open"]
 
-_DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(ms|s|m|h|d|w)?\s*$")
-_UNITS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0, "d": 86400.0, "w": 604800.0}
-
 
 def seconds(value: Any, what: str = "duration") -> float | None:
-    """Seconds of a duration such as `7d`, `1h`, `90s`, a number or a timedelta."""
+    """Seconds of a duration such as `7d`, `1h`, `90s`, a number or a timedelta.
+
+    Strings are spans as `predictors.frequency` spells them, so a table's
+    durations read the way a predictor's frequency does. A calendar alias
+    such as `MS` has no fixed length and is refused.
+    """
     if value is None:
         return None
     if isinstance(value, datetime.timedelta):
@@ -63,13 +64,18 @@ def seconds(value: Any, what: str = "duration") -> float | None:
     if isinstance(value, int | float):
         return float(value)
     if isinstance(value, str):
-        match = _DURATION.match(value)
-        if match is not None:
-            return float(match.group(1)) * _UNITS[match.group(2) or "s"]
         try:
-            return frequency.seconds(value)
-        except ValueError:
-            pass
+            calendar = frequency.is_calendar(value)
+            found = None if calendar else frequency.seconds(value)
+        except (TypeError, ValueError):
+            calendar, found = False, None
+        if calendar:
+            raise InvalidInput(
+                f"{what} `{value}` steps by the calendar, not a fixed duration",
+                hint="use a span such as `1d`, `1h` or `7d`",
+            )
+        if found is not None:
+            return found
     raise InvalidInput(
         f"{what} `{value}` is not a duration",
         hint="use a number of seconds or a string such as `1d`, `1h` or `7d`",

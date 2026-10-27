@@ -22,7 +22,8 @@ from generalforecast.errors import (  # noqa: F401
     public_code,
     reason_of,
 )
-from generalforecast.predictors.validation import NAME
+from generalforecast.predictors import validation
+from generalforecast.predictors.validation import IDENTITY_LIMIT, PredictorError
 
 VERSION = "gf/v1"
 
@@ -89,12 +90,17 @@ def require(condition: bool, message: str) -> None:
         raise ServiceError("ValidationError", message, 422)
 
 
+def _service(check: Any, *args: Any, message: str | None = None) -> Any:
+    """Runs one of `predictors.validation`'s checks, failing as a 422 service error."""
+    try:
+        return check(*args)
+    except PredictorError as error:
+        raise ServiceError("ValidationError", message or error.message, 422) from None
+
+
 def fields(value: Any, required: set[str], optional: set[str] | None = None) -> dict:
-    """Checks object shape, including unknown keys."""
-    require(isinstance(value, dict), "expected an object")
-    require(required <= value.keys(), f"required fields: {sorted(required)}")
-    require(not value.keys() - required - (optional or set()), "unknown fields")
-    return value
+    """Checks object shape, including unknown keys, by `predictors.validation.fields`."""
+    return _service(validation.fields, value, required, optional or frozenset())
 
 
 # A catalog model's name, `tabpfn-3.5-classifier`: unlike a chosen resource
@@ -128,16 +134,14 @@ def model_id(value: Any) -> str:
 
 def name(value: Any) -> str:
     """Validates a chosen name by the one rule, `predictors.validation.NAME`."""
-    require(
-        isinstance(value, str) and NAME.fullmatch(value) is not None, "invalid name"
-    )
-    return value
+    return _service(validation.name, value)
 
 
 def text(value: Any, field: str) -> str:
-    """Checks a bounded, nonempty identity string."""
-    require(isinstance(value, str) and 0 < len(value) <= 256, f"invalid {field}")
-    return value
+    """Checks a nonempty identity string of at most `IDENTITY_LIMIT` characters."""
+    return _service(
+        validation.bounded, value, IDENTITY_LIMIT, message=f"invalid {field}"
+    )
 
 
 def number(value: Any, low: float, high: float, field: str) -> float:

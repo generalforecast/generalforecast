@@ -146,7 +146,12 @@ def test_batch_readers_stop_without_collecting_whole_source(monkeypatch, format)
 
             def row_group(self, index):
                 assert index == 0
-                return type("Group", (), {"total_byte_size": 100})()
+                chunk = type("Chunk", (), {"total_uncompressed_size": 100})()
+                return type(
+                    "Group",
+                    (),
+                    {"num_rows": 1, "num_columns": 1, "column": lambda self, i: chunk},
+                )()
 
         class ParquetSource(Streaming):
             metadata = Metadata()
@@ -172,7 +177,12 @@ def test_parquet_rejects_uncompressed_metadata_before_batches(monkeypatch):
 
         def row_group(self, index):
             assert index == 0
-            return type("Group", (), {"total_byte_size": 2048})()
+            chunk = type("Chunk", (), {"total_uncompressed_size": 2048})()
+            return type(
+                "Group",
+                (),
+                {"num_rows": 1, "num_columns": 1, "column": lambda self, i: chunk},
+            )()
 
     class ParquetSource:
         metadata = Metadata()
@@ -186,6 +196,42 @@ def test_parquet_rejects_uncompressed_metadata_before_batches(monkeypatch):
     with pytest.raises(PredictorError) as error:
         read_table(b"small", "parquet", max_bytes=1024)
     assert error.value.code == "CapacityExceeded"
+
+
+def test_parquet_dictionaries_are_costed_before_they_decode(monkeypatch):
+    table = pa.table({"x": ["z" * 64] * 4096, "n": list(range(4096))})
+    data = io.BytesIO()
+    parquet.write_table(table, data, use_dictionary=True)
+    raw = data.getvalue()
+    assert len(raw) < 64 * 1024 < 4096 * 64
+    read = read_table(raw, "parquet", max_bytes=1 << 20)
+    assert read.equals(table)
+    with pytest.raises(PredictorError) as error:
+        read_table(raw, "parquet", max_bytes=128 * 1024)
+    assert error.value.code == "CapacityExceeded"
+
+
+def test_parquet_row_counts_must_agree(monkeypatch):
+    group = type(
+        "Group", (), {"num_rows": 5, "num_columns": 0, "column": lambda self, i: None}
+    )()
+    metadata = type(
+        "Metadata",
+        (),
+        {"num_rows": 1, "num_row_groups": 1, "row_group": lambda self, i: group},
+    )()
+
+    class ParquetSource:
+        def __init__(self, *args, **kwargs):
+            self.metadata = metadata
+
+        def iter_batches(self, **kwargs):
+            pytest.fail("Parquet batches must not decode after metadata rejection")
+
+    monkeypatch.setattr("generalforecast.tabular.parquet.ParquetFile", ParquetSource)
+    with pytest.raises(PredictorError) as error:
+        read_table(b"small", "parquet")
+    assert error.value.code == "InvalidTable"
 
 
 def test_compressed_parquet_and_ipc_exceed_decoded_budget():
