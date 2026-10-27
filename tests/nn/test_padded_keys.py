@@ -124,13 +124,13 @@ def test_queries_masked_to_their_own_keys_attend_as_if_alone() -> None:
         _close(together[:, query : query + 1], alone)
 
 
-def _reads_every_row(length: jax.Array, queries: int, rows: int) -> jax.Array:
+def _reads_every_row(queries: int, rows: int) -> jax.Array:
     """The mask a decode of several units together gives a unit that reads one context.
 
     Every query reads every row of the call's padded context, past the
     unit's own length too; only the length bounds what it reads.
     """
-    return jnp.ones((length.shape[0], queries, rows), dtype=bool)
+    return jnp.ones((len(LENGTHS), queries, rows), dtype=bool)
 
 
 def test_keys_read_counts_only_keys_within_the_length_that_the_mask_allows() -> None:
@@ -139,7 +139,7 @@ def test_keys_read_counts_only_keys_within_the_length_that_the_mask_allows() -> 
         _padded_rows(ICL),
         jnp.asarray(LENGTHS, dtype=jnp.int32),
     )
-    mask = _reads_every_row(cache.length, 3, max(LENGTHS)).at[1, 0, 2].set(False)
+    mask = _reads_every_row(3, max(LENGTHS)).at[1, 0, 2].set(False)
 
     counts = keys_read(cache._replace(mask=mask))
 
@@ -156,7 +156,7 @@ def test_a_mask_past_the_length_scales_queries_as_the_length_alone() -> None:
         np.random.default_rng(4).normal(size=(2, 3, ICL)), jnp.float32
     )
     cache = block_kv(block, context, jnp.asarray(LENGTHS, dtype=jnp.int32))
-    mask = _reads_every_row(cache.length, 3, context.shape[1])
+    mask = _reads_every_row(3, context.shape[1])
 
     _close(
         attention_block(block, queries, cache._replace(mask=mask)),
@@ -179,7 +179,7 @@ def test_retrieval_scales_queries_by_the_keys_within_the_length() -> None:
     cache = retrieval_cache(
         decoder, context, labels, 3, jnp.asarray(LENGTHS, dtype=jnp.int32)
     )
-    mask = _reads_every_row(cache.length, 3, context.shape[1])
+    mask = _reads_every_row(3, context.shape[1])
 
     _close(
         retrieve(decoder, queries, cache._replace(mask=mask)),

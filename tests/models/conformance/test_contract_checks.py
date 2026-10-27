@@ -123,7 +123,7 @@ def _attribute(functions: TabularFunctions) -> Callable[[], tuple[Any, Any]]:
 def test_checked_custom_models_fail_to_load_as_invalid(
     module: types.ModuleType, changes: dict[str, Any], name: str, reason: str
 ) -> None:
-    module.model = _attribute(kernel.kernel_functions._replace(**changes))
+    vars(module)["model"] = _attribute(kernel.kernel_functions._replace(**changes))
 
     with pytest.raises(ModelRefError) as caught:
         custom.checked("broken_kernels:model")

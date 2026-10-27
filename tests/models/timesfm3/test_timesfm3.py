@@ -19,6 +19,7 @@ from generalforecast.models.timesfm3.checkpoint import (
 from generalforecast.models.timesfm3.model import (
     Moments,
     _refined,
+    decode,
     encode,
     timesfm_functions,
 )
@@ -133,8 +134,8 @@ def test_a_cache_read_back_padded_decodes_as_the_cache_encode_made() -> None:
     paged = paged_series(cache, grows, 6)
 
     np.testing.assert_allclose(
-        timesfm_functions.decode(model, paged, 3 * PATCH),
-        timesfm_functions.decode(model, cache, 3 * PATCH),
+        decode(model, paged, 3 * PATCH),
+        decode(model, cache, 3 * PATCH),
         rtol=1e-6,
         atol=1e-6,
     )

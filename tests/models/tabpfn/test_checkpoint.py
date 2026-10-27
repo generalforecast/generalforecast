@@ -130,6 +130,7 @@ def test_published_files_convert_exactly(
     monkeypatch.delenv("GF_CHECKPOINTS", raising=False)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     published = checkpoint.PUBLISHED[name]
+    assert published.filename is not None
     path = hf_hub_download(
         published.repository, published.filename, revision=published.revision
     )
