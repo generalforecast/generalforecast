@@ -23,6 +23,8 @@ import pyarrow as pa
 import pytest
 from pyarrow import flight
 
+from tests.utils import processes
+
 ROOT = Path(__file__).resolve().parents[2]
 TOKEN = b"Bearer secret"
 KEY = "ab" * 32
@@ -121,7 +123,7 @@ host_bytes = {256 << 20}
 
     def start(self) -> Server:
         environment = {**os.environ, "GF_TEST_KEY": KEY, "PYTHONPATH": str(ROOT)}
-        self.process = subprocess.Popen(
+        self.process = processes.start(
             [str(self.binary), "run", "--config", str(self.config)], env=environment
         )
         if self.trust is None:
@@ -145,12 +147,12 @@ host_bytes = {256 << 20}
                 time.sleep(0.2)
 
     def stop(self) -> int:
-        """Stops the server with SIGTERM and returns its exit code."""
+        """Stops the server with SIGTERM, and then its group; returns its exit code."""
         code = 0
         if self.process is not None:
-            self.process.terminate()
-            code = self.process.wait(timeout=30)
-            self.process = None
+            stopped = processes.stop(self.process)
+            assert stopped is not None, "the server did not stop within 30 seconds"
+            code, self.process = stopped, None
         return code
 
     def http(self, path: str) -> tuple[int, str]:
@@ -255,7 +257,7 @@ class Router:
 
     def start(self, check: Callable[[], object]) -> Router:
         with self.log.open("ab") as log:
-            self.process = subprocess.Popen(
+            self.process = processes.start(
                 [str(self.binary), "run", "--config", str(self.config)], stderr=log
             )
         deadline = time.monotonic() + 60
@@ -284,8 +286,7 @@ class Router:
 
     def stop(self) -> None:
         if self.process is not None:
-            self.process.terminate()
-            self.process.wait(timeout=30)
+            processes.stop(self.process)
             self.process = None
 
     def metric(self, line: str) -> bool:

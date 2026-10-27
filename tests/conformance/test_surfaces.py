@@ -13,9 +13,11 @@ tests use: gf-server's worker loads them by spec, and the in-process engine
 loads them under the same catalog references.
 """
 
+import atexit
 import json
 import math
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -39,6 +41,7 @@ from generalforecast.serve import models as serve_models
 from generalforecast.service.boundary import Scope
 from generalforecast.service.contracts import ServiceError
 from generalforecast.tabular import arrow_bytes
+from tests.utils import processes
 from tests.utils.server import build
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -85,7 +88,9 @@ class Served:
     def __init__(
         self, binary: Path, target: str, *, metrics: str | None = None
     ) -> None:
+        # Removed in `stop`, and at exit should a test die first.
         self.directory = Path(tempfile.mkdtemp(prefix="gf-conformance-"))
+        atexit.register(shutil.rmtree, self.directory, ignore_errors=True)
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(serve_models, "checkpoint", lambda *_, **__: None)
             model = serve_models.served(target, self.directory)
@@ -104,13 +109,16 @@ class Served:
         config.chmod(0o600)
         environment = dict(os.environ, GF_LOG_KEY="0" * 64, PYTHONPATH=str(ROOT))
         environment.pop(listener.API_KEY_ENV, None)
-        self.process = subprocess.Popen(
-            [str(binary), "run", "--config", str(config)],
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+        # The server logs to a file: a pipe nobody reads would fill and stall it.
+        self.log = self.directory / "server.log"
+        with self.log.open("w") as log:
+            self.process = processes.start(
+                [str(binary), "run", "--config", str(config)],
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=log,
+                text=True,
+            )
         self._wait("ready")
         self.client = Client(base_url=self.url)
 
@@ -120,8 +128,7 @@ class Served:
         while time.monotonic() < deadline:
             line = self.process.stdout.readline()
             if not line:
-                assert self.process.stderr is not None
-                raise AssertionError(self.process.stderr.read())
+                raise AssertionError(self.log.read_text())
             if json.loads(line).get("event") == expected:
                 return
         raise AssertionError(f"gf-server never reported {expected}")
@@ -138,8 +145,11 @@ class Served:
             return error.code, json.loads(error.read())
 
     def stop(self) -> None:
-        self.process.terminate()
-        self.process.wait(60)
+        """Stops the server and its workers, and removes its directory."""
+        try:
+            processes.stop(self.process, timeout=60)
+        finally:
+            shutil.rmtree(self.directory, ignore_errors=True)
 
 
 @pytest.fixture(scope="module")

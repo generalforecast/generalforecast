@@ -14,11 +14,21 @@ import threading
 import time
 from pathlib import Path
 
+import pytest
+
 from generalforecast import protocol
-from tests.serve.processes import assert_exited as _assert_exited
-from tests.serve.processes import children as _children
+from tests.utils import processes
+from tests.utils.processes import assert_exited as _assert_exited
+from tests.utils.processes import children as _children
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+@pytest.fixture(autouse=True)
+def _stopped():
+    """Every process a test here starts is stopped, with its group, when it ends."""
+    with processes.scoped():
+        yield
 
 
 def _assert_quiet(stderr):
@@ -40,8 +50,14 @@ def test_a_worker_ignores_sigint_and_exits_when_its_socket_closes():
         path = Path(short) / "worker.sock"
         listener.bind(str(path))
         listener.listen(1)
-        worker = subprocess.Popen(
-            [sys.executable, "-m", "generalforecast.worker_process", "--socket", path],
+        worker = processes.start(
+            [
+                sys.executable,
+                "-m",
+                "generalforecast.worker_process",
+                "--socket",
+                str(path),
+            ],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -75,14 +91,13 @@ def _server(tmp_path, *, stdout):
         "PYTHONPATH": str(ROOT),
         "XDG_CACHE_HOME": str(tmp_path / "cache"),
     }
-    process = subprocess.Popen(
+    process = processes.start(
         [str(server.binary), "run", "--config", str(server.config)],
         stdin=subprocess.DEVNULL,
         stdout=stdout,
         stderr=subprocess.PIPE,
         text=True,
         env=environment,
-        start_new_session=True,
     )
     return server, process
 
