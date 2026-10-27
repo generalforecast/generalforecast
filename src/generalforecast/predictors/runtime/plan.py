@@ -136,6 +136,9 @@ class ExecutionPlan:
         outputs: The outputs predictions carry; the task's when empty.
         selection: The resolved context selection; exact when None.
         role_types: The kinds of the id, time and series columns.
+        related: A forecaster's declared groups: None for independent series,
+            `()` for every series as one group, else the series columns whose
+            values name each group.
     """
 
     name: str
@@ -156,6 +159,7 @@ class ExecutionPlan:
     outputs: tuple[str, ...] = ()
     selection: SelectionInfo | None = None
     role_types: tuple[tuple[str, str], ...] = field(default=())
+    related: tuple[str, ...] | None = None
 
     def __post_init__(self) -> None:
         """Validates every field; no credentials, code or runtime binding."""
@@ -205,6 +209,10 @@ class ExecutionPlan:
         ensure(
             self.context.mode == "request" or self.target is not None,
             "snapshot and live context require an explicit target",
+        )
+        ensure(
+            self.related is None or set(self.related) <= set(self.series),
+            "related groups are named by series columns",
         )
 
     @classmethod
@@ -271,6 +279,7 @@ class ExecutionPlan:
             outputs=tuple(predictor["outputs"]),
             selection=SelectionInfo.from_dict(predictor["selection"]),
             role_types=tuple(role_types),
+            related=tuple(predictor["related"]) if "related" in predictor else None,
         )
 
     @classmethod
@@ -345,6 +354,7 @@ class ExecutionPlan:
             "outputs": list(self.outputs),
             "selection": None if self.selection is None else self.selection.to_dict(),
             "role_types": dict(self.role_types),
+            "related": None if self.related is None else list(self.related),
         }
 
 

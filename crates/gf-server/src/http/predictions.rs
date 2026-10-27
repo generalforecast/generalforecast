@@ -789,48 +789,18 @@ async fn series_predict(
     require(features == expected.as_slice(), "features differ from lock")?;
     let rows = forecast.query_rows(&schema, predictor.id.as_deref(), queries)?;
     let queried = forecast.queries(&bound.context, &rows)?;
-    let query = bound.forecast.queries.first().ok_or_else(failed)?;
     let horizon = forecast.horizon;
-    let mut group = query.group.clone();
-    let mut covariates: Vec<&String> = forecast
-        .past_inputs
-        .iter()
-        .chain(&forecast.future_inputs)
-        .collect();
-    covariates.sort();
-    covariates.dedup();
-    let mut known = Sha256::new();
-    known.update(b"predictor-forecast\0");
-    known.update(query.fingerprint);
-    for (name, values) in forecast.future_inputs.iter().zip(&queried.future) {
-        let row = bound.context.identities.len()
-            + covariates
-                .iter()
-                .position(|covariate| *covariate == name)
-                .ok_or_else(failed)?;
-        if group.roles.get(row) != Some(&KNOWN) || group.horizon != horizon {
-            return Err(failed());
-        }
-        for (step, &value) in values.iter().enumerate() {
-            group.future[row * horizon + step] = value as f32;
-            group.future_observed[row * horizon + step] = true;
-            known.update((value as f32).to_le_bytes());
-        }
-    }
-    let fingerprint: [u8; 32] = if forecast.future_inputs.is_empty() {
-        query.fingerprint
-    } else {
-        known.finalize().into()
+    // One forecast request of every queried series, as
+    // `ForecastContext.predict` sends it; the engine forecasts its groups at
+    // once, each from the table its fingerprint names.
+    let bytes =
+        serde_json::to_vec(&bound.context.request(&queried.futures)).map_err(|_| failed())?;
+    let Inference::Forecast(parsed) = request::parse(&bytes, &front.predictor_options())? else {
+        return Err(failed());
     };
-    let inferred = front
+    let answers = front
         .engine()?
-        .forecast(
-            &served.worker,
-            &group,
-            &fingerprint,
-            &queried.members,
-            horizon,
-        )
+        .forecast_request(&served.worker, &parsed)
         .await?;
     drop(charge);
     let invalid = || {
@@ -840,7 +810,23 @@ async fn series_predict(
             503,
         )
     };
-    let levels = inferred.levels.as_deref().ok_or_else(invalid)?;
+    // Each queried series' query, in ascending order, and where its answer is.
+    let order: HashMap<usize, usize> = queried
+        .futures
+        .keys()
+        .enumerate()
+        .map(|(query, &series)| (series, query))
+        .collect();
+    let mut placed: HashMap<usize, (usize, usize)> = HashMap::new();
+    for (answer, (indices, _)) in answers.iter().enumerate() {
+        for (row, &query) in indices.iter().enumerate() {
+            placed.insert(query, (answer, row));
+        }
+    }
+    let levels = answers
+        .first()
+        .and_then(|(_, inferred)| inferred.levels.as_deref())
+        .ok_or_else(invalid)?;
     let column = |level: f64| levels.iter().position(|known| *known == level);
     let median = column(0.5).ok_or_else(invalid)?;
     let columns: Vec<usize> = predictor
@@ -855,19 +841,19 @@ async fn series_predict(
                 422,
             )
         })?;
-    let predicted = &inferred.predictions;
-    if (predicted.rows, predicted.horizon, predicted.columns)
-        != (queried.members.len(), Some(horizon), levels.len())
-        || !predicted.values.iter().all(|value| value.is_finite())
-    {
-        return Err(invalid());
+    for (indices, inferred) in &answers {
+        let predicted = &inferred.predictions;
+        if inferred.levels.as_deref() != Some(levels)
+            || (predicted.rows, predicted.horizon, predicted.columns)
+                != (indices.len(), Some(horizon), levels.len())
+            || !predicted.values.iter().all(|value| value.is_finite())
+        {
+            return Err(invalid());
+        }
     }
     let at = |member: usize, position: usize, column: usize| {
-        let row = queried
-            .members
-            .iter()
-            .position(|&queried| queried == member)
-            .unwrap_or_default();
+        let (answer, row) = placed[&order[&member]];
+        let predicted = &answers[answer].1.predictions;
         f64::from(predicted.values[(row * horizon + position) * predicted.columns + column])
     };
     let mut values: HashMap<&str, Vec<Value>> = HashMap::new();

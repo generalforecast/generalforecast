@@ -104,6 +104,7 @@ export interface Manifest {
   inputs?: string[] | Inputs;
   time?: string;
   series?: string[];
+  related?: "all" | string[];
   frequency?: string | number;
   horizon?: number;
   quantiles?: number[];
@@ -250,6 +251,7 @@ export interface Resolution {
   time_type?: Kind | null;
   series?: string[];
   series_types?: Array<Kind | null>;
+  related?: string[];
   frequency?: string | number;
   horizon?: number;
   quantiles?: number[];

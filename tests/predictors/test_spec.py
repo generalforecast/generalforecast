@@ -228,7 +228,7 @@ INVALID = [
         f"model: {MODEL}\ntarget: y\nfoo: 1\n",
         "foo",
         "unknown key `foo`",
-        "gf.yaml takes name, model, target, id, time, series, frequency, horizon, quantiles, inputs, context, selection, resources",
+        "gf.yaml takes name, model, target, id, time, series, related, frequency, horizon, quantiles, inputs, context, selection, resources",
     ),
     (
         f"model: {MODEL}\ntarget: y\ncontext: a.csv\n",

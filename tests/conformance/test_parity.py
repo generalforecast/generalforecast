@@ -15,6 +15,9 @@ predicted through:
   published with `published_entry` and run by `PredictorExecutor`, as the
   hosted plane runs a revision.
 
+The forecasters include 500 series that end on different days, each with
+its own known-future promotions, and two declared related groups.
+
 Every path must answer the same predictions, floats within tolerance, and
 know the predictor by the same lock digest. The models are the tiny ones the
 conformance tests load in both engines.
@@ -93,6 +96,47 @@ def forecaster_rows() -> pa.Table:
     )
 
 
+def many_rows() -> pa.Table:
+    """500 series ending on three different days, each with its own promotions.
+
+    Each series' three rows past its end have no target: they are the
+    queries, with the known-future promotions of that series alone.
+    """
+    columns: dict[str, list] = {"sku": [], "date": [], "units": [], "promo": []}
+    for sku in range(500):
+        end = 16 - sku % 3
+        for step in range(end + 3):
+            columns["sku"].append(f"sku-{sku:03d}")
+            columns["date"].append(START + datetime.timedelta(days=step))
+            columns["units"].append(
+                None if step >= end else float(5 + sku % 7 + step % 4)
+            )
+            columns["promo"].append(float((sku * 3 + step) % 2))
+    return pa.table(columns)
+
+
+def grouped_rows() -> pa.Table:
+    """Two regions of four stores, each region's stores forecast together."""
+    columns: dict[str, list] = {
+        "region": [],
+        "store": [],
+        "date": [],
+        "units": [],
+        "promo": [],
+    }
+    for region in ("east", "west"):
+        for store in range(4):
+            for step in range(19):
+                columns["region"].append(region)
+                columns["store"].append(f"{region}-{store}")
+                columns["date"].append(START + datetime.timedelta(days=step))
+                columns["units"].append(
+                    None if step >= 16 else float(10 + store + step % 5)
+                )
+                columns["promo"].append(float((step + (region == "west")) % 2))
+    return pa.table(columns)
+
+
 CASES = {
     "classifier": (
         classifier_rows,
@@ -131,6 +175,31 @@ CASES = {
             "horizon": 3,
             "inputs": {"past": ["footfall"], "future": ["promo"]},
             "context": {"snapshot": "rows.parquet", "until": "2025-03-18"},
+        },
+    ),
+    "many": (
+        many_rows,
+        {
+            "model": "general-forecast/chronos-2",
+            "target": "units",
+            "time": "date",
+            "series": ["sku"],
+            "horizon": 3,
+            "inputs": {"future": ["promo"]},
+            "context": {"snapshot": "rows.parquet"},
+        },
+    ),
+    "grouped": (
+        grouped_rows,
+        {
+            "model": "general-forecast/chronos-2",
+            "target": "units",
+            "time": "date",
+            "series": ["region", "store"],
+            "related": ["region"],
+            "horizon": 3,
+            "inputs": {"future": ["promo"]},
+            "context": {"snapshot": "rows.parquet"},
         },
     ),
 }
@@ -248,7 +317,10 @@ def test_every_path_predicts_the_same_and_knows_the_same_lock(
         plan.lock_digest,
     ):
         assert known == digest
-    if case != "forecaster":
+    if case == "many":
+        assert len(queries) == 1500
+        assert len({row["date"] for row in queries.to_pylist()}) == 5
+    if case not in ("forecaster", "many", "grouped"):
         assert plan.spec.selection is not None
         assert plan.spec.selection.strategy == "retrieved"
         assert published["predictor"]["strategy"] == plan.spec.selection.strategy_spec()

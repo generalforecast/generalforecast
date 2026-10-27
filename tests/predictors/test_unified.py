@@ -6,6 +6,7 @@
 import datetime
 import json
 from dataclasses import replace
+from typing import Any
 
 import pyarrow as pa
 import pytest
@@ -526,3 +527,39 @@ def test_unordered_quantiles_lock_in_order(tmp_path):
         quantiles=[0.9, 0.1],
     )
     assert lock_of(root).predictor["quantiles"] == [0.1, 0.9]
+
+
+def test_a_declared_group_holds_at_most_eight_series_and_one_origin(tmp_path):
+    def rows(stores: int, short: bool = False) -> pa.Table:
+        columns: dict[str, list] = {"store": [], "date": [], "units": []}
+        for store in range(stores):
+            for step in range(10 - (short and store == 0)):
+                columns["store"].append(f"s{store}")
+                columns["date"].append(
+                    datetime.date(2025, 1, 1) + datetime.timedelta(days=step)
+                )
+                columns["units"].append(float(step))
+        return pa.table(columns)
+
+    manifest: dict[str, Any] = {
+        "model": FORECASTER,
+        "target": "units",
+        "time": "date",
+        "series": ["store"],
+        "horizon": 2,
+    }
+    directory(tmp_path / "eight", rows(8), related="all", **manifest)
+    directory(tmp_path / "many", rows(40), **manifest)
+    with pytest.raises(InvalidInput) as caught:
+        directory(tmp_path / "nine", rows(9), related="all", **manifest)
+    assert (
+        "a related group holds 9 series; at most 8 forecast together"
+        in caught.value.message
+    )
+    with pytest.raises(InvalidInput) as caught:
+        directory(tmp_path / "ragged", rows(3, short=True), related="all", **manifest)
+    assert "share the same forecast origin" in caught.value.message
+    directory(tmp_path / "independent", rows(3, short=True), **manifest)
+    with pytest.raises(InvalidInput) as caught:
+        directory(tmp_path / "outside", rows(3), related=["region"], **manifest)
+    assert caught.value.param == "related"

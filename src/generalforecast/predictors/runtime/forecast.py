@@ -1,12 +1,21 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Aligned grouped forecast contexts, with explicit complete future query rows.
+"""A forecaster's bound series: each forecast on its own, or with the series declared related.
+
+Every series forecasts from its own context, from its own origin, with its
+own known-future values; a predictor's `related` groups are the exception,
+whose series (at most `ServingPolicy.group_series` of them) forecast jointly
+from one origin and share their known-future values. A prediction is one
+engine forecast request with a query per queried series, its group's
+context rows and its future values, so any number of series forecast in one
+batched call; the engine keeps each group's context table by its
+fingerprint.
 
 Times sit on their frequency's axis, `frequency.coordinate`: UTC seconds for
 a span, the period ordinal for a calendar alias such as `MS`, so a model
 stepping by `frequency.step` sees evenly spaced times. gf-server's binder
-(`predictors.rs`) places them the same way.
+(`predictors.rs`) builds the same request from the same rows.
 """
 
 from dataclasses import dataclass
@@ -16,29 +25,43 @@ import numpy as np
 import pyarrow as pa
 
 from generalforecast.engine import LocalEngine, ModelOutputError
-from generalforecast.models.catalog import V1_POLICY, ModelRef
+from generalforecast.models.catalog import ModelRef
 from generalforecast.models.outputs import DEFAULT_QUANTILES, quantile_index, quantiles
 from generalforecast.predictors import frequency as _frequency
 from generalforecast.predictors.runtime.compiled import CompiledPlan
-from generalforecast.predictors.runtime.schema import TableSchema
-from generalforecast.predictors.validation import ensure
+from generalforecast.predictors.runtime.schema import TableSchema, series_groups
+from generalforecast.predictors.validation import PredictorError, ensure
 from generalforecast.service.catalog import forecast_request
 from generalforecast.service.contracts import ServiceError
 
 
+def _label(identity: tuple) -> str:
+    return ", ".join(str(value) for value in identity) or "(all rows)"
+
+
 @dataclass(frozen=True)
 class ForecastContext:
-    """A related group's series, aligned once into the request its forecasts repeat.
+    """A forecaster's series, aligned once into the rows its requests repeat.
 
-    Each forecast is that request with the queries' future inputs, so the
-    engine reads the group's context table by its fingerprint: made once,
-    and once per set of known future values.
+    Attributes:
+        identities: Each series' values of the series columns, by index.
+        index: Each series' index, by its values.
+        origins: Each series' last context time, on the frequency's axis.
+        step: The distance between times on that axis.
+        group_of: Each series' group.
+        groups: Each group's series.
+        rows: Each series' context rows, as the forecast request takes them.
+        options: The request's model, target and series options.
     """
 
     identities: tuple[tuple, ...]
-    origin: int | float
+    index: dict[tuple, int]
+    origins: tuple[int | float, ...]
     step: int | float
-    request: dict[str, Any]
+    group_of: tuple[int, ...]
+    groups: tuple[tuple[int, ...], ...]
+    rows: tuple[tuple[dict[str, Any], ...], ...]
+    options: dict[str, Any]
 
     @classmethod
     def build(
@@ -48,35 +71,34 @@ class ForecastContext:
         table: pa.Table,
         schema: TableSchema,
     ):
-        """Validates and aligns a related group, binding it as a table."""
+        """Validates and aligns every series, and warms the first group's forecast."""
+        from generalforecast.predictors.runtime.tabular import bound_order
+
         spec = lock.spec
         assert (
             spec.time is not None
             and spec.target is not None
             and spec.horizon is not None
+            and spec.frequency is not None
         )
-        identities = tuple(
-            dict.fromkeys(
-                tuple(row[name] for name in spec.series) for row in table.to_pylist()
-            )
-        )
-        ensure(
-            1 <= len(identities) <= V1_POLICY.group_series,
-            "grouped forecast supports at most eight explicitly related series",
-            "CapacityExceeded",
-        )
-        assert spec.frequency is not None
         cadence = spec.frequency
-        ends: dict[tuple, int | float] = {}
-        rows = []
-        for index, row in enumerate(table.to_pylist()):
+        records = bound_order(lock, table).to_pylist()
+        index: dict[tuple, int] = {}
+        rows: list[list[dict[str, Any]]] = []
+        ends: list[int | float] = []
+        for key, row in enumerate(records):
             identity = tuple(row[name] for name in spec.series)
+            series = index.get(identity)
             moment = _frequency.coordinate(row[spec.time], cadence)
-            ends[identity] = max(moment, ends.get(identity, moment))
-            rows.append(
+            if series is None:
+                series = index[identity] = len(index)
+                rows.append([])
+                ends.append(moment)
+            ends[series] = max(ends[series], moment)
+            rows[series].append(
                 {
-                    "key": str(index),
-                    "series": f"gfseries:{identities.index(identity)}",
+                    "key": str(key),
+                    "series": f"gfseries:{series}",
                     "time": moment,
                     "value": row[spec.target],
                     "covariates": {
@@ -85,57 +107,100 @@ class ForecastContext:
                     },
                 }
             )
-        ensure(
-            len(set(ends.values())) == 1,
-            "related series must share the same forecast origin",
-        )
-        origin = next(iter(ends.values()))
-        step = _frequency.step(cadence)
-        query = {
-            "key": "warm",
-            "series": "gfseries:0",
-            "origin": origin,
-            "group": [f"gfseries:{i}" for i in range(len(identities))],
-            "future_covariates": {
-                name: [0.0] * spec.horizon for name in spec.future_inputs
-            },
-        }
-        request = {
+        identities = list(index)
+        ensure(bool(identities), "a forecast context has no series", "EmptyContext")
+        group_of, groups = series_groups(spec, identities)
+        for members in groups:
+            ensure(
+                len({ends[series] for series in members}) == 1,
+                "related series must share the same forecast origin",
+            )
+        options = {
             "model": lock.model.resolved,
             "task": "forecast",
             "target": spec.target,
             "features": [],
-            "context": rows,
-            "queries": [query],
             "options": {
                 "series": {
-                    "step": step,
+                    "step": _frequency.step(cadence),
                     "horizon": spec.horizon,
                     "quantiles": list(spec.quantiles or DEFAULT_QUANTILES),
                     "known_covariates": list(spec.future_inputs),
                 }
             },
         }
+        bound = cls(
+            tuple(identities),
+            index,
+            tuple(ends),
+            _frequency.step(cadence),
+            tuple(group_of),
+            tuple(groups),
+            tuple(tuple(series) for series in rows),
+            options,
+        )
         engine, ref = model
-        engine.forecast(ref, forecast_request(request, ref.entry.capability.quantiles))
-        return cls(identities, origin, step, request)
+        declared = ref.entry.capability.quantiles
+        zeros = {name: [0.0] * spec.horizon for name in spec.future_inputs}
+        # Every group's request is checked; the engine warms on the first.
+        forecast_request(
+            bound.request({series: zeros for series in range(len(identities))}),
+            declared,
+        )
+        engine.forecast(
+            ref, forecast_request(bound.request({groups[0][0]: zeros}), declared)
+        )
+        return bound
+
+    def request(self, futures: dict[int, dict[str, list[Any]]]) -> dict[str, Any]:
+        """The forecast request for queried series and their known-future values.
+
+        It carries the context rows of every group a queried series is in,
+        and one query per queried series, in ascending series order.
+        """
+        queried = sorted(futures)
+        groups = sorted({self.group_of[series] for series in queried})
+        context = [
+            row
+            for group in groups
+            for series in self.groups[group]
+            for row in self.rows[series]
+        ]
+        queries = [
+            {
+                "key": f"q{series}",
+                "series": f"gfseries:{series}",
+                "origin": self.origins[series],
+                "group": [
+                    f"gfseries:{member}"
+                    for member in self.groups[self.group_of[series]]
+                ],
+                "future_covariates": futures[series],
+            }
+            for series in queried
+        ]
+        return {**self.options, "context": context, "queries": queries}
 
     def predict(
         self, lock: CompiledPlan, model: tuple[LocalEngine, ModelRef], table: pa.Table
     ) -> dict[str, Any]:
-        """Aligns future rows and forecasts the queried series of the bound group."""
+        """Places each query row on its series' horizon and forecasts the queried series."""
         spec = lock.spec
         assert spec.horizon is not None and spec.time is not None
+        assert spec.frequency is not None
         positions: list[tuple[int, int]] = []
         seen: dict[int, set[int]] = {}
-        future: dict[tuple[str, int], float] = {}
+        future: dict[tuple[int, str, int], float] = {}
         for row in table.to_pylist():
             identity = tuple(row[name] for name in spec.series)
-            ensure(identity in self.identities, "query series is missing from context")
-            series = self.identities.index(identity)
-            assert spec.frequency is not None
+            series = self.index.get(identity)
+            if series is None:
+                raise PredictorError(
+                    "InvalidPredictor",
+                    f"query series {_label(identity)} is missing from context",
+                )
             moment = _frequency.coordinate(row[spec.time], spec.frequency)
-            offset = (moment - self.origin) / self.step - 1
+            offset = (moment - self.origins[series]) / self.step - 1
             position = round(offset)
             ensure(
                 abs(offset - position) < 1e-6 and 0 <= position < spec.horizon,
@@ -147,6 +212,8 @@ class ForecastContext:
             )
             held.add(position)
             positions.append((series, position))
+            group = self.group_of[series]
+            shared = len(self.groups[group]) > 1
             for name in spec.future_inputs:
                 value = row[name]
                 ensure(
@@ -155,10 +222,12 @@ class ForecastContext:
                     and abs(value) <= 1e12,
                     "known future covariates must be bounded numeric values",
                 )
-                key = (name, position)
+                # A related group shares its known-future values; a series
+                # on its own has its own.
+                key = (-1 - group if shared else series, name, position)
                 ensure(
                     key not in future or future[key] == value,
-                    "grouped targets must share named future covariates",
+                    "related series must share named future covariates",
                     "UnsupportedCovariates",
                 )
                 future[key] = value
@@ -166,23 +235,23 @@ class ForecastContext:
             all(len(times) == spec.horizon for times in seen.values()),
             "queries must include the complete horizon for each requested series",
         )
-        members = tuple(sorted(seen))
-        template = self.request["queries"][0]
-        queries = [
-            {
-                **template,
-                "key": f"q{member}",
-                "series": f"gfseries:{member}",
-                "future_covariates": {
-                    name: [future[(name, i)] for i in range(spec.horizon)]
-                    for name in spec.future_inputs
-                },
+
+        def owner(series: int) -> int:
+            group = self.group_of[series]
+            return -1 - group if len(self.groups[group]) > 1 else series
+
+        futures = {
+            series: {
+                name: [
+                    future[(owner(series), name, step)] for step in range(spec.horizon)
+                ]
+                for name in spec.future_inputs
             }
-            for member in members
-        ]
+            for series in seen
+        }
         engine, ref = model
         declared = ref.entry.capability.quantiles
-        parsed = forecast_request({**self.request, "queries": queries}, declared)
+        parsed = forecast_request(self.request(futures), declared)
         try:
             result, grid = engine.forecast(ref, parsed)
         except ModelOutputError:
@@ -194,7 +263,7 @@ class ForecastContext:
             "pinned model capabilities changed",
             "ModelMismatch",
         )
-        rows = {member: index for index, member in enumerate(members)}
+        rows = {series: at for at, series in enumerate(sorted(futures))}
         levels = spec.quantiles or DEFAULT_QUANTILES
         return {
             "value": [
@@ -205,3 +274,6 @@ class ForecastContext:
                 quantiles(result[rows[s], p], levels, grid) for s, p in positions
             ],
         }
+
+
+__all__ = ["ForecastContext", "series_groups"]

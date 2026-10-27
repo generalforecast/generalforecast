@@ -86,6 +86,9 @@ class Resolution:
         outputs: What predictions carry.
         resources: The hosted serving resources the manifest declares.
         manifest: The digest of the normalized manifest.
+        related: A forecaster's declared groups: None for independent series,
+            `()` for one group of every series, else the series columns
+            whose values name each group.
         context_table: The context rows the lock's digest names, when known.
         query_table: A snapshot's query rows, when known.
     """
@@ -117,6 +120,7 @@ class Resolution:
     outputs: tuple[str, ...] = ()
     resources: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
     manifest: str | None = None
+    related: tuple[str, ...] | None = None
     context_table: Any = field(default=None, compare=False, repr=False)
     query_table: Any = field(default=None, compare=False, repr=False)
 
@@ -315,6 +319,7 @@ def resolve(
         selection=selection,
         frequency=frequency,
         horizon=spec.horizon,
+        related=spec.related,
         quantiles=quantiles,
         outputs=OUTPUTS[task],
         files=MappingProxyType(dict(pin.files)),

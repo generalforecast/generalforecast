@@ -108,6 +108,7 @@ def test_manifest_fields_are_the_gf_yaml_fields_plus_rows():
         "inputs",
         "time",
         "series",
+        "related",
         "frequency",
         "horizon",
         "quantiles",

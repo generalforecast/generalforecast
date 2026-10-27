@@ -9,6 +9,7 @@
 //! durable table; a request-context predictor binds each request's rows into
 //! the ephemeral table their encoding names, as a tabular request does.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -112,30 +113,86 @@ pub struct ForecastPredictor {
     /// anchors at one time of day, as `frequency.check` holds them.
     #[serde(default)]
     pub calendar: Option<String>,
+    /// The series forecast jointly, as the lock's `related` declares them:
+    /// None for every series on its own, an empty list for one group of
+    /// every series, else the series columns whose values name each group.
+    #[serde(default)]
+    pub related: Option<Vec<String>>,
 }
 
-/// A forecast predictor's context, aligned as its lock lays it out: its
-/// related series, their shared origin and step, and the forecast request
-/// of the group, as `PredictorExecutor` builds it.
+/// A forecast predictor's context, aligned as `ForecastContext.build` aligns
+/// it in process: each series' context rows and origin, and the groups its
+/// lock declares related.
 #[derive(Clone, Debug)]
 pub struct ForecastContext {
     /// Each series' values of the lock's series columns, in context order.
     pub identities: Vec<Vec<Value>>,
-    pub origin: f64,
+    /// Each series' index, by its values as JSON text.
+    pub index: HashMap<String, usize>,
+    /// Each series' last time on the frequency's axis, and as JSON.
+    pub origins: Vec<(f64, Value)>,
     pub step: f64,
-    /// The group's `gf_core::request` forecast payload.
-    pub request: Value,
+    /// Each series' group, and each group's series.
+    pub group_of: Vec<usize>,
+    pub groups: Vec<Vec<usize>>,
+    /// Each series' context rows, as the forecast request takes them.
+    pub rows: Vec<Vec<Value>>,
+    /// The request's model, target and series options.
+    pub options: Map<String, Value>,
 }
 
 /// Where a forecast predictor's queries fall: each row's series and horizon
-/// position, the series queried, and the known inputs' future values.
+/// position, and each queried series' known-future values.
 #[derive(Clone, Debug)]
 pub struct ForecastQueries {
     pub positions: Vec<(usize, usize)>,
-    /// The series queried, in context order.
-    pub members: Vec<usize>,
-    /// Each future input's values over the horizon, in the lock's order.
-    pub future: Vec<Vec<f64>>,
+    /// Each queried series' future values by input, in ascending series
+    /// order, as its query carries them.
+    pub futures: std::collections::BTreeMap<usize, Map<String, Value>>,
+}
+
+impl ForecastContext {
+    /// The forecast request for queried series and their known-future
+    /// values: the context rows of every group a queried series is in, and
+    /// a query per queried series in ascending order, as
+    /// `ForecastContext.request` writes it.
+    #[must_use]
+    pub fn request(
+        &self,
+        futures: &std::collections::BTreeMap<usize, Map<String, Value>>,
+    ) -> Value {
+        let mut groups: Vec<usize> = futures
+            .keys()
+            .map(|&series| self.group_of[series])
+            .collect();
+        groups.sort_unstable();
+        groups.dedup();
+        let context: Vec<Value> = groups
+            .iter()
+            .flat_map(|&group| self.groups[group].iter())
+            .flat_map(|&series| self.rows[series].iter().cloned())
+            .collect();
+        let queries: Vec<Value> = futures
+            .iter()
+            .map(|(&series, future)| {
+                let group: Vec<String> = self.groups[self.group_of[series]]
+                    .iter()
+                    .map(|member| format!("gfseries:{member}"))
+                    .collect();
+                json!({
+                    "key": format!("q{series}"),
+                    "series": format!("gfseries:{series}"),
+                    "origin": self.origins[series].1,
+                    "group": group,
+                    "future_covariates": future,
+                })
+            })
+            .collect();
+        let mut request = self.options.clone();
+        request.insert("context".to_string(), Value::Array(context));
+        request.insert("queries".to_string(), Value::Array(queries));
+        Value::Object(request)
+    }
 }
 
 fn refused(message: &str) -> RequestError {
@@ -392,10 +449,11 @@ impl ForecastPredictor {
             .map(|name| cells(column(name)?))
             .collect::<Result<Vec<_>, _>>()?;
         let mut identities: Vec<Vec<Value>> = Vec::new();
+        let mut index: HashMap<String, usize> = HashMap::new();
         let mut ends: Vec<(f64, Value)> = Vec::new();
         let mut moments: Vec<Vec<f64>> = Vec::new();
         let mut days: Vec<Option<f64>> = Vec::new();
-        let mut context = Vec::with_capacity(rows.num_rows());
+        let mut series_rows: Vec<Vec<Value>> = Vec::new();
         for row in 0..rows.num_rows() {
             let identity: Vec<Value> = series.iter().map(|column| column[row].clone()).collect();
             let moment = &times[row];
@@ -403,14 +461,16 @@ impl ForecastPredictor {
                 .as_f64()
                 .filter(|_| identity.iter().all(|value| !value.is_null()))
                 .ok_or_else(|| refused("forecast time and series cannot be missing"))?;
-            let index = if let Some(index) = identities.iter().position(|known| *known == identity)
-            {
-                index
+            let key = Value::Array(identity.clone()).to_string();
+            let at_series = if let Some(&known) = index.get(&key) {
+                known
             } else {
+                index.insert(key, identities.len());
                 identities.push(identity);
                 ends.push((at, moment.clone()));
                 moments.push(Vec::new());
                 days.push(None);
+                series_rows.push(Vec::new());
                 identities.len() - 1
             };
             if let (Some(alias), Some(clock)) = (&self.calendar, &clock) {
@@ -419,75 +479,61 @@ impl ForecastPredictor {
                 let moment = clock[row].as_f64().unwrap_or_default();
                 let of_day = moment.rem_euclid(86_400.0);
                 if !anchored(moment, alias)
-                    || days[index].is_some_and(|known| known.total_cmp(&of_day).is_ne())
+                    || days[at_series].is_some_and(|known| known.total_cmp(&of_day).is_ne())
                 {
                     return Err(refused("declared frequency differs from observed times"));
                 }
-                days[index] = Some(of_day);
+                days[at_series] = Some(of_day);
             }
-            if at > ends[index].0 {
-                ends[index] = (at, moment.clone());
+            if at > ends[at_series].0 {
+                ends[at_series] = (at, moment.clone());
             }
-            moments[index].push(at);
+            moments[at_series].push(at);
             let values: Map<String, Value> = inputs
                 .iter()
                 .zip(&covariates)
                 .map(|(name, column)| ((*name).clone(), column[row].clone()))
                 .collect();
-            context.push(json!({
+            series_rows[at_series].push(json!({
                 "key": row.to_string(),
-                "series": format!("gfseries:{index}"),
+                "series": format!("gfseries:{at_series}"),
                 "time": moment,
                 "value": targets[row],
                 "covariates": values,
             }));
         }
-        if identities.is_empty() || identities.len() > catalog::catalog().policy.group_series {
+        if identities.is_empty() {
             return Err(RequestError::new(
-                "CapacityExceeded",
-                "grouped forecast supports at most eight explicitly related series",
+                "EmptyContext",
+                "a forecast context has no series",
                 422,
             ));
         }
-        if ends
-            .iter()
-            .any(|(end, _)| end.total_cmp(&ends[0].0).is_ne())
-        {
-            return Err(refused(
-                "related series must share the same forecast origin",
-            ));
+        let (group_of, groups) = self.groups(&identities)?;
+        for members in &groups {
+            if members
+                .iter()
+                .any(|&member| ends[member].0.total_cmp(&ends[members[0]].0).is_ne())
+            {
+                return Err(refused(
+                    "related series must share the same forecast origin",
+                ));
+            }
         }
         let frequency = match frequency {
             Some(frequency) => frequency,
             None => self.observed(&mut moments)?,
         };
-        let origin = ends[0].1.clone();
-        let step = if origin.is_i64() && frequency.fract() == 0.0 {
+        let step = if ends[0].1.is_i64() && frequency.fract() == 0.0 {
             json!(frequency as i64)
         } else {
             json!(frequency)
         };
-        let group: Vec<String> = (0..identities.len())
-            .map(|index| format!("gfseries:{index}"))
-            .collect();
-        let future: Map<String, Value> = self
-            .future_inputs
-            .iter()
-            .map(|name| (name.clone(), json!(vec![0.0; self.horizon])))
-            .collect();
-        let request = json!({
+        let Value::Object(options) = json!({
             "model": model,
             "task": "forecast",
             "target": target,
             "features": [],
-            "context": context,
-            "queries": [{
-                "key": "warm",
-                "series": "gfseries:0",
-                "origin": origin,
-                "group": group,
-                "future_covariates": future,
-            }],
             "options": {
                 "series": {
                     "step": step,
@@ -496,13 +542,71 @@ impl ForecastPredictor {
                     "known_covariates": self.future_inputs,
                 }
             },
-        });
+        }) else {
+            unreachable!("a JSON object literal")
+        };
         Ok(ForecastContext {
             identities,
-            origin: ends[0].0,
+            index,
+            origins: ends,
             step: frequency,
-            request,
+            group_of,
+            groups,
+            rows: series_rows,
+            options,
         })
+    }
+
+    /// Each series' group, and each group's series, by the lock's `related`,
+    /// as `forecast.series_groups` makes them.
+    fn groups(
+        &self,
+        identities: &[Vec<Value>],
+    ) -> Result<(Vec<usize>, Vec<Vec<usize>>), RequestError> {
+        let Some(related) = &self.related else {
+            return Ok((
+                (0..identities.len()).collect(),
+                (0..identities.len()).map(|series| vec![series]).collect(),
+            ));
+        };
+        let positions: Vec<usize> = related
+            .iter()
+            .map(|column| {
+                self.series
+                    .iter()
+                    .position(|name| name == column)
+                    .ok_or_else(|| refused("related groups are named by series columns"))
+            })
+            .collect::<Result<_, _>>()?;
+        let mut keys: HashMap<String, usize> = HashMap::new();
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut group_of = Vec::with_capacity(identities.len());
+        for (series, identity) in identities.iter().enumerate() {
+            let key = Value::Array(positions.iter().map(|&at| identity[at].clone()).collect())
+                .to_string();
+            let group = *keys.entry(key).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[group].push(series);
+            group_of.push(group);
+        }
+        let most = catalog::catalog().policy.group_series;
+        if let Some(largest) = groups
+            .iter()
+            .map(Vec::len)
+            .max()
+            .filter(|&largest| largest > most)
+        {
+            return Err(RequestError::new(
+                "CapacityExceeded",
+                format!(
+                    "a related group holds {largest} series; at most {most} forecast together"
+                ),
+                422,
+            ));
+        }
+        Ok((group_of, groups))
     }
 
     /// The one step between each series' times, as the lock's compiler
@@ -623,19 +727,28 @@ impl ForecastPredictor {
             .map(|name| cells(column(name)?))
             .collect::<Result<Vec<_>, _>>()?;
         let mut positions = Vec::with_capacity(rows.num_rows());
-        let mut seen = vec![vec![false; self.horizon]; context.identities.len()];
-        let mut future: Vec<Vec<Option<f64>>> =
-            vec![vec![None; self.horizon]; self.future_inputs.len()];
+        let mut seen: HashMap<usize, Vec<bool>> = HashMap::new();
+        // Known-future values by owner: a series on its own, or its related
+        // group (as `usize::MAX - group`), which shares them.
+        let mut future: HashMap<(usize, usize, usize), f64> = HashMap::new();
+        let owner = |member: usize| {
+            let group = context.group_of[member];
+            if context.groups[group].len() > 1 {
+                usize::MAX - group
+            } else {
+                member
+            }
+        };
         for row in 0..rows.num_rows() {
             let identity: Vec<Value> = series.iter().map(|column| column[row].clone()).collect();
-            let member = context
-                .identities
-                .iter()
-                .position(|known| *known == identity)
+            let member = *context
+                .index
+                .get(&Value::Array(identity).to_string())
                 .ok_or_else(|| refused("query series is missing from context"))?;
+            let origin = context.origins[member].0;
             let position = times[row]
                 .as_f64()
-                .map(|at| (at - context.origin) / context.step - 1.0)
+                .map(|at| (at - origin) / context.step - 1.0)
                 .filter(|offset| {
                     (offset - offset.round()).abs() < 1e-6
                         && offset.round() >= 0.0
@@ -647,11 +760,14 @@ impl ForecastPredictor {
                         "query times must cover the locked future horizon after the context origin",
                     )
                 })?;
-            if std::mem::replace(&mut seen[member][position], true) {
+            let held = seen
+                .entry(member)
+                .or_insert_with(|| vec![false; self.horizon]);
+            if std::mem::replace(&mut held[position], true) {
                 return Err(refused("duplicate forecast query time within a series"));
             }
             positions.push((member, position));
-            for (values, column) in future.iter_mut().zip(&inputs) {
+            for (input, column) in inputs.iter().enumerate() {
                 let value = match &column[row] {
                     Value::Bool(value) => Some(f64::from(u8::from(*value))),
                     Value::Number(value) => value.as_f64(),
@@ -659,35 +775,43 @@ impl ForecastPredictor {
                 }
                 .filter(|value| value.is_finite() && value.abs() <= 1e12)
                 .ok_or_else(|| refused("known future covariates must be bounded numeric values"))?;
-                if values[position].is_some_and(|held| held.total_cmp(&value).is_ne()) {
+                let key = (owner(member), input, position);
+                if future
+                    .get(&key)
+                    .is_some_and(|held| held.total_cmp(&value).is_ne())
+                {
                     return Err(RequestError::new(
                         "UnsupportedCovariates",
-                        "grouped targets must share named future covariates",
+                        "related series must share named future covariates",
                         422,
                     ));
                 }
-                values[position] = Some(value);
+                future.insert(key, value);
             }
         }
-        let members: Vec<usize> = (0..seen.len())
-            .filter(|&member| seen[member].iter().any(|&held| held))
-            .collect();
-        if members
-            .iter()
-            .any(|&member| !seen[member].iter().all(|&held| held))
-        {
+        if seen.values().any(|held| !held.iter().all(|&held| held)) {
             return Err(refused(
                 "queries must include the complete horizon for each requested series",
             ));
         }
-        Ok(ForecastQueries {
-            positions,
-            members,
-            future: future
-                .into_iter()
-                .map(|values| values.into_iter().map(Option::unwrap_or_default).collect())
-                .collect(),
-        })
+        let futures = seen
+            .keys()
+            .map(|&member| {
+                let values: Map<String, Value> = self
+                    .future_inputs
+                    .iter()
+                    .enumerate()
+                    .map(|(input, name)| {
+                        let steps: Vec<Value> = (0..self.horizon)
+                            .map(|step| json!(future[&(owner(member), input, step)]))
+                            .collect();
+                        (name.clone(), Value::Array(steps))
+                    })
+                    .collect();
+                (member, values)
+            })
+            .collect();
+        Ok(ForecastQueries { positions, futures })
     }
 }
 
