@@ -97,9 +97,24 @@ def fields(value: Any, required: set[str], optional: set[str] | None = None) -> 
     return value
 
 
+# A catalog model's name, `tabpfn-3.5-classifier`: unlike a chosen resource
+# name it may start with a digit and hold dots. The spec's ModelName and
+# ModelId use the same grammar.
+MODEL_NAME_PATTERN = r"[a-z0-9][a-z0-9.-]{0,62}"
+MODEL_NAME = re.compile(MODEL_NAME_PATTERN)
 MODEL_ID = re.compile(
-    r"[a-z][a-z0-9-]{0,62}/[a-z0-9][a-z0-9.-]{0,62}(?:@sha256:[0-9a-f]{64})?(?:@\d+)?(?:\*\d+)?"
+    rf"[a-z][a-z0-9-]{{0,62}}/{MODEL_NAME_PATTERN}"
+    r"(?:@sha256:[0-9a-f]{64})?(?:@\d+)?(?:\*\d+)?"
 )
+
+
+def model_name(value: Any) -> str:
+    """Validates a catalog model's name, the id without its `general-forecast/`."""
+    require(
+        isinstance(value, str) and MODEL_NAME.fullmatch(value) is not None,
+        "invalid model name",
+    )
+    return value
 
 
 def model_id(value: Any) -> str:

@@ -445,3 +445,45 @@ test("predictors.predict names the environment in the query", async () => {
   await gf.predictors.predict("churn", { queries: example.request.value.payload.queries, env: "staging" });
   assert.deepEqual(asked, ["?env=staging"]);
 });
+
+test("an error keeps the service's reason", async () => {
+  const gf = new GeneralForecast({
+    project: "acme",
+    baseUrl: "http://mock.local",
+    fetch: async () =>
+      new Response(
+        JSON.stringify({ error: { code: "Unauthorized", message: "waiting for browser approval", reason: "authorization_pending" } }),
+        { status: 400, headers: { "content-type": "application/json" } },
+      ),
+  });
+  await assert.rejects(gf.models.list(), (error) => {
+    assert.ok(error instanceof GFError);
+    assert.equal(error.code, "Unauthorized");
+    assert.equal(error.reason, "authorization_pending");
+    return true;
+  });
+});
+
+test("asOf is sent as given text or seconds, and a Date as RFC 3339 UTC", async () => {
+  const sent = [];
+  const gf = new GeneralForecast({
+    project: "acme",
+    baseUrl: "http://mock.local",
+    fetch: async (_url, init) => {
+      sent.push(JSON.parse(init.body).payload.as_of);
+      return new Response(JSON.stringify({ error: { code: "NotFound", message: "stop" } }), { status: 404 });
+    },
+  });
+  for (const asOf of ["2026-10-27T08:00:00Z", 1761552000, new Date(Date.UTC(2026, 9, 27, 8))]) {
+    await assert.rejects(gf.predictors.predict("churn", { queries: [{ x: 1 }], asOf }));
+  }
+  assert.deepEqual(sent, ["2026-10-27T08:00:00Z", 1761552000, "2026-10-27T08:00:00.000Z"]);
+});
+
+test("every prediction example carries the one context shape", () => {
+  for (const example of EXAMPLES) {
+    const context = example.value?.result?.context;
+    if (example.section !== "response" || !context || !example.value.result.predictions) continue;
+    assert.deepEqual(Object.keys(context).sort(), ["as_of", "digest", "name", "rows", "source", "version"]);
+  }
+});

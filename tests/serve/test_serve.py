@@ -146,6 +146,22 @@ def test_serve_answers_the_hosted_models_api(server):
 
 
 @pytest.mark.slow
+def test_a_dotted_catalog_id_reaches_gf_serves_models_route(server):
+    from generalforecast.client import Client
+    from generalforecast.errors import NotFound
+
+    url, _ = server
+    # A dotted name is a model name, not a malformed one: this server does
+    # not serve tabpfn-3.5, so it is NotFound, never "invalid name".
+    status, body = call(url, "/v1/projects/local/models/tabpfn-3.5-classifier", key=KEY)
+    assert status == 404 and body["error"]["code"] == "NotFound", body
+    with Client(base_url=url, api_key=KEY) as client:
+        with pytest.raises(NotFound):
+            client.models.get("general-forecast/tabpfn-3.5-classifier")
+        assert client.models.get(MODEL)["name"] == MODEL
+
+
+@pytest.mark.slow
 def test_serve_requires_its_key_and_keeps_the_api_errors(server):
     url, _ = server
     status, body = call(url, "/v1/projects/local/models")

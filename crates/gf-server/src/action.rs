@@ -395,7 +395,7 @@ fn body<'a, T: Deserialize<'a>>(action: &'a Action) -> Result<T, Status> {
         .map_err(|error| Status::invalid_argument(format!("bad {} body: {error}", action.r#type)))
 }
 
-/// Checks a client's id for a write: 1 to 64 characters.
+/// Checks a client's id for a write: 1 to 64 bytes of UTF-8.
 ///
 /// # Errors
 ///

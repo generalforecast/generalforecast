@@ -20,6 +20,7 @@ flight = pytest.importorskip("pyarrow.flight")
 from tests.utils import engine_client as generalforecast
 from tests.utils.server import (
     NEAR_A,
+    SETTLE_SECONDS,
     Router,
     Server,
     build,
@@ -410,7 +411,8 @@ def test_a_primary_cut_off_while_running_is_fenced_then_catches_up(
             lambda: (
                 table.insert(np.arange(32, 40), features[32:40], targets[32:40]) is None
             ),
-            timeout=120,
+            # The write it waits on must first find the new primary.
+            timeout=2 * SETTLE_SECONDS,
         )
     finally:
         primary.process.send_signal(signal.SIGCONT)

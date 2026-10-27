@@ -14,12 +14,12 @@ import generalforecast as gf
 from generalforecast.async_client import AsyncClient, AsyncHostedPredictor
 from generalforecast.client import Client
 from generalforecast.contracts import Environment, PredictionResult
+from generalforecast.errors import printable
 from generalforecast.service.contracts import ServiceError
 from generalforecast.service.sdk import HostedPredictor
 from generalforecast.transport import (
     AsyncTransport,
     RelayedError,
-    printable,
     response_value,
 )
 from tests.product_sdk.test_lifecycle import invoke
@@ -214,7 +214,7 @@ def test_error_code_is_not_an_untrusted_credential_echo():
             )
         assert error.value.code == "RemoteError"
         assert str(error.value) == "permission denied"
-        assert code not in repr(error.value.body())
+        assert code not in repr(error.value.public_body())
 
 
 @pytest.mark.parametrize(

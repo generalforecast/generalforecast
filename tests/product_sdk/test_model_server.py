@@ -203,7 +203,7 @@ def test_no_key_endpoint_lists_and_describes_without_authorization(
     listed, model = drive(
         client,
         lambda c: c.models.list(),
-        lambda c: c.models.get("tabicl-v2-classifier"),
+        lambda c: c.models.get("general-forecast/tabicl-v2-classifier"),
     )
     assert listed == [{"name": "tabicl-v2-classifier"}]
     assert model == {"name": "tabicl-v2-classifier"}
@@ -225,7 +225,9 @@ def test_static_key_endpoint_sends_only_that_bearer_key(
         asynchronous, server, base_url=LOCAL, api_key="serve-key", project="lab"
     )
     assert "serve-key" not in repr(client.profile)
-    (described,) = drive(client, lambda c: c.models.get("tabicl-v2-classifier"))
+    (described,) = drive(
+        client, lambda c: c.models.get("general-forecast/tabicl-v2-classifier")
+    )
     assert described == {"name": "tabicl-v2-classifier"}
     ((_method, _origin, path, headers),) = server.seen
     assert path == "/v1/projects/lab/models/tabicl-v2-classifier"

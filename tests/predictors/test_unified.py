@@ -28,6 +28,7 @@ from generalforecast.predictors.runtime.plan import ExecutionPlan
 from generalforecast.predictors.runtime.schema import infer_schema
 from generalforecast.predictors.validation import NAME, PredictorError, name
 from generalforecast.serve.models import published_entry
+from generalforecast.service.contracts import ServiceError
 from generalforecast.service.sdk import pushed
 from tests.utils.engine import FakeEngine
 from tests.utils.locks import ad_hoc, directory, lock_of
@@ -391,10 +392,11 @@ def test_context_versions_name_a_live_context_apart_from_its_kind():
     version = ContextVersion("live", 3, 10, name="events")
     assert version.to_dict() == {
         "source": "live",
+        "name": "events",
         "version": 3,
+        "digest": None,
         "rows": 10,
         "as_of": None,
-        "name": "events",
     }
     assert context_version({"source": "live/events", "version": 3}) == ContextVersion(
         "live", 3, name="events"
@@ -409,8 +411,9 @@ def test_prediction_requests_carry_as_of():
     )
     assert request.as_of == "2025-01-01T00:00:00Z"
     assert request.to_dict() == {"queries": [{"x": 1}], "as_of": "2025-01-01T00:00:00Z"}
-    with pytest.raises(PredictorError):
+    with pytest.raises(ServiceError) as refused:
         PredictionRequest.from_dict({"queries": [{"x": 1}], "as_of": "soon"})
+    assert (refused.value.code, refused.value.param) == ("ValidationError", "as_of")
 
 
 def test_one_name_rule_for_chosen_names():

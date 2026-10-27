@@ -803,3 +803,34 @@ def test_an_environment_key_needs_no_readable_credentials_file(tmp_path):
         shared.resolve("https://a.example")
     assert "credentials.toml" in error.value.message
     assert error.value.hint is not None and "chmod 600" in error.value.hint
+
+
+def test_a_malformed_login_is_refused_before_anything_is_stored(tmp_path, monkeypatch):
+    from generalforecast.credentials import CredentialStore, Login
+
+    environ = {"GF_CONFIG_PATH": str(tmp_path / "gf" / "profiles.json")}
+    store = CredentialStore(environ)
+    written = []
+    monkeypatch.setattr(store, "keychain", lambda: True)
+    monkeypatch.setattr(store, "_keychain_write", lambda login: written.append(login))
+    for broken in (
+        {"workspace": "Acme\ud800"},
+        {"project": ""},
+        {"key": "not a key"},
+        {"key": None},
+    ):
+        login = Login(
+            "https://a.example",
+            "k1",
+            None,
+            "Acme",
+            "w1",
+            "p",
+            "file",
+            key="gf_k1234567",
+        )
+        for key, value in broken.items():
+            setattr(login, key, value)
+        with pytest.raises(ServiceError):
+            store.save(login)
+    assert not written and not store.path.exists()
