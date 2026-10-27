@@ -184,14 +184,19 @@ def _same(left: Any, right: Any, at: str = "") -> None:
         assert type(left) is type(right) and left == right, (at, left, right)
 
 
-def _predicted(server: Served, predictor: str, queries: pa.Table) -> list[dict]:
-    """The rows a served predictor answers for `queries` on its predict route."""
+def _predicted(
+    server: Served, predictor: str, queries: pa.Table, context: pa.Table | None = None
+) -> list[dict]:
+    """The rows a served predictor answers for `queries` (and a request context) on its predict route."""
+    payload: dict[str, Any] = {"queries": queries.to_pylist()}
+    if context is not None:
+        payload["context"] = context.to_pylist()
     body = {
         "api_version": "gf/v1",
         "project": "local",
         "request_id": f"r-{predictor}",
         "resource": {"kind": "predictor", "name": predictor},
-        "payload": {"queries": queries.to_pylist()},
+        "payload": payload,
     }
     status, envelope = server.post(
         f"/v1/projects/local/predictors/{predictor}/predict",

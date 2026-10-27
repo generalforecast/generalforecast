@@ -868,3 +868,31 @@ def test_a_zoned_origin_steps_through_utc():
         3600.0,
         7200.0,
     ]
+
+
+def test_an_input_of_no_recorded_kind_reads_iso_text_as_times(tmp_path):
+    root = directory(
+        tmp_path / "scorer",
+        pa.table(
+            {
+                "seen": [datetime.datetime.fromisoformat("2025-01-01T00:00")] * 2,
+                "tier": ["a", "b"],
+                "y": ["a", "b"],
+            }
+        ),
+        context="request",
+    )
+    rows = pa.table(
+        {
+            "seen": ["2025-01-01T00:00:00Z", "2025-01-02T06:00:00+01:00"],
+            "tier": ["gold", "2025-01-01"],
+            "y": ["a", "b"],
+        }
+    )
+    bound = served_context(lock_of(root), rows)
+    assert bound is not None
+    assert bound["seen"].to_pylist() == [
+        datetime.datetime.fromisoformat("2025-01-01T00:00"),
+        datetime.datetime.fromisoformat("2025-01-02T05:00"),
+    ]
+    assert bound["tier"].type == pa.string()

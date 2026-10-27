@@ -218,8 +218,9 @@ def typed(table: pa.Table, predictor: dict[str, Any]) -> pa.Table:
 
     JSON carries times as ISO text and whole numbers as integers; a column
     the lock calls a timestamp is read as one, in UTC, and a `float` column
-    of integers widens to float64, as does an integer input whose kind the
-    lock does not record.
+    of integers widens to float64. An input whose kind the lock does not
+    record (one checked without rows) reads whole numbers as float64 and
+    text that is all ISO times as UTC timestamps, on every path.
     """
     kinds = {column["name"]: column.get("type") for column in predictor["inputs"]}
     inputs = set(kinds)
@@ -250,6 +251,14 @@ def typed(table: pa.Table, predictor: dict[str, Any]) -> pa.Table:
                 # reads its numbers as float64 on every path, whichever a
                 # call's first values look like.
                 values = pc.cast(values, pa.float64())
+            elif storage == "string" and kind is None and name in inputs:
+                # ISO text in an input of no recorded kind reads as UTC
+                # timestamps when every value is one, as `gf check` infers
+                # a snapshot column's kind; other text stays text.
+                try:
+                    values = _timestamps(values)
+                except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+                    continue
             else:
                 continue
         except (pa.ArrowInvalid, pa.ArrowNotImplementedError):

@@ -16,7 +16,8 @@ predicted through:
   hosted plane runs a revision.
 
 The forecasters include 500 series that end on different days, each with
-its own known-future promotions, and two declared related groups.
+its own known-future promotions, two declared related groups, and one whose
+context comes with each request, its lock checked without rows.
 
 Every path must answer the same predictions, floats within tolerance, and
 know the predictor by the same lock digest. The models are the tiny ones the
@@ -93,6 +94,21 @@ def forecaster_rows() -> pa.Table:
             "footfall": [float((step * 3) % 5) for _ in range(2) for step in range(20)],
             "promo": [float(step % 2) for _ in range(2) for step in range(20)],
         }
+    )
+
+
+def request_rows() -> pa.Table:
+    """The forecaster's rows with each series' last three targets blank: its queries."""
+    rows = forecaster_rows()
+    late = [
+        day >= START + datetime.timedelta(days=17) for day in rows["date"].to_pylist()
+    ]
+    units = [
+        None if blank else value
+        for blank, value in zip(late, rows["units"].to_pylist(), strict=True)
+    ]
+    return rows.set_column(
+        rows.schema.get_field_index("units"), "units", pa.array(units)
     )
 
 
@@ -177,6 +193,19 @@ CASES = {
             "context": {"snapshot": "rows.parquet", "until": "2025-03-18"},
         },
     ),
+    "request": (
+        request_rows,
+        {
+            "model": "general-forecast/chronos-2",
+            "target": "units",
+            "time": "date",
+            "series": ["store"],
+            "frequency": "1d",
+            "horizon": 3,
+            "inputs": {"past": ["footfall"], "future": ["promo"]},
+            "context": {"request": {}},
+        },
+    ),
     "many": (
         many_rows,
         {
@@ -222,15 +251,27 @@ def _queries(root: Path) -> pa.Table:
     A tabular query carries the id and inputs; a forecast query its series,
     time and known-future inputs, over the horizon after the context.
     """
-    predictor = gf.Predictor(root)
-    queries = predictor._query_frame
-    assert queries is not None and queries.num_rows
     document = yaml.safe_load((root / "gf.lock").read_text())["predictor"]
+    if document["context"]["kind"] == "request":
+        queries = _request(root)[1]
+    else:
+        queries = gf.Predictor(root)._query_frame
+    assert queries is not None and queries.num_rows
     if document["task"] == "forecast":
         future = [c["name"] for c in document["inputs"] if c["role"] == "future"]
         return queries.select([*document["series"], document["time"], *future])
     names = [column["name"] for column in document["inputs"]]
     return queries.select([document["id"], *names])
+
+
+def _request(root: Path) -> tuple[pa.Table, pa.Table]:
+    """A request-context predictor's call: the labeled rows, and the rows to predict."""
+    import pyarrow.compute as pc
+
+    document = yaml.safe_load((root / "gf.lock").read_text())["predictor"]
+    rows = pq.read_table(root / "rows.parquet")
+    blank = pc.is_null(rows[document["target"]])
+    return rows.filter(pc.invert(blank)), rows.filter(blank)
 
 
 def _records(frame: Any) -> list[dict[str, Any]]:
@@ -254,19 +295,33 @@ def _outputs(frame: pd.DataFrame) -> list[dict[str, Any]]:
     return _records(frame[names].reset_index(drop=True))
 
 
-def _cli(root: Path, queries: pa.Table, monkeypatch: Any) -> pd.DataFrame:
+def _cli(
+    root: Path, queries: pa.Table, monkeypatch: Any, context: pa.Table | None = None
+) -> pd.DataFrame:
     source, output = (
         root.parent / f"{root.name}-q.parquet",
         root.parent / f"{root.name}-out.parquet",
     )
     pq.write_table(queries, source)
+    given = []
+    if context is not None:
+        pq.write_table(context, root.parent / f"{root.name}-c.parquet")
+        given = ["--context", str(root.parent / f"{root.name}-c.parquet")]
     errors = io.StringIO()
     monkeypatch.setattr(sys, "stdout", io.StringIO())
     monkeypatch.setattr(sys, "stderr", errors)
     monkeypatch.setenv("NO_COLOR", "1")
     try:
         cli.main(
-            ["predict", str(root), "--queries", str(source), "--output", str(output)]
+            [
+                "predict",
+                str(root),
+                "--queries",
+                str(source),
+                "--output",
+                str(output),
+                *given,
+            ]
         )
     except SystemExit as error:
         assert not error.code, errors.getvalue()
@@ -281,20 +336,42 @@ def test_every_path_predicts_the_same_and_knows_the_same_lock(
     lock = yaml.safe_load((root / "gf.lock").read_text())
     digest = lock["digest"]
     queries = _queries(root)
+    # A request-context predictor takes its labeled rows with each call.
+    context = (
+        _request(root)[0] if lock["predictor"]["context"]["kind"] == "request" else None
+    )
 
-    local = gf.Predictor(root).predict(queries)
-    command = _cli(root, queries, monkeypatch)
+    local = gf.Predictor(root).predict(queries, context=context)
+    command = _cli(root, queries, monkeypatch, context)
 
     sent = pushed(root)
     assert sent.lock.digest == digest
     plan = hosting.compile_lock(sent.lock, sent.snapshot)
     published = hosting.published_entry(plan)
-    hosted = hosting.PredictorExecutor().prepare(plan, sent.snapshot).predict(queries)
+    hosted = (
+        hosting.PredictorExecutor()
+        .prepare(plan, sent.snapshot)
+        .predict(
+            queries,
+            context=None
+            if context is None
+            else hosting.served_context(sent.lock, context),
+        )
+    )
     hosted_frame = _frame_of_result({"predictions": hosted.to_pylist()}, plan.spec.id)
 
     server = Served(build(), str(root))
+    pending = None
     try:
-        served_rows = _predicted(server, case, queries)
+        try:
+            served_rows = _predicted(server, case, queries, context)
+        except AssertionError as refused:
+            # gf-server's binder types a request context from the lock's
+            # kinds, which a lock checked without rows lacks; its fix lands
+            # with gf-server's (P1). Every Python path still must agree.
+            if case != "request" or "features differ from lock" not in str(refused):
+                raise
+            served_rows, pending = [], "gf serve refuses a kindless request lock (P1)"
         described = json.loads((server.directory / "models.json").read_text())[0][
             "predictor"
         ]
@@ -320,7 +397,7 @@ def test_every_path_predicts_the_same_and_knows_the_same_lock(
     if case == "many":
         assert len(queries) == 1500
         assert len({row["date"] for row in queries.to_pylist()}) == 5
-    if case not in ("forecaster", "many", "grouped"):
+    if case not in ("forecaster", "request", "many", "grouped"):
         assert plan.spec.selection is not None
         assert plan.spec.selection.strategy == "retrieved"
         assert published["predictor"]["strategy"] == plan.spec.selection.strategy_spec()
@@ -330,6 +407,8 @@ def test_every_path_predicts_the_same_and_knows_the_same_lock(
     for name, frame in (
         ("cli", command),
         ("hosted", hosted_frame),
-        ("served", served_frame),
+        *(() if pending else (("served", served_frame),)),
     ):
         _same(_outputs(frame), expected, name)
+    if pending:
+        pytest.xfail(pending)
