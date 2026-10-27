@@ -86,7 +86,24 @@ fn fake_worker(mut stream: UnixStream) {
     });
 }
 
+/// A directory of its own for each shard a test starts.
+fn fresh_directory() -> std::path::PathBuf {
+    static SHARDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let shard = SHARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let directory =
+        std::env::temp_dir().join(format!("gf-http-test-{}-{shard}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&directory);
+    directory
+}
+
 async fn shard() -> tokio::sync::mpsc::Sender<gf_server::shard::Command> {
+    shard_in(fresh_directory()).await
+}
+
+/// A shard over a fake worker, logging its tables under `directory`.
+async fn shard_in(
+    directory: std::path::PathBuf,
+) -> tokio::sync::mpsc::Sender<gf_server::shard::Command> {
     let (ours, theirs) = UnixStream::pair().unwrap();
     fake_worker(theirs);
     let connection = WorkerConnection::fake(ours, vec!["tiny".to_string()]).unwrap();
@@ -110,7 +127,6 @@ async fn shard() -> tokio::sync::mpsc::Sender<gf_server::shard::Command> {
             idle: Duration::from_secs(300),
         },
     };
-    let directory = std::env::temp_dir().join(format!("gf-http-test-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
     let key = EncryptionKey::from_hex(&"ab".repeat(32)).unwrap();
     let mut shard = Shard::new(
@@ -135,6 +151,7 @@ fn served() -> ServedModel {
         description: json!({"name": "tabicl-v2-classifier", "artifact": {"license": "BSD-3-Clause"}}),
         license_source: None,
         predictor: None,
+        project: None,
     }
 }
 
@@ -828,6 +845,7 @@ fn predictor_model(name: &str, context: &str, snapshot: Option<&std::path::Path>
         description: json!({"name": name, "kind": "predictor"}),
         license_source: None,
         predictor: Some(serde_json::from_value(predictor).unwrap()),
+        project: None,
     }
 }
 
@@ -843,7 +861,12 @@ fn snapshot_file() -> std::path::PathBuf {
         ),
     ];
     let batch = RecordBatch::try_from_iter(columns).unwrap();
-    let path = std::env::temp_dir().join(format!("gf-http-snapshot-{}.arrow", std::process::id()));
+    static SNAPSHOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let snapshot = SNAPSHOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!(
+        "gf-http-snapshot-{}-{snapshot}.arrow",
+        std::process::id()
+    ));
     let file = std::fs::File::create(&path).unwrap();
     let mut writer = arrow_ipc::writer::StreamWriter::try_new(file, &batch.schema()).unwrap();
     writer.write(&batch).unwrap();
@@ -1471,4 +1494,370 @@ async fn a_front_without_revisions_refuses_deployment_predictions() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
     assert_eq!(body["error"]["code"], "NotFound");
+}
+
+/// A front with `keys` and `budget` bytes of requests, before its models are
+/// ready, answering on a TCP port whose address it returns.
+async fn listening(
+    keys: Box<dyn KeyStore>,
+    budget: u64,
+    timeout: Duration,
+) -> std::net::SocketAddr {
+    let front = Arc::new(Front::new(
+        vec![served()],
+        keys,
+        Surface::SelfHosted,
+        true,
+        RequestBudget::new(budget),
+        timeout,
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router(front).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    address
+}
+
+/// The head of a request for the ad hoc route announcing a `length`-byte body.
+fn announced(address: std::net::SocketAddr, length: usize, key: Option<&str>) -> String {
+    let authorization = key.map_or_else(String::new, |key| {
+        format!("Authorization: Bearer {key}\r\n")
+    });
+    format!(
+        "POST /v1/projects/local/predict HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\
+         Content-Type: application/json\r\n{authorization}Content-Length: {length}\r\n\r\n",
+        address.port()
+    )
+}
+
+/// The status line and body of the one answer `stream` reads.
+async fn answer_of(stream: &mut tokio::net::TcpStream) -> (String, Value) {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    let mut buffer = [0u8; 4096];
+    loop {
+        let read = tokio::time::timeout(Duration::from_secs(10), stream.read(&mut buffer))
+            .await
+            .expect("answered in time")
+            .unwrap();
+        bytes.extend_from_slice(&buffer[..read]);
+        let text = String::from_utf8_lossy(&bytes);
+        if let Some((head, body)) = text.split_once("\r\n\r\n")
+            && let Ok(body) = serde_json::from_str(body)
+        {
+            return (head.lines().next().unwrap().to_string(), body);
+        }
+        assert!(read > 0, "the connection closed before an answer: {text}");
+    }
+}
+
+#[tokio::test]
+async fn bodies_nobody_sends_never_hold_the_request_budget() {
+    use tokio::io::AsyncWriteExt;
+    let address = listening(
+        Box::new(Static::new(Some(KEY))),
+        2 << 20,
+        Duration::from_secs(30),
+    )
+    .await;
+    // Callers without a key announce whole bodies and never send them.
+    let mut stalled = Vec::new();
+    for _ in 0..4 {
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(announced(address, 1 << 20, None).as_bytes())
+            .await
+            .unwrap();
+        stalled.push(stream);
+    }
+    for stream in &mut stalled {
+        let (status, body) = answer_of(stream).await;
+        assert!(status.contains("401"), "{status} {body}");
+    }
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let body = envelope("ad-hoc", &adhoc_payload()).to_string();
+    stream
+        .write_all(format!("{}{body}", announced(address, body.len(), Some(KEY))).as_bytes())
+        .await
+        .unwrap();
+    let (status, body) = answer_of(&mut stream).await;
+    assert!(status.contains("503"), "{status} {body}");
+    assert_eq!(
+        body["error"]["code"], "ModelNotReady",
+        "not refused for capacity"
+    );
+}
+
+#[tokio::test]
+async fn a_body_that_stalls_past_the_timeout_gives_its_budget_back() {
+    use tokio::io::AsyncWriteExt;
+    let address = listening(
+        Box::new(Static::new(Some(KEY))),
+        1 << 20,
+        Duration::from_millis(300),
+    )
+    .await;
+    let mut stalled = tokio::net::TcpStream::connect(address).await.unwrap();
+    stalled
+        .write_all(announced(address, 1 << 20, Some(KEY)).as_bytes())
+        .await
+        .unwrap();
+    let (status, body) = answer_of(&mut stalled).await;
+    assert!(status.contains("408"), "{status} {body}");
+    assert_eq!(body["error"]["code"], "RequestTimeout");
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    let body = envelope("ad-hoc", &adhoc_payload()).to_string();
+    stream
+        .write_all(format!("{}{body}", announced(address, body.len(), Some(KEY))).as_bytes())
+        .await
+        .unwrap();
+    let (status, body) = answer_of(&mut stream).await;
+    assert_eq!(body["error"]["code"], "ModelNotReady", "{status} {body}");
+}
+
+/// A control plane that answers every introspection with `answer`, after
+/// `delay`, counting the calls.
+async fn introspection_plane(
+    answer: Value,
+    delay: Duration,
+) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::Json;
+    use axum::routing::post;
+
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = asked.clone();
+    let plane = axum::Router::new().route(
+        "/internal/v1/keys:introspect",
+        post(move || {
+            let (counter, answer) = (counter.clone(), answer.clone());
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(delay).await;
+                Json(answer)
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, plane).await.unwrap() });
+    (format!("http://{address}"), asked)
+}
+
+#[tokio::test]
+async fn a_key_that_expires_past_any_duration_is_trusted_as_one_that_never_does() {
+    use gf_server::http::Introspect;
+    let (plane, _) = introspection_plane(
+        json!({"active": true, "project": "team-a", "permissions": [], "expires": 1e300}),
+        Duration::ZERO,
+    )
+    .await;
+    let keys = Introspect::new(&plane, "service-token".to_string()).unwrap();
+    let principal = keys.verify(Some("Bearer anything")).await.unwrap();
+    assert_eq!(principal.project.as_deref(), Some("team-a"));
+}
+
+#[tokio::test]
+async fn concurrent_requests_with_one_key_share_one_introspection() {
+    use std::sync::atomic::Ordering;
+
+    use gf_server::http::Introspect;
+    let (plane, asked) = introspection_plane(
+        json!({"active": true, "project": "team-a", "permissions": [], "expires": null}),
+        Duration::from_millis(200),
+    )
+    .await;
+    let keys = Arc::new(Introspect::new(&plane, "service-token".to_string()).unwrap());
+    let verified = futures::future::join_all((0..8).map(|_| {
+        let keys = keys.clone();
+        async move { keys.verify(Some("Bearer shared")).await }
+    }))
+    .await;
+    assert!(verified.iter().all(Result::is_ok));
+    assert_eq!(asked.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_predictor_of_one_project_is_not_served_to_another() {
+    let snapshot = snapshot_file();
+    let mut model = predictor_model("churn", "snapshot", Some(&snapshot));
+    model.project = Some("owner".to_string());
+    let front = predictor_front(model).await;
+    let payload = predictor_payload("churn", json!([]), json!([{"id": "q", "x": 1.5}]));
+    let mut body = predictor_envelope("churn", &payload);
+    body["project"] = json!("owner");
+    let (status, _, answer) = call(
+        &front,
+        "POST",
+        "/v1/projects/owner/predictors/churn/predict",
+        Some(&body),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    body["project"] = json!("other");
+    let (status, _, answer) = call(
+        &front,
+        "POST",
+        "/v1/projects/other/predictors/churn/predict",
+        Some(&body),
+        &[],
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
+    let (_, _, listed) = call(&front, "GET", "/v1/projects/other/predictors", None, &[]).await;
+    assert_eq!(listed["result"]["predictors"], json!([]));
+    let (_, _, listed) = call(&front, "GET", "/v1/projects/owner/predictors", None, &[]).await;
+    assert_eq!(
+        listed["result"]["predictors"].as_array().map(Vec::len),
+        Some(1)
+    );
+}
+
+/// Saves the shards' heads and stops them, as a server does when it exits.
+async fn stop(shards: &[tokio::sync::mpsc::Sender<gf_server::shard::Command>]) {
+    use gf_server::shard::Command;
+    for shard in shards {
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        shard.send(Command::SaveHeads { reply }).await.unwrap();
+        answer.await.unwrap().unwrap();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        shard.send(Command::Shutdown { reply }).await.unwrap();
+        answer.await.unwrap().unwrap();
+    }
+}
+
+/// A started front over two shards logging under `directory`, its tables
+/// restored from there first, and the tables Flight would serve.
+async fn restarted(
+    models: Vec<ServedModel>,
+    directory: &std::path::Path,
+) -> (
+    Arc<Front>,
+    Vec<tokio::sync::mpsc::Sender<gf_server::shard::Command>>,
+    Vec<String>,
+) {
+    let front = Arc::new(Front::new(
+        models,
+        Box::new(Static::new(None)),
+        Surface::SelfHosted,
+        true,
+        RequestBudget::new(1 << 30),
+        Duration::from_secs(30),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    let shards = vec![
+        shard_in(directory.to_path_buf()).await,
+        shard_in(directory.to_path_buf()).await,
+    ];
+    let keys = gf_server::wal::Keys::only(EncryptionKey::from_hex(&"ab".repeat(32)).unwrap());
+    let (_, interrupted) = tokio::sync::watch::channel(false);
+    let placement = gf_server::runtime::restore(
+        &shards,
+        directory,
+        &keys,
+        Some(&front.bound_tables()),
+        &interrupted,
+    )
+    .await
+    .unwrap();
+    front
+        .start(shards.clone(), Arc::new(Routes::new(2, 4)))
+        .await
+        .unwrap();
+    let flight = placement
+        .keys()
+        .map(|name| name.as_str().to_string())
+        .collect();
+    (front, shards, flight)
+}
+
+#[tokio::test]
+async fn a_restart_keeps_a_snapshot_predictors_bound_table_and_drops_stale_ones() {
+    let snapshot = snapshot_file();
+    let directory = fresh_directory();
+    let logs = |directory: &std::path::Path| {
+        let mut logs: Vec<String> = std::fs::read_dir(directory)
+            .unwrap()
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| name.ends_with(".log"))
+            .collect();
+        logs.sort();
+        logs
+    };
+    let predict = |front: Arc<Front>| async move {
+        let payload = predictor_payload("churn", json!([]), json!([{"id": "q", "x": 1.5}]));
+        call(
+            &front,
+            "POST",
+            "/v1/projects/local/predictors/churn/predict",
+            Some(&predictor_envelope("churn", &payload)),
+            &[],
+        )
+        .await
+    };
+    let models = vec![
+        predictor_model("churn", "snapshot", Some(&snapshot)),
+        predictor_model("retired", "snapshot", Some(&snapshot)),
+    ];
+    let (front, shards, flight) = restarted(models, &directory).await;
+    assert!(flight.is_empty());
+    let (status, _, body) = predict(front.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(logs(&directory).len(), 2);
+    stop(&shards).await;
+    drop(front);
+
+    // The next start serves `churn` alone, from the table it bound before.
+    let (front, shards, flight) = restarted(
+        vec![predictor_model("churn", "snapshot", Some(&snapshot))],
+        &directory,
+    )
+    .await;
+    assert!(
+        flight.is_empty(),
+        "Flight never serves a bound table: {flight:?}"
+    );
+    let (status, _, body) = predict(front.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["result"]["context"]["rows"], json!(4));
+    let (table, _) = gf_server::engine::bound_table("sha256:churn").unwrap();
+    assert_eq!(logs(&directory), vec![format!("{table}.log")]);
+    stop(&shards).await;
+    std::fs::remove_file(snapshot).unwrap();
+}
+
+#[tokio::test]
+async fn a_shard_whose_queue_stays_full_times_a_request_out() {
+    use gf_server::engine::Engine;
+    use gf_server::shard::Command;
+    let (shard, _queue) = tokio::sync::mpsc::channel(1);
+    let (reply, _) = tokio::sync::oneshot::channel();
+    shard.send(Command::SaveHeads { reply }).await.unwrap();
+    let engine = Engine::new(
+        vec![shard],
+        Arc::new(Routes::new(1, 4)),
+        RequestBudget::new(1 << 20),
+        Duration::from_millis(100),
+    );
+    let table = gf_server::name::TableName::new("pkg-full").unwrap();
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        engine.predict_bound(&table, &[0; 32], vec![0.0], None),
+    )
+    .await
+    .expect("refused within the request timeout")
+    .unwrap_err();
+    assert_eq!(
+        (refused.status, refused.code.as_str()),
+        (504, "RequestTimeout")
+    );
 }

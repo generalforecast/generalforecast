@@ -325,9 +325,7 @@ impl Engine {
             )
         })?;
         let context = predictor::bind(&predictor.schema, predictor.task()?, target, &rows)?;
-        let fingerprint: [u8; 32] = Sha256::digest(predictor.lock_digest.as_bytes()).into();
-        let table =
-            TableName::new(format!("pkg-{}", request::hex(&fingerprint))).map_err(|_| failed())?;
+        let (table, fingerprint) = bound_table(&predictor.lock_digest).ok_or_else(failed)?;
         let levels = self
             .bind(
                 model,
@@ -352,7 +350,9 @@ impl Engine {
 
     /// Writes labeled rows, once, into a durable table on the shard their
     /// fingerprint names; answers the table's quantile levels, if it
-    /// predicts values.
+    /// predicts values. A table a previous start bound and restored there is
+    /// kept when it holds these rows' definition and count, filled when it
+    /// is empty, and bound again otherwise.
     #[allow(clippy::too_many_arguments)]
     pub async fn bind(
         &self,
@@ -374,13 +374,47 @@ impl Engine {
         }))
         .map_err(|_| failed())?;
         let shard = self.durable(fingerprint);
-        let (reply, answer) = oneshot::channel();
-        let create = Command::Create {
-            definition,
-            terms: Terms::default(),
-            reply,
+        let created = self
+            .exchange(shard, |reply| Command::Create {
+                definition: definition.clone(),
+                terms: Terms::default(),
+                reply,
+            })
+            .await?;
+        let levels = match created {
+            Ok(levels) => levels,
+            Err(ServerError::Exists(_)) => {
+                let described = self
+                    .exchange(shard, |reply| Command::Describe {
+                        table: table.clone(),
+                        reply,
+                    })
+                    .await??;
+                let same = described.definition.model == definition.model
+                    && described.definition.columns == definition.columns
+                    && described.definition.classes == definition.classes;
+                if same && described.rows == rows as u64 {
+                    return Ok(described.levels);
+                }
+                if !same || described.rows != 0 {
+                    self.exchange(shard, |reply| Command::Release {
+                        table: table.clone(),
+                        keep: false,
+                        reply,
+                    })
+                    .await??;
+                    self.exchange(shard, |reply| Command::Create {
+                        definition,
+                        terms: Terms::default(),
+                        reply,
+                    })
+                    .await??
+                } else {
+                    described.levels
+                }
+            }
+            Err(error) => return Err(error.into()),
         };
-        let levels = self.wait(self.routes.shard(shard), create, answer).await?;
         let written = Rows {
             keys: (0..rows as u128).collect(),
             features,
@@ -392,18 +426,15 @@ impl Engine {
             layout: None,
             table: None,
         };
-        let (reply, answer) = oneshot::channel();
-        let write = Command::Write {
+        let charge = self.budget.charge();
+        self.exchange(shard, |reply| Command::Write {
             table: table.clone(),
             write: Write::Insert(Incoming::from(written)),
-            fence: Fence {
-                lease: None,
-                term: None,
-            },
-            charge: self.budget.charge(),
+            fence: Fence::default(),
+            charge,
             reply,
-        };
-        self.wait(self.routes.shard(shard), write, answer).await?;
+        })
+        .await??;
         Ok(levels)
     }
 
@@ -445,14 +476,13 @@ impl Engine {
 
     /// Drops a durable table `bind` wrote.
     pub async fn unbind(&self, table: &TableName, fingerprint: &[u8; 32]) -> Result<(), ApiError> {
-        let (reply, answer) = oneshot::channel();
-        let release = Command::Release {
+        self.exchange(self.durable(fingerprint), |reply| Command::Release {
             table: table.clone(),
             keep: false,
             reply,
-        };
-        let shard = self.routes.shard(self.durable(fingerprint));
-        self.wait(shard, release, answer).await
+        })
+        .await??;
+        Ok(())
     }
 
     /// Has every shard's worker load a model under `name` from `spec`, as a
@@ -478,10 +508,21 @@ impl Engine {
         self.budget.charge()
     }
 
-    /// The shard a durable table's fingerprint names, by `route::shard_of`:
-    /// its table stays there, however busy.
+    /// The shard a durable table's fingerprint names: its table stays there,
+    /// however busy.
     fn durable(&self, fingerprint: &[u8; 32]) -> usize {
-        route::shard_of(fingerprint, self.shards.len())
+        bound_shard(fingerprint, self.shards.len())
+    }
+
+    /// Asks shard `shard` and waits for its answer, as `wait` does.
+    async fn exchange<T>(
+        &self,
+        shard: usize,
+        command: impl FnOnce(oneshot::Sender<Result<T, ServerError>>) -> Command,
+    ) -> Result<Result<T, ServerError>, ApiError> {
+        let (reply, answer) = oneshot::channel();
+        self.answered(self.routes.shard(shard), command(reply), answer)
+            .await
     }
 
     /// Sends a shard a command and waits, within the request timeout, for
@@ -492,6 +533,18 @@ impl Engine {
         command: Command,
         answer: oneshot::Receiver<Result<T, ServerError>>,
     ) -> Result<T, ApiError> {
+        Ok(self.answered(busy, command, answer).await??)
+    }
+
+    /// The shard's answer to a command, or why there is none: it stopped, or
+    /// it neither took the command nor answered within the request timeout,
+    /// which a shard whose queue is full counts against too.
+    async fn answered<T>(
+        &self,
+        busy: Busy<'_>,
+        command: Command,
+        answer: oneshot::Receiver<Result<T, ServerError>>,
+    ) -> Result<Result<T, ServerError>, ApiError> {
         let stopped = || {
             ApiError::new(
                 "ModelUnavailable",
@@ -499,14 +552,43 @@ impl Engine {
                 503,
             )
         };
+        let timed_out = || ApiError::new("RequestTimeout", "inference timed out", 504);
+        let deadline = tokio::time::Instant::now() + self.timeout;
         let shard = &self.shards[busy.shard];
-        shard.send(command).await.map_err(|_| stopped())?;
-        let answered = tokio::time::timeout(self.timeout, answer)
+        tokio::time::timeout_at(deadline, shard.send(command))
             .await
-            .map_err(|_| ApiError::new("RequestTimeout", "inference timed out", 504))?
+            .map_err(|_| timed_out())?
             .map_err(|_| stopped())?;
-        Ok(answered?)
+        tokio::time::timeout_at(deadline, answer)
+            .await
+            .map_err(|_| timed_out())?
+            .map_err(|_| stopped())
     }
+}
+
+/// The first part of the name of every table a snapshot predictor's rows
+/// are bound into, which Flight clients may not create.
+pub const BOUND_PREFIX: &str = "pkg-";
+
+/// The durable table a snapshot predictor locked as `lock_digest` binds
+/// into, and the fingerprint that places it.
+#[must_use]
+pub fn bound_table(lock_digest: &str) -> Option<(TableName, [u8; 32])> {
+    let fingerprint: [u8; 32] = Sha256::digest(lock_digest.as_bytes()).into();
+    let name = TableName::new(format!("{BOUND_PREFIX}{}", request::hex(&fingerprint))).ok()?;
+    Some((name, fingerprint))
+}
+
+/// Whether `table` is a name `bound_table` gives.
+#[must_use]
+pub fn is_bound(table: &TableName) -> bool {
+    table.as_str().starts_with(BOUND_PREFIX)
+}
+
+/// The shard of `shards` a bound table with `fingerprint` lives on.
+#[must_use]
+pub fn bound_shard(fingerprint: &[u8; 32], shards: usize) -> usize {
+    route::shard_of(fingerprint, shards)
 }
 
 /// A tabular context in the ephemeral table its fingerprint names.

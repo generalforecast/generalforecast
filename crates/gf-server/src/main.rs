@@ -5,7 +5,6 @@
 //! `init` writes a starter configuration, and `check` looks at everything a
 //! configuration needs before starting.
 
-use std::collections::HashMap;
 use std::error::Error;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -18,7 +17,6 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use clap::Parser;
-use gf_core::node::Task;
 use gf_server::auth::Tokens;
 use gf_server::config::{Config, HttpConfig, KeysConfig};
 use gf_server::http::{Front, Introspect, KeyStore, Principal, ServedModel, Static};
@@ -26,7 +24,7 @@ use gf_server::metrics::Metrics;
 use gf_server::progress::{Compiling, Progress};
 use gf_server::revisions::{Limits as RevisionLimits, Revisions};
 use gf_server::runtime;
-use gf_server::service::{Placement, RequestBudget, SeriesPlacement, Service};
+use gf_server::service::{RequestBudget, Service};
 use gf_server::setup;
 use gf_server::shard::Command;
 use gf_server::upstream::{Cidr, Upstream};
@@ -249,60 +247,10 @@ async fn run(config: &std::path::Path) -> Result<(), Box<dyn Error>> {
     };
     let (shards, routes) = started.map_err(|error| -> Box<dyn Error> { error })?;
 
-    let mut placement = HashMap::new();
-    for (index, path) in setup::table_logs(&tables)?.iter().enumerate() {
-        if *interrupted.borrow() {
-            break;
-        }
-        // A log under a key the server lacks refuses the start, rather than
-        // leave its table out until a start that has the key.
-        let Some(replay) =
-            setup::open_log(path, &keys).map_err(|error| format!("{}: {error}", path.display()))?
-        else {
-            continue;
-        };
-        let definition = replay.definition().clone();
-        let shard = index % shards.len();
-        let name = definition.name.clone();
-        let rotate = replay.needs_rotation();
-        let (reply, answer) = oneshot::channel();
-        shards[shard]
-            .send(Command::Restore {
-                replay: Box::new(replay),
-                reply,
-            })
-            .await?;
-        // A table that cannot be served, such as one whose model left the
-        // configuration, keeps its log and leaves the others to start.
-        let levels = match answer.await? {
-            Ok(levels) => levels,
-            Err(error) => {
-                tracing::error!(table = name.as_str(), "not serving a table: {error}");
-                continue;
-            }
-        };
-        let placed = Placement {
-            shard,
-            task: Task::of_classes(definition.classes),
-            columns: Arc::new(definition.columns.clone()),
-            created: definition.created.clone(),
-            levels: levels.map(Arc::new),
-            series: SeriesPlacement::of(&definition),
-        };
-        if rotate {
-            // Rewrites the log under the current key before it takes writes.
-            let (reply, answer) = oneshot::channel();
-            let table = name.clone();
-            shards[shard].send(Command::Rotate { table, reply }).await?;
-            answer.await??;
-            tracing::info!(
-                table = name.as_str(),
-                "rewrote the log under the current key"
-            );
-        }
-        tracing::info!(table = name.as_str(), shard, "restored");
-        placement.insert(name, placed);
-    }
+    let bound = front.as_ref().map(|(front, _, _)| front.bound_tables());
+    let placement = runtime::restore(&shards, &tables, &keys, bound.as_ref(), &interrupted)
+        .await
+        .map_err(|error| -> Box<dyn Error> { error })?;
 
     // Ctrl-C while the tables restored: the workers are up, so stop them.
     if *interrupted.borrow() {

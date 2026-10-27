@@ -2552,6 +2552,12 @@ impl Service {
                         "a table splits into partitions only through a router",
                     ));
                 }
+                if crate::engine::is_bound(&definition.name) {
+                    return Err(invalid(format!(
+                        "table names starting with {:?} are the Models API's own",
+                        crate::engine::BOUND_PREFIX
+                    )));
+                }
                 let mut definition = *definition;
                 let created = creation_id()?;
                 definition.created = Some(created.clone());

@@ -22,7 +22,8 @@ use axum::body::Body;
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::response::Response;
-use futures::future::BoxFuture;
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
 use gf_core::catalog::{self, Surface};
 
 use gf_core::forecasting::KNOWN;
@@ -36,12 +37,15 @@ use serde_json::{Map, Number, Value, json};
 use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 
+use crate::auth::digest;
 use crate::engine::{self, Bound, Engine};
+use crate::name::TableName;
 use crate::predictors::{self, ContextMode, ForecastPredictor, ServedPredictor};
 use crate::progress::Compiling;
 use crate::revisions::{Published, Record, Revisions};
 use crate::routes::Routes;
 use crate::service::{Charge, RequestBudget, quantile_values};
+use crate::setup::random_hex;
 use crate::shard::{Asked, Command, Inferred, ServerError};
 use crate::upstream::Upstream;
 use arrow_array::RecordBatch;
@@ -55,6 +59,8 @@ pub const MAX_BYTES: usize = 1_048_576;
 const MAX_DEPTH: usize = 16;
 const MAX_NODES: usize = 65_536;
 const MAX_INTEGER: i64 = (1 << 53) - 1;
+/// The first path segment of the control plane's service-to-service routes.
+const INTERNAL: &str = "internal";
 /// The kinds of resource an envelope may name.
 const RESOURCE_KINDS: [&str; 9] = [
     "workspace",
@@ -262,6 +268,10 @@ pub struct ServedModel {
     /// The locked predictor served, if the model is one.
     #[serde(default)]
     pub predictor: Option<ServedPredictor>,
+    /// The one project whose routes reach this predictor, or None for
+    /// every project, as on a server that serves one owner alone.
+    #[serde(default)]
+    pub project: Option<String>,
 }
 
 /// Who a bearer key belongs to, and what it may do.
@@ -325,10 +335,6 @@ fn presented(authorization: Option<&str>) -> Result<&str, ApiError> {
     Ok(key)
 }
 
-fn digest(key: &str) -> [u8; 32] {
-    Sha256::digest(key.as_bytes()).into()
-}
-
 /// One key for every project, as `gf serve` takes it from `GF_API_KEY`; or
 /// none, where only this machine, or a network the operator trusts, reaches
 /// the server.
@@ -385,16 +391,21 @@ impl KeyStore for Static {
 
 /// The control plane's keys, checked through its introspection endpoint
 /// under a service token, with answers cached briefly: valid keys for 30
-/// seconds or until they expire, refused ones for 5.
+/// seconds or until they expire, refused ones for 5. Concurrent requests
+/// presenting one key share one introspection call.
 pub struct Introspect {
     client: reqwest::Client,
-    url: String,
-    token: String,
+    url: Arc<str>,
+    token: Arc<str>,
     cache: Mutex<HashMap<[u8; 32], Cached>>,
+    asking: Mutex<HashMap<[u8; 32], Asking>>,
 }
 
 /// An introspection answer, and until when it is trusted.
 type Cached = (Option<Principal>, Instant);
+
+/// An introspection call under way, which every request presenting its key awaits.
+type Asking = Shared<BoxFuture<'static, Result<(Option<Principal>, Duration), ApiError>>>;
 
 /// What the introspection endpoint answers for a valid key.
 #[derive(Deserialize)]
@@ -425,9 +436,10 @@ impl Introspect {
             .map_err(|error| error.to_string())?;
         Ok(Self {
             client,
-            url: format!("{}/internal/v1/keys:introspect", base.trim_end_matches('/')),
-            token,
+            url: format!("{}/internal/v1/keys:introspect", base.trim_end_matches('/')).into(),
+            token: token.into(),
             cache: Mutex::new(HashMap::new()),
+            asking: Mutex::new(HashMap::new()),
         })
     }
 
@@ -439,50 +451,95 @@ impl Introspect {
             .map(|(principal, _)| principal.clone())
     }
 
+    /// Caches an answer. A full cache sheds what has expired, then the
+    /// refused keys, which a caller presenting random keys fills it with,
+    /// and only then the valid keys it still holds.
     fn remember(&self, verifier: [u8; 32], principal: Option<Principal>, ttl: Duration) {
         let mut cache = self.cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if cache.len() >= CACHED_KEYS {
+            let now = Instant::now();
+            cache.retain(|_, (_, until)| *until > now);
+        }
+        if cache.len() >= CACHED_KEYS {
+            cache.retain(|_, (principal, _)| principal.is_some());
+        }
         if cache.len() >= CACHED_KEYS {
             cache.clear();
         }
         cache.insert(verifier, (principal, Instant::now() + ttl));
     }
 
-    async fn ask(&self, verifier: &[u8; 32]) -> Result<(Option<Principal>, Duration), ApiError> {
-        let unavailable =
-            || ApiError::new("CredentialUnavailable", "cannot check API keys now", 503);
-        let hex: String = verifier.iter().map(|byte| format!("{byte:02x}")).collect();
-        let response = self
-            .client
-            .post(&self.url)
-            .bearer_auth(&self.token)
-            .json(&json!({"verifier": hex}))
-            .send()
-            .await
-            .map_err(|_| unavailable())?;
-        // Unknown keys answer 200 `{"active": false}`; any other status says
-        // the control plane or this server's service token is at fault, not
-        // the key, so it is neither cached nor answered as a bad key.
-        if response.status() != StatusCode::OK {
-            return Err(unavailable());
-        }
-        let found: Introspected = response.json().await.map_err(|_| unavailable())?;
-        if !found.active {
-            return Ok((None, NEGATIVE_TTL));
-        }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        let left = match found.expires {
-            Some(expires) if expires <= now.as_secs_f64() => return Ok((None, NEGATIVE_TTL)),
-            Some(expires) => Duration::from_secs_f64(expires - now.as_secs_f64()),
-            None => POSITIVE_TTL,
-        };
-        let principal = Principal {
-            project: Some(found.project),
-            permissions: Some(found.permissions),
-        };
-        Ok((Some(principal), left.min(POSITIVE_TTL)))
+    /// The introspection call for `verifier`: the one under way, or a new one.
+    fn asking(&self, verifier: [u8; 32]) -> Asking {
+        let mut asking = self.asking.lock().unwrap_or_else(PoisonError::into_inner);
+        asking
+            .entry(verifier)
+            .or_insert_with(|| {
+                ask(
+                    self.client.clone(),
+                    self.url.clone(),
+                    self.token.clone(),
+                    verifier,
+                )
+                .boxed()
+                .shared()
+            })
+            .clone()
     }
+
+    /// Forgets a finished call, unless a later one for the key took its place.
+    fn asked(&self, verifier: &[u8; 32], call: &Asking) {
+        let mut asking = self.asking.lock().unwrap_or_else(PoisonError::into_inner);
+        if asking
+            .get(verifier)
+            .is_some_and(|current| current.ptr_eq(call))
+        {
+            asking.remove(verifier);
+        }
+    }
+}
+
+/// Asks the control plane who `verifier`'s key is, and for how long to trust the answer.
+async fn ask(
+    client: reqwest::Client,
+    url: Arc<str>,
+    token: Arc<str>,
+    verifier: [u8; 32],
+) -> Result<(Option<Principal>, Duration), ApiError> {
+    let unavailable = || ApiError::new("CredentialUnavailable", "cannot check API keys now", 503);
+    let response = client
+        .post(&*url)
+        .bearer_auth(&token)
+        .json(&json!({"verifier": request::hex(&verifier)}))
+        .send()
+        .await
+        .map_err(|_| unavailable())?;
+    // Unknown keys answer 200 `{"active": false}`; any other status says
+    // the control plane or this server's service token is at fault, not
+    // the key, so it is neither cached nor answered as a bad key.
+    if response.status() != StatusCode::OK {
+        return Err(unavailable());
+    }
+    let found: Introspected = response.json().await.map_err(|_| unavailable())?;
+    if !found.active {
+        return Ok((None, NEGATIVE_TTL));
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let left = match found.expires {
+        Some(expires) if expires <= now.as_secs_f64() => return Ok((None, NEGATIVE_TTL)),
+        // An expiry too far off for a duration is as good as none.
+        Some(expires) => {
+            Duration::try_from_secs_f64(expires - now.as_secs_f64()).unwrap_or(POSITIVE_TTL)
+        }
+        None => POSITIVE_TTL,
+    };
+    let principal = Principal {
+        project: Some(found.project),
+        permissions: Some(found.permissions),
+    };
+    Ok((Some(principal), left.min(POSITIVE_TTL)))
 }
 
 impl KeyStore for Introspect {
@@ -495,7 +552,10 @@ impl KeyStore for Introspect {
             let principal = match self.cached(&verifier) {
                 Some(principal) => principal,
                 None => {
-                    let (principal, ttl) = self.ask(&verifier).await?;
+                    let call = self.asking(verifier);
+                    let answered = call.clone().await;
+                    self.asked(&verifier, &call);
+                    let (principal, ttl) = answered?;
                     self.remember(verifier, principal.clone(), ttl);
                     principal
                 }
@@ -774,6 +834,21 @@ impl Front {
         Ok(())
     }
 
+    /// The durable tables `start` binds snapshot predictors' rows into, by
+    /// name, with the fingerprints that place them, so a restart restores
+    /// each where `start` looks for it.
+    #[must_use]
+    pub fn bound_tables(&self) -> HashMap<TableName, [u8; 32]> {
+        self.models
+            .iter()
+            .filter_map(|served| served.predictor.as_ref())
+            .filter(|predictor| {
+                predictor.context == ContextMode::Snapshot && predictor.forecast.is_none()
+            })
+            .filter_map(|predictor| engine::bound_table(&predictor.lock_digest))
+            .collect()
+    }
+
     /// Whether the front takes inference: its shards are up, its snapshot
     /// predictors bound, and it is not draining.
     #[must_use]
@@ -858,8 +933,11 @@ fn failure(scope: Option<&Scope>, error: &ApiError) -> Response {
 }
 
 async fn handle(State(front): State<Arc<Front>>, request: Request) -> Response {
+    if internal(request.uri().path()) {
+        return failure(None, &ApiError::new("NotFound", "route not found", 404));
+    }
     if let Some(upstream) = &front.upstream
-        && !owns(request.uri().path())
+        && !owns(request.method(), request.uri().path())
     {
         let peer = request
             .extensions()
@@ -879,6 +957,12 @@ async fn handle(State(front): State<Arc<Front>>, request: Request) -> Response {
 
 /// Answers one request; `scope` is set once its envelope is known, so a
 /// later failure carries it.
+///
+/// Everything a request's headers and path decide, its key among them, is
+/// checked before its body is read: a body counts against the request
+/// budget only once its sender is known, and must arrive within the
+/// front's request timeout, so neither an anonymous caller nor a stalled
+/// one can hold the budget.
 async fn answer(
     front: &Front,
     request: Request,
@@ -925,21 +1009,8 @@ async fn answer(
             413,
         ));
     }
-    // What the body holds counts against the server's request budget until answered.
-    let mut charge = front.budget.charge();
-    charge.grow(length as u64).map_err(|_| {
-        ApiError::new(
-            "CapacityExceeded",
-            "the server is at capacity; retry shortly",
-            503,
-        )
-    })?;
-    let body = axum::body::to_bytes(body, MAX_BYTES)
-        .await
-        .map_err(|_| ApiError::new("ValidationError", "invalid HTTP message", 400))?;
-    require(body.len() == length, "truncated request body")?;
     require(
-        parts.method != Method::GET || body.is_empty(),
+        parts.method != Method::GET || length == 0,
         "GET bodies are forbidden",
     )?;
     if target == "/livez" {
@@ -981,7 +1052,14 @@ async fn answer(
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     let request_id = match header("x-gf-request-id") {
         Some(id) => id.to_string(),
-        None => format!("r-{}", random_hex()),
+        None => format!(
+            "r-{}",
+            random_hex(16).map_err(|_| ApiError::new(
+                "InternalError",
+                "request failed safely",
+                500
+            ))?
+        ),
     };
     require(
         request_id.len() <= 128 && request_id.bytes().all(|byte| (33..=126).contains(&byte)),
@@ -990,13 +1068,37 @@ async fn answer(
     if let Some(given) = header("x-gf-project") {
         require(given == project, "project header/path mismatch")?;
     }
-    let payload = if parts.method == Method::GET {
+    if parts.method == Method::GET {
         *scope = Some(Scope {
             project: project.clone(),
-            request_id,
+            request_id: request_id.clone(),
             kind: action.kind().into(),
             name: resource.clone(),
         });
+    }
+    let principal = front.keys.verify(header("authorization")).await?;
+    principal.authorize(&project, action.permission())?;
+    // What the body holds counts against the server's request budget until answered.
+    let mut charge = front.budget.charge();
+    charge.grow(length as u64).map_err(|_| {
+        ApiError::new(
+            "CapacityExceeded",
+            "the server is at capacity; retry shortly",
+            503,
+        )
+    })?;
+    let body = tokio::time::timeout(front.timeout, axum::body::to_bytes(body, MAX_BYTES))
+        .await
+        .map_err(|_| {
+            ApiError::new(
+                "RequestTimeout",
+                "the request body did not arrive in time",
+                408,
+            )
+        })?
+        .map_err(|_| ApiError::new("ValidationError", "invalid HTTP message", 400))?;
+    require(body.len() == length, "truncated request body")?;
+    let payload = if parts.method == Method::GET {
         Value::Object(Map::new())
     } else {
         let content_type = header("content-type").unwrap_or_default();
@@ -1021,8 +1123,6 @@ async fn answer(
         )?;
         payload
     };
-    let principal = front.keys.verify(header("authorization")).await?;
-    principal.authorize(&project, action.permission())?;
     if !front.ready() {
         return Err(not_ready());
     }
@@ -1132,12 +1232,13 @@ fn name(value: &str) -> Result<String, ApiError> {
     Ok(value.to_string())
 }
 
-/// Maps the Models API paths to a project, action and resource; every other
-/// path is NotFound.
-/// Whether `path` is the front's to answer, whatever its method or
-/// spelling, so no inference route, nor a malformed one, is ever proxied.
+/// Whether `method` on `path` is the front's to answer: health, or one of
+/// the routes `resolve` serves, however its segments are cased or split, so
+/// no inference route, nor a misspelling of one, is ever proxied. Every
+/// other route, such as a hosted predictor's revisions or environments,
+/// streams upstream.
 #[must_use]
-pub fn owns(path: &str) -> bool {
+pub fn owns(method: &Method, path: &str) -> bool {
     if matches!(path, "/livez" | "/healthz" | "/readyz") {
         return true;
     }
@@ -1148,20 +1249,68 @@ pub fn owns(path: &str) -> bool {
     if !api.eq_ignore_ascii_case("v1") || !projects.eq_ignore_ascii_case("projects") {
         return false;
     }
+    // An escaped segment could spell any route once decoded; it is refused
+    // here rather than proxied.
+    if tail.iter().any(|part| part.contains('%')) {
+        return true;
+    }
     let lower: Vec<String> = tail.iter().map(|part| part.to_ascii_lowercase()).collect();
-    match lower
-        .iter()
-        .map(String::as_str)
-        .collect::<Vec<_>>()
-        .as_slice()
-    {
-        [] => false,
-        [first, ..] if first.contains('%') => true,
-        ["models", ..] | ["predictors", ..] | ["predict", ..] => true,
-        _ => false,
+    let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
+    route(method, &lower).is_some()
+}
+
+/// The action a route's segments after its project name, if it is one the
+/// front serves.
+fn route(method: &Method, tail: &[&str]) -> Option<Action> {
+    match (method, tail) {
+        (&Method::GET, ["models"]) => Some(Action::List),
+        (&Method::GET, ["models", _]) => Some(Action::Get),
+        (&Method::GET, ["predictors"]) => Some(Action::Predictors),
+        (&Method::GET, ["predictors", _]) => Some(Action::Predictor),
+        (&Method::POST, ["predictors", _, "predict"]) => Some(Action::PredictorPredict),
+        (&Method::POST, ["predict"]) => Some(Action::AdHoc),
+        _ => None,
     }
 }
 
+/// Whether `path` is one of the control plane's service-to-service routes,
+/// under `/internal`, which only this server's own calls may reach; a
+/// client's request for one is refused rather than proxied.
+#[must_use]
+pub fn internal(path: &str) -> bool {
+    path.split('/')
+        .find(|part| !part.is_empty())
+        .is_some_and(|first| percent_decoded(first).eq_ignore_ascii_case(INTERNAL))
+}
+
+/// `segment` with its `%XX` escapes decoded; an escape that is not one is
+/// kept as it is.
+fn percent_decoded(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let escaped = (bytes[index] == b'%')
+            .then(|| bytes.get(index + 1..index + 3))
+            .flatten()
+            .and_then(|hex| std::str::from_utf8(hex).ok())
+            .and_then(|hex| u8::from_str_radix(hex, 16).ok());
+        match escaped {
+            Some(byte) => {
+                decoded.push(byte);
+                index += 3;
+            }
+            None => {
+                decoded.push(bytes[index]);
+                index += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+/// Maps the Models API paths to a project, action and resource; every other
+/// path is NotFound.
 fn resolve(method: &Method, path: &str) -> Result<(String, Action, String), ApiError> {
     let not_found = || ApiError::new("NotFound", "route not found", 404);
     let parts: Vec<&str> = path.split('/').collect();
@@ -1173,25 +1322,14 @@ fn resolve(method: &Method, path: &str) -> Result<(String, Action, String), ApiE
     }
     let project = name(parts[3])?;
     let tail = &parts[4..];
-    match (method, tail) {
-        (&Method::GET, ["models"]) => Ok((project, Action::List, "models".into())),
-        (&Method::GET, ["models", model]) => Ok((project, Action::Get, name(model)?)),
-        (&Method::GET, ["predictors"]) => Ok((project, Action::Predictors, "predictors".into())),
-        (&Method::GET, ["predictors", predictor]) => {
-            Ok((project, Action::Predictor, name(predictor)?))
-        }
-        (&Method::POST, ["predictors", predictor, "predict"]) => {
-            Ok((project, Action::PredictorPredict, name(predictor)?))
-        }
-        (&Method::POST, ["predict"]) => Ok((project, Action::AdHoc, "ad-hoc".into())),
-        _ => Err(not_found()),
-    }
-}
-
-fn random_hex() -> String {
-    let mut bytes = [0u8; 16];
-    let _ = getrandom::fill(&mut bytes);
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    let action = route(method, tail).ok_or_else(not_found)?;
+    let resource = match action {
+        Action::List => "models".to_string(),
+        Action::Predictors => "predictors".to_string(),
+        Action::AdHoc => "ad-hoc".to_string(),
+        Action::Get | Action::Predictor | Action::PredictorPredict => name(tail[1])?,
+    };
+    Ok((project, action, resource))
 }
 
 /// JSON parsed without accepting ambiguous objects, which repeat a key.
@@ -1384,26 +1522,14 @@ impl Front {
             .ok_or_else(ApiError::not_served)
     }
 
-    /// The predictor `name` serves, with its lock.
-    fn predictor(&self, name: &str) -> Result<(&ServedModel, &ServedPredictor), ApiError> {
-        self.models
-            .iter()
-            .find_map(|served| {
-                served
-                    .predictor
-                    .as_ref()
-                    .map(|predictor| (served, predictor))
-            })
-            .filter(|(served, _)| served.name == name)
-            .or_else(|| {
-                self.models.iter().find_map(|served| {
-                    served
-                        .predictor
-                        .as_ref()
-                        .filter(|_| served.name == name)
-                        .map(|predictor| (served, predictor))
-                })
-            })
+    /// The predictor `name` serves to `project`, with its lock.
+    fn predictor<'a>(
+        &'a self,
+        project: &'a str,
+        name: &str,
+    ) -> Result<(&'a ServedModel, &'a ServedPredictor), ApiError> {
+        self.predictors(project)
+            .find(|(served, _)| served.name == name)
             .ok_or_else(|| {
                 ApiError::new(
                     "NotFound",
@@ -1412,6 +1538,21 @@ impl Front {
                 )
                 .param("name")
             })
+    }
+
+    /// The predictors `project` reaches here, with their locks.
+    fn predictors<'a>(
+        &'a self,
+        project: &'a str,
+    ) -> impl Iterator<Item = (&'a ServedModel, &'a ServedPredictor)> + 'a {
+        self.models.iter().filter_map(move |served| {
+            let reaches = served.project.as_deref().is_none_or(|own| own == project);
+            served
+                .predictor
+                .as_ref()
+                .filter(|_| reaches)
+                .map(|predictor| (served, predictor))
+        })
     }
 
     /// A catalog model's `GET models` entry: the catalog's description, the
@@ -1621,21 +1762,15 @@ async fn dispatch(
         Action::Get => Ok(front.model_description(front.served(resource)?)),
         Action::Predictors => Ok(json!({
             "predictors": front
-                .models
-                .iter()
-                .filter_map(|served| {
-                    served
-                        .predictor
-                        .as_ref()
-                        .map(|predictor| front.predictor_description(served, predictor))
-                })
+                .predictors(project)
+                .map(|(served, predictor)| front.predictor_description(served, predictor))
                 .collect::<Vec<_>>()
         })),
         Action::Predictor => {
-            let (served, predictor) = front.predictor(resource)?;
+            let (served, predictor) = front.predictor(project, resource)?;
             Ok(front.predictor_description(served, predictor))
         }
-        Action::PredictorPredict => match front.predictor(resource) {
+        Action::PredictorPredict => match front.predictor(project, resource) {
             Ok((served, predictor)) => {
                 predictor_predict(front, served, predictor, &payload, charge).await
             }
