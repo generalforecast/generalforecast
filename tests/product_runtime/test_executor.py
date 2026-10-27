@@ -3,42 +3,37 @@
 
 """Predictor execution contract tests. Injected numeric kernels are not model evidence."""
 
+import json
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError, replace
 
 import pyarrow as pa
 import pytest
-import yaml
 
 from generalforecast.engine import ModelOutputError
-from generalforecast.predictors.models import ModelPin
 from generalforecast.predictors.runtime import PredictorExecutor
-from generalforecast.predictors.runtime.compile import (
-    compile_dir,
-    compile_plan,
-    plan_from_dir,
-)
-from generalforecast.predictors.runtime.lock import ExecutionLock
-from generalforecast.predictors.validation import digest
+from generalforecast.predictors.selection import SelectionInfo
+from generalforecast.predictors.validation import PredictorError
 from generalforecast.service.contracts import ServiceError
 from generalforecast.service.interfaces import PreparedExecution
-from generalforecast.tabular import arrow_bytes
 from tests.utils.engine import FakeEngine
+from tests.utils.locks import compiled
 
 
 def checked(root, data, **changes):
-    root.mkdir(exist_ok=True)
-    spec = {
-        "name": "test-model",
-        "model": "general-forecast/tabicl-v2-classifier",
-        "context": "history.arrow",
-        "target": "y",
-        **changes,
+    """The compiled plan of a directory checked with these manifest settings.
+
+    `past_inputs` and `future_inputs` are a forecaster's `inputs.past` and
+    `inputs.future`.
+    """
+    covariates = {
+        key: changes.pop(f"{key}_inputs")
+        for key in ("past", "future")
+        if f"{key}_inputs" in changes
     }
-    (root / "gf.yaml").write_text(yaml.safe_dump(spec))
-    (root / "history.arrow").write_bytes(arrow_bytes(data))
-    plan, snapshot = plan_from_dir(root)
-    return compile_plan(plan, snapshot if plan.context.mode == "snapshot" else data)
+    if covariates:
+        changes["inputs"] = covariates
+    return compiled(root, data, **changes)
 
 
 @pytest.fixture
@@ -77,21 +72,24 @@ def test_prepare_warms_once_preserves_ids_outputs_and_immutable_state(
         prepared.context_rows = 100  # ty: ignore[invalid-assignment]
 
 
-def test_full_snapshot_checked_before_explicit_selection(tmp_path, data, kernels):
+def test_the_locked_selection_binds_and_the_full_snapshot_is_checked(
+    tmp_path, data, kernels, monkeypatch
+):
+    fake = FakeEngine().install(monkeypatch)
     locked = checked(
         tmp_path,
         data,
         id="id",
-        context={
-            "source": "history.arrow",
-            "selection": "most_recent",
-            "order_by": "x",
-            "max_rows": 3,
-        },
+        selection={"core": 2, "neighbors": 1, "seed": 3},
+    )
+    assert locked.spec.selection == SelectionInfo(
+        "retrieved", 2, 1, "stratified", seed=3
     )
     prepared = PredictorExecutor().prepare(locked, data)
-    assert prepared.context_rows == 3
-    assert kernels[0][:, 0].tolist() == [1, 2, 3]
+    assert prepared.context_rows == 4
+    [strategy] = fake.strategies
+    assert strategy is not None
+    assert json.loads(strategy) == locked.spec.selection.strategy_spec()
     with pytest.raises(ServiceError, match="snapshot digest") as error:
         PredictorExecutor().prepare(locked, data.slice(1))
     assert error.value.code == "SnapshotMismatch"
@@ -112,7 +110,7 @@ def test_dev_replacement_does_not_mutate_existing_context(tmp_path, data, kernel
     assert old.context_rows == 4
 
 
-@pytest.mark.parametrize("mode", ["request", "live/events"])
+@pytest.mark.parametrize("mode", ["request", "live"])
 def test_dynamic_context_validation_and_no_override(tmp_path, data, kernels, mode):
     locked = checked(tmp_path, data, context=mode, id="id")
     executor = PredictorExecutor()
@@ -133,7 +131,7 @@ def test_dynamic_context_validation_and_no_override(tmp_path, data, kernels, mod
 
 @pytest.mark.parametrize(
     "queries",
-    [{"x": [1]}, {"x": [None]}, {"x": [1.0], "y": [True]}, {"unknown": [1.0]}],
+    [{"x": ["1"]}, {"x": [None]}, {"x": [1.0], "y": [True]}, {"unknown": [1.0]}],
 )
 def test_queries_reject_physical_drift_missing_leakage_and_unknown(
     tmp_path, data, kernels, queries
@@ -145,15 +143,14 @@ def test_queries_reject_physical_drift_missing_leakage_and_unknown(
     assert error.value.status == 422
 
 
-def test_forged_capability_rehashed_lock_still_fails_admission(tmp_path, data, kernels):
+def test_forged_capability_rehashed_plan_still_fails_admission(tmp_path, data, kernels):
     locked = checked(tmp_path, data, id="id")
-    value = locked.to_dict()
-    value["model"]["max_context_rows"] += 1
-    value["model_digest"] = digest(ModelPin.from_dict(value["model"]).identity())
-    value["lock"] = digest({k: v for k, v in value.items() if k != "lock"})
-    lock = ExecutionLock.from_dict(value)
+    forged = replace(
+        locked,
+        model=replace(locked.model, max_context_rows=locked.model.max_context_rows + 1),
+    )
     with pytest.raises(ServiceError) as error:
-        PredictorExecutor().prepare(lock, data)
+        PredictorExecutor().prepare(forged, data)
     assert error.value.code == "ModelMismatch" and kernels == []
 
 
@@ -199,10 +196,8 @@ def test_schema_free_request_and_regression_projection(tmp_path, kernels):
         outputs=["quantiles", "value"],
         quantiles=[0.1, 0.5, 0.9],
     )
-    lock = replace(locked, schema=type(locked.schema)())
-    value = lock.to_dict()
-    value["lock"] = digest({k: v for k, v in value.items() if k != "lock"})
-    prepared = PredictorExecutor().prepare(ExecutionLock.from_dict(value), None)
+    assert not locked.schema.columns
+    prepared = PredictorExecutor().prepare(locked, None)
     result = prepared.predict(pa.table({"x": [1.5]}), context=data)
     assert result.column_names == ["quantiles", "value"]
     assert result.to_pylist() == [
@@ -238,36 +233,25 @@ def test_concurrent_request_contexts_do_not_mutate_bound_production(tmp_path, ke
     assert production.context_rows == 2
 
 
-def test_target_free_schema_free_request_can_warm_without_guessing_target(
-    tmp_path, kernels
-):
-    (tmp_path / "gf.yaml").write_text(
-        "name: test-model\nmodel: general-forecast/tabicl-v2-classifier\n"
-    )
-    lock = compile_dir(tmp_path)
-    prepared = PredictorExecutor().prepare(lock, None)
-    assert prepared.lock.spec.target is None and prepared._context is None
-    assert prepared.context_rows is None and not kernels
-    with pytest.raises(ServiceError, match="explicit target binding") as error:
-        prepared.predict(
-            pa.table({"x": [1.0]}), context=pa.table({"x": [1.0], "y": [True]})
-        )
-    assert error.value.code == "InvalidPredictor"
-
-
-@pytest.mark.parametrize("context", ["history.arrow", "live/history", "request"])
-def test_target_free_schema_bearing_or_bound_context_is_rejected(
-    tmp_path, data, kernels, context
-):
-    locked = checked(tmp_path, data, context=context)
+def test_a_request_plan_without_a_target_refuses_its_rows(tmp_path, data, kernels):
+    locked = checked(tmp_path, data, context="request")
     lock = replace(locked, spec=replace(locked.spec, target=None))
-    value = lock.to_dict()
-    value["lock"] = digest({k: v for k, v in value.items() if k != "lock"})
+    prepared = PredictorExecutor().prepare(lock, None)
     with pytest.raises(ServiceError, match="explicit target"):
-        PredictorExecutor().prepare(
-            replace(lock, lock_digest=value["lock"]),
-            None if context == "request" else data,
-        )
+        prepared.predict(pa.table({"x": [1.0]}), context=data)
+
+
+@pytest.mark.parametrize("context", ["snapshot", "live"])
+def test_a_bound_plan_names_its_target(tmp_path, data, kernels, context):
+    locked = checked(tmp_path, data, context=context)
+    with pytest.raises(PredictorError, match="explicit target"):
+        replace(locked.spec, target=None)
+
+
+def test_integer_queries_widen_to_a_float_input(tmp_path, data, kernels):
+    locked = checked(tmp_path, data, id="id")
+    prepared = PredictorExecutor().prepare(locked, data)
+    assert prepared.predict(pa.table({"x": [1]})).num_rows == 1
 
 
 def test_bad_native_output_and_private_error_are_typed(

@@ -146,17 +146,18 @@ def test_irregular_context_and_covariate_disagreement_fail_before_ready(
     locked = checked(
         tmp_path,
         context,
-        context="live/events",
+        context="live",
         model="general-forecast/chronos-2",
         time="time",
         series=["series"],
         horizon=2,
+        frequency=1,
         future_inputs=["promo"],
     )
     changed = context.set_column(1, "time", pa.array([0, 1, 2, 4, 0, 1, 2, 3]))
     with pytest.raises(ServiceError) as error:
         PredictorExecutor().prepare(locked, changed)
-    assert error.value.code == "AmbiguousFrequency"
+    assert error.value.code == "FrequencyMismatch"
     changed = context.set_column(3, "promo", pa.array([0.0] * 4 + [1.0] * 4))
     with pytest.raises(ServiceError) as error:
         PredictorExecutor().prepare(locked, changed)

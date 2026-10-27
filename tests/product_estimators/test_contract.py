@@ -65,7 +65,7 @@ def _saved(root) -> dict:
     resolution = predictors.resolve(spec, root, locked=True)
     assert resolution.lock_changes == ()
     lock = yaml.safe_load((root / "gf.lock").read_text())
-    assert lock["lock_version"] == 1 and lock["predictor"]["name"] == spec.name
+    assert lock["lock_version"] == 2 and lock["predictor"]["name"] == spec.name
     return lock["predictor"]
 
 

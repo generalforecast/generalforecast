@@ -42,7 +42,7 @@ def test_resolve_infers_everything(churn: Path):
         "sha256:"
     )
     assert resolution.pinned == f"{MODEL}@{resolution.model_digest}"
-    assert resolution.selection == SelectionInfo(None, 0, "stratified", None)
+    assert resolution.selection == SelectionInfo("exact")
     assert resolution.inferred["name"] == "the directory name"
     assert resolution.inferred["inputs"] == (
         "every column of context.csv except churned (target), customer_id (id), minus note"
@@ -192,9 +192,7 @@ def test_forecast_infers_frequency_and_quantiles(tmp_path: Path):
     resolution = resolve(load(root), root)
     assert resolution.task == "forecast"
     assert resolution.frequency == "1d"
-    assert (
-        resolution.inferred["frequency"] == "the median gap between times in date is 1d"
-    )
+    assert resolution.inferred["frequency"] == "the times in date step by 1d"
     assert resolution.quantiles == (0.1, 0.5, 0.9)
     assert resolution.inferred["quantiles"] == "the default levels"
     assert resolution.input_names == ("promo",)
@@ -202,40 +200,58 @@ def test_forecast_infers_frequency_and_quantiles(tmp_path: Path):
 
 
 SELECTIONS = [
-    (1_000, None, SelectionInfo(None, 0, "stratified", None)),
-    (CAP, None, SelectionInfo(None, 0, "stratified", None)),
-    (CAP + 1, None, SelectionInfo(15_000, 45_000, "stratified", None)),
+    (1_000, None, SelectionInfo("exact")),
+    (CAP, None, SelectionInfo("exact")),
+    (CAP + 1, None, SelectionInfo("retrieved", 15_000, 45_000, "stratified")),
     (
         CAP + 1,
         Selection(core=0.5, neighbors=0.25),
-        SelectionInfo(30_000, 15_000, "stratified", None),
+        SelectionInfo("retrieved", 30_000, 15_000, "stratified"),
     ),
     (
         CAP + 1,
         Selection(core=1_000, kind="random"),
-        SelectionInfo(1_000, 59_000, "random", None),
+        SelectionInfo("retrieved", 1_000, 59_000, "random"),
     ),
-    (100, Selection(core=10, neighbors=20), SelectionInfo(10, 20, "stratified", None)),
+    (
+        100,
+        Selection(core=10, neighbors=20, seed=7),
+        SelectionInfo("retrieved", 10, 20, "stratified", seed=7),
+    ),
+    (None, None, SelectionInfo("adaptive")),
 ]
 
 
 @pytest.mark.parametrize(("rows", "declared", "expected"), SELECTIONS)
 def test_selection_defaults(rows, declared, expected):
     spec = PredictorSpec(name="t", model=MODEL, target="y", selection=declared)
-    assert _selection(spec, rows, CAP, {}) == expected
+    assert _selection(spec, rows, CAP)[0] == expected
 
 
 def test_selection_recent_with_time_role():
     spec = PredictorSpec(name="t", model=MODEL, target="y", time="t")
-    inferred: dict[str, str] = {}
-    assert _selection(spec, CAP + 1, CAP, inferred) == SelectionInfo(
-        15_000, 45_000, "stratified", 180_000
+    selection, reason = _selection(spec, CAP + 1, CAP)
+    assert selection == SelectionInfo(
+        "retrieved", 15_000, 45_000, "stratified", 180_000
     )
-    assert (
-        inferred["selection.recent"]
-        == "`time` is t, so the nearest rows lean to the newest 180,000"
+    assert reason is not None and reason.startswith(
+        "60,001 rows exceed the 60,000 row cap"
     )
-    assert inferred["selection"].startswith("60,001 rows exceed the 60,000 row cap")
+
+
+def test_a_selection_past_the_row_cap_is_refused():
+    spec = PredictorSpec(
+        name="t",
+        model=MODEL,
+        target="y",
+        selection=Selection(core=100_000, neighbors=50_000),
+    )
+    with pytest.raises(InvalidInput) as caught:
+        _selection(spec, CAP + 1, CAP)
+    assert caught.value.message == (
+        f"selection reads 150,000 rows per query; {MODEL} reads at most 60,000"
+    )
+    assert (caught.value.limit, caught.value.actual) == (CAP, 150_000)
 
 
 def test_locked_requires_an_up_to_date_lock(churn: Path):

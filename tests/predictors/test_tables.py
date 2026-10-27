@@ -104,13 +104,29 @@ TABLE = pa.table(
 )
 
 
-def test_split_prefers_empty_targets():
+def test_split_keeps_empty_targets_as_queries_and_partitions_the_labeled_rows():
     table = pa.table({"y": [0, None, 1, None]})
     context, queries = split(
         table, spec(context=Context("snapshot", "c.csv", holdout=Holdout(0.5)))
     )
-    assert context.num_rows == 2 and queries.num_rows == 2
+    assert context.num_rows == 1 and queries.num_rows == 3
     assert queries["y"].null_count == 2
+
+
+def test_until_is_honoured_when_some_targets_are_blank():
+    days = [f"2025-08-{day:02d}" for day in range(1, 32)] + [
+        f"2025-09-{day:02d}" for day in range(1, 30)
+    ]
+    labels: list[float | None] = [float(index) for index in range(len(days))]
+    labels[5] = None
+    table = pa.table({"t": days, "x": [1.0] * len(days), "y": labels})
+    context, queries = split(
+        table, spec(time="t", context=Context("snapshot", "c.csv", until="2025-09-01"))
+    )
+    assert max(context["t"].to_pylist()) == "2025-08-31"
+    assert context.num_rows == 30
+    assert queries.num_rows == 30
+    assert "2025-08-06" in queries["t"].to_pylist()
 
 
 def test_split_until():

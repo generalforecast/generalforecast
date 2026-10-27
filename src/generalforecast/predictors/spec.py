@@ -8,7 +8,6 @@ digests belong to `gf.lock` (see `generalforecast.predictors.lock`).
 """
 
 import datetime as dt
-import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -19,10 +18,9 @@ import yaml
 
 from generalforecast.errors import InvalidInput
 from generalforecast.predictors import _registry, files, frequency
-from generalforecast.predictors.validation import PredictorError
+from generalforecast.predictors.validation import NAME, PredictorError
 
 MANIFEST = "gf.yaml"
-NAME = re.compile(r"[a-z][a-z0-9-]{0,62}")
 FREQUENCY = frequency.SPAN
 KINDS = ("int", "float", "0/1", "category", "text", "timestamp", "bool")
 ACCELERATORS = ("L4", "A10G", "L40S", "cpu")
@@ -181,7 +179,7 @@ class PredictorSpec:
         series: The series role columns.
         frequency: A forecaster's cadence, such as `1d`, or seconds as a number.
         horizon: How many steps a forecaster predicts.
-        quantiles: A forecaster's output levels.
+        quantiles: A forecaster's or regressor's output levels.
         inputs: The input columns, when listed; a list replaces inference.
         exclude: Columns removed from the inferred inputs.
         types: Declared column types, overriding inference.
@@ -912,7 +910,14 @@ def validate(spec: PredictorSpec) -> None:
                 at="model",
             )
     else:
-        for key in ("horizon", "frequency", "quantiles", "past", "future"):
+        if spec.quantiles and task == "classification":
+            raise spec.error(
+                "`quantiles` is for regression and forecast models",
+                param="quantiles",
+                because=f"{spec.model} is a classification model",
+                hint="remove `quantiles`; a classifier outputs class probabilities",
+            )
+        for key in ("horizon", "frequency", "past", "future"):
             if getattr(spec, key) not in (None, ()):
                 raise spec.error(
                     f"`{key}` is for forecast models",

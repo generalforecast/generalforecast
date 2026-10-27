@@ -5,7 +5,7 @@
 
 import re
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from generalforecast.models.catalog import SERIES_TYPES, TABULAR_TYPES
 from generalforecast.predictors.validation import (
@@ -251,7 +251,20 @@ class ModelResolver(Protocol):
 
 
 class CatalogResolver:
-    """Uses curated, already pinned metadata offline; checks upstream only on opt-in."""
+    """Uses curated, already pinned metadata offline; checks upstream only on opt-in.
+
+    Args:
+        surface: Whose qualification gate a model must pass. `predictor`,
+            the default, is hosted serving's: the catalog's evidence that a
+            hosted predictor may run the model. `local` admits every pinned
+            catalog model, for `gf check`, `gf.Predictor` and `gf serve` on
+            the user's own machine. Every other check is the same on both.
+    """
+
+    def __init__(self, surface: Literal["predictor", "local"] = "predictor") -> None:
+        """Binds the qualification gate models are admitted under."""
+        ensure(surface in ("predictor", "local"), "unknown resolver surface")
+        self.surface = surface
 
     def resolve(self, requested: str, *, offline: bool = True) -> ModelPin:
         """Refuses unknown names and pin mismatches instead of falling back or upgrading."""
@@ -279,14 +292,14 @@ class CatalogResolver:
         if ref.custom:
             raise PredictorError("UnsupportedModel", custom_refused(ref.name))
         entry = ref.entry
-        if not entry.gates.allows("predictor"):
+        if not entry.gates.allows(self.surface):
             raise PredictorError(
                 "ModelResolutionRequired",
-                f"{entry.name} is not qualified for predictors: {entry.gates.evidence}",
+                f"{entry.name} is not qualified for hosted predictors: {entry.gates.evidence}",
             )
         ensure(
-            entry.gates.allows("predictor", variant=ref.variant),
-            f"{ref} variants are not qualified for predictors",
+            entry.gates.allows(self.surface, variant=ref.variant),
+            f"{ref} variants are not qualified for hosted predictors",
             "UnsupportedCapability",
         )
         refused = V1_POLICY.admits(ref)

@@ -387,7 +387,7 @@ class _Estimator(BaseEstimator):
                 task,
                 context,
                 target=named_target,
-                inputs={"include": names},
+                inputs=names,
             )
         self.target_ = named_target
         self.context_ = context
@@ -425,7 +425,7 @@ class _Estimator(BaseEstimator):
             task,
             self.context_,
             target=self.target_,
-            inputs={"include": names},
+            inputs=names,
         )
         return Predictor(
             export_predictor(path, name=name, spec=spec, context=self.context_)

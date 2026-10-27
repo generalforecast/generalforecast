@@ -17,6 +17,8 @@ import pyarrow.compute as _compute
 from generalforecast import tabular
 from generalforecast.errors import InvalidInput
 from generalforecast.predictors import _registry, models
+from generalforecast.predictors.selection import SelectionInfo
+from generalforecast.predictors.selection import resolve as resolve_selection
 from generalforecast.predictors.spec import (
     DEFAULT_QUANTILES,
     PredictorSpec,
@@ -27,13 +29,10 @@ from generalforecast.predictors.tables import (
     inspect_frame,
     labels,
     read_frame,
-    split,
     to_table,
 )
 
 pc: Any = _compute  # ty cannot see Arrow's generated compute functions
-CORE_SHARE = 0.25
-RECENT_FACTOR = 4
 NUMERIC = ("int", "float", "0/1")
 
 
@@ -52,23 +51,6 @@ class ContextInfo:
     rows: int | None = None
     query_rows: int | None = None
     digest: str | None = None
-
-
-@dataclass(frozen=True)
-class SelectionInfo:
-    """The resolved context selection, as integers.
-
-    Attributes:
-        core: Rows every query sees; None means the whole context.
-        neighbors: Nearest rows per query.
-        kind: How the core is drawn, `stratified` or `random`.
-        recent: How many newest rows the nearest-row search leans on.
-    """
-
-    core: int | None
-    neighbors: int
-    kind: str
-    recent: int | None = None
 
 
 @dataclass(frozen=True)
@@ -96,6 +78,16 @@ class Resolution:
         lock_changes: `(op, key, old, new)` against the previous lock, `op` in `+ - ~`.
         files: The pinned model files by name.
         spec: The manifest this resolves.
+        input_roles: Each input's role, aligned with `inputs`: `input` for
+            a tabular model; `past` or `future` for a forecaster, whose
+            inputs the manifest does not mark `future` are `past`.
+        time_type: The time column's kind.
+        series_types: Each series column's kind.
+        outputs: What predictions carry.
+        resources: The hosted serving resources the manifest declares.
+        manifest: The digest of the normalized manifest.
+        context_table: The context rows the lock's digest names, when known.
+        query_table: A snapshot's query rows, when known.
     """
 
     name: str
@@ -119,6 +111,14 @@ class Resolution:
     quantiles: tuple[float, ...] = ()
     files: Mapping[str, str] = field(default_factory=lambda: MappingProxyType({}))
     spec: PredictorSpec | None = field(default=None, compare=False, repr=False)
+    input_roles: tuple[str, ...] = ()
+    time_type: str | None = None
+    series_types: tuple[str | None, ...] = ()
+    outputs: tuple[str, ...] = ()
+    resources: Mapping[str, Any] = field(default_factory=lambda: MappingProxyType({}))
+    manifest: str | None = None
+    context_table: Any = field(default=None, compare=False, repr=False)
+    query_table: Any = field(default=None, compare=False, repr=False)
 
     @property
     def pinned(self) -> str:
@@ -145,6 +145,10 @@ def resolve(
 ) -> Resolution:
     """Resolves a manifest in its directory, or against the rows of a request.
 
+    The resolution is compiled as the runtime compiles it, so a manifest
+    `gf check` accepts is one `gf.Predictor`, `gf serve` and hosted serving
+    accept, and the other way round.
+
     Args:
         spec: The manifest.
         root: The predictor directory, where the snapshot and `gf.lock` live;
@@ -163,6 +167,12 @@ def resolve(
             when there is one.
     """
     from generalforecast.predictors import lock
+    from generalforecast.predictors.runtime.context import (
+        context_columns,
+        project,
+        snapshot_context,
+        typed,
+    )
 
     validate(spec)
     assert spec.target is not None
@@ -176,11 +186,8 @@ def resolve(
     previous = lock.read_lock(root) if root is not None else None
     digest = _model_digest(spec, pin, previous, upgrade=upgrade)
 
-    frame: pa.Table | None = None
-    queries: pa.Table | None = None
+    table: pa.Table | None = None
     info: TableInfo | None = None
-    context_rows = query_rows = None
-    context_digest = None
     if spec.context.kind == "snapshot":
         assert spec.context.snapshot is not None
         if root is None:
@@ -191,8 +198,46 @@ def resolve(
             )
         table = read_frame(Path(root), spec.context.snapshot)
         info = inspect_frame(table, path=spec.context.snapshot)
+    elif rows is not None:
+        table = to_table(rows)
+        info = inspect_frame(table, path="the context")
+    elif spec.inputs is None and not (spec.past or spec.future):
+        raise spec.error(
+            f"`inputs` must be listed for a {spec.context.kind} context",
+            param="inputs",
+            hint=f"a {spec.context.kind} context has no rows to infer from; "
+            "write `inputs: [spend, plan]`",
+        )
+    if info is not None:
         _check_columns(spec, info)
-        frame, queries = split(table, spec)
+    inputs, roles = _inputs(spec, info, limits, inferred, task)
+    kinds = info.kinds() if info is not None else dict(spec.types)
+    draft = {
+        "task": task,
+        "target": spec.target,
+        "id": spec.id,
+        "time": spec.time,
+        "series": list(spec.series),
+        "inputs": [{"name": name, "type": kind} for name, kind in inputs],
+        "id_type": kinds.get(spec.id) if spec.id else None,
+        "time_type": kinds.get(spec.time) if spec.time else None,
+        "series_types": [kinds.get(column) for column in spec.series],
+        "context": {
+            "until": spec.context.until,
+            "holdout": None
+            if spec.context.holdout is None
+            else {
+                "fraction": spec.context.holdout.fraction,
+                "seed": spec.context.holdout.seed,
+            },
+        },
+    }
+    frame: pa.Table | None = None
+    queries: pa.Table | None = None
+    context_rows = query_rows = context_digest = None
+    if spec.context.kind == "snapshot":
+        assert table is not None
+        frame, queries = snapshot_context(table, draft, error=spec.error)
         if frame.num_rows == 0:
             raise spec.error(
                 f"every row of {spec.context.snapshot} is a query",
@@ -203,37 +248,48 @@ def resolve(
         context_rows, query_rows = frame.num_rows, queries.num_rows
         inferred["queries"] = _query_reason(spec, query_rows)
         context_digest = tabular.table_digest(frame)
-    elif rows is not None:
-        frame = to_table(rows)
-        info = inspect_frame(frame, path="the context")
-        _check_columns(spec, info)
-        context_rows = frame.num_rows
-    elif spec.inputs is None:
-        raise spec.error(
-            f"`inputs` must be listed for a {spec.context.kind} context",
-            param="inputs",
-            hint=f"a {spec.context.kind} context has no rows to infer from; "
-            "write `inputs: [spend, plan]`",
+    elif table is not None:
+        frame = typed(
+            project(
+                table,
+                context_columns(draft),
+                spec.target,
+                classifier=task == "classification",
+            ),
+            draft,
         )
+        context_rows = frame.num_rows
 
-    inputs = _inputs(spec, info, limits, inferred, task)
     target_type, classes = _target(spec, task, frame, pin, inferred)
     frequency = spec.frequency
-    quantiles = spec.quantiles
+    quantiles: tuple[float, ...] = ()
     if task == "forecast":
-        if frequency is None and frame is not None:
+        if frame is not None:
             frequency = _frequency(spec, frame, inferred)
-        if not quantiles:
-            quantiles = DEFAULT_QUANTILES
-            inferred["quantiles"] = "the default levels"
-        elif pin.quantiles and not set(quantiles) <= set(pin.quantiles):
-            unsupported = sorted(set(quantiles) - set(pin.quantiles))
+        elif frequency is None:
             raise spec.error(
-                f"{spec.model} does not output quantile {unsupported[0]}",
-                param="quantiles",
-                hint="pick levels from " + ", ".join(str(q) for q in pin.quantiles),
+                f"a {spec.context.kind} context has no rows to infer `frequency` from",
+                param="frequency",
+                hint="add `frequency: 1d`, or the step your times follow",
             )
-    selection = _selection(spec, context_rows, limits.context_rows, inferred)
+    if task != "classification":
+        quantiles = spec.quantiles or DEFAULT_QUANTILES
+        if not spec.quantiles:
+            inferred["quantiles"] = "the default levels"
+    labeled = None
+    if frame is not None:
+        labeled = frame.num_rows - frame[spec.target].null_count
+    selection, reason = _selection(spec, labeled, limits.context_rows)
+    if reason is not None:
+        inferred["selection"] = reason
+    if selection.recent is not None and spec.time is not None and selection.neighbors:
+        inferred.setdefault(
+            "selection.recent",
+            f"`time` is {spec.time}, so the nearest rows lean to the newest "
+            f"{selection.recent:,}",
+        )
+
+    from generalforecast.predictors.runtime.plan import OUTPUTS
 
     resolution = Resolution(
         name=spec.name,
@@ -244,10 +300,13 @@ def resolve(
         target_type=target_type,
         classes=classes,
         id=spec.id,
-        id_type=info.column(spec.id).kind if spec.id and info is not None else None,
+        id_type=kinds.get(spec.id) if spec.id else None,
         time=spec.time,
+        time_type=kinds.get(spec.time) if spec.time else None,
         series=spec.series,
+        series_types=tuple(kinds.get(column) for column in spec.series),
         inputs=inputs,
+        input_roles=roles,
         inferred=MappingProxyType(inferred),
         context=ContextInfo(
             spec.context.kind, context_rows, query_rows, context_digest
@@ -256,9 +315,15 @@ def resolve(
         frequency=frequency,
         horizon=spec.horizon,
         quantiles=quantiles,
+        outputs=OUTPUTS[task],
         files=MappingProxyType(dict(pin.files)),
+        resources=MappingProxyType(_resources(spec)),
+        manifest=lock.manifest_digest(spec),
         spec=spec,
+        context_table=frame,
+        query_table=queries,
     )
+    _admitted(spec, resolution, frame)
     changes = lock.changes(previous, lock.document(resolution))
     if locked and (changes or previous is None):
         raise InvalidInput(
@@ -271,14 +336,77 @@ def resolve(
     return dataclasses.replace(resolution, lock_changes=changes)
 
 
+def _resources(spec: PredictorSpec) -> dict[str, Any]:
+    """The manifest's hosted resources, as the lock records them."""
+    resources = spec.resources
+    if resources is None:
+        return {}
+    values = {
+        "accelerator": resources.accelerator,
+        "replicas_min": resources.replicas_min,
+        "replicas_max": resources.replicas_max,
+        "idle_seconds": resources.idle_seconds,
+    }
+    return {key: value for key, value in values.items() if value is not None}
+
+
+def _admitted(spec: PredictorSpec, resolution: Resolution, frame: Any) -> None:
+    """Compiles the resolution as the runtime does, so check refuses what serving would.
+
+    The same `capabilities.admit` and schema checks run here, at
+    `compile_lock` and when `gf serve` or hosted serving binds a revision.
+    """
+    from generalforecast.predictors import lock
+    from generalforecast.predictors.runtime.compile import compile_plan
+    from generalforecast.predictors.runtime.plan import ExecutionPlan
+    from generalforecast.predictors.validation import PredictorError
+
+    document = lock.document(resolution)
+    try:
+        plan = ExecutionPlan.from_lock(document)
+        compile_plan(plan, frame, resolver=_registry.resolver())
+    except PredictorError as error:
+        raise spec.error(
+            f"{spec.model} cannot serve this predictor: {error.message}",
+            param=_param(error.code),
+            hint=_hint(error.code),
+        ) from None
+
+
+def _param(code: str) -> str:
+    return {
+        "UnsupportedCapability": "model",
+        "CapacityExceeded": "inputs",
+        "AmbiguousFrequency": "frequency",
+        "FrequencyMismatch": "frequency",
+        "DuplicateTime": "time",
+        "ModelResolutionRequired": "model",
+        "UnsupportedTask": "model",
+    }.get(code, "model")
+
+
+def _hint(code: str) -> str | None:
+    return {
+        "ModelResolutionRequired": "pick a model `gf model list` shows for predictors",
+        "AmbiguousFrequency": "resample the context to one step, or fill its gaps",
+        "DuplicateTime": "keep one row per series and time",
+    }.get(code)
+
+
 def _pin(spec: PredictorSpec, *, online: bool) -> models.ModelPin:
     try:
         return _registry.pin(spec.model, online=online)
     except models.PredictorError as error:
+        if error.code == "ModelUnavailable" or online:
+            raise spec.error(
+                f"{spec.model} could not be confirmed upstream",
+                param="model",
+                hint=str(error),
+            ) from None
         raise spec.error(
-            f"{spec.model} could not be confirmed upstream",
+            f"{spec.model} cannot be locked: {error.message}",
             param="model",
-            hint=str(error),
+            hint="pick a model `gf model list` shows for predictors",
         ) from None
 
 
@@ -294,8 +422,13 @@ def _model_digest(
         return digest
     before = previous.get("predictor", {})
     pinned = before.get("model_digest")
-    if before.get("model") == spec.model and pinned is not None:
-        return pinned
+    if before.get("model") == spec.model and pinned not in (None, digest):
+        raise spec.error(
+            f"the catalog's {spec.model} is not the one gf.lock pinned",
+            param="model",
+            because=f"gf.lock pins {_short(pinned)}; this release ships {_short(digest)}",
+            hint="run `gf check --upgrade` to pin the new artifact",
+        )
     return digest
 
 
@@ -363,14 +496,22 @@ def _inputs(
     limits: _registry.Limits,
     inferred: dict[str, str],
     task: str,
-) -> tuple[tuple[str, str | None], ...]:
+) -> tuple[tuple[tuple[str, str | None], ...], tuple[str, ...]]:
+    """The inputs with their kinds, and each one's role.
+
+    A tabular model's inputs have the role `input`. A forecaster's inputs
+    are covariates: `future` when the manifest lists them under
+    `inputs.future`, and otherwise `past`, the one rule every consumer of
+    the lock reads instead of deriving roles again.
+    """
     roles = spec.roles
     kinds = info.kinds() if info is not None else {}
     overrides = dict(spec.types)
     if spec.inputs is not None:
         names = list(spec.inputs)
+    elif info is None:
+        names = []
     else:
-        assert info is not None
         names = [
             name
             for name in info.names
@@ -414,7 +555,12 @@ def _inputs(
                 f"looks like {kinds[name]}"
             )
         inputs.append((name, kind))
-    return tuple(inputs)
+    if task == "forecast":
+        future = set(spec.future)
+        marked = tuple("future" if name in future else "past" for name in names)
+    else:
+        marked = ("input",) * len(names)
+    return tuple(inputs), marked
 
 
 def _target(
@@ -476,115 +622,47 @@ def _target(
 
 def _frequency(
     spec: PredictorSpec, frame: pa.Table, inferred: dict[str, str]
-) -> str | float | None:
+) -> str | int | float:
+    """The context's frequency by the one rule, `frequency.infer` or `frequency.check`."""
+    from generalforecast.predictors import frequency
+
     assert spec.time is not None
-    if pa.types.is_integer(frame[spec.time].type):
-        periods = sorted(pc.unique(pc.drop_null(frame[spec.time])).to_pylist())
-        if len(periods) < 2:
-            raise spec.error(
-                f"cannot infer `frequency` from one distinct period in {spec.context.snapshot}",
-                param="frequency",
-                hint="add `frequency: 1`",
-            )
-        import statistics
-        from itertools import pairwise
-
-        step = int(statistics.median([b - a for a, b in pairwise(periods)]))
-        inferred["frequency"] = (
-            f"the median gap between periods in {spec.time} is {step}"
-        )
-        return step
+    times: dict[tuple, list] = {}
+    for row in frame.select([*spec.series, spec.time]).to_pylist():
+        key = tuple(row[column] for column in spec.series)
+        times.setdefault(key, []).append(row[spec.time])
     try:
-        stamps = pc.cast(frame[spec.time], pa.timestamp("us"))
-    except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
+        if spec.frequency is not None:
+            frequency.check(times, spec.frequency)
+            return spec.frequency
+        found = frequency.infer(times)
+    except frequency.FrequencyError as error:
         raise spec.error(
-            f"time column `{spec.time}` has no timestamps",
-            param="time",
-            hint="store times as ISO dates or timestamps",
+            error.message,
+            param="frequency" if error.code != "DuplicateTime" else "time",
+            because=error.because,
+            hint={
+                "AmbiguousFrequency": "resample to one step per series, or fill its gaps",
+                "DuplicateTime": "keep one row per series and time",
+                "TooFewTimes": "add `frequency: 1d`, or the step your times follow",
+                "FrequencyMismatch": "fix `frequency`, or resample the context",
+            }.get(error.code),
         ) from None
-    unique = pc.unique(pc.drop_null(stamps))
-    if len(unique) < 2:
-        raise spec.error(
-            f"cannot infer `frequency` from one distinct time in {spec.context.snapshot}",
-            param="frequency",
-            hint="add `frequency: 1d`",
-        )
-    ordered = pc.sort_indices(unique)
-    values = unique.take(ordered).cast(pa.int64()).to_numpy()
-    gaps = values[1:] - values[:-1]
-    import numpy as np
-
-    seconds = float(np.median(gaps)) / 1_000_000
-    frequency = _format_seconds(seconds)
-    inferred["frequency"] = (
-        f"the median gap between times in {spec.time} is {frequency}"
-    )
-    return frequency
-
-
-def _format_seconds(seconds: float) -> str | float:
-    for unit, size in (("w", 604800), ("d", 86400), ("h", 3600), ("min", 60), ("s", 1)):
-        if seconds >= size and seconds % size == 0:
-            return f"{int(seconds // size)}{unit}"
-    return seconds
+    inferred["frequency"] = f"the times in {spec.time} step by {found}"
+    return found
 
 
 def _selection(
-    spec: PredictorSpec,
-    rows: int | None,
-    cap: int,
-    inferred: dict[str, str],
-) -> SelectionInfo:
-    declared = spec.selection
-    kind = declared.kind if declared and declared.kind else "stratified"
-    undeclared = declared is None or (
-        declared.core is None and declared.neighbors is None
+    spec: PredictorSpec, rows: int | None, cap: int
+) -> tuple[SelectionInfo, str | None]:
+    """The lock's selection: the manifest's against the context's size and the row cap."""
+    return resolve_selection(
+        spec.selection,
+        rows=rows,
+        cap=cap,
+        timed=spec.time is not None,
+        model=spec.model,
     )
-    if undeclared and (rows is None or rows <= cap):
-        core: int | None = None
-        neighbors = 0
-        if rows is not None:
-            inferred["selection"] = (
-                f"{rows:,} rows fit under the {cap:,} row cap of {spec.model}, "
-                "so every query sees the whole context"
-            )
-    else:
-        core = _count(declared.core if declared else None, cap)
-        if (
-            core is None
-            and declared is not None
-            and declared.core is None
-            and declared.neighbors is not None
-        ):
-            core = None
-        elif core is None:
-            core = round(CORE_SHARE * cap)
-        neighbors_given = declared.neighbors if declared else None
-        neighbors = _count(neighbors_given, cap)
-        if neighbors is None:
-            neighbors = max(cap - (core or 0), 0)
-        if rows is not None and (
-            declared is None or (declared.core is None and declared.neighbors is None)
-        ):
-            inferred["selection"] = (
-                f"{rows:,} rows exceed the {cap:,} row cap of {spec.model}, so each query "
-                f"sees a {kind} core of {core:,} rows and its {neighbors:,} nearest rows"
-            )
-    recent = declared.recent if declared and declared.recent is not None else None
-    if recent is None and spec.time is not None and neighbors:
-        recent = neighbors * RECENT_FACTOR
-        inferred["selection.recent"] = (
-            f"`time` is {spec.time}, so the nearest rows lean to the newest {recent:,}"
-        )
-    return SelectionInfo(core, neighbors, kind, recent)
-
-
-def _count(value: float | None, cap: int) -> int | None:
-    if value is None:
-        return None
-    if type(value) is float:
-        return round(value * cap)
-    return int(value)
 
 
 def _query_reason(spec: PredictorSpec, query_rows: int) -> str:

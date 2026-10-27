@@ -1,10 +1,13 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Stage-zero ports, not a second server or a claim of implemented backends.
+"""The ports a predictor service implements: data, sources, models, operators, identity, execution.
 
-Owners implement these methods in the modules listed in replacement-contracts.md.
-The final adapter authorizes, invokes a port and wraps its result with boundary.py.
+`gf serve` and hosted serving implement them; an adapter authorizes a
+request, invokes a port and wraps its result with `service.boundary`.
+`NativeExecutor` is the one execution port: `PredictorExecutor` implements
+it in process, binding a `CompiledPlan`. These are part of the hosting API,
+`generalforecast.hosting`.
 """
 
 from collections.abc import Iterator
@@ -22,7 +25,7 @@ from generalforecast.service.boundary import JsonObject, Scope
 if TYPE_CHECKING:
     import pyarrow as pa
 
-    from generalforecast.predictors.runtime.lock import ExecutionLock
+    from generalforecast.predictors.runtime.compiled import CompiledPlan
 
 WriteOperation = Literal[
     "create_features",
@@ -315,7 +318,7 @@ class NativeExecutor(Protocol):
     """Trusted curated-model loading; never accepts uploaded Python code."""
 
     def prepare(
-        self, lock: "ExecutionLock", context: "pa.Table | None"
+        self, lock: "CompiledPlan", context: "pa.Table | None"
     ) -> PreparedExecution:
-        """Admit a lock, load verified weights and bind any snapshot context."""
+        """Admit a compiled plan, load verified weights and bind any snapshot context."""
         ...

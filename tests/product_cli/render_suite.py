@@ -450,7 +450,7 @@ class FakePredictor:
             inputs=(("spend", "float"), ("plan", "text"), ("signups", "int")),
             inferred={},
             context=ContextInfo("snapshot", 1840, 212, None),
-            selection=SelectionInfo(None, 0, "stratified"),
+            selection=SelectionInfo("exact"),
         )
 
     def eval(

@@ -145,12 +145,9 @@ def predictors() -> Any:
     return library
 
 
-# -- session D: Predictor -------------------------------------------------
-
-
 def predictor_class() -> Any:
-    """Session D's `generalforecast.Predictor`."""
-    try:  # contract: provided by session D
+    """`generalforecast.Predictor`, the class `gf eval` and `gf predict` run."""
+    try:
         from generalforecast import Predictor
 
         return Predictor
@@ -682,10 +679,12 @@ class PredictorCommands:
             f"{term.count(context.query_rows or 0)} query rows",
         )
         selection = resolution.selection
-        if selection.core is None:
+        if selection.strategy == "exact":
             text = f"whole table  {term.count(context.rows or 0)} rows, no neighbors"
+        elif selection.strategy == "adaptive":
+            text = selection.describe(context.rows)
         else:
-            text = f"retrieved  core {term.count(selection.core)} {selection.kind}, {term.count(selection.neighbors)} nearest per query"
+            text = f"retrieved  core {term.count(selection.core or 0)} {selection.kind}, {term.count(selection.neighbors)} nearest per query"
         self.out.status("Selection", text)
 
     # -- eval -------------------------------------------------------------
@@ -781,18 +780,20 @@ class PredictorCommands:
         """Uploads the locked predictor as a revision and points an environment at it."""
         from generalforecast.contracts import Environment, PromoteRequest, Revision
         from generalforecast.service.contracts import ServiceError
+        from generalforecast.service.sdk import pushed
 
         args, out = self.args, self.out
         root = self.root
         spec = self.library.load(root)
-        lock = _previous_lock(root)
-        if lock is None:
+        if _previous_lock(root) is None:
             raise Error(
                 "InvalidInput",
-                f"no {LOCK} in {_shown(root)}",
+                f"no version 2 {LOCK} in {_shown(root)}",
                 hint="run `gf check` first",
             )
-        predictor = lock.get("predictor") or {}
+        checked = pushed(root)
+        lock = checked.lock.to_dict()
+        predictor = lock["predictor"]
         name, env = spec.name, args.env
         try:
             self.call("GET", name)
@@ -840,16 +841,20 @@ class PredictorCommands:
         if not args.yes and not self.confirm("Push?"):
             raise term.Aborted()
         snapshot = None
-        if context.get("kind") == "snapshot":
+        if checked.snapshot is not None:
             from generalforecast.commands import upload_snapshot
 
-            source = root / str(spec.context.snapshot)
-            size = source.stat().st_size
             out.status(
                 "Uploading",
-                f"{name} revision {number}  snapshot, {term.count(context.get('rows', 0))} rows, {_bytes(size)}",
+                f"{name} revision {number}  snapshot, {term.count(checked.snapshot.num_rows)} rows, {_bytes(checked.snapshot.nbytes)}",
             )
-            snapshot = upload_snapshot(self.client, _table(source))["digest"]
+            snapshot = upload_snapshot(self.client, checked.snapshot)["digest"]
+            if snapshot != checked.lock.data_digest:
+                raise Error(
+                    "InvalidInput",
+                    "the uploaded snapshot differs from gf.lock",
+                    hint="run `gf check` again",
+                )
         else:
             out.status("Uploading", f"{name} revision {number}  {context.get('kind')}")
         started = time.perf_counter()
@@ -864,7 +869,7 @@ class PredictorCommands:
                     "POST",
                     name,
                     "/environments",
-                    {"name": env, "runtime": os.environ.get("GF_RUNTIME", "default")},
+                    {"name": env, "runtime": self.runtime()},
                 )
             )
         request = PromoteRequest(revision.number, current.generation)
@@ -882,6 +887,13 @@ class PredictorCommands:
             "revision": revision.to_dict(),
             "environment": ready.to_dict(),
         }
+
+    def runtime(self) -> str:
+        """The runtime a new environment runs on: `GF_RUNTIME`, else the profile's, else `hosted`."""
+        chosen = os.environ.get("GF_RUNTIME") or getattr(
+            self.client.profile, "runtime", None
+        )
+        return chosen or "hosted"
 
     def wait(self, environment: Any) -> Any:
         """Polls the environment until it is ready."""
@@ -975,7 +987,7 @@ class PredictorCommands:
                     "POST",
                     name,
                     "/environments",
-                    {"name": env, "runtime": os.environ.get("GF_RUNTIME", "default")},
+                    {"name": env, "runtime": self.runtime()},
                 )
             )
         request = PromoteRequest(revision, current.generation)
@@ -1124,13 +1136,16 @@ def _resolution_dict(resolution: Resolution) -> dict:
         "target": resolution.target,
         "target_type": resolution.target_type,
         "id": resolution.id,
-        "inputs": [{"name": n, "type": t} for n, t in resolution.inputs],
+        "inputs": [
+            {"name": n, "type": t, "role": r}
+            for (n, t), r in zip(resolution.inputs, resolution.input_roles, strict=True)
+        ],
         "context": {
             "kind": resolution.context.kind,
             "rows": resolution.context.rows,
             "query_rows": resolution.context.query_rows,
             "digest": resolution.context.digest,
         },
-        "selection": resolution.selection.__dict__,
+        "selection": resolution.selection.to_dict(),
         "changes": [list(c) for c in resolution.lock_changes],
     }

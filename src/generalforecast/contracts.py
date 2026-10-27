@@ -4,7 +4,6 @@
 """Shared immutable surface values and ports, not a second control plane."""
 
 import datetime
-import re
 from dataclasses import MISSING, asdict, dataclass, is_dataclass, replace
 from dataclasses import fields as dataclass_fields
 from typing import Any, Protocol, Self
@@ -12,12 +11,14 @@ from urllib.parse import urlsplit
 
 import pyarrow as pa
 
+# `gf.lock`'s version, defined by `generalforecast.predictors.lock`.
+from generalforecast.predictors.lock import LOCK_VERSION  # noqa: F401
 from generalforecast.predictors.validation import (
     PredictorError,
-    digest,
     ensure,
     fields,
     hash_value,
+    identifier,
     integer,
     name,
     text,
@@ -28,88 +29,26 @@ API_PREFIX = "/v1"
 STATES = frozenset({"pending", "building", "ready", "failed", "stopped"})
 TASKS = ("classification", "regression", "forecast")
 CONTEXT_KINDS = ("snapshot", "request", "live")
-MODEL_ID = re.compile(r"general-forecast/[a-z0-9][a-z0-9.-]*(@[^@\s]+)?")
-LOCK_VERSION = 1
 
 
 @dataclass(frozen=True)
 class PredictorLock:
-    """A pushed `gf.lock`: the predictor's resolved intent, content-addressed.
+    """A pushed `gf.lock` (version 2): the predictor's resolved intent, content-addressed.
 
-    The hosted plane keeps the document byte-for-byte as `gf check` wrote it;
-    `digest` names the revision and `identity` the pinned model.
+    The hosted plane keeps the document as `gf check` wrote it. `digest` is
+    the lock's one identity, the document's own `digest` key, which revision
+    dedupe, gf-server's table fingerprint and `gf serve` all use;
+    `identity` is the pinned model. `generalforecast.predictors.lock`
+    defines the format and validates it.
     """
 
     document: dict
 
     def __post_init__(self):
-        """Checks the lock's shape, the canonical model id and its context kind."""
-        value = self.document
-        fields(value, {"lock_version", "predictor", "model"})
-        ensure(
-            value["lock_version"] == LOCK_VERSION,
-            "unsupported lock version; run `gf check` to write version 1",
-            "UnsupportedLockVersion",
-        )
-        predictor = fields(
-            value["predictor"],
-            {
-                "name",
-                "model",
-                "model_digest",
-                "task",
-                "target",
-                "target_type",
-                "inputs",
-                "context",
-                "selection",
-            },
-            {
-                "classes",
-                "id",
-                "id_type",
-                "time",
-                "series",
-                "frequency",
-                "horizon",
-                "quantiles",
-            },
-        )
-        name(predictor["name"])
-        ensure(
-            type(predictor["model"]) is str
-            and MODEL_ID.fullmatch(predictor["model"]) is not None,
-            f"model `{predictor['model']}` is not a catalog id; use general-forecast/<name>",
-            "ValidationError",
-        )
-        hash_value(predictor["model_digest"])
-        ensure(predictor["task"] in TASKS, "invalid predictor task")
-        text(predictor["target"])
-        inputs = predictor["inputs"]
-        ensure(
-            type(inputs) is list
-            and all(
-                type(column) is dict
-                and {"name", "type"} <= set(column)
-                and type(column["name"]) is str
-                and (column["type"] is None or type(column["type"]) is str)
-                for column in inputs
-            ),
-            "lock inputs must list {name, type} columns",
-        )
-        context = fields(
-            predictor["context"],
-            {"kind"},
-            {"digest", "rows", "query_rows", "path", "name", "max_rows"},
-        )
-        ensure(context["kind"] in CONTEXT_KINDS, "invalid context kind")
-        if context["kind"] == "snapshot":
-            hash_value(context.get("digest"))
-            integer(context.get("rows"), 0)
-        if context["kind"] == "live":
-            name(context.get("name"))
-        fields(value["model"], {"files"})
-        object.__setattr__(self, "document", json_copy(value))
+        """Checks the document field by field, its digest included."""
+        from generalforecast.predictors.lock import validate
+
+        object.__setattr__(self, "document", json_copy(validate(self.document)))
 
     @property
     def predictor(self) -> dict:
@@ -153,13 +92,18 @@ class PredictorLock:
 
     @property
     def data_digest(self) -> str | None:
-        """The snapshot's content digest, when the context is a snapshot."""
+        """The context rows' digest, when the context is a snapshot."""
         return self.context.get("digest") if self.context_kind == "snapshot" else None
 
     @property
+    def resources(self) -> dict:
+        """The hosted serving resources the manifest declares; empty when none."""
+        return dict(self.document.get("resources") or {})
+
+    @property
     def digest(self) -> str:
-        """The revision's content address: the digest of the canonical lock."""
-        return digest(self.document)
+        """The revision's content address: the lock's own `digest`."""
+        return self.document["digest"]
 
     def to_dict(self) -> dict:
         """A copy of the lock document."""
@@ -173,10 +117,15 @@ class PredictorLock:
 
 
 def parse_lock(value: Any) -> "PredictorLock":
-    """A pushed lock: the `gf.lock` of a catalog predictor."""
+    """A pushed lock: the version 2 `gf.lock` of a catalog predictor.
+
+    A version 1 lock is refused with the hint to run `gf check`; the hosted
+    plane rewrites the version 1 locks it stored with
+    `generalforecast.predictors.lock.upgrade`.
+    """
     ensure(
         type(value) is dict and "predictor" in value,
-        "unsupported lock; run `gf check` to write a version 1 lock",
+        "unsupported lock; run `gf check` to write a version 2 lock",
         "UnsupportedLockVersion",
     )
     return PredictorLock.from_dict(value)
@@ -188,7 +137,7 @@ def lock_name(lock: "PredictorLock") -> str:
 
 
 def lock_digest(lock: "PredictorLock") -> str:
-    """The lock's content address."""
+    """The lock's content address, `PredictorLock.digest`."""
     return lock.digest
 
 
@@ -282,7 +231,7 @@ class Environment(WireValue):
         """Keeps environment identity distinct from the immutable revision."""
         name(self.predictor)
         name(self.name)
-        name(self.runtime)
+        identifier(self.runtime)
         integer(self.generation, 0)
         if self.revision is not None:
             integer(self.revision)
@@ -318,16 +267,34 @@ class PromoteRequest(WireValue):
 
 @dataclass(frozen=True)
 class ContextVersion(WireValue):
-    """The actual context observed by inference, not an accepted-write promise."""
+    """The actual context observed by inference, not an accepted-write promise.
+
+    Attributes:
+        source: The context's kind: `snapshot`, `live` or `request`.
+        name: A live context's name; None for the other kinds.
+        version: A snapshot's digest, or a live context's sequence.
+        rows: The context rows inference read.
+        as_of: The time a live context was read as of, in UTC seconds.
+
+    The wire form is `{source, name, version, rows, as_of}`. gf-server
+    refreshes a published revision whose context `source` is `live`.
+    """
 
     source: str
     version: str | int | None = None
     rows: int | None = None
     as_of: float | None = None
+    name: str | None = None
 
     def __post_init__(self):
         """Checks version metadata without fetching a live context."""
-        text(self.source)
+        ensure(self.source in CONTEXT_KINDS, "invalid context source")
+        ensure(
+            (self.name is not None) == (self.source == "live"),
+            "a live context, and only one, is named",
+        )
+        if self.name is not None:
+            name(self.name)
         if self.version is not None:
             ensure(type(self.version) in (int, str), "invalid context version")
         if self.rows is not None:
@@ -342,11 +309,13 @@ class ContextVersion(WireValue):
 def context_version(value: dict) -> ContextVersion:
     """Decodes a context as the SDK or the predictor API describes it.
 
-    The predictor API sends `{kind, rows, digest?, as_of?}`; the kind is the
-    source and the digest is the version.
+    The predictor API sends `{kind, rows, digest?, name?, as_of?}`; the kind
+    is the source and the digest is the version. A source spelled
+    `live/<name>`, as hosted serving wrote it before the name had its own
+    key, reads as a live source and its name.
     """
     if type(value) is dict and "kind" in value and "source" not in value:
-        body = dict(fields(value, {"kind"}, {"rows", "digest", "as_of"}))
+        body = dict(fields(value, {"kind"}, {"rows", "digest", "as_of", "name"}))
         as_of = body.get("as_of")
         if isinstance(as_of, str):
             as_of = datetime.datetime.fromisoformat(as_of).timestamp()
@@ -355,8 +324,86 @@ def context_version(value: dict) -> ContextVersion:
             version=body.get("digest"),
             rows=body.get("rows"),
             as_of=as_of,
+            name=body.get("name"),
         )
+    if (
+        type(value) is dict
+        and type(value.get("source")) is str
+        and value["source"].startswith("live/")
+    ):
+        value = {
+            **value,
+            "source": "live",
+            "name": value["source"].removeprefix("live/"),
+        }
     return ContextVersion.from_dict(value)
+
+
+@dataclass(frozen=True)
+class PredictionRequest(WireValue):
+    """A declared predictor's prediction request: `{queries, context?, as_of?}`.
+
+    Attributes:
+        queries: The rows to score.
+        context: A request context's rows; None for a snapshot or live context.
+        as_of: For a live context, the time to read it as of: an ISO 8601
+            timestamp or UTC seconds. Every surface honours it or refuses it.
+    """
+
+    queries: tuple[dict, ...]
+    context: tuple[dict, ...] | None = None
+    as_of: str | float | None = None
+
+    def __post_init__(self):
+        """Checks the rows and the time."""
+        ensure(
+            type(self.queries) is tuple
+            and 0 < len(self.queries) <= 10_000
+            and all(type(row) is dict for row in self.queries),
+            "queries must contain 1..10000 rows",
+        )
+        if self.context is not None:
+            ensure(
+                type(self.context) is tuple
+                and all(type(row) is dict for row in self.context),
+                "context must be a list of rows",
+            )
+        if isinstance(self.as_of, str):
+            try:
+                datetime.datetime.fromisoformat(self.as_of)
+            except ValueError:
+                raise PredictorError(
+                    "ValidationError", "as_of must be an ISO 8601 time"
+                ) from None
+        elif self.as_of is not None:
+            ensure(
+                type(self.as_of) in (int, float) and 0 <= self.as_of < 1e12,
+                "as_of must be an ISO 8601 time or UTC seconds",
+            )
+
+    @classmethod
+    def from_dict(cls, value: dict) -> "PredictionRequest":
+        """Decodes the request body's payload."""
+        body = fields(value, {"queries"}, {"context", "as_of"})
+        ensure(type(body["queries"]) is list, "queries must be a list of rows")
+        context = body.get("context")
+        ensure(
+            context is None or type(context) is list, "context must be a list of rows"
+        )
+        return cls(
+            tuple(body["queries"]),
+            None if context is None else tuple(context),
+            body.get("as_of"),
+        )
+
+    def to_dict(self) -> dict:
+        """The request body's payload, keys present only when set."""
+        payload: dict = {"queries": [dict(row) for row in self.queries]}
+        if self.context is not None:
+            payload["context"] = [dict(row) for row in self.context]
+        if self.as_of is not None:
+            payload["as_of"] = self.as_of
+        return payload
 
 
 @dataclass(frozen=True)
@@ -422,7 +469,7 @@ class ContextImportRef(WireValue):
                 self.credential_ref.startswith("secret/"),
                 "use a trusted secret reference",
             )
-            name(self.credential_ref.removeprefix("secret/"))
+            identifier(self.credential_ref.removeprefix("secret/"))
         if self.digest is not None:
             hash_value(self.digest)
         ensure(type(self.mapping) is tuple, "import mapping must be immutable")
@@ -454,7 +501,7 @@ class RuntimePlan(WireValue):
 
     def __post_init__(self):
         """Validates caller-selected runtime and trusted secret references."""
-        name(self.runtime)
+        identifier(self.runtime)
         name(self.environment)
         hash_value(self.predictor_digest)
         if self.model_digest is not None:
@@ -480,7 +527,7 @@ class RuntimePlan(WireValue):
             )
         for ref in self.secret_refs:
             ensure(ref.startswith("secret/"), "runtime secrets must be references")
-            name(ref.removeprefix("secret/"))
+            identifier(ref.removeprefix("secret/"))
         if self.model_digest is None:
             ensure(
                 self.data_digest is None

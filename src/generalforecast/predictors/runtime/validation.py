@@ -3,11 +3,13 @@
 
 """Admission and bounded Arrow validation for the in-process predictor executor."""
 
+from typing import Any
+
 import pyarrow as pa
 
 from generalforecast.predictors.models import CatalogResolver
 from generalforecast.predictors.runtime.compile import validate_queries
-from generalforecast.predictors.runtime.lock import ExecutionLock
+from generalforecast.predictors.runtime.compiled import CompiledPlan
 from generalforecast.predictors.runtime.schema import (
     TableSchema,
     infer_schema,
@@ -24,12 +26,12 @@ def isolated(data: pa.Table, *, max_rows: int = 1_000_000) -> pa.Table:
     return pa.ipc.open_stream(arrow_bytes(to_arrow(data, max_rows=max_rows))).read_all()
 
 
-def admit(lock: ExecutionLock) -> ExecutionLock:
+def admit(lock: CompiledPlan, resolver: Any = None) -> CompiledPlan:
     """Authenticates pinned capabilities independently of client-provided hashes."""
-    lock = ExecutionLock.from_dict(lock.to_dict())
-    lock.admit(offline=True)
+    resolver = resolver or CatalogResolver()
+    lock.admit(resolver, offline=True)
     ensure(
-        CatalogResolver().resolve(lock.spec.model, offline=True) == lock.model,
+        resolver.resolve(lock.spec.model, offline=True) == lock.model,
         "authored model differs from locked model",
         "ModelMismatch",
     )
@@ -38,11 +40,10 @@ def admit(lock: ExecutionLock) -> ExecutionLock:
         or (lock.spec.context.mode == "request" and not lock.schema.columns),
         "runtime requires an explicit target outside schema-free request mode",
     )
-    expected = lock.spec.outputs or (
-        ("label", "probabilities") if lock.task == "classification" else ("value",)
-    )
     ensure(
-        lock.outputs == expected, "outputs differ from authored intent", "LockMismatch"
+        lock.outputs == lock.spec.outputs,
+        "outputs differ from authored intent",
+        "LockMismatch",
     )
     ensure(
         lock.spec.id not in lock.outputs,
@@ -58,16 +59,12 @@ def admit(lock: ExecutionLock) -> ExecutionLock:
 
 
 def context_table(
-    lock: ExecutionLock, context: pa.Table
+    lock: CompiledPlan, context: pa.Table
 ) -> tuple[pa.Table, TableSchema]:
     """Verifies full snapshots, locked schema and explicit selection policies."""
     table = isolated(context)
     if lock.spec.context.mode == "snapshot":
-        ensure(
-            table_digest(table) == lock.data_digest,
-            "snapshot digest differs from lock",
-            "SnapshotMismatch",
-        )
+        table = _bound_rows(lock, table)
     schema = infer_schema(lock.spec, lock.model, lock.task, table)
     if lock.schema.columns:
         expected = {c.name: c for c in lock.schema.columns}
@@ -101,9 +98,25 @@ def context_table(
     return selected, infer_schema(lock.spec, lock.model, lock.task, selected)
 
 
-def query_table(
-    lock: ExecutionLock, schema: TableSchema, queries: pa.Table
-) -> pa.Table:
+def _bound_rows(lock: CompiledPlan, table: pa.Table) -> pa.Table:
+    """A snapshot's context rows: the rows the plan compiled, or a wider table of them.
+
+    A table with the plan's columns among others is read as those columns,
+    in the plan's order; its digest must then be the plan's.
+    """
+    if table_digest(table) != lock.data_digest:
+        names = [column.name for column in lock.schema.columns]
+        if set(names) <= set(table.column_names):
+            table = table.select(names)
+    ensure(
+        table_digest(table) == lock.data_digest,
+        "snapshot digest differs from lock",
+        "SnapshotMismatch",
+    )
+    return table
+
+
+def query_table(lock: CompiledPlan, schema: TableSchema, queries: pa.Table) -> pa.Table:
     """Rejects leaked targets, unknown columns, physical drift and missing roles."""
     table = isolated(queries, max_rows=MAX_QUERY_ROWS)
     ensure(table.num_rows > 0, "queries are empty")

@@ -17,13 +17,13 @@ from pathlib import Path
 
 import pyarrow as pa
 import pytest
-import yaml
 
 from generalforecast.predictors.validation import PredictorError
 from generalforecast.serve.models import served
 from generalforecast.service.boundary import Scope
 from generalforecast.service.catalog import CatalogService
 from generalforecast.tabular import arrow_bytes
+from tests.utils.locks import directory, lock_of
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = "general-forecast/tabicl-v2-classifier"
@@ -317,57 +317,18 @@ def history():
     )
 
 
-def lock(name, context, **predictor):
-    """A version-1 `gf.lock` as `gf check` writes it, by hand."""
-    return {
-        "lock_version": 1,
-        "predictor": {
-            "name": name,
-            "model": MODEL,
-            "target": "y",
-            "target_type": "bool",
-            "classes": [False, True],
-            "inputs": [{"name": "x", "type": "float"}],
-            "context": context,
-            "selection": {"core": None, "neighbors": 0, "kind": "stratified"},
-            **predictor,
-        },
-        "model": {"files": {}},
-    }
-
-
 @pytest.fixture
 def predictor_dir(tmp_path):
-    root = tmp_path / "churn"
-    root.mkdir()
-    (root / "gf.yaml").write_text(
-        yaml.safe_dump({"name": "churn", "model": MODEL, "target": "y", "id": "id"})
-    )
-    (root / "gf.lock").write_text(
-        yaml.safe_dump(
-            lock(
-                "churn",
-                {
-                    "kind": "snapshot",
-                    "path": "history.arrow",
-                    "rows": 4,
-                    "digest": "sha256:history",
-                },
-                id="id",
-            )
-        )
-    )
-    (root / "history.arrow").write_bytes(arrow_bytes(history()))
-    return root
+    return directory(tmp_path / "churn", history(), name="churn", id="id")
 
 
 @pytest.fixture
 def lone_lock(tmp_path):
-    lone = tmp_path / "elsewhere"
-    lone.mkdir()
-    (lone / "gf.lock").write_text(
-        yaml.safe_dump(lock("scorer", {"kind": "request", "digest": None}))
+    lone = directory(
+        tmp_path / "elsewhere", history(), context="request", name="scorer"
     )
+    (lone / "gf.yaml").unlink()
+    (lone / "history.arrow").unlink()
     return lone / "gf.lock"
 
 
@@ -409,10 +370,11 @@ def test_snapshot_predictor_binds_once_and_answers_predictions(predictor_dir):
         [described] = body["result"]["predictors"]
         assert described["name"] == "churn" and described["inputs"] == ["x"]
         assert described["model"].startswith(f"{MODEL}@sha256:")
+        digest = lock_of(predictor_dir).data_digest
         assert described["context"] == {
             "kind": "snapshot",
             "rows": 4,
-            "digest": "sha256:history",
+            "digest": digest,
         }
         assert described["lock_digest"].startswith("sha256:")
         status, body = call(url, "/v1/projects/team-a/predictors/churn", key=KEY)
@@ -431,7 +393,7 @@ def test_snapshot_predictor_binds_once_and_answers_predictions(predictor_dir):
         assert result["task"] == "classification"
         assert result["context"]["kind"] == "snapshot"
         assert result["context"]["rows"] == 4
-        assert result["context"]["digest"] == "sha256:history"
+        assert result["context"]["digest"] == digest
         assert result["model"].startswith(f"{MODEL}@sha256:")
         status, body = call(
             url,
@@ -541,8 +503,6 @@ def _read_snapshot(entry):
 def test_snapshot_context_follows_the_manifest_split(tmp_path):
     from generalforecast.predictors import load, split
 
-    root = tmp_path / "held"
-    root.mkdir()
     rows = pa.table(
         {
             "id": list(range(10)),
@@ -550,24 +510,12 @@ def test_snapshot_context_follows_the_manifest_split(tmp_path):
             "y": [i % 2 == 0 for i in range(10)],
         }
     )
-    (root / "history.arrow").write_bytes(arrow_bytes(rows))
-    (root / "gf.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "name": "held",
-                "model": MODEL,
-                "target": "y",
-                "id": "id",
-                "context": {
-                    "snapshot": "history.arrow",
-                    "holdout": {"fraction": 0.2, "seed": 0},
-                },
-            }
-        )
-    )
-    context = {"kind": "snapshot", "path": "history.arrow", "rows": 8, "digest": "d"}
-    (root / "gf.lock").write_text(
-        yaml.safe_dump(lock("held", context, id="id", id_type="int"))
+    root = directory(
+        tmp_path / "held",
+        rows,
+        name="held",
+        id="id",
+        split={"holdout": {"fraction": 0.2, "seed": 0}},
     )
     entry = served(str(root), tmp_path, allow_downloads=True)
     snapshot = _read_snapshot(entry)
@@ -581,8 +529,6 @@ def test_snapshot_context_follows_the_manifest_split(tmp_path):
 
 
 def test_blank_and_whole_number_targets_count_like_gf_check(tmp_path):
-    root = tmp_path / "blank"
-    root.mkdir()
     rows = pa.table(
         {
             "id": ["a", "b", "c", "d"],
@@ -590,65 +536,39 @@ def test_blank_and_whole_number_targets_count_like_gf_check(tmp_path):
             "y": ["no", "yes", "", ""],
         }
     )
-    (root / "history.arrow").write_bytes(arrow_bytes(rows))
-    (root / "gf.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "name": "blank",
-                "model": MODEL,
-                "target": "y",
-                "id": "id",
-                "context": {"snapshot": "history.arrow"},
-            }
-        )
-    )
-    context = {"kind": "snapshot", "path": "history.arrow", "rows": 2, "digest": "d"}
-    (root / "gf.lock").write_text(
-        yaml.safe_dump(
-            lock(
-                "blank",
-                context,
-                id="id",
-                id_type="text",
-                target_type="category",
-                classes=["no", "yes"],
-            )
-        )
-    )
+    root = directory(tmp_path / "blank", rows, name="blank", id="id")
     entry = served(str(root), tmp_path, allow_downloads=True)
     assert _read_snapshot(entry)["y"].to_pylist() == ["no", "yes"]
-
-    floaty = tmp_path / "floaty"
-    floaty.mkdir()
     rows = pa.table(
-        {"id": ["a", "b", "c"], "x": [0.0, 1.0, 2.0], "y": [0.0, 1.0, None]}
+        {
+            "id": ["a", "b", "c", "d", "e"],
+            "x": [0.0, 1.0, 2.0, 3.0, 4.0],
+            "y": [0.0, 1.0, None, 0.0, 1.0],
+        }
     )
-    (floaty / "history.arrow").write_bytes(arrow_bytes(rows))
-    (floaty / "gf.yaml").write_text(
-        yaml.safe_dump(
-            {
-                "name": "floaty",
-                "model": MODEL,
-                "target": "y",
-                "id": "id",
-                "context": {"snapshot": "history.arrow"},
-            }
-        )
-    )
-    (floaty / "gf.lock").write_text(
-        yaml.safe_dump(
-            lock(
-                "floaty",
-                context,
-                id="id",
-                id_type="text",
-                target_type="0/1",
-                classes=[0, 1],
-            )
-        )
-    )
+    floaty = directory(tmp_path / "floaty", rows, name="floaty", id="id")
     snapshot = _read_snapshot(served(str(floaty), tmp_path, allow_downloads=True))
-    assert snapshot["y"].type == pa.int64() and snapshot["y"].to_pylist() == [0, 1]
+    assert snapshot["y"].type == pa.int64() and snapshot["y"].to_pylist() == [
+        0,
+        1,
+        0,
+        1,
+    ]
+
+
+def test_a_stale_lock_or_changed_snapshot_is_not_served(tmp_path, predictor_dir):
+    manifest = predictor_dir / "gf.yaml"
+    manifest.write_text(manifest.read_text() + "selection: {seed: 4}\n")
+    with pytest.raises(PredictorError) as caught:
+        served(str(predictor_dir), tmp_path, allow_downloads=True)
+    assert caught.value.code == "LockRequired"
+    fresh = directory(tmp_path / "fresh", history(), name="fresh", id="id")
+    (fresh / "history.arrow").write_bytes(
+        arrow_bytes(history().set_column(1, "x", pa.array([9.0, 1.0, 2.0, 3.0])))
+    )
+    with pytest.raises(PredictorError) as caught:
+        served(str(fresh), tmp_path, allow_downloads=True)
+    assert caught.value.code == "SnapshotMismatch"
 
 
 def test_verbose_asks_gf_server_for_its_progress_lines(monkeypatch):

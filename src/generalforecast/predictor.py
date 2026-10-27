@@ -3,21 +3,22 @@
 
 """`generalforecast.Predictor`: one object for local, ad hoc, served and hosted predictors.
 
-A predictor is a catalog model, a target, inputs and a context. This module
-resolves a reference to one, builds the request every path validates the
-same way, runs it in process through the engine or over HTTP, and scores a
-held-out split.
+A predictor is a catalog model, a target, inputs and a context. A local
+predictor's `gf.yaml` resolves as `gf check` resolves it, and an ad hoc
+predictor's settings resolve as the hosted ad hoc route resolves them, into
+a version 2 lock document. `run_local` compiles that document and binds its
+context rows with `PredictorExecutor`, the executor hosted serving runs, so
+types, past and future covariates, `max_rows` and selection are honoured
+exactly as `gf serve` and hosted serving honour them. A served or hosted
+predictor is called over HTTP.
 """
 
 from __future__ import annotations
 
 import dataclasses
-import json
 import math
 import os
-import re
-import urllib.error
-import urllib.request
+import urllib.parse
 import uuid
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -32,18 +33,15 @@ from generalforecast import tabular
 from generalforecast.errors import (
     AmbiguousReference,
     Error,
-    Internal,
     InvalidInput,
     NotFound,
     boundary,
-    from_wire,
 )
 from generalforecast.native import models as registry
+from generalforecast.predictors.validation import NAME
 
 pc: Any = _compute
 ENVIRONMENTS = ("staging", "production")
-NAME = re.compile(r"^[a-z][a-z0-9-]{0,62}$")
-_URL = re.compile(r"^https?://", re.IGNORECASE)
 _HOLDOUT_FRACTION = 0.2
 
 
@@ -101,6 +99,8 @@ class PredictRequest:
     selection: Mapping[str, Any] | None = None
     as_of: Any = None
     classes: tuple[Any, ...] = ()
+    future: tuple[str, ...] = ()
+    lock: Mapping[str, Any] | None = field(default=None, compare=False, repr=False)
 
     @classmethod
     def build(
@@ -121,8 +121,13 @@ class PredictRequest:
         outputs: Sequence[str] | None = None,
         selection: Mapping[str, Any] | None = None,
         as_of: Any = None,
+        future: Sequence[str] = (),
     ) -> PredictRequest:
         """Checks the settings against the rows and the model's limits.
+
+        A forecaster's inputs are its covariates: `future` names those whose
+        values each query brings ahead, and every other input is a past
+        covariate, the rule `gf check` applies.
 
         Raises:
             InvalidInput: For a missing target or input column, no inputs
@@ -281,7 +286,36 @@ class PredictRequest:
             selection=dict(selection) if selection else None,
             as_of=as_of,
             classes=classes,
+            future=tuple(future),
         )
+
+    def manifest(self) -> dict[str, Any]:
+        """The ad hoc request as a manifest, as the hosted ad hoc route resolves it."""
+        manifest: dict[str, Any] = {
+            "name": "ad-hoc",
+            "model": self.model,
+            "target": self.target,
+            "context": {"request": {}},
+        }
+        if self.task == "forecast":
+            past = [name for name in self.inputs if name not in self.future]
+            sections = {"past": past, "future": list(self.future)}
+            if past or self.future:
+                manifest["inputs"] = {
+                    key: value for key, value in sections.items() if value
+                }
+        else:
+            manifest["inputs"] = list(self.inputs)
+        for key in ("id", "time", "frequency", "horizon"):
+            if getattr(self, key) is not None:
+                manifest[key] = getattr(self, key)
+        if self.series:
+            manifest["series"] = list(self.series)
+        if self.quantiles is not None and self.task != "classification":
+            manifest["quantiles"] = list(self.quantiles)
+        if self.selection:
+            manifest["selection"] = dict(self.selection)
+        return manifest
 
     def payload(self) -> dict[str, Any]:
         """The ad hoc request payload of section 5."""
@@ -359,81 +393,85 @@ def _capacity(what: str, model: str, limit: int, actual: int) -> Error:
 
 
 def run_local(request: PredictRequest, *, download: bool = True) -> Any:
-    """Runs a request in this process's engine and returns the result frame."""
-    from generalforecast.native import tables
+    """Runs a request in this process, as hosted serving runs the same lock, and returns a frame.
 
-    name = f"predictor-{uuid.uuid4().hex}"
-    if request.task == "forecast":
-        schema = tables.SeriesSchema(
-            target=request.target,
-            time=request.time or "time",
-            series=request.series or _single_series(request),
-            frequency=request.frequency or _infer_frequency(request),
-            known=request.inputs,
+    A local predictor's request carries its lock document; an ad hoc
+    request resolves its settings against its context rows first, as the
+    hosted ad hoc route does. The lock is compiled with `compile_lock` and
+    bound by `PredictorExecutor`; the executor's results become the frame.
+    """
+    from generalforecast.contracts import parse_lock
+    from generalforecast.predictors.models import CatalogResolver
+    from generalforecast.predictors.runtime import PredictorExecutor
+    from generalforecast.predictors.runtime.compile import compile_lock
+    from generalforecast.predictors.runtime.context import served_context
+
+    with boundary():
+        lock = parse_lock(dict(request.lock or _ad_hoc_lock(request)))
+        kind = lock.context_kind
+        rows = served_context(lock, request.context)
+        plan = compile_lock(lock, rows, resolver=CatalogResolver("local"))
+        prepared = PredictorExecutor(allow_downloads=download, surface="local").prepare(
+            plan, rows if kind != "request" else None
         )
-        series_table = tables.SeriesTable(
-            name,
-            model=request.model,
-            schema=schema,
-            horizon=request.horizon,
-            quantiles=request.quantiles,
-            download=download,
-        )
-        try:
-            series_table.insert(request.context)
-            return series_table.predict(request.queries, request.as_of)
-        finally:
-            series_table.drop()
-    limits = registry.limits(request.model)
-    selection = tables.retrieved_of(
-        request.selection,
-        limits.context_rows,
-        timed=request.time is not None,
-        rows=len(request.context),
-    )
-    table = tables.Table(
-        name,
-        model=request.model,
-        schema=tables.Schema(
-            target=request.target,
-            id=request.id,
-            time=request.time,
-            inputs=request.inputs,
-        ),
-        selection=selection,
-        download=download,
-    )
-    try:
-        table.insert(request.context)
-        frame = table.predict(
-            request.queries, request.as_of, quantiles=request.quantiles
-        )
-    finally:
-        table.drop()
-    if request.id is not None and request.id in frame.columns:
-        frame = frame.rename(columns={request.id: "id"})
-    return frame
+        queries = _query_rows(plan, request.queries)
+        table = prepared.predict(queries, context=rows if kind == "request" else None)
+    return _frame_of_predictions(plan, queries, table)
 
 
-def _single_series(request: PredictRequest) -> tuple[str, ...]:
-    raise InvalidInput(
-        f"{request.model} forecasts series and no `series` column is given",
-        param="series",
-        hint="pass series=[<column>] naming each series",
-    )
+def _ad_hoc_lock(request: PredictRequest) -> dict[str, Any]:
+    """The lock document of an ad hoc request, resolved against its context rows."""
+    from generalforecast.predictors import lock, resolve
+    from generalforecast.predictors.spec import PredictorSpec
+
+    spec = PredictorSpec.from_dict(request.manifest())
+    return lock.document(resolve(spec, rows=request.context))
 
 
-def _infer_frequency(request: PredictRequest) -> Any:
-    assert request.time is not None
-    times = request.context.column(request.time)
-    values = pc.unique(times).sort().to_pylist()
-    if len(values) < 2:
+def _query_rows(plan: Any, queries: pa.Table) -> pa.Table:
+    """The query columns the plan reads, in its order: its id and inputs, or a forecast's roles.
+
+    Other columns a frame carries, such as the target of rows held out for
+    `eval`, are left out, as a client would leave them out of a request.
+    """
+    spec = plan.spec
+    if plan.task == "forecast":
+        wanted = [*spec.series, spec.time, *spec.future_inputs]
+        if spec.id is not None:
+            wanted.append(spec.id)
+    else:
+        wanted = [
+            column.name
+            for column in plan.schema.columns
+            if column.role in ("input", "id")
+        ] or [*(spec.inputs.include or ()), *([spec.id] if spec.id else [])]
+    missing = [name for name in wanted if name not in queries.column_names]
+    if missing:
         raise InvalidInput(
-            "frequency is required: the context has too few times to infer it",
-            param="frequency",
+            f"input column `{missing[0]}` is not in the queries",
+            param=f"inputs.{missing[0]}",
+            hint="the queries have " + ", ".join(queries.column_names),
         )
-    step = values[1] - values[0]
-    return step.total_seconds() if hasattr(step, "total_seconds") else step
+    return queries.select(list(dict.fromkeys(wanted)))
+
+
+def _frame_of_predictions(plan: Any, queries: pa.Table, table: pa.Table) -> Any:
+    """The executor's predictions as a frame: id, a forecast's series and time, then outputs."""
+    import pandas as pd
+
+    spec = plan.spec
+    frame = _frame_of_result({"predictions": table.to_pylist()}, spec.id)
+    if plan.task == "forecast":
+        keys = pd.DataFrame(
+            {
+                name: queries.column(name).to_pylist()
+                for name in (*spec.series, spec.time)
+            }
+        )
+        frame = pd.concat([keys, frame.drop(columns=["id"], errors="ignore")], axis=1)
+        if spec.id is not None and spec.id in queries.column_names:
+            frame.insert(0, "id", queries.column(spec.id).to_pylist())
+    return frame
 
 
 @dataclass(frozen=True)
@@ -619,20 +657,57 @@ class Context:
             )
         return self._owner
 
-    def append(self, rows: Any) -> Any:
-        """Appends rows to a live context."""
-        owner = self._live()
-        with boundary():
-            return owner._client().contexts.append(self.name, tabular.frame(rows))
+    def append(self, rows: Any, *, idempotency_key: str | None = None) -> Any:
+        """Appends rows to a live context, each carrying the predictor's id column.
 
-    def label(self, ids: Iterable[Any], values: Iterable[Any]) -> Any:
+        Args:
+            rows: The rows to append.
+            idempotency_key: The write's durable id, so a retried append is
+                applied once; a fresh one if None.
+        """
+        owner = self._live()
+        identity = owner._id_name()
+        if identity is None:
+            raise InvalidInput(
+                "a live context's rows need an id column",
+                hint="declare `id:` in gf.yaml so appended rows can be labeled later",
+            )
+        with boundary():
+            return owner._client().contexts.append(
+                self.name,
+                tabular.frame(rows),
+                id=identity,
+                idempotency_key=idempotency_key or "w-" + uuid.uuid4().hex,
+            )
+
+    def label(
+        self,
+        ids: Iterable[Any],
+        values: Iterable[Any],
+        *,
+        idempotency_key: str | None = None,
+    ) -> Any:
         """Sets the target of rows in a live context, by id."""
         owner = self._live()
         ids, values = list(ids), list(values)
         if len(ids) != len(values):
             raise InvalidInput("ids and values must have the same length")
+        identity = owner._id_name() or "id"
+        target = owner.target
+        if target is None:
+            raise InvalidInput("the predictor names no target to label")
+        rows = [
+            {identity: key, target: value}
+            for key, value in zip(ids, values, strict=True)
+        ]
         with boundary():
-            return owner._client().contexts.label(self.name, ids, values)
+            return owner._client().contexts.label(
+                self.name,
+                rows,
+                id=identity,
+                column=target,
+                idempotency_key=idempotency_key or "w-" + uuid.uuid4().hex,
+            )
 
     def as_of(self, ts: Any) -> Predictor:
         """The same predictor reading the live context as of `ts`."""
@@ -644,8 +719,8 @@ class Context:
 class Resolution:
     """The resolved schema of a predictor, as `gf check` prints it."""
 
-    # contract: provided by session B (generalforecast.predictors.Resolution);
-    # this is the SDK's own view when a predictor is ad hoc or hosted.
+    # A served or hosted predictor's view, from what its server describes;
+    # local and ad hoc predictors explain with `predictors.Resolution`.
     name: str
     model: str
     task: str
@@ -683,8 +758,12 @@ class Predictor:
         quantiles: A regressor's or forecaster's levels.
         context: An ad hoc predictor's context rows, so `predict` can omit them.
         selection: How each query's context is drawn: core, neighbors, kind.
+        future: A forecaster's inputs whose values each query brings ahead;
+            its other inputs are past covariates.
         client: The hosted client to use; one from the profile if None.
         download: Whether a model's files may download if not cached.
+        project: A served predictor's project; `local` if None.
+        api_key: A served predictor's key; `GF_API_KEY` if None.
     """
 
     def __init__(
@@ -703,8 +782,11 @@ class Predictor:
         quantiles: Sequence[float] | None = None,
         context: Any = None,
         selection: Mapping[str, Any] | None = None,
+        future: Sequence[str] = (),
         client: Any = None,
         download: bool = True,
+        project: str | None = None,
+        api_key: str | None = None,
     ) -> None:
         """Resolves the reference; nothing runs until `predict` or `eval`."""
         self._kind, self._where = resolve_reference(ref)
@@ -713,8 +795,17 @@ class Predictor:
         self._as_of: Any = None
         self._root: Path | None = None
         self._spec: Any = None
+        self._resolution: Any = None
+        self._lock: dict[str, Any] | None = None
+        self._snapshot: pa.Table | None = None
         self._context_frame: pa.Table | None = None
         self._query_frame: pa.Table | None = None
+        self._context_kind = "request"
+        self._live_name: str | None = None
+        self._project = project
+        self._api_key = api_key
+        self._transport: Any = None
+        self.future = tuple(future)
         self.target = target
         self.inputs: tuple[str, ...] | None = (
             tuple(inputs) if inputs is not None else None
@@ -775,45 +866,31 @@ class Predictor:
     # -- resolution ---------------------------------------------------------
 
     def _load_local(self) -> None:
+        """Resolves `gf.yaml` as `gf check` does, without writing `gf.lock`."""
+        from generalforecast.predictors import lock, resolve
+        from generalforecast.predictors.spec import load
+
         assert self._root is not None
-        spec = _load_spec(self._root)
-        self._spec = spec
-        if spec.get("name"):
-            self.name = spec["name"]
-        self.model = registry.canonical(spec["model"])
-        self.task = registry.task_of(self.model)
-        self.target = self.target or spec.get("target")
-        if not self.target:
-            raise InvalidInput(
-                f"predictor {self.name} has no target",
-                hint="add `target: <column>` to gf.yaml",
-            )
-        if self.inputs is None and spec.get("inputs") is not None:
-            self.inputs = tuple(spec["inputs"])
-        if not self.exclude:
-            self.exclude = tuple(spec.get("exclude") or ())
-        self.id = self.id or spec.get("id")
-        self.time = self.time or spec.get("time")
-        self.series = self.series or tuple(spec.get("series") or ())
-        self.frequency = self.frequency or spec.get("frequency")
-        self.horizon = self.horizon or spec.get("horizon")
-        if self.quantiles is None and spec.get("quantiles"):
-            self.quantiles = tuple(spec["quantiles"])
-        if self.selection is None and spec.get("selection"):
-            self.selection = dict(spec["selection"])
-        context = spec.get("context") or {}
-        self._context_kind = context.get("kind", "snapshot")
-        if self._context_kind == "snapshot":
-            source = self._root / context["source"]
-            if not source.is_file():
-                raise NotFound(
-                    f"context file `{context['source']}` is not in {self._root}",
-                    hint="put the snapshot next to gf.yaml, or fix `context.snapshot`",
-                )
-            frame = tabular.frame(str(source))
-            self._context_frame, self._query_frame = _split(frame, self, context)
-        elif self._context_kind == "live":
-            self._live_name = context.get("name")
+        with boundary():
+            spec = load(self._root)
+            resolution = resolve(spec, self._root)
+        self._spec, self._resolution = spec, resolution
+        self._lock = lock.document(resolution)
+        self.name = spec.name
+        self.model = spec.model
+        self.task = resolution.task
+        self.target = spec.target
+        self.inputs = resolution.input_names
+        self.exclude = spec.exclude
+        self.id, self.time, self.series = spec.id, spec.time, spec.series
+        self.frequency, self.horizon = resolution.frequency, spec.horizon
+        self.quantiles = resolution.quantiles or None
+        self.future = spec.future
+        self.selection = resolution.selection.to_dict()
+        self._context_kind = spec.context.kind
+        self._live_name = spec.context.live
+        self._context_frame = resolution.context_table
+        self._query_frame = resolution.query_table
 
     # -- facts --------------------------------------------------------------
 
@@ -854,8 +931,7 @@ class Predictor:
         if self._facts is None:
             with boundary():
                 found = self._client().predictors.get(self.name, env=self._env)
-            data = getattr(found, "data", None)
-            self._facts = dict(data) if isinstance(data, Mapping) else {}
+            self._facts = dict(found) if isinstance(found, Mapping) else {}
             self.model = str(self._facts.get("model", self.model))
             self.task = str(self._facts.get("task", self.task))
         return self._facts
@@ -898,6 +974,8 @@ class Predictor:
         self, queries: Any, context: Any = None, *, as_of: Any = None
     ) -> PredictRequest:
         """The validated request `predict` runs for these rows."""
+        if self._kind == "local":
+            return self._local_request(queries, context, as_of=as_of)
         if context is None:
             context = self._context_frame
         if context is None:
@@ -922,6 +1000,54 @@ class Predictor:
             quantiles=self.quantiles,
             selection=self.selection,
             as_of=as_of if as_of is not None else self._as_of,
+            future=self.future,
+        )
+
+    def _local_request(
+        self, queries: Any, context: Any = None, *, as_of: Any = None
+    ) -> PredictRequest:
+        """A local predictor's request: its lock, and the context rows the lock names."""
+        assert self._lock is not None and self.target is not None
+        if self._context_kind == "request":
+            if context is None:
+                raise InvalidInput(
+                    "context is required",
+                    param="context",
+                    hint=f"predictor {self.name} takes its context with each call",
+                )
+            rows = tabular.frame(context)
+        else:
+            if context is not None:
+                raise InvalidInput(
+                    f"predictor {self.name} has a {self._context_kind} context",
+                    param="context",
+                    hint="its context is the one gf.yaml declares; pass queries only",
+                )
+            rows = self._context_frame
+        if rows is None:
+            raise InvalidInput(
+                "a live context is read where it lives",
+                hint="push the predictor and predict with the hosted name",
+            )
+        resolution = self._resolution
+        return PredictRequest(
+            model=self.model,
+            task=self.task,
+            target=self.target,
+            context=rows,
+            queries=tabular.frame(queries),
+            inputs=resolution.input_names,
+            id=self.id,
+            time=self.time,
+            series=self.series,
+            frequency=self.frequency,
+            horizon=self.horizon,
+            quantiles=self.quantiles,
+            selection=self.selection,
+            as_of=as_of if as_of is not None else self._as_of,
+            classes=tuple(resolution.classes or ()),
+            future=self.future,
+            lock=self._lock,
         )
 
     def predict(self, queries: Any, context: Any = None, *, as_of: Any = None) -> Any:
@@ -969,56 +1095,49 @@ class Predictor:
 
     # -- served HTTP --------------------------------------------------------
 
+    def _served_transport(self) -> Any:
+        """The SDK transport to a `gf serve`, with its key, made once."""
+        if self._transport is None:
+            from generalforecast.transport import Transport, credential_from_env
+
+            key = self._api_key
+            if key is None:
+                value, _ = credential_from_env()
+                key = value or None
+            with boundary():
+                self._transport = Transport(self._base, token=key, timeout=120)
+        return self._transport
+
     def _served_post(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
-        request_id = "r-" + uuid.uuid4().hex
-        body = {
-            "api_version": "gf/v1",
-            "project": "local",
-            "request_id": request_id,
-            "resource": {"kind": "predictor", "name": self.name},
-            "payload": dict(payload),
-        }
-        return self._served(path, json.dumps(body).encode(), request_id)
+        return self._served("POST", path, payload)
 
     def _served_get(self, path: str) -> dict[str, Any]:
-        return self._served(path, None, "r-" + uuid.uuid4().hex)
+        return self._served("GET", path, None)
 
-    def _served(self, path: str, data: bytes | None, request_id: str) -> dict[str, Any]:
-        url = f"{self._base}/v1/projects/local{path}"
-        request = urllib.request.Request(
-            url,
-            data=data,
-            method="POST" if data is not None else "GET",
-            headers={"Content-Type": "application/json", "X-GF-Request-ID": request_id},
+    def _served(
+        self, method: str, path: str, payload: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        """One call to a `gf serve`, enveloped and unwrapped as the SDK client does."""
+        from generalforecast.service.boundary import Request, Resource, Scope
+        from generalforecast.service.sdk import unwrap
+
+        project = self._project or "local"
+        request = Request(
+            Scope(project, "r-" + uuid.uuid4().hex),
+            Resource("predictor", self.name),
+            dict(payload or {}),
         )
-        try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                raw = response.read()
-                status = response.status
-        except urllib.error.HTTPError as error:
-            raw = error.read()
-            status = error.code
-        except OSError as error:
-            raise Internal(
-                f"cannot reach {self._base}: {error}".rstrip("."),
-                request_id=request_id,
-            ) from None
-        try:
-            value = json.loads(raw)
-        except ValueError:
-            raise Internal(
-                f"{self._base} answered {status} without a JSON body",
-                request_id=request_id,
-            ) from None
-        if not isinstance(value, Mapping):
-            raise Internal(
-                f"{self._base} answered with no envelope", request_id=request_id
+        with boundary():
+            value = self._served_transport().send(
+                method,
+                f"/v1/projects/{project}{path}",
+                request.to_dict() if method == "POST" else None,
+                {
+                    "X-GF-Request-ID": request.scope.request_id,
+                    "X-GF-Project": project,
+                },
             )
-        if "error" in value and value["error"] is not None:
-            raise from_wire(value["error"], status=status, request_id=request_id)
-        if status >= 400:
-            raise Internal(f"{self._base} answered {status}", request_id=request_id)
-        return dict(value.get("result", value))
+            return dict(unwrap(value, request))
 
     # -- evaluation ---------------------------------------------------------
 
@@ -1058,7 +1177,14 @@ class Predictor:
                 "`.eval(queries)`; or set `holdout` or `until` under `context`",
             )
         else:
-            context, held = _holdout(context, self.target, seed=0)
+            from generalforecast.predictors.tables import split_by
+
+            assert self.target is not None
+            context, held = split_by(
+                context,
+                self.target,
+                holdout={"fraction": _HOLDOUT_FRACTION, "seed": 0},
+            )
         assert self.target is not None
         if self.target not in held.column_names:
             raise InvalidInput(
@@ -1084,11 +1210,14 @@ class Predictor:
             task = registry.task_of(model)
             cap = registry.limits(model).queries if task != "forecast" else len(held)
             frames = []
+            lock = self._lock if model == self.model else self._lock_for(model)
             for start in range(0, max(len(held), 1), max(cap, 1)):
+                given = None if self._kind == "local" else context
                 batch = dataclasses.replace(
-                    self.request(held.slice(start, cap), context),
+                    self.request(held.slice(start, cap), given),
                     model=model,
                     task=task,
+                    lock=lock,
                 )
                 if start == 0:
                     request = batch
@@ -1107,6 +1236,16 @@ class Predictor:
                 "label" if self.task == "classification" else "value"
             ].tolist()
         return Evaluation(metrics, pd.DataFrame(rows))
+
+    def _lock_for(self, model: str) -> dict[str, Any] | None:
+        """A local predictor's lock with another model, resolved as `gf check` would."""
+        if self._kind != "local" or self._spec is None:
+            return None
+        from generalforecast.predictors import lock, resolve
+
+        with boundary():
+            spec = dataclasses.replace(self._spec, model=model)
+            return lock.document(resolve(spec, self._root))
 
     def _score(
         self, request: PredictRequest, frame: Any, truth: list[Any], held: pa.Table
@@ -1150,62 +1289,29 @@ class Predictor:
     # -- lifecycle ----------------------------------------------------------
 
     def explain(self) -> Any:
-        """The resolved schema: model, task, target, inputs, context and selection."""
+        """The resolved schema: model, task, target, inputs, context and selection.
+
+        A local predictor's is the `predictors.Resolution` `gf check` prints;
+        an ad hoc one's is the same, resolved against its context rows; a
+        served or hosted one's is what its server describes.
+        """
         if self._kind == "local":
-            assert self._root is not None
-            try:
-                from generalforecast import predictors as _predictors
+            return self._resolution
+        if self._kind == "catalog":
+            from generalforecast.predictors import resolve
+            from generalforecast.predictors.spec import PredictorSpec
 
-                spec = _predictors.load(self._root / "gf.yaml")
-                return _predictors.resolve(spec, self._root)
-            except ImportError:
-                pass
-        if self._kind in ("local", "catalog"):
             context = self._context_frame
-            inputs: tuple[tuple[str, str], ...] = ()
-            classes: tuple[Any, ...] = ()
-            if context is not None:
-                from generalforecast.columns import infer
-
-                names = self.inputs
-                if names is None:
-                    roles = {
-                        self.target,
-                        self.id,
-                        self.time,
-                        *self.series,
-                        *self.exclude,
-                    }
-                    names = tuple(n for n in context.column_names if n not in roles)
-                kinds = infer(
-                    context.select([n for n in names if n in context.column_names])
+            if context is None:
+                raise InvalidInput(
+                    "an ad hoc predictor explains against its context",
+                    hint="give the predictor a context",
                 )
-                inputs = tuple((n, str(kinds.get(n, "?"))) for n in names)
-                if (
-                    self.task == "classification"
-                    and self.target in context.column_names
-                ):
-                    column = context.column(self.target)
-                    classes = tuple(
-                        sorted(
-                            set(column.filter(pc.invert(_empty(column))).to_pylist()),
-                            key=lambda item: (str(type(item)), item),
-                        )
-                    )
-            assert self.target is not None
-            return Resolution(
-                name=self.name,
-                model=self.model,
-                task=self.task,
-                target=self.target,
-                classes=classes,
-                id=self.id,
-                time=self.time,
-                series=self.series,
-                inputs=inputs,
-                context=self.context,
-                selection=self.selection,
-            )
+            request = self.request(context.slice(0, 1), context)
+            with boundary():
+                return resolve(
+                    PredictorSpec.from_dict(request.manifest()), rows=context
+                )
         facts = self._hosted_facts()
         return Resolution(
             name=self.name,
@@ -1226,66 +1332,77 @@ class Predictor:
         )
 
     def save(self, path: str | os.PathLike[str]) -> Path:
-        """Writes `gf.yaml` (and the snapshot) for an ad hoc or local predictor at `path`."""
+        """Writes `gf.yaml`, its snapshot and `gf.lock` for a local or ad hoc predictor at `path`.
+
+        A local predictor's manifest is kept whole, its split, types, past
+        and future covariates, selection and resources included, with the
+        snapshot copied beside it; an ad hoc predictor's settings become a
+        manifest with its context rows as the snapshot. The directory checks
+        as the original does: `gf.Predictor(path)` predicts the same.
+        """
         if self._kind not in ("local", "catalog"):
             raise InvalidInput(
                 "only a local or ad hoc predictor can be saved",
                 hint="a hosted predictor's manifest is its revision",
             )
-        import yaml
+        from pyarrow import parquet
+
+        from generalforecast.predictors import resolve, write_lock, write_manifest
+        from generalforecast.predictors.spec import Context as SpecContext
+        from generalforecast.predictors.spec import PredictorSpec
 
         root = Path(path)
-        root.mkdir(parents=True, exist_ok=True)
         name = root.resolve().name if self._kind == "catalog" else self.name
-        if not NAME.match(name):
+        if not NAME.fullmatch(name):
             raise InvalidInput(
                 f"`{name}` is not a predictor name",
                 hint="use lowercase letters, digits and dashes, starting with a letter",
             )
-        manifest: dict[str, Any] = {
-            "name": name,
-            "model": self.model,
-            "target": self.target,
-        }
-        if self.id:
-            manifest["id"] = self.id
-        if self.inputs is not None:
-            manifest["inputs"] = list(self.inputs)
-        elif self.exclude:
-            manifest["inputs"] = {"exclude": list(self.exclude)}
-        if self.time:
-            manifest["time"] = self.time
-        if self.series:
-            manifest["series"] = list(self.series)
-        if self.frequency is not None:
-            manifest["frequency"] = self.frequency
-        if self.horizon is not None:
-            manifest["horizon"] = self.horizon
-        if self.quantiles is not None:
-            manifest["quantiles"] = list(self.quantiles)
-        if self.selection:
-            manifest["selection"] = dict(self.selection)
-        if self._context_frame is not None:
-            from pyarrow import parquet
+        snapshot = "context.parquet"
+        with boundary():
+            if self._kind == "local":
+                assert self._spec is not None and self._root is not None
+                spec = dataclasses.replace(self._spec, name=name, marks={})
+                rows = None
+                if spec.context.kind == "snapshot":
+                    from generalforecast.predictors.tables import read_frame
 
-            frame = self._context_frame
-            if self._query_frame is not None and len(self._query_frame):
-                frame = pa.concat_tables(
-                    [frame, self._query_frame], promote_options="default"
+                    assert spec.context.snapshot is not None
+                    rows = read_frame(self._root, spec.context.snapshot)
+                    spec = dataclasses.replace(
+                        spec,
+                        context=dataclasses.replace(spec.context, snapshot=snapshot),
+                    )
+            else:
+                rows = self._context_frame
+                if rows is None:
+                    raise InvalidInput(
+                        "an ad hoc predictor saves with its context rows",
+                        hint="give the predictor a context",
+                    )
+                request = self.request(rows.slice(0, 1), rows)
+                manifest = request.manifest()
+                manifest["name"] = name
+                manifest.pop("context")
+                spec = dataclasses.replace(
+                    PredictorSpec.from_dict(manifest),
+                    context=SpecContext("snapshot", snapshot=snapshot),
                 )
-            parquet.write_table(frame, root / "context.parquet")
-            manifest["context"] = {"snapshot": "context.parquet"}
-        elif self._kind == "local" and self._spec is not None:
-            manifest["context"] = self._spec.get("context_raw") or {
-                "request": {"max_rows": 10000}
-            }
-        else:
-            manifest["context"] = {"request": {"max_rows": 10000}}
-        (root / "gf.yaml").write_text(yaml.safe_dump(manifest, sort_keys=False))
+            root.mkdir(parents=True, exist_ok=True)
+            if rows is not None:
+                parquet.write_table(rows, root / snapshot)
+            write_manifest(spec, root, force=True)
+            write_lock(resolve(spec, root), root)
         return root
 
-    def push(self, env: str = "staging") -> Predictor:
-        """Deploys a local predictor to a hosted environment and returns it."""
+    def push(self, env: str = "staging", *, runtime: str | None = None) -> Predictor:
+        """Deploys a local predictor to a hosted environment and returns it.
+
+        Args:
+            env: The environment, `staging` or `production`.
+            runtime: The runtime a new environment runs on, `hosted` or
+                `local`; the profile's when None.
+        """
         if env not in ENVIRONMENTS:
             raise InvalidInput(
                 f"environment `{env}` is not one of staging, production", param="env"
@@ -1298,7 +1415,7 @@ class Predictor:
         assert self._root is not None
         client = self._client()
         with boundary():
-            client.predictors.push(self._root, env=env)
+            client.predictors.push(self._root, env=env, runtime=runtime)
         return Predictor(self.name, env=env, client=client)
 
 
@@ -1347,14 +1464,16 @@ def resolve_reference(ref: Any) -> tuple[str, Any]:
             "a predictor reference must be a path, a name, a model id or a URL"
         )
     text = ref.strip()
-    if _URL.match(text):
-        base, _, name = text.rstrip("/").rpartition("/")
-        if not name or "://" in name or not base:
+    parsed = urllib.parse.urlsplit(text)
+    if parsed.scheme.lower() in ("http", "https") and parsed.netloc:
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) != 1 or parsed.query or parsed.fragment:
             raise InvalidInput(
                 f"`{text}` names no predictor",
                 hint="use http://host:port/<predictor>",
             )
-        return "served", (base, name)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        return "served", (base, parts[0])
     if registry.is_catalog_id(text) and registry.known_org(text):
         return "catalog", registry.canonical(text)
     if registry.is_bare_name(text):
@@ -1368,7 +1487,7 @@ def resolve_reference(ref: Any) -> tuple[str, Any]:
             f"`{text}` is both a directory with gf.yaml and a hosted predictor name",
             hint=f"pass ./{text} for the local predictor, or env= for the hosted one",
         )
-    if not NAME.match(text):
+    if not NAME.fullmatch(text):
         raise InvalidInput(
             f"`{text}` is not a predictor name, path, model id or URL",
             hint="names are lowercase letters, digits and dashes",
@@ -1387,169 +1506,6 @@ def _local_root(path: str) -> Path:
             f"no gf.yaml in `{path}`", hint="run `gf init` there to write one"
         )
     return root
-
-
-def _load_spec(root: Path) -> dict[str, Any]:
-    """The manifest's fields as the SDK reads them, through session B's loader when present."""
-    try:
-        from generalforecast import predictors as _predictors
-    except ImportError:
-        _predictors = None
-    if _predictors is not None and hasattr(_predictors, "load"):
-        spec = _predictors.load(root / "gf.yaml")
-        return _spec_fields(spec)
-    import yaml
-
-    with boundary():
-        raw = yaml.safe_load((root / "gf.yaml").read_text()) or {}
-    if not isinstance(raw, Mapping):
-        raise InvalidInput(f"{root / 'gf.yaml'} is not a mapping")
-    return _manifest_fields(raw)
-
-
-def _spec_fields(spec: Any) -> dict[str, Any]:
-    if isinstance(spec, Mapping):
-        return _manifest_fields(spec)
-    if hasattr(spec, "to_dict"):
-        return _manifest_fields(spec.to_dict())
-    return _manifest_fields(
-        {name: getattr(spec, name) for name in dir(spec) if not name.startswith("_")}
-    )
-
-
-def _manifest_fields(raw: Mapping[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {
-        "name": raw.get("name"),
-        "model": raw.get("model"),
-        "target": raw.get("target"),
-        "id": raw.get("id"),
-        "time": raw.get("time"),
-        "series": raw.get("series"),
-        "frequency": raw.get("frequency"),
-        "horizon": raw.get("horizon"),
-        "quantiles": raw.get("quantiles"),
-        "selection": raw.get("selection"),
-        "inputs": None,
-        "exclude": (),
-    }
-    if not out["model"]:
-        raise InvalidInput(
-            "gf.yaml has no `model`", hint="add `model: general-forecast/<name>`"
-        )
-    inputs = raw.get("inputs")
-    if isinstance(inputs, Mapping):
-        if "include" in inputs and inputs["include"] is not None:
-            out["inputs"] = tuple(inputs["include"])
-        out["exclude"] = tuple(inputs.get("exclude") or ())
-        if out["inputs"] is not None and out["exclude"]:
-            raise InvalidInput(
-                "gf.yaml gives both an `inputs` list and `inputs.exclude`",
-                hint="a list of inputs already replaces inference",
-            )
-    elif isinstance(inputs, Sequence) and not isinstance(inputs, str):
-        out["inputs"] = tuple(inputs)
-    elif inputs is not None:
-        raise InvalidInput("gf.yaml `inputs` must be a list or a mapping")
-    context = raw.get("context") or {}
-    info: dict[str, Any] = {}
-    if isinstance(context, Mapping):
-        kinds = [
-            key
-            for key in ("snapshot", "request", "live", "source", "mode")
-            if key in context
-        ]
-        if "snapshot" in context:
-            info = {"kind": "snapshot", "source": context["snapshot"]}
-        elif "live" in context:
-            info = {"kind": "live", "name": context["live"]}
-        elif "request" in context:
-            info = {"kind": "request", **(context["request"] or {})}
-        elif context.get("mode") == "snapshot" or "source" in context:
-            info = {"kind": "snapshot", "source": context.get("source")}
-        elif context.get("mode") == "live":
-            info = {"kind": "live", "name": context.get("source")}
-        elif context.get("mode") == "request":
-            info = {"kind": "request"}
-        elif kinds:
-            info = {"kind": kinds[0]}
-        if "until" in context and "holdout" in context:
-            raise InvalidInput(
-                "gf.yaml sets both `context.until` and `context.holdout`",
-                hint="keep one of them",
-            )
-        info["until"] = context.get("until")
-        info["holdout"] = context.get("holdout")
-    elif isinstance(context, str):
-        info = {"kind": "snapshot", "source": context}
-    out["context"] = info
-    out["context_raw"] = dict(context) if isinstance(context, Mapping) else context
-    return out
-
-
-def _split(
-    frame: pa.Table, predictor: Predictor, context: Mapping[str, Any]
-) -> tuple[pa.Table, pa.Table]:
-    """Context rows and query rows of a snapshot, through session B's `split` when present."""
-    try:
-        from generalforecast import predictors as _predictors
-
-        if hasattr(_predictors, "split") and predictor._root is not None:
-            spec = _predictors.load(predictor._root / "gf.yaml")
-            with boundary():
-                left, right = _predictors.split(frame, spec)
-            return tabular.frame(left), tabular.frame(right)
-    except ImportError:
-        pass
-    target = predictor.target
-    assert target is not None
-    if target not in frame.column_names:
-        near = _did_you_mean(target, frame.column_names)
-        raise InvalidInput(
-            f"target column `{target}` is not in the context",
-            param="target",
-            hint=f"did you mean `{near}`?"
-            if near
-            else "the context has " + ", ".join(frame.column_names),
-        )
-    empty = _empty(frame.column(target))
-    if pc.any(empty).as_py():
-        return frame.filter(pc.invert(empty)), frame.filter(empty)
-    until = context.get("until")
-    if until is not None and predictor.time:
-        times = frame.column(predictor.time)
-        boundary_value = (
-            pa.scalar(until, type=times.type)
-            if not isinstance(until, str)
-            else pa.scalar(until).cast(times.type)
-        )
-        after = pc.greater_equal(times, boundary_value)
-        return frame.filter(pc.invert(after)), frame.filter(after)
-    holdout = context.get("holdout")
-    if holdout:
-        fraction = (
-            float(holdout.get("fraction", _HOLDOUT_FRACTION))
-            if isinstance(holdout, Mapping)
-            else float(holdout)
-        )
-        seed = int(holdout.get("seed", 0)) if isinstance(holdout, Mapping) else 0
-        return _holdout(frame, target, fraction=fraction, seed=seed)
-    return frame, frame.slice(0, 0)
-
-
-def _holdout(
-    frame: pa.Table,
-    target: str | None,
-    *,
-    fraction: float = _HOLDOUT_FRACTION,
-    seed: int = 0,
-) -> tuple[pa.Table, pa.Table]:
-    """A deterministic random split: the context and `fraction` of rows held out."""
-    count = len(frame)
-    held = max(1, round(fraction * count)) if count > 1 else 0
-    order = np.random.default_rng(seed).permutation(count)
-    mask = np.zeros(count, dtype=bool)
-    mask[order[:held]] = True
-    return frame.filter(pa.array(~mask)), frame.filter(pa.array(mask))
 
 
 __all__ = [

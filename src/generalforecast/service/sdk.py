@@ -20,8 +20,8 @@ from generalforecast.contracts import (
     PredictorLock,
     Revision,
 )
-from generalforecast.predictors.lock import read_lock
 from generalforecast.predictors.models import describe
+from generalforecast.predictors.validation import PredictorError
 from generalforecast.service.boundary import (
     JsonObject,
     Request,
@@ -30,7 +30,7 @@ from generalforecast.service.boundary import (
     json_object,
 )
 from generalforecast.service.contracts import ServiceError, name, require
-from generalforecast.tabular import file_format, read_table, table_digest, to_arrow
+from generalforecast.tabular import file_format, read_table, to_arrow
 
 __all__ = ["AsyncClient", "Client", "SuiteClient", "endpoint"]  # noqa: F822
 
@@ -468,7 +468,14 @@ def environment_name(value: str | None, default: str) -> str:
 
 @dataclass(frozen=True)
 class Pushed:
-    """What `push` sends for a checked predictor: its lock and snapshot rows."""
+    """What `push` sends for a checked predictor: its lock and its context rows.
+
+    Attributes:
+        lock: The version 2 `gf.lock`, its resources included.
+        snapshot: A snapshot predictor's context rows, exactly the rows the
+            lock's context digest names: split, projected and normalized as
+            `served_context` reads them. None for a request or live context.
+    """
 
     lock: PredictorLock
     snapshot: pa.Table | None = None
@@ -480,28 +487,47 @@ class Pushed:
 
 
 def pushed(predictor: "str | Path") -> Pushed:
-    """Reads a checked predictor: a directory with `gf.yaml` and `gf.lock`.
+    """Reads a checked predictor: a directory with `gf.yaml` and an up-to-date `gf.lock`.
 
-    Predictors push the `gf.lock` `gf check` wrote and, for a snapshot
-    context, the snapshot rows.
+    `gf push` and `Client.predictors.push` both send this: the lock `gf check`
+    wrote and, for a snapshot context, the context rows its digest names,
+    never the snapshot file's query rows.
+
+    Raises:
+        ServiceError: `LockRequired` for a missing, version 1 or stale lock;
+            `SnapshotMismatch` for a snapshot that changed since `gf check`.
     """
+    from generalforecast.errors import Error
+    from generalforecast.predictors.lock import lock_document, manifest_digest
+    from generalforecast.predictors.runtime.context import served_context
+    from generalforecast.predictors.spec import load
+    from generalforecast.predictors.tables import read_frame
+
     root = Path(predictor)
-    document = read_lock(root)
-    if document is None:
+    try:
+        document = lock_document(root)
+        if (root / "gf.yaml").is_file() and document["manifest"] != manifest_digest(
+            load(root)
+        ):
+            raise ServiceError(
+                "LockRequired",
+                f"gf.lock in {root} was written for another gf.yaml; run `gf check` first",
+                422,
+            )
+    except Error as error:
         raise ServiceError(
-            "LockRequired", f"no gf.lock in {root}; run `gf check` first", 422
-        )
+            "LockRequired", f"{error.message}; run `gf check` first", 422
+        ) from None
     lock = PredictorLock.from_dict(document)
     snapshot = None
     if lock.context_kind == "snapshot":
-        path = lock.context.get("path")
-        require(type(path) is str, "snapshot lock names no context file")
-        assert isinstance(path, str)
-        snapshot = read_table((root / path).read_bytes(), file_format(path))
-        require(
-            table_digest(snapshot) == lock.data_digest,
-            "snapshot differs from gf.lock; run `gf check` again",
-        )
+        path = lock.context["path"]
+        try:
+            snapshot = served_context(lock, read_frame(root, path))
+        except Error as error:
+            raise ServiceError("MissingFile", error.message, 422) from None
+        except PredictorError as error:
+            raise ServiceError("SnapshotMismatch", f"{error.message}", 422) from None
     return Pushed(lock, snapshot)
 
 

@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Additive local-suite envelope, shared by HTTP and in-process adapters.
+"""The `gf/v1` request and result envelope, shared by HTTP and in-process adapters.
 
-Parsing is not authorization or domain admission. Existing alpha contracts stay
-unchanged until their replacements are wired and proven by integration.
+`gf serve`, hosted serving and the SDK parse and write the same envelope.
+Parsing is not authorization or domain admission; each adapter authorizes
+after parsing.
 """
 
 import json
