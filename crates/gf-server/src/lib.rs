@@ -25,6 +25,8 @@ pub mod quantiles;
 pub mod revisions;
 pub mod routes;
 pub mod runtime;
+#[cfg(test)]
+mod scratch;
 pub mod service;
 pub mod setup;
 pub mod shard;

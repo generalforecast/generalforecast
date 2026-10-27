@@ -3,11 +3,14 @@
 
 //! Rows by id in blocks, in memory and spilled to disk.
 
+mod scratch;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use gf_core::rows::{BLOCK_BYTES, Row, RowMemory, RowStore, RowsError, Sealer};
 use gf_core::table::RowId;
+use scratch::Scratch;
 
 /// A sealer that binds a block's place and version without encrypting, so
 /// tests can see that swapped or stale blocks are refused.
@@ -29,10 +32,11 @@ impl Sealer for Bound {
     }
 }
 
-fn path(name: &str) -> PathBuf {
-    let directory = std::env::temp_dir().join(format!("gf-rows-{}-{name}", std::process::id()));
-    std::fs::create_dir_all(&directory).unwrap();
-    directory.join("table.rows")
+/// A row file's path in a directory of its own, removed with the guard.
+fn path(name: &str) -> (Scratch, PathBuf) {
+    let scratch = Scratch::new(&format!("rows-{name}"));
+    let file = scratch.path().join("table.rows");
+    (scratch, file)
 }
 
 /// Rows 0..count of two features, their targets and keys derived from their ids.
@@ -77,7 +81,7 @@ fn rows_come_back_as_they_went_in() {
 #[test]
 fn a_store_past_its_budget_spills_to_disk_and_reads_back() {
     let memory = RowMemory::bounded(4 * BLOCK_BYTES as u64);
-    let file = path("spill");
+    let (_scratch, file) = path("spill");
     let mut store = RowStore::on_disk(&memory, 2, &file, Arc::new(Bound)).unwrap();
     let (features, targets, keys) = rows(5_000);
     store.push(&features, &targets, &keys).unwrap();
@@ -102,7 +106,8 @@ fn a_store_past_its_budget_spills_to_disk_and_reads_back() {
 #[test]
 fn changed_rows_are_written_again_and_old_copies_counted_as_garbage() {
     let memory = RowMemory::bounded(BLOCK_BYTES as u64);
-    let mut store = RowStore::on_disk(&memory, 2, &path("garbage"), Arc::new(Bound)).unwrap();
+    let (_scratch, file) = path("garbage");
+    let mut store = RowStore::on_disk(&memory, 2, &file, Arc::new(Bound)).unwrap();
     let (features, targets, keys) = rows(2_000);
     store.push(&features, &targets, &keys).unwrap();
     store.gather(&ids(1_000..2_000)).unwrap();
@@ -121,7 +126,8 @@ fn changed_rows_are_written_again_and_old_copies_counted_as_garbage() {
 #[test]
 fn a_snapshot_reads_rows_as_they_were_while_the_store_changes() {
     let memory = RowMemory::bounded(BLOCK_BYTES as u64);
-    let mut store = RowStore::on_disk(&memory, 2, &path("snapshot"), Arc::new(Bound)).unwrap();
+    let (_scratch, file) = path("snapshot");
+    let mut store = RowStore::on_disk(&memory, 2, &file, Arc::new(Bound)).unwrap();
     let (features, targets, keys) = rows(3_000);
     store.push(&features, &targets, &keys).unwrap();
     let snapshot = store.snapshot();
@@ -153,7 +159,7 @@ fn a_snapshot_reads_rows_as_they_were_while_the_store_changes() {
 #[test]
 fn a_block_changed_on_disk_is_refused() {
     let memory = RowMemory::bounded(0);
-    let file = path("damaged");
+    let (_scratch, file) = path("damaged");
     let mut store = RowStore::on_disk(&memory, 2, &file, Arc::new(Bound)).unwrap();
     let (features, targets, keys) = rows(1_000);
     store.push(&features, &targets, &keys).unwrap();
@@ -173,7 +179,7 @@ fn a_block_changed_on_disk_is_refused() {
 #[test]
 fn a_dropped_store_removes_its_file_and_frees_its_memory() {
     let memory = RowMemory::unbounded();
-    let file = path("dropped");
+    let (_scratch, file) = path("dropped");
     let mut store = RowStore::on_disk(&memory, 2, &file, Arc::new(Bound)).unwrap();
     let (features, targets, keys) = rows(100);
     store.push(&features, &targets, &keys).unwrap();
@@ -204,7 +210,8 @@ fn reserved_rows_take_values_in_any_order() {
 #[test]
 fn a_snapshot_reads_rows_as_they_were_across_a_clear() {
     let memory = RowMemory::bounded(0);
-    let mut store = RowStore::on_disk(&memory, 2, &path("cleared"), Arc::new(Bound)).unwrap();
+    let (_scratch, file) = path("cleared");
+    let mut store = RowStore::on_disk(&memory, 2, &file, Arc::new(Bound)).unwrap();
     let (features, targets, keys) = rows(2);
     store.push(&features, &targets, &keys).unwrap();
     let before = store.snapshot();

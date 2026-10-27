@@ -4,6 +4,8 @@
 //! A shard driven with a fake worker: table checks, quarantine, hung workers
 //! and the query queue.
 
+mod common;
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
@@ -351,13 +353,10 @@ fn key() -> EncryptionKey {
 
 async fn shard(settings: ShardSettings) -> Harness {
     static SHARDS: AtomicUsize = AtomicUsize::new(0);
-    let directory = std::env::temp_dir().join(format!(
-        "gf-shard-test-{}-{}",
-        std::process::id(),
+    let directory = common::scratch(&format!(
+        "shard-test-{}",
         SHARDS.fetch_add(1, Ordering::Relaxed)
     ));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).unwrap();
     shard_in(settings, directory).await
 }
 
@@ -385,8 +384,7 @@ async fn shard_routed(
             "bounded".to_string(),
             "capped".to_string(),
         ],
-    )
-    .unwrap();
+    );
     let metrics = Arc::new(Metrics::default());
     let mut shard = Shard::new(
         connection,
@@ -1308,8 +1306,7 @@ async fn acknowledged_writes_are_headed_once_the_shard_goes_idle() {
     shard.insert(&[4]).await;
     headed(first_head).await;
 
-    let copy = shard.directory.with_extension("copy");
-    std::fs::create_dir(&copy).unwrap();
+    let copy = common::scratch("shard-copy");
     let copy_log = copy.join("rows.log");
     let copy_head = copy.join("rows.head");
     std::fs::copy(shard.directory.join("rows.log"), &copy_log).unwrap();
@@ -1878,9 +1875,7 @@ async fn ephemeral_tables_past_the_count_go_least_recently_used_first() {
 #[tokio::test]
 async fn the_routes_forget_a_context_as_its_table_leaves_the_shard() {
     let routes = Arc::new(Routes::new(1, 16));
-    let directory = std::env::temp_dir().join(format!("gf-shard-routes-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&directory);
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = common::scratch("shard-routes");
     let mut settings = settings();
     settings.ephemeral.tables = 1;
     let shard = shard_routed(settings, directory, Some(routes.clone())).await;

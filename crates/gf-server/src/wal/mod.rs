@@ -1732,9 +1732,7 @@ mod tests {
 
     #[test]
     fn a_table_with_a_retired_strategy_is_not_served_and_keeps_its_log() {
-        let directory = std::env::temp_dir().join(format!("gf-retired-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir_all(&directory).unwrap();
+        let directory = crate::scratch::Scratch::new("retired");
         let path = directory.join("payments.log");
         let key = EncryptionKey::from_hex(&"07".repeat(32)).unwrap();
         log_with_strategy(
@@ -1756,6 +1754,5 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), log);
         assert_eq!(std::fs::read(head_path(&path)).unwrap(), head);
         assert!(!directory.join("payments.log.unreadable").exists());
-        std::fs::remove_dir_all(&directory).unwrap();
     }
 }

@@ -379,14 +379,8 @@ mod tests {
         }
     }
 
-    fn tempdir() -> PathBuf {
-        let directory = std::env::temp_dir().join(format!(
-            "gf-setup-{}-{}",
-            std::process::id(),
-            random_hex(4).unwrap()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        directory
+    fn tempdir() -> crate::scratch::Scratch {
+        crate::scratch::Scratch::new("setup")
     }
 
     #[test]

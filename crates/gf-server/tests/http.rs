@@ -747,10 +747,7 @@ fn snapshot_file() -> std::path::PathBuf {
     let batch = RecordBatch::try_from_iter(columns).unwrap();
     static SNAPSHOTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let snapshot = SNAPSHOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "gf-http-snapshot-{}-{snapshot}.arrow",
-        std::process::id()
-    ));
+    let path = common::scratch(&format!("http-snapshot-{snapshot}")).join("snapshot.arrow");
     let file = std::fs::File::create(&path).unwrap();
     let mut writer = arrow_ipc::writer::StreamWriter::try_new(file, &batch.schema()).unwrap();
     writer.write(&batch).unwrap();
