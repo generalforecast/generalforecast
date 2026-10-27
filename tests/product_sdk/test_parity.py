@@ -173,7 +173,14 @@ def calls(authored: Any) -> dict[str, tuple[tuple, dict]]:
         "contexts.import_file": (("history", {"x": [1]}), {}),
         "contexts.refresh": (("history",), {}),
         "contexts.mutate": (
-            ("history", {"write_id": "w", "operation": "insert", "records": []}),
+            (
+                "history",
+                {
+                    "write_id": "w",
+                    "operation": "create_features",
+                    "records": [{"key": "row1", "features": {"x": 2.0}}],
+                },
+            ),
             {},
         ),
         "contexts.snapshot": (("history",), {"target": "y", "knowledge_at": 1.0}),
@@ -204,8 +211,8 @@ def calls(authored: Any) -> dict[str, tuple[tuple, dict]]:
         "identity.manage": (("audit.list",), {}),
         "keys.list": ((), {}),
         "keys.create": ((), {"name": "ci", "permissions": ["models:read"]}),
-        "keys.revoke": (("key-1",), {}),
-        "keys.rotate": (("key-1",), {}),
+        "keys.revoke": (("key-" + "0" * 24,), {}),
+        "keys.rotate": (("key-" + "0" * 24,), {}),
         "secrets.list": ((), {}),
         "secrets.get": (("token",), {}),
         "secrets.create": ((), {"name": "token", "value": "v"}),
@@ -306,3 +313,200 @@ def test_a_closed_client_raises_the_same_typed_error(asynchronous):
         asyncio.run(run())
     assert error.value.code == "ClientClosed"
     assert isinstance(error.value, gf.InvalidInput)
+
+
+def spec_routes() -> list[tuple[str, re.Pattern[str], Any]]:
+    from generalforecast import _api
+
+    return [
+        (
+            route.method,
+            re.compile(re.sub(r"\{[^}]+\}", "[^/]+", route.path)),
+            route.request,
+        )
+        for route in _api.ROUTES
+    ]
+
+
+def identity_calls() -> list[tuple[str, dict]]:
+    """Every identity action, with the identities its path takes."""
+    from generalforecast._operations import WORKSPACE_ACTIONS
+
+    ids = {"workspace": "acme", "id": "item-1"}
+    calls = [
+        (action, {k: v for k, v in ids.items() if "{" + k + "}" in path})
+        for action, (_method, path, _resource) in WORKSPACE_ACTIONS.items()
+    ]
+    return [
+        *calls,
+        ("workspace.get", {}),
+        ("auth.status", {}),
+        ("auth.logout", {}),
+        ("organizations.list", {}),
+        ("organizations.create", {"name": "acme", "account": "a"}),
+        ("projects.list", {}),
+        ("projects.create", {"name": "web", "organization": "acme"}),
+        ("memberships.list", {}),
+        ("memberships.add", {"issuer": "i", "subject": "s", "role": "admin"}),
+        ("memberships.remove", {"issuer": "i", "subject": "s"}),
+        ("sso.get", {}),
+        ("sso.configure", {"enabled": True}),
+        ("audit.list", {"after": 0, "limit": 10}),
+    ]
+
+
+# A revision's lock uses gf.yaml's type names (`bool`, `int`), which the spec's
+# Lock schema does not list; the lock and the spec are reconciled elsewhere.
+_LOCK_ROUTE = re.compile(r"/v1/projects/[^/]+/predictors/[^/]+/revisions")
+
+
+def sent_requests(tmp_path, monkeypatch) -> list[tuple[str, str, Any, bool]]:
+    """Every request a client sends for the parity table and every identity action.
+
+    Each is marked with whether the SDK built its payload; an identity action
+    forwards the caller's.
+    """
+    authored = checked(tmp_path)
+    lock = checked_lock(authored)
+    revision = Revision("risk", 1, lock.digest, lock.model, time.time())
+    monkeypatch.setattr(_operations, "answer", lambda _prepared, value: value)
+    sync, _asynchronous = clients()
+    sent: list[tuple[str, str, Any, bool]] = []
+    built = True
+
+    class Spec(Recorder):
+        def reply(self, method, path, body, headers, deadline=None):
+            sent.append((method, path.split("?")[0], body, built))
+            return super().reply(method, path, body, headers, deadline)
+
+    for call, (args, kwargs) in calls(authored).items():
+        record(sync, Spec(results(lock, revision)), call, args, kwargs)
+    built = False
+    for action, payload in identity_calls():
+        record(
+            sync,
+            Spec(results(lock, revision)),
+            "identity.manage",
+            (action, payload),
+            {},
+        )
+    return sent
+
+
+def spec_request(routes, method: str, path: str) -> Any:
+    matching = [
+        request
+        for verb, pattern, request in routes
+        if verb == method and pattern.fullmatch(path)
+    ]
+    assert matching, (method, path)
+    return matching[0]
+
+
+def test_every_request_either_client_sends_is_a_route_of_the_spec(
+    tmp_path, monkeypatch
+):
+    routes = spec_routes()
+    for method, path, body, built in sent_requests(tmp_path, monkeypatch):
+        request = spec_request(routes, method, path)
+        if (
+            built
+            and method == "POST"
+            and isinstance(body, dict)
+            and request is not None
+            and not _LOCK_ROUTE.fullmatch(path)
+        ):
+            request.from_payload(body)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="gf.lock writes gf.yaml type names (bool, int) that the spec's Lock "
+    "schema does not list; reconcile predictors/lock.py with api/openapi.yaml",
+)
+def test_a_pushed_lock_matches_the_spec(tmp_path, monkeypatch):
+    routes = spec_routes()
+    for method, path, body, _built in sent_requests(tmp_path, monkeypatch):
+        if method == "POST" and _LOCK_ROUTE.fullmatch(path):
+            spec_request(routes, method, path).from_payload(body)
+
+
+class Refusing(Recorder):
+    """Answers as `Recorder`, refusing the first request to each named route."""
+
+    def __init__(self, table, refused: dict[tuple[str, str], Any]) -> None:
+        super().__init__(table)
+        self.refused = dict(refused)
+
+    def reply(self, method, path, body, headers, deadline=None):
+        route = path.removeprefix("/v1/projects/test").split("?")[0]
+        refusal = self.refused.pop((method, route), None)
+        if refusal is not None:
+            super().reply(method, path, body, headers, deadline)
+            raise refusal
+        return super().reply(method, path, body, headers, deadline)
+
+
+def test_failures_inside_operations_are_handled_alike(tmp_path, monkeypatch):
+    from generalforecast.service.contracts import ServiceError
+
+    authored = checked(tmp_path)
+    lock = checked_lock(authored)
+    revision = Revision("risk", 1, lock.digest, lock.model, time.time())
+    monkeypatch.setattr(_operations, "answer", lambda _prepared, value: value)
+    missing = ServiceError("NotFound", "gone", 404)
+    cases = [
+        # A new predictor and environment are created before the promotion.
+        (
+            "predictors.push",
+            (authored,),
+            {},
+            {
+                ("GET", "/predictors/risk"): missing,
+                ("GET", "/predictors/risk/environments/staging"): missing,
+            },
+            None,
+        ),
+        # Running out of time inside a poll is a WaitTimeout.
+        (
+            "predictors.wait",
+            ("risk",),
+            {"timeout": 0},
+            {
+                ("GET", "/predictors/risk/environments/staging"): ServiceError(
+                    "Timeout", "request deadline exceeded", 504
+                )
+            },
+            "WaitTimeout",
+        ),
+    ]
+    for call, args, kwargs, refused, raised in cases:
+        outcomes = []
+        for client in clients():
+            recorder = Refusing(results(lock, revision), refused)
+            try:
+                record(client, recorder, call, args, kwargs)
+                outcomes.append((recorder.sent, None))
+            except ServiceError as error:
+                outcomes.append((recorder.sent, error.code))
+        assert outcomes[0] == outcomes[1], call
+        assert outcomes[0][1] == raised, call
+
+
+def test_every_versioned_request_goes_through_call(monkeypatch):
+    seen = []
+
+    def sync_call(self, method, path, *args, **kwargs):
+        seen.append(("sync", method, path))
+        return {"keys": []}
+
+    async def async_call(self, method, path, *args, **kwargs):
+        seen.append(("async", method, path))
+        return {"keys": []}
+
+    monkeypatch.setattr(Client, "_call", sync_call)
+    monkeypatch.setattr(AsyncClient, "_call", async_call)
+    sync, asynchronous = clients()
+    assert sync.keys.list() == []
+    assert asyncio.run(asynchronous.keys.list()) == []
+    assert seen == [("sync", "GET", "/keys"), ("async", "GET", "/keys")]
