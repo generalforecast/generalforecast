@@ -4,24 +4,29 @@
 """Browser login for the CLI: the OAuth 2.0 device authorization grant.
 
 `gf login` asks the server for a device code, opens the approval page, and
-polls until a signed-in browser approves or denies it. Standard library only,
-so login stays fast and works before heavier SDK modules load.
+polls until a signed-in browser approves or denies it. Requests go through
+the SDK's hardened `Transport`, so a key is never forwarded by a redirect,
+read through an ambient proxy or sent over plain HTTP off loopback.
 """
 
-import json
 import os
 import socket
 import sys
 import time
-import urllib.error
-import urllib.request
 from collections.abc import Callable
 from typing import Any
 
-from generalforecast.service.contracts import ServiceError
+from generalforecast.service.contracts import ServiceError, reason_of
 
 START = "/v1/cli-logins"
 TOKEN = "/v1/cli-logins/token"
+
+# How the service says a poll came early. It folds its codes into the wire
+# vocabulary and keeps each one's name as the error's `reason`.
+PENDING = reason_of("AuthorizationPending")
+SLOW_DOWN = reason_of("SlowDown")
+# Seconds a `slow_down` adds to the polling interval, as RFC 8628 asks.
+SLOW_DOWN_SECONDS = 5
 
 
 def machine_name() -> str:
@@ -59,47 +64,26 @@ def call(
     token: str | None = None,
     project: str | None = None,
 ) -> dict[str, Any]:
-    """GETs, or POSTs a JSON payload, without loading the SDK transport."""
-    headers = {
-        "Accept": "application/json",
-        "X-GF-Request-ID": "r-" + os.urandom(16).hex(),
-    }
+    """GETs, or POSTs a JSON payload, through the hardened transport.
+
+    Raises:
+        ServiceError: The server's error, with its wire code and `reason`;
+            a refused redirect or a plain-HTTP server off loopback.
+    """
+    from generalforecast.transport import MAX_TIMEOUT, MIN_TIMEOUT, Transport
+
+    headers = {"X-GF-Request-ID": "r-" + os.urandom(16).hex()}
     if project:
         headers["X-GF-Project"] = project
-    if payload is not None:
-        headers["Content-Type"] = "application/json"
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    request = urllib.request.Request(
-        server + path,
-        data=None if payload is None else json.dumps(payload).encode(),
-        headers=headers,
-        method="GET" if payload is None else "POST",
-    )
+    # One request is bounded as every SDK request is, whatever a flag asks.
+    bounded = min(max(timeout, MIN_TIMEOUT), MAX_TIMEOUT)
+    transport = Transport(server, token=token, timeout=bounded)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(response.read())
-    except urllib.error.HTTPError as error:
-        try:
-            body = json.loads(error.read())
-            problem = body["error"]
-            code, message = str(problem["code"]), str(problem["message"])
-        except (ValueError, KeyError, TypeError):
-            code, message = "RequestFailed", f"server returned HTTP {error.code}"
-        raise ServiceError(code, message, error.code) from None
-    except TimeoutError:
-        raise ServiceError(
-            "Timeout", f"{server} did not respond in time", 504
-        ) from None
-    except (urllib.error.URLError, OSError) as error:
-        reason = getattr(error, "reason", error)
-        raise ServiceError(
-            "TransportError", f"cannot reach {server} ({reason})", 503
-        ) from None
-    except ValueError:
-        raise ServiceError(
-            "ProtocolError", f"{server} returned invalid JSON", 502
-        ) from None
+        return transport.send(
+            "GET" if payload is None else "POST", path, payload, headers
+        )
+    finally:
+        transport.close()
 
 
 class DeviceLogin:
@@ -138,7 +122,14 @@ class DeviceLogin:
         return grant
 
     def wait(self, grant: dict[str, Any]) -> dict[str, Any]:
-        """Polls until approval, honoring interval and slow_down."""
+        """Polls until approval, honoring the interval and every `slow_down`.
+
+        Raises:
+            ServiceError: `ExpiredToken` once the code expires, or the
+                server's refusal: an expired or consumed code
+                (`expired_token`), a denial in the browser (`access_denied`),
+                or a rate limit.
+        """
         interval = max(int(grant["interval"]), 1)
         deadline = self.clock() + int(grant["expires_in"])
         while True:
@@ -153,9 +144,9 @@ class DeviceLogin:
                     self.timeout,
                 )
             except ServiceError as error:
-                if error.code == "AuthorizationPending":
+                if error.reason == PENDING:
                     continue
-                if error.code == "SlowDown":
-                    interval += 5
+                if error.reason == SLOW_DOWN:
+                    interval += SLOW_DOWN_SECONDS
                     continue
                 raise

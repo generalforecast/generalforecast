@@ -115,3 +115,16 @@ def test_forecast_takes_the_known_future_rows(catalog) -> None:
     with pytest.raises(InvalidInput):
         estimator.forecast(future=future.drop(columns=["price"]))
     estimator.close()
+
+
+def test_set_params_checks_a_model_as_the_constructor_does():
+    forecaster = Forecaster("general-forecast/chronos-2", download=False)
+    for model in ("chronos-2", "tests.custom:Forecaster"):
+        with pytest.raises(InvalidInput) as constructed:
+            Forecaster(model, download=False)
+        with pytest.raises(InvalidInput) as changed:
+            forecaster.set_params(model=model)
+        assert changed.value.message == constructed.value.message
+    assert forecaster.model == "general-forecast/chronos-2"
+    forecaster.set_params(model="general-forecast/chronos-2")
+    assert forecaster.get_params()["model"] == "general-forecast/chronos-2"
