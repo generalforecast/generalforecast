@@ -13,6 +13,7 @@ so a credential reaches only the origin it was given for.
 import asyncio
 import ipaddress
 import json
+import logging
 import os
 import re
 import ssl
@@ -766,7 +767,16 @@ class Transport(_Policy):
             if end - time.monotonic() <= 0:
                 raise _timeout()
             try:
-                status, raw = self._send_once(method, path, data, headers, end, limit)
+                try:
+                    status, raw = self._send_once(
+                        method, path, data, headers, end, limit
+                    )
+                except ServiceError as error:
+                    _logged(
+                        method, self.url + path, error.code, self._headers | headers
+                    )
+                    raise
+                _logged(method, self.url + path, status, self._headers | headers)
                 if status == 503:
                     error = _failure(status, _error_object(raw))
                     if self._retry(method, body, attempt, error):
@@ -843,6 +853,17 @@ class Transport(_Policy):
         if time.monotonic() > end:
             raise _timeout()
         return status, bytes(raw)
+
+
+# Every exchange, at DEBUG: method, URL, status or failure, and request id.
+# The SDK leaves it silent; `gf -v` shows it.
+REQUESTS = logging.getLogger("generalforecast.requests")
+
+
+def _logged(method: str, url: str, outcome: object, headers: Mapping[str, str]) -> None:
+    REQUESTS.debug(
+        "%s %s %s %s", method, url, outcome, headers.get("X-GF-Request-ID") or "-"
+    )
 
 
 def _error_object(raw: bytes) -> Any:
@@ -949,8 +970,20 @@ class AsyncTransport(_Policy):
             async with asyncio.timeout(remaining):
                 for attempt in range(self.retries + 1):
                     try:
-                        status, raw = await self._send_once(
-                            method, path, data, headers, limit
+                        try:
+                            status, raw = await self._send_once(
+                                method, path, data, headers, limit
+                            )
+                        except ServiceError as error:
+                            _logged(
+                                method,
+                                self.url + path,
+                                error.code,
+                                self._headers | headers,
+                            )
+                            raise
+                        _logged(
+                            method, self.url + path, status, self._headers | headers
                         )
                         if status == 503:
                             error = _failure(status, _error_object(raw))
