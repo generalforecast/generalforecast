@@ -46,7 +46,13 @@ from generalforecast.service.boundary import (
     Scope,
     json_object,
 )
-from generalforecast.service.contracts import ServiceError, name, number, require
+from generalforecast.service.contracts import (
+    InputError,
+    ServiceError,
+    name,
+    number,
+    require,
+)
 from generalforecast.service.interfaces import (
     AcceptedWrite,
     ContextSnapshot,
@@ -77,8 +83,11 @@ ARROW_STREAM = "application/vnd.apache.arrow.stream"
 # The most rows an append, or labels a label, the service takes in one call;
 # a larger write is sent in chunks of as many. See `LiveContextAppend`.
 WRITE_CHUNK = 100
-# The longest write id the service takes.
+# The longest write id the service takes, in UTF-8 bytes.
 WRITE_ID_LENGTH = 256
+# The namespace of the write ids a chunked write sends; no caller's key may
+# start with it, so a chunk can never replay a caller's own write.
+CHUNK_PREFIX = "gf-chunk/"
 
 
 @dataclass(frozen=True)
@@ -305,17 +314,42 @@ class PartialWrite(ServiceError):
         self.chunks = chunks
 
 
+def write_key(key: Any) -> str:
+    """An idempotency key, checked as every write checks it.
+
+    Raises:
+        InputError: A key that is not 1 to `WRITE_ID_LENGTH` bytes of UTF-8
+            text, or that is in the chunked writes' namespace.
+    """
+    try:
+        size = len(key.encode()) if isinstance(key, str) else 0
+    except UnicodeEncodeError:
+        size = 0
+    if not 0 < size <= WRITE_ID_LENGTH:
+        raise InputError(
+            "ValidationError",
+            f"an idempotency key is 1 to {WRITE_ID_LENGTH} bytes of text",
+            param="idempotency_key",
+        )
+    if key.startswith(CHUNK_PREFIX):
+        raise InputError(
+            "ValidationError",
+            f"idempotency keys starting with `{CHUNK_PREFIX}` are reserved for "
+            "chunked writes",
+            param="idempotency_key",
+        )
+    return key
+
+
 def chunk_write_id(key: str, index: int) -> str:
     """The write id of the `index`th chunk, from 0, of a write under `key`.
 
-    `key#1`, `key#2` and on: a retry under the same key sends the same ids,
-    so the service replays each chunk it already accepted. A key too long to
-    take the suffix within `WRITE_ID_LENGTH` is replaced by its digest.
+    `gf-chunk/<sha256 of key>/<n>`, in a namespace no caller's key can use,
+    and of one length whatever the key: a retry under the same key sends the
+    same ids, so the service replays each chunk it already accepted.
     """
-    suffix = f"#{index + 1}"
-    if len(key) + len(suffix) > WRITE_ID_LENGTH:
-        key = "sha256-" + hashlib.sha256(key.encode()).hexdigest()
-    return key + suffix
+    digest = hashlib.sha256(write_key(key).encode()).hexdigest()
+    return f"{CHUNK_PREFIX}{digest}/{index + 1}"
 
 
 def _context_write(
@@ -372,6 +406,7 @@ def context_append(
     context: str, data: Any, *, id: str, idempotency_key: str
 ) -> Operation[WriteReceipt]:
     """Appends rows under a durable write id, in chunks the service accepts."""
+    write_key(idempotency_key)
     payload = yield Work(
         append_payload, (data,), {"id": id, "write_id": idempotency_key}
     )
@@ -384,6 +419,7 @@ def context_label(
     context: str, data: Any, *, id: str, column: str, idempotency_key: str
 ) -> Operation[WriteReceipt]:
     """Attaches one target's values to rows already in the context, in chunks the service accepts."""
+    write_key(idempotency_key)
     payload = yield Work(
         label_payload,
         (data,),

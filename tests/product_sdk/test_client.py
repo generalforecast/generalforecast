@@ -158,6 +158,12 @@ def _receipt(write_id: str, operation: str, rows: int, sequence: int) -> dict:
     }
 
 
+def chunk(key: str, index: int) -> str:
+    from generalforecast._operations import chunk_write_id
+
+    return chunk_write_id(key, index)
+
+
 def _rows(count: int) -> list[dict]:
     return [{"id": f"r{i}", "x": float(i), "y": i % 2} for i in range(count)]
 
@@ -178,14 +184,51 @@ def test_the_chunk_size_is_the_largest_write_the_spec_accepts():
         assert schema["properties"]["write_id"]["maxLength"] == WRITE_ID_LENGTH
 
 
-def test_chunk_write_ids_derive_from_the_key_and_stay_within_the_limit():
-    from generalforecast._operations import WRITE_ID_LENGTH, chunk_write_id
+def test_chunk_write_ids_are_in_their_own_namespace_whatever_the_key():
+    import hashlib
 
-    assert [chunk_write_id("w", index) for index in range(3)] == ["w#1", "w#2", "w#3"]
-    long = "k" * WRITE_ID_LENGTH
-    derived = chunk_write_id(long, 11)
-    assert len(derived) <= WRITE_ID_LENGTH and derived.endswith("#12")
-    assert derived == chunk_write_id(long, 11) != chunk_write_id(long[:-1] + "j", 11)
+    from generalforecast._operations import (
+        CHUNK_PREFIX,
+        WRITE_ID_LENGTH,
+        chunk_write_id,
+        write_key,
+    )
+
+    digest = hashlib.sha256(b"w").hexdigest()
+    assert [chunk_write_id("w", index) for index in range(2)] == [
+        f"{CHUNK_PREFIX}{digest}/1",
+        f"{CHUNK_PREFIX}{digest}/2",
+    ]
+    # A caller's key of the old chunk spelling no longer meets a chunk's id.
+    assert chunk_write_id("z", 0) != "z#1"
+    longest = "\u00e9" * (WRITE_ID_LENGTH // 2)
+    assert len(chunk_write_id(longest, 11)) == len(chunk_write_id("w", 11))
+    for bad in ("", "k" * (WRITE_ID_LENGTH + 1), "\u00e9" * 129, "\ud800", None):
+        with pytest.raises(ServiceError) as refused:
+            write_key(bad)
+        assert refused.value.param == "idempotency_key"
+    with pytest.raises(ServiceError, match="reserved"):
+        write_key(CHUNK_PREFIX + "x")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_every_write_checks_its_key_before_sending(wire, asynchronous):
+    from generalforecast._operations import WRITE_ID_LENGTH
+
+    for rows in (_rows(1), _rows(150)):
+        with pytest.raises(ServiceError) as refused:
+            run(
+                asynchronous,
+                wire.url,
+                lambda c, rows=rows: c.contexts.append(
+                    "history",
+                    rows,
+                    id="id",
+                    idempotency_key="k" * (WRITE_ID_LENGTH + 1),
+                ),
+            )
+        assert refused.value.param == "idempotency_key"
+    assert not wire.requests
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -214,17 +257,17 @@ def test_large_appends_and_labels_go_in_chunks_under_derived_write_ids(
         wire.expect(
             "POST",
             "/contexts/history/append",
-            _receipt(f"w#{index + 1}", "append", stop - start, index + 1),
-            payload={"write_id": f"w#{index + 1}", "rows": rows[start:stop]},
+            _receipt(chunk("w", index), "append", stop - start, index + 1),
+            payload={"write_id": chunk("w", index), "rows": rows[start:stop]},
         )
     labels = [{"id": row["id"], "value": row["y"]} for row in rows]
     for index, (start, stop) in enumerate(((0, 100), (100, 200), (200, 250))):
         wire.expect(
             "POST",
             "/contexts/history/label",
-            _receipt(f"l#{index + 1}", "label", stop - start, index + 4),
+            _receipt(chunk("l", index), "label", stop - start, index + 4),
             payload={
-                "write_id": f"l#{index + 1}",
+                "write_id": chunk("l", index),
                 "target": "y",
                 "labels": labels[start:stop],
             },
@@ -245,10 +288,8 @@ def test_large_appends_and_labels_go_in_chunks_under_derived_write_ids(
     ):
         assert receipt.write_id == key and receipt.sequence == last
         assert receipt["rows"] == 250 and receipt["durably_accepted"] is True
-        assert [chunk["write_id"] for chunk in receipt["chunks"]] == [
-            f"{key}#1",
-            f"{key}#2",
-            f"{key}#3",
+        assert [part["write_id"] for part in receipt["chunks"]] == [
+            chunk(key, index) for index in range(3)
         ]
         assert receipt["operation"] == operation
 
@@ -265,34 +306,35 @@ def test_a_failed_chunk_names_the_accepted_ones_and_a_retry_resumes(wire, asynch
             "POST",
             "/contexts/history/append",
             result,
-            payload={"write_id": f"w#{index + 1}", "rows": rows[start : start + 100]},
+            payload={"write_id": chunk("w", index), "rows": rows[start : start + 100]},
             status=status,
         )
 
     def append(client):
         return client.contexts.append("history", rows, id="id", idempotency_key="w")
 
-    expect(0, _receipt("w#1", "append", 100, 1))
+    expect(0, _receipt(chunk("w", 0), "append", 100, 1))
     expect(1, "CapacityExceeded", 429)
     with pytest.raises(PartialWrite) as caught:
         run(asynchronous, wire.url, append)
     error = caught.value
     assert isinstance(error, gf.CapacityExceeded) and error.status == 429
-    assert [receipt.write_id for receipt in error.accepted] == ["w#1"]
+    assert [receipt.write_id for receipt in error.accepted] == [chunk("w", 0)]
     assert error.chunks == 3
     assert (
         error.message == "append failed at chunk 2 of 3: service rejected the request"
     )
     assert (
         error.because
-        == "chunks 1 to 1 of 3, 100 of 250 rows, were accepted as write ids `w#1`"
+        == "chunks 1 to 1 of 3, 100 of 250 rows, were accepted as write ids "
+        f"`{chunk('w', 0)}`"
     )
     assert "same idempotency_key" in (error.hint or "")
 
     # The same key again: the first chunk replays its receipt, the rest go on.
-    expect(0, _receipt("w#1", "append", 100, 1))
-    expect(1, _receipt("w#2", "append", 100, 2))
-    expect(2, _receipt("w#3", "append", 50, 3))
+    expect(0, _receipt(chunk("w", 0), "append", 100, 1))
+    expect(1, _receipt(chunk("w", 1), "append", 100, 2))
+    expect(2, _receipt(chunk("w", 2), "append", 50, 3))
     receipt = run(asynchronous, wire.url, append)
     assert receipt["rows"] == 250 and receipt.sequence == 3
 
@@ -306,7 +348,7 @@ def test_a_first_chunk_that_fails_raises_its_own_error(wire, asynchronous):
         "POST",
         "/contexts/history/append",
         "NotFound",
-        payload={"write_id": "w#1", "rows": rows[:100]},
+        payload={"write_id": chunk("w", 0), "rows": rows[:100]},
         status=404,
     )
     with pytest.raises(ServiceError) as caught:
