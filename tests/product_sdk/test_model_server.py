@@ -13,6 +13,7 @@ from typing import Any, cast
 import httpx
 import pytest
 
+import generalforecast as gf
 from generalforecast.async_client import AsyncClient
 from generalforecast.client import Client
 from generalforecast.service.boundary import Request, Resource, Scope, success
@@ -26,11 +27,18 @@ from generalforecast.transport import (
 
 HOSTED = "https://hosted.example"
 LOCAL = "http://127.0.0.1:8123"
-_MODEL_ROUTE = re.compile(r"/v1/projects/([^/]+)/models(?:/([^/]+))?")
+# What gf-server's front resolves (crates/gf-server/src/http.rs `resolve`).
+_SERVED = (
+    ("GET", re.compile(r"/v1/projects/([^/]+)/(models)(?:/([^/]+))?")),
+    ("GET", re.compile(r"/v1/projects/([^/]+)/(predictors)(?:/([^/]+))?")),
+)
+_PREDICTORS = {
+    "risk": {"name": "risk", "model": "general-forecast/tabicl-v2-classifier"}
+}
 
 
 class ModelServer:
-    """Answers like a plain model server, or like the hosted platform."""
+    """Answers like a plain gf serve model server, or like the hosted platform."""
 
     def __init__(self, origin: str, *, platform: bool = False) -> None:
         self.origin, self.platform, self.seen = origin, platform, []
@@ -46,18 +54,35 @@ class ModelServer:
             if self.platform:
                 return 401, {"error": {"code": "Unauthenticated", "message": "key"}}
             return 404, {"error": {"code": "NotFound", "message": "route not found"}}
-        route = _MODEL_ROUTE.fullmatch(path)
-        if route is None:
+        for verb, pattern in _SERVED:
+            route = pattern.fullmatch(path)
+            if route is not None and method == verb:
+                break
+        else:
             return 404, {"error": {"code": "NotFound", "message": "route not found"}}
-        project, model = route.groups()
-        assert method == "GET" and not body
+        project, collection, item = route.groups()
+        assert not body
+        kind = "model" if collection == "models" else "predictor"
+        if collection == "models":
+            found = (
+                {"name": item}
+                if item
+                else {"models": [{"name": "tabicl-v2-classifier"}]}
+            )
+        elif item is None:
+            found = {"predictors": list(_PREDICTORS.values())}
+        elif item in _PREDICTORS:
+            found = _PREDICTORS[item]
+        else:
+            return 404, {
+                "error": {"code": "NotFound", "message": "predictor not found"}
+            }
         request = Request(
             Scope(project, headers["x-gf-request-id"]),
-            Resource("model", model or "models"),
+            Resource(kind, item or collection),
             {},
         )
-        listing = {"models": [{"name": "tabicl-v2-classifier"}]}
-        return 200, dict(success(request, {"name": model} if model else listing))
+        return 200, dict(success(request, found))
 
 
 class _Reply(io.BytesIO):
@@ -191,7 +216,6 @@ def test_hosted_only_operations_raise_typed_error_after_one_probe(
     client = connect(asynchronous, server, base_url=LOCAL)
     results = drive(
         client,
-        lambda c: c.predictors.list(),
         lambda c: c.predictors.create("risk"),
         lambda c: c.keys.list(),
         lambda c: c.identity.manage("auth.status"),
@@ -205,12 +229,32 @@ def test_hosted_only_operations_raise_typed_error_after_one_probe(
         assert (error.code, error.status) == ("UnsupportedOperation", 501)
         assert "standalone model server" in error.message
     assert errors[0].path == "/v1/projects/local/predictors"
+    # One probe classifies the server; every request is still sent, so a
+    # server that gains a route answers it.
     assert [p for _m, _o, p, _h in server.seen] == [
         "/v1/projects/local/predictors",
         PLATFORM_PROBE,
+        "/v1/projects/local/keys",
+        "/v1/auth/status",
         "/v1/projects/local/models",
     ]
     assert_no_hosted_secret(server, hosted_environment)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_missing_predictor_on_gf_serve_never_hides_its_other_routes(asynchronous):
+    server = ModelServer(LOCAL)
+    client = connect(asynchronous, server, base_url=LOCAL)
+    missing, listed, found = drive(
+        client,
+        lambda c: c.predictors.get("typo"),
+        lambda c: c.predictors.list(),
+        lambda c: c.predictors.get("risk"),
+    )
+    assert isinstance(missing, gf.NotFound) and not isinstance(missing, HostedOnlyError)
+    assert listed == [_PREDICTORS["risk"]]
+    assert found.name == "risk"
+    assert PLATFORM_PROBE not in [p for _m, _o, p, _h in server.seen]
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -221,11 +265,11 @@ def test_hosted_missing_resource_stays_not_found(asynchronous):
         client, lambda c: c.predictors.get("gone"), lambda c: c.keys.list()
     )
     for error in (first, second):
-        assert isinstance(error, ServiceError) and error.code == "NotFound"
+        assert isinstance(error, gf.NotFound) and error.code == "NotFound"
     assert [p for _m, _o, p, _h in server.seen] == [
         "/v1/projects/local/predictors/gone",
-        PLATFORM_PROBE,
         "/v1/projects/local/keys",
+        PLATFORM_PROBE,
     ]
     assert all(h["authorization"] == "Bearer hosted-key" for *_r, h in server.seen)
 
@@ -261,16 +305,23 @@ def test_base_url_is_explicit_and_keyless_profiles_round_trip(tmp_path):
     assert "Authorization" not in client._transport._headers
 
 
-def test_portable_routes_are_exactly_model_listing_and_prediction():
+def test_portable_routes_are_exactly_what_gf_serve_resolves():
     portable = [
         ("GET", "/v1/projects/p/models"),
         ("GET", "/v1/projects/p/models/m?view=full"),
-        ("POST", "/v1/projects/p/predictions"),
+        ("GET", "/v1/projects/p/predictors"),
+        ("GET", "/v1/projects/p/predictors/risk"),
+        ("POST", "/v1/projects/p/predictors/risk/predict?env=staging"),
+        ("POST", "/v1/projects/p/predict"),
         ("GET", "/livez"),
     ]
     platform = [
         ("POST", "/v1/projects/p/models"),
+        ("POST", "/v1/projects/p/predictors"),
         ("POST", "/v1/projects/p/predictors/d/revisions"),
+        ("GET", "/v1/projects/p/predictors/d/environments/production"),
+        ("POST", "/v1/projects/p/predictions"),
+        ("POST", "/v1/projects/p/models/m/infer"),
         ("GET", "/v1/projects/p/keys"),
         ("GET", "/v1/workspaces"),
         ("GET", PLATFORM_PROBE),

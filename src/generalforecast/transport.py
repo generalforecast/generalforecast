@@ -1,7 +1,14 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded HTTPS transport with explicit, independent credential layers."""
+"""Bounded HTTPS transport with explicit, independent credential layers.
+
+`Transport` and `AsyncTransport` are the one HTTP stack every SDK surface
+uses: the clients, `gf login`, served predictors and remote table reads. They
+send no cookies, follow no redirects, read no proxy settings from the
+environment and require HTTPS except on loopback, so a credential reaches
+only the origin it was given for.
+"""
 
 import asyncio
 import ipaddress
@@ -29,9 +36,12 @@ from urllib.request import (
 import httpx
 
 from generalforecast._files import private_lock, read_private, write_private
+from generalforecast.errors import (
+    printable,  # noqa: F401  (re-exported)
+    wire_fields,
+)
 from generalforecast.service.boundary import MAX_BYTES, json_object
 from generalforecast.service.contracts import (
-    WIRE_ERROR_CODES,
     ServiceError,
     name,
     number,
@@ -42,18 +52,6 @@ DEFAULT_KEY_ENV = "GF_API_KEY"
 PROFILE_FIELDS = ("url", "project", "environment", "runtime", "key_env")
 _PROFILE_LIMIT = 65536
 _KEY_ENV = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
-_ESCAPES = re.compile(
-    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])|\x9b[0-?]*[ -/]*[@-~]"
-)
-
-
-def printable(message: str) -> str:
-    """Removes terminal escapes and non-printable characters from a message."""
-    return "".join(
-        " " if character in "\t\n\r" else character
-        for character in _ESCAPES.sub("", message)
-        if character in "\t\n\r" or character.isprintable()
-    ).strip()
 
 
 class RelayedError(ServiceError):
@@ -308,10 +306,13 @@ def connection(
 
 
 PLATFORM_PROBE = "/v1/auth/status"
+# What a standalone `gf serve` (gf-server's front) answers: model listing and
+# predictions. Every other versioned route belongs to the hosted platform.
 _PORTABLE_ROUTES = (
     ("GET", re.compile(r"/v1/projects/[^/]+/models(/[^/]+)?")),
-    ("POST", re.compile(r"/v1/projects/[^/]+/models/[^/]+/infer")),
-    ("POST", re.compile(r"/v1/projects/[^/]+/predictions")),
+    ("GET", re.compile(r"/v1/projects/[^/]+/predictors(/[^/]+)?")),
+    ("POST", re.compile(r"/v1/projects/[^/]+/predictors/[^/]+/predict")),
+    ("POST", re.compile(r"/v1/projects/[^/]+/predict")),
 )
 
 
@@ -324,7 +325,7 @@ class HostedOnlyError(ServiceError):
             "UnsupportedOperation",
             f"{method} {path.split('?', 1)[0]} requires the hosted platform; "
             "this endpoint is a standalone model server that only serves "
-            "model listing and inference",
+            "models, predictors and predictions",
             501,
         )
         self.method, self.path = method, path.split("?", 1)[0]
@@ -357,11 +358,6 @@ def retryable(method: str, body: Any) -> bool:
     )
 
 
-_ERROR_KEYS = frozenset(
-    {"code", "message", "reason", "param", "hint", "limit", "actual", "request_id"}
-)
-
-
 def response_value(status: int, raw: bytes) -> dict[str, Any]:
     """Decodes bounded JSON, refusing credential forwarding and unsafe errors."""
     if 300 <= status < 400:
@@ -370,47 +366,24 @@ def response_value(status: int, raw: bytes) -> dict[str, Any]:
         require(len(raw) <= MAX_BYTES, "response too large")
         value = json_object(json.loads(raw))
     except (ValueError, UnicodeError, ServiceError):
-        raise ServiceError("ProtocolError", "invalid service response", 502) from None
+        raise ServiceError(
+            "ProtocolError", "invalid service response", status
+        ) from None
     if not 200 <= status < 300:
-        detail = value.get("error")
-        if (
-            type(detail) is not dict
-            or not {"code", "message"} <= set(detail)
-            or not set(detail) <= _ERROR_KEYS
-            or any(type(detail[key]) is not str for key in ("code", "message"))
-            or any(
-                type(detail.get(key, "")) is not str
-                for key in ("reason", "param", "hint", "request_id")
-            )
-            or any(
-                type(detail.get(key, 0)) not in (int, float)
-                for key in ("limit", "actual")
-            )
-        ):
-            raise ServiceError("ProtocolError", "invalid service error", status)
-        message = printable(detail["message"]) if len(detail["message"]) <= 512 else ""
-        fields = {
-            key: (printable(value) if type(value) is str else value)
-            for key, value in detail.items()
-            if key not in ("code", "message") and value is not None
-        }
-        if message:
-            error: ServiceError = RelayedError(
-                _wire_code(detail["code"]), message, status
-            )
-        else:
-            error = ServiceError(
-                _wire_code(detail["code"]), "service rejected request", status
-            )
-        for key, value in fields.items():
-            setattr(error, key, value)
-        raise error
+        raise _failure(status, value.get("error"))
     return value
 
 
-def _wire_code(code: str) -> str:
-    """Classifies an untrusted remote code without echoing unknown values."""
-    return code if code in WIRE_ERROR_CODES else "RemoteError"
+def _failure(status: int, detail: Any) -> ServiceError:
+    """The error a non-2xx reply's error object describes."""
+    fields = wire_fields(detail, status=status)
+    if fields is None:
+        return ServiceError("ProtocolError", "invalid service error", status)
+    code, message = fields.pop("code"), fields.pop("message")
+    fields.pop("status")
+    if message:
+        return RelayedError(code, message, status, **fields)
+    return ServiceError(code, "service rejected request", status, **fields)
 
 
 def request_data(body: Any) -> bytes | None:
@@ -425,8 +398,12 @@ def request_data(body: Any) -> bytes | None:
     )
 
 
-def endpoint(url: str) -> str:
-    """Requires TLS except on loopback and forbids credential-bearing URLs."""
+def _origin(url: str, *, paths: bool) -> str:
+    """Checks a URL: HTTPS except on loopback, no credentials or fragment.
+
+    An endpoint (`paths` False) is an origin alone; a resource URL may carry
+    a path and a query.
+    """
     require(type(url) is str, "invalid endpoint")
     try:
         parsed = urlsplit(url)
@@ -445,14 +422,28 @@ def endpoint(url: str) -> str:
         and (parsed.scheme == "https" or (parsed.scheme == "http" and local))
         and not parsed.username
         and not parsed.password
-        and not parsed.query
         and not parsed.fragment
-        and parsed.path in ("", "/")
+        and (paths or (not parsed.query and parsed.path in ("", "/")))
         and (port is None or 1 <= port <= 65535)
         and not any(c.isspace() or ord(c) < 32 for c in url),
-        "endpoint requires HTTPS (or loopback HTTP), no credentials/path/query",
+        "endpoint requires HTTPS (or loopback HTTP), no credentials/path/query"
+        if not paths
+        else "a URL requires HTTPS (or loopback HTTP) and no credentials",
     )
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def endpoint(url: str) -> str:
+    """Requires TLS except on loopback and forbids credential-bearing URLs."""
+    _origin(url, paths=False)
     return url.rstrip("/")
+
+
+def split_url(url: str) -> tuple[str, str]:
+    """A resource URL as its checked origin and its path with any query."""
+    origin = _origin(url, paths=True)
+    rest = url[len(origin) :] or "/"
+    return origin, rest
 
 
 def credential(value: str, label: str) -> str:
@@ -471,8 +462,67 @@ class _NoRedirect(HTTPRedirectHandler):
         raise ServiceError("RedirectRefused", "credential forwarding is disabled", 502)
 
 
-class Transport:
-    """No cookies, automatic retries, redirects, or credential-bearing repr."""
+def _closed() -> ServiceError:
+    return ServiceError("ClientClosed", "client is closed", 400)
+
+
+def _timeout() -> ServiceError:
+    return ServiceError("Timeout", "request deadline exceeded", 504)
+
+
+def _transport_failure(what: str) -> ServiceError:
+    return ServiceError(
+        "TransportError",
+        f"{what}; outcome unknown; preserve write_id or submission_id",
+        503,
+    )
+
+
+def _compressed() -> ServiceError:
+    return ServiceError(
+        "ProtocolError", "compressed service responses are disabled", 502
+    )
+
+
+def _too_large() -> ServiceError:
+    return ServiceError("ProtocolError", "invalid service response", 502)
+
+
+def _checked_path(path: str) -> str:
+    require(
+        path.startswith("/")
+        and not path.startswith("//")
+        and "\\" not in path
+        and "#" not in path,
+        "invalid request path",
+    )
+    return path
+
+
+def _download_failure(status: int, raw: bytes) -> ServiceError:
+    """The error for a non-2xx download: the service's own error object, if any."""
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError):
+        value = None
+    detail = value.get("error") if isinstance(value, dict) else None
+    if detail is not None:
+        return _failure(status, detail)
+    return ServiceError(
+        "NotFound" if status == 404 else "RemoteError",
+        f"the server answered HTTP {status}",
+        status,
+    )
+
+
+class _Policy:
+    """What both transports share: settings, headers, retries and platform detection.
+
+    The platform is learned once, from one probe of `PLATFORM_PROBE` after the
+    first missing hosted-only route. It only explains a later missing route
+    as `HostedOnlyError`; it never stops a request from being sent, so a
+    server that turns out to serve a route answers it.
+    """
 
     def __init__(
         self,
@@ -543,42 +593,118 @@ class Transport:
                 and tls_context.verify_mode == ssl.CERT_REQUIRED,
                 "TLS context must verify certificates and hostnames",
             )
+        self._tls = tls_context
+
+    def _end(self, deadline: float | None) -> float:
+        """The moment a request must finish by: its deadline or the timeout."""
+        if self.closed:
+            raise _closed()
+        end = time.monotonic() + self.timeout
+        return end if deadline is None else min(deadline, end)
+
+    def _retry(self, method: str, body: Any, attempt: int, error: ServiceError) -> bool:
+        return (
+            retryable(method, body)
+            and attempt < self.retries
+            and (error.code == "TransportError" or error.status == 503)
+        )
+
+    def _probe_needed(self, method: str, path: str, error: ServiceError) -> bool:
+        return (
+            self.platform is None and hosted_only(method, path) and route_missing(error)
+        )
+
+    def _learn(self, probe: ServiceError | None) -> None:
+        self.platform = platform_from_probe(probe)
+
+    def _explain(self, method: str, path: str, error: ServiceError) -> None:
+        """Raises a missing hosted-only route on a model server as `HostedOnlyError`."""
+        if (
+            self.platform is False
+            and hosted_only(method, path)
+            and route_missing(error)
+        ):
+            raise HostedOnlyError(method, path) from None
+
+    def _answered(self, method: str, path: str) -> None:
+        if hosted_only(method, path):
+            self.platform = True
+
+
+class Transport(_Policy):
+    """No cookies, automatic retries, redirects, or credential-bearing repr.
+
+    `send` is the public API: it takes a path under the endpoint, a JSON
+    body (or Arrow bytes) and request headers, and returns the reply's JSON
+    object or raises its error as a `ServiceError`. `download` returns the
+    raw bytes of a resource.
+    """
+
+    def __init__(self, url: str, **options: Any) -> None:
+        """Validates the endpoint and credentials; see `_Policy`."""
+        super().__init__(url, **options)
         self._opener = build_opener(
-            ProxyHandler({}), _NoRedirect(), HTTPSHandler(context=tls_context)
+            ProxyHandler({}), _NoRedirect(), HTTPSHandler(context=self._tls)
         )
 
     def send(
         self,
         method: str,
         path: str,
-        body: Any,
-        headers: dict[str, str],
+        body: Any = None,
+        headers: Mapping[str, str] | None = None,
         *,
         deadline: float | None = None,
     ) -> dict[str, Any]:
-        """Raises HostedOnlyError for platform routes on a standalone model server.
+        """Sends one request and returns the reply's JSON object.
 
-        The first missing hosted-only route triggers one probe of PLATFORM_PROBE;
-        the answer is remembered for this transport.
+        Args:
+            method: `GET` or `POST`.
+            path: The path under the endpoint, with any query.
+            body: A JSON object, Arrow stream bytes, or None.
+            headers: Headers to add to the transport's own.
+            deadline: A `time.monotonic()` moment the request must finish by.
+
+        Raises:
+            ServiceError: The reply's error; `HostedOnlyError` for a hosted
+                route a standalone model server does not serve.
         """
-        platform_route = hosted_only(method, path)
-        if platform_route and self.platform is False:
-            raise HostedOnlyError(method, path)
         try:
-            value = self._exchange(method, path, body, headers, deadline=deadline)
+            status, raw = self._exchange(
+                method, path, body, dict(headers or {}), deadline, MAX_BYTES
+            )
+            value = response_value(status, raw)
         except ServiceError as error:
-            if platform_route and self.platform is None and route_missing(error):
+            if self._probe_needed(method, path, error):
                 try:
-                    self._exchange("GET", PLATFORM_PROBE, None, {}, deadline=deadline)
-                    self.platform = True
-                except ServiceError as probe:
-                    self.platform = platform_from_probe(probe)
-                if not self.platform:
-                    raise HostedOnlyError(method, path) from None
+                    response_value(
+                        *self._exchange(
+                            "GET", PLATFORM_PROBE, None, {}, deadline, MAX_BYTES
+                        )
+                    )
+                    probe = None
+                except ServiceError as answer:
+                    probe = answer
+                self._learn(probe)
+            self._explain(method, path, error)
             raise
-        if platform_route:
-            self.platform = True
+        self._answered(method, path)
         return value
+
+    def download(
+        self, path: str, *, limit: int, deadline: float | None = None
+    ) -> bytes:
+        """GETs a resource's bytes, at most `limit` of them."""
+        status, raw = self._exchange(
+            "GET", path, None, {"Accept": "*/*"}, deadline, limit
+        )
+        if not 200 <= status < 300:
+            raise _download_failure(status, raw)
+        return raw
+
+    def close(self) -> None:
+        """Prevents further requests; urllib closes each response after reading."""
+        self.closed = True
 
     def _exchange(
         self,
@@ -586,47 +712,34 @@ class Transport:
         path: str,
         body: Any,
         headers: dict[str, str],
-        *,
-        deadline: float | None = None,
-    ) -> dict[str, Any]:
+        deadline: float | None,
+        limit: int,
+    ) -> tuple[int, bytes]:
         """Uses a single deadline; never retries an unguarded mutation."""
-        require(not self.closed, "client is closed")
-        end = (
-            min(deadline, time.monotonic() + self.timeout)
-            if deadline is not None
-            else time.monotonic() + self.timeout
-        )
+        end = self._end(deadline)
+        _checked_path(path)
+        data = request_data(body)
         for attempt in range(self.retries + 1):
-            remaining = end - time.monotonic()
-            if remaining <= 0:
-                raise ServiceError("Timeout", "request deadline exceeded", 504)
+            if end - time.monotonic() <= 0:
+                raise _timeout()
             try:
-                return self._send_once(method, path, body, headers, remaining, end)
+                status, raw = self._send_once(method, path, data, headers, end, limit)
+                if status == 503:
+                    error = _failure(status, _error_object(raw))
+                    if self._retry(method, body, attempt, error):
+                        self._pause(attempt, end)
+                        continue
+                return status, raw
             except ServiceError as error:
-                if (
-                    not retryable(method, body)
-                    or attempt == self.retries
-                    or (error.code != "TransportError" and error.status != 503)
-                ):
+                if not self._retry(method, body, attempt, error):
                     raise
-                time.sleep(
-                    min(self.retry_delay * 2**attempt, max(0, end - time.monotonic()))
-                )
+                self._pause(attempt, end)
         raise AssertionError("unreachable")
 
-    def close(self) -> None:
-        """Prevents further requests; urllib closes each response after reading."""
-        self.closed = True
+    def _pause(self, attempt: int, end: float) -> None:
+        time.sleep(min(self.retry_delay * 2**attempt, max(0, end - time.monotonic())))
 
-    def _send_once(self, method, path, body, headers, timeout, deadline):
-        require(
-            path.startswith("/")
-            and not path.startswith("//")
-            and "\\" not in path
-            and "#" not in path,
-            "invalid request path",
-        )
-        data = request_data(body)
+    def _send_once(self, method, path, data, headers, end, limit):
         request = Request(
             self.url + path,
             data=data,
@@ -634,31 +747,32 @@ class Transport:
             headers=self._headers | headers,
         )
         try:
-            response = self._opener.open(request, timeout=timeout)
+            response = self._opener.open(request, timeout=end - time.monotonic())
         except HTTPError as error:
             response = error
         except TimeoutError:
-            raise ServiceError("Timeout", "request deadline exceeded", 504) from None
+            raise _timeout() from None
         except (URLError, OSError, HTTPException) as error:
             if isinstance(getattr(error, "reason", None), TimeoutError):
-                raise ServiceError(
-                    "Timeout", "request deadline exceeded", 504
-                ) from None
-            raise ServiceError(
-                "TransportError",
-                "request failed; outcome unknown; preserve write_id or submission_id",
-                503,
-            ) from None
+                raise _timeout() from None
+            raise _transport_failure("request failed") from None
         with response:
             status = response.code
             if 300 <= status < 400:
                 raise ServiceError(
                     "RedirectRefused", "credential forwarding is disabled", 502
                 )
+            received = getattr(response, "headers", None)
+            if (
+                received is not None
+                and (received.get("Content-Encoding") or "identity").lower()
+                != "identity"
+            ):
+                raise _compressed()
             try:
                 raw = bytearray()
-                while len(raw) <= MAX_BYTES:
-                    remaining = deadline - time.monotonic()
+                while len(raw) <= limit:
+                    remaining = end - time.monotonic()
                     if remaining <= 0:
                         raise TimeoutError
                     reader = response
@@ -671,35 +785,36 @@ class Transport:
                             break
                         reader = getattr(reader, "fp", None)
                     read = getattr(response, "read1", response.read)
-                    chunk = read(min(65536, MAX_BYTES + 1 - len(raw)))
+                    chunk = read(min(65536, limit + 1 - len(raw)))
                     if not chunk:
                         break
                     raw.extend(chunk)
                     if not hasattr(response, "read1"):
                         break
-                require(len(raw) <= MAX_BYTES, "response too large")
-                json_object(json.loads(raw))
             except TimeoutError:
-                raise ServiceError(
-                    "Timeout", "request deadline exceeded", 504
-                ) from None
+                raise _timeout() from None
             except (OSError, HTTPException):
-                raise ServiceError(
-                    "TransportError",
-                    "response interrupted; outcome unknown; preserve write_id or submission_id",
-                    503,
-                ) from None
-            except (ValueError, UnicodeError, ServiceError):
-                raise ServiceError(
-                    "ProtocolError", "invalid service response", 502
-                ) from None
-        if time.monotonic() > deadline:
-            raise ServiceError("Timeout", "request deadline exceeded", 504)
-        return response_value(status, bytes(raw))
+                raise _transport_failure("response interrupted") from None
+        if len(raw) > limit:
+            raise _too_large()
+        if time.monotonic() > end:
+            raise _timeout()
+        return status, bytes(raw)
 
 
-class AsyncTransport:
-    """Native async HTTP with bounded streams, cancellation and connection cleanup."""
+def _error_object(raw: bytes) -> Any:
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError):
+        return None
+    return value.get("error") if isinstance(value, dict) else None
+
+
+class AsyncTransport(_Policy):
+    """Native async HTTP with bounded streams, cancellation and connection cleanup.
+
+    `send` and `download` match `Transport`'s, awaited.
+    """
 
     def __init__(
         self,
@@ -709,13 +824,9 @@ class AsyncTransport:
         **options: Any,
     ) -> None:
         """Shares credential validation, never sync network I/O or event-loop wrappers."""
-        settings = Transport(url, **options)
-        self.url, self.timeout = settings.url, settings.timeout
-        self.retries, self.retry_delay = settings.retries, settings.retry_delay
-        self._headers = settings._headers
-        self.platform: bool | None = None
+        super().__init__(url, **options)
         self._http = httpx.AsyncClient(
-            verify=options.get("tls_context") or True,
+            verify=self._tls or True,
             timeout=self.timeout,
             follow_redirects=False,
             trust_env=False,
@@ -723,39 +834,52 @@ class AsyncTransport:
         )
 
     async def aclose(self) -> None:
-        """Closes all pooled sockets."""
+        """Closes all pooled sockets; later requests raise `ClientClosed`."""
+        self.closed = True
         await self._http.aclose()
 
     async def send(
         self,
         method: str,
         path: str,
-        body: Any,
-        headers: dict[str, str],
+        body: Any = None,
+        headers: Mapping[str, str] | None = None,
         *,
         deadline: float | None = None,
     ) -> dict[str, Any]:
-        """Matches Transport.send hosted-only classification with one async probe."""
-        platform_route = hosted_only(method, path)
-        if platform_route and self.platform is False:
-            raise HostedOnlyError(method, path)
+        """Sends one request and returns the reply's JSON object; see `Transport.send`."""
         try:
-            value = await self._exchange(method, path, body, headers, deadline=deadline)
+            status, raw = await self._exchange(
+                method, path, body, dict(headers or {}), deadline, MAX_BYTES
+            )
+            value = response_value(status, raw)
         except ServiceError as error:
-            if platform_route and self.platform is None and route_missing(error):
+            if self._probe_needed(method, path, error):
                 try:
-                    await self._exchange(
-                        "GET", PLATFORM_PROBE, None, {}, deadline=deadline
+                    response_value(
+                        *await self._exchange(
+                            "GET", PLATFORM_PROBE, None, {}, deadline, MAX_BYTES
+                        )
                     )
-                    self.platform = True
-                except ServiceError as probe:
-                    self.platform = platform_from_probe(probe)
-                if not self.platform:
-                    raise HostedOnlyError(method, path) from None
+                    probe = None
+                except ServiceError as answer:
+                    probe = answer
+                self._learn(probe)
+            self._explain(method, path, error)
             raise
-        if platform_route:
-            self.platform = True
+        self._answered(method, path)
         return value
+
+    async def download(
+        self, path: str, *, limit: int, deadline: float | None = None
+    ) -> bytes:
+        """GETs a resource's bytes, at most `limit` of them."""
+        status, raw = await self._exchange(
+            "GET", path, None, {"Accept": "*/*"}, deadline, limit
+        )
+        if not 200 <= status < 300:
+            raise _download_failure(status, raw)
+        return raw
 
     async def _exchange(
         self,
@@ -763,86 +887,65 @@ class AsyncTransport:
         path: str,
         body: Any,
         headers: dict[str, str],
-        *,
-        deadline: float | None = None,
-    ) -> dict[str, Any]:
+        deadline: float | None,
+        limit: int,
+    ) -> tuple[int, bytes]:
         """Enforces an overall timeout including retry delays and streaming reads."""
-        require(
-            path.startswith("/")
-            and not path.startswith("//")
-            and "\\" not in path
-            and "#" not in path,
-            "invalid request path",
-        )
+        end = self._end(deadline)
+        _checked_path(path)
         data = request_data(body)
-        remaining = (
-            self.timeout
-            if deadline is None
-            else min(self.timeout, deadline - time.monotonic())
-        )
+        remaining = end - time.monotonic()
         if remaining <= 0:
-            raise ServiceError("Timeout", "request deadline exceeded", 504)
+            raise _timeout()
         try:
             async with asyncio.timeout(remaining):
                 for attempt in range(self.retries + 1):
                     try:
-                        # Do not persist console cookies or ambient proxy credentials.
-                        self._http.cookies.clear()
-                        async with self._http.stream(
-                            method,
-                            self.url + path,
-                            content=data,
-                            headers=self._headers | headers,
-                        ) as response:
-                            if 300 <= response.status_code < 400:
-                                raise ServiceError(
-                                    "RedirectRefused",
-                                    "credential forwarding is disabled",
-                                    502,
-                                )
-                            if (
-                                response.headers.get(
-                                    "Content-Encoding", "identity"
-                                ).lower()
-                                != "identity"
-                            ):
-                                raise ServiceError(
-                                    "ProtocolError",
-                                    "compressed service responses are disabled",
-                                    502,
-                                )
-                            raw = bytearray()
-                            async for chunk in response.aiter_bytes(chunk_size=65536):
-                                if len(raw) + len(chunk) > MAX_BYTES:
-                                    raise ServiceError(
-                                        "ProtocolError", "invalid service response", 502
-                                    )
-                                raw.extend(chunk)
-                            value = response_value(response.status_code, bytes(raw))
-                        return value
-                    except httpx.TimeoutException:
-                        raise ServiceError(
-                            "Timeout", "request deadline exceeded", 504
-                        ) from None
-                    except httpx.TransportError:
-                        error = ServiceError(
-                            "TransportError",
-                            "request failed; outcome unknown; preserve idempotency identity",
-                            503,
+                        status, raw = await self._send_once(
+                            method, path, data, headers, limit
                         )
-                    except ServiceError as caught:
-                        error = caught
-                    except RuntimeError:
-                        raise ServiceError(
-                            "ClientClosed", "client is closed", 409
-                        ) from None
-                    if (
-                        not retryable(method, body)
-                        or attempt == self.retries
-                        or (error.code != "TransportError" and error.status != 503)
-                    ):
-                        raise error
+                        if status == 503:
+                            error = _failure(status, _error_object(raw))
+                            if self._retry(method, body, attempt, error):
+                                await asyncio.sleep(self.retry_delay * 2**attempt)
+                                continue
+                        return status, raw
+                    except ServiceError as error:
+                        if not self._retry(method, body, attempt, error):
+                            raise
                     await asyncio.sleep(self.retry_delay * 2**attempt)
         except TimeoutError:
-            raise ServiceError("Timeout", "request deadline exceeded", 504) from None
+            raise _timeout() from None
         raise AssertionError("unreachable")
+
+    async def _send_once(self, method, path, data, headers, limit):
+        if self.closed:
+            raise _closed()
+        try:
+            # Do not persist console cookies or ambient proxy credentials.
+            self._http.cookies.clear()
+            async with self._http.stream(
+                method,
+                self.url + path,
+                content=data,
+                headers=self._headers | headers,
+            ) as response:
+                if 300 <= response.status_code < 400:
+                    raise ServiceError(
+                        "RedirectRefused", "credential forwarding is disabled", 502
+                    )
+                if (
+                    response.headers.get("Content-Encoding", "identity").lower()
+                    != "identity"
+                ):
+                    raise _compressed()
+                raw = bytearray()
+                async for chunk in response.aiter_bytes(chunk_size=65536):
+                    if len(raw) + len(chunk) > limit:
+                        raise _too_large()
+                    raw.extend(chunk)
+                return response.status_code, bytes(raw)
+        except httpx.TimeoutException:
+            raise _timeout() from None
+        except httpx.TransportError:
+            raise _transport_failure("request failed") from None
