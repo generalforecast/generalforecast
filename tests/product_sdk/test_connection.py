@@ -5,6 +5,8 @@
 
 import argparse
 import asyncio
+import inspect
+from typing import Any
 
 import pytest
 
@@ -129,12 +131,13 @@ def test_an_unscoped_key_asks_the_service_for_its_project_once(
 
     client = (AsyncClient if asynchronous else Client)()
     assert client.project is None
-    client._transport.send = areply if asynchronous else reply
+    transport: Any = client._transport
+    transport.send = areply if asynchronous else reply
 
     async def twice():
         for _ in range(2):
             listed = client.predictors.list()
-            assert (await listed if asynchronous else listed) == []
+            assert (await listed if inspect.isawaitable(listed) else listed) == []
 
     asyncio.run(twice())
     assert client.project == "acme"
