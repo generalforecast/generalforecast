@@ -423,6 +423,7 @@ impl Engine {
             times: None,
             id: None,
             words: Vec::new(),
+            series: Vec::new(),
             writes: Vec::new(),
             layout: None,
             table: None,

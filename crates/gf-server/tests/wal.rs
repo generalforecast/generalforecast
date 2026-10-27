@@ -117,6 +117,7 @@ fn records() -> Vec<Record> {
                 column: 1,
                 values: vec!["north".to_string(), "south".to_string()],
             }],
+            series: Vec::new(),
             writes: Vec::new(),
             layout: None,
             table: None,
@@ -128,6 +129,7 @@ fn records() -> Vec<Record> {
             times: None,
             id: None,
             words: Vec::new(),
+            series: Vec::new(),
             writes: Vec::new(),
             layout: None,
             table: None,
@@ -140,6 +142,7 @@ fn records() -> Vec<Record> {
             times: Some(vec![None, Some(i64::MIN)]),
             id: None,
             words: Vec::new(),
+            series: Vec::new(),
             writes: Vec::new(),
             layout: None,
             table: None,
@@ -172,6 +175,113 @@ fn strategy_records_replay_as_written() {
         assert!(record.keys().is_empty());
         assert_eq!(record.write_id(), None);
     }
+}
+
+#[test]
+fn series_keys_travel_on_the_records_that_name_them() {
+    use gf_server::wal::{GivenKey, SeriesKey};
+
+    let directory = tempdir();
+    let path = directory.join("payments.log");
+    let named = vec![
+        SeriesKey {
+            digest: 1,
+            key: GivenKey::String("shoes".to_string()),
+        },
+        SeriesKey {
+            digest: 2,
+            key: GivenKey::Integer("-7".to_string()),
+        },
+        SeriesKey {
+            digest: 3,
+            key: GivenKey::Bytes("0aff".to_string()),
+        },
+        SeriesKey {
+            digest: 4,
+            key: GivenKey::Uuid("123e4567-e89b-12d3-a456-426614174000".to_string()),
+        },
+    ];
+    let observed = |series: &[SeriesKey]| Rows {
+        keys: vec![(1u128 << 64) | 100],
+        features: vec![1.0],
+        targets: Targets::Values(vec![0.5]),
+        times: Some(vec![Some(100)]),
+        id: None,
+        words: Vec::new(),
+        series: series.to_vec(),
+        writes: Vec::new(),
+        layout: None,
+        table: None,
+    };
+    let records = [
+        Record::Insert(observed(&named[..2])),
+        Record::Upsert(observed(&[])),
+        Record::Insert(observed(&named[2..])),
+    ];
+    let log = written(&path, &records);
+    drop(log);
+    let (_, replayed, _) = open(&path, &keys(7)).unwrap();
+    assert!(same(&replayed, &records));
+    assert_eq!(replayed[0].series(), &named[..2]);
+    assert!(replayed[1].series().is_empty());
+    assert_eq!(replayed[2].series(), &named[2..]);
+
+    // A compaction's snapshot carries every key the table holds.
+    let (_, _, mut log) = open(&path, &keys(7)).unwrap();
+    let snapshot = Record::Snapshot(observed(&named));
+    log.compact(&definition(), 3, std::slice::from_ref(&snapshot))
+        .unwrap();
+    drop(log);
+    let (_, replayed, _) = open(&path, &keys(7)).unwrap();
+    assert!(same(&replayed, &[snapshot]));
+    assert_eq!(replayed[0].series(), &named[..]);
+
+    // A key travels as its kind and text, and text not of its kind is refused.
+    let json = serde_json::to_value(&named[1]).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"digest": 2, "key": {"kind": "integer", "value": "-7"}})
+    );
+    assert_eq!(serde_json::from_value::<SeriesKey>(json).unwrap(), named[1]);
+    // A key digests as generalforecast.keys digests it, and the series it
+    // names must be that digest's; text not of its kind is refused.
+    let digests: Vec<Result<u64, String>> = named.iter().map(|key| key.key.digest()).collect();
+    assert_eq!(
+        digests,
+        [
+            Ok(0x798e_6fd9_6d29_8952),
+            Ok(0xffff_ffff_ffff_fff9),
+            Ok(0xc3a5_576a_0913_d767),
+            Ok(0xa456_4266_1417_4000),
+        ]
+    );
+    assert_eq!(
+        GivenKey::Integer(u128::MAX.to_string()).digest(),
+        Ok(u64::MAX)
+    );
+    assert_eq!(
+        GivenKey::Uuid("00000000-0000-0000-0000-000000000004".to_string()).digest(),
+        Ok(4)
+    );
+    assert!(named.iter().all(|key| key.check().is_err()));
+    let own = SeriesKey {
+        digest: 0xffff_ffff_ffff_fff9,
+        key: named[1].key.clone(),
+    };
+    assert_eq!(own.check(), Ok(()));
+    assert!(GivenKey::Integer("1.5".to_string()).digest().is_err());
+    assert!(
+        GivenKey::Integer(format!("{}0", u128::MAX))
+            .digest()
+            .is_err()
+    );
+    assert!(GivenKey::Bytes("abc".to_string()).digest().is_err());
+    assert!(GivenKey::Bytes("0AFF".to_string()).digest().is_err());
+    assert!(
+        GivenKey::Uuid("123e4567e89b12d3a456426614174000".to_string())
+            .digest()
+            .is_err()
+    );
 }
 
 fn same(left: &[Record], right: &[Record]) -> bool {
@@ -385,6 +495,7 @@ fn compaction_keeps_sequence_numbers() {
         times: Some(vec![Some(9)]),
         id: None,
         words: Vec::new(),
+        series: Vec::new(),
         writes: vec![PastWrite {
             id: "retried".to_string(),
             rows: 1,
@@ -615,6 +726,7 @@ fn a_crash_on_either_side_of_compactions_rename_leaves_a_whole_log() {
         times: Some(vec![Some(9)]),
         id: None,
         words: Vec::new(),
+        series: Vec::new(),
         writes: Vec::new(),
         layout: None,
         table: None,
@@ -680,6 +792,7 @@ fn a_late_compaction_of_a_dropped_table_leaves_its_successor_alone() {
         times: Some(vec![Some(9)]),
         id: None,
         words: Vec::new(),
+        series: Vec::new(),
         writes: Vec::new(),
         layout: None,
         table: None,
@@ -921,6 +1034,7 @@ fn a_compactions_layout_comes_back_to_the_bit() {
         times: Some(vec![Some(9)]),
         id: None,
         words: Vec::new(),
+        series: Vec::new(),
         writes: Vec::new(),
         layout: Some(RowLayout {
             ids: vec![RowId(5)],

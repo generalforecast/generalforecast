@@ -38,6 +38,9 @@ pub enum FlightAction {
         table: TableName,
         words: bool,
     },
+    /// The keys of a table's series as clients gave them, which the table
+    /// keeps and replays as user data, in the order it first saw them.
+    KnownSeries(TableName),
     Delete(DeleteAction),
     Truncate(TableName),
     Refit(TableName),
@@ -195,6 +198,7 @@ impl FlightAction {
                 let Describe { table, words } = body(action)?;
                 Self::Describe { table, words }
             }
+            "known_series" => Self::KnownSeries(body::<Table>(action)?.table),
             "delete" => Self::Delete(body(action)?),
             "truncate" => Self::Truncate(body::<Table>(action)?.table),
             "refit" => Self::Refit(body::<Table>(action)?.table),
@@ -266,6 +270,7 @@ impl FlightAction {
             Self::Locate(_) => "locate",
             Self::CreateTable(_) => "create_table",
             Self::Describe { .. } => "describe",
+            Self::KnownSeries(_) => "known_series",
             Self::Delete(_) => "delete",
             Self::Truncate(_) => "truncate",
             Self::Refit(_) => "refit",
@@ -291,6 +296,7 @@ impl FlightAction {
             Self::Delete(delete) => Some(&delete.table),
             Self::Locate(table)
             | Self::Describe { table, .. }
+            | Self::KnownSeries(table)
             | Self::Truncate(table)
             | Self::Refit(table)
             | Self::SetStrategy { table, .. }

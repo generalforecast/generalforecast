@@ -519,6 +519,7 @@ impl Harness {
             times: None,
             id: id.map(str::to_string),
             words: Vec::new(),
+            series: Vec::new(),
             writes: Vec::new(),
             layout: None,
             table: None,
@@ -1160,6 +1161,7 @@ async fn a_node_that_needs_leases_takes_writes_only_under_a_term() {
             times: None,
             id: None,
             words: Vec::new(),
+            series: Vec::new(),
             writes: Vec::new(),
             layout: None,
             table: None,
@@ -1215,6 +1217,7 @@ async fn a_truncate_empties_the_table_and_later_writes_in_its_batch_follow_it() 
                 times: None,
                 id: None,
                 words: Vec::new(),
+                series: Vec::new(),
                 writes: Vec::new(),
                 layout: None,
                 table: None,
@@ -1464,6 +1467,16 @@ impl Harness {
 
     /// Inserts observations of series at times, each row's key packing both.
     async fn observe(&self, table: &str, placed: &[(u64, i64)]) -> Result<usize, Code> {
+        self.observe_named(table, placed, Vec::new()).await
+    }
+
+    /// Observations naming their series' keys, as a client's write does.
+    async fn observe_named(
+        &self,
+        table: &str,
+        placed: &[(u64, i64)],
+        named: Vec<gf_server::wal::SeriesKey>,
+    ) -> Result<usize, Code> {
         let (reply, answer) = oneshot::channel();
         let rows = Rows {
             keys: placed
@@ -1478,6 +1491,7 @@ impl Harness {
             times: Some(placed.iter().map(|&(_, time)| Some(time)).collect()),
             id: None,
             words: Vec::new(),
+            series: named,
             writes: Vec::new(),
             layout: None,
             table: None,
@@ -1507,6 +1521,33 @@ impl Harness {
         before: Option<Vec<i64>>,
     ) -> Result<gf_server::protocol::Predictions, Code> {
         self.forecast_over(table, series, before, 3).await
+    }
+
+    async fn known_series(&self, table: &str) -> Result<Vec<gf_server::wal::SeriesKey>, Code> {
+        let (reply, answer) = oneshot::channel();
+        let command = Command::KnownSeries {
+            table: name(table),
+            reply,
+        };
+        self.commands.send(command).await.unwrap();
+        answer.await.unwrap().map_err(|error| status(&error))
+    }
+
+    async fn truncate(&self, table: &str) -> Result<usize, Code> {
+        let (reply, answer) = oneshot::channel();
+        let command = Command::Write {
+            table: name(table),
+            write: Write::Truncate,
+            fence: Fence::default(),
+            charge: Charge::default(),
+            reply,
+        };
+        self.commands.send(command).await.unwrap();
+        answer
+            .await
+            .unwrap()
+            .map(|written| written.rows)
+            .map_err(|error| status(&error))
     }
 
     async fn forecast_over(
@@ -1623,6 +1664,89 @@ async fn a_series_table_compacted_and_restarted_forecasts_as_before() {
 }
 
 #[tokio::test]
+async fn a_series_tables_keys_are_kept_through_compaction_restart_and_replication() {
+    use gf_server::wal::{GivenKey, SeriesKey};
+
+    // Keys whose digests, as clients compute them, are the series' numbers.
+    let key = |digest: u64, given: GivenKey| SeriesKey { digest, key: given };
+    let shoes = key(1, GivenKey::Integer("1".to_string()));
+    let socks = key(2, GivenKey::Integer("2".to_string()));
+    let third = key(3, GivenKey::Integer("3".to_string()));
+    let shard = shard(settings()).await;
+    shard.create_series("rows").await.unwrap();
+    assert_eq!(shard.known_series("rows").await, Ok(Vec::new()));
+    assert_eq!(shard.describe().await.series, Some(0));
+
+    // A write names its series, a key once however many observations name
+    // it, and a later write adds only the series the table has not seen.
+    let placed: Vec<(u64, i64)> = (0..6)
+        .flat_map(|step| [(1, 100 + 10 * step), (2, 100 + 10 * step)])
+        .collect();
+    let named = vec![shoes.clone(), socks.clone(), shoes.clone()];
+    assert_eq!(shard.observe_named("rows", &placed, named).await, Ok(12));
+    let named = vec![third.clone(), socks.clone()];
+    assert_eq!(
+        shard
+            .observe_named("rows", &[(3, 100), (2, 160)], named)
+            .await,
+        Ok(2)
+    );
+    let all = vec![shoes.clone(), socks.clone(), third.clone()];
+    assert_eq!(shard.known_series("rows").await, Ok(all.clone()));
+    assert_eq!(shard.describe().await.series, Some(3));
+    // A key no client could read back, or one that is another series', is
+    // refused before the log takes it.
+    let unreadable = vec![key(4, GivenKey::Bytes("xyz".to_string()))];
+    assert_eq!(
+        shard.observe_named("rows", &[(4, 100)], unreadable).await,
+        Err(Code::InvalidArgument)
+    );
+    let anothers = vec![key(4, GivenKey::Integer("5".to_string()))];
+    assert_eq!(
+        shard.observe_named("rows", &[(4, 100)], anothers).await,
+        Err(Code::InvalidArgument)
+    );
+    assert_eq!(shard.known_series("rows").await, Ok(all.clone()));
+
+    // The log carries the keys through a compaction and a restart, and to a
+    // replica that takes the snapshot in place of the records before it.
+    shard.compact().await;
+    let replica = self::shard(self::settings()).await;
+    replica.create_series("rows").await.unwrap();
+    replica.replicate(shard.read_log(0).await).await.unwrap();
+    assert_eq!(replica.known_series("rows").await, Ok(all.clone()));
+    let shard = shard.restart().await;
+    assert_eq!(shard.known_series("rows").await, Ok(all.clone()));
+    let fourth = key(
+        4,
+        GivenKey::Uuid("00000000-0000-0000-0000-000000000004".to_string()),
+    );
+    shard
+        .observe_named("rows", &[(4, 100)], vec![fourth.clone()])
+        .await
+        .unwrap();
+    let shard = shard.restart().await;
+    assert_eq!(
+        shard.known_series("rows").await,
+        Ok([all.clone(), vec![fourth]].concat())
+    );
+
+    // A truncated table holds no series; a table of rows names none.
+    assert_eq!(shard.truncate("rows").await, Ok(15));
+    assert_eq!(shard.known_series("rows").await, Ok(Vec::new()));
+    assert_eq!(shard.describe().await.series, Some(0));
+    shard.create_named("plain", 3).await.unwrap();
+    assert_eq!(
+        shard.observe_named("plain", &[(1, 100)], vec![shoes]).await,
+        Err(Code::InvalidArgument)
+    );
+    assert_eq!(
+        shard.known_series("plain").await,
+        Err(Code::InvalidArgument)
+    );
+}
+
+#[tokio::test]
 async fn a_queued_write_keeps_its_budget_until_it_is_answered() {
     let test = async {
         let shard = shard(settings()).await;
@@ -1650,6 +1774,7 @@ async fn a_queued_write_keeps_its_budget_until_it_is_answered() {
                     times: None,
                     id: None,
                     words: Vec::new(),
+                    series: Vec::new(),
                     writes: Vec::new(),
                     layout: None,
                     table: None,

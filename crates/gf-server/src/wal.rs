@@ -37,6 +37,9 @@
 //!
 //! Records that add rows carry the words they added to the vocabularies of
 //! the table's categorical columns, so replay codes categories as the primary did.
+//! Records that add observations to a table of series carry the keys of the
+//! series they first name, as the client gave them, so a client that opens
+//! the table later can name its series again.
 //!
 //! Replicas copy a table by reading its log from a sequence number: entry 0 is
 //! the definition, and each later entry is one record. Records that change
@@ -627,6 +630,117 @@ pub enum GroupSpec {
     Given { size: u64 },
 }
 
+/// A series' key as a client gave it: user data a table of series keeps,
+/// logs and replays, so a client that opens the table later can name its
+/// series again. The text is the key's own form: a whole number's decimal
+/// digits, which may take 128 bits, more than JSON numbers carry exactly; a
+/// string as it is; bytes in lowercase hex; a UUID hyphenated.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum GivenKey {
+    Integer(String),
+    String(String),
+    Bytes(String),
+    Uuid(String),
+}
+
+impl GivenKey {
+    /// The 64-bit digest a table knows the series by, computed as
+    /// `generalforecast.keys` computes it: the low 64 bits of the key's 128,
+    /// which are an integer's two's complement, a UUID's bits, and the
+    /// little-endian 16-byte BLAKE2b digest of a string's UTF-8 or of bytes.
+    /// Checks the text is of its kind's form on the way, so every client
+    /// reads it back.
+    ///
+    /// # Errors
+    ///
+    /// Names what is wrong with the text.
+    pub fn digest(&self) -> Result<u64, String> {
+        use blake2::digest::consts::U16;
+        use blake2::{Blake2b, Digest};
+
+        let hashed = |bytes: &[u8]| {
+            let digest = Blake2b::<U16>::digest(bytes);
+            u64::from_le_bytes(digest[..8].try_into().expect("16 bytes"))
+        };
+        match self {
+            Self::Integer(text) => text
+                .parse::<i128>()
+                .map(|number| number as u128)
+                .or_else(|_| text.parse::<u128>())
+                .map(|number| number as u64)
+                .map_err(|_| format!("integer key {text:?} is not a whole number of 128 bits")),
+            Self::String(text) => Ok(hashed(text.as_bytes())),
+            Self::Bytes(text) => unhex(text)
+                .ok_or_else(|| format!("bytes key {text:?} is not lowercase hex"))
+                .map(|bytes| hashed(&bytes)),
+            Self::Uuid(text) => {
+                let hyphenated = text.len() == 36
+                    && [8, 13, 18, 23]
+                        .iter()
+                        .all(|&index| text.as_bytes()[index] == b'-');
+                let plain: String = text
+                    .bytes()
+                    .enumerate()
+                    .filter(|&(index, _)| !matches!(index, 8 | 13 | 18 | 23))
+                    .map(|(_, byte)| byte as char)
+                    .collect();
+                let bytes = hyphenated
+                    .then(|| unhex(&plain))
+                    .flatten()
+                    .ok_or_else(|| format!("UUID key {text:?} is not hyphenated lowercase hex"))?;
+                // A UUID's bytes are big-endian: its last 8 hold the low half.
+                Ok(u64::from_be_bytes(bytes[8..].try_into().expect("16 bytes")))
+            }
+        }
+    }
+}
+
+/// Bytes from lowercase hex of even length, or None for other text.
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    };
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    text.as_bytes()
+        .chunks(2)
+        .map(|pair| Some((digit(pair[0])? << 4) | digit(pair[1])?))
+        .collect()
+}
+
+/// A series of a table of series: the 64-bit digest the table knows it by,
+/// which clients pack into its observations' row keys, and its key as the
+/// client gave it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SeriesKey {
+    pub digest: u64,
+    pub key: GivenKey,
+}
+
+impl SeriesKey {
+    /// Checks the key reads back and is the series' own: it digests to the
+    /// digest the table knows the series by.
+    ///
+    /// # Errors
+    ///
+    /// Names what is wrong with the key.
+    pub fn check(&self) -> Result<(), String> {
+        let digest = self.key.digest()?;
+        if digest != self.digest {
+            return Err(format!(
+                "series key {:?} digests to {digest:#x}, not to series {:#x}",
+                self.key, self.digest
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A series definition checked: what the node's `SeriesSpec` takes from it,
 /// beside what the model's profile gives.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -692,6 +806,10 @@ pub struct Rows {
     /// Words the record adds to columns' vocabularies, in code order; a
     /// snapshot's are every word.
     pub words: Vec<Words>,
+    /// The series the record's rows first name in a table of series, each
+    /// key as the client gave it by the digest the table knows it by; a
+    /// snapshot's are every series the table holds.
+    pub series: Vec<SeriesKey>,
     /// A snapshot's: the writes the table last applied, by client id, so a
     /// retry still applies once after the log is compacted.
     pub writes: Vec<PastWrite>,
@@ -770,6 +888,21 @@ impl Record {
         match self {
             Self::Insert(rows) | Self::Update(rows) | Self::Upsert(rows) | Self::Snapshot(rows) => {
                 &rows.words
+            }
+            Self::Delete { .. }
+            | Self::Refit
+            | Self::Truncate
+            | Self::Strategy(_)
+            | Self::Term { .. } => &[],
+        }
+    }
+
+    /// The series the record names, if it carries rows of a table of series.
+    #[must_use]
+    pub fn series(&self) -> &[SeriesKey] {
+        match self {
+            Self::Insert(rows) | Self::Update(rows) | Self::Upsert(rows) | Self::Snapshot(rows) => {
+                &rows.series
             }
             Self::Delete { .. }
             | Self::Refit
@@ -2280,6 +2413,9 @@ fn record_frame(record: &Record) -> Frame {
             if !rows.words.is_empty() {
                 header["words"] = json!(rows.words);
             }
+            if !rows.series.is_empty() {
+                header["series"] = json!(rows.series);
+            }
             if !rows.writes.is_empty() {
                 header["writes"] = json!(rows.writes);
             }
@@ -2841,6 +2977,11 @@ fn record_from(frame: &Frame) -> Result<Record, LogError> {
             id: id.clone(),
             words: match header.get("words") {
                 Some(words) => serde_json::from_value(words.clone())
+                    .map_err(|error| LogError::Malformed(error.to_string()))?,
+                None => Vec::new(),
+            },
+            series: match header.get("series") {
+                Some(series) => serde_json::from_value(series.clone())
                     .map_err(|error| LogError::Malformed(error.to_string()))?,
                 None => Vec::new(),
             },
