@@ -7,6 +7,7 @@ pub mod action;
 pub mod auth;
 pub mod budget;
 pub mod config;
+pub mod definition;
 pub mod engine;
 pub mod ephemeral;
 pub mod error;

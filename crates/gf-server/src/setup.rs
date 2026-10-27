@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
 use crate::config::Config;
-use crate::wal::{self, EncryptionKey, Keys, Log, LogError, Replay, TableDefinition};
+use crate::definition::TableDefinition;
+use crate::wal::{self, EncryptionKey, Keys, Log, LogError, Replay};
 
 /// What a starter configuration says.
 pub struct Starter {

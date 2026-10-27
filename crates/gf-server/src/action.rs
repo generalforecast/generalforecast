@@ -18,9 +18,10 @@ use serde::{Deserialize, Serialize};
 use tonic::Status;
 
 use crate::auth::Scope;
+use crate::definition::{CreationId, TableDefinition};
 use crate::name::TableName;
 use crate::protocol::StrategySpec;
-use crate::wal::{CreationId, TableDefinition, Terms};
+use crate::wal::Terms;
 
 /// The longest a client's write id may be.
 const WRITE_ID_BYTES: usize = 64;

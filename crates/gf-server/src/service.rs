@@ -79,6 +79,7 @@ use crate::budget::Charge;
 /// crates that embed this server.
 pub use crate::budget::RequestBudget;
 use crate::config::{Assign, PlacementConfig};
+use crate::definition::{CreationId, Durability, TableDefinition};
 use crate::error::{ServerError, exists};
 use crate::metrics::{Histogram, Metrics};
 use crate::name::TableName;
@@ -87,9 +88,7 @@ use crate::protocol::{Predictions, StrategySpec};
 use crate::quantiles::{self, quantile_values};
 use crate::shard::{Command, Description, Fence, Incoming, Lease, Lineage, LogLength, Write};
 use crate::trace::{Trace, traced};
-use crate::wal::{
-    CreationId, Durability, GivenKey, LogEntry, Rows, SeriesKey, TableDefinition, Terms, decode,
-};
+use crate::wal::{GivenKey, LogEntry, Rows, SeriesKey, Terms, decode};
 use gf_core::columns::{self, Cells, Column, ColumnKind, Strings};
 
 type Boxed<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;

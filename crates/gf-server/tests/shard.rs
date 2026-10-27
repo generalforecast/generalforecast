@@ -13,6 +13,7 @@ use gf_core::cache::Eviction;
 use gf_core::columns::{Column, ColumnKind};
 use gf_core::node::{Scheduling, Targets};
 use gf_server::budget::{Charge, RequestBudget};
+use gf_server::definition::{CreationId, Durability, TableDefinition, TimeKind};
 use gf_server::metrics::Metrics;
 use gf_server::name::TableName;
 use gf_server::protocol::{
@@ -24,10 +25,7 @@ use gf_server::shard::{
     Asked, Command, EphemeralLimits, Fence, Incoming, Inferred, Lease, RequestContext, Shard,
     ShardSettings, Write,
 };
-use gf_server::wal::{
-    CreationId, Durability, EncryptionKey, Keys, Log, LogEntry, LogError, Record, Rows,
-    TableDefinition, Terms, TimeKind, decode,
-};
+use gf_server::wal::{EncryptionKey, Keys, Log, LogEntry, LogError, Record, Rows, Terms, decode};
 use gf_server::worker::WorkerConnection;
 use serde_json::Value;
 use tokio::net::UnixStream;
@@ -1431,7 +1429,7 @@ async fn writes_during_a_compaction_wait_for_it_and_then_apply() {
 
 /// A table of two series of one covariate, forecast in pairs.
 fn series_definition(name: &str) -> TableDefinition {
-    use gf_server::wal::{GroupSpec, SeriesDefinition};
+    use gf_server::definition::{GroupSpec, SeriesDefinition};
 
     TableDefinition {
         model: "tiny-forecaster".to_string(),
@@ -2053,7 +2051,7 @@ async fn a_clamped_tables_compaction_keeps_the_strategy_it_was_given() {
     let shard = shard(settings()).await;
     let mut definition = definition("rows", 3);
     definition.model = "capped".to_string();
-    definition.past_cap = gf_server::wal::PastCapSpec::Clamp;
+    definition.past_cap = gf_server::definition::PastCapSpec::Clamp;
     let (reply, answer) = oneshot::channel();
     shard
         .commands
@@ -2080,7 +2078,7 @@ async fn a_clamped_tables_compaction_keeps_the_strategy_it_was_given() {
     let replica = self::shard(self::settings()).await;
     let mut definition = self::definition("rows", 3);
     definition.model = "capped".to_string();
-    definition.past_cap = gf_server::wal::PastCapSpec::Clamp;
+    definition.past_cap = gf_server::definition::PastCapSpec::Clamp;
     let (reply, answer) = oneshot::channel();
     replica
         .commands

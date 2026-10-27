@@ -13,12 +13,13 @@ use gf_core::columns::{Column, ColumnKind, Words};
 use gf_core::node::{FittedColumns, RowLayout, Scaling, TableLayout, Targets};
 use gf_core::pages::{Bucket, CellLayout, IndexLayout, PageId, PageLayout};
 use gf_core::table::RowId;
+use gf_server::definition::{CreationId, PastCapSpec, TableDefinition, TimeKind};
 use gf_server::name::TableName;
 use gf_server::protocol::{RecencySpec, StrategySpec};
 use gf_server::setup;
 use gf_server::wal::{
-    self, CreationId, EncryptionKey, HEAD_INTERVAL, Keys, Log, LogEntry, LogError, PastCapSpec,
-    PastWrite, Record, Rows, TableDefinition, Term, Terms, TimeKind, decode,
+    self, EncryptionKey, HEAD_INTERVAL, Keys, Log, LogEntry, LogError, PastWrite, Record, Rows,
+    Term, Terms, decode,
 };
 
 /// Opens a log and replays it whole: its definition, its records, and the log.
@@ -1088,7 +1089,7 @@ fn a_compactions_layout_comes_back_to_the_bit() {
 #[test]
 fn series_definitions_name_their_columns_and_replay() {
     use gf_core::forecasting::GroupStrategy;
-    use gf_server::wal::{GroupSpec, SeriesDefinition};
+    use gf_server::definition::{GroupSpec, SeriesDefinition};
 
     let series = |known: Vec<&str>, step: u64| {
         Some(Box::new(SeriesDefinition {

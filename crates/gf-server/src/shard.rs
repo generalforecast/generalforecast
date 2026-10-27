@@ -67,6 +67,7 @@ use gf_core::regions::RegionStats;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::budget::Charge;
+use crate::definition::{CreationId, Durability, TableDefinition};
 use crate::ephemeral::{Ephemeral, EphemeralTables};
 use crate::error::ServerError;
 use crate::metrics::{Metrics, TableMetrics, Timing};
@@ -78,8 +79,8 @@ use crate::protocol::{
 };
 use crate::routes::Routes;
 use crate::wal::{
-    self, Compacted, Compactor, CreationId, Durability, EncryptionKey, Log, LogEntry, PastWrite,
-    Record, Replay, RowSealer, Rows, SeriesKey, TableDefinition, Terms, decode,
+    self, Compacted, Compactor, EncryptionKey, Log, LogEntry, PastWrite, Record, Replay, RowSealer,
+    Rows, SeriesKey, Terms, decode,
 };
 use crate::worker::{self, WorkerConnection};
 use gf_core::columns::{self, Strings, Vocabulary, Words};
@@ -2615,9 +2616,9 @@ impl Shard {
                 .series
                 .as_ref()
                 .map_or(1, |series| match series.group {
-                    crate::wal::GroupSpec::Alone => 1,
-                    crate::wal::GroupSpec::Random { size, .. }
-                    | crate::wal::GroupSpec::Given { size } => {
+                    crate::definition::GroupSpec::Alone => 1,
+                    crate::definition::GroupSpec::Random { size, .. }
+                    | crate::definition::GroupSpec::Given { size } => {
                         usize::try_from(size).unwrap_or(usize::MAX)
                     }
                 }),
