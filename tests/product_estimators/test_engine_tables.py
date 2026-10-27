@@ -688,3 +688,27 @@ def test_rows_without_ids_refuse_a_collision_on_a_partitioned_table() -> None:
     # Ids moved on would write again the rows earlier partitions took.
     assert handle.inserted == 1
     assert caught.value.hint == "give the rows an id column with Schema(id=...)"
+
+
+def test_rows_without_ids_are_refused_on_a_routed_table() -> None:
+    class Recording:
+        """A handle that takes every insert, as a partition without the ids would."""
+
+        inserted = 0
+
+        def insert(self, *_: Any) -> None:
+            self.inserted += 1
+
+    table = engine.Table(
+        "routed",
+        model="general-forecast/tabicl-v2-classifier",
+        target="y",
+        ops=engine.TableOptions(partitions=2, route_by={"column": "x"}),
+        download=False,
+    )
+    handle = Recording()
+    with pytest.raises(InvalidInput, match="routed by 'x'") as caught:
+        table._insert_unkeyed(cast(Any, handle), np.zeros((2, 1)), np.zeros(2), None)
+    # No partition can refuse an id another holds, so nothing is written.
+    assert handle.inserted == 0
+    assert caught.value.hint == "give the rows an id column with Schema(id=...)"
