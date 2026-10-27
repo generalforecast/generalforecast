@@ -57,11 +57,8 @@ def admit(spec: Any, pin: Any, task: str, outputs: tuple[str, ...]) -> None:
         "model does not provide requested quantile precision",
         "UnsupportedCapability",
     )
-    ensure(
-        not levels or pin.quantiles or pin.quantile_step is not None,
-        "model does not provide requested quantile levels",
-        "UnsupportedCapability",
-    )
+    # A model that declares neither levels nor a step publishes them in its
+    # pinned weights; binding checks the levels against them, on every path.
     if spec.context.max_rows is not None:
         ensure(
             spec.context.max_rows <= pin.max_context_rows,
@@ -89,7 +86,7 @@ def admit(spec: Any, pin: Any, task: str, outputs: tuple[str, ...]) -> None:
             "series, horizon, frequency and covariate roles require a forecast task",
         )
     policy = V1_POLICY
-    refused = policy.admits(ModelRef(pin.repository, pin.codes, pin.estimators))
+    refused = policy.admits(ModelRef(pin.model, pin.codes, pin.estimators))
     ensure(refused is None, f"serving policy allows {refused}", "CapacityExceeded")
     ensure(
         pin.max_context_rows <= policy.context_rows

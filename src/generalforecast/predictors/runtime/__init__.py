@@ -41,7 +41,7 @@ def _load(
     from generalforecast.models.catalog import ModelRefError
 
     pin = lock.model
-    ref = ModelRef(pin.repository, pin.codes, pin.estimators, pin.digest)
+    ref = ModelRef(pin.model, pin.codes, pin.estimators, pin.digest)
     engine = engines.local(surface, allow_downloads)
     try:
         engine.load(ref)

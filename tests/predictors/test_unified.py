@@ -312,31 +312,32 @@ def test_gf_check_and_the_runtime_refuse_the_same_irregular_times(tmp_path):
     )
 
 
-def test_check_admits_quantiles_as_the_runtime_does(tmp_path):
+def test_check_admits_quantiles_as_the_runtime_does(tmp_path, monkeypatch):
     rows = sales().select(["store", "date", "units"])
+    manifest: dict[str, Any] = {
+        "target": "units",
+        "time": "date",
+        "series": ["store"],
+        "horizon": 2,
+        "quantiles": [0.123],
+    }
+    # A model whose catalog entry declares its levels is held to them at check.
     with pytest.raises(InvalidInput) as caught:
-        directory(
-            tmp_path / "levels",
-            rows,
-            model="general-forecast/timesfm-3",
-            target="units",
-            time="date",
-            series=["store"],
-            horizon=2,
-            quantiles=[0.123],
-        )
+        directory(tmp_path / "chronos", rows, model=FORECASTER, **manifest)
     assert "quantile" in caught.value.message
+    # One that publishes them only in its weights is held to them at bind.
+    root = directory(
+        tmp_path / "timesfm", rows, model="general-forecast/timesfm-3", **manifest
+    )
+    FakeEngine((0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)).install(monkeypatch)
+    lock = lock_of(root)
+    from generalforecast.predictors.models import CatalogResolver
 
-
-def test_models_without_a_published_digest_are_not_locked(tmp_path):
-    with pytest.raises(InvalidInput) as caught:
-        directory(
-            tmp_path / "limix",
-            typed_rows(),
-            model="general-forecast/limix-2-classifier",
-        )
-    assert caught.value.param == "model"
-    assert "cannot be locked" in caught.value.message
+    plan = compile_lock(
+        lock, served_context(lock, rows), resolver=CatalogResolver("local")
+    )
+    with pytest.raises(Exception, match=r"does not output quantile 0\.123"):
+        PredictorExecutor(surface="local").prepare(plan, served_context(lock, rows))
 
 
 def test_ad_hoc_selection_is_honoured(monkeypatch):

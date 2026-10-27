@@ -372,7 +372,7 @@
         "queries": 100,
         "inputs": 32
       },
-      "digest": null,
+      "digest": "sha256:ae6bbf4492712d2af3209a077cc49b3d06bbb0842455e2a6a00c6078aebade29",
       "pinned": false,
       "hostable": false,
       "bounds": {
@@ -395,7 +395,7 @@
         "queries": 100,
         "inputs": 32
       },
-      "digest": null,
+      "digest": "sha256:005f3fa6fa71fc7b34931970b1b85236de1452ac0b19681e6f7c05d87238e8e2",
       "pinned": false,
       "hostable": false,
       "bounds": {
@@ -418,7 +418,7 @@
         "queries": 100,
         "inputs": 16
       },
-      "digest": null,
+      "digest": "sha256:60425dc4ed035ba2278099f39d68b8157ed90ad19be958f57a2f7dfd9474f189",
       "pinned": false,
       "hostable": false,
       "bounds": {

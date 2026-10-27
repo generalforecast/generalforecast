@@ -35,6 +35,28 @@ from generalforecast.service.catalog import forecast_request
 from generalforecast.service.contracts import ServiceError
 
 
+def _levels(spec: Any, declared: Any, grid: Any) -> None:
+    """Holds the loaded forecaster's levels to the catalog's and the plan's.
+
+    A model whose catalog entry declares its levels must output exactly
+    those; one that declares none publishes them in its pinned weights, and
+    the plan's levels must be among them.
+    """
+    ensure(
+        not declared or tuple(grid) == tuple(declared),
+        "pinned model capabilities changed",
+        "ModelMismatch",
+    )
+    missing = [
+        level for level in spec.quantiles or DEFAULT_QUANTILES if level not in grid
+    ]
+    ensure(
+        not missing,
+        f"the model does not output quantile {missing[0]}" if missing else "",
+        "UnsupportedCapability",
+    )
+
+
 def _label(identity: tuple) -> str:
     return ", ".join(str(value) for value in identity) or "(all rows)"
 
@@ -147,9 +169,10 @@ class ForecastContext:
             bound.request({series: zeros for series in range(len(identities))}),
             declared,
         )
-        engine.forecast(
+        _, grid = engine.forecast(
             ref, forecast_request(bound.request({groups[0][0]: zeros}), declared)
         )
+        _levels(spec, declared, grid)
         return bound
 
     def request(self, futures: dict[int, dict[str, list[Any]]]) -> dict[str, Any]:
@@ -258,11 +281,7 @@ class ForecastContext:
             raise ServiceError(
                 "ModelOutputError", "native forecaster returned invalid forecasts", 503
             ) from None
-        ensure(
-            grid == tuple(declared),
-            "pinned model capabilities changed",
-            "ModelMismatch",
-        )
+        _levels(spec, declared, grid)
         rows = {series: at for at, series in enumerate(sorted(futures))}
         levels = spec.quantiles or DEFAULT_QUANTILES
         return {

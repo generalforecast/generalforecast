@@ -87,9 +87,21 @@ class Artifact:
     convert: str | None = None
 
     @property
-    def digest(self) -> str | None:
-        """The content digest of the file manifest, or None without one."""
-        return content_digest(dict(self.files)) if self.files else None
+    def digest(self) -> str:
+        """The artifact's pin: what a lock records and serving verifies.
+
+        With file hashes, the content digest of the file manifest: the files
+        as they load, whether they load as they are or `convert` from their
+        upstream format, since conversion reads exactly these bytes. Without
+        them, as for a repository that is not publicly readable, the digest
+        of the immutable upstream commit, `{repository, revision}`, which is
+        all that pins such a model.
+        """
+        if self.files:
+            return content_digest(dict(self.files))
+        return content_digest(
+            {"repository": self.repository, "revision": self.revision}
+        )
 
     @property
     def license_files(self) -> tuple[str, ...]:
