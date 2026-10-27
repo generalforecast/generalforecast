@@ -79,7 +79,7 @@ use crate::config::{Assign, PlacementConfig};
 use crate::metrics::{Histogram, Metrics};
 use crate::name::TableName;
 use crate::partition;
-use crate::protocol::Predictions;
+use crate::protocol::{Predictions, StrategySpec};
 use crate::shard::{
     Command, Description, Fence, Incoming, Lease, Lineage, LogLength, ServerError, Write,
 };
@@ -830,7 +830,7 @@ impl Service {
                 let placement = self.placement.read().await;
                 let mut creating = self.creating.lock().unwrap_or_else(PoisonError::into_inner);
                 if placement.contains_key(&name) {
-                    return Err(exists(format!("table {name:?} exists")));
+                    return Err(exists(format!("table {:?} exists", name.as_str())));
                 }
                 if let Some((_, placed)) = creating.get(&name) {
                     placed.clone()
@@ -2329,6 +2329,8 @@ impl Service {
         #[derive(Default, serde::Deserialize)]
         struct Share {
             share: Option<u64>,
+            #[serde(default)]
+            strategy: Option<StrategySpec>,
         }
         let share: Share = if body.is_empty() {
             Share::default()
@@ -2357,6 +2359,7 @@ impl Service {
                 strings,
                 share: share.share,
                 before,
+                strategy: share.strategy.map(|strategy| strategy.strategy()),
                 reply,
             })
             .await?;
@@ -2595,6 +2598,7 @@ impl Service {
                     log_length,
                     outputs,
                     levels,
+                    strategy,
                     context_rows,
                     effective_fit_rows,
                     regions,
@@ -2619,6 +2623,7 @@ impl Service {
                 described["outputs"] = json!(outputs);
                 described["quantile_levels"] = json!(levels);
                 described["context_rows"] = json!(context_rows);
+                described["resolved_strategy"] = json!(strategy);
                 if let Some(rows) = effective_fit_rows {
                     described["effective_fit_rows"] = json!(rows);
                 }
@@ -2654,6 +2659,18 @@ impl Service {
                 let written = self
                     .ask(placement.shard, |reply| Command::Refit {
                         table,
+                        fence,
+                        reply,
+                    })
+                    .await?;
+                results(vec![answer(&written, &placement)])
+            }
+            FlightAction::SetStrategy { table, strategy } => {
+                let (placement, _routed) = self.routed(&table).await?;
+                let written = self
+                    .ask(placement.shard, |reply| Command::SetStrategy {
+                        table,
+                        strategy,
                         fence,
                         reply,
                     })
@@ -2880,6 +2897,7 @@ impl FlightService for Service {
             "delete",
             "truncate",
             "refit",
+            "set_strategy",
             "compact",
             "drop_table",
             "list_tables",

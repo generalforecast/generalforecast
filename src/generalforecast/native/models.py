@@ -27,10 +27,14 @@ def _base(ref: str) -> str:
     return re.split(r"[@*]", ref, maxsplit=1)[0]
 
 
-def _ref(ref: str) -> ModelRef:
+def _ref(ref: Any) -> ModelRef:
     try:
         return _catalog.parse(ref)
     except ModelRefError as error:
+        if not isinstance(ref, str):
+            raise InvalidInput(
+                str(error), hint='pass a custom model as "module:attribute"'
+            ) from None
         name = _base(ref)
         if (known := _catalog.known_as(name)) is not None:
             raise InvalidInput(
@@ -45,19 +49,47 @@ def _ref(ref: str) -> ModelRef:
         raise InvalidInput(str(error), param="model") from None
 
 
+def _entry(ref: str) -> ModelEntry:
+    try:
+        return _ref(ref).entry
+    except ModelRefError as error:
+        raise InvalidInput(str(error), param="model") from None
+
+
+def _capability(ref: str) -> _catalog.Capability:
+    """What the model can do; a custom model's is read from its loaded contract."""
+    parsed = _ref(ref)
+    if not parsed.custom:
+        return parsed.entry.capability
+    from generalforecast.models import custom
+
+    try:
+        return custom.capability(parsed)
+    except ModelRefError as error:
+        raise InvalidInput(str(error), param="model") from None
+
+
 def canonical(ref: str) -> str:
-    """The canonical id of a model reference, with its variant kept."""
+    """The canonical id of a model reference, with its variant kept.
+
+    A custom model's `module:attribute` is its own canonical spelling.
+    """
     return str(_ref(ref))
 
 
 def limits(ref: str) -> Limits:
     """The model's context row, query and input limits."""
-    return _ref(ref).entry.limits
+    return _capability(ref).limits
 
 
 def task_of(ref: str) -> Task:
     """The task the model performs."""
-    return _ref(ref).entry.capability.task
+    return _capability(ref).task
+
+
+def quantiles(ref: str) -> tuple[float, ...]:
+    """The levels a forecaster's outputs are at, if declared; empty otherwise."""
+    return _capability(ref).quantiles
 
 
 def _artifacts() -> Any:
@@ -68,7 +100,7 @@ def _artifacts() -> Any:
 
 def is_cached(ref: str) -> bool:
     """Whether the model's files are in the local cache."""
-    return bool(_artifacts().cached(_ref(ref).entry))
+    return bool(_artifacts().cached(_entry(ref)))
 
 
 def pull(ref: str, *, progress: Any = None) -> Path:
@@ -76,9 +108,7 @@ def pull(ref: str, *, progress: Any = None) -> Path:
     artifacts = _artifacts()
     try:
         return Path(
-            artifacts.checkpoint(
-                _ref(ref).entry, allow_downloads=True, progress=progress
-            )
+            artifacts.checkpoint(_entry(ref), allow_downloads=True, progress=progress)
         )
     except artifacts.ArtifactError as error:
         if error.code == "NotFound":
@@ -88,7 +118,7 @@ def pull(ref: str, *, progress: Any = None) -> Path:
 
 def cache_path(ref: str) -> Path:
     """Where the model's files live in the cache."""
-    return Path(_artifacts().checkpoint(_ref(ref).entry))
+    return Path(_artifacts().checkpoint(_entry(ref)))
 
 
 def catalog(task: Task | None = None) -> list[ModelEntry]:
@@ -115,6 +145,11 @@ def is_bare_name(ref: Any) -> bool:
     return isinstance(ref, str) and _base(ref) in _catalog.ALIASES
 
 
+def is_custom(ref: str) -> bool:
+    """Whether `ref` names a custom model by its `module:attribute`."""
+    return _ref(ref).custom
+
+
 def is_catalog_model(ref: Any) -> bool:
     """Whether `ref` names a catalog model, not a custom `module:attribute` spec."""
     if not isinstance(ref, str) or "/" not in _base(ref):
@@ -128,7 +163,7 @@ def is_catalog_model(ref: Any) -> bool:
 
 def entry(ref: str) -> ModelEntry:
     """The catalog entry of a model reference."""
-    return _ref(ref).entry
+    return _entry(ref)
 
 
 def short(ref: str) -> str:
@@ -156,10 +191,12 @@ __all__ = [
     "is_cached",
     "is_catalog_id",
     "is_catalog_model",
+    "is_custom",
     "known_org",
     "limits",
     "not_cached",
     "pull",
+    "quantiles",
     "short",
     "task_of",
 ]

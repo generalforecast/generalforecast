@@ -38,6 +38,7 @@ use tokio::sync::mpsc;
 
 use crate::engine::{self, Bound, Engine};
 use crate::predictors::{self, ContextMode, ForecastPredictor, ServedPredictor};
+use crate::progress::Compiling;
 use crate::revisions::{Published, Record, Revisions};
 use crate::routes::Routes;
 use crate::service::{Charge, RequestBudget, quantile_values};
@@ -623,12 +624,13 @@ impl Front {
     /// logged and skipped, so a
     /// slow compile never keeps the server from starting. Returns how many
     /// buckets compiled.
-    pub async fn warm(&self) -> usize {
+    pub async fn warm(&self, compiling: &Compiling) -> usize {
         let mut shapes = Vec::new();
         let Ok(engine) = self.engine() else {
             return 0;
         };
         let engine = engine.with_timeout(WARM_TIMEOUT);
+        let mut models = Vec::new();
         for served in self.catalog_models() {
             let Ok(model) = catalog::resolve(Some(&served.reference), self.surface) else {
                 continue;
@@ -636,6 +638,10 @@ impl Front {
             if model.entry.task == catalog::Task::Forecast {
                 continue;
             }
+            models.push((served, model));
+        }
+        compiling.expect((models.len() * WARM_SHAPES.len()) as u64);
+        for (served, model) in models {
             let regression = model.entry.task == catalog::Task::Regression;
             for &(context_rows, queries) in WARM_SHAPES {
                 let replicas = (0..engine.shards()).map(|shard| {
@@ -657,6 +663,7 @@ impl Front {
                         failed = Some(error.message);
                     }
                 }
+                compiling.advance(1);
                 if let Some(message) = failed {
                     tracing::warn!(
                         model = served.name.as_str(),

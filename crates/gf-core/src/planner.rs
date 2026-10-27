@@ -19,6 +19,7 @@
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
+use std::num::NonZeroU64;
 
 use crate::context::{Context, Fingerprint, mix};
 use crate::pages::{IndexError, PageIndex, Vectors};
@@ -88,6 +89,13 @@ pub struct Core {
 pub enum Strategy {
     /// Every live row, for every query.
     Exact,
+    /// What fits the table's size: `Exact` while the live rows are within the
+    /// model's context cap, and past it a stratified core of a quarter of the
+    /// cap plus the nearest rows that fill the rest, the neighbors leaning to
+    /// the newest rows when the table has times. Resolved by `resolve` from
+    /// the live row count at each plan, so a table that grows past the cap
+    /// crosses into retrieval on its own and one that shrinks reads whole again.
+    Adaptive,
     /// A core shared by every query of a window, plus each query's
     /// `neighbors` nearest rows outside it, encoded together. Without
     /// neighbors it is a subsample; without a core, each query's nearest rows.
@@ -116,6 +124,17 @@ pub enum Recency {
 
 /// Seeds the sample that stands in for every row past a model's trained length.
 const CAP_SEED: u64 = 0x6361_705f_726f_7773;
+
+/// Seeds the core an adaptive strategy resolves to, the seed a `Retrieved`
+/// selection takes unless it says otherwise.
+pub const ADAPTIVE_SEED: u64 = 0;
+
+/// The share of the cap an adaptive strategy's core takes past the cap.
+const ADAPTIVE_CORE_SHARE: f64 = 0.25;
+
+/// How many nearest rows an adaptive strategy's neighbors are the latest of,
+/// per neighbor, when the table has times.
+const ADAPTIVE_AMONG_PER_NEIGHBOR: usize = 4;
 
 /// The most rows a strategy's count may name, since no table holds more.
 pub const MAX_STRATEGY_ROWS: u64 = u32::MAX as u64;
@@ -217,12 +236,46 @@ impl Strategy {
         }
     }
 
+    /// The strategy a table of `rows` live rows plans with, under a model cap
+    /// of `cap` context rows: an adaptive strategy becomes `Exact` up to the
+    /// cap (or without one) and past it a retrieved strategy of a stratified
+    /// core of `round(0.25 * cap)` rows, seeded `ADAPTIVE_SEED`, plus the
+    /// `cap - core` nearest rows, kept as the latest of four times as many
+    /// nearest when `timed`. Any other strategy is itself.
+    #[must_use]
+    pub fn resolve(self, rows: u64, cap: Option<NonZeroU64>, timed: bool) -> Self {
+        let Self::Adaptive = self else {
+            return self;
+        };
+        let Some(cap) = cap.map(NonZeroU64::get).filter(|&cap| rows > cap) else {
+            return Self::Exact;
+        };
+        #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+        #[allow(clippy::cast_sign_loss)]
+        let core = ((cap as f64) * ADAPTIVE_CORE_SHARE).round_ties_even() as u64;
+        let neighbors = usize::try_from(cap - core).unwrap_or(usize::MAX);
+        Self::Retrieved {
+            core: (core > 0).then_some(Core {
+                rows: core,
+                seed: ADAPTIVE_SEED,
+                kind: CoreKind::Stratified,
+            }),
+            neighbors,
+            among: timed
+                .then(|| neighbors.checked_mul(ADAPTIVE_AMONG_PER_NEIGHBOR))
+                .flatten(),
+            recency: None,
+        }
+    }
+
     /// The strategy cut to contexts of at most `rows` rows: every row becomes
     /// a random sample of `rows`, and a retrieved context keeps at most `rows`
-    /// of its core and fills what is left with neighbors.
+    /// of its core and fills what is left with neighbors. An adaptive strategy
+    /// never passes the cap it resolves against, so it stays as it is.
     #[must_use]
     pub fn capped(self, rows: u64) -> Self {
         match self {
+            Self::Adaptive => Self::Adaptive,
             Self::Exact => Self::subsample(rows, CAP_SEED, CoreKind::Random),
             Self::Retrieved {
                 core,
@@ -245,10 +298,12 @@ impl Strategy {
         }
     }
 
-    /// The core's seed, which the live rows are ranked by, if it has a core.
+    /// The core's seed, which the live rows are ranked by, if it has a core;
+    /// an adaptive strategy keeps the ranking its core past the cap draws from.
     #[must_use]
     pub fn seed(&self) -> Option<u64> {
         match self {
+            Self::Adaptive => Some(ADAPTIVE_SEED),
             Self::Retrieved {
                 core: Some(core), ..
             } => Some(core.seed),

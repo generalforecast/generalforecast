@@ -99,6 +99,30 @@ impl Strategy {
         Self(planner::Strategy::Exact)
     }
 
+    /// What fits the table's size, resolved from its live rows at each plan.
+    ///
+    /// Exact up to the model's context cap, and past it a stratified core of
+    /// a quarter of the cap plus the nearest rows that fill the rest, the
+    /// neighbors leaning to the newest rows when the table has times.
+    #[staticmethod]
+    fn adaptive() -> Self {
+        Self(planner::Strategy::Adaptive)
+    }
+
+    /// The strategy a table of `rows` live rows plans with.
+    ///
+    /// `cap` is the model's context rows, or None for no cap; `timed` whether
+    /// the table's rows have times. An adaptive strategy is resolved by the
+    /// server's rule, any other is itself.
+    #[pyo3(signature = (rows, cap, timed = false))]
+    fn resolve(&self, rows: i64, cap: Option<i64>, timed: bool) -> PyResult<Self> {
+        let cap = cap
+            .map(|cap| count::<u64>(cap, "cap"))
+            .transpose()?
+            .and_then(std::num::NonZeroU64::new);
+        Ok(Self(self.0.resolve(count(rows, "rows")?, cap, timed)))
+    }
+
     /// The same deterministic sample of rows for every query: a core alone.
     ///
     /// `kind` is `random`, `stratified` (by class, or by target bin for a
@@ -172,7 +196,11 @@ impl Strategy {
             recency,
         } = self.0
         else {
-            return "Strategy.exact()".to_string();
+            return match self.0 {
+                planner::Strategy::Adaptive => "Strategy.adaptive()",
+                _ => "Strategy.exact()",
+            }
+            .to_string();
         };
         let mut more = String::new();
         if let Some(among) = among {
@@ -227,7 +255,11 @@ impl Strategy {
             recency,
         } = self.0
         else {
-            return r#"{"kind": "exact"}"#.to_string();
+            return match self.0 {
+                planner::Strategy::Adaptive => r#"{"kind": "adaptive"}"#,
+                _ => r#"{"kind": "exact"}"#,
+            }
+            .to_string();
         };
         let among = among.map_or_else(|| "null".to_string(), |among| among.to_string());
         let recency = match recency {
@@ -1466,6 +1498,21 @@ impl Node {
         let node = &mut self.0;
         let dropped = py.detach(|| node.refit(TableId(table))).map_err(raised)?;
         Ok(movements(&dropped))
+    }
+
+    /// Changes how a table chooses contexts from here on; see `Node.strategy`.
+    fn set_strategy(&mut self, table: u32, strategy: &Strategy) -> PyResult<()> {
+        self.0
+            .set_strategy(TableId(table), strategy.0)
+            .map_err(raised)
+    }
+
+    /// The strategy a table's next plan chooses contexts with.
+    ///
+    /// An adaptive strategy resolved against the table's live rows, or the
+    /// one it was given.
+    fn strategy(&self, table: u32) -> PyResult<Strategy> {
+        Ok(Strategy(self.0.strategy(TableId(table)).map_err(raised)?))
     }
 }
 

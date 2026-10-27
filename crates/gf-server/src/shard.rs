@@ -72,8 +72,8 @@ use crate::metrics::{Metrics, TableMetrics, Timing};
 use crate::name::TableName;
 use crate::partition::{self, Given, ModelRows, Offer};
 use crate::protocol::{
-    ModelProfile, Outcome, Predictions, WorkerReply, WorkerRequest, movements_json, outcome_from,
-    step_frame,
+    ModelProfile, Outcome, Predictions, StrategySpec, WorkerReply, WorkerRequest, movements_json,
+    outcome_from, step_frame,
 };
 use crate::routes::Routes;
 use crate::service::Charge;
@@ -303,6 +303,8 @@ pub enum Write {
     Refit,
     /// Deletes every row.
     Truncate,
+    /// Changes how the table chooses contexts from here on.
+    Strategy(StrategySpec),
 }
 
 impl Write {
@@ -314,7 +316,7 @@ impl Write {
             | Self::Upsert(incoming)
             | Self::Label(incoming) => incoming.rows.id.as_deref(),
             Self::Delete { id, .. } => id.as_deref(),
-            Self::Refit | Self::Truncate => None,
+            Self::Refit | Self::Truncate | Self::Strategy(_) => None,
         }
     }
 
@@ -326,7 +328,7 @@ impl Write {
             | Self::Upsert(incoming)
             | Self::Label(incoming) => &incoming.rows.keys,
             Self::Delete { keys, .. } => keys,
-            Self::Refit | Self::Truncate => &[],
+            Self::Refit | Self::Truncate | Self::Strategy(_) => &[],
         }
     }
 
@@ -345,7 +347,7 @@ impl Write {
             | Self::Update(incoming)
             | Self::Upsert(incoming)
             | Self::Label(incoming) => !incoming.strings.is_empty(),
-            Self::Delete { .. } | Self::Refit | Self::Truncate => false,
+            Self::Delete { .. } | Self::Refit | Self::Truncate | Self::Strategy(_) => false,
         }
     }
 }
@@ -558,6 +560,9 @@ pub struct Description {
     /// values: a forecaster's own levels, or a tabular regressor's evenly
     /// spaced ones.
     pub levels: Option<Vec<f64>>,
+    /// The strategy the table's next plan chooses contexts with: its
+    /// adaptive strategy resolved against its live rows, or the one it was given.
+    pub strategy: StrategySpec,
     /// The most context rows the model was trained on, if it says.
     pub context_rows: Option<u64>,
     /// The most rows the table's state is fit on: its `fit_rows`, or fewer
@@ -598,6 +603,13 @@ pub enum Command {
     },
     Refit {
         table: TableName,
+        fence: Fence,
+        reply: Reply<Written>,
+    },
+    /// Changes how the table chooses contexts from here on, logged like a write.
+    SetStrategy {
+        table: TableName,
+        strategy: StrategySpec,
         fence: Fence,
         reply: Reply<Written>,
     },
@@ -707,6 +719,8 @@ pub enum Command {
         share: Option<u64>,
         /// The queries' cutoff, which every offered row comes before.
         before: Option<i64>,
+        /// The strategy the router assembles by, in place of the table's own.
+        strategy: Option<Strategy>,
         reply: Reply<(ModelRows, Vec<Offer>)>,
     },
     /// Predicts queries, the rows without keys, against contexts given to
@@ -739,6 +753,10 @@ pub enum Command {
     },
     /// Saves every log's head, as a server does before it exits.
     SaveHeads { reply: Reply<()> },
+    /// Stops the worker and the shard, as a server does once it has drained:
+    /// the worker is told to exit, and killed if it does not; nothing is
+    /// started again.
+    Shutdown { reply: Reply<()> },
     /// Has the worker sample its own threads for `seconds`, their stacks
     /// written collapsed to `path`, and with `trace` write JAX's trace of
     /// the window into that directory.
@@ -957,6 +975,9 @@ pub struct Shard {
     recent: HashMap<TableId, Recent>,
     /// Set while the worker is stopped and starting again.
     down: Option<Down>,
+    /// Whether the server told the shard to shut down, so a worker that
+    /// stops is not started again.
+    stopping: bool,
     metrics: Arc<Metrics>,
     /// The bytes of each cache tier this shard last added to the gauges.
     cache_reported: [u64; 3],
@@ -1037,6 +1058,7 @@ impl Shard {
             broken: HashMap::new(),
             recent: HashMap::new(),
             down: None,
+            stopping: false,
             metrics,
             cache_reported: [0; 3],
             rows_reported: 0,
@@ -1161,6 +1183,7 @@ impl Shard {
                     self.commit_batch(batch).await;
                 }
                 Event::Command(None) => break,
+                Event::Stopped | Event::Hung if self.stopping => break,
                 Event::Compacted(finished) => self.finish_compaction(*finished).await,
                 Event::Reply(reply) => self.finish(reply).await,
                 Event::Stopped => self.restart("the worker stopped").await,
@@ -1293,6 +1316,21 @@ impl Shard {
                     reply,
                 },
             ),
+            Command::SetStrategy {
+                table,
+                strategy,
+                fence,
+                reply,
+            } => self.queue(
+                batch,
+                Queued {
+                    table,
+                    write: Write::Strategy(strategy),
+                    fence,
+                    charge: Charge::default(),
+                    reply,
+                },
+            ),
             command => {
                 self.commit_batch(std::mem::take(batch)).await;
                 self.handle(command).await;
@@ -1314,6 +1352,11 @@ impl Shard {
             }
             Command::SaveHeads { reply } => {
                 self.save_heads();
+                let _ = reply.send(Ok(()));
+            }
+            Command::Shutdown { reply } => {
+                self.worker.terminate().await;
+                self.stopping = true;
                 let _ = reply.send(Ok(()));
             }
             Command::Record {
@@ -1341,7 +1384,9 @@ impl Shard {
                 };
                 let _ = reply.send(answered);
             }
-            Command::Write { reply, .. } | Command::Refit { reply, .. } => {
+            Command::Write { reply, .. }
+            | Command::Refit { reply, .. }
+            | Command::SetStrategy { reply, .. } => {
                 let _ = reply.send(Err(ServerError::Internal(
                     "writes are committed in batches".to_string(),
                 )));
@@ -1355,6 +1400,7 @@ impl Shard {
                         log_length: entry.log.length(),
                         outputs: entry.outputs,
                         levels: entry.levels.clone(),
+                        strategy: StrategySpec::of(self.node.strategy(id)?),
                         context_rows: self.node.spec(id)?.context_rows.map(NonZeroU64::get),
                         effective_fit_rows: {
                             let spec = self.node.spec(id)?;
@@ -1495,9 +1541,10 @@ impl Shard {
                 strings,
                 share,
                 before,
+                strategy,
                 reply,
             } => {
-                let _ = reply.send(self.offer(&table, features, &strings, share, before));
+                let _ = reply.send(self.offer(&table, features, &strings, share, before, strategy));
             }
             Command::Infer {
                 context,
@@ -1612,11 +1659,12 @@ impl Shard {
         strings: &Strings,
         share: Option<u64>,
         before: Option<i64>,
+        strategy: Option<Strategy>,
     ) -> Result<(ModelRows, Vec<Offer>), ServerError> {
         let id = self.usable(table)?;
         let mut coded = queries.clone();
         self.resolve(table, &mut coded, strings)?;
-        let offered = self.node.candidates(id, &coded, share, before)?;
+        let offered = self.node.candidates(id, &coded, share, before, strategy)?;
         let entry = &self.tables[table];
         let width = entry.definition.features();
         let ids: Vec<RowId> = offered.iter().map(|candidate| candidate.row).collect();
@@ -2700,6 +2748,11 @@ impl Shard {
             })?;
         let config = definition.config().map_err(ServerError::Invalid)?;
         let settings = definition.series_settings().map_err(ServerError::Invalid)?;
+        if let Some(roles) = &definition.roles {
+            roles
+                .check(definition.classes)
+                .map_err(ServerError::Invalid)?;
+        }
         if let Some(route) = &definition.route_by {
             route
                 .check(&definition.columns)
@@ -2935,7 +2988,7 @@ impl Shard {
     /// read. A table that fails to restore is served nowhere, and its log
     /// stays, or is set aside if it is damaged.
     async fn restore(&mut self, mut replay: Replay) -> Result<Option<Vec<f64>>, ServerError> {
-        let definition = replay.definition().clone();
+        let mut definition = replay.definition().clone();
         let (id, outputs, levels) = self.serve(&definition, false).await?;
         let path = self.log_path(&definition.name);
         let mut vocabularies = vec![Vocabulary::default(); vocabularies_of(&definition)];
@@ -2948,6 +3001,12 @@ impl Shard {
                     break;
                 }
             };
+            if let Record::Strategy(strategy) = &record {
+                definition.strategy = strategy.clone();
+            }
+            if let Some(strategy) = snapshot_strategy(&record) {
+                take_strategy(&mut definition, strategy);
+            }
             learn(
                 &mut vocabularies,
                 record.words(),
@@ -3071,8 +3130,31 @@ impl Shard {
                 dropped = self.node.refit(id)?;
                 0
             }
+            Record::Strategy(strategy) => {
+                self.node.set_strategy(id, strategy.strategy())?;
+                if let Some(entry) = self
+                    .names
+                    .get(&id)
+                    .and_then(|name| self.tables.get_mut(name))
+                {
+                    entry.definition.strategy = strategy;
+                }
+                0
+            }
             Record::Term { .. } => 0,
-            record => self.change(id, record)?,
+            record => {
+                let carried = snapshot_strategy(&record);
+                let rows = self.change(id, record)?;
+                if let Some(strategy) = carried
+                    && let Some(entry) = self
+                        .names
+                        .get(&id)
+                        .and_then(|name| self.tables.get_mut(name))
+                {
+                    take_strategy(&mut entry.definition, strategy);
+                }
+                rows
+            }
         };
         let written = Written { rows, log_length };
         if let Some(write_id) = write_id {
@@ -3118,7 +3200,9 @@ impl Shard {
                 apply_compacted(node, id, rows)?;
                 Ok(count)
             }
-            Record::Refit | Record::Term { .. } => unreachable!("refits and terms change no rows"),
+            Record::Refit | Record::Strategy(_) | Record::Term { .. } => {
+                unreachable!("refits, strategies and terms change no rows")
+            }
         }
     }
 
@@ -3343,6 +3427,7 @@ impl Shard {
             }
             Write::Refit => Record::Refit,
             Write::Truncate => Record::Truncate,
+            Write::Strategy(strategy) => Record::Strategy(strategy),
         };
         Ok(Ok((id, record)))
     }
@@ -3380,6 +3465,15 @@ impl Shard {
             }
             Record::Delete { keys, .. } => self.node.check_delete(id, keys)?,
             Record::Refit | Record::Truncate => {}
+            Record::Strategy(strategy) => {
+                if self.tables[table].definition.series.is_some() {
+                    return Err(ServerError::Invalid(
+                        "a table of series takes no strategy: its groups are its contexts"
+                            .to_string(),
+                    ));
+                }
+                strategy.strategy().check().map_err(NodeError::Strategy)?;
+            }
             Record::Term { term, .. } => {
                 let current = self.tables[table].log.term().term;
                 if *term <= current {
@@ -3526,6 +3620,9 @@ impl Shard {
                 LogEntry::Record(snapshot @ Record::Snapshot(_)) => {
                     self.apply_staged(id, std::mem::take(staged)).await?;
                     let entry = self.tables.get_mut(table).expect("checked above");
+                    if let Some(strategy) = snapshot_strategy(&snapshot) {
+                        take_strategy(&mut entry.definition, strategy);
+                    }
                     entry.log.compact(
                         &entry.definition,
                         sequence,
@@ -3603,11 +3700,13 @@ impl Shard {
             return Ok(());
         }
         let id = self.usable(table)?;
-        let source = self.node.compaction_source(id)?;
+        let mut source = self.node.compaction_source(id)?;
         let (name, entry) = self
             .tables
             .get_key_value(table)
             .expect("usable tables are served");
+        // The strategy as given, which a clamp may have cut in the node's.
+        source.table.strategy = Some(entry.definition.strategy.strategy());
         let compactor = entry
             .log
             .begin_compaction(&entry.definition, entry.log.length())?;
@@ -4389,6 +4488,22 @@ fn charge(cost: &mut HashMap<TableId, f64>, seconds: f64, rows: &HashMap<TableId
 /// Applies a compaction's record to a table: one with a layout rebuilds the
 /// table exactly, one without, from a log compacted before layouts were kept,
 /// makes the table hold its rows.
+/// The strategy a snapshot's layout carries, if it is one with a layout.
+fn snapshot_strategy(record: &Record) -> Option<Strategy> {
+    match record {
+        Record::Snapshot(rows) => rows.table.as_ref().and_then(|table| table.strategy),
+        _ => None,
+    }
+}
+
+/// Gives the definition the strategy a snapshot carried, keeping the
+/// definition's own spelling of it when it is the same strategy.
+fn take_strategy(definition: &mut TableDefinition, strategy: Strategy) {
+    if definition.strategy.strategy() != strategy {
+        definition.strategy = StrategySpec::of(strategy);
+    }
+}
+
 fn apply_compacted(node: &mut Node, id: TableId, rows: Rows) -> Result<(), NodeError> {
     let count = rows.keys.len();
     let table = TableRows {

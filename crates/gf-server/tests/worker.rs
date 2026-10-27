@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use gf_server::progress::Compiling;
 use gf_server::protocol::{Frame, WorkerReply};
 use gf_server::worker::Pipeline;
 use serde_json::json;
@@ -34,7 +35,7 @@ fn frame(kind: &str, n: u64) -> Frame {
 async fn frames_are_pipelined_and_replies_reach_their_requests() {
     let (ours, theirs) = UnixStream::pair().unwrap();
     echo(theirs);
-    let mut pipeline = Pipeline::new(ours, std::env::temp_dir());
+    let mut pipeline = Pipeline::new(ours, std::env::temp_dir(), Compiling::default());
 
     let first = pipeline.send(&frame("step", 0)).await.unwrap();
     let second = pipeline.send(&frame("step", 1)).await.unwrap();
@@ -61,7 +62,7 @@ async fn worker_errors_and_disconnects_reach_waiting_requests() {
         .frame();
         error.write_to(&mut theirs).await.unwrap();
     });
-    let mut pipeline = Pipeline::new(ours, std::env::temp_dir());
+    let mut pipeline = Pipeline::new(ours, std::env::temp_dir(), Compiling::default());
 
     let first = pipeline.send(&frame("step", 0)).await.unwrap();
     let second = pipeline.send(&frame("step", 1)).await.unwrap();
@@ -79,7 +80,7 @@ async fn worker_errors_and_disconnects_reach_waiting_requests() {
 #[tokio::test]
 async fn a_stopped_pipeline_refuses_frames_at_once() {
     let (ours, mut theirs) = UnixStream::pair().unwrap();
-    let mut pipeline = Pipeline::new(ours, std::env::temp_dir());
+    let mut pipeline = Pipeline::new(ours, std::env::temp_dir(), Compiling::default());
     let stopped = pipeline.stopped();
 
     // A frame nothing asked for means the worker and the pipeline disagree.
@@ -93,7 +94,7 @@ async fn a_stopped_pipeline_refuses_frames_at_once() {
 #[tokio::test]
 async fn a_worker_that_stops_reading_never_blocks_sends() {
     let (ours, _theirs) = UnixStream::pair().unwrap();
-    let mut pipeline = Pipeline::new(ours, std::env::temp_dir());
+    let mut pipeline = Pipeline::new(ours, std::env::temp_dir(), Compiling::default());
     // Far past what the socket buffers, and under the size that goes through files.
     let mut big = frame("apply", 0);
     big.buffers.push(vec![0; 512 << 10]);

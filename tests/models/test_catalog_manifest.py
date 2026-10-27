@@ -56,7 +56,12 @@ def test_checked_in_manifest_is_the_catalogs() -> None:
 )
 def test_native_references_parse_as_the_catalog_does(spec: str) -> None:
     try:
-        expected = str(catalog.parse(spec))
+        parsed = catalog.parse(spec)
+        expected = (
+            ("UnsupportedModel", catalog.custom_refused(spec))
+            if parsed.custom
+            else str(parsed)
+        )
     except catalog.ModelRefError as error:
         expected = {
             "UnknownModel": ("ModelNotFound", "model is not in the curated catalog"),

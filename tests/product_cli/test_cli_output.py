@@ -510,3 +510,44 @@ def test_wine_init_check_eval_end_to_end(monkeypatch, tmp_path):
     assert code == 1
     assert "\nerror: predictor wine has no query rows to score\n" in stderr
     assert "`gf eval --queries FILE`" in stderr
+
+
+def test_permission_denied_says_what_to_do(monkeypatch):
+    from generalforecast import errors
+
+    def denied(args, out):
+        raise errors.Unauthorized("permission denied for this scope")
+
+    monkeypatch.setattr("generalforecast.commands.execute", denied)
+    code, stdout, stderr = gf("model", "list", monkeypatch=monkeypatch)
+    assert code == 1 and not stdout
+    assert stderr == (
+        "error: permission denied for this scope\n"
+        "  hint: run `gf login` again, or use a key that has this permission\n"
+    )
+
+
+def test_whoami_shows_the_workspace_by_name():
+    import argparse
+
+    from generalforecast import render
+
+    err, out_stream = io.StringIO(), io.StringIO()
+    out = term.Output(out=out_stream, err=err, environ={"NO_COLOR": "1"})
+    render._whoami(
+        argparse.Namespace(),
+        {
+            "email": "tejas@generalforecast.com",
+            "workspace": {
+                "id": "ws-d05c5221daffd41b",
+                "display_name": "General Forecast",
+            },
+            "project": "general-forecast",
+            "server": "https://app.generalforecast.com",
+            "source": "macOS keychain",
+        },
+        out,
+    )
+    text = out_stream.getvalue()
+    assert "workspace    General Forecast\n" in text
+    assert "ws-d05c" not in text and "{" not in text

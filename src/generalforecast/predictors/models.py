@@ -221,12 +221,19 @@ def describe(requested: str) -> ModelPin:
     Predictors and servers resolve through `CatalogResolver`, which also requires
     predictor qualification; local estimators validate intent with this instead.
     """
-    from generalforecast.models.catalog import V1_POLICY, ModelRefError, parse
+    from generalforecast.models.catalog import (
+        V1_POLICY,
+        ModelRefError,
+        custom_refused,
+        parse,
+    )
 
     try:
         ref = parse(requested)
     except ModelRefError as error:
         raise PredictorError(error.code, str(error)) from None
+    if ref.custom:
+        raise PredictorError("UnsupportedModel", custom_refused(ref.name))
     ensure(
         bool(ref.entry.artifact.files),
         f"{ref.entry.name} has no pinned files to describe",
@@ -248,7 +255,12 @@ class CatalogResolver:
 
     def resolve(self, requested: str, *, offline: bool = True) -> ModelPin:
         """Refuses unknown names and pin mismatches instead of falling back or upgrading."""
-        from generalforecast.models.catalog import V1_POLICY, ModelRefError, parse
+        from generalforecast.models.catalog import (
+            V1_POLICY,
+            ModelRefError,
+            custom_refused,
+            parse,
+        )
 
         text(requested)
         try:
@@ -264,6 +276,8 @@ class CatalogResolver:
                 else str(error)
             )
             raise PredictorError(code, message) from None
+        if ref.custom:
+            raise PredictorError("UnsupportedModel", custom_refused(ref.name))
         entry = ref.entry
         if not entry.gates.allows("predictor"):
             raise PredictorError(
@@ -296,16 +310,19 @@ class CatalogResolver:
 
 
 def for_task(spec: str, task: str) -> str:
-    """The catalog spec the engine's workers load a model by, checked for `task`.
+    """The spec the engine's workers load a model by, checked for `task`.
 
     Names, aliases and `@K`/`*N` variants resolve offline through the shared
-    catalog; the engine verifies pinned files as its workers load them.
+    catalog; the engine verifies pinned files as its workers load them. A
+    custom model's task is read from its loaded contract.
     """
-    from generalforecast.models.catalog import parse
+    from generalforecast.models.catalog import ModelRefError, parse
+    from generalforecast.models.custom import capability
     from generalforecast.predictors.validation import ensure
 
-    ensure(
-        parse(spec).entry.capability.task == task,
-        "model does not support estimator task",
-    )
+    try:
+        found = capability(parse(spec)).task
+    except ModelRefError as error:
+        raise PredictorError(error.code, str(error)) from None
+    ensure(found == task, "model does not support estimator task")
     return spec

@@ -73,9 +73,10 @@ use gf_server::auth::{
 };
 use gf_server::metrics::Counter;
 use gf_server::name::TableName;
+use gf_server::protocol::StrategySpec;
 use gf_server::service::{EPOCH, GPU_SECONDS, HORIZON, MESSAGE_BYTES};
 use gf_server::trace::{Trace, traced};
-use gf_server::wal::{CreationId, RouteBy, RouteKind, TableDefinition, Term, Terms};
+use gf_server::wal::{CreationId, PastCapSpec, RouteBy, RouteKind, TableDefinition, Term, Terms};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{oneshot, watch};
@@ -1725,8 +1726,15 @@ impl Router {
             // tables do, so they keep the settings a gathered context cannot.
             let gathered = count > 1 && definition.route_by.is_none();
             // Each partition would cut its own context to the length, so the
-            // context gathered from them all would pass it again.
-            if gathered && body.get("past_cap").and_then(Value::as_str) == Some("clamp") {
+            // context gathered from them all would pass it again. An adaptive
+            // strategy is resolved within the length for the table as a whole,
+            // so there is nothing for the partitions to cut.
+            let adaptive =
+                body.pointer("/strategy/kind").and_then(Value::as_str) == Some("adaptive");
+            if gathered
+                && !adaptive
+                && body.get("past_cap").and_then(Value::as_str) == Some("clamp")
+            {
                 return Err(Status::invalid_argument(
                     "past_cap = \"clamp\" needs a table of one partition or a route",
                 ));
@@ -1770,27 +1778,7 @@ impl Router {
         let body: Value = serde_json::from_slice(&action.body).unwrap_or(Value::Null);
         let answer = match parsed {
             FlightAction::Describe { .. } => {
-                let mut answers = Vec::with_capacity(count);
-                for name in &names {
-                    let mut asked = body.clone();
-                    asked["table"] = json!(name);
-                    let described = self
-                        .read_action(name, &self::action("describe", &asked))
-                        .await?;
-                    answers.push(described.into_iter().next().unwrap_or(Value::Null));
-                }
-                let mut whole = answers[0].clone();
-                for field in ["rows", "log_length"] {
-                    let total: u64 = answers
-                        .iter()
-                        .filter_map(|answer| answer.get(field).and_then(Value::as_u64))
-                        .sum();
-                    whole[field] = json!(total);
-                }
-                // A description is the definition's fields, flat, with the rows'.
-                whole["name"] = json!(table);
-                whole["partitions"] = json!(count);
-                vec![whole]
+                vec![self.describe_whole(table, count, &body).await?]
             }
             FlightAction::Delete(delete) => {
                 let keys = body
@@ -1841,6 +1829,37 @@ impl Router {
                     let request = self::action(&action.r#type, &json!({"table": name}));
                     let parsed = FlightAction::parse(&request)?;
                     answers.extend(self.write_action(name, &request, &parsed).await?);
+                }
+                answers
+            }
+            FlightAction::SetStrategy { strategy, .. } => {
+                // As at creation: partitions each cut their own context to
+                // the length, so only an adaptive strategy, resolved within
+                // it for the table as a whole, gathers under a clamp.
+                let definition = self.definition_of(table, count).await?;
+                if definition.route_by.is_none()
+                    && definition.past_cap == PastCapSpec::Clamp
+                    && !matches!(strategy, StrategySpec::Adaptive)
+                {
+                    return Err(Status::invalid_argument(
+                        "past_cap = \"clamp\" needs a table of one partition or a route, \
+                         so a gathered table's strategy stays adaptive",
+                    ));
+                }
+                let mut answers = Vec::new();
+                for name in &names {
+                    let body = json!({"table": name, "strategy": strategy});
+                    let request = self::action(&action.r#type, &body);
+                    let parsed = FlightAction::parse(&request)?;
+                    answers.extend(self.write_action(name, &request, &parsed).await?);
+                }
+                if let Some(definition) = self
+                    .definitions
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get_mut(table)
+                {
+                    definition.strategy = strategy.clone();
                 }
                 answers
             }
@@ -1961,10 +1980,55 @@ impl Router {
         Ok(definition)
     }
 
-    /// The strategy a partitioned table's predictions assemble their contexts by.
+    /// The strategy a partitioned table's predictions assemble their contexts
+    /// by: the definition's, or an adaptive one resolved against the rows of
+    /// every partition together, which costs a description of each.
     async fn strategy_of(&self, table: &str, count: usize) -> Result<Strategy, Status> {
         let definition = self.definition_of(table, count).await?;
-        Ok(definition.config().map_err(Status::internal)?.strategy)
+        let strategy = definition.config().map_err(Status::internal)?.strategy;
+        if strategy != Strategy::Adaptive {
+            return Ok(strategy);
+        }
+        let whole = self
+            .describe_whole(table, count, &json!({"table": table}))
+            .await?;
+        Ok(resolved_whole(&whole))
+    }
+
+    /// A partitioned table described as one: the first partition's
+    /// description with the rows and log lengths of them all, and an adaptive
+    /// strategy resolved against those rows.
+    async fn describe_whole(
+        &self,
+        table: &str,
+        count: usize,
+        body: &Value,
+    ) -> Result<Value, Status> {
+        let mut answers = Vec::with_capacity(count);
+        for index in 0..count {
+            let name = partitions::name(table, index, count);
+            let mut asked = body.clone();
+            asked["table"] = json!(name);
+            let described = self
+                .read_action(&name, &self::action("describe", &asked))
+                .await?;
+            answers.push(described.into_iter().next().unwrap_or(Value::Null));
+        }
+        let mut whole = answers[0].clone();
+        for field in ["rows", "log_length"] {
+            let total: u64 = answers
+                .iter()
+                .filter_map(|answer| answer.get(field).and_then(Value::as_u64))
+                .sum();
+            whole[field] = json!(total);
+        }
+        // A description is the definition's fields, flat, with the rows'.
+        whole["name"] = json!(table);
+        whole["partitions"] = json!(count);
+        if whole.pointer("/strategy/kind").and_then(Value::as_str) == Some("adaptive") {
+            whole["resolved_strategy"] = json!(StrategySpec::of(resolved_whole(&whole)));
+        }
+        Ok(whole)
     }
 
     /// The column a partitioned table's rows and queries are routed by, if any.
@@ -2235,7 +2299,7 @@ impl Router {
         quantiles: Option<&MetadataValue<Ascii>>,
     ) -> Result<(Streaming<FlightData>, String, Instant), Status> {
         let share = partitions::sampled(strategy).map(|rows| partitions::share(rows, count));
-        let body = json!({ "share": share }).to_string();
+        let body = json!({ "share": share, "strategy": StrategySpec::of(*strategy) }).to_string();
         let offers = futures::future::try_join_all((0..count).map(|index| {
             let name = partitions::name(table, index, count);
             let path = vec!["candidates".to_string(), name.clone(), body.clone()];
@@ -2854,6 +2918,7 @@ impl Router {
             FlightAction::Delete(DeleteAction { table, .. })
             | FlightAction::Truncate(table)
             | FlightAction::Refit(table)
+            | FlightAction::SetStrategy { table, .. }
             | FlightAction::Compact(table) => self.write_action(table, &action, &parsed).await?,
             FlightAction::DropTable(table) => self.drop_table(table).await?,
             FlightAction::LogLengths
@@ -2962,6 +3027,7 @@ impl FlightService for Router {
             "delete",
             "truncate",
             "refit",
+            "set_strategy",
             "compact",
             "drop_table",
             "list_tables",
@@ -2980,6 +3046,18 @@ impl FlightService for Router {
             actions.collect::<Vec<_>>(),
         ))))
     }
+}
+
+/// An adaptive strategy resolved against a whole table's description: its
+/// rows over every partition and its model's cap. Gathered rows carry no
+/// times, so the resolution leans to none.
+fn resolved_whole(whole: &Value) -> Strategy {
+    let rows = whole.get("rows").and_then(Value::as_u64).unwrap_or(0);
+    let cap = whole
+        .get("context_rows")
+        .and_then(Value::as_u64)
+        .and_then(std::num::NonZeroU64::new);
+    Strategy::Adaptive.resolve(rows, cap, false)
 }
 
 #[cfg(test)]

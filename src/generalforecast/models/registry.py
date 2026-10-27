@@ -251,7 +251,8 @@ def load(
             `general-forecast/tabicl-v2-classifier`; then `@K` for K error-correcting code
             estimators, which serve more classes than the classifier has
             slots, then `*N` for an ensemble of N estimators: each at most
-            once, in that order. A forecaster takes neither.
+            once, in that order. A forecaster takes neither. Or a custom
+            model's `module:attribute`, on the local surface alone.
         surface: Where the model runs. Local use takes checkpoints without
             recorded hashes; predictors and remote serving
             need the model's qualification gates, every pinned file and the
@@ -280,6 +281,10 @@ def load_ref(
 ) -> Model:
     """Loads a parsed model reference, as `load` does a spec."""
     _catalog.admit(ref, surface)
+    if ref.custom:
+        from generalforecast.models import custom
+
+        return custom.load(ref.name)
     entry = ref.entry
     if surface != "local":
         return _variant(entry.id, surface, allow_downloads, ref.codes, ref.estimators)
@@ -290,14 +295,21 @@ def load_ref(
 def load_engine_model(spec: str) -> Model:
     """Loads what the engine's workers were started with.
 
-    A spec is a catalog id or a registered implementation's id (see
-    `register`).
+    A spec is a catalog id, a custom model's `module:attribute` or a
+    registered implementation's id (see `register`). A custom model is
+    checked against its contract as it loads, so one the engine would run
+    wrongly fails to load instead.
     """
     loader = IMPLEMENTATIONS.get(spec)
-    if loader is None:
-        return load(spec)
-    functions, parameters = loader()
-    return wrap(functions, parameters, ModelRef(spec, None, None, None))
+    if loader is not None:
+        functions, parameters = loader()
+        return wrap(functions, parameters, ModelRef(spec, None, None, None))
+    ref = _catalog.parse(spec)
+    if ref.custom:
+        from generalforecast.models import custom
+
+        return custom.checked(spec)
+    return load_ref(ref)
 
 
 def wrap(functions: Any, parameters: Any, ref: ModelRef) -> Model:

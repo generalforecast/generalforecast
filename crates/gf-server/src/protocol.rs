@@ -793,10 +793,16 @@ pub enum WorkerReply {
         #[serde(default)]
         compile_cache: CompileCache,
     },
-    /// Sent while a step runs, each time the worker finishes compiling a
+    /// Sent while a request runs, each time the worker finishes compiling a
     /// program, so a long compile is not taken for a hung worker; it
-    /// answers no request.
-    Progress,
+    /// answers no request. A warm-up's reports count the programs compiled
+    /// so far and in all.
+    Progress {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        done: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total: Option<u64>,
+    },
     /// Sent when programs a step deferred tables for are compiled, by the
     /// keys the step's reply named; it answers no request.
     Compiled {
@@ -1101,6 +1107,8 @@ impl SummarySpec {
 pub enum StrategySpec {
     #[default]
     Exact,
+    /// Exact up to the model's cap, retrieved past it; see `Strategy::Adaptive`.
+    Adaptive,
     Retrieved {
         #[serde(default)]
         core: Option<CoreSpec>,
@@ -1171,6 +1179,7 @@ impl StrategySpec {
     pub fn strategy(&self) -> Strategy {
         match *self {
             Self::Exact => Strategy::Exact,
+            Self::Adaptive => Strategy::Adaptive,
             Self::Retrieved {
                 core,
                 neighbors,
@@ -1191,6 +1200,33 @@ impl StrategySpec {
             },
             Self::Subsample { rows, seed } => Strategy::subsample(rows, seed, CoreKind::Random),
             Self::Neighbors { rows } => Strategy::neighbors(rows),
+        }
+    }
+
+    /// The strategy as clients spell it, a retrieved one in full.
+    #[must_use]
+    pub fn of(strategy: Strategy) -> Self {
+        match strategy {
+            Strategy::Exact => Self::Exact,
+            Strategy::Adaptive => Self::Adaptive,
+            Strategy::Retrieved {
+                core,
+                neighbors,
+                among,
+                recency,
+            } => Self::Retrieved {
+                core: core.map(|core| CoreSpec {
+                    rows: core.rows,
+                    seed: core.seed,
+                    kind: CoreKindSpec(core.kind),
+                }),
+                neighbors,
+                among,
+                recency: recency.map(|recency| match recency {
+                    Recency::Last(rows) => RecencySpec::Last(rows),
+                    Recency::Span(span) => RecencySpec::Span(span),
+                }),
+            },
         }
     }
 }

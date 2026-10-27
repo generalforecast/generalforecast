@@ -1036,6 +1036,11 @@ pub struct TableLayout {
     pub fitted: Option<FittedColumns>,
     /// Rows inserted, updated or deleted since the state was last fit.
     pub changed: u64,
+    /// The table's strategy as the compaction began, as the table was given
+    /// it rather than as a clamp cuts it, so a copy that takes the snapshot
+    /// in place of the records before it keeps a change those records
+    /// carried. None in layouts written before strategies changed.
+    pub strategy: Option<Strategy>,
 }
 
 /// The center and scale of each column in the retrieval space, and the live
@@ -1455,6 +1460,9 @@ struct TableState {
     prints: BTreeMap<Option<i64>, Fingerprint>,
     /// The rows plans read ranked by the strategy's core seed, if it has a core.
     ranking: Option<Ranking>,
+    /// The strategy the last plan resolved `spec.strategy` to; cores and
+    /// regions are drawn for it, and dropped when it changes.
+    resolved: Strategy,
     /// Live rows whose target is not known yet.
     unlabeled: RoaringBitmap,
     /// The quantiles a regression table's targets are binned by for
@@ -1771,13 +1779,54 @@ impl TableState {
         Context::from_bitmap(self.table.snapshot().rows().bitmap() - &self.unlabeled)
     }
 
+    /// The strategy the table plans with now: an adaptive one resolved from
+    /// its live rows, the model's cap and whether its rows have times, any
+    /// other as given.
+    fn resolved(&self) -> Strategy {
+        self.spec.strategy.resolve(
+            self.table.len(),
+            self.spec.context_rows,
+            self.times.has_timed(),
+        )
+    }
+
+    /// As `resolved`, and makes the state fit it: when the resolution has
+    /// changed since the last plan, as an adaptive table's does when it grows
+    /// past the cap or shrinks back, the cores and regions drawn for the old
+    /// one are dropped, so the next plan draws them anew, at the cost a
+    /// `refit` pays for its region draw. Cached encodings stay, keyed by the
+    /// rows they hold.
+    fn strategy(&mut self) -> Strategy {
+        let strategy = self.resolved();
+        if strategy != self.resolved {
+            self.resolved = strategy;
+            self.cores.1.clear();
+            self.regions = None;
+        }
+        strategy
+    }
+
+    /// Sets the table's strategy, as given, and drops what was drawn for
+    /// the old one: the live rows are ranked anew by the new core's seed,
+    /// the cores and regions are dropped.
+    fn set_strategy(&mut self, strategy: Strategy) {
+        self.spec.strategy = strategy;
+        let served = self.served().rows();
+        self.ranking = strategy
+            .seed()
+            .map(|seed| Ranking::new(seed, &served, &self.table));
+        self.resolved = self.resolved();
+        self.cores.1.clear();
+        self.regions = None;
+    }
+
     /// Sets what a plan for the state of `epoch` draws cores with: a
     /// regression table's target bins, from its live rows, and no diverse
     /// cores of an earlier state.
     fn prepare_cores(&mut self, epoch: Epoch) {
         let Strategy::Retrieved {
             core: Some(core), ..
-        } = self.spec.strategy
+        } = self.strategy()
         else {
             return;
         };
@@ -1946,7 +1995,7 @@ impl TableState {
             .as_ref()
             .is_some_and(|regions| regions.epoch == epoch && regions.scaling == self.scaled_rows);
         if !drawn {
-            let per_region = match self.spec.strategy {
+            let per_region = match self.strategy() {
                 Strategy::Retrieved { neighbors, .. } if neighbors > 0 => spec.rows,
                 _ => u64::MAX,
             };
@@ -1980,6 +2029,7 @@ impl TableState {
         prints: &[Fingerprint],
         window_of: &[Option<usize>],
     ) -> Result<Plan, NodeError> {
+        let strategy = self.strategy();
         let windows = Windows::Before {
             times: &self.times,
             cutoffs,
@@ -1995,14 +2045,7 @@ impl TableState {
             ranking: self.ranking.as_ref(),
             times: &self.times,
         };
-        let planned = plan_with(
-            &self.spec.strategy,
-            &source,
-            &mut cores,
-            vectors,
-            windows,
-            window_of,
-        );
+        let planned = plan_with(&strategy, &source, &mut cores, vectors, windows, window_of);
         self.cores.1 = cores;
         Ok(planned?)
     }
@@ -2040,7 +2083,7 @@ impl TableState {
                 recency: Some(recency),
                 ..
             },
-        ) = (self.spec.regions, self.spec.strategy)
+        ) = (self.spec.regions, self.resolved)
         else {
             return;
         };
@@ -2249,7 +2292,7 @@ impl TableState {
         // A span of time holds timed rows alone, so it is empty with none of
         // them before the cutoff.
         let span = matches!(
-            self.spec.strategy,
+            self.resolved(),
             Strategy::Retrieved {
                 recency: Some(Recency::Span(_)),
                 ..
@@ -2990,6 +3033,7 @@ impl Node {
             .transpose()?;
         let (model_features, page_size) = (spec.model_features(), spec.page_size);
         let ranking = spec.strategy.seed().map(Ranking::empty);
+        let resolved = spec.strategy.resolve(0, spec.context_rows, false);
         let id = TableId(self.next_table);
         self.next_table += 1;
         self.tables.insert(
@@ -3005,6 +3049,7 @@ impl Node {
                 scaled_rows: 0,
                 prints: BTreeMap::new(),
                 ranking,
+                resolved,
                 unlabeled: RoaringBitmap::new(),
                 edges: None,
                 cores: (Epoch(0), Cores::default()),
@@ -3110,11 +3155,13 @@ impl Node {
         Ok((rows.keys, rows.features, rows.targets))
     }
 
-    /// The rows a table offers each query under its strategy, for contexts
-    /// assembled across partitions: every live row for `Exact`; for
-    /// `Retrieved`, its core of `share` rows (the strategy's own count
-    /// without one), drawn as a plan draws it, and each query's nearest rows
-    /// outside the core. Shared rows come first, each once. A diverse core is
+    /// The rows a table offers each query under `strategy`, or its own when
+    /// None, for contexts assembled across partitions: every live row for
+    /// `Exact`; for `Retrieved`, its core of `share` rows (the strategy's own
+    /// count without one), drawn as a plan draws it, and each query's nearest
+    /// rows outside the core. The router that assembles gives the strategy
+    /// when the table's is adaptive, resolved against every partition's rows
+    /// rather than this one's. Shared rows come first, each once. A diverse core is
     /// spread over this partition's rows alone, so the cores partitions offer
     /// together are not one farthest-point sample of the whole table. With a
     /// cutoff, only rows from before it are offered, as a query with that
@@ -3129,6 +3176,7 @@ impl Node {
         queries: &[f32],
         share: Option<u64>,
         cutoff: Option<i64>,
+        strategy: Option<Strategy>,
     ) -> Result<Vec<Candidate>, NodeError> {
         let state = self
             .tables
@@ -3148,6 +3196,10 @@ impl Node {
         let wanted = state.horizon_of(cutoff.as_ref().map(std::slice::from_ref));
         let refit = state.refit_for(wanted);
         state.prepare_cores(Epoch(state.epoch.0 + u64::from(refit)));
+        let strategy = match strategy {
+            Some(given) => given,
+            None => state.strategy(),
+        };
         let live = state.served().rows();
         let live = match cutoff {
             Some(cutoff) => &state.times.before(cutoff) & &live,
@@ -3175,7 +3227,7 @@ impl Node {
             neighbors,
             among,
             recency,
-        } = state.spec.strategy
+        } = strategy
         else {
             shared(&mut offered, &live);
             return Ok(offered);
@@ -3358,6 +3410,7 @@ impl Node {
             column_counts: state.columns.counts.clone(),
             fitted,
             changed: state.changed,
+            strategy: Some(state.spec.strategy),
         };
         Ok(CompactionSource {
             table,
@@ -3414,6 +3467,13 @@ impl Node {
             }
             let state = self.state(table)?;
             state.begin_restore(layout.clone())?;
+            if let Some(strategy) = layout.strategy {
+                let strategy = match (state.spec.past_cap, state.spec.context_rows) {
+                    (PastCap::Clamp, Some(rows)) => strategy.capped(rows.get()),
+                    _ => strategy,
+                };
+                state.set_strategy(strategy);
+            }
         }
         let state = self.state(table)?;
         let Some(restoring) = &mut state.restoring else {
@@ -4427,6 +4487,40 @@ impl Node {
     pub fn refit(&mut self, table: TableId) -> Result<Vec<Movement>, NodeError> {
         self.state(table)?.renumber()?;
         self.advance_epoch(table)
+    }
+
+    /// Changes how a table's contexts are chosen from here on, as a table
+    /// created with `strategy` would choose them: under `PastCap::Clamp` it
+    /// is cut to the model's cap first. The ranking, cores and regions drawn
+    /// for the old strategy are dropped and drawn anew by the next plan;
+    /// cached encodings stay.
+    ///
+    /// # Errors
+    ///
+    /// If the table does not exist or the strategy is not valid.
+    pub fn set_strategy(&mut self, table: TableId, strategy: Strategy) -> Result<(), NodeError> {
+        strategy.check()?;
+        let state = self.state(table)?;
+        let strategy = match (state.spec.past_cap, state.spec.context_rows) {
+            (PastCap::Clamp, Some(rows)) => strategy.capped(rows.get()),
+            _ => strategy,
+        };
+        state.set_strategy(strategy);
+        Ok(())
+    }
+
+    /// The strategy a table's next plan chooses contexts with: its adaptive
+    /// strategy resolved against its live rows, or the one it was given.
+    ///
+    /// # Errors
+    ///
+    /// If the table does not exist.
+    pub fn strategy(&self, table: TableId) -> Result<Strategy, NodeError> {
+        Ok(self
+            .tables
+            .get(&table)
+            .ok_or(NodeError::UnknownTable(table))?
+            .resolved())
     }
 
     /// Starts a new epoch for a table after its state is to be refit.

@@ -1112,6 +1112,10 @@ def present(error: BaseException, out: term.Output) -> int:
     hint = getattr(error, "hint", None)
     if hint is None and getattr(error, "code", None) == "NotLoggedIn":
         hint = "run `gf login`"
+    if hint is None and str(getattr(error, "message", "")).startswith(
+        "permission denied"
+    ):
+        hint = "run `gf login` again, or use a key that has this permission"
     because = getattr(error, "because", None)
     limit, actual = getattr(error, "limit", None), getattr(error, "actual", None)
     if because is None and limit is not None and actual is not None:

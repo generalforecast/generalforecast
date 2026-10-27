@@ -1,6 +1,6 @@
 [project]
 name = "generalforecast"
-version = "0.1.10"
+version = "0.1.11"
 description = "gf: predictors on tabular and time series foundation models, local or hosted"
 readme = "README.md"
 license = "Apache-2.0"

@@ -69,6 +69,12 @@ class Forecaster(RegressorMixin, BaseEstimator):
         require_sklearn()
         if isinstance(model, str):
             model = registry.canonical(model)
+            if registry.is_custom(model):
+                raise InvalidInput(
+                    f"Forecaster runs catalog forecasters, not custom model `{model}`",
+                    hint="run a custom forecaster through gf.engine.SeriesTable",
+                    param="model",
+                )
             from generalforecast.native.estimators import note_download
 
             note_download(model, download)

@@ -128,6 +128,20 @@ class Capability:
         """Whether it is a classifier or regressor rather than a forecaster."""
         return self.task != "forecast"
 
+    @property
+    def limits(self) -> "Limits":
+        """What one call may send a model that can do this; see `Limits`."""
+        policy = V1_POLICY
+        if not self.tabular:
+            return Limits(policy.context_rows, policy.group_series, policy.covariates)
+        rows = self.context_rows or policy.context_rows
+        inputs = self.context_features or policy.features
+        return Limits(
+            min(rows, policy.context_rows),
+            policy.query_rows,
+            min(inputs, policy.features),
+        )
+
 
 @dataclass(frozen=True)
 class Gates:
@@ -280,17 +294,7 @@ class ModelEntry:
     @property
     def limits(self) -> "Limits":
         """What one call may send it; see `Limits`."""
-        policy = V1_POLICY
-        capability = self.capability
-        if not capability.tabular:
-            return Limits(policy.context_rows, policy.group_series, policy.covariates)
-        rows = capability.context_rows or policy.context_rows
-        inputs = capability.context_features or policy.features
-        return Limits(
-            min(rows, policy.context_rows),
-            policy.query_rows,
-            min(inputs, policy.features),
-        )
+        return self.capability.limits
 
     @property
     def directory(self) -> str:
@@ -420,6 +424,8 @@ _REF = re.compile(
     r"(?:\*(?P<estimators>\d+))?"
 )
 _BASE = re.compile(r"(?P<name>[^@*]+)(?:[@*].*)?", re.DOTALL)
+# A custom model: a Python module's dotted name, a colon and an attribute.
+_CUSTOM = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*")
 
 
 @dataclass(frozen=True)
@@ -428,7 +434,8 @@ class ModelRef:
 
     Attributes:
         name: A built-in model's canonical id, such as
-            `general-forecast/tabicl-v2-classifier`.
+            `general-forecast/tabicl-v2-classifier`, or a custom model's
+            `module:attribute`.
         codes: `@K` error-correcting codes, if any.
         estimators: `*N` ensemble estimators, if any.
         digest: The `@sha256:` artifact digest it is pinned to, if any.
@@ -445,8 +452,25 @@ class ModelRef:
         return self.codes is not None or self.estimators is not None
 
     @property
+    def custom(self) -> bool:
+        """Whether it names a custom model by its `module:attribute`.
+
+        A custom model is the user's own, written against
+        `generalforecast.models.contract` or `generalforecast.models.series`;
+        it has no catalog entry and runs on the local surface alone.
+        """
+        return ":" in self.name
+
+    @property
     def entry(self) -> ModelEntry:
-        """The built-in model it names."""
+        """The built-in model it names.
+
+        Raises:
+            ModelRefError: `UnsupportedModel` for a custom model, which has
+                no entry.
+        """
+        if self.custom:
+            raise ModelRefError("UnsupportedModel", custom_refused(self.name))
         return ENTRIES[self.name]
 
     @property
@@ -468,9 +492,19 @@ def admit(ref: ModelRef, surface: Surface) -> None:
     """Refuses a reference `surface` may not run, before any of its code loads.
 
     Raises:
-        ModelRefError: If it names a model not qualified for the surface, or
-            a variant past the serving policy's bounds.
+        ModelRefError: If it names a model not qualified for the surface, a
+            custom model off the local surface, or a variant past the
+            serving policy's bounds.
     """
+    if ref.custom:
+        if surface != "local":
+            raise ModelRefError("UnsupportedModel", custom_refused(ref.name))
+        if ref.variant or ref.digest is not None:
+            raise ModelRefError(
+                "UnsupportedCapability",
+                f"a custom model takes no pin, codes or estimators: {ref}",
+            )
+        return
     entry = ref.entry
     if not entry.allows(surface, variant=ref.variant):
         raise ModelRefError(
@@ -490,17 +524,26 @@ def parse(spec: str) -> ModelRef:
             optionally `@K` codes and `*N` estimators, each at most once, in
             that order. A bare name or an upstream id, such as
             `tabicl-classifier` or `amazon/chronos-2`, is refused with the
-            canonical id as the hint.
+            canonical id as the hint. Or a custom model's `module:attribute`,
+            which takes no pin, codes or estimators.
 
     Returns:
-        The reference, naming the model by its canonical id.
+        The reference, naming the model by its canonical id or its
+        `module:attribute`.
 
     Raises:
         ModelRefError: If the spec is malformed, names no built-in model or
             one by an old spelling, pins other content than the catalog
             holds, or asks a variant the model cannot take.
     """
-    match = _REF.fullmatch(spec) if type(spec) is str else None
+    if type(spec) is not str:
+        raise ModelRefError(
+            "InvalidModel",
+            f"a model spec is a string, not {type(spec).__name__}: a catalog id "
+            f'such as "{ORGANIZATION}/tabicl-v2-classifier", or a custom model\'s '
+            '"module:attribute"',
+        )
+    match = _REF.fullmatch(spec)
     if match is None:
         raise ModelRefError(
             "InvalidModel",
@@ -521,9 +564,18 @@ def parse(spec: str) -> ModelRef:
         digest,
     )
     if ":" in name:
-        raise ModelRefError(
-            "InvalidModel", not_canonical(name, "general-forecast/<name>")
-        )
+        if _CUSTOM.fullmatch(name) is None:
+            raise ModelRefError(
+                "InvalidModel",
+                f"`{name}` is neither a catalog model id, {ORGANIZATION}/<name>, "
+                'nor a custom model\'s "module:attribute"',
+            )
+        if ref.variant or digest is not None:
+            raise ModelRefError(
+                "UnsupportedCapability",
+                f"a custom model takes no pin, codes or estimators: {spec!r}",
+            )
+        return ref
     entry = ENTRIES.get(name)
     if entry is None:
         if (canonical := ALIASES.get(name)) is not None:
@@ -575,17 +627,39 @@ def not_canonical(name: str, canonical: str) -> str:
     return f"`{name}` is not a catalog model id; use {canonical}"
 
 
-def reference(ref: str) -> ModelRef:
-    """A parsed catalog reference, or the error a user is shown for the spelling.
+def custom_refused(spec: str) -> str:
+    """The one message a custom model is refused with off the local surface.
+
+    >>> custom_refused("mypkg.models:fn")
+    'custom model `mypkg.models:fn` runs locally only; predictors, gf push and serving take a catalog model id, such as general-forecast/tabicl-v2-classifier'
+    """
+    return (
+        f"custom model `{spec}` runs locally only; predictors, gf push and serving "
+        f"take a catalog model id, such as {ORGANIZATION}/tabicl-v2-classifier"
+    )
+
+
+def reference(ref: str, surface: Surface = "local") -> ModelRef:
+    """A parsed reference, or the error a user is shown for the spelling.
+
+    Args:
+        ref: A catalog id, optionally with a pin and variant, or a custom
+            model's `module:attribute`.
+        surface: Where the model runs; a custom model runs locally only.
 
     Raises:
         InvalidInput: If it is a bare name or an old spelling, with the
-            canonical id as the hint, or is malformed.
+            canonical id as the hint, is malformed, is not a string, or is a
+            custom model off the local surface.
         NotFound: If no catalog model has that id.
     """
     try:
-        return parse(ref)
+        parsed = parse(ref)
     except ModelRefError as error:
+        if not isinstance(ref, str):
+            raise InvalidInput(
+                str(error), hint='pass a custom model as "module:attribute"'
+            ) from None
         name = _base(ref)
         if (known := known_as(name)) is not None:
             raise InvalidInput(not_canonical(name, known), param="model") from None
@@ -595,34 +669,47 @@ def reference(ref: str) -> ModelRef:
                 hint="run `gf model list` to see the catalog",
             ) from None
         raise InvalidInput(str(error)) from None
+    if parsed.custom and surface != "local":
+        raise InvalidInput(custom_refused(parsed.name), param="model")
+    return parsed
 
 
-def canonical(ref: str) -> str:
+def canonical(ref: str, surface: Surface = "local") -> str:
     """The canonical id a reference names, with its variant and pin kept.
 
     Args:
         ref: `general-forecast/<name>`, optionally with `@K` codes, `*N`
-            estimators or an `@sha256:` pin.
+            estimators or an `@sha256:` pin; or a custom model's
+            `module:attribute`, which is its own canonical spelling.
+        surface: Where the model runs; a custom model runs locally only.
 
     Returns:
         The reference as the catalog spells it.
 
     Raises:
         InvalidInput: If it is a bare name or an old spelling, with the
-            canonical id as the hint, or is malformed.
+            canonical id as the hint, is malformed, or is a custom model off
+            the local surface.
         NotFound: If no catalog model has that id.
     """
-    return str(reference(ref))
+    return str(reference(ref, surface))
+
+
+def _entry(ref: str) -> ModelEntry:
+    try:
+        return reference(ref).entry
+    except ModelRefError as error:
+        raise InvalidInput(str(error), param="model") from None
 
 
 def limits(ref: str) -> Limits:
-    """What one call may send a model: context rows, queries and inputs."""
-    return reference(ref).entry.limits
+    """What one call may send a catalog model: context rows, queries and inputs."""
+    return _entry(ref).limits
 
 
 def task_of(ref: str) -> Task:
-    """The task a model does: `classification`, `regression` or `forecast`."""
-    return reference(ref).entry.capability.task
+    """The task a catalog model does: `classification`, `regression` or `forecast`."""
+    return _entry(ref).capability.task
 
 
 @overload
