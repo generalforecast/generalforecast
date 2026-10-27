@@ -23,6 +23,7 @@ from generalforecast.contracts import (
     Revision,
 )
 from generalforecast.predictors.lock import read_lock
+from generalforecast.predictors.spec import load
 from generalforecast.service.contracts import ServiceError
 from generalforecast.service.sdk import ContextSpec, ImportReceipt
 from generalforecast.tabular import table_digest
@@ -116,7 +117,11 @@ def test_push_cas_readiness_and_rollback(wire, tmp_path, asynchronous):
         "POST",
         base + "/revisions",
         revision.to_dict(),
-        payload={"lock": lock.to_dict(), "snapshot": lock.data_digest},
+        payload={
+            "lock": lock.to_dict(),
+            "snapshot": lock.data_digest,
+            "manifest": load(authored).to_dict(),
+        },
     )
     wire.expect("GET", base + "/environments/production", "NotFound", status=404)
     wire.expect(

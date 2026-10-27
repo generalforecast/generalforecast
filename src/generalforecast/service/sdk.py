@@ -450,10 +450,13 @@ class Pushed:
         snapshot: A snapshot predictor's context rows, exactly the rows the
             lock's context digest names: split, projected and normalized as
             `served_context` reads them. None for a request or live context.
+        manifest: The normalized `gf.yaml` the lock was written for, which
+            a hosted plane holds the lock to (`compile_lock(..., manifest=)`).
     """
 
     lock: PredictorLock
     snapshot: pa.Table | None = None
+    manifest: dict | None = None
 
     @property
     def name(self) -> str:
@@ -485,7 +488,8 @@ def pushed(predictor: "str | Path") -> Pushed:
     try:
         # The lock must be exactly what gf check writes now, as gf serve and
         # gf.Predictor require; a forged or stale one never leaves.
-        verified(load(root), root)
+        spec = load(root)
+        verified(spec, root)
         document = lock_document(root)
     except Error as error:
         code = "LockRequired" if error.param == "lock" else error.code
@@ -509,7 +513,7 @@ def pushed(predictor: "str | Path") -> Pushed:
             raise ServiceError("MissingFile", error.message, 422) from None
         except PredictorError as error:
             raise ServiceError("SnapshotMismatch", f"{error.message}", 422) from None
-    return Pushed(lock, snapshot)
+    return Pushed(lock, snapshot, spec.to_dict())
 
 
 def append_payload(data: Any, *, id: str, write_id: str) -> JsonObject:

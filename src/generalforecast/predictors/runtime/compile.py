@@ -71,8 +71,14 @@ def compile_lock(
     *,
     outputs: tuple[str, ...] | list[str] | None = None,
     resolver: ModelResolver | None = None,
+    manifest: dict[str, Any] | None = None,
 ) -> CompiledPlan:
     """The compiled plan for a `gf.lock` and its context rows.
+
+    Every lock is held to its rows (a snapshot's row count, its task's
+    outputs) and, given the normalized manifest `gf push` sends with it, to
+    that manifest: `resolution.pushed_admission`, the hosted counterpart of
+    the `verified` admission every local entry point applies.
 
     Args:
         lock: A `contracts.PredictorLock`, or a version 2 lock document.
@@ -84,6 +90,8 @@ def compile_lock(
             otherwise. Outputs without `quantiles` predict no quantile
             levels, whatever levels the lock records.
         resolver: The trusted catalog; the built-in one by default.
+        manifest: The normalized `gf.yaml` the lock was written for, as
+            `gf push` sends it; a pushed lock is held to it field by field.
 
     Raises:
         PredictorError: `SnapshotMismatch` for rows other than the lock's,
@@ -91,8 +99,10 @@ def compile_lock(
             the admission and schema refusals of `compile_plan`.
     """
     from generalforecast.contracts import PredictorLock, parse_lock
+    from generalforecast.predictors.resolution import pushed_admission
 
     locked = lock if isinstance(lock, PredictorLock) else parse_lock(lock)
+    pushed_admission(locked.to_dict(), manifest, table)
     plan = ExecutionPlan.from_lock(locked)
     if outputs is not None:
         plan = replace(plan, outputs=tuple(outputs))

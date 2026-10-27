@@ -485,6 +485,15 @@ def test_every_entry_point_refuses_a_forged_lock(tmp_path, monkeypatch, forgery)
         pushed(root)
     with pytest.raises(gf.InvalidInput):
         gf.Predictor(root)
+    # Hosted serving holds the pushed lock to its manifest and rows alike.
+    document = yaml.safe_load((root / "gf.lock").read_text())
+    rows = pq.read_table(root / "rows.parquet")
+    with pytest.raises(PredictorError):
+        hosting.compile_lock(
+            document,
+            hosting.served_context(document, rows),
+            manifest=load(root).to_dict(),
+        )
 
 
 def test_any_number_of_series_and_queries_predict_alike_past_one_call(tmp_path, engine):

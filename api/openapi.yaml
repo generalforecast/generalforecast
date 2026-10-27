@@ -4418,6 +4418,10 @@ components:
 
     RevisionRegister:
       type: object
+      description: |
+        a checked predictor's lock, its uploaded snapshot's digest, and the
+        normalized gf.yaml the lock was written for, which the plane holds
+        the lock to field by field
       required: [lock, snapshot]
       additionalProperties: false
       properties:
@@ -4426,6 +4430,11 @@ components:
           oneOf:
             - $ref: "#/components/schemas/Digest"
             - type: "null"
+        manifest:
+          type: [object, "null"]
+          description: |
+            the normalized gf.yaml, as `PredictorSpec.to_dict` writes it; its
+            digest is the lock's `manifest`
 
     RevisionRegisterRequest:
       allOf:

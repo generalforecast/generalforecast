@@ -402,6 +402,100 @@ def verified(
     return resolution
 
 
+def pushed_admission(
+    document: dict[str, Any], manifest: dict[str, Any] | None, rows: Any
+) -> None:
+    """Holds a pushed lock to its manifest and rows, as `verified` holds a directory's.
+
+    A hosted plane has no `gf.yaml` file, but `gf push` sends the
+    normalized manifest the lock was written for. Its digest must be the
+    lock's `manifest`, and every field the lock takes from it (the name,
+    model, roles, horizon, related groups, quantiles, split, resources and
+    the selection `gf check` resolves against the rows) must be what the
+    manifest says. Whatever the manifest, the rows a snapshot lock counts
+    must be the rows given, and its outputs those of its task.
+
+    Raises:
+        PredictorError: `LockMismatch` naming the first field that differs.
+    """
+    from generalforecast.predictors import lock as locks
+    from generalforecast.predictors.runtime.plan import OUTPUTS
+    from generalforecast.predictors.validation import PredictorError, ensure
+
+    predictor = document["predictor"]
+
+    def agree(condition: Any, field: str, code: str = "LockMismatch") -> None:
+        ensure(
+            condition,
+            f"gf.lock's {field} is not what gf check writes for it; run `gf check`",
+            code,
+        )
+
+    agree(tuple(predictor["outputs"]) == OUTPUTS[predictor["task"]], "outputs")
+    context = predictor["context"]
+    if context["kind"] == "snapshot" and rows is not None:
+        agree(context.get("rows") == rows.num_rows, "context rows", "SnapshotMismatch")
+    if manifest is None:
+        return
+    try:
+        spec = PredictorSpec.from_dict(manifest)
+        validate(spec)
+    except InvalidInput as error:
+        raise PredictorError(
+            "LockMismatch", f"the pushed manifest is invalid: {error.message}"
+        ) from None
+    agree(document.get("manifest") == locks.manifest_digest(spec), "manifest")
+    task = predictor["task"]
+    for name, expected in (
+        ("name", spec.name),
+        ("model", spec.model),
+        ("target", spec.target),
+        ("id", spec.id),
+        ("time", spec.time),
+        ("series", list(spec.series) or None),
+        ("horizon", spec.horizon),
+        ("related", None if spec.related is None else list(spec.related)),
+    ):
+        agree(predictor.get(name) == expected, name)
+    if task != "classification":
+        levels = sorted(spec.quantiles) or list(DEFAULT_QUANTILES)
+        agree(list(predictor.get("quantiles", ())) == levels, "quantiles")
+    if spec.frequency is not None:
+        agree(predictor.get("frequency") == spec.frequency, "frequency")
+    agree(context.get("until") == spec.context.until, "context.until")
+    holdout = spec.context.holdout
+    agree(
+        context.get("holdout")
+        == (
+            None
+            if holdout is None
+            else {"fraction": holdout.fraction, "seed": holdout.seed}
+        ),
+        "context.holdout",
+    )
+    agree(dict(document.get("resources", {})) == _resources(spec), "resources")
+    if spec.inputs is not None:
+        names = [column["name"] for column in predictor["inputs"]]
+        agree(sorted(names) == sorted(spec.inputs), "inputs")
+    for column, kind in spec.types:
+        typed = {item["name"]: item["type"] for item in predictor["inputs"]}
+        agree(typed.get(column) == kind, f"inputs.types.{column}")
+    labeled = None
+    if rows is not None and spec.target in rows.column_names:
+        labeled = rows.num_rows - rows[spec.target].null_count
+    if context["kind"] == "snapshot" and labeled is not None:
+        selection, _ = _selection(
+            spec, labeled, _registry.limits(spec.model).context_rows
+        )
+        if task == "forecast" and selection.strategy == "retrieved":
+            selection = SelectionInfo("exact", kind=selection.kind, seed=selection.seed)
+        agree(predictor["selection"] == selection.to_dict(), "selection")
+    else:
+        declared = spec.selection
+        locked = predictor["selection"]
+        agree(declared is None or locked.get("seed") == declared.seed, "selection.seed")
+
+
 def _resources(spec: PredictorSpec) -> dict[str, Any]:
     """The manifest's hosted resources, as the lock records them."""
     resources = spec.resources
@@ -851,4 +945,11 @@ def _query_reason(spec: PredictorSpec, query_rows: int) -> str:
     return "no rows; every row has a target and no split is declared"
 
 
-__all__ = ["ContextInfo", "Resolution", "SelectionInfo", "resolve", "verified"]
+__all__ = [
+    "ContextInfo",
+    "Resolution",
+    "SelectionInfo",
+    "pushed_admission",
+    "resolve",
+    "verified",
+]

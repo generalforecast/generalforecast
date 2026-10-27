@@ -606,9 +606,14 @@ export interface Lock {
   model: LockedModel;
 }
 
+/**
+ * a checked predictor's lock, its uploaded snapshot's digest, and the normalized
+ * gf.yaml the lock was written for, which the plane holds the lock to field by field
+ */
 export interface RevisionRegister {
   lock: Lock;
   snapshot: Digest | null;
+  manifest?: Record<string, unknown> | null;
 }
 
 export interface RevisionRegisterRequest extends Envelope {

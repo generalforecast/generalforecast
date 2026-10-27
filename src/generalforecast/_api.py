@@ -1818,14 +1818,20 @@ class Lock(Payload):
 
 @dataclass(frozen=True, kw_only=True)
 class RevisionRegister(Payload):
-    """The RevisionRegister schema."""
+    """The RevisionRegister schema.
+
+    a checked predictor's lock, its uploaded snapshot's digest, and the normalized
+    gf.yaml the lock was written for, which the plane holds the lock to field by field
+    """
 
     lock: Lock
     snapshot: Digest | None
+    manifest: dict[str, Any] | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("lock", "lock", True, _record(Lock)),
         Field("snapshot", "snapshot", True, _union(_decode_Digest, _null)),
+        Field("manifest", "manifest", False, _union(_mapping(_any), _null)),
     )
 
 

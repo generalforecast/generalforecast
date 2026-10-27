@@ -726,7 +726,7 @@ def predictor_push(
         "predictors",
         resource,
         "revisions",
-        {"lock": lock.to_dict(), "snapshot": snapshot},
+        {"lock": lock.to_dict(), "snapshot": snapshot, "manifest": checked.manifest},
     )
     revision = decoded(Revision.from_dict, value, "revision")
     try:
