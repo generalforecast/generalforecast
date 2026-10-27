@@ -87,7 +87,10 @@ impl Node {
         let epoch = self.tables.get(&table).map(|state| state.epoch);
         for key in self.cache.holding(table, &changed) {
             // A page's entry is a source while it holds a row no write touched.
-            if key.kind == Kind::Rows && Some(key.epoch) == epoch && !self.doomed.contains(&key) {
+            if key.kind == Kind::Rows
+                && Some(key.epoch) == epoch
+                && !self.flight.doomed.contains(&key)
+            {
                 let fresh = match (self.cache.rows(&key), self.cache.stale(&key)) {
                     (Some(held), Some(stale)) => held
                         .iter()
@@ -107,10 +110,10 @@ impl Node {
     /// Drops a stale entry now, or once the steps reading it complete.
     pub(super) fn drop_or_doom(&mut self, key: &CacheKey) -> Option<Movement> {
         if self.cache.pinned(key) {
-            self.doomed.insert(*key);
+            self.flight.doomed.insert(*key);
             return None;
         }
-        self.doomed.remove(key);
+        self.flight.doomed.remove(key);
         self.cache.remove(key)
     }
 

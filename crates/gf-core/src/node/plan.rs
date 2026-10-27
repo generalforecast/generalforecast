@@ -31,7 +31,59 @@ pub(super) fn by_key(table: &Table, rows: &[RowId]) -> Vec<RowId> {
     keyed.into_iter().map(|(_, row)| row).collect()
 }
 
+/// What a plan keeps between plans and may change as it plans: the cores,
+/// bins and regions it draws, the strategy it resolved, and the region
+/// counts and aging it took. A plan made only to look, such as
+/// `Node::contexts`, takes a memo first and recalls it after, so the next
+/// plan finds the state as it was.
+pub(super) struct PlanMemo {
+    cores: (Epoch, Cores),
+    edges: Option<(Epoch, Vec<f32>)>,
+    regions: Option<Regions>,
+    region_stats: RegionStats,
+    region_draws: u64,
+    planned_counts: RegionStats,
+    resolved: Strategy,
+    aged_at: Option<u64>,
+}
+
 impl TableState {
+    /// A memo of what plans keep, for `recall`.
+    pub(super) fn memo(&self) -> PlanMemo {
+        PlanMemo {
+            cores: self.cores.clone(),
+            edges: self.edges.clone(),
+            regions: self.regions.clone(),
+            region_stats: self.region_stats,
+            region_draws: self.region_draws,
+            planned_counts: self.planned_counts,
+            resolved: self.resolved,
+            aged_at: self.aged_at,
+        }
+    }
+
+    /// Puts back what plans keep as `memo` took it.
+    pub(super) fn recall(&mut self, memo: PlanMemo) {
+        let PlanMemo {
+            cores,
+            edges,
+            regions,
+            region_stats,
+            region_draws,
+            planned_counts,
+            resolved,
+            aged_at,
+        } = memo;
+        self.cores = cores;
+        self.edges = edges;
+        self.regions = regions;
+        self.region_stats = region_stats;
+        self.region_draws = region_draws;
+        self.planned_counts = planned_counts;
+        self.resolved = resolved;
+        self.aged_at = aged_at;
+    }
+
     /// Plans the pending requests for the state of `epoch`.
     ///
     /// With regions, a query without a cutoff reads its region's built
@@ -335,17 +387,10 @@ impl Node {
             return Ok(vec![None; rows.len()]);
         };
         // A context a write doomed, or one still being encoded, is not built.
+        let keys = state.spec.entry_keys(table, state.epoch);
         let cached = |built: &&Built| {
-            let key = CacheKey {
-                model: state.spec.model,
-                table,
-                epoch: state.epoch,
-                kind: Kind::Context,
-                rows: built.key,
-            };
-            self.cache.contains(&key)
-                && !self.doomed.contains(&key)
-                && !self.encoding.contains(&key)
+            let key = keys.context(built.key);
+            self.flight.holds(&self.cache, &key) && !self.flight.encoding.contains(&key)
         };
         rows.map(|row| {
             state
@@ -521,24 +566,9 @@ impl Node {
         // Planned against copies of what plans keep, so a refit this plan
         // foresees drops no core, bins or region the current state reads,
         // and counted as no region's hit or miss.
-        let kept = (
-            state.cores.clone(),
-            state.edges.clone(),
-            state.regions.clone(),
-            state.region_stats,
-            state.planned_counts,
-        );
-        let model = state.spec.model;
-        let cached = |rows| {
-            let key = CacheKey {
-                model,
-                table,
-                epoch,
-                kind: Kind::Context,
-                rows,
-            };
-            self.cache.contains(&key) && !self.doomed.contains(&key)
-        };
+        let memo = state.memo();
+        let keys = state.spec.entry_keys(table, epoch);
+        let cached = |rows| self.flight.holds(&self.cache, &keys.context(rows));
         let planned = state.plan_pending(
             epoch,
             &state.served(),
@@ -546,23 +576,12 @@ impl Node {
             Instant::now(),
             &mut PlanParts::default(),
         );
-        (
-            state.cores,
-            state.edges,
-            state.regions,
-            state.region_stats,
-            state.planned_counts,
-        ) = kept;
+        let blind = planned
+            .as_ref()
+            .is_ok_and(|planned| !state.blind(planned).is_empty());
+        state.recall(memo);
         state.pending = pending;
         let planned = planned?;
-        let alone = vec![(
-            RequestId(u64::MAX),
-            queries.to_vec(),
-            cutoffs.map(<[i64]>::to_vec),
-        )];
-        let pending = std::mem::replace(&mut state.pending, alone);
-        let blind = !state.blind(&planned).is_empty();
-        state.pending = pending;
         if blind {
             return Err(NodeError::EmptyContext(table));
         }

@@ -48,6 +48,63 @@ impl Failed<'_> {
 }
 
 impl Node {
+    /// Gives back everything a step that failed to plan took, as its ledger
+    /// records it: its pins, the entries it admitted, which hold nothing, and
+    /// those it moved between tiers, which the executor never moved, so later
+    /// steps encode them again; the fits it marked, so they are planned again;
+    /// and the region rebuilds it claimed. Returns the drops for the executor,
+    /// the step's own among them, since it never sees the step.
+    pub(super) fn unwind(&mut self, ledger: Ledger, step: Step) -> Vec<Movement> {
+        let Ledger {
+            pins,
+            admitted,
+            fits,
+            rebuilds,
+        } = ledger;
+        for key in &pins {
+            let _ = self.cache.unpin(key);
+        }
+        let (mut dropped, moved): (Vec<Movement>, Vec<Movement>) = step
+            .movements
+            .into_iter()
+            .partition(|movement| movement.to.is_none());
+        // Stale entries only this step still read go now.
+        let stale: Vec<CacheKey> = pins
+            .iter()
+            .filter(|key| self.flight.doomed.contains(key))
+            .copied()
+            .collect();
+        for key in admitted
+            .iter()
+            .chain(moved.iter().map(|movement| &movement.key))
+            .chain(&stale)
+        {
+            dropped.extend(self.drop_or_doom(key));
+        }
+        for mark in fits {
+            if let Some(state) = self.tables.get_mut(&mark.table) {
+                state.fitted = mark.fitted;
+                state.horizon = mark.horizon;
+                state.fitted_latest = mark.fitted_latest;
+            }
+        }
+        for (key, table, region) in rebuilds {
+            if let Some(claimed) = self.rebuilding.get_mut(&key) {
+                claimed.retain(|rebuilt| (rebuilt.table, rebuilt.region) != (table, region));
+                if claimed.is_empty() {
+                    self.rebuilding.remove(&key);
+                }
+            }
+            self.rebuilt_regions.remove(&(table, region));
+        }
+        for unit in &step.series_units {
+            if let Some(state) = self.tables.get_mut(&unit.table) {
+                state.writing.remove(&unit.key);
+            }
+        }
+        dropped
+    }
+
     /// Releases a finished step's entries; returns drops of entries from ended epochs.
     pub fn complete(&mut self, step: &Step) -> Vec<Movement> {
         self.release(step, &Failed::None)
@@ -78,24 +135,21 @@ impl Node {
     ) -> Vec<Movement> {
         let mut undone = failed.clone();
         undone.extend(deferred.iter().map(|(table, _)| *table));
+        let requests = step_requests(step);
+        let mut requeued = Vec::with_capacity(deferred.len());
+        for (table, _) in deferred {
+            if let Some(state) = self.tables.get_mut(table) {
+                requeued.push(state.scheduled.take(|request| requests.contains(&request)));
+            }
+        }
         let dropped = self.complete_except(step, &undone);
-        for (table, key) in deferred {
+        for ((table, key), requests) in deferred.iter().zip(requeued) {
             let compiled = self.compiled.contains(key);
             if let Some(state) = self.tables.get_mut(table) {
-                let mut queued = std::mem::take(&mut state.scheduled);
-                queued.append(&mut state.pending);
-                state.pending = queued;
-                state.generation += 1;
+                state.queue_again(requests);
                 if !compiled {
                     state.compiling = Some(key.clone());
                 }
-            }
-        }
-        for batch in &step.queries {
-            if let Some(state) = self.tables.get_mut(&batch.table)
-                && !deferred.iter().any(|(table, _)| *table == batch.table)
-            {
-                state.scheduled.clear();
             }
         }
         dropped
@@ -147,15 +201,7 @@ impl Node {
     /// to encode it, a change purged it, or its epoch ended, is dropped once no
     /// step reads it any more.
     pub(super) fn release(&mut self, step: &Step, failed: &Failed) -> Vec<Movement> {
-        for movement in &step.movements {
-            self.moving.remove(&movement.key);
-        }
-        for key in encoded(step) {
-            self.encoding.remove(&key);
-        }
-        for table in fitted_tables(step) {
-            self.fitting.remove(&table);
-        }
+        self.flight.release(step);
         let kept = step
             .units
             .iter()
@@ -180,7 +226,7 @@ impl Node {
                 let current = self.tables.get(&page.table).map(|state| state.epoch);
                 let served = page.placed.action() == Action::Encode && !failed.includes(page.table);
                 if served
-                    || self.doomed.contains(source)
+                    || self.flight.doomed.contains(source)
                     || current.is_none_or(|epoch| source.epoch < epoch)
                 {
                     dropped.extend(self.drop_or_doom(source));
@@ -195,7 +241,8 @@ impl Node {
             if let Some(source) = unit.source {
                 let _ = self.cache.unpin(&source);
                 let current = self.tables.get(&unit.table).map(|state| state.epoch);
-                if self.doomed.contains(&source) || current.is_none_or(|epoch| source.epoch < epoch)
+                if self.flight.doomed.contains(&source)
+                    || current.is_none_or(|epoch| source.epoch < epoch)
                 {
                     dropped.extend(self.drop_or_doom(&source));
                 }
@@ -207,7 +254,7 @@ impl Node {
                 continue;
             };
             let written = !failed.includes(unit.table)
-                && !self.doomed.contains(&unit.key)
+                && !self.flight.doomed.contains(&unit.key)
                 && unit.key.epoch >= state.epoch;
             // A group extends forward, so an earlier cutoff written after a
             // later one, in this step or an earlier, leaves the later as the
@@ -216,7 +263,7 @@ impl Node {
                 Some(prev) => {
                     prev.cutoff <= recent.cutoff
                         || !self.cache.contains(&prev.key)
-                        || self.doomed.contains(&prev.key)
+                        || self.flight.doomed.contains(&prev.key)
                         || prev.key.epoch < state.epoch
                 }
                 None => true,
@@ -241,7 +288,7 @@ impl Node {
             // failed step was to write, whether encoded or extended.
             let written = matches!(action, Action::Encode | Action::Extend);
             let stale = (failed.includes(table) && written)
-                || self.doomed.contains(&key)
+                || self.flight.doomed.contains(&key)
                 || current.is_none_or(|epoch| key.epoch < epoch);
             if stale {
                 dropped.extend(self.drop_or_doom(&key));
@@ -260,6 +307,12 @@ impl Node {
                 }
             }
         }
+        let requests = step_requests(step);
+        for table in step_tables(step) {
+            if let Some(state) = self.tables.get_mut(&table) {
+                state.scheduled.take(|request| requests.contains(&request));
+            }
+        }
         if matches!(failed, Failed::All) {
             // The worker may not have moved these, so they are encoded again.
             for movement in step
@@ -272,4 +325,22 @@ impl Node {
         }
         dropped
     }
+}
+
+/// The requests a step answers.
+fn step_requests(step: &Step) -> HashSet<RequestId> {
+    step.queries
+        .iter()
+        .map(|batch| batch.request)
+        .chain(step.forecasts.iter().map(|forecast| forecast.request))
+        .collect()
+}
+
+/// The tables whose requests a step answers.
+fn step_tables(step: &Step) -> BTreeSet<TableId> {
+    step.queries
+        .iter()
+        .map(|batch| batch.table)
+        .chain(step.forecasts.iter().map(|forecast| forecast.table))
+        .collect()
 }

@@ -17,7 +17,8 @@ use std::time::{Duration, Instant};
 use roaring::RoaringBitmap;
 
 use crate::cache::{
-    Cache, CacheError, CacheKey, Epoch, Eviction, Kind, ModelId, Movement, Tier, TierConfig,
+    Admission, Cache, CacheError, CacheKey, Epoch, Eviction, Kind, ModelId, Movement, Placement,
+    Tier, TierConfig,
 };
 use crate::categories::{CategoryEncoding, Lookup};
 use crate::context::{Context, Fingerprint};
@@ -189,9 +190,8 @@ struct TableState {
     /// Whether the table holds a context one request brought; see
     /// `Node::set_single_use`.
     single_use: bool,
-    /// A single-use table's requests in the step in flight, which queue
-    /// again if the worker defers its part; see `Node::complete_deferring`.
-    scheduled: Vec<(RequestId, Vec<f32>, Option<Vec<i64>>)>,
+    /// The table's requests in the steps in flight.
+    scheduled: Scheduled,
     /// The program the worker compiles for the table's part of a step,
     /// which steps leave it out until.
     compiling: Option<String>,
@@ -245,9 +245,8 @@ pub struct Node {
     rows: RowMemory,
     /// The table the next step starts from.
     turn: TableId,
-    /// Stale entries a running step still reads, dropped once every step
-    /// reading them completes.
-    doomed: HashSet<CacheKey>,
+    /// What the steps in flight hold.
+    flight: Flight,
     /// Drops from purges, for the executor to apply.
     drops: Vec<Movement>,
     /// Requests planning refused, for the executor to answer.
@@ -264,17 +263,128 @@ pub struct Node {
     /// the regions they are for.
     rebuilding: HashMap<CacheKey, Vec<Rebuilding>>,
     rebuilt_regions: HashSet<(TableId, usize)>,
-    /// Entries a step in flight moves between tiers: later steps read them
-    /// only once it completes, since until then their slots may not hold them.
-    moving: HashSet<CacheKey>,
-    /// Entries a step in flight encodes, and tables it fits. Requests that
-    /// would read them wait for it: if it fails, the worker never holds them.
-    encoding: HashSet<CacheKey>,
-    fitting: HashSet<TableId>,
     /// Programs the worker reported compiled beside its steps, by key.
     compiled: HashSet<String>,
     /// Where the last `schedule` spent its time.
     parts: PlanParts,
+}
+
+/// A table's requests in the steps in flight, kept until their steps
+/// complete, so those of a part the worker defers queue again; see
+/// `Node::complete_deferring`.
+#[derive(Debug, Default)]
+struct Scheduled {
+    queries: Vec<(RequestId, Vec<f32>, Option<Vec<i64>>)>,
+    /// Requests with given contexts, which queue again with them.
+    given: Vec<(RequestId, Vec<f32>, Vec<Context>)>,
+    forecasts: Vec<(RequestId, SeriesRequest)>,
+}
+
+impl Scheduled {
+    /// Takes out the requests `of` names.
+    fn take(&mut self, of: impl Fn(RequestId) -> bool) -> Self {
+        let mut taken = Self::default();
+        (taken.queries, self.queries) = std::mem::take(&mut self.queries)
+            .into_iter()
+            .partition(|(request, _, _)| of(*request));
+        (taken.given, self.given) = std::mem::take(&mut self.given)
+            .into_iter()
+            .partition(|(request, _, _)| of(*request));
+        (taken.forecasts, self.forecasts) = std::mem::take(&mut self.forecasts)
+            .into_iter()
+            .partition(|(request, _)| of(*request));
+        taken
+    }
+}
+
+/// What the steps in flight hold, which later steps plan around.
+#[derive(Debug, Default)]
+struct Flight {
+    /// Entries a step in flight moves between tiers: later steps read them
+    /// only once it completes, since until then their slots may not hold them.
+    moving: HashSet<CacheKey>,
+    /// Stale entries a running step still reads, dropped once every step
+    /// reading them completes.
+    doomed: HashSet<CacheKey>,
+    /// Entries a step in flight encodes, and tables it fits. Requests that
+    /// would read them wait for it: if it fails, the worker never holds them.
+    encoding: HashSet<CacheKey>,
+    fitting: HashSet<TableId>,
+}
+
+impl Flight {
+    /// Whether a new step must not read the entry: a step in flight moves it,
+    /// so its slots may not hold it yet, or it is stale and still read. A unit
+    /// or page on such an entry is computed again, transiently.
+    fn busy(&self, key: &CacheKey) -> bool {
+        self.moving.contains(key) || self.doomed.contains(key)
+    }
+
+    /// Whether a step may copy rows from the entry: one a step in flight
+    /// computes is held by the worker only once it completes.
+    fn source(&self, key: &CacheKey) -> bool {
+        !self.busy(key) && !self.encoding.contains(key)
+    }
+
+    /// Whether the cache holds the entry for later steps: it is cached and
+    /// no change has made it stale. A step in flight may still move it.
+    fn holds(&self, cache: &Cache, key: &CacheKey) -> bool {
+        cache.contains(key) && !self.doomed.contains(key)
+    }
+
+    /// Whether a new step reads the entry as it is, encoding nothing.
+    fn reuses(&self, cache: &Cache, key: &CacheKey) -> bool {
+        cache.contains(key) && !self.busy(key)
+    }
+
+    /// Records what a step about to run holds: the entries it moves and
+    /// encodes, and the tables it fits.
+    fn hold(&mut self, step: &Step) {
+        self.moving.extend(
+            step.movements
+                .iter()
+                .filter(|movement| movement.to.is_some())
+                .map(|movement| movement.key),
+        );
+        self.encoding.extend(encoded(step));
+        self.fitting.extend(fitted_tables(step));
+    }
+
+    /// Forgets what a finished step held.
+    fn release(&mut self, step: &Step) {
+        for movement in &step.movements {
+            self.moving.remove(&movement.key);
+        }
+        for key in encoded(step) {
+            self.encoding.remove(&key);
+        }
+        for table in fitted_tables(step) {
+            self.fitting.remove(&table);
+        }
+    }
+}
+
+/// What planning a step has taken so far: the cache pins it holds, the
+/// entries it admitted, the fits it marked and the region rebuilds it
+/// claimed. A step that plans whole hands them to the step, whose release
+/// gives them back; one that fails partway gives every one back at once, see
+/// `Node::unwind`, so nothing it took outlives it.
+#[derive(Debug, Default)]
+struct Ledger {
+    pins: Vec<CacheKey>,
+    admitted: Vec<CacheKey>,
+    fits: Vec<FitMark>,
+    /// Each rebuild's entry, table and region.
+    rebuilds: Vec<(CacheKey, TableId, usize)>,
+}
+
+/// A table's fit as it stood before a step planned its own.
+#[derive(Debug)]
+struct FitMark {
+    table: TableId,
+    fitted: Option<Epoch>,
+    horizon: Option<i64>,
+    fitted_latest: Option<i64>,
 }
 
 /// A region's context a rebuild step encodes, to replace its built one.

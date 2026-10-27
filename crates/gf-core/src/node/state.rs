@@ -395,6 +395,48 @@ impl TableState {
         refused
     }
 
+    /// Moves the pending requests, and the forecasts, to the steps in flight,
+    /// each given request with its contexts.
+    pub(super) fn schedule_pending(&mut self) {
+        let width = self.spec.features;
+        let mut given = self.given.take().map(Vec::into_iter);
+        for (request, queries, cutoffs) in std::mem::take(&mut self.pending) {
+            match &mut given {
+                Some(contexts) => {
+                    let count = queries.len() / width;
+                    let contexts = contexts.by_ref().take(count).collect();
+                    self.scheduled.given.push((request, queries, contexts));
+                }
+                None => self.scheduled.queries.push((request, queries, cutoffs)),
+            }
+        }
+        self.scheduled.forecasts.append(&mut self.forecasts);
+    }
+
+    /// Queues again requests of a step whose part the worker deferred,
+    /// ahead of those that came after them.
+    pub(super) fn queue_again(&mut self, requests: Scheduled) {
+        let Scheduled {
+            mut queries,
+            given,
+            mut forecasts,
+        } = requests;
+        // Behind a pending given batch, as requests that come meanwhile wait.
+        if self.given.is_some() {
+            self.later.splice(0..0, queries);
+        } else {
+            queries.append(&mut self.pending);
+            self.pending = queries;
+        }
+        for request in given.into_iter().rev() {
+            self.givens.push_front(request);
+        }
+        forecasts.append(&mut self.forecasts);
+        self.forecasts = forecasts;
+        self.generation += 1;
+        self.promote();
+    }
+
     /// Once no request is pending, makes pending the queued given requests,
     /// as one batch, or the others that wait. The two take turns, so neither
     /// waits more than one step behind the other.

@@ -21,7 +21,7 @@ impl Node {
             scheduling: Scheduling::Turns,
             rows: RowMemory::unbounded(),
             turn: TableId(0),
-            doomed: HashSet::new(),
+            flight: Flight::default(),
             drops: Vec::new(),
             refused: Vec::new(),
             advanced: Vec::new(),
@@ -30,9 +30,6 @@ impl Node {
             untold: Vec::new(),
             rebuilding: HashMap::new(),
             rebuilt_regions: HashSet::new(),
-            moving: HashSet::new(),
-            encoding: HashSet::new(),
-            fitting: HashSet::new(),
             compiled: HashSet::new(),
             parts: PlanParts::default(),
         })
@@ -351,7 +348,7 @@ impl Node {
                 aged_at: None,
                 rebuild_waited: 0,
                 single_use: false,
-                scheduled: Vec::new(),
+                scheduled: Scheduled::default(),
                 compiling: None,
             },
         );

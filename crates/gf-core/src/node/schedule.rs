@@ -10,8 +10,7 @@ use super::*;
 /// whole step is planned.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn schedule_table(
-    cache: &mut Cache,
-    busy: Busy,
+    placing: &mut Placing,
     id: TableId,
     state: &mut TableState,
     snapshot: &Snapshot,
@@ -28,6 +27,12 @@ pub(super) fn schedule_table(
     let own = state.spec.summary == SummaryScope::Context;
     let fuse = !own && wanted.is_none() && fuses(state, snapshot, &planned);
     let fits = step.fits.len();
+    placing.ledger.fits.push(FitMark {
+        table: id,
+        fitted: state.fitted,
+        horizon: state.horizon,
+        fitted_latest: state.fitted_latest,
+    });
     if state.fitted != Some(state.epoch) {
         state.horizon = wanted;
     }
@@ -69,7 +74,7 @@ pub(super) fn schedule_table(
             })
             .collect();
         let first = step.pages.len();
-        place_pages(cache, busy, id, state, snapshot, &pages, true, step)?;
+        place_pages(placing, id, state, snapshot, &pages, true, step)?;
         let indices: Vec<StepPage> = (first..step.pages.len()).map(StepPage).collect();
         for (&page, &index) in pages.iter().zip(&indices) {
             placed.insert(page, index);
@@ -101,8 +106,7 @@ pub(super) fn schedule_table(
     let width = state.spec.features;
     let first_unit = step.units.len();
     place_units(
-        cache,
-        busy,
+        placing,
         id,
         state,
         snapshot,
@@ -110,6 +114,7 @@ pub(super) fn schedule_table(
         keys,
         &placed,
         fuse,
+        Unkept::Compute,
         step,
         parts,
     )?;
@@ -220,7 +225,47 @@ pub(super) fn fit_sample(
     Ok(())
 }
 
+/// The context bytes a step may newly encode, and those it has so far.
+pub(super) struct Budget {
+    limit: u64,
+    used: u64,
+    slot_bytes: u64,
+}
+
+impl Budget {
+    /// Whether the step has spent it all.
+    fn spent(&self) -> bool {
+        self.used >= self.limit
+    }
+
+    /// Takes `cost` if it fits what is left, or if the step has nothing yet
+    /// (`first`), so a part larger than the budget still runs alone; returns
+    /// whether it took it.
+    fn take(&mut self, cost: u64, first: bool) -> bool {
+        let used = self.used.saturating_add(cost);
+        if !first && used > self.limit {
+            return false;
+        }
+        self.used = used;
+        true
+    }
+}
+
 impl Node {
+    /// A new step's budget: `step_bytes`, the device tier's size by default,
+    /// or no limit without a device tier, since then nothing is kept.
+    fn budget(&self) -> Budget {
+        let limit = self.step_bytes.unwrap_or(match self.cache.device_bytes() {
+            0 => u64::MAX,
+            bytes => bytes,
+        });
+        Budget {
+            limit,
+            used: 0,
+            slot_bytes: self.cache.slot_bytes(),
+        }
+    }
+
     /// Plans pending requests into one step, or None if none can run yet.
     ///
     /// Requests whose queries would read no rows are refused instead; see
@@ -298,16 +343,11 @@ impl Node {
         }
         let mut step = Step::default();
         let mut scheduled = Vec::new();
-        if let Err(error) = self.plan_step(&waiting, &mut step, &mut scheduled, now) {
-            // Undo the half-planned step as a failed one, and keep the drops it
-            // already made for the executor, which never sees the step.
-            let dropped = self.fail(&step);
+        let mut ledger = Ledger::default();
+        let planned = self.plan_step(&waiting, &mut step, &mut scheduled, &mut ledger, now);
+        if let Err(error) = planned {
+            let dropped = self.unwind(ledger, step);
             self.drops.extend(dropped);
-            self.drops.extend(
-                step.movements
-                    .into_iter()
-                    .filter(|movement| movement.to.is_none()),
-            );
             return Err(error);
         }
         let Some(&first) = scheduled.first() else {
@@ -317,24 +357,12 @@ impl Node {
         for &id in &scheduled {
             if let Some(state) = self.tables.get_mut(&id) {
                 state.gave = state.given.is_some();
-                if state.single_use {
-                    state.scheduled = std::mem::take(&mut state.pending);
-                } else {
-                    state.pending.clear();
-                }
-                state.forecasts.clear();
+                state.schedule_pending();
                 state.promote();
                 state.generation += 1;
             }
         }
-        self.moving.extend(
-            step.movements
-                .iter()
-                .filter(|movement| movement.to.is_some())
-                .map(|movement| movement.key),
-        );
-        self.encoding.extend(encoded(&step));
-        self.fitting.extend(fitted_tables(&step));
+        self.flight.hold(&step);
         self.turn = TableId(first.0 + 1);
         for (id, _) in &due {
             if let Some(state) = self.tables.get_mut(id) {
@@ -348,20 +376,13 @@ impl Node {
     /// Each table with a region context due a rebuild, among those of current
     /// states no step rebuilds yet, and when its longest due fell due.
     pub(super) fn oldest_due(&mut self, now: Instant) -> Vec<(TableId, Instant)> {
-        let rebuilt = &self.rebuilt_regions;
+        let (cache, flight, rebuilt) = (&self.cache, &self.flight, &self.rebuilt_regions);
         self.tables
             .iter_mut()
             .filter_map(|(&id, state)| {
-                let spec = state.spec.regions?;
                 state.age_regions(now);
-                let regions = state.regions.as_mut()?;
-                if regions.epoch != state.epoch || state.fitted != Some(state.epoch) {
-                    return None;
-                }
-                regions
-                    .due(spec.rebuild, now)
+                due_rebuilds(id, state, cache, flight, rebuilt, now)
                     .into_iter()
-                    .filter(|&(region, _)| !rebuilt.contains(&(id, region)))
                     .map(|(_, due)| due)
                     .min()
                     .map(|due| (id, due))
@@ -376,134 +397,12 @@ impl Node {
     ///
     /// As `schedule`.
     pub(super) fn rebuild_step(&mut self, now: Instant) -> Result<Option<Step>, NodeError> {
-        let budget = self.step_bytes.unwrap_or(match self.cache.device_bytes() {
-            0 => u64::MAX,
-            bytes => bytes,
-        });
-        let slot_bytes = self.cache.slot_bytes();
-        let mut used = 0;
         let mut step = Step::default();
-        let tables: Vec<TableId> = self
-            .tables
-            .range(self.turn..)
-            .chain(self.tables.range(..self.turn))
-            .map(|(&id, _)| id)
-            .collect();
-        for id in tables {
-            if (!step.units.is_empty() && used >= budget) || self.fitting.contains(&id) {
-                continue;
-            }
-            let state = self.tables.get_mut(&id).expect("listed above");
-            let Some(spec) = state.spec.regions else {
-                continue;
-            };
-            let epoch = state.epoch;
-            let current = state.fitted == Some(epoch)
-                && state.restoring.is_none()
-                && !state.refit_for(None)
-                && state
-                    .regions
-                    .as_ref()
-                    .is_some_and(|regions| regions.epoch == epoch);
-            if !current {
-                continue;
-            }
-            let since = self.parts.start();
-            let regions = state.regions.as_mut().expect("checked above");
-            let generation = regions.generation;
-            let due: Vec<(usize, Instant, u64)> = regions
-                .due(spec.rebuild, now)
-                .into_iter()
-                .filter(|&(region, _)| !self.rebuilt_regions.contains(&(id, region)))
-                .filter_map(|(region, due)| {
-                    Some((region, due, regions.built[region].as_ref()?.changes))
-                })
-                .collect();
-            let centers: Vec<Vec<f32>> = due
-                .iter()
-                .map(|&(region, _, _)| regions.centers[region].clone())
-                .collect();
-            self.parts.add("regions", since);
-            if due.is_empty() {
-                continue;
-            }
-            let since = self.parts.start();
-            let snapshot = state.served();
-            self.parts.add("snapshot", since);
-            let since = self.parts.start();
-            state.prepare_cores(epoch);
-            let mut planned =
-                state.plan_around(&snapshot, &centers, &[], &[], &vec![None; centers.len()])?;
-            self.parts.add("retrieve", since);
-            let since = self.parts.start();
-            let key_of = |rows| CacheKey {
-                model: state.spec.model,
-                table: id,
-                epoch,
-                kind: Kind::Context,
-                rows,
-            };
-            let mut kept = Vec::new();
-            let mut keys = Vec::new();
-            // Regions join while the budget lasts; the step's first always does.
-            for (&(region, due, seen), unit) in due.iter().zip(&planned.queries) {
-                let unit = &planned.units[unit.0];
-                let key = key_of(unit.key);
-                if self.encoding.contains(&key) {
-                    continue;
-                }
-                let encodes = !self.rebuilding.contains_key(&key)
-                    && !keys.contains(&key)
-                    && !self.cache.contains(&key);
-                let cost = if encodes {
-                    state.spec.sizes.bytes(unit.rows.len() as usize, slot_bytes)
-                } else {
-                    0
-                };
-                if (!step.units.is_empty() || !keys.is_empty()) && used + cost > budget {
-                    break;
-                }
-                used += cost;
-                self.rebuilding.entry(key).or_default().push(Rebuilding {
-                    table: id,
-                    region,
-                    epoch,
-                    generation,
-                    rows: unit.rows.clone(),
-                    seen,
-                    due,
-                });
-                self.rebuilt_regions.insert((id, region));
-                if encodes {
-                    keys.push(key);
-                    kept.push(unit.clone());
-                }
-            }
-            planned.units = kept;
-            self.parts.add("checks", since);
-            let busy = Busy {
-                moving: &self.moving,
-                doomed: &self.doomed,
-                encoding: &self.encoding,
-            };
-            let placed = place_units(
-                &mut self.cache,
-                busy,
-                id,
-                state,
-                &snapshot,
-                planned.units,
-                keys,
-                &BTreeMap::new(),
-                false,
-                &mut step,
-                &mut self.parts,
-            );
-            if let Err(error) = placed {
-                let dropped = self.fail(&step);
-                self.drops.extend(dropped);
-                return Err(error);
-            }
+        let mut ledger = Ledger::default();
+        if let Err(error) = self.plan_rebuilds(&mut step, &mut ledger, now) {
+            let dropped = self.unwind(ledger, step);
+            self.drops.extend(dropped);
+            return Err(error);
         }
         let since = self.parts.start();
         // Contexts the cache held already replace their regions' at once.
@@ -513,7 +412,7 @@ impl Node {
             .filter(|key| {
                 self.cache.contains(key) && !step.units.iter().any(|unit| unit.key == **key)
             })
-            .filter(|key| !self.encoding.contains(key))
+            .filter(|key| !self.flight.encoding.contains(key))
             .copied()
             .collect();
         for key in held {
@@ -524,15 +423,137 @@ impl Node {
             self.parts.add("assemble", since);
             return Ok(None);
         }
-        self.moving.extend(
-            step.movements
-                .iter()
-                .filter(|movement| movement.to.is_some())
-                .map(|movement| movement.key),
-        );
-        self.encoding.extend(encoded(&step));
+        self.flight.hold(&step);
         self.parts.add("assemble", since);
         Ok(Some(step))
+    }
+
+    /// Adds the due region rebuilds of each table to `step` while the budget
+    /// allows, recording what it takes in `ledger`.
+    fn plan_rebuilds(
+        &mut self,
+        step: &mut Step,
+        ledger: &mut Ledger,
+        now: Instant,
+    ) -> Result<(), NodeError> {
+        let mut budget = self.budget();
+        let slot_bytes = budget.slot_bytes;
+        let tables: Vec<TableId> = self
+            .tables
+            .range(self.turn..)
+            .chain(self.tables.range(..self.turn))
+            .map(|(&id, _)| id)
+            .collect();
+        for id in tables {
+            if (!step.units.is_empty() && budget.spent()) || self.flight.fitting.contains(&id) {
+                continue;
+            }
+            let state = self.tables.get_mut(&id).expect("listed above");
+            let epoch = state.epoch;
+            if state.restoring.is_some() || state.refit_for(None) {
+                continue;
+            }
+            let since = self.parts.start();
+            let due: Vec<(usize, Instant)> = due_rebuilds(
+                id,
+                state,
+                &self.cache,
+                &self.flight,
+                &self.rebuilt_regions,
+                now,
+            );
+            let Some(regions) = state.regions.as_ref().filter(|_| !due.is_empty()) else {
+                self.parts.add("regions", since);
+                continue;
+            };
+            let generation = regions.generation;
+            let due: Vec<(usize, Instant, u64)> = due
+                .into_iter()
+                .filter_map(|(region, due)| {
+                    Some((region, due, regions.built[region].as_ref()?.changes))
+                })
+                .collect();
+            let centers: Vec<Vec<f32>> = due
+                .iter()
+                .map(|&(region, _, _)| regions.centers[region].clone())
+                .collect();
+            self.parts.add("regions", since);
+            let since = self.parts.start();
+            let snapshot = state.served();
+            self.parts.add("snapshot", since);
+            let since = self.parts.start();
+            state.prepare_cores(epoch);
+            let mut planned =
+                state.plan_around(&snapshot, &centers, &[], &[], &vec![None; centers.len()])?;
+            self.parts.add("retrieve", since);
+            let since = self.parts.start();
+            let mut kept = Vec::new();
+            let mut keys = Vec::new();
+            // Regions join while the budget lasts; the step's first always does.
+            for (&(region, due, seen), unit) in due.iter().zip(&planned.queries) {
+                let unit = &planned.units[unit.0];
+                let key = state.spec.entry_keys(id, epoch).context(unit.key);
+                if self.flight.encoding.contains(&key) {
+                    continue;
+                }
+                let encodes = !self.rebuilding.contains_key(&key)
+                    && !keys.contains(&key)
+                    && !self.cache.contains(&key);
+                let cost = if encodes {
+                    state.spec.sizes.bytes(unit.rows.len() as usize, slot_bytes)
+                } else {
+                    0
+                };
+                if !budget.take(cost, step.units.is_empty() && keys.is_empty()) {
+                    break;
+                }
+                self.rebuilding.entry(key).or_default().push(Rebuilding {
+                    table: id,
+                    region,
+                    epoch,
+                    generation,
+                    rows: unit.rows.clone(),
+                    seen,
+                    due,
+                });
+                self.rebuilt_regions.insert((id, region));
+                ledger.rebuilds.push((key, id, region));
+                if encodes {
+                    keys.push(key);
+                    kept.push(unit.clone());
+                }
+            }
+            planned.units = kept;
+            self.parts.add("checks", since);
+            let mut placing = Placing {
+                cache: &mut self.cache,
+                flight: &self.flight,
+                ledger: &mut *ledger,
+            };
+            // A rebuild the cache cannot keep would be computed for nothing,
+            // so it waits for room, its region's built context serving on.
+            let skipped = place_units(
+                &mut placing,
+                id,
+                state,
+                &snapshot,
+                planned.units,
+                keys,
+                &BTreeMap::new(),
+                false,
+                Unkept::Skip,
+                step,
+                &mut self.parts,
+            )?;
+            for key in skipped {
+                for rebuilt in self.rebuilding.remove(&key).unwrap_or_default() {
+                    self.rebuilt_regions
+                        .remove(&(rebuilt.table, rebuilt.region));
+                }
+                ledger.rebuilds.retain(|(claimed, _, _)| *claimed != key);
+            }
+        }
+        Ok(())
     }
 
     /// Makes the contexts rebuilt as `key` their regions' built ones, and
@@ -599,18 +620,15 @@ impl Node {
         waiting: &[TableId],
         step: &mut Step,
         scheduled: &mut Vec<TableId>,
+        ledger: &mut Ledger,
         now: Instant,
     ) -> Result<(), NodeError> {
-        let budget = self.step_bytes.unwrap_or(match self.cache.device_bytes() {
-            0 => u64::MAX,
-            bytes => bytes,
-        });
-        let slot_bytes = self.cache.slot_bytes();
-        let mut used = 0;
+        let mut budget = self.budget();
+        let slot_bytes = budget.slot_bytes;
         for &id in waiting {
             // Planning costs time, so tables wait without it once the budget is
             // spent, or while a step in flight fits them.
-            if (!scheduled.is_empty() && used >= budget) || self.fitting.contains(&id) {
+            if (!scheduled.is_empty() && budget.spent()) || self.flight.fitting.contains(&id) {
                 continue;
             }
             let Some(state) = self.tables.get_mut(&id) else {
@@ -618,7 +636,7 @@ impl Node {
             };
             if state.spec.series.is_some() {
                 let since = self.parts.start();
-                let planned = self.plan_series(id, budget, slot_bytes, &mut used, step, scheduled);
+                let planned = self.plan_series(id, &mut budget, step, scheduled, ledger);
                 self.parts.add("series", since);
                 planned?;
                 continue;
@@ -662,17 +680,8 @@ impl Node {
                         planned?
                     }
                     _ => {
-                        let model = state.spec.model;
-                        let cached = |rows| {
-                            let key = CacheKey {
-                                model,
-                                table: id,
-                                epoch,
-                                kind: Kind::Context,
-                                rows,
-                            };
-                            self.cache.contains(&key) && !self.doomed.contains(&key)
-                        };
+                        let keys = state.spec.entry_keys(id, epoch);
+                        let cached = |rows| self.flight.holds(&self.cache, &keys.context(rows));
                         state.plan_pending(epoch, &snapshot, &cached, now, &mut self.parts)?
                     }
                 };
@@ -707,22 +716,18 @@ impl Node {
                 state.past_cap = true;
                 self.past_cap.push(id);
             }
+            let entry_keys = state.spec.entry_keys(id, epoch);
             let keys: Vec<CacheKey> = planned
                 .units
                 .iter()
-                .map(|unit| CacheKey {
-                    model: state.spec.model,
-                    table: id,
-                    epoch,
-                    kind: Kind::Context,
-                    rows: unit.key,
-                })
+                .map(|unit| entry_keys.context(unit.key))
                 .collect();
             // Contexts a step in flight encodes, or, for those not cached
             // yet, pages it embeds, are read only once it completes.
-            let waits = keys.iter().any(|key| self.encoding.contains(key))
+            let waits = keys.iter().any(|key| self.flight.encoding.contains(key))
                 || (keys.iter().any(|key| !self.cache.contains(key))
                     && self
+                        .flight
                         .encoding
                         .iter()
                         .any(|key| key.table == id && key.kind == Kind::Rows));
@@ -731,33 +736,33 @@ impl Node {
                 state.deferred = Some((state.generation, planned));
                 continue;
             }
+            // A context the step cannot read as it is, cached or not, is
+            // computed again.
             let cost: u64 = planned
                 .units
                 .iter()
                 .zip(&keys)
-                .filter(|(_, key)| !self.cache.contains(key))
+                .filter(|(_, key)| !self.flight.reuses(&self.cache, key))
                 .map(|(unit, _)| state.spec.sizes.bytes(unit.rows.len() as usize, slot_bytes))
                 .sum();
-            if !scheduled.is_empty() && used + cost > budget {
+            if !budget.take(cost, scheduled.is_empty()) {
                 state.deferred = Some((state.generation, planned));
                 continue;
             }
-            used += cost;
             let state = self.tables.get_mut(&id).expect("planned above");
             let counts = std::mem::take(&mut state.planned_counts);
             state.region_stats.count(&counts);
             if refit {
                 step.movements.extend(self.advance_epoch(id)?);
             }
-            let busy = Busy {
-                moving: &self.moving,
-                doomed: &self.doomed,
-                encoding: &self.encoding,
-            };
             let state = self.tables.get_mut(&id).expect("planned above");
+            let mut placing = Placing {
+                cache: &mut self.cache,
+                flight: &self.flight,
+                ledger: &mut *ledger,
+            };
             schedule_table(
-                &mut self.cache,
-                busy,
+                &mut placing,
                 id,
                 state,
                 &snapshot,
@@ -777,12 +782,12 @@ impl Node {
     pub(super) fn plan_series(
         &mut self,
         id: TableId,
-        budget: u64,
-        slot_bytes: u64,
-        used: &mut u64,
+        budget: &mut Budget,
         step: &mut Step,
         scheduled: &mut Vec<TableId>,
+        ledger: &mut Ledger,
     ) -> Result<(), NodeError> {
+        let slot_bytes = budget.slot_bytes;
         let state = self.tables.get_mut(&id).expect("waiting tables exist");
         let spec = state
             .spec
@@ -825,19 +830,14 @@ impl Node {
                 forecasting::plan(&spec, index, &snapshot, features, &requests)?
             }
         };
+        let entry_keys = state.spec.entry_keys(id, state.epoch);
         let keys: Vec<CacheKey> = planned
             .units
             .iter()
-            .map(|unit| CacheKey {
-                model: state.spec.model,
-                table: id,
-                epoch: state.epoch,
-                kind: Kind::Context,
-                rows: unit.key,
-            })
+            .map(|unit| entry_keys.context(unit.key))
             .collect();
         // Contexts a step in flight encodes are read only once it completes.
-        if keys.iter().any(|key| self.encoding.contains(key)) {
+        if keys.iter().any(|key| self.flight.encoding.contains(key)) {
             return Ok(());
         }
         let features = state.spec.features;
@@ -857,7 +857,7 @@ impl Node {
             let prev = state.recent.get(&unit.group).filter(|prev| {
                 spec.extendable
                     && self.cache.contains(&prev.key)
-                    && !self.encoding.contains(&prev.key)
+                    && !self.flight.encoding.contains(&prev.key)
             })?;
             let (_, patches) = extension_size(&spec, unit, prev)?;
             let sizes = &state.spec.sizes;
@@ -869,7 +869,7 @@ impl Node {
             .units
             .iter()
             .zip(&keys)
-            .filter(|(unit, key)| unit.whole || !self.cache.contains(key))
+            .filter(|(unit, key)| unit.whole || !self.flight.reuses(&self.cache, key))
             .map(|(unit, _)| {
                 let fresh = unit_bytes(unit);
                 match extended_bytes(unit) {
@@ -878,16 +878,15 @@ impl Node {
                 }
             })
             .sum();
-        if !scheduled.is_empty() && *used + cost > budget {
+        if !budget.take(cost, scheduled.is_empty()) {
             return Ok(());
         }
-        *used += cost;
-        let busy = Busy {
-            moving: &self.moving,
-            doomed: &self.doomed,
-            encoding: &self.encoding,
-        };
         let state = self.tables.get_mut(&id).expect("planned above");
+        let mut placing = Placing {
+            cache: &mut self.cache,
+            flight: &self.flight,
+            ledger,
+        };
         let first_unit = step.series_units.len();
         for (unit, key) in planned.units.iter().zip(keys) {
             let grid = forecasting::grid(&spec, unit, features, |rows| state.rows.rows(rows))?;
@@ -902,17 +901,16 @@ impl Node {
                 );
                 // A kept unit whose entry is gone is nothing to extend.
                 let recent = match state.recent.get(&unit.group).copied() {
-                    Some(prev) if !self.cache.contains(&prev.key) => {
+                    Some(prev) if !placing.cache.contains(&prev.key) => {
                         state.recent.remove(&unit.group);
                         None
                     }
-                    Some(prev) if self.encoding.contains(&prev.key) => None,
+                    Some(prev) if placing.flight.encoding.contains(&prev.key) => None,
                     recent => recent,
                 };
                 let extended = match recent {
-                    Some(prev) if spec.extendable && !self.cache.contains(&key) => extend(
-                        &mut self.cache,
-                        busy,
+                    Some(prev) if spec.extendable && !placing.cache.contains(&key) => extend(
+                        &mut placing,
                         &state.table.snapshot(),
                         &spec,
                         &state.spec.sizes,
@@ -933,14 +931,7 @@ impl Node {
                         patches = Some(extension.patches);
                         extension.placed
                     }
-                    None => place(
-                        &mut self.cache,
-                        busy,
-                        key,
-                        bytes,
-                        unit.rows(),
-                        &mut step.movements,
-                    )?,
+                    None => place(&mut placing, key, bytes, unit.rows(), &mut step.movements)?,
                 };
                 if placed.action() == Action::Encode {
                     patches = Some(state.spec.sizes.series_patches(&spec, unit.steps));
@@ -1000,14 +991,44 @@ impl Node {
             state.fitted = None;
             state.recent.clear();
             state.writing.clear();
-            state.scheduled.clear();
+            state.scheduled = Scheduled::default();
             state.compiling = None;
         }
         self.compiled.clear();
-        self.doomed.clear();
+        self.flight.doomed.clear();
         self.drops.clear();
-        self.moving.clear();
-        self.encoding.clear();
-        self.fitting.clear();
+        self.flight.moving.clear();
+        self.flight.encoding.clear();
+        self.flight.fitting.clear();
     }
+}
+
+/// The regions of a table's current state due a rebuild by `now`, and since
+/// when each has been: those no step rebuilds yet whose built context the
+/// cache still holds, since a query reading a region whose context is gone
+/// builds it anew itself.
+fn due_rebuilds(
+    id: TableId,
+    state: &mut TableState,
+    cache: &Cache,
+    flight: &Flight,
+    rebuilt: &HashSet<(TableId, usize)>,
+    now: Instant,
+) -> Vec<(usize, Instant)> {
+    let (Some(spec), Some(regions)) = (state.spec.regions, state.regions.as_mut()) else {
+        return Vec::new();
+    };
+    if regions.epoch != state.epoch || state.fitted != Some(state.epoch) {
+        return Vec::new();
+    }
+    let keys = state.spec.entry_keys(id, state.epoch);
+    let due = regions.due(spec.rebuild, now);
+    due.into_iter()
+        .filter(|&(region, _)| !rebuilt.contains(&(id, region)))
+        .filter(|&(region, _)| {
+            regions.built[region]
+                .as_ref()
+                .is_some_and(|built| flight.holds(cache, &keys.context(built.key)))
+        })
+        .collect()
 }

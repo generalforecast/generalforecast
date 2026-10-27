@@ -5,35 +5,81 @@
 
 use super::*;
 
-/// Entries a new step must not read: those a step in flight moves between
-/// tiers, whose slots may not hold them yet, and stale ones a step in flight
-/// still reads. A unit or page on such an entry is computed again, transiently.
-#[derive(Clone, Copy)]
-pub(super) struct Busy<'a> {
-    pub(super) moving: &'a HashSet<CacheKey>,
-    pub(super) doomed: &'a HashSet<CacheKey>,
-    /// Entries a step in flight computes, which the worker holds only once
-    /// it completes; a later step reads them, but copies from none.
-    pub(super) encoding: &'a HashSet<CacheKey>,
+/// The cache as a step's planning sees it: every pin and admission goes
+/// through here and into the ledger, so a plan that fails partway can give
+/// back everything it took, and entries the steps in flight hold are known.
+pub(super) struct Placing<'a> {
+    pub(super) cache: &'a mut Cache,
+    pub(super) flight: &'a Flight,
+    pub(super) ledger: &'a mut Ledger,
 }
 
-impl Busy<'_> {
-    pub(super) fn contains(&self, key: &CacheKey) -> bool {
-        self.moving.contains(key) || self.doomed.contains(key)
+impl Placing<'_> {
+    /// Where an entry lives, counting a hit, or None if it is not cached.
+    fn lookup(&mut self, key: &CacheKey) -> Option<Placement> {
+        self.cache.lookup(key)
     }
 
-    /// Whether a step may copy rows from the entry.
-    pub(super) fn source(&self, key: &CacheKey) -> bool {
-        !self.contains(key) && !self.encoding.contains(key)
+    /// Pins an entry for the step.
+    fn pin(&mut self, key: &CacheKey) -> Result<(), CacheError> {
+        self.cache.pin(key)?;
+        self.ledger.pins.push(*key);
+        Ok(())
     }
+
+    /// Releases a pin the step took and no longer needs.
+    fn unpin(&mut self, key: &CacheKey) {
+        if let Some(at) = self.ledger.pins.iter().rposition(|pinned| pinned == key) {
+            self.ledger.pins.swap_remove(at);
+            let _ = self.cache.unpin(key);
+        }
+    }
+
+    /// Admits a new entry to the device, pinned for the step.
+    fn admit(
+        &mut self,
+        key: CacheKey,
+        bytes: u64,
+        cost: f64,
+        rows: Context,
+    ) -> Result<Admission, CacheError> {
+        let admission = self.cache.admit(key, bytes, cost, rows)?;
+        self.ledger.admitted.push(key);
+        self.pin(&key)?;
+        Ok(admission)
+    }
+
+    /// Admits a new entry to the host, pinned for the step.
+    fn admit_host(
+        &mut self,
+        key: CacheKey,
+        bytes: u64,
+        cost: f64,
+        rows: Context,
+    ) -> Result<Admission, CacheError> {
+        let admission = self.cache.admit_host(key, bytes, cost, rows)?;
+        self.ledger.admitted.push(key);
+        self.pin(&key)?;
+        Ok(admission)
+    }
+}
+
+/// What a step does with a unit the cache cannot keep.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Unkept {
+    /// Computes it for this step only, as a request's units are.
+    Compute,
+    /// Leaves it out of the step, as a rebuild is: the context it would
+    /// replace keeps serving, and the rebuild waits for room.
+    Skip,
 }
 
 /// Adds units of a table to a step, placing each, and the pages holding the
-/// rows of those to encode that `placed` does not hold already.
+/// rows of those to encode that `placed` does not hold already; returns the
+/// keys of the units `unkept` left out.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn place_units(
-    cache: &mut Cache,
-    busy: Busy,
+    placing: &mut Placing,
     id: TableId,
     state: &TableState,
     snapshot: &Snapshot,
@@ -41,21 +87,30 @@ pub(super) fn place_units(
     keys: Vec<CacheKey>,
     placed: &BTreeMap<PageId, StepPage>,
     fuse: bool,
+    unkept: Unkept,
     step: &mut Step,
     parts: &mut PlanParts,
-) -> Result<(), NodeError> {
+) -> Result<Vec<CacheKey>, NodeError> {
     let since = parts.start();
     // The rows of units to encode, whose pages the step needs.
     let mut encoding = Context::new();
+    let mut skipped = Vec::new();
     for (unit, key) in units.into_iter().zip(keys) {
         let mut rows: Vec<RowId> = unit.rows.iter().collect();
-        let bytes = state.spec.sizes.bytes(rows.len(), cache.slot_bytes());
+        let bytes = state
+            .spec
+            .sizes
+            .bytes(rows.len(), placing.cache.slot_bytes());
         let held = unit.rows.clone();
         let placement = if fuse {
             Placed::Fuse
         } else {
-            place(cache, busy, key, bytes, unit.rows, &mut step.movements)?
+            place(placing, key, bytes, unit.rows, &mut step.movements)?
         };
+        if placement == Placed::Transient && unkept == Unkept::Skip {
+            skipped.push(key);
+            continue;
+        }
         // A unit fit on its own rows carries the values the model reads of
         // them, and reads no pages.
         let mut fit = None;
@@ -85,9 +140,9 @@ pub(super) fn place_units(
         .into_iter()
         .filter(|page| !placed.contains_key(page))
         .collect();
-    let pages = place_pages(cache, busy, id, state, snapshot, &missing, false, step);
+    place_pages(placing, id, state, snapshot, &missing, false, step)?;
     parts.add("pages", since);
-    pages
+    Ok(skipped)
 }
 
 /// Places pages of a table in the host tier and adds them to the step, pinning kept ones.
@@ -95,10 +150,8 @@ pub(super) fn place_units(
 /// Cached pages are pinned before any new page is admitted, so admitting one
 /// cannot evict another this step reads. A fit computes its pages, so they
 /// carry no rows to embed.
-#[allow(clippy::too_many_arguments)]
 pub(super) fn place_pages(
-    cache: &mut Cache,
-    busy: Busy,
+    placing: &mut Placing,
     table: TableId,
     state: &TableState,
     snapshot: &Snapshot,
@@ -113,20 +166,17 @@ pub(super) fn place_pages(
             .iter()
             .filter(|&row| snapshot.version(row).is_some())
             .collect();
-        let key = CacheKey {
-            model: state.spec.model,
-            table,
-            epoch: state.epoch,
-            kind: Kind::Rows,
-            rows: snapshot.fingerprint(&context),
-        };
-        let cached = cache.lookup(&key);
-        if cached.is_some() && !busy.contains(&key) {
-            cache.pin(&key)?;
+        let key = state
+            .spec
+            .entry_keys(table, state.epoch)
+            .of(Kind::Rows, snapshot.fingerprint(&context));
+        let cached = placing.lookup(&key);
+        if cached.is_some() && !placing.flight.busy(&key) {
+            placing.pin(&key)?;
         }
         // Sources are pinned with the cached pages, before any admission.
         let copies = if cached.is_none() && !fit {
-            page_sources(cache, busy, table, state.epoch, &rows)?
+            page_sources(placing, table, state.epoch, &rows)?
         } else {
             Vec::new()
         };
@@ -134,7 +184,7 @@ pub(super) fn place_pages(
     }
     for (key, rows, cached, copies) in entries {
         let placed = if let Some(placement) = cached {
-            if busy.contains(&key) {
+            if placing.flight.busy(&key) {
                 Placed::Transient
             } else {
                 Placed::Reuse(placement.slots)
@@ -143,10 +193,9 @@ pub(super) fn place_pages(
             let bytes = state.spec.sizes.bytes_per_representation * rows.len() as u64;
             let cost = EMBED_COST_PER_CELL * (rows.len() * state.spec.model_features()) as f64;
             let held = rows.iter().copied().collect();
-            match cache.admit_host(key, bytes, cost, held) {
+            match placing.admit_host(key, bytes, cost, held) {
                 Ok(admission) => {
                     step.movements.extend(admission.movements);
-                    cache.pin(&key)?;
                     Placed::Encode(admission.slots)
                 }
                 Err(CacheError::NoRoom | CacheError::TooLarge { .. }) => Placed::Transient,
@@ -185,8 +234,7 @@ pub(super) fn place_pages(
 ///
 /// Each row is copied from the first source holding it, in key order.
 pub(super) fn page_sources(
-    cache: &mut Cache,
-    busy: Busy,
+    placing: &mut Placing,
     table: TableId,
     epoch: Epoch,
     rows: &[RowId],
@@ -194,10 +242,11 @@ pub(super) fn page_sources(
     let wanted: Context = rows.iter().copied().collect();
     let mut copies = Vec::new();
     let mut covered = HashSet::new();
-    for source in cache.holding(table, &wanted) {
-        if source.kind != Kind::Rows || source.epoch != epoch || !busy.source(&source) {
+    for source in placing.cache.holding(table, &wanted) {
+        if source.kind != Kind::Rows || source.epoch != epoch || !placing.flight.source(&source) {
             continue;
         }
+        let cache = &placing.cache;
         let (Some(held), Some(stale)) = (cache.rows(&source), cache.stale(&source)) else {
             continue;
         };
@@ -213,7 +262,7 @@ pub(super) fn page_sources(
             continue;
         }
         covered.extend(positions.iter().map(|&(_, to)| to));
-        cache.pin(&source)?;
+        placing.pin(&source)?;
         copies.push((source, positions));
     }
     Ok(copies)
@@ -276,8 +325,7 @@ pub(super) fn extension_bytes(
 /// room, so the unit is placed as any other.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn extend(
-    cache: &mut Cache,
-    busy: Busy,
+    placing: &mut Placing,
     snapshot: &Snapshot,
     spec: &SeriesSpec,
     sizes: &EntrySizes,
@@ -292,10 +340,10 @@ pub(super) fn extend(
         return Ok(None);
     };
     let bytes = extension_bytes(spec, sizes, features, unit, patches, slot_bytes);
-    if busy.contains(&prev.key) || busy.contains(&key) {
+    if placing.flight.busy(&prev.key) || placing.flight.busy(&key) {
         return Ok(None);
     }
-    let Some(placement) = cache.lookup(&prev.key) else {
+    let Some(placement) = placing.lookup(&prev.key) else {
         return Ok(None);
     };
     if placement.tier != Tier::Device {
@@ -313,11 +361,10 @@ pub(super) fn extend(
         return Ok(None);
     }
     let cost = (unit.rows().len() as f64).powi(2);
-    cache.pin(&prev.key)?;
-    match cache.admit(key, bytes, cost, unit.rows()) {
+    placing.pin(&prev.key)?;
+    match placing.admit(key, bytes, cost, unit.rows()) {
         Ok(admission) => {
             movements.extend(admission.movements);
-            cache.pin(&key)?;
             Ok(Some(Extension {
                 placed: Placed::Extend {
                     source: placement.slots,
@@ -329,7 +376,7 @@ pub(super) fn extend(
             }))
         }
         Err(error) => {
-            let _ = cache.unpin(&prev.key);
+            placing.unpin(&prev.key);
             match error {
                 CacheError::NoRoom | CacheError::TooLarge { .. } => Ok(None),
                 error => Err(error.into()),
@@ -340,37 +387,37 @@ pub(super) fn extend(
 
 /// Finds or makes room for a unit's entry on the device, pinning kept entries.
 pub(super) fn place(
-    cache: &mut Cache,
-    busy: Busy,
+    placing: &mut Placing,
     key: CacheKey,
     bytes: u64,
     rows: Context,
     movements: &mut Vec<Movement>,
 ) -> Result<Placed, NodeError> {
-    if busy.contains(&key) {
+    if placing.flight.busy(&key) {
         return Ok(Placed::Transient);
     }
-    let placed = if let Some(placement) = cache.lookup(&key) {
-        if placement.tier == Tier::Device {
-            Ok(Placed::Reuse(placement.slots))
+    let placed = if let Some(placement) = placing.lookup(&key) {
+        let reused = if placement.tier == Tier::Device {
+            Ok(placement.slots)
         } else {
-            cache.promote(&key).map(|admission| {
+            placing.cache.promote(&key).map(|admission| {
                 movements.extend(admission.movements);
-                Placed::Reuse(admission.slots)
+                admission.slots
             })
-        }
+        };
+        reused.and_then(|slots| {
+            placing.pin(&key)?;
+            Ok(Placed::Reuse(slots))
+        })
     } else {
         let cost = (rows.len() as f64).powi(2);
-        cache.admit(key, bytes, cost, rows).map(|admission| {
+        placing.admit(key, bytes, cost, rows).map(|admission| {
             movements.extend(admission.movements);
             Placed::Encode(admission.slots)
         })
     };
     match placed {
-        Ok(placed) => {
-            cache.pin(&key)?;
-            Ok(placed)
-        }
+        Ok(placed) => Ok(placed),
         Err(CacheError::NoRoom | CacheError::TooLarge { .. }) => Ok(Placed::Transient),
         Err(error) => Err(error.into()),
     }

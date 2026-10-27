@@ -454,6 +454,15 @@ impl TableSpec {
         self.clamp().map_or(strategy, |rows| strategy.capped(rows))
     }
 
+    /// The keys of this table's entries in its state of `epoch`.
+    pub(super) fn entry_keys(&self, table: TableId, epoch: Epoch) -> EntryKeys {
+        EntryKeys {
+            model: self.model,
+            table,
+            epoch,
+        }
+    }
+
     /// The values of each row the model reads.
     #[must_use]
     pub fn model_features(&self) -> usize {
@@ -499,5 +508,32 @@ impl TableSpec {
             }
             _ => Bucket(0),
         }
+    }
+}
+
+/// The keys of one table's cache entries in one state, the one place they
+/// are made, so every check of what the cache holds names entries alike.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct EntryKeys {
+    model: ModelId,
+    table: TableId,
+    epoch: Epoch,
+}
+
+impl EntryKeys {
+    /// The key of an entry of `kind` computed from the rows `rows` fingerprints.
+    pub(super) fn of(self, kind: Kind, rows: Fingerprint) -> CacheKey {
+        CacheKey {
+            model: self.model,
+            table: self.table,
+            epoch: self.epoch,
+            kind,
+            rows,
+        }
+    }
+
+    /// The key of a context of those rows.
+    pub(super) fn context(self, rows: Fingerprint) -> CacheKey {
+        self.of(Kind::Context, rows)
     }
 }
