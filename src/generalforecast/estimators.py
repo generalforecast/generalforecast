@@ -41,6 +41,26 @@ if TYPE_CHECKING:
 __all__ = ["Classifier", "Forecaster", "Regressor"]
 
 
+def _forecaster_model(model: Any, download: bool) -> Any:
+    """A forecaster's model as the constructor and `set_params` take it.
+
+    A string becomes its canonical catalog id; a custom model is refused.
+    """
+    if not isinstance(model, str):
+        return model
+    model = registry.canonical(model)
+    if registry.is_custom(model):
+        raise InvalidInput(
+            f"Forecaster runs catalog forecasters, not custom model `{model}`",
+            hint="run a custom forecaster through gf.engine.SeriesTable",
+            param="model",
+        )
+    from generalforecast.native.estimators import note_download
+
+    note_download(model, download)
+    return model
+
+
 class Forecaster(RegressorMixin, BaseEstimator):
     """Prepares series context, not foundation weights, for explicit future rows.
 
@@ -67,18 +87,7 @@ class Forecaster(RegressorMixin, BaseEstimator):
     ) -> None:
         """Stores cloneable settings; local checkpoints are cache-only by default."""
         require_sklearn()
-        if isinstance(model, str):
-            model = registry.canonical(model)
-            if registry.is_custom(model):
-                raise InvalidInput(
-                    f"Forecaster runs catalog forecasters, not custom model `{model}`",
-                    hint="run a custom forecaster through gf.engine.SeriesTable",
-                    param="model",
-                )
-            from generalforecast.native.estimators import note_download
-
-            note_download(model, download)
-        self.model = model
+        self.model = _forecaster_model(model, download)
         self.target = target
         self.time = time
         self.series = series
@@ -95,7 +104,11 @@ class Forecaster(RegressorMixin, BaseEstimator):
         return hasattr(self, "context_")
 
     def set_params(self, **params: Any) -> "Forecaster":
-        """Invalidates context when any constructor parameter changes."""
+        """Checks a new model as the constructor does; invalidates context on any change."""
+        if "model" in params:
+            params["model"] = _forecaster_model(
+                params["model"], params.get("download", self.download)
+            )
         super().set_params(**params)
         if params:
             self.close()

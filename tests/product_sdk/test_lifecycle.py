@@ -24,7 +24,7 @@ from generalforecast.contracts import (
 )
 from generalforecast.predictors.lock import read_lock
 from generalforecast.service.contracts import ServiceError
-from generalforecast.service.sdk import ContextSpec
+from generalforecast.service.sdk import ContextSpec, ImportReceipt
 from generalforecast.tabular import table_digest
 
 
@@ -224,6 +224,7 @@ def test_predictions_and_context_transactions(wire, asynchronous):
         "revision": 1,
         "environment": "production",
     }
+    # Production, the services' default, is named by omission.
     wire.expect(
         "POST",
         "/predictors/risk/predict",
@@ -262,10 +263,20 @@ def test_predictions_and_context_transactions(wire, asynchronous):
         {"digest": "sha256:" + "a" * 64, "sequence": 3},
         payload=reference.to_dict(),
     )
+    # A refresh answers with the import it ran, as hosted's imports.refresh does.
     wire.expect(
         "POST",
         "/contexts/history/refresh",
-        {"name": "history", "sequence": 3},
+        {
+            "context": "history",
+            "digest": "sha256:" + "b" * 64,
+            "rows": 4,
+            "sequence": 3,
+            "accepted_at": 1.0,
+            "receipt": "receipt-1",
+            "mode": "replace",
+            "continuous": False,
+        },
         payload={},
     )
     wire.expect("GET", "/contexts/history", {"name": "history", "sequence": 3})
@@ -310,7 +321,9 @@ def test_predictions_and_context_transactions(wire, asynchronous):
             assert (await invoke(live.import_source, reference)).digest.startswith(
                 "sha256:"
             )
-            assert (await invoke(live.refresh)).sequence == 3 and live.sequence == 0
+            refreshed = await invoke(live.refresh)
+            assert isinstance(refreshed, ImportReceipt)
+            assert (refreshed.sequence, refreshed.rows) == (3, 4) and live.sequence == 0
             assert (await invoke(live.status)).sequence == 3
         finally:
             await invoke(

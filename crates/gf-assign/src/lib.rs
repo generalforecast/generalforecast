@@ -17,4 +17,4 @@ pub mod rebalance;
 pub use assignment::{Assignment, Slice, Transfer};
 pub use key::Key;
 pub use policy::{Mode, Policy};
-pub use rebalance::{Rebalance, SliceLoad, rebalance};
+pub use rebalance::{Rebalance, SliceLoad, imbalance, rebalance};

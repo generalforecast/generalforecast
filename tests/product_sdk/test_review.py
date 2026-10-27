@@ -276,23 +276,19 @@ def test_async_refuses_compressed_bodies_before_consuming_or_decoding():
 
 
 def test_async_snapshot_encoding_and_digest_do_not_block_event_loop(wire, monkeypatch):
-    import generalforecast.async_client as module
+    import generalforecast._operations as module
 
-    original_arrow, original_digest = module.arrow_bytes, module.table_digest
     main_thread = threading.get_ident()
     calls = []
+    for name in ("table", "arrow_bytes", "bytes_digest"):
+        original = getattr(module, name)
 
-    def off_loop(function, data):
-        assert threading.get_ident() != main_thread
-        calls.append(function)
-        return function(data)
+        def off_loop(data, original=original):
+            assert threading.get_ident() != main_thread
+            calls.append(original.__name__)
+            return original(data)
 
-    monkeypatch.setattr(
-        module, "arrow_bytes", lambda data: off_loop(original_arrow, data)
-    )
-    monkeypatch.setattr(
-        module, "table_digest", lambda data: off_loop(original_digest, data)
-    )
+        monkeypatch.setattr(module, name, off_loop)
     wire.expect("POST", "/snapshots")
 
     async def run():
@@ -302,4 +298,4 @@ def test_async_snapshot_encoding_and_digest_do_not_block_event_loop(wire, monkey
             assert (await client.upload_snapshot({"x": [1]}))["rows"] == 1
 
     asyncio.run(run())
-    assert calls == [original_arrow, original_digest]
+    assert calls == ["table", "arrow_bytes", "bytes_digest"]

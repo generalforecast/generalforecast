@@ -13,12 +13,13 @@ use gf_core::columns::{Column, ColumnKind, Words};
 use gf_core::node::{FittedColumns, RowLayout, Scaling, TableLayout, Targets};
 use gf_core::pages::{Bucket, CellLayout, IndexLayout, PageId, PageLayout};
 use gf_core::table::RowId;
+use gf_server::definition::{CreationId, PastCapSpec, TableDefinition, TimeKind};
 use gf_server::name::TableName;
 use gf_server::protocol::{RecencySpec, StrategySpec};
 use gf_server::setup;
 use gf_server::wal::{
-    self, CreationId, EncryptionKey, HEAD_INTERVAL, Keys, Log, LogEntry, LogError, PastCapSpec,
-    PastWrite, Record, Rows, TableDefinition, Term, Terms, TimeKind, decode,
+    self, EncryptionKey, HEAD_INTERVAL, Keys, Log, LogEntry, LogError, PastWrite, Record, Rows,
+    Term, Terms, decode,
 };
 
 /// Opens a log and replays it whole: its definition, its records, and the log.
@@ -117,6 +118,7 @@ fn records() -> Vec<Record> {
                 column: 1,
                 values: vec!["north".to_string(), "south".to_string()],
             }],
+            series: Vec::new(),
             writes: Vec::new(),
             layout: None,
             table: None,
@@ -128,6 +130,7 @@ fn records() -> Vec<Record> {
             times: None,
             id: None,
             words: Vec::new(),
+            series: Vec::new(),
             writes: Vec::new(),
             layout: None,
             table: None,
@@ -140,6 +143,7 @@ fn records() -> Vec<Record> {
             times: Some(vec![None, Some(i64::MIN)]),
             id: None,
             words: Vec::new(),
+            series: Vec::new(),
             writes: Vec::new(),
             layout: None,
             table: None,
@@ -172,6 +176,113 @@ fn strategy_records_replay_as_written() {
         assert!(record.keys().is_empty());
         assert_eq!(record.write_id(), None);
     }
+}
+
+#[test]
+fn series_keys_travel_on_the_records_that_name_them() {
+    use gf_server::wal::{GivenKey, SeriesKey};
+
+    let directory = tempdir();
+    let path = directory.join("payments.log");
+    let named = vec![
+        SeriesKey {
+            digest: 1,
+            key: GivenKey::String("shoes".to_string()),
+        },
+        SeriesKey {
+            digest: 2,
+            key: GivenKey::Integer("-7".to_string()),
+        },
+        SeriesKey {
+            digest: 3,
+            key: GivenKey::Bytes("0aff".to_string()),
+        },
+        SeriesKey {
+            digest: 4,
+            key: GivenKey::Uuid("123e4567-e89b-12d3-a456-426614174000".to_string()),
+        },
+    ];
+    let observed = |series: &[SeriesKey]| Rows {
+        keys: vec![(1u128 << 64) | 100],
+        features: vec![1.0],
+        targets: Targets::Values(vec![0.5]),
+        times: Some(vec![Some(100)]),
+        id: None,
+        words: Vec::new(),
+        series: series.to_vec(),
+        writes: Vec::new(),
+        layout: None,
+        table: None,
+    };
+    let records = [
+        Record::Insert(observed(&named[..2])),
+        Record::Upsert(observed(&[])),
+        Record::Insert(observed(&named[2..])),
+    ];
+    let log = written(&path, &records);
+    drop(log);
+    let (_, replayed, _) = open(&path, &keys(7)).unwrap();
+    assert!(same(&replayed, &records));
+    assert_eq!(replayed[0].series(), &named[..2]);
+    assert!(replayed[1].series().is_empty());
+    assert_eq!(replayed[2].series(), &named[2..]);
+
+    // A compaction's snapshot carries every key the table holds.
+    let (_, _, mut log) = open(&path, &keys(7)).unwrap();
+    let snapshot = Record::Snapshot(observed(&named));
+    log.compact(&definition(), 3, std::slice::from_ref(&snapshot))
+        .unwrap();
+    drop(log);
+    let (_, replayed, _) = open(&path, &keys(7)).unwrap();
+    assert!(same(&replayed, &[snapshot]));
+    assert_eq!(replayed[0].series(), &named[..]);
+
+    // A key travels as its kind and text, and text not of its kind is refused.
+    let json = serde_json::to_value(&named[1]).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({"digest": 2, "key": {"kind": "integer", "value": "-7"}})
+    );
+    assert_eq!(serde_json::from_value::<SeriesKey>(json).unwrap(), named[1]);
+    // A key digests as generalforecast.keys digests it, and the series it
+    // names must be that digest's; text not of its kind is refused.
+    let digests: Vec<Result<u64, String>> = named.iter().map(|key| key.key.digest()).collect();
+    assert_eq!(
+        digests,
+        [
+            Ok(0x798e_6fd9_6d29_8952),
+            Ok(0xffff_ffff_ffff_fff9),
+            Ok(0xc3a5_576a_0913_d767),
+            Ok(0xa456_4266_1417_4000),
+        ]
+    );
+    assert_eq!(
+        GivenKey::Integer(u128::MAX.to_string()).digest(),
+        Ok(u64::MAX)
+    );
+    assert_eq!(
+        GivenKey::Uuid("00000000-0000-0000-0000-000000000004".to_string()).digest(),
+        Ok(4)
+    );
+    assert!(named.iter().all(|key| key.check().is_err()));
+    let own = SeriesKey {
+        digest: 0xffff_ffff_ffff_fff9,
+        key: named[1].key.clone(),
+    };
+    assert_eq!(own.check(), Ok(()));
+    assert!(GivenKey::Integer("1.5".to_string()).digest().is_err());
+    assert!(
+        GivenKey::Integer(format!("{}0", u128::MAX))
+            .digest()
+            .is_err()
+    );
+    assert!(GivenKey::Bytes("abc".to_string()).digest().is_err());
+    assert!(GivenKey::Bytes("0AFF".to_string()).digest().is_err());
+    assert!(
+        GivenKey::Uuid("123e4567e89b12d3a456426614174000".to_string())
+            .digest()
+            .is_err()
+    );
 }
 
 fn same(left: &[Record], right: &[Record]) -> bool {
@@ -336,9 +447,9 @@ fn logs_read_back_from_any_sequence_for_replicas() {
         log.append(&record).unwrap();
     }
 
-    let entries = log.read(0, usize::MAX).unwrap();
+    let entries = log.read(0, usize::MAX, usize::MAX).unwrap();
     let tail: Vec<Record> = log
-        .read(2, usize::MAX)
+        .read(2, usize::MAX, usize::MAX)
         .unwrap()
         .iter()
         .map(|(_, bytes)| record(bytes))
@@ -354,11 +465,11 @@ fn logs_read_back_from_any_sequence_for_replicas() {
         LogEntry::Definition(definition(), Terms::default())
     );
     assert!(same(&tail, &records()[1..]));
-    assert!(log.read(length, usize::MAX).unwrap().is_empty());
+    assert!(log.read(length, usize::MAX, usize::MAX).unwrap().is_empty());
     // A read past the end, as from a replica ahead of this copy, is refused.
     for from in [length + 1, u64::MAX] {
         assert!(matches!(
-            log.read(from, usize::MAX),
+            log.read(from, usize::MAX, usize::MAX),
             Err(LogError::Beyond { .. })
         ));
     }
@@ -367,7 +478,7 @@ fn logs_read_back_from_any_sequence_for_replicas() {
     let (_, _, mut log) = open(&path, &keys(7)).unwrap();
     log.append(&Record::Refit).unwrap();
     assert_eq!(log.length(), length + 1);
-    assert_eq!(log.read(length, usize::MAX).unwrap().len(), 1);
+    assert_eq!(log.read(length, usize::MAX, usize::MAX).unwrap().len(), 1);
 }
 
 #[test]
@@ -385,6 +496,7 @@ fn compaction_keeps_sequence_numbers() {
         times: Some(vec![Some(9)]),
         id: None,
         words: Vec::new(),
+        series: Vec::new(),
         writes: vec![PastWrite {
             id: "retried".to_string(),
             rows: 1,
@@ -409,14 +521,14 @@ fn compaction_keeps_sequence_numbers() {
     ));
     assert_eq!(log.length(), 8);
     let sequences: Vec<u64> = log
-        .read(0, usize::MAX)
+        .read(0, usize::MAX, usize::MAX)
         .unwrap()
         .iter()
         .map(|(sequence, _)| *sequence)
         .collect();
     assert_eq!(sequences, [0, 5, 6, 7]);
     // A replica that far behind gets the definition, for its terms, then the snapshot.
-    let behind = log.read(2, usize::MAX).unwrap();
+    let behind = log.read(2, usize::MAX, usize::MAX).unwrap();
     let sequences: Vec<u64> = behind.iter().map(|(sequence, _)| *sequence).collect();
     assert_eq!(sequences, [0, 5, 6, 7]);
     assert!(same(&[record(&behind[1].1)], &[snapshot]));
@@ -455,7 +567,7 @@ fn terms_survive_reopening_and_compaction() {
     let (_, _, log) = open(&path, &keys(7)).unwrap();
     assert_eq!(log.terms(), &terms);
     assert_eq!(
-        decode(&log.read(1, usize::MAX).unwrap()[0].1).unwrap(),
+        decode(&log.read(1, usize::MAX, usize::MAX).unwrap()[0].1).unwrap(),
         LogEntry::Definition(definition(), terms)
     );
 }
@@ -566,13 +678,13 @@ fn staged_records_become_durable_together_and_read_in_pages() {
     let (_, replayed, log) = open(&path, &keys(7)).unwrap();
     assert!(same(&replayed, &records()[..3]));
     let page: Vec<u64> = log
-        .read(1, 2)
+        .read(1, 2, usize::MAX)
         .unwrap()
         .iter()
         .map(|(sequence, _)| *sequence)
         .collect();
     assert_eq!(page, [1, 2]);
-    assert_eq!(log.read(3, 2).unwrap().len(), 1);
+    assert_eq!(log.read(3, 2, usize::MAX).unwrap().len(), 1);
 }
 
 #[test]
@@ -615,6 +727,7 @@ fn a_crash_on_either_side_of_compactions_rename_leaves_a_whole_log() {
         times: Some(vec![Some(9)]),
         id: None,
         words: Vec::new(),
+        series: Vec::new(),
         writes: Vec::new(),
         layout: None,
         table: None,
@@ -680,6 +793,7 @@ fn a_late_compaction_of_a_dropped_table_leaves_its_successor_alone() {
         times: Some(vec![Some(9)]),
         id: None,
         words: Vec::new(),
+        series: Vec::new(),
         writes: Vec::new(),
         layout: None,
         table: None,
@@ -810,19 +924,19 @@ fn rotation_keeps_every_entry_and_its_sequence() {
         previous: vec![key(7)],
     };
     let (_, before, mut log) = open(&path, &rotated).unwrap();
-    let entries = log.read(0, usize::MAX).unwrap();
+    let entries = log.read(0, usize::MAX, usize::MAX).unwrap();
 
     log.rotate().unwrap();
 
     // The same entries at the same sequence numbers, as copies elsewhere hold
     // them, where a compaction would have added one.
     assert!(!log.needs_rotation());
-    assert_eq!(log.read(0, usize::MAX).unwrap(), entries);
+    assert_eq!(log.read(0, usize::MAX, usize::MAX).unwrap(), entries);
     drop(log);
     let (_, after, log) = open(&path, &keys(8)).unwrap();
     assert!(same(&after, &before));
     assert_eq!(log.length(), records().len() as u64 + 1);
-    log.read(1, usize::MAX).unwrap();
+    log.read(1, usize::MAX, usize::MAX).unwrap();
 }
 
 #[test]
@@ -921,6 +1035,7 @@ fn a_compactions_layout_comes_back_to_the_bit() {
         times: Some(vec![Some(9)]),
         id: None,
         words: Vec::new(),
+        series: Vec::new(),
         writes: Vec::new(),
         layout: Some(RowLayout {
             ids: vec![RowId(5)],
@@ -974,7 +1089,7 @@ fn a_compactions_layout_comes_back_to_the_bit() {
 #[test]
 fn series_definitions_name_their_columns_and_replay() {
     use gf_core::forecasting::GroupStrategy;
-    use gf_server::wal::{GroupSpec, SeriesDefinition};
+    use gf_server::definition::{GroupSpec, SeriesDefinition};
 
     let series = |known: Vec<&str>, step: u64| {
         Some(Box::new(SeriesDefinition {
@@ -1027,4 +1142,70 @@ fn series_definitions_name_their_columns_and_replay() {
     drop(log);
     let (replayed, _, _) = open(&path, &keys(7)).unwrap();
     assert_eq!(replayed, definition);
+}
+
+#[test]
+fn a_creation_cut_short_inside_its_definition_is_set_aside_and_frees_its_name() {
+    let directory = tempdir();
+    let path = directory.join("payments.log");
+    let keys = Keys::only(key(7));
+    drop(Log::create(&path, &key(7), &definition(), Terms::default()).unwrap());
+    // A crash after the head was written, before the definition reached disk.
+    for length in [26, 16] {
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(length)
+            .unwrap();
+        assert!(matches!(
+            Log::open(&path, &keys).err(),
+            Some(LogError::Unfinished)
+        ));
+        assert!(setup::open_log(&path, &keys).unwrap().is_none());
+        assert!(!path.exists(), "the cut-short log is set aside");
+        drop(Log::create(&path, &key(7), &definition(), Terms::default()).unwrap());
+        assert!(open(&path, &keys).is_ok(), "the name takes a new creation");
+    }
+}
+
+#[test]
+fn a_page_of_entries_stops_at_its_byte_bound_past_its_first_entry() {
+    let directory = tempdir();
+    let path = directory.join("payments.log");
+    let log = written(&path, &records());
+    let all = log.read(0, usize::MAX, usize::MAX).unwrap();
+    assert!(all.len() > 2);
+    let first = log.read(0, usize::MAX, 0).unwrap();
+    assert_eq!(first.len(), 1, "a page always takes its first entry");
+    let sizes: Vec<usize> = all.iter().map(|(_, plain)| plain.len()).collect();
+    // A page with room for the first two sealed entries and not the third.
+    let sealed = |plain: usize| plain + 8 + 24 + 16;
+    let room = sealed(sizes[0]) + sealed(sizes[1]);
+    let page = log.read(0, usize::MAX, room).unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page, all[..2]);
+}
+
+#[test]
+fn a_log_whose_head_names_records_is_refused_not_freed_when_cut_inside_its_definition() {
+    let directory = tempdir();
+    let path = directory.join("payments.log");
+    let keys = Keys::only(key(7));
+    drop(written(&path, &records()));
+    OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(26)
+        .unwrap();
+    assert!(matches!(
+        Log::open(&path, &keys).err(),
+        Some(LogError::Head(_))
+    ));
+    assert!(setup::open_log(&path, &keys).unwrap().is_none());
+    assert!(
+        path.exists(),
+        "a log that lost acknowledged records stays where it is"
+    );
 }

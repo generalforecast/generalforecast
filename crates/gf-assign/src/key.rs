@@ -6,8 +6,8 @@
 /// A point in a table's key space.
 pub type Key = u64;
 
-/// The splitmix64 finalizer.
-fn mix(mut x: u64) -> u64 {
+/// The splitmix64 finalizer, which spreads every input bit over the output.
+pub fn mix(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     x ^ (x >> 31)
@@ -21,6 +21,11 @@ pub fn hashed(bytes: &[u8]) -> Key {
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
     mix(h)
+}
+
+/// The key of a 128-bit row key: its halves folded together, then mixed.
+pub fn wide(key: u128) -> Key {
+    mix((key as u64) ^ ((key >> 64) as u64).rotate_left(32))
 }
 
 /// The key of a number placed in order, so a range of numbers is a range of keys.
@@ -50,5 +55,14 @@ mod tests {
         let b = hashed(&2u64.to_le_bytes());
         assert!(a.abs_diff(b) > 1 << 40);
         assert_eq!(a, hashed(&1u64.to_le_bytes()));
+    }
+
+    #[test]
+    fn wide_keys_read_both_halves() {
+        let low = 7u128;
+        let high = 7u128 << 64;
+        assert_ne!(wide(low), wide(high));
+        assert_ne!(wide(low), wide(low | high));
+        assert_eq!(wide(low), mix(7));
     }
 }

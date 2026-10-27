@@ -18,9 +18,10 @@ use serde::{Deserialize, Serialize};
 use tonic::Status;
 
 use crate::auth::Scope;
+use crate::definition::{CreationId, TableDefinition};
 use crate::name::TableName;
 use crate::protocol::StrategySpec;
-use crate::wal::{CreationId, TableDefinition, Terms};
+use crate::wal::Terms;
 
 /// The longest a client's write id may be.
 const WRITE_ID_BYTES: usize = 64;
@@ -38,6 +39,9 @@ pub enum FlightAction {
         table: TableName,
         words: bool,
     },
+    /// The keys of a table's series as clients gave them, which the table
+    /// keeps and replays as user data, in the order it first saw them.
+    KnownSeries(TableName),
     Delete(DeleteAction),
     Truncate(TableName),
     Refit(TableName),
@@ -195,6 +199,7 @@ impl FlightAction {
                 let Describe { table, words } = body(action)?;
                 Self::Describe { table, words }
             }
+            "known_series" => Self::KnownSeries(body::<Table>(action)?.table),
             "delete" => Self::Delete(body(action)?),
             "truncate" => Self::Truncate(body::<Table>(action)?.table),
             "refit" => Self::Refit(body::<Table>(action)?.table),
@@ -266,6 +271,7 @@ impl FlightAction {
             Self::Locate(_) => "locate",
             Self::CreateTable(_) => "create_table",
             Self::Describe { .. } => "describe",
+            Self::KnownSeries(_) => "known_series",
             Self::Delete(_) => "delete",
             Self::Truncate(_) => "truncate",
             Self::Refit(_) => "refit",
@@ -291,6 +297,7 @@ impl FlightAction {
             Self::Delete(delete) => Some(&delete.table),
             Self::Locate(table)
             | Self::Describe { table, .. }
+            | Self::KnownSeries(table)
             | Self::Truncate(table)
             | Self::Refit(table)
             | Self::SetStrategy { table, .. }
@@ -340,19 +347,27 @@ impl FlightAction {
         matches!(self, Self::Delete(_) | Self::Truncate(_))
     }
 
+    /// Whether it acts on every table of the server at once, as moving
+    /// tables by load or profiling the workers does, so only a token whose
+    /// scope reaches every table may make it.
+    #[must_use]
+    pub fn needs_every_table(&self) -> bool {
+        matches!(self, Self::Rebalance | Self::ProfileWorkers { .. })
+    }
+
     /// Refuses the action if a token's scope does not reach its table, or
     /// every table for an action on the whole server.
     ///
     /// # Errors
     ///
     /// As `Scope::check` and `Scope::check_create`, and `PERMISSION_DENIED`
-    /// for `profile_workers` under any scope but the unscoped one.
+    /// for an action on every table under any scope but the unscoped one.
     pub fn check_scope(&self, scope: &Scope) -> Result<(), Status> {
         match self {
             Self::CreateTable(definition) => scope.check_create(&definition.name),
-            Self::ProfileWorkers { .. } if *scope != Scope::All => Err(Status::permission_denied(
-                "profile_workers needs an unscoped token",
-            )),
+            action if action.needs_every_table() && *scope != Scope::All => Err(
+                Status::permission_denied(format!("{} needs an unscoped token", action.name())),
+            ),
             other => other.table().map_or(Ok(()), |table| scope.check(table)),
         }
     }

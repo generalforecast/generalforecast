@@ -6,18 +6,25 @@
 //! own shard, which a request's context reaches by `routes::Routes`. The
 //! server starts its shards so, and an engine embedding them does too.
 
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use gf_core::node::Task;
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::config::{Config, WorkerConfig};
+use crate::engine;
+use crate::error::ServerError;
 use crate::metrics::Metrics;
+use crate::name::TableName;
 use crate::routes::Routes;
+use crate::service::{Placement, SeriesPlacement};
+use crate::setup;
 use crate::shard::{Command, Shard, ShardSettings};
-use crate::wal::EncryptionKey;
+use crate::wal::{EncryptionKey, Keys};
 use crate::worker::{
     CPU_WORKER_CORES, Launch, WorkerConnection, allowed_cpus, cpu_groups, visible_gpus,
 };
@@ -156,4 +163,98 @@ pub async fn start(
         shards.push(shard.spawn()?);
     }
     Ok((shards, routes))
+}
+
+/// Serves every table logged under `tables` from its log, until
+/// `interrupted`, and answers where the tables Flight serves went.
+///
+/// A table one of `bound`, the front's snapshot predictors, binds its rows
+/// into is restored on the shard its fingerprint names, where binding
+/// finds it to bind again, and Flight does not serve it. Every other table
+/// is Flight's, as it was before.
+///
+/// # Errors
+///
+/// If a log is sealed under a key `keys` lacks, a shard stopped, or a log
+/// sealed under a previous key cannot be rewritten under the current one.
+pub async fn restore(
+    shards: &[mpsc::Sender<Command>],
+    tables: &Path,
+    keys: &Keys,
+    bound: Option<&HashMap<TableName, [u8; 32]>>,
+    interrupted: &watch::Receiver<bool>,
+) -> Result<HashMap<TableName, Placement>, Box<dyn Error + Send + Sync>> {
+    let mut placement = HashMap::new();
+    for (index, path) in setup::table_logs(tables)?.iter().enumerate() {
+        if *interrupted.borrow() {
+            break;
+        }
+        // A log under a key the server lacks refuses the start, rather than
+        // leave its table out until a start that has the key.
+        let Some(replay) =
+            setup::open_log(path, keys).map_err(|error| format!("{}: {error}", path.display()))?
+        else {
+            continue;
+        };
+        let definition = replay.definition().clone();
+        let name = definition.name.clone();
+        let rotate = replay.needs_rotation();
+        let fingerprint = bound.and_then(|bound| bound.get(&name));
+        let shard = fingerprint.map_or(index % shards.len(), |fingerprint| {
+            engine::bound_shard(fingerprint, shards.len())
+        });
+        let restored = ask(&shards[shard], |reply| Command::Restore {
+            replay: Box::new(replay),
+            reply,
+        })
+        .await?;
+        // A table that cannot be served, such as one whose model left the
+        // configuration, keeps its log and leaves the others to start.
+        let levels = match restored {
+            Ok(levels) => levels,
+            Err(error) => {
+                tracing::error!(table = name.as_str(), "not serving a table: {error}");
+                continue;
+            }
+        };
+        if rotate {
+            // Rewrites the log under the current key before it takes writes.
+            let table = name.clone();
+            ask(&shards[shard], |reply| Command::Rotate { table, reply }).await??;
+            tracing::info!(
+                table = name.as_str(),
+                "rewrote the log under the current key"
+            );
+        }
+        tracing::info!(table = name.as_str(), shard, "restored");
+        if fingerprint.is_none() {
+            placement.insert(
+                name,
+                Placement {
+                    shard,
+                    task: Task::of_classes(definition.classes),
+                    columns: Arc::new(definition.columns.clone()),
+                    created: definition.created.clone(),
+                    levels: levels.map(Arc::new),
+                    series: SeriesPlacement::of(&definition),
+                },
+            );
+        }
+    }
+    Ok(placement)
+}
+
+/// Sends `shard` a command and waits for its answer.
+async fn ask<T>(
+    shard: &mpsc::Sender<Command>,
+    command: impl FnOnce(oneshot::Sender<Result<T, ServerError>>) -> Command,
+) -> Result<Result<T, ServerError>, Box<dyn Error + Send + Sync>> {
+    let (reply, answer) = oneshot::channel();
+    shard
+        .send(command(reply))
+        .await
+        .map_err(|_| "a shard stopped while the tables restored")?;
+    Ok(answer
+        .await
+        .map_err(|_| "a shard stopped while the tables restored")?)
 }

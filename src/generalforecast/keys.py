@@ -17,7 +17,7 @@ import contextlib
 import hashlib
 import re
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -105,6 +105,55 @@ def series_keys(series: Any, times: Any) -> tuple[np.ndarray, np.ndarray]:
         raise ValueError(f"expected {len(keys)} times, got shape {stamps.shape}")
     digests = np.ascontiguousarray(keys.halves[:, 0])
     return digests, np.column_stack([stamps.view(np.uint64), digests])
+
+
+def spec_of_key(value: Any) -> dict[str, str]:
+    """A key as given, as servers keep it: its kind and its text.
+
+    A table of series keeps the keys of its series this way, so a client that
+    opens the table later can name them. An integer's text is its decimal
+    digits, a string's is itself, bytes' is lowercase hex, and a UUID's is its
+    hyphenated form.
+
+    Raises:
+        TypeError: If the value is not a key.
+    """
+    if isinstance(value, bool | np.bool_):
+        raise TypeError("a key is an integer, string, bytes or UUID, not a boolean")
+    if isinstance(value, int | np.integer):
+        return {"kind": "integer", "value": str(int(value))}
+    if isinstance(value, uuid.UUID):
+        return {"kind": "uuid", "value": str(value)}
+    if isinstance(value, str):
+        return {"kind": "string", "value": value}
+    if isinstance(value, bytes):
+        return {"kind": "bytes", "value": value.hex()}
+    raise TypeError(
+        f"a key is an integer, string, bytes or UUID, not {type(value).__name__}"
+    )
+
+
+def key_of_spec(spec: Mapping[str, Any]) -> Key:
+    """The key a server kept as its kind and text; see `spec_of_key`.
+
+    Raises:
+        ValueError: If the spec is not a key's.
+    """
+    try:
+        kind, text = spec["kind"], spec["value"]
+        match kind:
+            case "integer":
+                return int(text)
+            case "string":
+                return str(text)
+            case "bytes":
+                return bytes.fromhex(text)
+            case "uuid":
+                return uuid.UUID(text)
+            case _:
+                raise ValueError(f"unknown key kind {kind!r}")
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"not a key: {spec!r}") from error
 
 
 def _wide(value: Any) -> int:

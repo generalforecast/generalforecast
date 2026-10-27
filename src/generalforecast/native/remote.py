@@ -26,7 +26,7 @@ from generalforecast.columns import (
     columns_of,
     prepare,
 )
-from generalforecast.keys import Key, Keys, keys_of
+from generalforecast.keys import Key, Keys, key_of_spec, keys_of, spec_of_key
 from generalforecast.native.client import (
     _REBUILD_WAIT,
     Answer,
@@ -84,6 +84,22 @@ def _retry_once(call: Callable[[], Any]) -> Any:
         return call()
     except flight.FlightUnavailableError:
         return call()
+
+
+def _series_key_column(digests: np.ndarray, given: np.ndarray) -> Any:
+    """Each observation's series key as the server keeps it, dictionary-encoded.
+
+    The server reads each series' key once by its digest, so the column
+    carries each distinct key's JSON once and an index per observation.
+    """
+    import pyarrow as pa
+
+    _, first, indices = np.unique(digests, return_index=True, return_inverse=True)
+    specs = [json.dumps(spec_of_key(key)) for key in given[first].tolist()]
+    return pa.DictionaryArray.from_arrays(
+        pa.array(indices.astype(np.int32), type=pa.int32()),
+        pa.array(specs, type=pa.string()),
+    )
 
 
 def _split(batch: Any) -> list[Any]:
@@ -280,7 +296,7 @@ class RemoteSeriesTable(SeriesTable):
     def _change(self, kind: str, rows: Any) -> None:
         import pyarrow as pa
 
-        stamps, keys = self._placed(rows)
+        stamps, keys, given = self._placed(rows)
         if not len(keys):
             return
         prepared, _ = prepare(rows, (*self.columns, Column(self.target)))
@@ -290,6 +306,7 @@ class RemoteSeriesTable(SeriesTable):
             np.ascontiguousarray(prepared[-1], dtype=np.float32), type=pa.float32()
         )
         columns["time"] = pa.array(stamps)
+        columns["series_key"] = _series_key_column(keys[:, 1], given)
         self._put(kind, pa.RecordBatch.from_pydict(columns))
 
     @override
@@ -304,7 +321,7 @@ class RemoteSeriesTable(SeriesTable):
     def delete(self, rows: Any, missing_ok: bool = False) -> None:
         import pyarrow as pa
 
-        _, keys = self._placed(rows)
+        _, keys, _ = self._placed(rows)
         if not len(keys):
             return
         batch = pa.RecordBatch.from_pydict({"key": Keys(keys, keys[:, 1]).arrow()})
@@ -313,6 +330,22 @@ class RemoteSeriesTable(SeriesTable):
     @override
     def truncate(self) -> None:
         self._client._action("truncate", {"table": self.name})
+
+    @override
+    def known_series(self) -> list[Any]:
+        """The keys of the server's series as given, in the order it first saw them.
+
+        The server keeps each series' key with its observations and replays
+        them with its log, so a client that opens the table later gets them
+        too; a truncated table holds none.
+        """
+        known = self._client._action("known_series", {"table": self.name})[0]
+        keys = []
+        for named in known:
+            key = key_of_spec(named["key"])
+            self._names.setdefault(int(named["digest"]), key)
+            keys.append(key)
+        return keys
 
     @override
     def forecast(
@@ -1138,6 +1171,10 @@ class AsyncRemoteSeriesTable:
     async def truncate(self) -> None:
         """`RemoteSeriesTable.truncate`, awaited off the event loop."""
         await self._client._run(self._table.truncate)
+
+    async def known_series(self) -> list[Any]:
+        """`RemoteSeriesTable.known_series`, awaited off the event loop."""
+        return await self._client._run(self._table.known_series)
 
     async def forecast(
         self,

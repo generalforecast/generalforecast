@@ -140,3 +140,74 @@ def test_root_estimators_are_lazy_and_owned_by_the_estimator_module(monkeypatch)
     assert gf.__getattr__("Classifier") is owner.Classifier
     assert gf.__getattr__("Regressor") is owner.Regressor
     assert gf.__getattr__("Forecaster") is owner.Forecaster
+
+
+def test_every_row_form_normalizes_alike():
+    import pandas as pd
+
+    from generalforecast import tabular
+
+    columns = {
+        "count": np.array([1, 2], dtype=np.int32),
+        "score": [float("nan"), 2.5],
+        "plan": pd.Categorical(["a", "b"]),
+    }
+    as_mapping = tabular.frame(columns)
+    assert as_mapping.equals(tabular.frame(pd.DataFrame(columns)))
+    assert as_mapping.schema.types == [pa.int64(), pa.float64(), pa.string()]
+    assert as_mapping["score"].null_count == 1
+    with pytest.raises(gf.InvalidInput):
+        tabular.frame({"score": [float("inf")]})
+
+
+def test_remote_rows_are_read_only_over_the_hardened_transport(monkeypatch):
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from generalforecast import tabular
+
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *_args):
+            pass
+
+        def do_GET(self):
+            seen.append((self.path, self.headers.get("Authorization")))
+            if self.path.startswith("/moved"):
+                self.send_response(302)
+                self.send_header("Location", "https://elsewhere.example/rows.csv")
+                self.end_headers()
+                return
+            data = b"x,y\n1,2\n"
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    base = f"http://127.0.0.1:{server.server_port}"
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+    try:
+        assert tabular.frame(base + "/rows.csv?sig=s").to_pylist() == [{"x": 1, "y": 2}]
+        with pytest.raises(gf.InvalidInput) as moved:
+            tabular.frame(base + "/moved/rows.csv?sig=SECRET")
+        assert "SECRET" not in str(moved.value)
+        assert "forwarding is disabled" in moved.value.message
+    finally:
+        server.shutdown()
+        server.server_close()
+        worker.join()
+    assert seen == [("/rows.csv?sig=s", None), ("/moved/rows.csv?sig=SECRET", None)]
+    with pytest.raises(gf.InvalidInput) as plain:
+        tabular.frame("http://rows.example/rows.csv?sig=SECRET")
+    assert "SECRET" not in str(plain.value) and "HTTPS" in plain.value.message
+
+
+def test_empty_rows_are_an_empty_table_in_every_container():
+    from generalforecast import tabular
+
+    for empty in ([], (), {}):
+        assert tabular.frame(empty).num_columns == 0

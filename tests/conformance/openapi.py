@@ -211,6 +211,8 @@ class Example:
     schema: dict[str, Any]
     value: Any
     invalid: bool = False
+    # False for the routes outside the envelope: health and the CLI login.
+    envelope: bool = True
 
     @property
     def id(self) -> str:
@@ -224,9 +226,11 @@ def examples(spec: dict[str, Any]) -> list[Example]:
     for path, methods in spec["paths"].items():
         for method, operation in methods.items():
             tags = tuple(operation.get("tags", []))
+            envelope = operation.get("x-gf-envelope", "health" not in tags)
             body = operation.get("requestBody")
-            if body is not None:
-                media = body["content"]["application/json"]
+            # A body that is not JSON, such as an Arrow stream, has no examples.
+            media = None if body is None else body["content"].get("application/json")
+            if media is not None:
                 for name, example in media.get("examples", {}).items():
                     found.append(
                         Example(
@@ -240,6 +244,7 @@ def examples(spec: dict[str, Any]) -> list[Example]:
                             media["schema"],
                             example["value"],
                             bool(example.get("x-gf-invalid", False)),
+                            envelope,
                         )
                     )
             for status, response in operation["responses"].items():
@@ -258,6 +263,7 @@ def examples(spec: dict[str, Any]) -> list[Example]:
                             name,
                             media["schema"],
                             example["value"],
+                            envelope=envelope,
                         )
                     )
     return found
