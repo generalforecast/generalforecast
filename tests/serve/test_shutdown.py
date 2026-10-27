@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 from pathlib import Path
@@ -183,3 +184,38 @@ def test_a_terminal_sees_one_stopped_line(tmp_path):
     assert len(lines) == 1, lines
     assert lines[0].startswith("\x1b[1;32m     Stopped\x1b[0m after "), lines
     _assert_quiet(process.stderr.read())
+
+
+def test_a_server_stops_when_the_process_that_started_it_is_killed(tmp_path):
+    """No exit handler runs under SIGKILL; the server sees its parent's pipe close."""
+    from tests.utils.server import build
+
+    code = textwrap.dedent(
+        f"""
+        import time
+        from pathlib import Path
+        from tests.utils.server import Server
+        server = Server(Path({str(build())!r}), Path({str(tmp_path)!r})).start()
+        Path({str(tmp_path / "pid")!r}).write_text(str(server.process.pid))
+        time.sleep(600)
+        """
+    )
+    parent = subprocess.Popen(
+        [sys.executable, "-c", code],
+        stdout=subprocess.DEVNULL,
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT)},
+    )
+    try:
+        deadline = time.monotonic() + 300
+        while not (tmp_path / "pid").exists():
+            assert parent.poll() is None and time.monotonic() < deadline
+            time.sleep(0.2)
+        server = int((tmp_path / "pid").read_text())
+        workers = _children(server)
+        assert workers
+        parent.kill()
+        parent.wait(30)
+        _assert_exited([server, *workers], seconds=120)
+    finally:
+        parent.kill()

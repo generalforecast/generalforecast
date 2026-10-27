@@ -218,6 +218,8 @@ def test_router_check_reports_and_fails_with_the_routers_words(monkeypatch, tmp_
 
 def test_serving_a_node_or_router_becomes_its_server(monkeypatch, tmp_path):
     monkeypatch.delenv("GF_OFFLINE", raising=False)
+    # A launcher's parent pipe reaches the server through the exec.
+    monkeypatch.setenv("GF_PARENT_FD", "7")
     started = []
     monkeypatch.setattr(listener, "binary", lambda name: tmp_path / name)
     monkeypatch.setattr(
@@ -244,6 +246,7 @@ def test_serving_a_node_or_router_becomes_its_server(monkeypatch, tmp_path):
     assert node_args[1:] == router_args[1:] == ["run", "--config", str(config)]
     assert node_env["HF_HUB_OFFLINE"] == node_env["GF_OFFLINE"] == "1"
     assert "GF_OFFLINE" not in router_env
+    assert node_env["GF_PARENT_FD"] == router_env["GF_PARENT_FD"] == "7"
 
 
 def test_metrics_are_configured_only_when_asked_for(tmp_path):

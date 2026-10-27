@@ -9,6 +9,11 @@ target, writes the server's configuration to a private directory and
 becomes the server, so signals reach it directly. A node or a router runs
 from a configuration file its `init` wrote, which `check` validates.
 
+A launcher that wants the server gone when it dies starts `gf serve` with
+`GF_PARENT_FD` naming the read end of a pipe whose write end it keeps, as
+gf-server reads it: the variable and the inherited descriptor pass through
+the exec, so the server stops when the launcher's end closes.
+
 The servers need Linux or macOS: they replace this process, signal their
 workers and talk to them over Unix sockets. Elsewhere these commands refuse
 before doing anything.

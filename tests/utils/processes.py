@@ -7,6 +7,12 @@ A server's workers share its group, so stopping the group stops them all.
 Every group still running when the test process ends, whether its tests
 finished, failed, timed out or were terminated, is killed: on interpreter
 exit, and on SIGTERM or SIGHUP, as pytest-xdist and CI runners send them.
+
+A process killed outright runs no exit handler, so each server also gets
+the read end of a pipe in `GF_PARENT_FD`, whose write end only this process
+holds: gf-server and gf-router stop when it closes, however this process
+ends. `gf serve` hands the variable and the descriptor on to the gf-server
+it becomes.
 """
 
 from __future__ import annotations
@@ -20,16 +26,34 @@ import time
 from collections.abc import Iterator
 from typing import Any
 
-# The groups started and not yet stopped, by leader pid.
-_STARTED: dict[int, subprocess.Popen] = {}
+# The variable that names the descriptor a server watches for its parent's exit.
+PARENT_FD = "GF_PARENT_FD"
+# The groups started and not yet stopped, by leader pid, with the write end
+# of the pipe each one's server watches.
+_STARTED: dict[int, tuple[subprocess.Popen, int]] = {}
 _ARMED = False
 
 
 def start(arguments: list[str], **options: Any) -> subprocess.Popen:
-    """Starts a process as the leader of a new process group."""
+    """Starts a process as the leader of a new process group, watching this one."""
     _arm()
-    process = subprocess.Popen(arguments, start_new_session=True, **options)
-    _STARTED[process.pid] = process
+    watched, holder = os.pipe()
+    environment = dict(options.pop("env", None) or os.environ)
+    environment[PARENT_FD] = str(watched)
+    try:
+        process = subprocess.Popen(
+            arguments,
+            start_new_session=True,
+            pass_fds=(watched, *options.pop("pass_fds", ())),
+            env=environment,
+            **options,
+        )
+    except BaseException:
+        os.close(holder)
+        raise
+    finally:
+        os.close(watched)
+    _STARTED[process.pid] = (process, holder)
     return process
 
 
@@ -66,7 +90,9 @@ def _kill_group(process: subprocess.Popen) -> None:
         process.wait(10)
     except subprocess.TimeoutExpired:
         pass
-    _STARTED.pop(process.pid, None)
+    _, holder = _STARTED.pop(process.pid, (None, None))
+    if holder is not None:
+        os.close(holder)
 
 
 @contextlib.contextmanager
@@ -77,12 +103,12 @@ def scoped() -> Iterator[None]:
         yield
     finally:
         for pid in set(_STARTED) - before:
-            _kill_group(_STARTED[pid])
+            _kill_group(_STARTED[pid][0])
 
 
 def stop_all() -> None:
     """Kills every group still running."""
-    for process in list(_STARTED.values()):
+    for process, _ in list(_STARTED.values()):
         _kill_group(process)
 
 
