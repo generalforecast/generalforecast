@@ -5,14 +5,19 @@ import type {
   ApiError,
   Envelope,
   ErrorCode,
+  Label,
+  LiveContext,
+  LiveContextList,
   Manifest,
   Model,
   ModelList,
   Predictor,
   PredictorList,
   Queries,
+  Receipt,
   ResourceKind,
   Result,
+  Row,
 } from "./types.js";
 import { ERROR_CODES, ROUTES, VERSION } from "./types.js";
 
@@ -41,6 +46,23 @@ export interface PredictOptions {
   queries: Queries["queries"];
   context?: Queries["context"];
   asOf?: string;
+  /** the hosted environment whose revision scores the queries; `production` if left out */
+  env?: string;
+}
+
+export interface AppendOptions {
+  /** the rows, each with the context's id column, 1 to 100 per call */
+  rows: Row[];
+  /** names the write, so a retry with the same id applies once */
+  writeId: string;
+}
+
+export interface LabelOptions {
+  target: string;
+  /** each row's id and target value, 1 to 100 per call */
+  labels: Label[];
+  /** names the write, so a retry with the same id applies once */
+  writeId: string;
 }
 
 /** An API error: the server's `error` object plus the request id from the envelope. */
@@ -103,6 +125,7 @@ export class GeneralForecast {
 
   readonly predictors: Predictors;
   readonly models: Models;
+  readonly contexts: Contexts;
 
   constructor(options: Options) {
     if (!options.project) throw new TypeError("project is required");
@@ -113,6 +136,7 @@ export class GeneralForecast {
     this.requestId = options.requestId ?? randomRequestId;
     this.predictors = new Predictors(this);
     this.models = new Models(this);
+    this.contexts = new Contexts(this);
   }
 
   /** Score queries with an ad hoc predictor: a manifest fragment plus `context` and `queries` rows. */
@@ -148,19 +172,22 @@ export class GeneralForecast {
     );
   }
 
-  /** Send one enveloped request and unwrap its reply. */
+  /** Send one enveloped request and unwrap its reply; `query` goes in the URL. */
   async call<T>(
     route: { method: string; path: string },
     params: Record<string, string>,
     resource: { kind: ResourceKind; name: string },
     payload?: object,
+    query?: Record<string, string>,
   ): Promise<T> {
     const requestId = this.requestId();
-    const path = route.path.replace(/\{([a-z_]+)\}/g, (_, key: string) => {
-      const value = params[key];
-      if (value === undefined) throw new TypeError(`route needs ${key}`);
-      return encodeURIComponent(value);
-    });
+    const search = query === undefined ? "" : new URLSearchParams(query).toString();
+    const path =
+      route.path.replace(/\{([a-z_]+)\}/g, (_, key: string) => {
+        const value = params[key];
+        if (value === undefined) throw new TypeError(`route needs ${key}`);
+        return encodeURIComponent(value);
+      }) + (search ? "?" + search : "");
     const headers: Record<string, string> = {
       Accept: "application/json",
       "X-GF-Request-ID": requestId,
@@ -225,6 +252,7 @@ export class Predictors {
       { project: this.client.project, name },
       { kind: "predictor", name },
       payload,
+      options.env === undefined ? undefined : { env: options.env },
     );
   }
 
@@ -264,6 +292,48 @@ export class Models {
       ROUTES["models.get"],
       { project: this.client.project, model: name },
       { kind: "model", name },
+    );
+  }
+}
+
+/** Hosted live contexts: rows a predictor's context reads, appended and labeled as they arrive. */
+export class Contexts {
+  constructor(private readonly client: GeneralForecast) {}
+
+  async list(): Promise<LiveContext[]> {
+    const result = await this.client.call<LiveContextList>(
+      ROUTES["contexts.list"],
+      { project: this.client.project },
+      { kind: "context", name: "contexts" },
+    );
+    return result.contexts;
+  }
+
+  async get(name: string): Promise<LiveContext> {
+    return this.client.call<LiveContext>(
+      ROUTES["contexts.show"],
+      { project: this.client.project, name },
+      { kind: "context", name },
+    );
+  }
+
+  /** Append rows; the receipt is durable acceptance, not yet serving visibility. */
+  async append(name: string, options: AppendOptions): Promise<Receipt> {
+    return this.client.call<Receipt>(
+      ROUTES["contexts.append"],
+      { project: this.client.project, name },
+      { kind: "context", name },
+      { write_id: options.writeId, rows: options.rows },
+    );
+  }
+
+  /** Attach one target's values to rows already in the context. */
+  async label(name: string, options: LabelOptions): Promise<Receipt> {
+    return this.client.call<Receipt>(
+      ROUTES["contexts.label"],
+      { project: this.client.project, name },
+      { kind: "context", name },
+      { write_id: options.writeId, target: options.target, labels: options.labels },
     );
   }
 }

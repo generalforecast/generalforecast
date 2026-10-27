@@ -247,7 +247,8 @@ function client(log) {
 
 test("the spec has request examples for every POST route and a reply for each", () => {
   for (const [name, route] of Object.entries(ROUTES)) {
-    if (route.method !== "POST") continue;
+    // An Arrow upload's body is a stream, not an example.
+    if (route.method !== "POST" || route.body !== "application/json") continue;
     assert.ok(paired(route.path, "POST").length > 0, `${name} has examples`);
   }
 });
@@ -396,4 +397,51 @@ test("a reply that does not echo the request is refused", async () => {
       ),
   });
   await assert.rejects(gf.predictors.predict("churn", { queries: [{ x: 1 }] }), (error) => error instanceof GFError && error.code === "Internal");
+});
+
+test("contexts list, show, append and label through the envelope", async () => {
+  const log = [];
+  const gf = client(log);
+  const append = paired(ROUTES["contexts.append"].path, "POST")[0];
+  const label = paired(ROUTES["contexts.label"].path, "POST")[0];
+  const name = append.request.value.resource.name;
+  const contexts = await gf.contexts.list();
+  assert.ok(contexts.length > 0);
+  assert.equal((await gf.contexts.get(name)).name, name);
+  const appended = await gf.contexts.append(name, {
+    writeId: append.request.value.payload.write_id,
+    rows: append.request.value.payload.rows,
+  });
+  assert.deepEqual(appended, append.response.value.result);
+  const labeled = await gf.contexts.label(name, {
+    writeId: label.request.value.payload.write_id,
+    target: label.request.value.payload.target,
+    labels: label.request.value.payload.labels,
+  });
+  assert.deepEqual(labeled, label.response.value.result);
+  assert.deepEqual(
+    log.map((call) => `${call.method} ${call.pathname}`),
+    [
+      "GET /v1/projects/acme/contexts",
+      `GET /v1/projects/acme/contexts/${name}`,
+      `POST /v1/projects/acme/contexts/${name}/append`,
+      `POST /v1/projects/acme/contexts/${name}/label`,
+    ],
+  );
+});
+
+test("predictors.predict names the environment in the query", async () => {
+  const asked = [];
+  const mock = mockFetch();
+  const gf = new GeneralForecast({
+    project: "acme",
+    baseUrl: "http://mock.local",
+    fetch: async (url, init) => {
+      asked.push(new URL(url).search);
+      return mock(url, init);
+    },
+  });
+  const example = paired(ROUTES["predictors.predict"].path, "POST").find((p) => p.request.name === "scored");
+  await gf.predictors.predict("churn", { queries: example.request.value.payload.queries, env: "staging" });
+  assert.deepEqual(asked, ["?env=staging"]);
 });
