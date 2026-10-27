@@ -20,7 +20,7 @@ from generalforecast.contracts import (
     PredictorLock,
     Revision,
 )
-from generalforecast.predictors.models import describe
+from generalforecast.predictors.models import describe, qualification
 from generalforecast.predictors.validation import PredictorError
 from generalforecast.service.boundary import (
     JsonObject,
@@ -527,7 +527,9 @@ def pushed(predictor: "str | Path") -> Pushed:
 
     Raises:
         ServiceError: `LockRequired` for a missing, version 1 or stale lock;
-            `SnapshotMismatch` for a snapshot that changed since `gf check`.
+            `ModelResolutionRequired` for a model `gf check` reported is not
+            qualified for `gf push`; `SnapshotMismatch` for a snapshot that
+            changed since `gf check`.
     """
     from generalforecast.errors import Error
     from generalforecast.predictors.lock import lock_document, manifest_digest
@@ -554,6 +556,13 @@ def pushed(predictor: "str | Path") -> Pushed:
             error.message,
             422,
         ) from None
+    try:
+        runs = qualification(document["predictor"]["model"])
+    except PredictorError as error:
+        raise ServiceError(error.code, error.message, 422) from None
+    if not runs.push:
+        refused = runs.refusal("push")
+        raise ServiceError(refused.code, refused.message, 422)
     lock = PredictorLock.from_dict(document)
     snapshot = None
     if lock.context_kind == "snapshot":

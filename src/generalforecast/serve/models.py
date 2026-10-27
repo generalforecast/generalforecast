@@ -187,6 +187,11 @@ def _predictor(path: Path, directory: Path, *, allow_downloads: bool) -> dict[st
             "gf.lock was written for another gf.yaml; run gf check",
             "LockRequired",
         )
+    from generalforecast.predictors.models import qualification
+
+    runs = qualification(predictor["model"])
+    if not runs.serve:
+        raise runs.refusal("serve")
     ref = canonical(predictor["model"])
     _verified(ref, allow_downloads=allow_downloads)
     rows = None

@@ -626,6 +626,7 @@ class PredictorCommands:
             upgrade=args.upgrade,
         )
         self.print_resolution(resolution)
+        out.status("Runs", _qualification(resolution).describe())
         out.table(self.roles(resolution, spec), indent=2)
         changes = _shown_changes(resolution.lock_changes, resolution.model)
         out.changes(changes)
@@ -1127,6 +1128,12 @@ def _cost_line(accelerator: str) -> str:
     return f"about ${rates.get(accelerator, 0.0004):.4f} after a cold start of about {starts.get(accelerator, 40)}s"
 
 
+def _qualification(resolution: Resolution) -> Any:
+    from generalforecast.predictors.models import qualification
+
+    return qualification(resolution.model)
+
+
 def _resolution_dict(resolution: Resolution) -> dict:
     return {
         "name": resolution.name,
@@ -1147,5 +1154,6 @@ def _resolution_dict(resolution: Resolution) -> dict:
             "digest": resolution.context.digest,
         },
         "selection": resolution.selection.to_dict(),
+        "runs": _qualification(resolution).to_dict(),
         "changes": [list(c) for c in resolution.lock_changes],
     }
