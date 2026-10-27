@@ -3,21 +3,21 @@
 
 import json
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 import jax.numpy as jnp
 import numpy as np
-from huggingface_hub import hf_hub_download
 from jax import Array
 
-from generalforecast.models.catalog import short_name
 from generalforecast.models.checkpoints import (
-    converted_checkpoint,
+    Published,
+    check_settings,
+    converted_file,
     load_state,
     read_all,
     read_linear,
     read_torch_checkpoint,
-    save_state,
+    without,
 )
 from generalforecast.models.limix.model import (
     CellEmbedding,
@@ -36,14 +36,6 @@ from generalforecast.nn.norm import RMSNormParameters
 from generalforecast.nn.scaling import LogScaleParameters
 
 ARCHITECTURE = "limix"
-
-
-class Published(NamedTuple):
-    """A checkpoint file in Stable AI's Hugging Face repositories."""
-
-    repository: str
-    revision: str
-    filename: str
 
 
 LIMIX_2 = Published(
@@ -141,8 +133,7 @@ def one_task(state: dict[str, Any], regression: bool) -> dict[str, Any]:
     Returns:
         The state for one task.
     """
-    dropped = (*_TASK[not regression], *_IMPUTATION, "reg_log_widths")
-    return {key: value for key, value in state.items() if not key.startswith(dropped)}
+    return without(state, (*_TASK[not regression], *_IMPUTATION, "reg_log_widths"))
 
 
 def read_published(path: Path) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
@@ -171,18 +162,12 @@ def limix_checkpoint(id: str) -> Path:
     Returns:
         A directory with `config.json` and `model.safetensors`.
     """
-    published = PUBLISHED[id]
-    name = short_name(id)
 
-    def convert(directory: Path) -> None:
-        path = hf_hub_download(
-            published.repository, published.filename, revision=published.revision
-        )
-        settings, state = read_published(Path(path))
-        state = one_task(state, regression=name.endswith("-regressor"))
-        save_state(directory, ARCHITECTURE, settings, state)
+    def convert(path: Path, name: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        settings, state = read_published(path)
+        return ARCHITECTURE, settings, one_task(state, name.endswith("-regressor"))
 
-    return converted_checkpoint(name, published.revision, convert)
+    return converted_file(id, PUBLISHED[id], convert)
 
 
 def check_supported(settings: dict[str, Any]) -> None:
@@ -194,18 +179,11 @@ def check_supported(settings: dict[str, Any]) -> None:
     Raises:
         NotImplementedError: Naming the unsupported setting.
     """
-    for key, values in SUPPORTED.items():
-        if settings.get(key) not in values:
-            raise NotImplementedError(
-                f"LimiX {key}={settings.get(key)!r} is not supported"
-            )
+    check_settings("LimiX", settings, SUPPORTED)
     for section, supported in SECTION_SUPPORTED.items():
-        for key, values in supported.items():
-            value = settings.get(section, {}).get(key)
-            if value not in values:
-                raise NotImplementedError(
-                    f"LimiX {section}.{key}={value!r} is not supported"
-                )
+        check_settings(
+            "LimiX", settings.get(section, {}), supported, prefix=f"{section}."
+        )
     last = int(settings["nlayers"]) - 1
     for key in ("cls_y_emb_layer", "reg_y_emb_layer"):
         if int(settings.get(key, last)) != last:

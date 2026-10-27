@@ -9,13 +9,15 @@ the forecasting settings, and safetensors under the module's parameter names.
 
 import math
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 from jax import Array
 
 from generalforecast.models import catalog
 from generalforecast.models.artifacts import checkpoint
 from generalforecast.models.checkpoints import (
+    Published,
+    check_settings,
     load_state,
     read_all,
     read_linear,
@@ -31,13 +33,6 @@ from generalforecast.nn.norm import RMSNormParameters
 from generalforecast.nn.rope import RoPE
 
 ARCHITECTURE = "chronos2"
-
-
-class Published(NamedTuple):
-    """A checkpoint in Amazon's Hugging Face repositories."""
-
-    repository: str
-    revision: str
 
 
 # The upstream revision the catalog's mirror was converted from.
@@ -119,26 +114,15 @@ def check_supported(settings: dict[str, Any]) -> None:
         NotImplementedError: Naming the unsupported or unknown setting.
     """
     forecasting = settings.get("chronos_config", {})
-    for key, values in SUPPORTED.items():
-        if settings.get(key) not in values:
-            raise NotImplementedError(
-                f"Chronos-2 {key}={settings.get(key)!r} is not supported"
-            )
-    for key, values in FORECASTING_SUPPORTED.items():
-        if forecasting.get(key) not in values:
-            raise NotImplementedError(
-                f"Chronos-2 {key}={forecasting.get(key)!r} is not supported"
-            )
+    check_settings("Chronos-2", settings, SUPPORTED)
+    check_settings("Chronos-2", forecasting, FORECASTING_SUPPORTED)
     patches = {forecasting.get(key) for key in FORECASTING_SIZES[1:4]}
     if len(patches) != 1:
         raise NotImplementedError(
             "Chronos-2 input and output patches of different sizes are not supported"
         )
-    known = {*SUPPORTED, *SIZES, *IGNORED}
-    known_forecasting = {*FORECASTING_SUPPORTED, *FORECASTING_SIZES}
-    unknown = sorted((set(settings) - known) | (set(forecasting) - known_forecasting))
-    if unknown:
-        raise NotImplementedError(f"Chronos-2 settings {unknown} are not supported")
+    check_settings("Chronos-2", settings, SUPPORTED, known=(*SIZES, *IGNORED))
+    check_settings("Chronos-2", forecasting, FORECASTING_SUPPORTED, FORECASTING_SIZES)
 
 
 def _norm(state: dict[str, Array], name: str, epsilon: float) -> RMSNormParameters:

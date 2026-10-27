@@ -13,6 +13,12 @@ from jax import Array
 from jaxtyping import Bool, Float, Int
 
 from generalforecast.models.buckets import QUANTILE_LEVELS, bucket_quantiles
+from generalforecast.models.common import (
+    TableState,
+    as_tokens,
+    check_class_count,
+    compute_dtype,
+)
 from generalforecast.models.contract import (
     Averaging,
     ReadCache,
@@ -20,7 +26,6 @@ from generalforecast.models.contract import (
     TabularProperties,
 )
 from generalforecast.models.limix.prepare import (
-    LimiXSnapshot,
     fit_snapshot,
     kept_groups,
     prepare_features,
@@ -125,29 +130,11 @@ class LimiX:
         return isinstance(self.targets, ValueTargets)
 
 
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class TableState:
-    """State fit on every context row: preprocessing and each group's code.
-
-    `num_classes` is static: postprocessing slices logits by it.
-    """
-
-    snapshot: LimiXSnapshot
-    codes: Float[Array, " groups model"]
-    num_classes: int = field(metadata={"static": True})
-
-
 class LimiXCache(NamedTuple):
     """Each layer's keys and values across rows, for cells and for targets."""
 
     cells: tuple[AttentionCache, ...]
     targets: tuple[AttentionCache, ...]
-
-
-def _dtype(model: LimiX) -> jnp.dtype:
-    """The dtype the network computes in, set by its parameters."""
-    return model.column_codes.weight.dtype
 
 
 def _column_codes(model: LimiX, groups: int) -> Float[Array, " groups model"]:
@@ -159,7 +146,7 @@ def _column_codes(model: LimiX, groups: int) -> Float[Array, " groups model"]:
     width = model.column_codes.weight.shape[1]
     generator = np.random.default_rng(model.code_seed)
     draws = generator.standard_normal((groups, width), dtype=np.float32)
-    return linear(model.column_codes, jnp.asarray(draws, dtype=_dtype(model)))
+    return linear(model.column_codes, jnp.asarray(draws, dtype=compute_dtype(model)))
 
 
 def _embed_cells(
@@ -189,7 +176,7 @@ def _embed_targets(
         return jnp.where(
             known, encoder.classes[jnp.maximum(targets, 0)], encoder.missing
         )
-    values = targets.astype(_dtype(model))
+    values = targets.astype(compute_dtype(model))
     present = jnp.isfinite(values)[:, None]
     hidden = mlp(encoder.mlp, jnp.where(present, values[:, None], 0))
     return jnp.where(present, rms_norm(encoder.norm, hidden), encoder.missing)
@@ -202,24 +189,13 @@ def _tokens(
     targets: Array | None,
 ) -> Float[Array, " rows tokens model"]:
     """A row's cell tokens, with its column codes, then its target tokens."""
-    values = prepare_features(state.snapshot, features).astype(_dtype(model))
-    cells = _embed_cells(model.cells, values) + state.codes
+    values = prepare_features(state.snapshot, features).astype(compute_dtype(model))
+    cells = _embed_cells(model.cells, values) + state.columns
     scaled = None if targets is None else scale_targets(state.snapshot, targets)
     embedded = _embed_targets(model, features.shape[0], scaled)
     width = model.task.shape[0]
     target_tokens = embedded.reshape(-1, model.target_tokens, width) + model.task
     return jnp.concatenate([cells, target_tokens], axis=1)
-
-
-def check_class_count(model: LimiX, num_classes: int) -> None:
-    """Raises if the model cannot serve `num_classes` classes, 0 for regression."""
-    if model.regression:
-        if num_classes != 0:
-            raise ValueError(f"regressors take num_classes=0, got {num_classes}")
-        return
-    slots = model.decoder[-1].weight.shape[0]
-    if not 1 <= num_classes <= slots:
-        raise ValueError(f"num_classes must be in 1 .. {slots}, got {num_classes}")
 
 
 def fit(
@@ -247,7 +223,7 @@ def fit(
         The table state and one representation per context row.
     """
     del categorical
-    check_class_count(model, num_classes)
+    check_class_count(properties(model), num_classes)
     snapshot = fit_snapshot(
         features,
         model.group_size,
@@ -255,7 +231,8 @@ def fit(
         num_rows,
     )
     codes = _column_codes(model, snapshot.group_scale.shape[0])
-    state = TableState(snapshot=snapshot, codes=codes, num_classes=num_classes)
+    # Each feature group's code is what the model keeps of its columns.
+    state = TableState(snapshot=snapshot, columns=codes, num_classes=num_classes)
     return state, embed(model, state, features, targets)
 
 
@@ -380,12 +357,6 @@ def _layer(
     return tokens + rms_norm(norm, within)
 
 
-def _as_tokens(model: LimiX, rows: Array) -> Float[Array, " 1 rows tokens model"]:
-    """Row representations as tokens, in a batch of one."""
-    width = model.task.shape[0]
-    return rows.reshape(1, rows.shape[0], -1, width)
-
-
 def encode(
     model: LimiX,
     state: TableState,
@@ -411,7 +382,7 @@ def encode(
     del targets
     groups = kept_groups(state.snapshot)
     length = batch_length(num_rows)
-    tokens = _as_tokens(model, rows)
+    tokens = as_tokens(rows, model.task.shape[0])
     cells_caches: list[AttentionCache] = []
     targets_caches: list[AttentionCache] = []
     for index, layer in enumerate(model.layers):
@@ -470,7 +441,7 @@ def decode_reading(
         Class logits over every class slot, or logits over the regression buckets.
     """
     groups = kept_groups(state.snapshot)
-    tokens = _as_tokens(model, rows)
+    tokens = as_tokens(rows, model.task.shape[0])
     for index, layer in enumerate(model.layers):
         cells_cache, targets_cache = jax.tree.map(
             lambda values: values[None],

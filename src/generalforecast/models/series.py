@@ -12,11 +12,17 @@ attention caches, the slot layout, the pools, compiled programs and the frame
 protocol.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol
 
+import jax
+import jax.core
 import jax.numpy as jnp
 from jax import Array
+from jaxtyping import Int
+
+from generalforecast.nn.attention import AttentionCache
 
 # The roles of a group's rows: the series forecast, a covariate known only
 # in the past, and a covariate known over the horizon too.
@@ -171,6 +177,158 @@ class SeriesFunctions(NamedTuple):
     decode: Decode | None
     extend: Extend | None
     properties: Properties
+
+
+class GroupInputs(NamedTuple):
+    """A group as a forecaster reads it: trimmed to its context and masked.
+
+    Attributes:
+        values: The context's last steps, 0 where unobserved, float32.
+        observed: Which of them are observed, False on padding rows.
+        real: Which rows are real rather than padding.
+        future: Known future values over the horizon, 0 where not known,
+            float32.
+        future_observed: Which future values are known: observed where the
+            group says, or finite if it does not, and never on padding rows.
+    """
+
+    values: Array
+    observed: Array
+    real: Array
+    future: Array
+    future_observed: Array
+
+
+def group_inputs(
+    group: SeriesGroup, patch: int, limit: int, horizon: int, known_only: bool = True
+) -> GroupInputs:
+    """A group's context, at most `limit` steps of it, and its known future.
+
+    Args:
+        group: The group.
+        patch: Steps per patch, which the context must be whole patches of.
+        limit: Most context steps read, the latest.
+        horizon: Steps of future values when the group has none.
+        known_only: Whether only known covariates' future values are known.
+
+    Returns:
+        The inputs.
+
+    Raises:
+        ValueError: If the context is not whole patches.
+    """
+    rows, steps = group.values.shape
+    if steps % patch:
+        raise ValueError(
+            f"the context's {steps} steps are not whole patches of {patch}"
+        )
+    real = (
+        jnp.ones(rows, bool)
+        if group.num_rows is None
+        else jnp.arange(rows) < group.num_rows
+    )
+    observed = (group.observed & real[:, None])[:, -limit:]
+    values = jnp.where(observed, group.values[:, -limit:], 0.0).astype(jnp.float32)
+    if group.future is None:
+        future = jnp.zeros((rows, horizon), jnp.float32)
+        future_observed = jnp.zeros((rows, horizon), bool)
+    else:
+        future_observed = (
+            jnp.isfinite(group.future)
+            if group.future_observed is None
+            else group.future_observed
+        )
+        future_observed = future_observed & real[:, None]
+        if known_only:
+            future_observed = future_observed & (group.roles == KNOWN)[:, None]
+        future = jnp.where(future_observed, group.future, 0.0).astype(jnp.float32)
+    return GroupInputs(values, observed, real, future, future_observed)
+
+
+def refuse_known(group: SeriesGroup) -> None:
+    """Raises for a known covariate when roles can be seen: a group with one is forecast whole.
+
+    Under a trace they cannot, so an encoding must poison itself instead.
+
+    Raises:
+        ValueError: If a row is a known covariate.
+    """
+    if not isinstance(group.roles, jax.core.Tracer) and bool(
+        (group.roles == KNOWN).any()
+    ):
+        raise ValueError(
+            "a group with a known covariate is forecast whole, not encoded"
+        )
+
+
+def observed_moments(
+    values: Array, observed: Array, keepdims: bool = False
+) -> tuple[Array, Array, Array]:
+    """The count, mean and population deviation of observed values along the last axis.
+
+    With none observed, the mean and deviation are 0.
+
+    Args:
+        values: Values.
+        observed: Which are observed.
+        keepdims: Whether the last axis stays, of size 1.
+
+    Returns:
+        The count, an integer, the mean and the deviation.
+    """
+    count = observed.sum(axis=-1, keepdims=keepdims)
+    divisor = jnp.maximum(count, 1)
+    mean = jnp.where(observed, values, 0.0).sum(axis=-1, keepdims=keepdims) / divisor
+    centered = values - (mean if keepdims else mean[..., None])
+    squares = jnp.where(observed, jnp.square(centered), 0.0)
+    return count, mean, jnp.sqrt(squares.sum(axis=-1, keepdims=keepdims) / divisor)
+
+
+def median_index(levels: Sequence[float]) -> int:
+    """Where the median, level 0.5, sits among a forecaster's quantile levels.
+
+    Forecasters that feed their medians back or fan their quantiles out from
+    it find it by its level, since a grid need not put it in the middle.
+
+    Args:
+        levels: The quantile levels.
+
+    Returns:
+        The median's index.
+
+    Raises:
+        ValueError: If no level is 0.5.
+    """
+    if 0.5 not in levels:
+        raise ValueError(f"the quantile levels {tuple(levels)} have no median, 0.5")
+    return list(levels).index(0.5)
+
+
+def real_patches(layers: Sequence[AttentionCache]) -> Int[Array, ""] | None:
+    """How many of a context cache's patches are real, from its attention caches' lengths.
+
+    A cache the runtime reads back from its slots holds its real patches
+    first and zeros after, and says how many are real; one from `encode` or
+    `extend` holds only real patches and says nothing.
+
+    Args:
+        layers: The cache's attention caches along time, patches first.
+
+    Returns:
+        The count, or None when every patch is real.
+    """
+    return layers[0].length if layers else None
+
+
+def rows_first(layers: Sequence[AttentionCache]) -> tuple[AttentionCache, ...]:
+    """Attention caches stored patches first, with rows first as attention along time reads them.
+
+    A scalar length stays as it is.
+    """
+    return tuple(
+        jax.tree.map(lambda leaf: leaf.swapaxes(0, 1) if leaf.ndim > 1 else leaf, layer)
+        for layer in layers
+    )
 
 
 def padded_horizon(values: Array, steps: int, fill: float | bool) -> Array:

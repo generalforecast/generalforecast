@@ -9,6 +9,7 @@ padding and batching are invisible, and how precision and memory behave.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any
 
 import jax
@@ -17,14 +18,20 @@ import numpy as np
 import pytest
 
 from generalforecast import protocol
-from generalforecast._core import CacheKey
+from generalforecast._core import CacheKey, bucket_size
 from generalforecast.models.conformance import Table, check, predict, table
 from generalforecast.models.conformance import close as _close
 from generalforecast.models.conformance import padded as _padded
 from generalforecast.models.contract import TabularFunctions
 from generalforecast.nn.attention import AttentionKernel
 from generalforecast.runtime import paging
-from generalforecast.runtime.decoding import paged_decode
+from generalforecast.runtime.decoding import (
+    Context,
+    Decoding,
+    paged_decode,
+    paged_inputs,
+    paged_shape,
+)
 from generalforecast.runtime.device import (
     DeviceSettings,
     configure,
@@ -429,6 +436,50 @@ def test_a_paged_decode_predicts_as_one_of_the_whole_cache(
             model, state, functions.decode(model, state, whole, queries)
         ),
     )
+
+
+def test_a_decoding_in_a_masked_call_predicts_as_in_an_unmasked_one(
+    case: Case, functions: TabularFunctions, model: Any
+) -> None:
+    """A decoding of one context, decoded beside one of two, gets the runtime's all-True mask.
+
+    `paged_inputs` gives it every row of the call's padded context, past its
+    own 20, so only its length bounds what it reads.
+    """
+    data = _padded(
+        table(case.regression, rows=20, queries=6), context_size=32, query_size=8
+    )
+    state, rows = functions.fit(
+        model, data.features, data.targets, data.num_classes, num_rows=20
+    )
+    cache = functions.encode(model, state, rows, data.targets, num_rows=20)
+    layout = cache_layout(functions, model, FEATURES, slot_bytes=4096)
+    slots = pack(layout, cache)
+    context = Context(layout, 20, list(range(slots.shape[0])))
+    queries = functions.embed(model, state, data.queries)[:6]
+    batch = SimpleNamespace(table=0)
+    alone = Decoding(batch, list(range(6)), [context], queries)
+    # The same context twice, each query reading one of them.
+    joined = Decoding(
+        batch, list(range(6)), [context, context], queries, [0] * 3 + [1] * 3
+    )
+    stored = functions.properties(model).stored_cache
+
+    def decoded(decodings: list[Decoding]) -> tuple[np.ndarray, tuple]:
+        shape = paged_shape(decodings, layout, bucket_size)
+        _, inputs = paged_inputs(decodings, layout, shape)
+        decode = paged_decode(functions, stored, layout, shape.masked, shape.in_order)
+        states = jax.tree.map(lambda values: values[None], state)
+        return np.asarray(decode(model, slots, states, *inputs)), inputs
+
+    together, inputs = decoded([alone, joined])
+    expected, _ = decoded([alone])
+
+    # The mask reads past the decoding's 20 rows, as the runtime builds it.
+    counts, reads = inputs[3], inputs[-1]
+    assert counts[0] == 20 and reads.shape[-1] > 20 and reads[0].all()
+    _close(together[0, :6], expected[0, :6])
+    _close(together[1, :6], expected[0, :6])
 
 
 def test_a_unit_that_summarizes_its_own_rows_predicts_as_those_rows_alone(

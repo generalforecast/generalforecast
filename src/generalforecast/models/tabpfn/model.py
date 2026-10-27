@@ -12,11 +12,11 @@ from jaxtyping import Bool, Float, Int
 from generalforecast.models.buckets import QUANTILE_LEVELS, bucket_quantiles
 from generalforecast.models.column_embedding import (
     ColumnEmbeddingParameters,
-    ColumnSummary,
     embed_cells,
     fit_columns,
     summarize_columns,
 )
+from generalforecast.models.common import TableState, check_class_count, compute_dtype
 from generalforecast.models.contract import (
     Averaging,
     TabularFunctions,
@@ -25,7 +25,6 @@ from generalforecast.models.contract import (
 from generalforecast.models.icl import (
     ICLCache,
     ICLParameters,
-    check_class_count,
     decode_queries,
     decode_table,
     encode_context,
@@ -39,7 +38,6 @@ from generalforecast.models.row_interaction import (
 )
 from generalforecast.models.tabpfn.buckets import regression_borders
 from generalforecast.models.tabpfn.prepare import (
-    TabPFNSnapshot,
     fit_snapshot,
     prepare_features,
 )
@@ -69,24 +67,6 @@ class TabPFN:
         return isinstance(self.icl.target_encoder, ValueEncoder)
 
 
-@jax.tree_util.register_dataclass
-@dataclass(frozen=True)
-class TableState:
-    """State fit on every context row: preprocessing and the column summary.
-
-    `num_classes` is static: postprocessing slices logits by it.
-    """
-
-    snapshot: TabPFNSnapshot
-    columns: ColumnSummary
-    num_classes: int = field(metadata={"static": True})
-
-
-def _dtype(model: TabPFN) -> jnp.dtype:
-    """The dtype the network computes in, set by its parameters."""
-    return model.icl.blocks[0].attention.query.weight.dtype
-
-
 def fit(
     model: TabPFN,
     features: Float[Array, " rows features"],
@@ -113,14 +93,14 @@ def fit(
         The table state and one representation per context row.
     """
     del categorical
-    check_class_count(model.icl, num_classes)
+    check_class_count(properties(model), num_classes)
     snapshot = fit_snapshot(
         features,
         targets if model.regression else None,
         num_rows,
         model.rank_buckets,
     )
-    prepared = prepare_features(snapshot, features).astype(_dtype(model))
+    prepared = prepare_features(snapshot, features).astype(compute_dtype(model))
     count = batch_length(snapshot.columns.count)
     summary, cells = fit_columns(
         model.columns,
@@ -150,7 +130,7 @@ def embed(
     Returns:
         One representation per row.
     """
-    prepared = prepare_features(state.snapshot, features).astype(_dtype(model))
+    prepared = prepare_features(state.snapshot, features).astype(compute_dtype(model))
     scaled = None if targets is None else scale_targets(state.snapshot, targets)
     count = batch_length(state.snapshot.columns.count)
     cells = embed_cells(
@@ -287,7 +267,7 @@ def tabpfn_outputs(
 
     def prepare(rows: Array) -> tuple[Array, Array]:
         snapshot = fit_snapshot(rows[:context_size], rank_buckets=model.rank_buckets)
-        prepared = prepare_features(snapshot, rows).astype(_dtype(model))
+        prepared = prepare_features(snapshot, rows).astype(compute_dtype(model))
         return prepared, snapshot.columns.count
 
     prepared, count = jax.vmap(prepare)(table)

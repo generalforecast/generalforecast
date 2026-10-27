@@ -21,7 +21,7 @@ from generalforecast.nn.attention import (
 from generalforecast.nn.induced import (
     InducedAttentionParameters,
     compress,
-    compress_streamed,
+    compress_layers,
     expand,
 )
 from generalforecast.nn.norm import RMSNormParameters, rms_norm
@@ -191,36 +191,26 @@ def _fit_streamed(
 ) -> ColumnStates:
     """Each layer's column states, from at most `size` rows at a time.
 
-    A layer's states read every row's cells after the layers before it, so for
-    each layer, each chunk of rows runs through those layers again, and the
-    states gather over the chunks by a running softmax. Memory then does not
-    grow with the rows, for compute that grows with the square of the layers.
+    A chunk's cells run through the layers before each one, row blocks
+    included; see `compress_layers`. Memory then does not grow with the
+    rows, for compute that grows with the square of the layers.
     """
     dtype = parameters.readout.dtype
     readout = parameters.readout.shape[0]
     lengths = None if length is None else jnp.full(features.shape[1], length)
-    states: list[Array] = []
-    for column in parameters.columns:
 
-        def cells(start: Array, size: int, done: tuple = tuple(states)) -> Array:
-            rows = jax.lax.dynamic_slice_in_dim(features, start, size)
-            labels = jax.lax.dynamic_slice_in_dim(targets, start, size)
-            hidden = embed_cells(
-                parameters.cells, rows, means, dtype, categorical, count
-            )
-            hidden = hidden + embed_targets(parameters.target_encoder, labels)[:, None]
-            tokens = jnp.broadcast_to(
-                parameters.readout, (size, *parameters.readout.shape)
-            )
-            keys = None if count is None else jnp.full(size, readout + count)
-            for earlier, state, row in zip(
-                parameters.columns, done, parameters.rows, strict=False
-            ):
-                sequence = _layer(earlier, state, row, tokens, hidden, keys, False)
-                tokens, hidden = sequence[:, :readout], sequence[:, readout:]
-            return jnp.swapaxes(hidden, 0, 1)
+    def cells(start: Array, size: int, earlier: tuple[Array, ...]) -> Array:
+        rows = jax.lax.dynamic_slice_in_dim(features, start, size)
+        labels = jax.lax.dynamic_slice_in_dim(targets, start, size)
+        hidden = embed_cells(parameters.cells, rows, means, dtype, categorical, count)
+        hidden = hidden + embed_targets(parameters.target_encoder, labels)[:, None]
+        tokens = jnp.broadcast_to(parameters.readout, (size, *parameters.readout.shape))
+        keys = None if count is None else jnp.full(size, readout + count)
+        for column, state, row in zip(
+            parameters.columns, earlier, parameters.rows, strict=False
+        ):
+            sequence = _layer(column, state, row, tokens, hidden, keys, False)
+            tokens, hidden = sequence[:, :readout], sequence[:, readout:]
+        return jnp.swapaxes(hidden, 0, 1)
 
-        states.append(
-            compress_streamed(column, cells, features.shape[0], size, lengths)
-        )
-    return tuple(states)
+    return compress_layers(parameters.columns, cells, features.shape[0], size, lengths)

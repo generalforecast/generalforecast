@@ -30,13 +30,20 @@ import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
+from generalforecast.models.common import compute_dtype
 from generalforecast.models.series import (
     KNOWN,
     TARGET,
     SeriesFunctions,
     SeriesGroup,
     SeriesProperties,
+    group_inputs,
+    median_index,
+    observed_moments,
     padded_horizon,
+    real_patches,
+    refuse_known,
+    rows_first,
 )
 from generalforecast.nn.attention import (
     AttentionCache,
@@ -165,6 +172,10 @@ class TimesFMCache:
             covariate, whose cache would forecast wrongly.
         roles: Each row's role.
         real: Which rows are real.
+
+    A cache the runtime reads back from its slots may carry `length` on
+    its attention caches: how many patches are real, which come first; the
+    rest are zeros, which `decode` reads as no keys.
     """
 
     sequence: tuple[AttentionCache, ...]
@@ -175,16 +186,6 @@ class TimesFMCache:
     last: Float[Array, " rows outputs"]
     roles: Int[Array, " rows"]
     real: Bool[Array, " rows"]
-
-
-def _along_rows(leaf: Array) -> Array:
-    """A stored attention cache leaf with rows first, as attention along time reads it; a cache's scalar length stays as it is."""
-    return leaf.swapaxes(0, 1) if leaf.ndim > 1 else leaf
-
-
-def _dtype(model: TimesFM) -> jnp.dtype:
-    """The dtype the network computes in, set by its parameters."""
-    return model.head.weight.dtype
 
 
 def _safe(deviation: Array) -> Array:
@@ -198,12 +199,8 @@ def _update(
     masked: Bool[Array, " rows patch"],
 ) -> Moments:
     """The moments after one patch of values, as upstream accumulates them."""
-    seen = (~masked).astype(jnp.float32)
-    count = seen.sum(axis=-1)
-    present = jnp.where(masked, 0.0, values)
-    mean = present.sum(axis=-1) / jnp.maximum(count, 1.0)
-    variance = jnp.where(masked, 0.0, jnp.square(values - mean[:, None])).sum(axis=-1)
-    deviation = jnp.sqrt(variance / jnp.maximum(count, 1.0))
+    count, mean, deviation = observed_moments(values, ~masked)
+    count = count.astype(jnp.float32)
     total = moments.count + count
     safe = jnp.maximum(total, 1.0)
     new_mean = jnp.where(
@@ -332,7 +329,7 @@ def _embed(
     features = jnp.concatenate(
         [normalized, following, masks.astype(jnp.float32)], axis=-1
     )
-    tokens = residual_block(model.embedding, features.astype(_dtype(model)))
+    tokens = residual_block(model.embedding, features.astype(compute_dtype(model)))
     return tokens, masks.all(axis=-1)
 
 
@@ -430,7 +427,7 @@ def _refined(
     """
     rows, patches, _ = raw.shape
     rolls = model.output_patch // model.patch
-    middle = len(model.quantiles) // 2
+    middle = median_index(model.quantiles)
 
     def medians(outputs: Array) -> Array:
         return outputs.reshape(
@@ -488,40 +485,19 @@ def _sizes(model: TimesFM, horizon: int) -> tuple[int, int, int]:
 
 def _rows(model: TimesFM, group: SeriesGroup, horizon: int) -> Rows:
     """A group as the network reads it: trimmed, masked and clipped."""
-    rows, steps = group.values.shape
-    if steps % model.patch:
-        raise ValueError(
-            f"the context's {steps} steps are not whole patches of {model.patch}"
-        )
+    rows = group.values.shape[0]
     if rows > model.max_rows:
         raise ValueError(f"a group of {rows} rows passes the model's {model.max_rows}")
     limit = CONTEXT_LIMIT // model.patch * model.patch
-    real = (
-        jnp.ones(rows, bool)
-        if group.num_rows is None
-        else jnp.arange(rows) < group.num_rows
+    values, observed, real, future, future_observed = group_inputs(
+        group, model.patch, limit, horizon
     )
-    observed = (group.observed & real[:, None])[:, -limit:]
     first = _first(~observed, real & (group.roles == TARGET), model.patch)
     # A row the network would see nothing of is read as observed zeros, as
     # upstream's forecaster reads an all-missing series.
     observed = observed | ~observed.any(axis=-1, keepdims=True)
-    values = jnp.where(observed, group.values[:, -limit:], 0.0).astype(jnp.float32)
     values = jnp.clip(jnp.nan_to_num(values), -model.value_clip, model.value_clip)
-    if group.future is None:
-        future = jnp.zeros((rows, horizon), jnp.float32)
-        future_observed = jnp.zeros((rows, horizon), bool)
-    else:
-        future_observed = (
-            jnp.isfinite(group.future)
-            if group.future_observed is None
-            else group.future_observed
-        )
-        future_observed = (
-            future_observed & real[:, None] & (group.roles == KNOWN)[:, None]
-        )
-        future = jnp.where(future_observed, group.future, 0.0).astype(jnp.float32)
-        future = jnp.clip(jnp.nan_to_num(future), -model.value_clip, model.value_clip)
+    future = jnp.clip(jnp.nan_to_num(future), -model.value_clip, model.value_clip)
     return Rows(values, ~observed, group.roles, real, future, ~future_observed, first)
 
 
@@ -530,7 +506,7 @@ def _finish(
     outputs: Float[Array, " rows patches outputs"],
     frames: Moments,
     trend: Trend,
-    context: int,
+    context: int | Int[Array, ""],
     horizon: int,
 ) -> Float[Array, " rows horizon quantiles"]:
     """Predictions on the original scale from the last context patch's outputs on.
@@ -624,12 +600,7 @@ def encode(model: TimesFM, group: SeriesGroup) -> TimesFMCache:
     Raises:
         ValueError: If a row is a known covariate, when that can be seen.
     """
-    if not isinstance(group.roles, jax.core.Tracer) and bool(
-        (group.roles == KNOWN).any()
-    ):
-        raise ValueError(
-            "a group with a known covariate is forecast whole, not encoded"
-        )
+    refuse_known(group)
     data = _rows(model, group, 0)
     rows, steps = data.values.shape
     context = steps // model.patch
@@ -692,6 +663,11 @@ def decode(
     """
     del future, future_observed
     context, rows = cache.visible.shape
+    # A cache read back from the runtime's slots holds its real patches
+    # first, then padding, and says how many are real.
+    real = real_patches(cache.sequence)
+    held = context if real is None else real
+    visible = cache.visible.T & (jnp.arange(context) < held)
     _, patches, _ = _sizes(model, horizon)
     blank = jnp.zeros((rows, patches * model.patch), jnp.float32)
     masked = jnp.ones((rows, patches * model.patch), bool)
@@ -701,7 +677,7 @@ def decode(
     tokens, _ = _embed(model, blank, masked, jnp.ones(rows, bool), unchanged)
     time_mask = jnp.concatenate(
         [
-            jnp.broadcast_to(cache.visible.T[:, None, :], (rows, patches, context)),
+            jnp.broadcast_to(visible[:, None, :], (rows, patches, context)),
             jnp.broadcast_to(
                 jnp.tril(jnp.ones((patches, patches), bool)), (rows, patches, patches)
             ),
@@ -711,8 +687,8 @@ def decode(
     # The horizon's tokens are keys for every real row, since no real row is
     # fully masked from its start.
     variate_mask = jnp.broadcast_to(cache.real[None, None, :], (patches, rows, rows))
-    prefix = tuple(jax.tree.map(_along_rows, layer) for layer in cache.sequence)
-    positions = context + jnp.arange(patches) - cache.first
+    prefix = rows_first(cache.sequence)
+    positions = held + jnp.arange(patches) - cache.first
     outputs, _ = _transform(model, tokens, positions, time_mask, variate_mask, prefix)
     raw = linear(model.head, outputs).astype(jnp.float32)
     refined = _refined(model, cache.moments, cache.last, raw)
@@ -722,7 +698,7 @@ def decode(
         refined,
     )
     outputs = jnp.concatenate([cache.last[:, None], raw], axis=1)
-    return _finish(model, outputs, frames, cache.trend, context, horizon)
+    return _finish(model, outputs, frames, cache.trend, held, horizon)
 
 
 def properties(model: TimesFM) -> SeriesProperties:

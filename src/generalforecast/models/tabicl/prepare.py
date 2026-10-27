@@ -20,20 +20,16 @@ from jaxtyping import Float, Int
 
 from generalforecast.models.prepare import (
     Columns,
+    Standardizer,
     constant_columns,
+    fit_standardizer,
     kept_first,
-    masked_stats,
     precise_mean,
     precise_moments,
+    soft_clip,
+    standardize,
     valid_rows,
 )
-
-# Standardized values are clipped here, as upstream's scaler clips them.
-CLIP = 100.0
-# Values this many deviations from the mean are outliers.
-OUTLIER = 4.0
-# Added to deviations, so a constant column scales rather than divides by zero.
-EPSILON = 1e-6
 
 
 class NumericSnapshot(NamedTuple):
@@ -42,22 +38,14 @@ class NumericSnapshot(NamedTuple):
     Queries reuse the snapshot, and appends do not refit it.
 
     Attributes:
-        center: Each column's mean, which also fills its missing cells.
-        center_low: What rounding the mean to float32 left out, so values near
-            it center as upstream's float64 mean centers them.
-        scale: Each column's deviation plus `EPSILON`.
-        lower: Each standardized column's lower soft bound.
-        upper: Each standardized column's upper soft bound.
+        features: Each column's standardization and soft bounds; the mean
+            also fills a column's missing cells.
         target_center: The targets' mean, or None for classification.
         target_scale: The targets' deviation, or 1 where they barely vary.
         columns: The columns upstream keeps, first, then the constant ones.
     """
 
-    center: Float[Array, " features"]
-    center_low: Float[Array, " features"]
-    scale: Float[Array, " features"]
-    lower: Float[Array, " features"]
-    upper: Float[Array, " features"]
+    features: Standardizer
     target_center: Float[Array, ""] | None
     target_scale: Float[Array, ""] | None
     columns: Columns
@@ -71,17 +59,6 @@ def _finite(values: Float[Array, " rows features"]) -> Float[Array, " rows featu
 def _target_scale(deviation: Array) -> Array:
     """The deviation, or 1 where values barely vary, as scikit-learn scales targets."""
     return jnp.where(deviation > 10 * jnp.finfo(deviation.dtype).eps, deviation, 1)
-
-
-def _standardize(
-    snapshot: NumericSnapshot, features: Float[Array, " rows features"]
-) -> Float[Array, " rows features"]:
-    """Imputes, standardizes and clips rows, before the outlier bounds."""
-    cleaned = _finite(features)
-    centered = (cleaned - snapshot.center) - snapshot.center_low
-    # A cell imputed with the mean centers to 0.
-    centered = jnp.where(jnp.isnan(cleaned), 0, centered)
-    return jnp.clip(centered / snapshot.scale, -CLIP, CLIP)
 
 
 def kept_columns(
@@ -131,31 +108,16 @@ def fit_numeric_snapshot(
     present = valid[:, None] & ~jnp.isnan(cleaned)
     # Imputing with the mean keeps the mean, so it centers the column too, and
     # the imputed cells count as rows without adding to the squares.
-    stats = masked_stats(cleaned, present)
     observed = jnp.sum(present, axis=0) / jnp.maximum(jnp.sum(valid), 1)
-    scale = stats.deviation * jnp.sqrt(observed) + EPSILON
-    centered = jnp.where(present, (cleaned - stats.center) - stats.center_low, 0)
-    standardized = jnp.clip(centered / scale, -CLIP, CLIP)
-    # Two passes: moments without the values the first pass puts past the bounds.
-    mean, deviation = precise_moments(standardized, valid[:, None], ddof=1)
-    deviation = jnp.maximum(deviation, EPSILON)
-    inside = (
-        valid[:, None]
-        & (standardized >= mean - OUTLIER * deviation)
-        & (standardized <= mean + OUTLIER * deviation)
+    standardizer = fit_standardizer(
+        cleaned, present, valid[:, None], spread=jnp.sqrt(observed)
     )
-    mean, deviation = precise_moments(standardized, inside, ddof=1)
-    deviation = jnp.maximum(deviation, EPSILON)
     target_center = target_scale = None
     if targets is not None:
         target_center, target_deviation = precise_moments(targets, valid)
         target_scale = _target_scale(target_deviation)
     return NumericSnapshot(
-        center=stats.center,
-        center_low=stats.center_low,
-        scale=scale,
-        lower=mean - OUTLIER * deviation,
-        upper=mean + OUTLIER * deviation,
+        features=standardizer,
         target_center=target_center,
         target_scale=target_scale,
         columns=kept_columns(features, num_rows),
@@ -175,8 +137,8 @@ def apply_numeric_snapshot(
     Returns:
         Prepared rows, the kept columns first in `snapshot.columns` order.
     """
-    standardized = _standardize(snapshot, features)
-    magnitude = jnp.log1p(jnp.abs(standardized))
-    clipped = jnp.maximum(snapshot.lower - magnitude, standardized)
-    prepared = jnp.minimum(snapshot.upper + magnitude, clipped)
-    return prepared[:, snapshot.columns.order]
+    cleaned = _finite(features)
+    # A cell imputed with the mean standardizes to 0.
+    standardized = standardize(snapshot.features, cleaned)
+    standardized = jnp.where(jnp.isnan(cleaned), 0, standardized)
+    return soft_clip(snapshot.features, standardized)[:, snapshot.columns.order]

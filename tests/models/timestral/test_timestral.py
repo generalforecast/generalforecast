@@ -5,11 +5,14 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from generalforecast.models.conformance import group
+from generalforecast.models.conformance import group, paged_series
 from generalforecast.models.series import KNOWN
 from generalforecast.models.timestral.checkpoint import (
     check_supported,
@@ -21,7 +24,14 @@ from generalforecast.models.timestral.model import (
     extend,
     timestral_functions,
 )
-from tests.models.timestral.tiny import CONTEXT, PATCH, tiny_checkpoint, tiny_timestral
+from generalforecast.runtime.device import to_cache_dtype
+from tests.models.timestral.tiny import (
+    BLOCK_SIZE,
+    CONTEXT,
+    PATCH,
+    tiny_checkpoint,
+    tiny_timestral,
+)
 
 
 def test_unsupported_settings_raise() -> None:
@@ -73,3 +83,68 @@ def test_decode_refuses_known_futures_and_extend_the_context_limit() -> None:
         decode(model, cache, PATCH, future=jnp.zeros((3, PATCH)))
     with pytest.raises(ValueError, match="limit"):
         extend(model, cache, group(steps=CONTEXT, horizon=PATCH, known=False))
+
+
+def _grows(cache: Any) -> list[bool]:
+    """Which of a cache's leaves have its patches on their first axis."""
+    patches = cache.valid.shape[0]
+    return [
+        leaf.ndim > 0 and leaf.shape[0] == patches for leaf in jax.tree.leaves(cache)
+    ]
+
+
+@pytest.mark.parametrize("patches", [CONTEXT // PATCH, CONTEXT // PATCH - 3])
+@pytest.mark.parametrize("paged", [False, True])
+def test_decode_past_the_context_limit_forecasts_as_forecast_does(
+    patches: int, paged: bool
+) -> None:
+    model = tiny_timestral()
+    data = group(steps=patches * PATCH, horizon=PATCH, known=False)
+    # Fed-back medians pass the limit within the horizon, so forecast drops
+    # the oldest steps and runs its window whole.
+    horizon = 4 * BLOCK_SIZE * PATCH + PATCH
+    cache = encode(model, data)
+    if paged:
+        # Read back padded past its real patches, as the worker reads a bucket.
+        cache = paged_series(cache, _grows(cache), CONTEXT // PATCH - patches + 1)
+
+    np.testing.assert_allclose(
+        decode(model, cache, horizon),
+        timestral_functions.forecast(model, data, horizon),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+def test_paged_caches_of_different_lengths_decode_together_past_the_limit() -> None:
+    model = tiny_timestral()
+    bucket = CONTEXT // PATCH
+    horizon = 4 * BLOCK_SIZE * PATCH + PATCH
+    groups = [
+        group(steps=patches * PATCH, horizon=PATCH, known=False, seed=seed)
+        for seed, patches in enumerate((bucket, bucket - 5))
+    ]
+    pages = []
+    for data in groups:
+        cache = encode(model, data)
+        pages.append(paged_series(cache, _grows(cache), bucket - cache.valid.shape[0]))
+    stacked = jax.tree.map(lambda *leaves: jnp.stack(leaves), *pages)
+
+    together = jax.vmap(lambda cache: decode(model, cache, horizon))(stacked)
+
+    for index, data in enumerate(groups):
+        np.testing.assert_allclose(
+            together[index],
+            timestral_functions.forecast(model, data, horizon),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+
+
+def test_a_reduced_precision_cache_keeps_the_context_values_exact() -> None:
+    cache = encode(tiny_timestral(), group(steps=4 * PATCH, horizon=PATCH, known=False))
+
+    stored = to_cache_dtype(cache, jnp.dtype("float16"))
+
+    assert stored.values.dtype == jnp.int32
+    np.testing.assert_array_equal(stored.values, cache.values)

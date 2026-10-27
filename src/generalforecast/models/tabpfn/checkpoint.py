@@ -3,21 +3,22 @@
 
 import json
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 import numpy as np
-from huggingface_hub import hf_hub_download
 from jax import Array
 from safetensors import safe_open
 from safetensors.numpy import load_file
 
-from generalforecast.models.catalog import short_name
 from generalforecast.models.checkpoints import (
-    converted_checkpoint,
+    Published,
+    check_settings,
+    converted_file,
     load_state,
     read_all,
+    read_linear,
     read_torch_checkpoint,
-    save_state,
+    without,
 )
 from generalforecast.models.column_embedding import (
     ColumnEmbeddingParameters,
@@ -40,15 +41,6 @@ from generalforecast.nn.qassmax import QASSMaxParameters
 from generalforecast.nn.retrieval import RetrievalParameters
 from generalforecast.nn.rope import RoPE
 from generalforecast.nn.target import ClassEncoder, TargetEncoder, ValueEncoder
-
-
-class Published(NamedTuple):
-    """A checkpoint file in Prior Labs' Hugging Face repositories."""
-
-    repository: str
-    revision: str
-    filename: str
-
 
 TABPFN_3 = ("Prior-Labs/tabpfn_3", "24a16a89d245878b846555110985634aa2e656d7")
 TABPFN_3_5 = ("Prior-Labs/tabpfn_3_5", "06bf2ba35c80a92a3b9abb436b99cf49e7a0365e")
@@ -95,8 +87,7 @@ def one_task(state: dict[str, Any], regression: bool) -> dict[str, Any]:
     Returns:
         The state for one task; a single-task state is returned as it is.
     """
-    other = _TASK_ONLY[not regression]
-    return {key: value for key, value in state.items() if not key.startswith(other)}
+    return without(state, _TASK_ONLY[not regression])
 
 
 def read_published(path: Path) -> tuple[str, dict[str, Any], dict[str, np.ndarray]]:
@@ -134,18 +125,12 @@ def tabpfn_checkpoint(id: str) -> Path:
     Returns:
         A directory with `config.json` and `model.safetensors`.
     """
-    published = PUBLISHED[id]
-    name = short_name(id)
 
-    def convert(directory: Path) -> None:
-        path = hf_hub_download(
-            published.repository, published.filename, revision=published.revision
-        )
-        architecture, settings, state = read_published(Path(path))
-        state = one_task(state, regression=name.endswith("-regressor"))
-        save_state(directory, architecture, settings, state)
+    def convert(path: Path, name: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        architecture, settings, state = read_published(path)
+        return architecture, settings, one_task(state, name.endswith("-regressor"))
 
-    return converted_checkpoint(name, published.revision, convert)
+    return converted_file(id, PUBLISHED[id], convert)
 
 
 # Settings every release has, with the values the loader is checked against.
@@ -183,24 +168,14 @@ def check_supported(settings: dict[str, Any], architecture: str = "tabpfn_v3") -
         raise NotImplementedError(
             f"TabPFN architecture {architecture!r} is not supported"
         )
-    for key, values in {**SUPPORTED, **RELEASE_SUPPORTED[architecture]}.items():
-        if settings.get(key) not in values:
-            raise NotImplementedError(
-                f"TabPFN {key}={settings.get(key)!r} is not supported"
-            )
-
-
-def _linear(state: dict[str, Array], prefix: str) -> LinearParameters:
-    """Linear parameters stored under `prefix`, with an optional bias."""
-    return LinearParameters(
-        weight=state[f"{prefix}.weight"], bias=state.get(f"{prefix}.bias")
-    )
+    check_settings("TabPFN", settings, {**SUPPORTED, **RELEASE_SUPPORTED[architecture]})
 
 
 def _mlp(state: dict[str, Array], prefix: str) -> MLPParameters:
     """A two-layer MLP stored as a PyTorch `Sequential` under `prefix`."""
     return MLPParameters(
-        input=_linear(state, f"{prefix}.0"), output=_linear(state, f"{prefix}.2")
+        input=read_linear(state, f"{prefix}.0", bias=None),
+        output=read_linear(state, f"{prefix}.2", bias=None),
     )
 
 
@@ -238,10 +213,10 @@ def _attention(
     state: dict[str, Array], prefix: str, num_heads: int, rope: RoPE | None = None
 ) -> AttentionParameters:
     return AttentionParameters(
-        query=_linear(state, f"{prefix}.q_projection"),
-        key=_linear(state, f"{prefix}.k_projection"),
-        value=_linear(state, f"{prefix}.v_projection"),
-        output=_linear(state, f"{prefix}.out_projection"),
+        query=read_linear(state, f"{prefix}.q_projection", bias=None),
+        key=read_linear(state, f"{prefix}.k_projection", bias=None),
+        value=read_linear(state, f"{prefix}.v_projection", bias=None),
+        output=read_linear(state, f"{prefix}.out_projection", bias=None),
         num_heads=num_heads,
         scale=_scale(state, f"{prefix}.softmax_scaling_layer"),
         query_norm=_head_norm(state, f"{prefix}.q_norm"),
@@ -289,7 +264,9 @@ def _target_encoder(
     )
     if regression:
         name = f"{prefix}.regression" if multitask else prefix
-        return ValueEncoder(linear=_linear(state, name), norm=_layer_norm(state, norm))
+        return ValueEncoder(
+            linear=read_linear(state, name, bias=None), norm=_layer_norm(state, norm)
+        )
     name = f"{prefix}.multiclass" if multitask else prefix
     table = state[f"{name}.embedding.weight"]
     return ClassEncoder(
@@ -303,11 +280,11 @@ def _cells(
 ) -> LinearParameters | FourierCellParameters:
     """A linear cell projection, or Fourier cell features in multitask releases."""
     if "x_embed.fourier.frequencies" not in state:
-        return _linear(state, "x_embed")
+        return read_linear(state, "x_embed", bias=None)
     return FourierCellParameters(
         frequencies=state["x_embed.fourier.frequencies"],
-        fourier=_linear(state, "x_embed.fourier.in_linear"),
-        channels=_linear(state, "x_embed.metadata_linear"),
+        fourier=read_linear(state, "x_embed.fourier.in_linear", bias=None),
+        channels=read_linear(state, "x_embed.metadata_linear", bias=None),
         norm=LayerNormParameters(
             weight=state["x_embed.layernorm.weight"],
             bias=state["x_embed.layernorm.bias"],
@@ -361,8 +338,8 @@ def _retrieval(
     state: dict[str, Array], prefix: str, settings: dict[str, Any]
 ) -> RetrievalParameters:
     return RetrievalParameters(
-        query=_linear(state, f"{prefix}.q_projection"),
-        key=_linear(state, f"{prefix}.k_projection"),
+        query=read_linear(state, f"{prefix}.q_projection", bias=None),
+        key=read_linear(state, f"{prefix}.k_projection", bias=None),
         num_heads=int(settings["decoder_num_heads"]),
         scale=_scale(state, f"{prefix}.softmax_scaling_layer"),
     )
@@ -384,7 +361,7 @@ def _decoder(
         norm=_norm(state, f"{block}.norm"), mlp=_mlp(state, f"{block}.mlp")
     )
     if regression:
-        return _linear(state, "heads.output_projection"), head
+        return read_linear(state, "heads.output_projection", bias=None), head
     return _retrieval(state, "heads.many_class_decoder", settings), head
 
 

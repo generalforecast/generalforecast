@@ -28,6 +28,27 @@ class FourierCellParameters:
     rank_frequencies: int = field(metadata={"static": True})
 
 
+def fourier_features(
+    values: Float[Array, "*batch"],
+    frequencies: Float[Array, "*members frequencies"],
+    dtype: jnp.dtype,
+) -> Float[Array, "*batch features"]:
+    """Sines, then cosines, of each value times each of its frequencies.
+
+    Phases are computed in float32, which the features then leave for `dtype`.
+
+    Args:
+        values: Cell values.
+        frequencies: Frequencies, broadcast against the values' trailing axes.
+        dtype: Dtype of the features.
+
+    Returns:
+        Twice as many features as frequencies per value.
+    """
+    phase = values.astype(jnp.float32)[..., None] * frequencies.astype(jnp.float32)
+    return jnp.concatenate([jnp.sin(phase), jnp.cos(phase)], axis=-1).astype(dtype)
+
+
 def rank_features(
     ranks: Float[Array, "*batch"], num_frequencies: int
 ) -> Float[Array, "*batch features"]:
@@ -53,11 +74,8 @@ def fourier_cells(
     """
     group = parameters.frequencies.shape[0]
     values, ranks = grouped[..., :group], grouped[..., -group:]
-    phase = values.astype(jnp.float32)[..., None] * parameters.frequencies.astype(
-        jnp.float32
-    )
-    features = jnp.concatenate([jnp.sin(phase), jnp.cos(phase)], axis=-1)
-    fourier = linear(parameters.fourier, features.astype(grouped.dtype).sum(axis=-2))
+    features = fourier_features(values, parameters.frequencies, grouped.dtype)
+    fourier = linear(parameters.fourier, features.sum(axis=-2))
     lifted = rank_features(ranks, parameters.rank_frequencies)
     channels = jnp.concatenate(
         [grouped[..., :-group], lifted.reshape(*ranks.shape[:-1], -1)], axis=-1

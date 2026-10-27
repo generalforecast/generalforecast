@@ -13,7 +13,7 @@ from generalforecast.nn.fourier import FourierCellParameters, fourier_cells
 from generalforecast.nn.induced import (
     InducedAttentionParameters,
     compress,
-    compress_streamed,
+    compress_layers,
     expand,
 )
 from generalforecast.nn.linear import LinearParameters, linear
@@ -21,15 +21,20 @@ from generalforecast.nn.target import TargetEncoder, embed_targets
 
 
 class FeatureGrouping(NamedTuple):
-    """How features are grouped into cells, see `group_features`.
+    """How features are grouped into cells, see `group_columns`.
 
     Attributes:
         mode: `same` or `none`.
         size: Features per group.
+        offset: Added to each member's shift: 0 makes member g read the
+            column `2**g` after the cell's, as TabICL and TabPFN group, and
+            -1 makes the first member the cell's own column, as Kumo Tabular
+            does.
     """
 
     mode: str = "none"
     size: int = 1
+    offset: int = 0
 
 
 @jax.tree_util.register_dataclass
@@ -55,46 +60,65 @@ class ColumnSummary(NamedTuple):
     inducing: tuple[Float[Array, " batch_features inducing model"], ...]
 
 
+def group_columns(
+    features: int,
+    grouping: FeatureGrouping,
+    count: Int[Array, "*batch"] | None = None,
+) -> Int[Array, "*batch features size"]:
+    """The columns each cell's group reads.
+
+    `same` makes member g of cell c read column `c + 2**g + offset`, cycling
+    through the leading `count` columns as if the rest were dropped; size 1
+    or `none` makes each cell read its own column.
+
+    Args:
+        features: Columns of the table.
+        grouping: Grouping mode, size and offset.
+        count: Leading columns each shift cycles through, per batch row, as
+            if the rest were dropped; None for all.
+
+    Returns:
+        Each cell's members' columns, per batch row if `count` has one.
+    """
+    mode, size, offset = grouping
+    position = jnp.arange(features)[:, None]
+    if size == 1 or mode == "none":
+        return position
+    if mode != "same":
+        raise ValueError(f"unknown feature group mode: {mode!r}")
+    width = features if count is None else jnp.asarray(count)[..., None, None]
+    return (position + (2 ** jnp.arange(size) + offset)[None, :]) % width
+
+
 def group_features(
     table: Float[Array, " batch rows features *channels"],
     grouping: FeatureGrouping,
     count: Int[Array, " batch"] | None = None,
 ) -> Float[Array, " batch rows groups width"]:
-    """Groups features the way the checkpoint was trained.
+    """Groups features the way the checkpoint was trained, see `group_columns`.
 
-    `same` makes group i a circular shift by 2**i; size 1 or `none` keeps scalar
-    groups. A table with channels after the features, such as missing-value
-    flags, groups each channel, and the channels' groups follow one another.
+    A table with channels after the features, such as missing-value flags,
+    groups each channel, and the channels' groups follow one another.
 
     Args:
         table: Feature table, optionally with a channel axis.
-        grouping: Grouping mode and size.
-        count: Leading columns each shift cycles through, per batch row, as if
-            the rest were dropped; None for all.
+        grouping: Grouping mode, size and offset.
+        count: Leading columns each shift cycles through, per batch row, as
+            if the rest were dropped; None for all.
 
     Returns:
         Grouped features.
     """
-    mode, group_size = grouping
     channels = table if table.ndim == 4 else table[..., None]
-    if group_size == 1 or mode == "none":
-        shifted = [channels]
-    elif mode == "same":
-        features = channels.shape[2]
-        width = jnp.full(channels.shape[:1], features) if count is None else count
-        position = jnp.arange(features)
-        shifted = [
-            jnp.take_along_axis(
-                channels,
-                ((position + 2**shift) % width[:, None])[:, None, :, None],
-                axis=2,
-            )
-            for shift in range(group_size)
-        ]
-    else:
-        raise ValueError(f"unknown feature group mode: {mode!r}")
-    grouped = jnp.stack(shifted, axis=-1)
-    return grouped.reshape(*grouped.shape[:3], -1)
+    batch, rows, features, width = channels.shape
+    index = group_columns(features, grouping, count)
+    size = index.shape[-1]
+    index = jnp.broadcast_to(index, (batch, features, size))
+    gathered = jnp.take_along_axis(
+        channels, index.reshape(batch, 1, features * size, 1), axis=2
+    )
+    gathered = gathered.reshape(batch, rows, features, size, width).swapaxes(-1, -2)
+    return gathered.reshape(batch, rows, features, width * size)
 
 
 def _cells(
@@ -194,22 +218,21 @@ def summarize_columns(
     if length is not None:
         # Columns are folded into the batch axis, each batch row's in turn.
         length = jnp.repeat(length, context.shape[2])
-    states: list[Array] = []
-    for block in parameters.blocks:
 
-        def cells(start: Array, size: int, done: tuple = tuple(states)) -> Array:
-            hidden = _cells(
-                parameters,
-                jax.lax.dynamic_slice_in_dim(context, start, size, axis=1),
-                jax.lax.dynamic_slice_in_dim(targets, start, size, axis=1),
-                count,
-            )
-            for earlier, state in zip(parameters.blocks, done, strict=False):
-                hidden = expand(earlier, hidden, state)
-            return hidden
+    def cells(start: Array, size: int, earlier: tuple[Array, ...]) -> Array:
+        hidden = _cells(
+            parameters,
+            jax.lax.dynamic_slice_in_dim(context, start, size, axis=1),
+            jax.lax.dynamic_slice_in_dim(targets, start, size, axis=1),
+            count,
+        )
+        for block, state in zip(parameters.blocks, earlier, strict=False):
+            hidden = expand(block, hidden, state)
+        return hidden
 
-        states.append(compress_streamed(block, cells, rows, size, length))
-    return ColumnSummary(inducing=tuple(states))
+    return ColumnSummary(
+        inducing=compress_layers(parameters.blocks, cells, rows, size, length)
+    )
 
 
 def _step_rows(

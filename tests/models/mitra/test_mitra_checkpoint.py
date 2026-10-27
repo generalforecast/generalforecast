@@ -68,8 +68,9 @@ def test_offline_directory_must_exist(
         mitra_checkpoint("general-forecast/mitra-classifier")
         == tmp_path / "mitra-classifier"
     )
-    with pytest.raises(FileNotFoundError, match="mitra-regressor"):
-        mitra_checkpoint("general-forecast/mitra-regressor")
+    (tmp_path / "mitra-classifier").rmdir()
+    with pytest.raises(FileNotFoundError, match="mitra-classifier"):
+        mitra_checkpoint("general-forecast/mitra-classifier")
 
 
 def test_published_classifier_converts_exactly(

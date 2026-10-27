@@ -8,13 +8,15 @@ the module's parameter names, with the attention's projections fused.
 """
 
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 from jax import Array
 
 from generalforecast.models import catalog
 from generalforecast.models.artifacts import checkpoint
 from generalforecast.models.checkpoints import (
+    Published,
+    check_settings,
     load_state,
     read_all,
     read_linear,
@@ -30,13 +32,6 @@ from generalforecast.nn.norm import RMSNormParameters
 from generalforecast.nn.rope import RoPE
 
 ARCHITECTURE = "timestral"
-
-
-class Published(NamedTuple):
-    """A checkpoint in Mistral's Hugging Face repositories."""
-
-    repository: str
-    revision: str
 
 
 # The upstream revisions the catalog's mirrors were converted from.
@@ -112,11 +107,7 @@ def check_supported(settings: dict[str, Any]) -> None:
     Raises:
         NotImplementedError: Naming the unsupported or unknown setting.
     """
-    for key, values in SUPPORTED.items():
-        if settings.get(key) not in values:
-            raise NotImplementedError(
-                f"Timestral {key}={settings.get(key)!r} is not supported"
-            )
+    check_settings("Timestral", settings, SUPPORTED)
     kinds = set(settings.get("block_schedule", ())) - set(LAYER_KINDS)
     if kinds:
         raise NotImplementedError(
@@ -124,9 +115,7 @@ def check_supported(settings: dict[str, Any]) -> None:
         )
     if 0.5 not in settings.get("quantile_knots", ()):
         raise NotImplementedError("Timestral quantile_knots must hold the median")
-    unknown = sorted(set(settings) - set(SUPPORTED) - set(SIZES) - set(IGNORED))
-    if unknown:
-        raise NotImplementedError(f"Timestral settings {unknown} are not supported")
+    check_settings("Timestral", settings, SUPPORTED, known=(*SIZES, *IGNORED))
 
 
 def _norm(state: dict[str, Array], name: str, epsilon: float) -> RMSNormParameters:

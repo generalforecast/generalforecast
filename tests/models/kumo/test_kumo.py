@@ -33,7 +33,7 @@ from tests.models.kumo.tiny import (
     tiny_kumo,
     tiny_kumo_state,
 )
-from tests.utils.engine_client import local
+from tests.utils import node_harness
 
 
 def test_properties_come_from_the_parameters() -> None:
@@ -98,7 +98,9 @@ def test_columns_with_more_categories_than_kept_are_flagged_once(
     np.testing.assert_array_equal(ranks[:, 0], features[:, 0] / 3)
     assert bool(snapshot.categories.crowded[0])
 
-    client = local()
+    # The worker logs in this process, where caplog sees it; the engine's
+    # workers run in processes of their own, whose logs reach only stderr.
+    client = node_harness.local(compile_cache=False)
     crowded = client.create_table(
         "crowded",
         model="tests/kumo-classifier",

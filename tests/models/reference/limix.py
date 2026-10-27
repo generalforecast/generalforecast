@@ -156,9 +156,9 @@ def our_outputs(regression: bool, prepared: Any) -> np.ndarray:
     # are left out of attention, so their codes do not matter.
     groups = int(kept_groups(state.snapshot))
     draws = _codes(groups, width).numpy()
-    draws = np.pad(draws, ((0, state.codes.shape[0] - groups), (0, 0)))
+    draws = np.pad(draws, ((0, state.columns.shape[0] - groups), (0, 0)))
     codes = linear(model.column_codes, jnp.asarray(draws))
-    state = dataclasses.replace(state, codes=codes)
+    state = dataclasses.replace(state, columns=codes)
     rows = limix_functions.embed(model, state, context, targets)
     cache = limix_functions.encode(model, state, rows, targets)
     queries = limix_functions.embed(

@@ -18,6 +18,7 @@ known covariate, whose context reads its future, so a group without one
 encodes once and decodes any horizon, growing exactly by whole patches.
 """
 
+import functools
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -28,6 +29,7 @@ import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
+from generalforecast.models.common import compute_dtype
 from generalforecast.models.series import (
     KNOWN,
     PAST,
@@ -35,7 +37,13 @@ from generalforecast.models.series import (
     SeriesFunctions,
     SeriesGroup,
     SeriesProperties,
+    group_inputs,
+    median_index,
+    observed_moments,
     padded_horizon,
+    real_patches,
+    refuse_known,
+    rows_first,
 )
 from generalforecast.nn.attention import (
     AttentionCache,
@@ -154,6 +162,12 @@ class TimestralCache:
             heads, head_dim)`, keys rotated at their positions.
         valid: Which patches are keys for each row, `(patches, rows)`: the
             observed ones and those after a row's first.
+        values: The context's values as the network reads them, `(patches,
+            rows, patch)`: the window `decode` runs whole once fed-back
+            medians would pass the context limit, as `forecast` does. They
+            are kept as the bits of their float32 values, so a cache stored
+            in a reduced precision keeps them exact.
+        observed: Which of `values` are observed.
         statistics: The context's running moments per row at its last step.
         lowest: The lowest observed value per row, or infinity for none.
         highest: The highest observed value per row, or minus infinity.
@@ -170,6 +184,8 @@ class TimestralCache:
 
     time: tuple[AttentionCache, ...]
     valid: Bool[Array, " patches rows"]
+    values: Int[Array, " patches rows patch"]
+    observed: Bool[Array, " patches rows patch"]
     statistics: Welford
     lowest: Float[Array, " rows"]
     highest: Float[Array, " rows"]
@@ -178,11 +194,6 @@ class TimestralCache:
     roles: Int[Array, " rows"]
     sign: Int[Array, " rows"]
     real: Bool[Array, " rows"]
-
-
-def _dtype(model: Timestral) -> jnp.dtype:
-    """The dtype the network computes in, set by its parameters."""
-    return model.query.dtype
 
 
 def _combine(a: Welford, b: Welford) -> Welford:
@@ -264,12 +275,8 @@ def _scaled(
     running = _running(values, observed, before)
     scaled = _standardize(model, values, observed, _patch_frames(model, running))
     known = (roles == KNOWN)[:, None]
-    count = jnp.maximum(observed.sum(axis=-1, keepdims=True), 1)
-    loc = jnp.where(observed, values, 0.0).sum(axis=-1, keepdims=True) / count
-    deviation = jnp.where(observed, jnp.square(values - loc), 0.0)
-    scale = jnp.maximum(
-        jnp.sqrt(deviation.sum(axis=-1, keepdims=True) / count), model.minimum_scale
-    )
+    _, loc, deviation = observed_moments(values, observed, keepdims=True)
+    scale = jnp.maximum(deviation, model.minimum_scale)
     indicator = ((values == 0) | (values == 1) | ~observed).all(axis=-1, keepdims=True)
     indicator = indicator & observed.any(axis=-1, keepdims=True)
     whole = Scale(jnp.where(indicator, 0.0, loc), jnp.where(indicator, 1.0, scale))
@@ -292,7 +299,7 @@ def _embed(
         ],
         axis=-1,
     )
-    return residual_block(model.patch_embedding, features.astype(_dtype(model)))
+    return residual_block(model.patch_embedding, features.astype(compute_dtype(model)))
 
 
 def _valid(
@@ -389,7 +396,7 @@ def _quantiles(
     """
     rows, patches, _ = tokens.shape
     levels = model.quantiles
-    middle = levels.index(0.5)
+    middle = median_index(levels)
     raw = residual_block(model.head, tokens).astype(jnp.float32)
     raw = raw.reshape(rows, patches, model.patch, len(levels))
     widths = [0.0] * len(levels)
@@ -467,7 +474,7 @@ def _refine(
     if patches <= 1:
         return quantiles
     anchor = _scale_of(model, state)
-    median = quantiles[..., model.quantiles.index(0.5)].reshape(
+    median = quantiles[..., median_index(model.quantiles)].reshape(
         -1, patches, model.patch
     )
     sinh_median = (median - anchor.loc[:, None, None]) / anchor.scale[:, None, None]
@@ -486,32 +493,11 @@ def _refine(
 
 def _rows(model: Timestral, group: SeriesGroup, horizon: int) -> Rows:
     """A group as the network reads it: trimmed, masked, and mirrored if averaging."""
-    rows, steps = group.values.shape
-    if steps % model.patch:
-        raise ValueError(
-            f"the context's {steps} steps are not whole patches of {model.patch}"
-        )
+    rows = group.values.shape[0]
     limit = model.context_limit // model.patch * model.patch
-    real = (
-        jnp.ones(rows, bool)
-        if group.num_rows is None
-        else jnp.arange(rows) < group.num_rows
+    values, observed, real, future, future_observed = group_inputs(
+        group, model.patch, limit, horizon
     )
-    observed = (group.observed & real[:, None])[:, -limit:]
-    values = jnp.where(observed, group.values[:, -limit:], 0.0).astype(jnp.float32)
-    if group.future is None:
-        future = jnp.zeros((rows, horizon), jnp.float32)
-        future_observed = jnp.zeros((rows, horizon), bool)
-    else:
-        future_observed = (
-            jnp.isfinite(group.future)
-            if group.future_observed is None
-            else group.future_observed
-        )
-        future_observed = (
-            future_observed & real[:, None] & (group.roles == KNOWN)[:, None]
-        )
-        future = jnp.where(future_observed, group.future, 0.0).astype(jnp.float32)
     data = Rows(
         values,
         observed,
@@ -532,16 +518,6 @@ def _rows(model: Timestral, group: SeriesGroup, horizon: int) -> Rows:
         jnp.concatenate([future, -future]),
         jnp.concatenate([future_observed, future_observed]),
     )
-
-
-def _length(cache: TimestralCache) -> Int[Array, ""] | None:
-    """How many of a cache's patches are real, from its attention caches' lengths; None when all are."""
-    return cache.time[0].length if cache.time else None
-
-
-def _along_rows(leaf: Array) -> Array:
-    """A stored attention cache leaf with rows first, as attention along time reads it; a cache's scalar length stays as it is."""
-    return leaf.swapaxes(0, 1) if leaf.ndim > 1 else leaf
 
 
 def _first(observed: Bool[Array, " rows time"], patch: int) -> Int[Array, ""]:
@@ -573,7 +549,7 @@ def _block(
         [
             _embed(model, scaled, observed),
             jnp.broadcast_to(model.query, (rows, horizon, model.query.shape[0])).astype(
-                _dtype(model)
+                compute_dtype(model)
             ),
         ],
         axis=1,
@@ -682,7 +658,7 @@ def _feedback(
     future_observed: Bool[Array, " rows steps"],
 ) -> tuple[Float[Array, " rows steps"], Bool[Array, " rows steps"]]:
     """What a block adds to the context: medians, known futures, or blanks."""
-    median = quantiles[..., model.quantiles.index(0.5)]
+    median = quantiles[..., median_index(model.quantiles)]
     median = jnp.where(jnp.isfinite(median) & (jnp.abs(median) < EXTREME), median, 0.0)
     known, past = (roles == KNOWN)[:, None], (roles == PAST)[:, None]
     values = jnp.where(known, future, jnp.where(past, 0.0, median))
@@ -735,6 +711,16 @@ def forecast(
     return _finish(model, quantiles, data, low, high, nonnegative)
 
 
+def _by_patch(model: Timestral, values: Array) -> Array:
+    """Steps `(rows, time)` as patches first, `(patches, rows, patch)`, as caches keep them."""
+    return values.reshape(values.shape[0], -1, model.patch).swapaxes(0, 1)
+
+
+def _by_row(values: Array) -> Array:
+    """Undoes `_by_patch`."""
+    return values.swapaxes(0, 1).reshape(values.shape[1], -1)
+
+
 def _grow(
     model: Timestral,
     cache: TimestralCache | None,
@@ -766,7 +752,7 @@ def _grow(
     earlier = 0 if cache is None else cache.valid.shape[0]
     # A cache read back from the runtime's slots holds its real patches
     # first, then padding, and says how many are real.
-    real = None if cache is None else _length(cache)
+    real = None if cache is None else real_patches(cache.time)
     if real is None and (earlier + patches) * model.patch > model.context_limit:
         raise ValueError(
             f"a context of {(earlier + patches) * model.patch} steps passes the "
@@ -795,7 +781,7 @@ def _grow(
             ],
             -1,
         )
-        prefix = tuple(jax.tree.map(_along_rows, layer) for layer in cache.time)
+        prefix = rows_first(cache.time)
     positions = held + jnp.arange(patches) - first
     _, caches = _transform(
         model, tokens, positions, time_mask, _variate_mask(data, valid.T), prefix
@@ -804,6 +790,10 @@ def _grow(
         jax.tree.map(lambda leaf: leaf.swapaxes(0, 1), layer) for layer in caches
     )
     last = jax.tree.map(lambda leaf: leaf[:, -1], running)
+    raw = jax.lax.bitcast_convert_type(
+        _by_patch(model, values.astype(jnp.float32)), jnp.int32
+    )
+    seen = _by_patch(model, observed)
     if cache is None:
         lowest, highest, nonnegative = _range(values, observed)
         # A known covariate's context reads the horizon, so its cache would
@@ -813,6 +803,8 @@ def _grow(
         return TimestralCache(
             time,
             valid.T,
+            raw,
+            seen,
             last,
             lowest,
             highest,
@@ -847,6 +839,8 @@ def _grow(
             for old, new in zip(cache.time, time, strict=True)
         ),
         grown(cache.valid, valid.T),
+        grown(cache.values, raw),
+        grown(cache.observed, seen),
         last,
         lowest,
         highest,
@@ -872,12 +866,7 @@ def encode(model: Timestral, group: SeriesGroup) -> TimestralCache:
     Raises:
         ValueError: If a row is a known covariate, when that can be seen.
     """
-    if not isinstance(group.roles, jax.core.Tracer) and bool(
-        (group.roles == KNOWN).any()
-    ):
-        raise ValueError(
-            "a group with a known covariate is forecast whole, not encoded"
-        )
+    refuse_known(group)
     data = _rows(model, group, 0)
     return _grow(model, None, data, data.values, data.observed)
 
@@ -889,11 +878,13 @@ def decode(
     future: Array | None = None,
     future_observed: Array | None = None,
 ) -> Float[Array, " rows horizon quantiles"]:
-    """Forecasts `horizon` steps from an encoded context, block by block.
+    """Forecasts `horizon` steps from an encoded context, block by block, as `forecast` does.
 
     Each block's query tokens read the cached context and each other; past one
     block, the context grows by the block's medians, exactly as encoding the
-    longer context would, though without dropping steps past the model's limit.
+    longer context would. Once the medians would take the context past the
+    model's limit, `forecast` drops its oldest steps and runs the window whole,
+    so each such block runs the window the cache's values and the medians make.
     The range forecasts are clamped to is the context's at the start, as in
     `forecast`.
 
@@ -918,57 +909,120 @@ def decode(
     low, high, nonnegative = _bounds(
         model, cache.statistics, cache.lowest, cache.highest, cache.nonnegative
     )
+    limit = model.context_limit // model.patch * model.patch
+    # The context's steps: the real ones first, then room for the medians.
+    real = real_patches(cache.time)
+    stored = cache.valid.shape[0] * model.patch
+    start = stored if real is None else real * model.patch
+    values = jax.lax.bitcast_convert_type(_by_row(cache.values), jnp.float32)
+    observed = _by_row(cache.observed)
     blocks = []
     done = 0
     while done < horizon:
         patches = min(model.block_size, -(-(horizon - done) // model.patch))
-        context = cache.valid.shape[0]
-        real = _length(cache)
-        tokens = jnp.broadcast_to(model.query, (rows, patches, model.query.shape[0]))
-        own = _causal(patches, patches) | jnp.eye(patches, dtype=bool)
-        time_mask = jnp.concatenate(
-            [
-                jnp.broadcast_to(cache.valid.T[:, None, :], (rows, patches, context)),
-                jnp.broadcast_to(own, (rows, patches, patches)),
-            ],
-            axis=-1,
+        steps = patches * model.patch
+
+        cached = functools.partial(_cached_block, model, cache, patches)
+        # The window `forecast` reads: the context's last steps, medians included.
+        whole = functools.partial(
+            _window_block, model, cache, values, observed, start + done - limit, steps
         )
-        held = context if real is None else real
-        positions = held + jnp.arange(patches) - cache.first
-        prefix = tuple(jax.tree.map(_along_rows, layer) for layer in cache.time)
-        slots = jnp.ones((patches, rows), bool)
-        outputs, _ = _transform(
-            model,
-            tokens.astype(_dtype(model)),
-            positions,
-            time_mask,
-            _variate_mask(cache, slots),
-            prefix,
-        )
-        quantiles = _denormalize(
-            _quantiles(model, outputs), _scale_of(model, cache.statistics)
-        )
-        quantiles = _refine(model, quantiles, cache.statistics, cache.roles)
+        # The fed-back medians pass the limit only if the stored patches would.
+        # A cache read back from slots says its real patches only when traced,
+        # so its groups choose apart; decoded together under `jax.vmap`, each
+        # such block runs both ways.
+        if stored + done <= limit:
+            quantiles = cached()
+        elif real is None:
+            quantiles = whole()
+        else:
+            quantiles = jax.lax.cond(start + done > limit, whole, cached)
         blocks.append(quantiles)
-        done += patches * model.patch
+        done += steps
         if done < horizon:
-            steps = patches * model.patch
             blank = jnp.zeros((rows, steps), jnp.float32)
             added, added_observed = _feedback(
                 model, quantiles, cache.roles, blank, jnp.zeros((rows, steps), bool)
             )
-            data = Rows(
-                added,
-                added_observed,
-                cache.roles,
-                cache.sign,
-                cache.real,
-                blank,
-                blank > 0,
+            length = start + done - steps
+            values, observed = (
+                jax.lax.dynamic_update_slice_in_dim(
+                    jnp.concatenate([leaf, jnp.zeros_like(new)], axis=1),
+                    new,
+                    length,
+                    axis=1,
+                )
+                for leaf, new in ((values, added), (observed, added_observed))
             )
-            cache = _grow(model, cache, data, added, added_observed, fold=False)
+            # A cache that cannot grow past the limit is not read again.
+            if real is not None or stored + done <= limit:
+                data = Rows(
+                    added,
+                    added_observed,
+                    cache.roles,
+                    cache.sign,
+                    cache.real,
+                    blank,
+                    blank > 0,
+                )
+                cache = _grow(model, cache, data, added, added_observed, fold=False)
     quantiles = jnp.concatenate(blocks, axis=1)[:, :horizon]
     return _finish(model, quantiles, cache, low, high, nonnegative)
+
+
+def _cached_block(
+    model: Timestral, cache: TimestralCache, patches: int
+) -> Float[Array, " rows steps quantiles"]:
+    """A block of `patches` query tokens that read the cached context."""
+    rows = cache.roles.shape[0]
+    context = cache.valid.shape[0]
+    real = real_patches(cache.time)
+    tokens = jnp.broadcast_to(model.query, (rows, patches, model.query.shape[0]))
+    own = _causal(patches, patches) | jnp.eye(patches, dtype=bool)
+    time_mask = jnp.concatenate(
+        [
+            jnp.broadcast_to(cache.valid.T[:, None, :], (rows, patches, context)),
+            jnp.broadcast_to(own, (rows, patches, patches)),
+        ],
+        axis=-1,
+    )
+    held = context if real is None else real
+    positions = held + jnp.arange(patches) - cache.first
+    outputs, _ = _transform(
+        model,
+        tokens.astype(compute_dtype(model)),
+        positions,
+        time_mask,
+        _variate_mask(cache, jnp.ones((patches, rows), bool)),
+        rows_first(cache.time),
+    )
+    quantiles = _denormalize(
+        _quantiles(model, outputs), _scale_of(model, cache.statistics)
+    )
+    return _refine(model, quantiles, cache.statistics, cache.roles)
+
+
+def _window_block(
+    model: Timestral,
+    cache: TimestralCache,
+    values: Float[Array, " rows time"],
+    observed: Bool[Array, " rows time"],
+    offset: int | Int[Array, ""],
+    steps: int,
+) -> Float[Array, " rows steps quantiles"]:
+    """A block run whole over the context's steps from `offset`, as many as the limit takes, as `forecast` runs one."""
+    limit = model.context_limit // model.patch * model.patch
+    values, observed = (
+        jax.lax.dynamic_slice_in_dim(leaf, offset, limit, axis=1)
+        for leaf in (values, observed)
+    )
+    rows = cache.roles.shape[0]
+    blank = jnp.zeros((rows, steps), jnp.float32)
+    unknown = jnp.zeros((rows, steps), bool)
+    data = Rows(values, observed, cache.roles, cache.sign, cache.real, blank, unknown)
+    quantiles = _block(model, data, blank, unknown)
+    last = jax.tree.map(lambda leaf: leaf[:, -1], _running(values, observed))
+    return _refine(model, quantiles, last, cache.roles)
 
 
 def extend(

@@ -10,17 +10,15 @@ from jaxtyping import Bool, Float, Int
 
 from generalforecast.models.prepare import (
     Columns,
+    Standardizer,
     constant_columns,
+    fit_standardizer,
     kept_first,
-    masked_stats,
     precise_moments,
+    soft_clip,
+    standardize,
 )
 
-# Standardized values are clipped here, as in Kumo Tabular's own preprocessing.
-CLIP = 100.0
-# Then soft-clipped this many deviations from the mean, as its ClipSigma does.
-SIGMA = 4.0
-EPSILON = 1e-6
 # The most distinct context values a categorical column keeps exactly: 64 KiB
 # of float32 per column of a table with categorical columns.
 CATEGORIES = 16384
@@ -62,15 +60,9 @@ class KumoSnapshot(NamedTuple):
     AlignCategories does, so they also hold the context's categories. `columns`
     puts first the columns Kumo Tabular's DropConstantColumns keeps, numerical
     ones before categorical ones.
-    `center_low` is what rounding the mean to float32 left out, so values near
-    it center as upstream's float64 mean centers them.
     """
 
-    center: Float[Array, " features"]
-    center_low: Float[Array, " features"]
-    scale: Float[Array, " features"]
-    lower: Float[Array, " features"]
-    upper: Float[Array, " features"]
+    features: Standardizer
     target_center: Float[Array, ""] | None
     target_scale: Float[Array, ""] | None
     columns: Columns
@@ -199,32 +191,13 @@ def fit_snapshot(
         categories = jax.vmap(_fit_categories, in_axes=(1, None))(features, valid)
         features = align_categories(categories, features, categorical)
     finite = valid[:, None] & jnp.isfinite(features)
-    stats = masked_stats(features, finite)
-    scale = stats.deviation + EPSILON
-    centered = (features - stats.center) - stats.center_low
-    standardized = jnp.clip(centered / scale, -CLIP, CLIP)
-    mean, deviation = precise_moments(standardized, finite, ddof=1)
-    deviation = jnp.maximum(deviation, EPSILON)
-    inside = (
-        finite
-        & (standardized >= mean - SIGMA * deviation)
-        & (standardized <= mean + SIGMA * deviation)
-    )
-    kept_mean, kept_deviation = precise_moments(standardized, inside, ddof=1)
-    # A column with nothing inside its bounds keeps the first pass's.
-    kept = inside.any(axis=0)
-    mean = jnp.where(kept, kept_mean, mean)
-    deviation = jnp.where(kept, jnp.maximum(kept_deviation, EPSILON), deviation)
+    standardizer = fit_standardizer(features, finite, finite)
     target_center = target_scale = None
     if targets is not None:
         target_center, target_deviation = precise_moments(targets, valid)
         target_scale = jnp.where(target_deviation > 0, target_deviation, 1)
     return KumoSnapshot(
-        stats.center,
-        stats.center_low,
-        scale,
-        mean - SIGMA * deviation,
-        mean + SIGMA * deviation,
+        standardizer,
         target_center,
         target_scale,
         kumo_columns(features, valid, categorical),
@@ -253,9 +226,5 @@ def prepare_features(
     """
     if snapshot.categories is not None and categorical is not None:
         features = align_categories(snapshot.categories, features, categorical)
-    centered = (features - snapshot.center) - snapshot.center_low
-    standardized = jnp.clip(centered / snapshot.scale, -CLIP, CLIP)
-    magnitude = jnp.log1p(jnp.abs(standardized))
-    clipped = jnp.maximum(snapshot.lower - magnitude, standardized)
-    prepared = jnp.minimum(snapshot.upper + magnitude, clipped)
-    return prepared[:, snapshot.columns.order]
+    standardized = standardize(snapshot.features, features)
+    return soft_clip(snapshot.features, standardized)[:, snapshot.columns.order]

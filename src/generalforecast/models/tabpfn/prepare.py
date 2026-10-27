@@ -46,6 +46,13 @@ class TabPFNSnapshot(NamedTuple):
 
 
 def _sum(values: Array, mask: Array) -> Array:
+    """Plain sums of the values `mask` marks, as upstream's float32 scaler takes them.
+
+    TabPFN's `torch_nanmean` and `torch_nanstd` divide plain sums.
+    `prepare.masked_moments`, which sums differences from a present value,
+    serves upstreams that compute in float64 and would move a near-constant
+    column's standardized values here.
+    """
     return jnp.sum(jnp.where(mask, values, 0), axis=0)
 
 

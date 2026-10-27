@@ -7,7 +7,9 @@ import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
+from generalforecast.models.column_embedding import FeatureGrouping, group_columns
 from generalforecast.models.prepare import precise_mean
+from generalforecast.nn.fourier import fourier_features
 from generalforecast.nn.linear import LinearParameters
 
 
@@ -47,18 +49,6 @@ def impute_means(
     return precise_mean(features, valid[:, None] & ~jnp.isnan(features))
 
 
-def group_indices(
-    features: int, group: int, count: Int[Array, ""] | None = None
-) -> Array:
-    """Columns of each cell: cell c groups columns `c + 2**g - 1` mod the width.
-
-    The width is `count`, the leading columns kept, or every column if None.
-    """
-    offsets = 2 ** jnp.arange(group) - 1
-    width = features if count is None else count
-    return (jnp.arange(features)[:, None] + offsets[None, :]) % width
-
-
 def _project(
     fourier: Float[Array, " rows features group fourier"], linear: LinearParameters
 ) -> Float[Array, " rows features model"]:
@@ -94,14 +84,11 @@ def embed_cells(
     """
     missing = jnp.isnan(features)
     filled = jnp.where(missing, means, features).astype(jnp.float32)
-    group = parameters.frequencies.shape[0]
-    index = group_indices(features.shape[-1], group, count)
+    grouping = FeatureGrouping("same", parameters.frequencies.shape[0], offset=-1)
+    index = group_columns(features.shape[-1], grouping, count)
 
     def fourier(frequencies: Array) -> Array:
-        phases = filled[:, index, None] * frequencies.astype(jnp.float32)
-        return jnp.concatenate([jnp.sin(phases), jnp.cos(phases)], axis=-1).astype(
-            dtype
-        )
+        return fourier_features(filled[:, index], frequencies, dtype)
 
     if categorical is None:
         embedded = _project(fourier(parameters.frequencies), parameters.linear)

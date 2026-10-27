@@ -313,3 +313,16 @@ def test_built_in_classifiers_say_their_native_class_slots() -> None:
         )
         == catalog.MAX_CLASSES
     )
+
+
+@pytest.mark.parametrize(
+    "family", ["chronos2", "limix", "mitra", "tabpfn", "timesfm3", "timestral"]
+)
+def test_published_checkpoints_go_by_canonical_ids(family: str) -> None:
+    import importlib
+
+    published = importlib.import_module(
+        f"generalforecast.models.{family}.checkpoint"
+    ).PUBLISHED
+
+    assert set(published) <= set(catalog.ENTRIES)

@@ -3,7 +3,7 @@
 
 import json
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any
 
 from huggingface_hub import hf_hub_download
 from jax import Array
@@ -12,6 +12,8 @@ from safetensors.numpy import load_file
 from generalforecast.models import catalog
 from generalforecast.models.artifacts import checkpoint
 from generalforecast.models.checkpoints import (
+    Published,
+    check_settings,
     converted_checkpoint,
     load_state,
     read_all,
@@ -26,25 +28,15 @@ from generalforecast.nn.norm import LayerNormParameters
 ARCHITECTURE = "mitra"
 
 
-class Published(NamedTuple):
-    """A checkpoint in AutoGluon's Hugging Face repositories."""
-
-    repository: str
-    revision: str
-
-
 PUBLISHED = {
     "general-forecast/mitra-classifier": Published(
         "autogluon/mitra-classifier", "c425e9fa0910a6be1c494321792e7ba2a1367b1a"
-    ),
-    "general-forecast/mitra-regressor": Published(
-        "autogluon/mitra-regressor", "5f277aa8f69042d39d6ac3612aed18bb9279bd95"
     ),
     # The upstream revisions the general-forecast mirrors were converted from.
     "general-forecast/mitra-2-classifier": Published(
         "autogluon/mitra-classifier-2", "edada0d20759c58ada8c8605c25f22f6e98ea5f0"
     ),
-    "mitra-2-regressor": Published(
+    "general-forecast/mitra-2-regressor": Published(
         "autogluon/mitra-regressor-2", "246c7d310fff04296a2388df5f448e3ffe809283"
     ),
 }
@@ -92,14 +84,7 @@ def check_supported(settings: dict[str, Any]) -> None:
     Raises:
         NotImplementedError: Naming the unsupported or unknown setting.
     """
-    for key, values in SUPPORTED.items():
-        if settings.get(key) not in values:
-            raise NotImplementedError(
-                f"Mitra {key}={settings.get(key)!r} is not supported"
-            )
-    unknown = sorted(set(settings) - set(SUPPORTED) - set(SIZES))
-    if unknown:
-        raise NotImplementedError(f"Mitra settings {unknown} are not supported")
+    check_settings("Mitra", settings, SUPPORTED, known=SIZES)
     # Mitra-1's regressor predicts one value, where generalforecast's regressors return
     # quantiles; Mitra-2's predicts a distribution over buckets.
     if settings["task"] == "REGRESSION" and int(settings["dim_output"]) == 1:

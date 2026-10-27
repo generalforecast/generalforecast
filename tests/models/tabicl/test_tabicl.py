@@ -207,12 +207,13 @@ def test_outliers_are_clipped_softly_as_upstream_clips_them() -> None:
     prepared = apply_numeric_snapshot(snapshot, jnp.asarray(features))
 
     # The bounds come from the rows without the outlier, four deviations wide.
-    rest = (features[1:, 0] - snapshot.center[0]) / snapshot.scale[0]
+    standardizer = snapshot.features
+    rest = (features[1:, 0] - standardizer.center[0]) / standardizer.scale[0]
     expected_upper = rest.mean() + 4 * rest.std(ddof=1)
-    np.testing.assert_allclose(snapshot.upper[0], expected_upper, rtol=1e-4)
-    outlier = (features[0, 0] - snapshot.center[0]) / snapshot.scale[0]
+    np.testing.assert_allclose(standardizer.upper[0], expected_upper, rtol=1e-4)
+    outlier = (features[0, 0] - standardizer.center[0]) / standardizer.scale[0]
     np.testing.assert_allclose(
-        prepared[0, 0], np.log1p(abs(outlier)) + snapshot.upper[0], rtol=1e-5
+        prepared[0, 0], np.log1p(abs(outlier)) + standardizer.upper[0], rtol=1e-5
     )
     assert float(prepared[0, 0]) < outlier
 
