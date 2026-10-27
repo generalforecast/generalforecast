@@ -336,9 +336,9 @@ fn logs_read_back_from_any_sequence_for_replicas() {
         log.append(&record).unwrap();
     }
 
-    let entries = log.read(0, usize::MAX).unwrap();
+    let entries = log.read(0, usize::MAX, usize::MAX).unwrap();
     let tail: Vec<Record> = log
-        .read(2, usize::MAX)
+        .read(2, usize::MAX, usize::MAX)
         .unwrap()
         .iter()
         .map(|(_, bytes)| record(bytes))
@@ -354,11 +354,11 @@ fn logs_read_back_from_any_sequence_for_replicas() {
         LogEntry::Definition(definition(), Terms::default())
     );
     assert!(same(&tail, &records()[1..]));
-    assert!(log.read(length, usize::MAX).unwrap().is_empty());
+    assert!(log.read(length, usize::MAX, usize::MAX).unwrap().is_empty());
     // A read past the end, as from a replica ahead of this copy, is refused.
     for from in [length + 1, u64::MAX] {
         assert!(matches!(
-            log.read(from, usize::MAX),
+            log.read(from, usize::MAX, usize::MAX),
             Err(LogError::Beyond { .. })
         ));
     }
@@ -367,7 +367,7 @@ fn logs_read_back_from_any_sequence_for_replicas() {
     let (_, _, mut log) = open(&path, &keys(7)).unwrap();
     log.append(&Record::Refit).unwrap();
     assert_eq!(log.length(), length + 1);
-    assert_eq!(log.read(length, usize::MAX).unwrap().len(), 1);
+    assert_eq!(log.read(length, usize::MAX, usize::MAX).unwrap().len(), 1);
 }
 
 #[test]
@@ -409,14 +409,14 @@ fn compaction_keeps_sequence_numbers() {
     ));
     assert_eq!(log.length(), 8);
     let sequences: Vec<u64> = log
-        .read(0, usize::MAX)
+        .read(0, usize::MAX, usize::MAX)
         .unwrap()
         .iter()
         .map(|(sequence, _)| *sequence)
         .collect();
     assert_eq!(sequences, [0, 5, 6, 7]);
     // A replica that far behind gets the definition, for its terms, then the snapshot.
-    let behind = log.read(2, usize::MAX).unwrap();
+    let behind = log.read(2, usize::MAX, usize::MAX).unwrap();
     let sequences: Vec<u64> = behind.iter().map(|(sequence, _)| *sequence).collect();
     assert_eq!(sequences, [0, 5, 6, 7]);
     assert!(same(&[record(&behind[1].1)], &[snapshot]));
@@ -455,7 +455,7 @@ fn terms_survive_reopening_and_compaction() {
     let (_, _, log) = open(&path, &keys(7)).unwrap();
     assert_eq!(log.terms(), &terms);
     assert_eq!(
-        decode(&log.read(1, usize::MAX).unwrap()[0].1).unwrap(),
+        decode(&log.read(1, usize::MAX, usize::MAX).unwrap()[0].1).unwrap(),
         LogEntry::Definition(definition(), terms)
     );
 }
@@ -566,13 +566,13 @@ fn staged_records_become_durable_together_and_read_in_pages() {
     let (_, replayed, log) = open(&path, &keys(7)).unwrap();
     assert!(same(&replayed, &records()[..3]));
     let page: Vec<u64> = log
-        .read(1, 2)
+        .read(1, 2, usize::MAX)
         .unwrap()
         .iter()
         .map(|(sequence, _)| *sequence)
         .collect();
     assert_eq!(page, [1, 2]);
-    assert_eq!(log.read(3, 2).unwrap().len(), 1);
+    assert_eq!(log.read(3, 2, usize::MAX).unwrap().len(), 1);
 }
 
 #[test]
@@ -810,19 +810,19 @@ fn rotation_keeps_every_entry_and_its_sequence() {
         previous: vec![key(7)],
     };
     let (_, before, mut log) = open(&path, &rotated).unwrap();
-    let entries = log.read(0, usize::MAX).unwrap();
+    let entries = log.read(0, usize::MAX, usize::MAX).unwrap();
 
     log.rotate().unwrap();
 
     // The same entries at the same sequence numbers, as copies elsewhere hold
     // them, where a compaction would have added one.
     assert!(!log.needs_rotation());
-    assert_eq!(log.read(0, usize::MAX).unwrap(), entries);
+    assert_eq!(log.read(0, usize::MAX, usize::MAX).unwrap(), entries);
     drop(log);
     let (_, after, log) = open(&path, &keys(8)).unwrap();
     assert!(same(&after, &before));
     assert_eq!(log.length(), records().len() as u64 + 1);
-    log.read(1, usize::MAX).unwrap();
+    log.read(1, usize::MAX, usize::MAX).unwrap();
 }
 
 #[test]
@@ -1027,4 +1027,47 @@ fn series_definitions_name_their_columns_and_replay() {
     drop(log);
     let (replayed, _, _) = open(&path, &keys(7)).unwrap();
     assert_eq!(replayed, definition);
+}
+
+#[test]
+fn a_creation_cut_short_inside_its_definition_is_set_aside_and_frees_its_name() {
+    let directory = tempdir();
+    let path = directory.join("payments.log");
+    let keys = Keys::only(key(7));
+    drop(Log::create(&path, &key(7), &definition(), Terms::default()).unwrap());
+    // A crash after the head was written, before the definition reached disk.
+    for length in [26, 16] {
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(length)
+            .unwrap();
+        assert!(matches!(
+            Log::open(&path, &keys).err(),
+            Some(LogError::Unfinished)
+        ));
+        assert!(setup::open_log(&path, &keys).unwrap().is_none());
+        assert!(!path.exists(), "the cut-short log is set aside");
+        drop(Log::create(&path, &key(7), &definition(), Terms::default()).unwrap());
+        assert!(open(&path, &keys).is_ok(), "the name takes a new creation");
+    }
+}
+
+#[test]
+fn a_page_of_entries_stops_at_its_byte_bound_past_its_first_entry() {
+    let directory = tempdir();
+    let path = directory.join("payments.log");
+    let log = written(&path, &records());
+    let all = log.read(0, usize::MAX, usize::MAX).unwrap();
+    assert!(all.len() > 2);
+    let first = log.read(0, usize::MAX, 0).unwrap();
+    assert_eq!(first.len(), 1, "a page always takes its first entry");
+    let sizes: Vec<usize> = all.iter().map(|(_, plain)| plain.len()).collect();
+    // A page with room for the first two sealed entries and not the third.
+    let sealed = |plain: usize| plain + 8 + 24 + 16;
+    let room = sealed(sizes[0]) + sealed(sizes[1]);
+    let page = log.read(0, usize::MAX, room).unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page, all[..2]);
 }

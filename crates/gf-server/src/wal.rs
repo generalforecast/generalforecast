@@ -1012,6 +1012,9 @@ pub enum LogError {
         length: u64,
     },
     Malformed(String),
+    /// The log ends inside its definition: a creation a crash cut short,
+    /// which was never acknowledged.
+    Unfinished,
     /// The table names a strategy this server no longer serves; its log is
     /// whole and stays where it is.
     RetiredStrategy(String),
@@ -1024,7 +1027,11 @@ impl LogError {
     pub fn damaged(&self) -> bool {
         matches!(
             self,
-            Self::Format(_) | Self::Decrypt { .. } | Self::Length { .. } | Self::Malformed(_)
+            Self::Format(_)
+                | Self::Decrypt { .. }
+                | Self::Length { .. }
+                | Self::Malformed(_)
+                | Self::Unfinished
         )
     }
 }
@@ -1063,6 +1070,10 @@ impl fmt::Display for LogError {
                 "the log holds {length} entries, so it cannot be read from entry {from}"
             ),
             Self::Malformed(message) => formatter.write_str(message),
+            Self::Unfinished => write!(
+                formatter,
+                "the log ends inside its definition: a creation a crash cut short"
+            ),
             Self::RetiredStrategy(kind) => write!(
                 formatter,
                 "the table uses the retired {kind} strategy; recreate it with \
@@ -1372,16 +1383,23 @@ impl Log {
         }
     }
 
-    /// Entries with sequence numbers from `from` on, at most `limit` of them,
-    /// decrypted, for a replica to apply. Records compaction folded away are
-    /// not there: a replica that far behind starts from the definition, for
-    /// its term, and the snapshot.
+    /// Entries with sequence numbers from `from` on, decrypted, for a replica
+    /// to apply: at most `limit` of them, and past the first, no more than
+    /// `bytes` of them sealed, so a page of snapshot records never sits in
+    /// memory at once. Records compaction folded away are not there: a
+    /// replica that far behind starts from the definition, for its term, and
+    /// the snapshot.
     ///
     /// # Errors
     ///
     /// `Beyond` if `from` is past the log's synced end, or if the file cannot
     /// be read or an entry does not open.
-    pub fn read(&self, from: u64, limit: usize) -> Result<Vec<(u64, Vec<u8>)>, LogError> {
+    pub fn read(
+        &self,
+        from: u64,
+        limit: usize,
+        bytes: usize,
+    ) -> Result<Vec<(u64, Vec<u8>)>, LogError> {
         let length = self.durable_length();
         if from > length {
             return Err(LogError::Beyond { from, length });
@@ -1400,12 +1418,15 @@ impl Log {
             previous = tag_of(&sealed[PREFIX..]);
         }
         let synced = &self.offsets[..self.durable];
+        let mut read = 0usize;
         for (index, window) in synced.windows(2).enumerate().skip(first) {
-            if entries.len() >= limit {
+            let size = usize::try_from(window[1] - window[0]).expect("fits");
+            if entries.len() >= limit || (!entries.is_empty() && read + size > bytes) {
                 break;
             }
+            read += size;
             let sequence = self.sequence(index);
-            let mut sealed = vec![0u8; usize::try_from(window[1] - window[0]).expect("fits")];
+            let mut sealed = vec![0u8; size];
             self.file.read_exact_at(&mut sealed, window[0])?;
             let (nonce, ciphertext) = sealed[PREFIX..].split_at(NONCE);
             let created = self.sealed_creation(sequence);
@@ -1462,12 +1483,19 @@ impl Log {
     ///
     /// # Errors
     ///
-    /// If the write fails, which cuts the staged records back off, or an
-    /// earlier one left the log unusable.
+    /// If the record cannot be sealed or written, which cuts every staged
+    /// record back off, so a failed stage leaves none; or if an earlier
+    /// failure left the log unusable.
     pub fn stage(&mut self, record: &Record) -> Result<(), LogError> {
         self.writable()?;
         let sequence = self.length();
-        let bytes = self.seal(&record_frame(record), sequence)?;
+        let bytes = match self.seal(&record_frame(record), sequence) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.discard_staged();
+                return Err(error);
+            }
+        };
         let start = self.offsets.last().copied().unwrap_or_default();
         if let Err(error) = self.file.write_all(&bytes) {
             self.cut_back();
@@ -1869,9 +1897,12 @@ impl Replay {
             torn: None,
             done: false,
         };
-        let frame = match entries.next_entry()? {
-            Some(plain) => Frame::from_bytes(&plain)?,
-            None => return Err(LogError::Malformed("the log has no definition".to_string())),
+        // The definition is synced before a creation is acknowledged, so a
+        // log that ends inside it holds nothing anyone was told was kept.
+        let frame = match entries.next_entry() {
+            Ok(Some(plain)) => Frame::from_bytes(&plain)?,
+            Ok(None) | Err(LogError::Head(_)) => return Err(LogError::Unfinished),
+            Err(error) => return Err(error),
         };
         let definition = definition_from(&frame)?;
         if definition.name != entries.log.table {

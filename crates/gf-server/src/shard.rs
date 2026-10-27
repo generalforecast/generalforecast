@@ -650,6 +650,8 @@ pub enum Command {
         table: TableName,
         from: u64,
         limit: usize,
+        /// The most sealed bytes past the first entry, as `Log::read` takes them.
+        bytes: usize,
         reply: Reply<Vec<(u64, Vec<u8>)>>,
     },
     /// Applies log entries read from another node, with their sequence numbers.
@@ -1433,12 +1435,13 @@ impl Shard {
                 table,
                 from,
                 limit,
+                bytes,
                 reply,
             } => {
                 let entries = self.entry(&table).and_then(|_| {
                     self.tables[&table]
                         .log
-                        .read(from, limit)
+                        .read(from, limit, bytes)
                         .map_err(ServerError::from)
                 });
                 let _ = reply.send(entries);

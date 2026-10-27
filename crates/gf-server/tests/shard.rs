@@ -636,6 +636,7 @@ impl Harness {
             table: name("rows"),
             from,
             limit: 100,
+            bytes: usize::MAX,
             reply,
         };
         self.commands.send(command).await.unwrap();

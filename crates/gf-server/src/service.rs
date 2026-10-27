@@ -1941,6 +1941,10 @@ const REPLICATE_BATCH_BYTES: usize = 64 << 20;
 /// Entries per command when reading a log for a replica, so a whole log never sits in memory.
 const READ_BATCH: usize = 64;
 
+/// Sealed bytes of entries past the first per command when reading a log
+/// for a replica, so a page of snapshot records never sits in memory at once.
+const READ_BATCH_BYTES: usize = 64 << 20;
+
 /// A client's id for a write, from the `gf-write-id` metadata.
 fn write_id<T>(request: &Request<T>) -> Result<Option<String>, Status> {
     match request.metadata().get(WRITE_ID) {
@@ -2843,13 +2847,12 @@ impl FlightService for Service {
                         table,
                         from,
                         limit: READ_BATCH,
+                        bytes: READ_BATCH_BYTES,
                         reply,
                     })
                     .await?;
-                let next = entries
-                    .last()
-                    .filter(|_| entries.len() >= READ_BATCH)
-                    .map(|(sequence, _)| sequence + 1);
+                // A page cut short by its bounds has more behind it; an empty one ends the log.
+                let next = entries.last().map(|(sequence, _)| sequence + 1);
                 let messages: Vec<Result<FlightData, Status>> = entries
                     .into_iter()
                     .flat_map(|(sequence, entry)| {
