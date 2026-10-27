@@ -27,7 +27,7 @@ from generalforecast.columns import (
     prepare,
 )
 from generalforecast.keys import Key, Keys, keys_of
-from generalforecast.native.client import (
+from generalforecast.native.handles import (
     _REBUILD_WAIT,
     Answer,
     Definition,

@@ -14,7 +14,7 @@ from generalforecast import worker
 from generalforecast._core import GroupStrategy, Strategy
 from generalforecast.columns import Column
 from generalforecast.keys import keys_of
-from generalforecast.native.client import RebuildWait, SeriesTable, Table
+from generalforecast.native.handles import RebuildWait, SeriesTable, Table
 from generalforecast.native.local_client import LocalClient as _LocalClient
 from generalforecast.native.remote import AsyncRemoteClient as _AsyncRemoteClient
 from generalforecast.native.remote import (

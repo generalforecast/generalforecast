@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""The native table API: tables' definitions and what every table client shares."""
+"""The handles on an engine's tables: their definitions, and what every client's handle does.
+
+`RemoteTable` and `RemoteSeriesTable` implement them over Flight, for a
+server, a router or this process's engine; `gf.engine.Table` and
+`gf.engine.SeriesTable` hold one each.
+"""
 
 import abc
 import contextlib

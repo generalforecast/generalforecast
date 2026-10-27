@@ -27,7 +27,7 @@ from generalforecast import tabular
 from generalforecast._core import DEFAULT_FIT_ROWS, GroupStrategy, Strategy
 from generalforecast.errors import Conflict, InvalidInput, NotFound, boundary
 from generalforecast.native import models as registry
-from generalforecast.native.client import (
+from generalforecast.native.handles import (
     Described,
     PastCap,
     Rebuild,
@@ -38,8 +38,8 @@ from generalforecast.native.client import (
     SeriesDefinition,
     Summary,
 )
-from generalforecast.native.client import SeriesTable as _NativeSeriesTable
-from generalforecast.native.client import Table as _NativeTable
+from generalforecast.native.handles import SeriesTable as _NativeSeriesTable
+from generalforecast.native.handles import Table as _NativeTable
 from generalforecast.predictors import frequency
 
 Kind = Literal["random", "stratified", "balanced", "diverse"]

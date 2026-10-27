@@ -32,7 +32,7 @@ from generalforecast.keys import Key, keys_of
 from generalforecast.models import registry
 from generalforecast.models.contract import TabularFunctions, TabularProperties
 from generalforecast.models.series import SeriesFunctions
-from generalforecast.native.client import (  # noqa: F401
+from generalforecast.native.handles import (  # noqa: F401
     _REBUILD_WAIT,
     _SERIES,
     Definition,

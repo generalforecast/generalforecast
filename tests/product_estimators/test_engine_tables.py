@@ -380,7 +380,7 @@ def test_series_tables_open_and_attach_with_exists_open(catalog) -> None:
 
 
 def test_descriptions_carry_a_routed_table_s_partitions() -> None:
-    from generalforecast.native.client import Described
+    from generalforecast.native.handles import Described
 
     reply = {
         "name": "routed",

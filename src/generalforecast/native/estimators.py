@@ -28,7 +28,7 @@ from generalforecast._core import Strategy
 from generalforecast.columns import infer
 from generalforecast.errors import InvalidInput, boundary
 from generalforecast.native import models as registry
-from generalforecast.native.client import Table
+from generalforecast.native.handles import Table
 from generalforecast.native.local_client import LocalClient
 from generalforecast.native.predictor import (
     admitted_spec,
