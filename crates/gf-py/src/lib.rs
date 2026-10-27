@@ -99,8 +99,9 @@ impl Strategy {
         Self(planner::Strategy::Exact)
     }
 
-    /// What fits the table's size, resolved from its live rows at each plan:
-    /// exact up to the model's context cap, and past it a stratified core of
+    /// What fits the table's size, resolved from its live rows at each plan.
+    ///
+    /// Exact up to the model's context cap, and past it a stratified core of
     /// a quarter of the cap plus the nearest rows that fill the rest, the
     /// neighbors leaning to the newest rows when the table has times.
     #[staticmethod]
@@ -108,9 +109,11 @@ impl Strategy {
         Self(planner::Strategy::Adaptive)
     }
 
-    /// The strategy a table of `rows` live rows plans with under a cap of
-    /// `cap` context rows (None for no cap), with times when `timed`: an
-    /// adaptive strategy resolved by the server's rule, any other itself.
+    /// The strategy a table of `rows` live rows plans with.
+    ///
+    /// `cap` is the model's context rows, or None for no cap; `timed` whether
+    /// the table's rows have times. An adaptive strategy is resolved by the
+    /// server's rule, any other is itself.
     #[pyo3(signature = (rows, cap, timed = false))]
     fn resolve(&self, rows: i64, cap: Option<i64>, timed: bool) -> PyResult<Self> {
         let cap = cap
@@ -1504,8 +1507,10 @@ impl Node {
             .map_err(raised)
     }
 
-    /// The strategy a table's next plan chooses contexts with: its adaptive
-    /// strategy resolved against its live rows, or the one it was given.
+    /// The strategy a table's next plan chooses contexts with.
+    ///
+    /// An adaptive strategy resolved against the table's live rows, or the
+    /// one it was given.
     fn strategy(&self, table: u32) -> PyResult<Strategy> {
         Ok(Strategy(self.0.strategy(TableId(table)).map_err(raised)?))
     }

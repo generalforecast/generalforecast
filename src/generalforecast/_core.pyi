@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: General Forecast, Inc.
-# SPDX-License-Identifier: Apache-2.0
-
 """Types for generalforecast._core, the Rust control plane built from crates/gf-py."""
 
 from typing import Literal, Self
@@ -195,15 +192,18 @@ class Strategy:
         """Every live row, for every query."""
     @staticmethod
     def adaptive() -> Strategy:
-        """What fits the table's size, resolved from its live rows at each plan:
-        exact up to the model's context cap, and past it a stratified core of
+        """What fits the table's size, resolved from its live rows at each plan.
+
+        Exact up to the model's context cap, and past it a stratified core of
         a quarter of the cap plus the nearest rows that fill the rest, the
         neighbors leaning to the newest rows when the table has times.
         """
     def resolve(self, rows: int, cap: int | None, timed: bool = False) -> Strategy:
-        """The strategy a table of `rows` live rows plans with under a cap of
-        `cap` context rows (None for no cap), with times when `timed`: an
-        adaptive strategy resolved by the server's rule, any other itself.
+        """The strategy a table of `rows` live rows plans with.
+
+        `cap` is the model's context rows, or None for no cap; `timed` whether
+        the table's rows have times. An adaptive strategy is resolved by the
+        server's rule, any other is itself.
         """
     @staticmethod
     def subsample(rows: int, seed: int = 0, kind: CoreKind = "random") -> Strategy:
@@ -596,8 +596,10 @@ class Node:
     def set_strategy(self, table: int, strategy: Strategy) -> None:
         """Changes how a table chooses contexts from here on; see `Node.strategy`."""
     def strategy(self, table: int) -> Strategy:
-        """The strategy a table's next plan chooses contexts with: its adaptive
-        strategy resolved against its live rows, or the one it was given.
+        """The strategy a table's next plan chooses contexts with.
+
+        An adaptive strategy resolved against the table's live rows, or the
+        one it was given.
         """
 
 class BoundTable:
