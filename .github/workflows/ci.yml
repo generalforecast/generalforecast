@@ -6,9 +6,14 @@ name: CI
 #   drafts and stacked PRs based on other branches run nothing;
 # - on request: add the `ci` label to a PR (remove and add it to run again),
 #   or run the workflow by hand on any branch;
-# - pushes to main, unless the merged PR already passed on the same tree.
-# Changes to documentation alone run nothing, and the Rust job runs only when
-# code it checks changes. Tests marked slow run weekly in weekly.yml.
+# - pushes to main, unless the merged PR already passed on the same tree;
+# - from release.yml, which runs every job before it builds wheels.
+# Changes to documentation alone run nothing, and each job but the Python
+# checks runs only when code it checks changes. The server and router
+# integration tests, which build both binaries and start processes, run
+# whenever the Rust crates or the Python they serve change. The other tests
+# marked slow, which compile models, run weekly in weekly.yml and before
+# every release.
 on:
   push:
     branches: [main]
@@ -18,8 +23,13 @@ on:
     types: [opened, reopened, ready_for_review, labeled]
     paths-ignore: ["**.md"]
   workflow_dispatch:
-  # The release workflow runs these checks before it publishes wheels.
+  # The release workflow runs these checks before it builds wheels.
   workflow_call:
+    inputs:
+      everything:
+        description: Run every job, whatever changed
+        type: boolean
+        default: true
 
 # A newer run for the same PR or branch cancels the older one; adding any
 # other label gets a group of its own, so it cannot cancel a real run.
@@ -45,6 +55,8 @@ jobs:
     outputs:
       rust: ${{ steps.decide.outputs.rust }}
       python: ${{ steps.decide.outputs.python }}
+      serving: ${{ steps.decide.outputs.serving }}
+      typescript: ${{ steps.decide.outputs.typescript }}
     steps:
       - id: decide
         env:
@@ -53,11 +65,18 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
           SHA: ${{ github.sha }}
+          # Set only when release.yml calls this workflow.
+          EVERYTHING: ${{ inputs.everything == true }}
         run: |
-          rust=true python=true
-          if [ "$EVENT" = pull_request ]; then
+          rust=true python=true serving=true typescript=true
+          if [ "$EVERYTHING" = true ]; then
+            echo "called to run every job"
+          elif [ "$EVENT" = pull_request ]; then
             files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')
             grep -qE '^(crates/|Cargo\.|rust-toolchain|tests/product_cli/|\.github/workflows/ci\.yml)|^src/generalforecast/[^/]*$|^src/generalforecast/(service|predictors)/' <<<"$files" || rust=false
+            # The binaries, the Python workers and engine they start, and the tests' harness.
+            grep -qE '^(crates/|Cargo\.|rust-toolchain|src/generalforecast/|tests/(conftest|test_server|test_router|test_remote|test_placement|test_estimators)\.py|tests/(utils|models)/|pyproject\.toml|uv\.lock|\.github/workflows/ci\.yml)' <<<"$files" || serving=false
+            grep -qE '^(clients/typescript/|api/|\.github/workflows/ci\.yml)' <<<"$files" || typescript=false
           elif [ "$EVENT" = push ]; then
             # A merge whose tree is the PR head's repeats checks that passed.
             pr=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[0].number // empty')
@@ -74,17 +93,21 @@ jobs:
                   fi
                 done
                 if $passed; then
-                  rust=false python=false
+                  rust=false python=false serving=false typescript=false
                   echo "PR #$pr passed on this tree"
                 fi
               fi
             fi
           fi
-          echo "rust=$rust python=$python"
-          echo "rust=$rust" >>"$GITHUB_OUTPUT"
-          echo "python=$python" >>"$GITHUB_OUTPUT"
+          echo "rust=$rust python=$python serving=$serving typescript=$typescript"
+          {
+            echo "rust=$rust"
+            echo "python=$python"
+            echo "serving=$serving"
+            echo "typescript=$typescript"
+          } >>"$GITHUB_OUTPUT"
 
-# The two checks run side by side, so a run takes as long as the slower one.
+  # The checks run side by side, so a run takes as long as the slowest one.
   rust:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -100,7 +123,9 @@ jobs:
       # rustup installs the toolchain pinned in rust-toolchain.toml.
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test -p gf-core -p gf-server -p gf-router -p gf-cli
+      # gf-py's test binary would link against libpython; the Python job
+      # tests the extension it builds instead.
+      - run: cargo test --workspace --exclude gf-py
       - run: cargo build -p gf-cli --bins
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
@@ -131,3 +156,40 @@ jobs:
       # Tests that compile models or start servers are marked slow and run
       # weekly; the rest run on both cores.
       - run: uv run pytest -m "not slow" -n auto
+
+  # Tests marked server or router start gf-server and gf-router processes,
+  # which they build; those also marked slow are left out of the Python job.
+  serving:
+    needs: changes
+    if: needs.changes.outputs.serving == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.8.0"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: cargo build -p gf-server -p gf-router
+      - run: uv run pytest -m "(server or router) and slow" -n auto
+
+  typescript:
+    needs: changes
+    if: needs.changes.outputs.typescript == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: clients/typescript
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - run: npm ci
+      # Builds the client, then checks it against the spec's examples.
+      - run: npm test
