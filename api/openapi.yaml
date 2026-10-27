@@ -396,7 +396,7 @@ paths:
                             - {name: plan, type: category}
                             - {name: signups, type: number}
                           context: {kind: snapshot, rows: 1840, query_rows: 212, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
-                          selection: {core: 1000, neighbors: 3000, kind: stratified}
+                          selection: {strategy: retrieved, core: 1000, neighbors: 3000, kind: stratified, recent: null, seed: 0}
                           limits: {context_rows: 100000, queries: 100, inputs: 32}
                           environments:
                             - {predictor: churn, name: production, revision: 7, generation: 9, runtime: hosted, status: ready}
@@ -477,7 +477,7 @@ paths:
                         - {name: plan, type: category}
                         - {name: signups, type: number}
                       context: {kind: snapshot, rows: 1840, query_rows: 212, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
-                      selection: {core: 1000, neighbors: 3000, kind: stratified}
+                      selection: {strategy: retrieved, core: 1000, neighbors: 3000, kind: stratified, recent: null, seed: 0}
                       limits: {context_rows: 100000, queries: 100, inputs: 32}
                       environments:
                         - {predictor: churn, name: staging, revision: 8, generation: 3, runtime: hosted, status: ready}
@@ -1104,23 +1104,28 @@ paths:
                   resource: {kind: predictor, name: churn}
                   payload:
                     lock:
-                      lock_version: 1
+                      lock_version: 2
+                      digest: sha256:4e2c0a8f6d4b2e0c8a6f4d2b0e8c6a4f2d0b8e6c4a2f0d8b6e4c2a0f8d6b4e2c
+                      manifest: sha256:1f3e5d7c9b1a3f5e7d9c1b3a5f7e9d1c3b5a7f9e1d3c5b7a9f1e3d5c7b9a1f3e
                       predictor:
                         name: churn
                         model: general-forecast/tabicl-v2-classifier
                         model_digest: sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
                         task: classification
                         target: churned
-                        target_type: category
-                        classes: ["0", "1"]
+                        target_type: 0/1
+                        classes: [0, 1]
                         id: customer_id
+                        id_type: int
+                        outputs: [label, probabilities]
                         inputs:
-                          - {name: spend, type: number}
-                          - {name: plan, type: category}
-                        context: {kind: snapshot, rows: 1840, query_rows: 212, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
-                        selection: {core: 1000, neighbors: 3000, kind: stratified}
+                          - {name: spend, type: float, role: input}
+                          - {name: plan, type: category, role: input}
+                        context: {kind: snapshot, path: context.csv, rows: 1840, query_rows: 212, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
+                        selection: {strategy: retrieved, core: 1000, neighbors: 3000, kind: stratified, recent: null, seed: 0}
+                      resources: {accelerator: L4}
                       model:
-                        files: {"model.safetensors": sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0}
+                        files: {"model.safetensors": 7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0}
                     snapshot: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e
       responses:
         "200":
@@ -1167,23 +1172,28 @@ paths:
                     result:
                       revision: {predictor: churn, number: 7, predictor_digest: sha256:9c0d1e2f30415263748596a7b8c9d0e1f2a3b4c5d6e7f8091a2b3c4d5e6f7081, model: general-forecast/tabicl-v2-classifier, created_at: 1761300000.0, status: ready}
                       lock:
-                        lock_version: 1
+                        lock_version: 2
+                        digest: sha256:4e2c0a8f6d4b2e0c8a6f4d2b0e8c6a4f2d0b8e6c4a2f0d8b6e4c2a0f8d6b4e2c
+                        manifest: sha256:1f3e5d7c9b1a3f5e7d9c1b3a5f7e9d1c3b5a7f9e1d3c5b7a9f1e3d5c7b9a1f3e
                         predictor:
                           name: churn
                           model: general-forecast/tabicl-v2-classifier
                           model_digest: sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
                           task: classification
                           target: churned
-                          target_type: category
-                          classes: ["0", "1"]
+                          target_type: 0/1
+                          classes: [0, 1]
                           id: customer_id
+                          id_type: int
+                          outputs: [label, probabilities]
                           inputs:
-                            - {name: spend, type: number}
-                            - {name: plan, type: category}
-                          context: {kind: snapshot, rows: 1840, query_rows: 212, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
-                          selection: {core: 1000, neighbors: 3000, kind: stratified}
+                            - {name: spend, type: float, role: input}
+                            - {name: plan, type: category, role: input}
+                          context: {kind: snapshot, path: context.csv, rows: 1840, query_rows: 212, digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e}
+                          selection: {strategy: retrieved, core: 1000, neighbors: 3000, kind: stratified, recent: null, seed: 0}
+                        resources: {accelerator: L4}
                         model:
-                          files: {"model.safetensors": sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0}
+                          files: {"model.safetensors": 7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0}
 
   /v1/projects/{project}/predictors/{name}/environments:
     get:
@@ -3621,13 +3631,21 @@ components:
         exclude: {type: array, items: {type: string}}
         types:
           type: object
-          additionalProperties: {$ref: "#/components/schemas/ColumnType"}
+          additionalProperties: {$ref: "#/components/schemas/Kind"}
         past: {type: array, items: {type: string}}
         future: {type: array, items: {type: string}}
 
     ColumnType:
       type: string
       enum: [number, category, text, boolean, date, timestamp]
+
+    Kind:
+      type: string
+      description: |
+        a column's kind, the one vocabulary gf.yaml's `inputs.types` and
+        gf.lock use: whole numbers, real numbers, 0/1 flags, categories, free
+        text, dates and times, and booleans
+      enum: [int, float, "0/1", category, text, timestamp, bool]
 
     Selection:
       type: object
@@ -3803,9 +3821,28 @@ components:
         name: {type: string}
         type: {$ref: "#/components/schemas/ColumnType"}
 
+    LockInput:
+      type: object
+      description: |
+        an input column as gf.lock pins it: its kind (null when a request or
+        live context's rows were not seen) and its role, `input` for a
+        tabular model, `past` or `future` for a forecaster's covariates
+      required: [name, type, role]
+      additionalProperties: false
+      properties:
+        name: {type: string}
+        type:
+          oneOf:
+            - $ref: "#/components/schemas/Kind"
+            - type: "null"
+        role: {type: string, enum: [input, past, future]}
+
     ContextLock:
       type: object
-      description: the context as gf.lock pins it
+      description: |
+        the context as gf.lock pins it: a snapshot's file, its context rows'
+        digest and count and the split that made its queries; a live
+        context's name; a request context's most rows per call
       required: [kind]
       additionalProperties: false
       properties:
@@ -3813,24 +3850,41 @@ components:
         rows: {type: integer, minimum: 0}
         query_rows: {type: integer, minimum: 0}
         digest: {$ref: "#/components/schemas/Digest"}
-        live: {$ref: "#/components/schemas/Name"}
+        path: {type: string}
+        name: {$ref: "#/components/schemas/Name"}
         max_rows: {type: integer, minimum: 1}
+        until: {type: string, description: labeled rows at or after this ISO time are queries}
+        holdout: {$ref: "#/components/schemas/LockHoldout"}
+
+    LockHoldout:
+      type: object
+      description: a seeded random fraction of the labeled rows are queries
+      required: [fraction, seed]
+      additionalProperties: false
+      properties:
+        fraction: {type: number, exclusiveMinimum: 0, exclusiveMaximum: 1}
+        seed: {type: integer, minimum: 0}
 
     ResolvedSelection:
       type: object
-      description: the selection as gf.lock pins it, in rows
-      required: [core, neighbors, kind]
+      description: |
+        the selection as gf.lock pins it, in rows: `exact` reads the whole
+        context, `retrieved` a core and each query's nearest rows, and
+        `adaptive` resolves per call for a context only calls carry
+      required: [strategy, core, neighbors, kind, recent, seed]
       additionalProperties: false
       properties:
-        core: {type: [integer, "null"]}
+        strategy: {type: string, enum: [exact, adaptive, retrieved]}
+        core: {type: [integer, "null"], minimum: 0}
         neighbors: {type: integer, minimum: 0}
-        kind: {type: string, enum: [stratified, random]}
-        recent: {type: [integer, "null"]}
+        kind: {type: string, enum: [stratified, random, balanced, diverse]}
+        recent: {type: [integer, "null"], minimum: 0}
+        seed: {type: integer, minimum: 0}
 
     Resolution:
       type: object
-      description: the resolved predictor gf check prints and gf.lock pins
-      required: [name, model, model_digest, task, target, target_type, inputs, context, selection]
+      description: the resolved predictor gf.lock pins
+      required: [name, model, model_digest, task, target, target_type, outputs, inputs, context, selection]
       additionalProperties: false
       properties:
         name: {$ref: "#/components/schemas/Name"}
@@ -3838,14 +3892,35 @@ components:
         model_digest: {$ref: "#/components/schemas/Digest"}
         task: {$ref: "#/components/schemas/Task"}
         target: {type: string}
-        target_type: {$ref: "#/components/schemas/ColumnType"}
-        classes: {type: array, items: {type: string}}
+        target_type:
+          oneOf:
+            - $ref: "#/components/schemas/Kind"
+            - type: "null"
+        classes: {type: array, items: {type: [string, integer, boolean]}}
         id: {type: string}
+        id_type:
+          oneOf:
+            - $ref: "#/components/schemas/Kind"
+            - type: "null"
         time: {type: string}
+        time_type:
+          oneOf:
+            - $ref: "#/components/schemas/Kind"
+            - type: "null"
         series: {type: array, items: {type: string}}
+        series_types:
+          type: array
+          items:
+            oneOf:
+              - $ref: "#/components/schemas/Kind"
+              - type: "null"
+        frequency: {type: [string, number]}
+        horizon: {type: integer, minimum: 1}
+        quantiles: {type: array, items: {type: number, exclusiveMinimum: 0, exclusiveMaximum: 1}}
+        outputs: {type: array, items: {type: string}, minItems: 1}
         inputs:
           type: array
-          items: {$ref: "#/components/schemas/Input"}
+          items: {$ref: "#/components/schemas/LockInput"}
         context: {$ref: "#/components/schemas/ContextLock"}
         selection: {$ref: "#/components/schemas/ResolvedSelection"}
 
@@ -4353,16 +4428,37 @@ components:
       properties:
         files:
           type: object
-          additionalProperties: {$ref: "#/components/schemas/Digest"}
+          description: each artifact file's sha256, hex
+          additionalProperties: {type: string, pattern: "^[0-9a-f]{64}$"}
+
+    LockResources:
+      type: object
+      description: the hosted serving resources gf.yaml declares
+      additionalProperties: false
+      properties:
+        accelerator: {type: string, enum: [L4, A10G, L40S, cpu]}
+        replicas_min: {type: integer, minimum: 0}
+        replicas_max: {type: integer, minimum: 1}
+        idle_seconds: {type: integer, minimum: 0}
 
     Lock:
       type: object
-      description: gf.lock
-      required: [lock_version, predictor, model]
+      description: |
+        gf.lock, version 2: what gf check resolved gf.yaml into. `digest` is
+        the canonical JSON digest of the document without `digest`, the one
+        identity of a predictor revision; `manifest` the digest of the
+        normalized gf.yaml it resolves, null for an upgraded version 1 lock
+      required: [lock_version, digest, manifest, predictor, model]
       additionalProperties: false
       properties:
-        lock_version: {type: integer, const: 1}
+        lock_version: {type: integer, const: 2}
+        digest: {$ref: "#/components/schemas/Digest"}
+        manifest:
+          oneOf:
+            - $ref: "#/components/schemas/Digest"
+            - type: "null"
         predictor: {$ref: "#/components/schemas/Resolution"}
+        resources: {$ref: "#/components/schemas/LockResources"}
         model: {$ref: "#/components/schemas/LockedModel"}
 
     RevisionRegister:

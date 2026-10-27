@@ -354,14 +354,15 @@ Row = dict[str, str | float | bool | None]
 _decode_Row: Decoder = _mapping(_union(_text, _number, _boolean, _null))
 
 
-ColumnType = Literal["number", "category", "text", "boolean", "date", "timestamp"]
-_decode_ColumnType: Decoder = _literal(
-    "number",
+Kind = Literal["int", "float", "0/1", "category", "text", "timestamp", "bool"]
+_decode_Kind: Decoder = _literal(
+    "int",
+    "float",
+    "0/1",
     "category",
     "text",
-    "boolean",
-    "date",
     "timestamp",
+    "bool",
 )
 
 
@@ -375,16 +376,27 @@ class Inputs(Payload):
     """
 
     exclude: tuple[str, ...] | None = None
-    types: dict[str, ColumnType] | None = None
+    types: dict[str, Kind] | None = None
     past: tuple[str, ...] | None = None
     future: tuple[str, ...] | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("exclude", "exclude", False, _items(_text)),
-        Field("types", "types", False, _mapping(_decode_ColumnType)),
+        Field("types", "types", False, _mapping(_decode_Kind)),
         Field("past", "past", False, _items(_text)),
         Field("future", "future", False, _items(_text)),
     )
+
+
+ColumnType = Literal["number", "category", "text", "boolean", "date", "timestamp"]
+_decode_ColumnType: Decoder = _literal(
+    "number",
+    "category",
+    "text",
+    "boolean",
+    "date",
+    "timestamp",
+)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -653,60 +665,125 @@ class Input(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class LockInput(Payload):
+    """The LockInput schema.
+
+    an input column as gf.lock pins it: its kind (null when a request or live context's
+    rows were not seen) and its role, `input` for a tabular model, `past` or `future`
+    for a forecaster's covariates
+    """
+
+    name: str
+    type: Kind | None
+    role: Literal["input", "past", "future"]
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("name", "name", True, _text),
+        Field("type", "type", True, _union(_decode_Kind, _null)),
+        Field("role", "role", True, _literal("input", "past", "future")),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class LockHoldout(Payload):
+    """A seeded random fraction of the labeled rows are queries."""
+
+    fraction: float
+    seed: int
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("fraction", "fraction", True, _number),
+        Field("seed", "seed", True, _integer),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class ContextLock(Payload):
-    """The context as gf.lock pins it."""
+    """The ContextLock schema.
+
+    the context as gf.lock pins it: a snapshot's file, its context rows' digest and
+    count and the split that made its queries; a live context's name; a request
+    context's most rows per call
+    """
 
     kind: ContextKind
     rows: int | None = None
     query_rows: int | None = None
     digest: Digest | None = None
-    live: Name | None = None
+    path: str | None = None
+    name: Name | None = None
     max_rows: int | None = None
+    until: str | None = None
+    holdout: LockHoldout | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("kind", "kind", True, _decode_ContextKind),
         Field("rows", "rows", False, _integer),
         Field("query_rows", "query_rows", False, _integer),
         Field("digest", "digest", False, _decode_Digest),
-        Field("live", "live", False, _decode_Name),
+        Field("path", "path", False, _text),
+        Field("name", "name", False, _decode_Name),
         Field("max_rows", "max_rows", False, _integer),
+        Field("until", "until", False, _text),
+        Field("holdout", "holdout", False, _record(LockHoldout)),
     )
 
 
 @dataclass(frozen=True, kw_only=True)
 class ResolvedSelection(Payload):
-    """The selection as gf.lock pins it, in rows."""
+    """The ResolvedSelection schema.
 
+    the selection as gf.lock pins it, in rows: `exact` reads the whole context,
+    `retrieved` a core and each query's nearest rows, and `adaptive` resolves per call
+    for a context only calls carry
+    """
+
+    strategy: Literal["exact", "adaptive", "retrieved"]
     core: int | None
     neighbors: int
-    kind: Literal["stratified", "random"]
-    recent: int | None = None
+    kind: Literal["stratified", "random", "balanced", "diverse"]
+    recent: int | None
+    seed: int
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("strategy", "strategy", True, _literal("exact", "adaptive", "retrieved")),
         Field("core", "core", True, _union(_integer, _null)),
         Field("neighbors", "neighbors", True, _integer),
-        Field("kind", "kind", True, _literal("stratified", "random")),
-        Field("recent", "recent", False, _union(_integer, _null)),
+        Field(
+            "kind",
+            "kind",
+            True,
+            _literal("stratified", "random", "balanced", "diverse"),
+        ),
+        Field("recent", "recent", True, _union(_integer, _null)),
+        Field("seed", "seed", True, _integer),
     )
 
 
 @dataclass(frozen=True, kw_only=True)
 class Resolution(Payload):
-    """The resolved predictor gf check prints and gf.lock pins."""
+    """The resolved predictor gf.lock pins."""
 
     name: Name
     model: ModelId
     model_digest: Digest
     task: Task
     target: str
-    target_type: ColumnType
-    inputs: tuple[Input, ...]
+    target_type: Kind | None
+    outputs: tuple[str, ...]
+    inputs: tuple[LockInput, ...]
     context: ContextLock
     selection: ResolvedSelection
-    classes: tuple[str, ...] | None = None
+    classes: tuple[str | int | bool, ...] | None = None
     id: str | None = None
+    id_type: Kind | None = None
     time: str | None = None
+    time_type: Kind | None = None
     series: tuple[str, ...] | None = None
+    series_types: tuple[Kind | None, ...] | None = None
+    frequency: str | float | None = None
+    horizon: int | None = None
+    quantiles: tuple[float, ...] | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("name", "name", True, _decode_Name),
@@ -714,12 +791,24 @@ class Resolution(Payload):
         Field("model_digest", "model_digest", True, _decode_Digest),
         Field("task", "task", True, _decode_Task),
         Field("target", "target", True, _text),
-        Field("target_type", "target_type", True, _decode_ColumnType),
-        Field("classes", "classes", False, _items(_text)),
+        Field("target_type", "target_type", True, _union(_decode_Kind, _null)),
+        Field("classes", "classes", False, _items(_union(_text, _integer, _boolean))),
         Field("id", "id", False, _text),
+        Field("id_type", "id_type", False, _union(_decode_Kind, _null)),
         Field("time", "time", False, _text),
+        Field("time_type", "time_type", False, _union(_decode_Kind, _null)),
         Field("series", "series", False, _items(_text)),
-        Field("inputs", "inputs", True, _items(_record(Input))),
+        Field(
+            "series_types",
+            "series_types",
+            False,
+            _items(_union(_decode_Kind, _null)),
+        ),
+        Field("frequency", "frequency", False, _union(_text, _number)),
+        Field("horizon", "horizon", False, _integer),
+        Field("quantiles", "quantiles", False, _items(_number)),
+        Field("outputs", "outputs", True, _items(_text)),
+        Field("inputs", "inputs", True, _items(_record(LockInput))),
         Field("context", "context", True, _record(ContextLock)),
         Field("selection", "selection", True, _record(ResolvedSelection)),
     )
@@ -1632,24 +1721,57 @@ class RevisionListReply(Payload):
 class LockedModel(Payload):
     """The LockedModel schema."""
 
-    files: dict[str, Digest]
+    files: dict[str, str]
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("files", "files", True, _mapping(_decode_Digest)),
+        Field("files", "files", True, _mapping(_pattern("^[0-9a-f]{64}$"))),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class LockResources(Payload):
+    """The hosted serving resources gf.yaml declares."""
+
+    accelerator: Literal["L4", "A10G", "L40S", "cpu"] | None = None
+    replicas_min: int | None = None
+    replicas_max: int | None = None
+    idle_seconds: int | None = None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field(
+            "accelerator",
+            "accelerator",
+            False,
+            _literal("L4", "A10G", "L40S", "cpu"),
+        ),
+        Field("replicas_min", "replicas_min", False, _integer),
+        Field("replicas_max", "replicas_max", False, _integer),
+        Field("idle_seconds", "idle_seconds", False, _integer),
     )
 
 
 @dataclass(frozen=True, kw_only=True)
 class Lock(Payload):
-    """Gf.lock."""
+    """Gf.lock, version 2: what gf check resolved gf.yaml into.
 
-    lock_version: Literal[1] = 1
+    `digest` is the canonical JSON digest of the document without `digest`, the one
+    identity of a predictor revision; `manifest` the digest of the normalized gf.yaml
+    it resolves, null for an upgraded version 1 lock
+    """
+
+    lock_version: Literal[2] = 2
+    digest: Digest
+    manifest: Digest | None
     predictor: Resolution
     model: LockedModel
+    resources: LockResources | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("lock_version", "lock_version", True, _literal(1)),
+        Field("lock_version", "lock_version", True, _literal(2)),
+        Field("digest", "digest", True, _decode_Digest),
+        Field("manifest", "manifest", True, _union(_decode_Digest, _null)),
         Field("predictor", "predictor", True, _record(Resolution)),
+        Field("resources", "resources", False, _record(LockResources)),
         Field("model", "model", True, _record(LockedModel)),
     )
 

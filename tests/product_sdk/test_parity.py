@@ -419,11 +419,6 @@ def test_every_request_either_client_sends_is_a_route_of_the_spec(
             request.from_payload(body)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="gf.lock writes gf.yaml type names (bool, int) that the spec's Lock "
-    "schema does not list; reconcile predictors/lock.py with api/openapi.yaml",
-)
 def test_a_pushed_lock_matches_the_spec(tmp_path, monkeypatch):
     routes = spec_routes()
     for method, path, body, _built in sent_requests(tmp_path, monkeypatch):

@@ -62,7 +62,12 @@ export interface ErrorReply extends Envelope {
 /** one record; column names are keys, cells are scalars */
 export type Row = Record<string, string | number | boolean | null>;
 
-export type ColumnType = "number" | "category" | "text" | "boolean" | "date" | "timestamp";
+/**
+ * a column's kind, the one vocabulary gf.yaml's `inputs.types` and gf.lock use: whole
+ * numbers, real numbers, 0/1 flags, categories, free text, dates and times, and
+ * booleans
+ */
+export type Kind = "int" | "float" | "0/1" | "category" | "text" | "timestamp" | "bool";
 
 /**
  * inputs by rule rather than by list: `exclude` removes columns from the inferred set,
@@ -70,10 +75,12 @@ export type ColumnType = "number" | "category" | "text" | "boolean" | "date" | "
  */
 export interface Inputs {
   exclude?: string[];
-  types?: Record<string, ColumnType>;
+  types?: Record<string, Kind>;
   past?: string[];
   future?: string[];
 }
+
+export type ColumnType = "number" | "category" | "text" | "boolean" | "date" | "timestamp";
 
 /**
  * which context rows a query sees; fractions below 1 are of the model's row cap,
@@ -180,37 +187,74 @@ export interface Input {
   type: ColumnType;
 }
 
-/** the context as gf.lock pins it */
+/**
+ * an input column as gf.lock pins it: its kind (null when a request or live context's
+ * rows were not seen) and its role, `input` for a tabular model, `past` or `future` for
+ * a forecaster's covariates
+ */
+export interface LockInput {
+  name: string;
+  type: Kind | null;
+  role: "input" | "past" | "future";
+}
+
+/** a seeded random fraction of the labeled rows are queries */
+export interface LockHoldout {
+  fraction: number;
+  seed: number;
+}
+
+/**
+ * the context as gf.lock pins it: a snapshot's file, its context rows' digest and count
+ * and the split that made its queries; a live context's name; a request context's most
+ * rows per call
+ */
 export interface ContextLock {
   kind: ContextKind;
   rows?: number;
   query_rows?: number;
   digest?: Digest;
-  live?: Name;
+  path?: string;
+  name?: Name;
   max_rows?: number;
+  until?: string;
+  holdout?: LockHoldout;
 }
 
-/** the selection as gf.lock pins it, in rows */
+/**
+ * the selection as gf.lock pins it, in rows: `exact` reads the whole context,
+ * `retrieved` a core and each query's nearest rows, and `adaptive` resolves per call
+ * for a context only calls carry
+ */
 export interface ResolvedSelection {
+  strategy: "exact" | "adaptive" | "retrieved";
   core: number | null;
   neighbors: number;
-  kind: "stratified" | "random";
-  recent?: number | null;
+  kind: "stratified" | "random" | "balanced" | "diverse";
+  recent: number | null;
+  seed: number;
 }
 
-/** the resolved predictor gf check prints and gf.lock pins */
+/** the resolved predictor gf.lock pins */
 export interface Resolution {
   name: Name;
   model: ModelId;
   model_digest: Digest;
   task: Task;
   target: string;
-  target_type: ColumnType;
-  classes?: string[];
+  target_type: Kind | null;
+  classes?: Array<string | number | boolean>;
   id?: string;
+  id_type?: Kind | null;
   time?: string;
+  time_type?: Kind | null;
   series?: string[];
-  inputs: Input[];
+  series_types?: Array<Kind | null>;
+  frequency?: string | number;
+  horizon?: number;
+  quantiles?: number[];
+  outputs: string[];
+  inputs: LockInput[];
   context: ContextLock;
   selection: ResolvedSelection;
 }
@@ -500,13 +544,29 @@ export interface RevisionListReply extends Envelope {
 }
 
 export interface LockedModel {
-  files: Record<string, Digest>;
+  files: Record<string, string>;
 }
 
-/** gf.lock */
+/** the hosted serving resources gf.yaml declares */
+export interface LockResources {
+  accelerator?: "L4" | "A10G" | "L40S" | "cpu";
+  replicas_min?: number;
+  replicas_max?: number;
+  idle_seconds?: number;
+}
+
+/**
+ * gf.lock, version 2: what gf check resolved gf.yaml into. `digest` is the canonical
+ * JSON digest of the document without `digest`, the one identity of a predictor
+ * revision; `manifest` the digest of the normalized gf.yaml it resolves, null for an
+ * upgraded version 1 lock
+ */
 export interface Lock {
-  lock_version: 1;
+  lock_version: 2;
+  digest: Digest;
+  manifest: Digest | null;
   predictor: Resolution;
+  resources?: LockResources;
   model: LockedModel;
 }
 
