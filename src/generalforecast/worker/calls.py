@@ -329,7 +329,7 @@ class Calls:
         self.stats.part(part, seconds)
 
     def _seen(self: "Worker", call: Call) -> None:
-        """Records a call that compiled, if it is a kind a later process can compile again."""
+        """Records a kind's call at its count, once compiled or first run here, if a later process can compile it again."""
         if call.program is None or call.program[1] not in self._specs:
             return
         # What a paged decode reads its slots from follows from its items and

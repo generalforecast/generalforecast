@@ -286,7 +286,8 @@ class Chunks:
                 and `dispatch` otherwise, and its `wait` seconds, until the
                 device finishes it. Without it, no call is split so.
             seen: Takes each call whose shape its program had not seen, once
-                it ran.
+                it ran, and a kind's first call at each count in this
+                process, which a program compiled at start had not.
             noted: Takes the stage, kind, call and seconds of each call whose
                 shape its program had not seen, to say what compiled.
         """
@@ -421,6 +422,8 @@ class Chunks:
                 self.timed("compile" if compiled else "dispatch", dispatched - started)
                 self.timed("wait", finished - dispatched)
             measuring = 0.0
+            with self._lock:
+                first_use = padded not in self._counts.get(key, ())
             self._ran(key, padded)
             if ahead is not None and buckets is not None:
                 # The first of a kind's calls compiles in it; its other
@@ -430,7 +433,7 @@ class Chunks:
                         self._start(key, bucket, count, first, prepare, ahead)
             if self._compiled is not None and compiled:
                 self._compiled(stage)
-            if self._seen is not None and compiled:
+            if self._seen is not None and (compiled or first_use):
                 self._seen(call)
             consume(first, stop, outputs)
             # Freed before the next call, so the device never holds two calls' outputs.

@@ -20,7 +20,13 @@ from typing import Any, cast
 import jax
 import numpy as np
 
-from generalforecast.constants import COMPILED_SHAPES, RECORDED_KINDS, WARM_QUIET
+from generalforecast.constants import (
+    COMPILED_SHAPES,
+    RECORDED_KINDS,
+    RECORDED_PROGRAMS,
+    RECORDED_SECONDS,
+    WARM_QUIET,
+)
 from generalforecast.runtime.budget import forget_compiled, note_compiled
 from generalforecast.runtime.device import DeviceSettings, with_precision
 from generalforecast.system import mappings_short
@@ -238,14 +244,41 @@ class Kind:
 
 @dataclass
 class Recorded:
-    """What a model's manifest holds: each kind of call, oldest first, with the item counts it took, and what was measured by compiling.
+    """What a model's manifest holds: each kind of call, least recently used first, with the item counts it took, and what was measured by compiling.
 
     A measure is a tuple its worker reads, such as a table width whose
-    sizes were measured; the latest `RECORDED_KINDS` are kept.
+    sizes were measured; the latest `RECORDED_KINDS` are kept. `used` holds
+    when a worker last used each kind, in seconds since the epoch.
     """
 
     kinds: dict[Kind, set[int]]
     measures: dict[tuple, None]
+    used: dict[Kind, float] = dataclasses.field(default_factory=dict)
+
+    def programs(self, kind: Kind) -> int:
+        """Programs a kind compiles at a start: each count it took, and each power of two up to the most."""
+        return len(counts_up_to(self.kinds[kind]))
+
+    def prune(self, now: float) -> None:
+        """Forgets the least recently used kinds past `RECORDED_PROGRAMS` programs, and those unused for `RECORDED_SECONDS`."""
+        for kind in [
+            kind
+            for kind, used in self.used.items()
+            if kind in self.kinds and now - used > RECORDED_SECONDS
+        ]:
+            del self.kinds[kind]
+        total = sum(self.programs(kind) for kind in self.kinds)
+        while self.kinds and (
+            total > RECORDED_PROGRAMS or len(self.kinds) > RECORDED_KINDS
+        ):
+            oldest = next(iter(self.kinds))
+            total -= self.programs(oldest)
+            del self.kinds[oldest]
+        self.used = {kind: self.used[kind] for kind in self.kinds if kind in self.used}
+
+    def by_use(self) -> list[tuple[Kind, set[int]]]:
+        """The kinds, most recently used first, with their counts."""
+        return list(reversed(self.kinds.items()))
 
 
 class Manifest:
@@ -253,13 +286,15 @@ class Manifest:
 
     A file of its own per model, read and rewritten whole under a lock, so
     workers sharing a machine add to it rather than overwrite each other.
-    Only the latest `RECORDED_KINDS` kinds are kept. A file that cannot be
-    read, such as one an older version wrote, reads as empty.
+    It is bounded as `Recorded.prune` says, by last use, so the programs a
+    start compiles stay few however many shapes were ever served. A file
+    that cannot be read, such as one an older version wrote, reads as empty.
     """
 
-    def __init__(self, path: Path) -> None:
-        """A manifest kept at `path`."""
+    def __init__(self, path: Path, clock: Callable[[], float] = time.time) -> None:
+        """A manifest kept at `path`, its uses timed by `clock`."""
         self.path = path
+        self._clock = clock
 
     def read(self) -> Recorded:
         """What is recorded."""
@@ -274,14 +309,15 @@ class Manifest:
         return recorded if isinstance(recorded, Recorded) else Recorded({}, {})
 
     def add(self, kind: Kind, count: int) -> None:
-        """Records a kind's call at `count` items as the latest used."""
+        """Records a kind's call at `count` items as the latest used, and forgets what `Recorded.prune` does."""
 
         def added(recorded: Recorded) -> None:
             counts = recorded.kinds.pop(kind, set())
             counts.add(count)
             recorded.kinds[kind] = counts
-            while len(recorded.kinds) > RECORDED_KINDS:
-                del recorded.kinds[next(iter(recorded.kinds))]
+            now = self._clock()
+            recorded.used[kind] = now
+            recorded.prune(now)
 
         self._update(added)
 
@@ -454,7 +490,11 @@ class Programs:
         return Manifest(self._manifests / f"{digest}.json")
 
     def remember(self, model: str, kind: Kind, count: int) -> None:
-        """Records that a model's kind of call compiled for `count` items, for later processes to compile at start."""
+        """Records that a model's kind of call ran at `count` items, for later processes to compile at start.
+
+        Recorded once a process, at its first call, so a manifest keeps the
+        kinds by when a worker last used them.
+        """
         manifest = self.manifest(model)
         if manifest is None or not self._record((model, kind, count)):
             return

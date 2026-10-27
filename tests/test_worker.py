@@ -232,3 +232,42 @@ def test_a_measure_that_raises_is_taken_again() -> None:
         memo.get("key", flaky)
     assert memo.get("key", flaky) == 3
     assert len(attempts) == 2
+
+
+def test_a_start_compiles_the_most_recently_used_programs_and_the_rest_ahead(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from generalforecast.worker import ahead
+
+    # Two programs at start, so the test compiles few.
+    started = 2
+    monkeypatch.setattr(ahead, "STARTED_PROGRAMS", started)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    first = Worker(slot_bytes=4096, compile_ahead=False)
+    _, step = _fused(first, 1)
+    # As `worker_process` loads models: by spec, so their calls are recorded.
+    first._specs[0] = "tiny-tabicl"
+    first.run(step([0]))
+    manifest = first.programs.manifest("tiny-tabicl")
+    assert manifest is not None
+    # Each kind as if it took 8 items too: four programs each to start with.
+    for kind in list(manifest.read().kinds):
+        manifest.add(kind, 8)
+    recorded = manifest.read()
+    total = sum(recorded.programs(kind) for kind in recorded.kinds)
+    assert total > started
+
+    later = Worker(slot_bytes=4096)
+    later.add_model(0, tabicl_functions, tiny_tabicl(regression=False))
+    later._specs[0] = "tiny-tabicl"
+    later.allocate(256, 0, 0)
+    later.programs.quiet = 3600.0
+    reported: list[tuple[int, int]] = []
+
+    later.warm_start(lambda done, of: reported.append((done, of)))
+
+    assert later.programs.warmed == started
+    assert reported[-1] == (started, started)
+    # The rest wait to compile ahead while the worker serves.
+    assert len(later.programs._later) == total - started
+    later.programs.drop()

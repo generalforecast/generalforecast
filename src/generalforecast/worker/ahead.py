@@ -25,6 +25,7 @@ import numpy as np
 
 from generalforecast._core import bucket_size
 from generalforecast.constants import (
+    STARTED_PROGRAMS,
     TABLE_STAGES,
     WARM_RUN_ROWS,
     WARMED_PAGES,
@@ -34,6 +35,7 @@ from generalforecast.runtime.budget import Call, _shapes, note_compiled
 from generalforecast.runtime.device import cache_root, cpu_flags
 from generalforecast.runtime.programs import (
     Kind,
+    Recorded,
     abstract,
     counts_up_to,
     ladder,
@@ -118,35 +120,39 @@ class Ahead:
         progress: Callable[[int, int], None] | None = None,
         models: Sequence[int] | None = None,
     ) -> None:
-        """Compiles the kinds of call earlier processes recorded for the loaded models, before any step.
+        """Compiles the kinds of call earlier processes recorded for the loaded models: the most recently used before any step, the rest ahead.
 
         Each kind compiles for every power of two of items up to the most a
         call of it took, and for each count it took, from shapes alone, so
         the device stays free. Programs JAX's compile cache holds load from
         it; tracing them is what remains, which steps would otherwise do.
-        A kind that no longer compiles, as after the model's code changed,
-        is skipped. Call it after `allocate`: paged decodes read the pool.
+        Each model's `STARTED_PROGRAMS` most recently used programs compile
+        here, so a start takes about as long however much was recorded; the
+        rest compile ahead in quiet gaps between steps, most recently used
+        first. A kind that no longer compiles, as after the model's code
+        changed, is skipped. Call it after `allocate`: paged decodes read
+        the pool.
 
         Args:
             progress: Called with the programs compiled so far and the
-                programs to compile in all, after each program and each
-                measure, so the caller can show how far along it is.
+                programs to compile before any step, after each program and
+                each measure, so the caller can show how far along it is.
             models: The loaded models to compile for; every one by default.
         """
         started = time.perf_counter()
         chosen = self._specs.keys() if models is None else models
-        planned = []
+        planned: list[tuple[int, Recorded, list[tuple[Kind, int]]]] = []
         for model in chosen:
             recorded = self.programs.recorded(self._specs[model])
-            kinds = [
-                (kind, self._buckets(kind.program[0]) or counts_up_to(counts))
-                for kind, counts in recorded.kinds.items()
+            programs = [
+                (kind, count)
+                for kind, counts in recorded.by_use()
+                for count in self._buckets(kind.program[0]) or counts_up_to(counts)
             ]
-            planned.append((model, recorded, kinds))
-        total = sum(len(counts) for _, _, kinds in planned for _, counts in kinds)
+            planned.append((model, recorded, programs))
+        total = sum(min(len(programs), STARTED_PROGRAMS) for *_, programs in planned)
         done = 0
-        for model, recorded, kinds in planned:
-            parameters = self._models[model].parameters
+        for model, recorded, programs in planned:
             if not self.forecaster(model) and recorded.kinds:
                 # What a step measures by compiling, once per model and width,
                 # before it decides where a context goes.
@@ -155,44 +161,50 @@ class Ahead:
                     self._measure(model, measure)
                     if progress is not None:
                         progress(done, total)
-            for kind, counts in kinds:
-                program = (kind.program[0], model, *kind.program[2:])
-                planned_before = done
-                try:
-                    function = cast(jax.stages.Wrapped, self._program(program))
-                    for count in counts:
-                        items = abstract(kind.item, count)
-                        shared = self._shared(program, kind, items)
-                        arguments = (parameters, *shared, *items)
-                        note_compiled(
-                            function, arguments, function.lower(*arguments).compile()
+            failed: set[Kind] = set()
+            for kind, count in programs[:STARTED_PROGRAMS]:
+                if kind not in failed and not self._warm_program(model, kind, count):
+                    failed.add(kind)
+                done += 1
+                if progress is not None:
+                    progress(done, total)
+            for kind, count in programs[STARTED_PROGRAMS:]:
+                if kind not in failed:
+                    self.programs.later(
+                        lambda model=model, kind=kind, count=count: self._warm_program(
+                            model, kind, count
                         )
-                        # A program's first run sets it up on the device, which
-                        # would otherwise slow the first step that calls it. One
-                        # reading a large table takes as long on zeros as the
-                        # call it would speed up, so only compiles.
-                        inputs = zeros((shared, items))
-                        if inputs is not None and (
-                            kind.program[0] not in TABLE_STAGES
-                            or most_rows(kind.item) <= WARM_RUN_ROWS
-                        ):
-                            jax.block_until_ready(
-                                function(parameters, *inputs[0], *inputs[1])
-                            )
-                        self.programs.warmed += 1
-                        done += 1
-                        if progress is not None:
-                            progress(done, total)
-                except Exception as error:  # noqa: BLE001
-                    logger.warning(
-                        "not compiling a recorded %s call: %s", kind.program[0], error
                     )
-                    # The shapes not compiled still count, so the progress a
-                    # server shows reaches its total.
-                    done = planned_before + len(counts)
-                    if progress is not None:
-                        progress(done, total)
         self.programs.warm_seconds += time.perf_counter() - started
+
+    def _warm_program(self: "Worker", model: int, kind: Kind, count: int) -> bool:
+        """Compiles a recorded kind of a model's call for `count` items, and runs it on zeros where that is quick; whether it compiled.
+
+        A program's first run sets it up on the device, which would otherwise
+        slow the first step that calls it. One reading a large table takes as
+        long on zeros as the call it would speed up, so only compiles.
+        """
+        program = (kind.program[0], model, *kind.program[2:])
+        parameters = self._models[model].parameters
+        try:
+            function = cast(jax.stages.Wrapped, self._program(program))
+            items = abstract(kind.item, count)
+            shared = self._shared(program, kind, items)
+            arguments = (parameters, *shared, *items)
+            note_compiled(function, arguments, function.lower(*arguments).compile())
+            inputs = zeros((shared, items))
+            if inputs is not None and (
+                kind.program[0] not in TABLE_STAGES
+                or most_rows(kind.item) <= WARM_RUN_ROWS
+            ):
+                jax.block_until_ready(function(parameters, *inputs[0], *inputs[1]))
+        except Exception as error:  # noqa: BLE001
+            logger.warning(
+                "not compiling a recorded %s call: %s", kind.program[0], error
+            )
+            return False
+        self.programs.warmed += 1
+        return True
 
     def _remember(self: "Worker", model: int, measure: tuple) -> None:
         """Records a measure a model took by compiling, for `warm_start` to take again."""
