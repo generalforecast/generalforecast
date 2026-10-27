@@ -184,6 +184,25 @@ fn fake_worker(mut stream: UnixStream, behaviour: Arc<AtomicU8>, held: Arc<Notif
                         message: "ValueError: seven classes".to_string(),
                     }
                     .frame(),
+                    // The fake worker loads model "slow" once released, and
+                    // never answers loading model "stuck".
+                    WorkerRequest::Controls { requests }
+                        if matches!(
+                            requests.as_slice(),
+                            [WorkerRequest::AddModel { name, .. }] if name == "slow"
+                        ) =>
+                    {
+                        held.notified().await;
+                        WorkerReply::Ok.frame()
+                    }
+                    WorkerRequest::Controls { requests }
+                        if matches!(
+                            requests.as_slice(),
+                            [WorkerRequest::AddModel { name, .. }] if name == "stuck"
+                        ) =>
+                    {
+                        continue;
+                    }
                     // The fake worker compiles three recorded programs as it
                     // starts, reporting progress after each.
                     WorkerRequest::Allocate { .. } => {
@@ -942,6 +961,78 @@ async fn a_worker_that_hangs_outside_a_step_is_started_again() {
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert_eq!(shard.metrics.workers_down.get(), 1);
+}
+
+impl Harness {
+    /// Has the shard's worker load model `name`, answering once it did.
+    fn add_model(&self, name: &str) -> impl Future<Output = Result<(), Code>> + use<> {
+        let commands = self.commands.clone();
+        let name = name.to_string();
+        async move {
+            let (reply, answer) = oneshot::channel();
+            let command = Command::AddModel {
+                name,
+                spec: "catalog/tiny".to_string(),
+                reply,
+            };
+            commands.send(command).await.unwrap();
+            answer.await.unwrap().map_err(|error| status(&error))
+        }
+    }
+
+    async fn models(&self) -> Vec<String> {
+        let (reply, answer) = oneshot::channel();
+        self.commands.send(Command::Models { reply }).await.unwrap();
+        answer.await.unwrap().unwrap()
+    }
+}
+
+#[tokio::test]
+async fn writes_and_reads_go_on_while_the_worker_loads_a_model() {
+    let shard = shard(settings()).await;
+    shard.create(3).await.unwrap();
+    let loading = tokio::spawn(shard.add_model("slow"));
+    let joined = tokio::spawn(shard.add_model("slow"));
+
+    // The worker holds the load, yet the shard takes writes and answers
+    // reads of its tables, its logs and its models meanwhile.
+    let served = tokio::time::timeout(Duration::from_secs(5), async {
+        shard.insert(&[1, 2, 3, 4]).await;
+        assert_eq!(shard.describe().await.rows, 4);
+        assert!(!shard.read_log(0).await.is_empty());
+        shard.models().await
+    })
+    .await
+    .expect("the shard waited for the model to load");
+    assert!(!served.contains(&"slow".to_string()));
+    assert!(!loading.is_finished());
+
+    shard.held.notify_one();
+    let loaded = tokio::time::timeout(Duration::from_secs(5), loading).await;
+    assert_eq!(loaded.expect("loaded").unwrap(), Ok(()));
+    assert_eq!(
+        joined.await.unwrap(),
+        Ok(()),
+        "a second call waits on the first"
+    );
+    assert!(shard.models().await.contains(&"slow".to_string()));
+    assert_eq!(shard.metrics.workers_down.get(), 0);
+}
+
+#[tokio::test]
+async fn a_worker_that_hangs_loading_a_model_is_started_again_and_the_load_fails() {
+    let mut settings = settings();
+    settings.step_timeout = Duration::from_millis(200);
+    let shard = shard(settings).await;
+
+    let failed = tokio::time::timeout(Duration::from_secs(10), shard.add_model("stuck")).await;
+
+    assert_eq!(
+        failed.expect("answered before the timeout"),
+        Err(Code::Internal)
+    );
+    assert_eq!(shard.metrics.workers_down.get(), 1);
+    assert!(!shard.models().await.contains(&"stuck".to_string()));
 }
 
 #[tokio::test]

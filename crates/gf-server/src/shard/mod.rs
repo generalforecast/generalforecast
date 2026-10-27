@@ -87,6 +87,7 @@ use gf_core::columns::{self, Strings, Vocabulary, Words};
 
 mod commit;
 mod compaction;
+mod models;
 mod replication;
 mod restart;
 mod steps;
@@ -881,6 +882,8 @@ pub struct ShardSettings {
 enum Event {
     /// The worker compiled programs that steps deferred tables for.
     Compiled,
+    /// The worker's answer to the oldest model it was told to load.
+    Added(worker::Reply),
     Command(Option<Box<Command>>),
     /// A log rewritten in the background, ready to install.
     Compacted(Box<Finished>),
@@ -953,6 +956,8 @@ pub struct Shard {
     in_flight: VecDeque<InFlight>,
     /// Tables added to or removed from the worker whose replies are still due.
     controls: VecDeque<(Control, oneshot::Receiver<worker::Reply>)>,
+    /// Models the worker is loading, oldest first.
+    adding: VecDeque<models::Adding>,
     /// When the worker last finished a step, to time steps that queued behind it.
     finished: Instant,
     /// Failed steps in a row, by table, and the tables quarantined for them.
@@ -1041,6 +1046,7 @@ impl Shard {
             queued_bytes: 0,
             in_flight: VecDeque::new(),
             controls: VecDeque::new(),
+            adding: VecDeque::new(),
             finished: Instant::now(),
             failures: HashMap::new(),
             quarantined: HashMap::new(),
@@ -1128,6 +1134,7 @@ impl Shard {
             let deadline = self.deadline();
             let expiry = self.ephemeral.expiry();
             let next = self.in_flight.front_mut().map(|step| &mut step.reply);
+            let adding = self.adding.front_mut().map(|adding| &mut adding.reply);
             let up = self.down.is_none();
             let stopped = self.worker.pipeline.stopped();
             let compiled = self.worker.pipeline.compiled();
@@ -1144,6 +1151,9 @@ impl Shard {
                 biased;
                 reply = async { next.expect("guarded").await }, if next.is_some() => {
                     Event::Reply(reply.unwrap_or_else(|_| Err("the worker stopped".to_string())))
+                }
+                added = async { adding.expect("guarded").await }, if adding.is_some() => {
+                    Event::Added(added.unwrap_or_else(|_| Err("the worker stopped".to_string())))
                 }
                 () = stopped, if up => Event::Stopped,
                 () = compiled, if up => Event::Compiled,
@@ -1175,6 +1185,7 @@ impl Shard {
                 Event::Stopped | Event::Hung if self.stopping => break,
                 Event::Compacted(finished) => self.finish_compaction(*finished).await,
                 Event::Reply(reply) => self.finish(reply).await,
+                Event::Added(answer) => self.added(answer),
                 Event::Stopped => self.restart("the worker stopped").await,
                 Event::Hung if self.overdue() => self.restart(&self.hung()).await,
                 // The worker reported progress since the deadline was set.
@@ -1201,14 +1212,16 @@ impl Shard {
     /// When the oldest step in flight must have answered. A step starts once
     /// the one before it finished, since the worker runs them in turn, and
     /// each compile the worker reports finished during it moves it later.
+    /// A model being loaded is timed the same way.
     fn deadline(&self) -> Option<Instant> {
         let progressed = self.worker.pipeline.progressed();
-        self.in_flight.front().map(|step| {
+        let step = self.in_flight.front().map(|step| {
             step.sent
                 .max(self.finished)
                 .max(progressed.unwrap_or(step.sent))
                 + self.step_timeout
-        })
+        });
+        [step, self.adding_deadline()].into_iter().flatten().min()
     }
 
     /// Whether the oldest step in flight is past its deadline.
@@ -1218,8 +1231,12 @@ impl Shard {
     }
 
     fn hung(&self) -> String {
+        let on = self.loading().map_or_else(
+            || "a step".to_string(),
+            |name| format!("loading model {name:?}"),
+        );
         format!(
-            "the worker went {} seconds without progress on a step",
+            "the worker went {} seconds without progress on {on}",
             self.step_timeout.as_secs()
         )
     }
@@ -1432,9 +1449,7 @@ impl Shard {
             Command::Models { reply } => {
                 let _ = reply.send(Ok(self.worker.models.clone()));
             }
-            Command::AddModel { name, spec, reply } => {
-                let _ = reply.send(self.add_model(name, spec).await);
-            }
+            Command::AddModel { name, spec, reply } => self.add_model(name, spec, reply).await,
             Command::ReadLog {
                 table,
                 from,
@@ -2401,45 +2416,6 @@ impl Shard {
             let _ = self.node.set_fit_limits(table, limits.0, limits.1);
         }
         !tables.is_empty()
-    }
-
-    /// Has the worker load a model it does not serve yet, and starts later
-    /// workers with it.
-    async fn add_model(&mut self, name: String, spec: String) -> Result<(), ServerError> {
-        if self.worker.models.contains(&name) {
-            return Ok(());
-        }
-        let request = WorkerRequest::Controls {
-            requests: vec![WorkerRequest::AddModel {
-                name: name.clone(),
-                spec: spec.clone(),
-            }],
-        };
-        // The worker compiles what earlier workers recorded for the model
-        // before it answers, reporting progress after each program.
-        let frame = self
-            .worker
-            .request_progressing(&request.frame(), self.step_timeout)
-            .await
-            .map_err(ServerError::Internal)?;
-        match WorkerReply::of(&frame).map_err(|error| ServerError::Internal(error.0))? {
-            WorkerReply::Ok => {
-                self.worker.models.push(name.clone());
-                self.worker.launch.config.models.insert(name, spec);
-                Ok(())
-            }
-            WorkerReply::Controlled { failures } => Err(ServerError::Invalid(format!(
-                "model {name:?} could not load: {}",
-                failures
-                    .iter()
-                    .map(|failure| failure.message.as_str())
-                    .collect::<Vec<_>>()
-                    .join("; ")
-            ))),
-            reply => Err(ServerError::Internal(format!(
-                "the worker answered adding a model with {reply:?}"
-            ))),
-        }
     }
 
     /// Sends the worker a request and reads its reply.
