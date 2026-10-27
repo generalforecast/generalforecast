@@ -193,7 +193,9 @@ pub struct Context {
 
 /// A target column's labels, None where unlabeled.
 fn labels(array: &ArrayRef) -> Result<Vec<Option<Label>>, RequestError> {
-    let refused = || invalid("class labels must be strings, booleans or integers");
+    let refused = || {
+        invalid("class labels must be strings, booleans or integers (whole-number floats included)")
+    };
     if let Some(values) = array.as_any().downcast_ref::<BooleanArray>() {
         return Ok((0..values.len())
             .map(|row| values.is_valid(row).then(|| Label::Bool(values.value(row))))
@@ -225,6 +227,29 @@ fn labels(array: &ArrayRef) -> Result<Vec<Option<Label>>, RequestError> {
         return Ok((0..values.len())
             .map(|row| values.is_valid(row).then(|| Label::Int(values.value(row))))
             .collect());
+    }
+    if array.data_type().is_floating() {
+        // A float column of whole numbers is integer labels, as pandas
+        // writes a target with blanks (`1.0`, `NaN`) and Python's
+        // `tables.whole_numbers` reads it; a NaN is unlabeled.
+        let values = cast(array, &DataType::Float64).map_err(|_| refused())?;
+        let values = values
+            .as_any()
+            .downcast_ref::<arrow_array::Float64Array>()
+            .ok_or_else(refused)?;
+        return (0..values.len())
+            .map(|row| {
+                let value = values.value(row);
+                if values.is_null(row) || value.is_nan() {
+                    return Ok(None);
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let whole = value as i64;
+                #[allow(clippy::cast_precision_loss)]
+                let exact = value.is_finite() && whole as f64 == value;
+                exact.then_some(Some(Label::Int(whole))).ok_or_else(refused)
+            })
+            .collect();
     }
     Err(refused())
 }
@@ -306,4 +331,29 @@ pub fn bind(
         classes,
         rows: rows.num_rows(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Float64Array};
+
+    use super::{Label, labels};
+
+    #[test]
+    fn whole_number_float_labels_are_integers_as_python_reads_them() {
+        let column: ArrayRef = Arc::new(Float64Array::from(vec![
+            Some(0.0),
+            Some(1.0),
+            Some(f64::NAN),
+            None,
+        ]));
+        assert_eq!(
+            labels(&column).unwrap(),
+            vec![Some(Label::Int(0)), Some(Label::Int(1)), None, None]
+        );
+        let fractional: ArrayRef = Arc::new(Float64Array::from(vec![Some(0.5)]));
+        assert!(labels(&fractional).is_err());
+    }
 }

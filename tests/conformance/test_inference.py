@@ -151,3 +151,40 @@ def test_forecast_predictions_carry_ordered_quantiles_per_future_row(server):
         levels = row["quantiles"]
         assert set(levels) == {"0.1", "0.5", "0.9"}
         assert levels["0.1"] <= levels["0.5"] <= levels["0.9"]
+
+
+def test_whole_number_float_labels_are_the_integer_classes(server):
+    # pandas writes a target with blanks as floats: 0.0, 1.0 and NaN (null).
+    rows = [{"spend": float(i), "seats": i % 2} for i in range(12)]
+    payload = {
+        "model": "general-forecast/tabicl-v2-classifier",
+        "target": "churned",
+        "inputs": ["spend", "seats"],
+        "queries": [{"spend": 4.0, "seats": 1}],
+    }
+    whole = scored(
+        server,
+        "/predict",
+        "ad-hoc",
+        {
+            **payload,
+            "context": [
+                {**row, "churned": int(i % 3 == 0)} for i, row in enumerate(rows)
+            ],
+        },
+    )
+    floats = scored(
+        server,
+        "/predict",
+        "ad-hoc",
+        {
+            **payload,
+            "context": [
+                {**row, "churned": None if i == 5 else float(i % 3 == 0)}
+                for i, row in enumerate(rows)
+            ],
+        },
+    )
+    [integer], [floated] = whole["predictions"], floats["predictions"]
+    assert set(integer["probabilities"]) == set(floated["probabilities"]) == {"0", "1"}
+    assert type(floated["label"]) is int
