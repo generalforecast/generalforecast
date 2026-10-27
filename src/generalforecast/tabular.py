@@ -1,10 +1,17 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Bounded local tabular conversion without semantic guesses or remote I/O."""
+"""Bounded tabular conversion without semantic guesses.
+
+Conversion and parsing are local. The only remote read is `frame` given an
+`http(s)` URL, which goes through the SDK's hardened `Transport`: HTTPS
+except on loopback, no redirects, no proxy settings from the environment and
+no credentials.
+"""
 
 import io
 import json
+import os
 from collections.abc import Iterable, Mapping
 from pathlib import PurePosixPath
 from typing import Any
@@ -414,7 +421,10 @@ def frame(obj: Any, *, columns: list[str] | tuple[str, ...] | None = None) -> pa
     Arrow table or record batch, a NumPy array (columns `columns`, else
     `f0`, `f1`, ...), or a path or URL to a `.csv`, `.parquet`, `.json`,
     `.jsonl`, `.arrow` or `.feather` file. Every public method that takes
-    `queries` or `context` reads them through this function.
+    `queries` or `context` reads them through this function, and every
+    form is normalized alike: int64, float64 with NaN as null, decoded
+    categories, and no infinities. A URL must be HTTPS (or loopback HTTP),
+    is read without redirects and carries no credentials.
 
     Raises:
         InvalidInput: For a value that is not rows, a file that cannot be read,
@@ -426,9 +436,6 @@ def frame(obj: Any, *, columns: list[str] | tuple[str, ...] | None = None) -> pa
         return _frame_from_location(str(obj))
     if obj is None:
         raise InvalidInput("rows are required: a frame, a list of dicts or a file")
-    if isinstance(obj, Mapping):
-        with boundary():
-            return pa.Table.from_pydict(dict(obj))
     if isinstance(obj, (list, tuple)) and len(obj) == 0:
         return pa.table({})
     with boundary():
@@ -438,36 +445,44 @@ def frame(obj: Any, *, columns: list[str] | tuple[str, ...] | None = None) -> pa
 def _frame_from_location(location: str) -> pa.Table:
     from urllib.parse import urlsplit
 
-    from generalforecast.errors import InvalidInput, boundary
+    from generalforecast.errors import Error, InvalidInput, boundary
 
     parts = urlsplit(location)
-    if parts.scheme in ("http", "https"):
-        import urllib.request
-
-        try:
-            with urllib.request.urlopen(location, timeout=60) as response:
-                data = response.read(MAX_BYTES + 1)
-        except OSError as exc:
-            raise InvalidInput(f"cannot read {location}: {exc}".rstrip(".")) from None
-        name = parts.path
-    else:
-        import os
-
-        path = os.path.expanduser(location)
-        if not os.path.isfile(path):
-            raise InvalidInput(f"no file at `{location}`")
-        with open(path, "rb") as handle:
-            data = handle.read(MAX_BYTES + 1)
-        name = path
-    suffix = PurePosixPath(name).suffix.lower().lstrip(".")
+    remote = parts.scheme in ("http", "https")
+    # A URL is shown without its query, which may hold a signature.
+    shown = f"{parts.scheme}://{parts.netloc}{parts.path}" if remote else location
+    if not remote and not os.path.isfile(os.path.expanduser(location)):
+        raise InvalidInput(f"no file at `{location}`")
+    suffix = PurePosixPath(parts.path if remote else location).suffix
+    suffix = suffix.lower().lstrip(".")
     if suffix not in _FRAME_FORMATS:
         raise InvalidInput(
-            f"`{location}` is not a file this reads",
+            f"`{shown}` is not a file this reads",
             hint="pass a .csv, .parquet, .json, .jsonl, .arrow or .feather file",
         )
+    if remote:
+        from generalforecast.transport import Transport, split_url
+
+        try:
+            origin, path = split_url(location)
+            transport = Transport(origin, timeout=60)
+            try:
+                data = transport.download(path, limit=MAX_BYTES)
+            finally:
+                transport.close()
+        except Error as exc:
+            raise InvalidInput(
+                f"cannot read {shown}: {exc.message}",
+                hint=exc.hint,
+                limit=exc.limit,
+                actual=exc.actual,
+            ) from None
+    else:
+        with open(os.path.expanduser(location), "rb") as handle:
+            data = handle.read(MAX_BYTES + 1)
     if len(data) > MAX_BYTES:
         raise InvalidInput(
-            f"`{location}` is larger than {MAX_BYTES // (1024 * 1024)} MiB",
+            f"`{shown}` is larger than {MAX_BYTES // (1024 * 1024)} MiB",
             limit=MAX_BYTES,
             actual=len(data),
         )
