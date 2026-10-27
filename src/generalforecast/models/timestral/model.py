@@ -167,7 +167,11 @@ class TimestralCache:
             rows, patch)`: the window `decode` runs whole once fed-back
             medians would pass the context limit, as `forecast` does. They
             are kept as the bits of their float32 values, so a cache stored
-            in a reduced precision keeps them exact.
+            in a reduced precision keeps them exact. With `observed`, they
+            take 5 bytes a step of a row, under 1% of a patch's cache beside
+            its keys and values (0.9% for timestral-28m in float16, 0.2% for
+            timestral-209m), so every cache keeps them rather than only one
+            whose decode would pass the limit.
         observed: Which of `values` are observed.
         statistics: The context's running moments per row at its last step.
         lowest: The lowest observed value per row, or infinity for none.
