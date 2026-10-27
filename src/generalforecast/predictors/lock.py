@@ -684,10 +684,11 @@ def _flatten(value: dict[str, Any], prefix: str = "") -> dict[str, Any]:
 def load_lock(root: str | Path, spec: PredictorSpec | None = None) -> Resolution:
     """The resolution a `gf.lock` records, without touching the context.
 
-    This is what `gf check --frozen` reads. (`gf.Predictor` resolves the
-    manifest again and compares; `gf serve` and `gf push` validate the
-    document and its manifest digest themselves.) The lock must describe
-    the manifest beside it exactly: it records the digest of the
+    A library read of what a lock records, for tools that describe one; no
+    entry point predicts from it. `gf check --frozen` and `--locked`,
+    `gf.Predictor`, `gf serve` and `gf push` hold a directory's lock to
+    `resolution.verified`, which also resolves the context. The lock must
+    describe the manifest beside it exactly: it records the digest of the
     normalized `gf.yaml`, so any edit that could change a prediction
     (inputs, types, split, selection and its seed, frequency, quantiles,
     resources) makes it stale.
