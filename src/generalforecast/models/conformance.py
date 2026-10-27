@@ -24,6 +24,7 @@ import numpy as np
 from jax import Array
 
 from generalforecast.models.contract import TabularFunctions, TabularProperties
+from generalforecast.models.outputs import quantile_index
 from generalforecast.models.series import (
     KNOWN,
     TARGET,
@@ -32,7 +33,7 @@ from generalforecast.models.series import (
     SeriesProperties,
 )
 from generalforecast.nn.attention import AttentionCache
-from generalforecast.runtime.device import to_cache_dtype
+from generalforecast.runtime.device import load_cache, to_cache_dtype
 from generalforecast.runtime.paging import cache_layout
 from generalforecast.runtime.shapes import pad_rows
 
@@ -187,7 +188,7 @@ def check(
     *,
     features: int = 5,
     tolerance: float = 1e-5,
-    cache_drift: float = 5e-2,
+    stored_tolerance: float = 1e-3,
 ) -> None:
     """Runs a model through every way the engine calls it, on random tables.
 
@@ -198,8 +199,8 @@ def check(
     padding past `num_rows`, garbage and NaN included, reaches no real row;
     that columns constant or empty in the context are left out; that tables
     batch with `jax.vmap`; that `decode` reads only the keys a cache's mask
-    allows within its length; that it serves every class count up to its
-    slots; and that its caches page by rows. What its properties and
+    allows within its length; that it serves class counts past three, up
+    to its slots; and that its caches page by rows. What its properties and
     functions claim is checked too: that it reads stored caches, scales and
     all; that it takes context rows without a target; that `decode_reading`
     decodes as `decode`; and that `crowded_categories` counts columns.
@@ -209,9 +210,10 @@ def check(
         parameters: Its parameters.
         features: Columns of the random tables.
         tolerance: How far results may move between equivalent calls.
-        cache_drift: How far a float16, bfloat16 or int8 cache may move
-            predictions of a model that reads stored caches: probabilities,
-            or medians per target deviation.
+        stored_tolerance: How far a model that reads stored caches may move
+            its predictions, probabilities or medians per target deviation,
+            between a float16, bfloat16 or int8 cache and the same cache
+            loaded back to float32.
 
     Raises:
         AssertionError: Naming the first check the model fails, whether its
@@ -226,7 +228,7 @@ def check(
         "properties: properties must return TabularProperties",
     )
     regression = properties.regression
-    limits = Limits(features, tolerance, cache_drift)
+    limits = Limits(features, tolerance, stored_tolerance)
     for name, run in _CHECKS:
         try:
             run(functions, parameters, properties, regression, limits)
@@ -241,7 +243,7 @@ class Limits(NamedTuple):
 
     features: int
     tolerance: float
-    cache_drift: float
+    stored_tolerance: float
 
 
 def _reason(error: Exception) -> str:
@@ -499,7 +501,7 @@ def _caches(change: Any, *caches: Any) -> Any:
 
 
 def _class_counts(functions, model, properties, regression, limits):
-    """A classifier serves any class count up to its slots, not only three."""
+    """A classifier serves class counts past three, its slots among them up to 32."""
     if regression:
         return
     slots = properties.class_slots
@@ -509,7 +511,13 @@ def _class_counts(functions, model, properties, regression, limits):
 
 
 def _stored(functions, model, properties, regression, limits):
-    """A model that reads stored caches reads them as the runtime stores them, scales and all."""
+    """A model that reads stored caches decodes one as it decodes it loaded back.
+
+    The runtime stores caches in float16, bfloat16 or int8 with a scale per
+    row and head, and hands a model that reads them so the stored cache; one
+    loaded back to float32, its scales applied, leaves only the rounding of
+    the model's own arithmetic between the two, whatever the storage's.
+    """
     if not properties.stored_cache:
         return
     data = table(regression, rows=40, queries=12, features=limits.features)
@@ -521,18 +529,19 @@ def _stored(functions, model, properties, regression, limits):
         outputs = functions.decode(model, state, cache, queries)
         return functions.postprocess(model, state, outputs)
 
-    exact = predictions(cache)
     for dtype in ("float16", "bfloat16", "int8"):
-        moved = jnp.abs(predictions(to_cache_dtype(cache, jnp.dtype(dtype))) - exact)
+        stored = to_cache_dtype(cache, jnp.dtype(dtype))
+        loaded = predictions(load_cache(stored))
+        moved = jnp.abs(predictions(stored) - loaded)
         if regression:
-            middle = exact.shape[-1] // 2
+            middle = quantile_index(0.5)
             drift = float(jnp.max(moved[:, middle]) / jnp.std(data.targets))
         else:
             drift = float(jnp.max(moved))
         _require(
-            drift <= limits.cache_drift,
-            f"a {dtype} cache moves predictions by {drift:.3g}, past "
-            f"{limits.cache_drift}",
+            drift <= limits.stored_tolerance,
+            f"a {dtype} cache decodes {drift:.3g} from the same cache loaded "
+            f"back, past {limits.stored_tolerance}",
         )
 
 
@@ -786,9 +795,11 @@ def paged_series(cache: Any, grows: list[bool], extra: int) -> Any:
         The padded cache, each attention cache's length its real patches.
     """
     leaves, treedef = jax.tree.flatten(cache)
-    real = next(
+    patches = [
         leaf.shape[0] for leaf, grown in zip(leaves, grows, strict=True) if grown
-    )
+    ]
+    _require(bool(patches), "no cache leaf grows with the context's patches")
+    real = patches[0]
     padded = [
         jnp.concatenate([leaf, jnp.zeros((extra, *leaf.shape[1:]), leaf.dtype)])
         if grown

@@ -185,6 +185,7 @@ def standardize(
 
 
 def _standardized(values: Array, center: Array, low: Array, scale: Array) -> Array:
+    """`standardize` from the center, its low part and the scale."""
     return jnp.clip(((values - center) - low) / scale, -CLIP, CLIP)
 
 

@@ -24,6 +24,7 @@ from generalforecast.models import custom
 from generalforecast.models.catalog import ModelRefError
 from generalforecast.models.conformance import check
 from generalforecast.models.contract import TabularFunctions
+from generalforecast.runtime.device import load_cache
 from tests.models.conformance import custom_model as kernel
 
 PARAMETERS = kernel.Kernel(temperature=jnp.asarray(2.0), width=32)
@@ -88,6 +89,19 @@ BROKEN: dict[str, dict[str, Any]] = {
 
 def test_the_kernel_classifier_passes_every_check() -> None:
     check(kernel.kernel_functions, PARAMETERS)
+
+
+def test_a_model_that_reads_stored_caches_passes_however_coarse_the_storage() -> None:
+    """However far int8 storage moves its predictions, they match the cache loaded back."""
+
+    def decode(model, state, cache, rows):
+        return kernel.decode(model, state, load_cache(cache), rows)
+
+    functions = kernel.kernel_functions._replace(
+        properties=_claiming(stored_cache=True), decode=decode
+    )
+
+    check(functions, PARAMETERS)
 
 
 @pytest.mark.parametrize("name", list(BROKEN))

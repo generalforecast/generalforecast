@@ -102,7 +102,7 @@ def group_features(
 
     Args:
         table: Feature table, optionally with a channel axis.
-        grouping: Grouping mode and size.
+        grouping: Grouping mode, size and offset.
         count: Leading columns each shift cycles through, per batch row, as
             if the rest were dropped; None for all.
 
