@@ -371,7 +371,13 @@ def test_selection_settings_resolve_against_the_model_cap() -> None:
         tables.seconds("7d") == 7 * 86_400
         and tables.seconds("1h") == 3_600
         and tables.seconds(90) == 90
+        and tables.seconds("15min") == tables.seconds("15m") == 900
     )
+    # One parser with predictor frequencies: no fractional spans, no
+    # calendar alias passed off as its mean length.
+    for spelled in ("1.5h", "MS", "W-MON", "soon"):
+        with pytest.raises(gf.InvalidInput):
+            tables.seconds(spelled, "frequency")
     with pytest.raises(gf.InvalidInput):
         tables.TimeOptions(bucket="soon")
     with pytest.raises(gf.InvalidInput):

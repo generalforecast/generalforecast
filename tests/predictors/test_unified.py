@@ -415,13 +415,30 @@ def test_prediction_requests_carry_as_of():
 
 def test_one_name_rule_for_chosen_names():
     from generalforecast.predictors.spec import NAME as SPEC_NAME
-    from generalforecast.service.contracts import NAME as SERVICE_NAME
+    from generalforecast.service import contracts
 
-    assert SPEC_NAME is NAME is SERVICE_NAME
-    assert name("churn-2") == "churn-2"
-    for bad in ("Churn", "churn_2", "2churn", ""):
+    assert SPEC_NAME is NAME
+    assert name("churn-2") == contracts.name("churn-2") == "churn-2"
+    for bad in ("Churn", "churn_2", "2churn", "", None):
         with pytest.raises(PredictorError):
             name(bad)
+        with pytest.raises(contracts.ServiceError) as caught:
+            contracts.name(bad)
+        assert caught.value.status == 422
+
+
+def test_service_field_checks_are_the_predictor_checks():
+    from generalforecast.service import contracts
+
+    with pytest.raises(contracts.ServiceError, match=r"required fields: \['b'\]"):
+        contracts.fields({"a": 1}, {"a", "b"})
+    with pytest.raises(contracts.ServiceError, match="unknown fields"):
+        contracts.fields({"a": 1, "c": 2}, {"a"})
+    with pytest.raises(contracts.ServiceError, match="expected an object"):
+        contracts.fields([], {"a"})
+    assert contracts.text("k" * 256, "key") == "k" * 256
+    with pytest.raises(contracts.ServiceError, match="invalid key"):
+        contracts.text("k" * 257, "key")
 
 
 def test_the_lock_document_round_trips_through_yaml(tmp_path):

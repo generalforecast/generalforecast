@@ -27,19 +27,37 @@ def ensure(condition: Any, message: str, code: str = "InvalidPredictor") -> None
         raise PredictorError(code, message)
 
 
+# The longest literal `gf.yaml` and `gf.lock` hold: a column, a path, a model id.
+TEXT_LIMIT = 512
+# The longest identity string a service request carries: a row key, a
+# request id, an idempotency key.
+IDENTITY_LIMIT = 256
+
+
 def fields(
     value: Any, required: set[str], optional: AbstractSet[str] = frozenset()
 ) -> dict:
-    """Rejects missing and unknown keys, including credentials and runtime placement."""
+    """Rejects missing and unknown keys, including credentials and runtime placement.
+
+    The one shape check: `service.contracts.fields` is this one raising a
+    service error.
+    """
     ensure(type(value) is dict, "expected an object")
-    ensure(required <= value.keys(), "required fields are missing")
+    missing = required - value.keys()
+    ensure(not missing, f"required fields: {sorted(missing)}")
     ensure(value.keys() <= required | optional, "unknown fields are not supported")
+    return value
+
+
+def bounded(value: Any, limit: int = TEXT_LIMIT) -> str:
+    """Checks a nonempty string of at most `limit` characters."""
+    ensure(type(value) is str and 0 < len(value) <= limit, "expected bounded text")
     return value
 
 
 def text(value: Any) -> str:
     """Checks a bounded literal, never an environment expansion or secret value."""
-    ensure(type(value) is str and 0 < len(value) <= 512, "expected bounded text")
+    bounded(value)
     ensure(not any(ord(c) < 32 for c in value), "control characters are not allowed")
     ensure(
         not any(c in value for c in ("${", "{{", "://", "?", "#")),
