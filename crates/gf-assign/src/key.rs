@@ -7,7 +7,7 @@
 pub type Key = u64;
 
 /// The splitmix64 finalizer, which spreads every input bit over the output.
-pub fn mix(mut x: u64) -> u64 {
+fn mix(mut x: u64) -> u64 {
     x = (x ^ (x >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     x ^ (x >> 31)
