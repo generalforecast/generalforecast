@@ -65,6 +65,7 @@ RECORDED = (
     "compile_lock",
     "configuration",
     "context_version",
+    "document_digest",
     "entries",
     "failure",
     "fields",

@@ -67,7 +67,7 @@ class FrequencyError(ValueError):
     Attributes:
         code: `AmbiguousFrequency` for times that follow no single step,
             `DuplicateTime` for a time repeated within a series, `TooFewTimes`
-            for a series with one time and no declared frequency, and
+            when no series has two times and no frequency is declared, and
             `FrequencyMismatch` for times that differ from a declared one.
         message: What is wrong.
         because: Where the times break the rule, if known.
@@ -329,12 +329,21 @@ def infer(series: Mapping[Any, Sequence[Any]]) -> str | int | float:
     Raises:
         FrequencyError: `TooFewTimes`, `DuplicateTime` or `AmbiguousFrequency`.
     """
-    ordered = _sorted(series)
-    if not ordered or any(len(times) < 2 for times in ordered.values()):
+    every_series = _sorted(series)
+    # A series of one time follows whatever step the others do.
+    ordered = {key: times for key, times in every_series.items() if len(times) > 1}
+    if not ordered:
         raise FrequencyError(
             "TooFewTimes",
-            "each forecast series needs two times to infer its frequency",
+            "no forecast series has two times to infer its frequency from",
         )
+    found = _inferred(ordered)
+    check(every_series, found)
+    return found
+
+
+def _inferred(ordered: Mapping[Any, list[Any]]) -> str | int | float:
+    """`infer` over series of two or more times each."""
     every = [value for times in ordered.values() for value in times]
     if _numeric(every):
         gaps = {
@@ -485,6 +494,10 @@ def grid(origin: Any, count: int, value: Any) -> list[Any]:
         return [stamp.date() for stamp in stamps]
     total = seconds(spelled)
     assert total is not None
+    if isinstance(origin, datetime.datetime) and origin.tzinfo is not None:
+        # Spans step through UTC, never a zone's wall clock, which jumps an
+        # hour at a daylight saving change.
+        origin = origin.astimezone(datetime.UTC)
     return [
         origin + datetime.timedelta(seconds=total * (index + 1))
         for index in range(count)

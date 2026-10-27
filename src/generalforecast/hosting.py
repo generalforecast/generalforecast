@@ -53,6 +53,8 @@ Exports:
         PredictorLock, parse_lock, lock_digest, lock_name, upgrade_lock:
             a pushed version 2 lock, read and identified; a stored version 1
             lock rewritten.
+        document_digest: a lock document's own digest, of its canonical
+            JSON without the `digest` key; a valid lock's `digest` is it.
         Revision, Environment, PromoteRequest: a predictor's revisions and
             the environments that serve them.
         ContextImportRef, ContextVersion, context_version: a live context's
@@ -124,6 +126,7 @@ from generalforecast.models.catalog import (
     resource_name,
 )
 from generalforecast.models.catalog import parse as parse_model
+from generalforecast.predictors.lock import lock_digest as document_digest
 from generalforecast.predictors.lock import upgrade as upgrade_lock
 from generalforecast.predictors.models import CatalogResolver, ModelPin
 from generalforecast.predictors.runtime import CONTEXT_ROWS_KEY, PredictorExecutor
@@ -290,6 +293,7 @@ __all__ = [
     "compile_lock",
     "configuration",
     "context_version",
+    "document_digest",
     "entries",
     "failure",
     "fields",

@@ -801,3 +801,70 @@ def test_a_text_covariate_is_refused_by_name(tmp_path):
             horizon=2,
             inputs={"past": ["weather"]},
         )
+
+
+def test_a_forecaster_refuses_splits_it_cannot_predict_and_names_why(tmp_path):
+    forecast: dict[str, Any] = {
+        "model": FORECASTER,
+        "target": "units",
+        "time": "date",
+        "series": ["store"],
+        "horizon": 2,
+    }
+
+    def refused(rows: pa.Table, **manifest: Any) -> InvalidInput:
+        with pytest.raises(InvalidInput) as caught:
+            directory(tmp_path / "f", rows, **{**forecast, **manifest})
+        return caught.value
+
+    # An until that holds out the horizon passes; one that holds out more does not.
+    directory(tmp_path / "ok", sales(), split={"until": "2025-01-11"}, **forecast)
+    error = refused(sales(), split={"until": "2025-01-09"})
+    assert "holds out 4 query rows, not the 2 steps of `horizon`" in error.message
+    assert error.param == "context.until"
+    assert (
+        "random draw" in refused(sales(), split={"holdout": {"fraction": 0.2}}).message
+    )
+    assert refused(sales(), selection={"core": 4}).message == (
+        "`selection` is for tabular models"
+    )
+    assert "`related: []`" in refused(sales(), related=[]).message
+    gap = sales().set_column(
+        2, "units", pa.array([None if i == 4 else float(i) for i in range(24)])
+    )
+    assert refused(gap).message == (
+        "series north has a blank target at 2025-01-05, inside its history"
+    )
+    nameless = sales().set_column(0, "store", pa.array(["north"] * 23 + [None]))
+    assert refused(nameless).message == "series column `store` has missing values"
+    periods = sales().set_column(1, "date", pa.array(list(range(12)) * 2))
+    assert (
+        "holds numbers, not dates"
+        in refused(periods, split={"until": "2025-01-11"}).message
+    )
+
+
+def test_a_series_of_one_time_follows_the_others_step(tmp_path):
+    from generalforecast.predictors import frequency
+
+    day = datetime.date(2025, 1, 1)
+    times = {
+        ("a",): [day + datetime.timedelta(days=d) for d in range(5)],
+        ("b",): [day],
+    }
+    assert frequency.infer(times) == "1d"
+    with pytest.raises(frequency.FrequencyError):
+        frequency.infer({("b",): [day]})
+
+
+def test_a_zoned_origin_steps_through_utc():
+    from zoneinfo import ZoneInfo
+
+    from generalforecast.predictors import frequency
+
+    origin = datetime.datetime(2024, 3, 10, 1, tzinfo=ZoneInfo("America/Los_Angeles"))
+    stepped = frequency.grid(origin, 2, "1h")
+    assert [frequency.instant(t) - frequency.instant(origin) for t in stepped] == [
+        3600.0,
+        7200.0,
+    ]

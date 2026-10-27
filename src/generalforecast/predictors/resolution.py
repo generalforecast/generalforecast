@@ -269,7 +269,10 @@ def resolve(
     quantiles: tuple[float, ...] = ()
     if task == "forecast":
         if frame is not None:
+            _forecast_rows(spec, frame, queries)
             frequency = _frequency(spec, frame, inferred)
+            if queries is not None and queries.num_rows:
+                _forecast_queries(spec, frame, queries, frequency)
         elif frequency is None:
             raise spec.error(
                 f"a {spec.context.kind} context has no rows to infer `frequency` from",
@@ -678,23 +681,130 @@ def _target(
     return kind, None
 
 
+def _series_times(spec: PredictorSpec, table: pa.Table) -> dict[tuple, list[Any]]:
+    assert spec.time is not None
+    times: dict[tuple, list[Any]] = {}
+    for row in table.select([*spec.series, spec.time]).to_pylist():
+        times.setdefault(tuple(row[c] for c in spec.series), []).append(row[spec.time])
+    return times
+
+
+def _label(key: tuple) -> str:
+    return "series " + ", ".join(map(str, key)) if key else "the series"
+
+
+def _forecast_rows(spec: PredictorSpec, frame: pa.Table, queries: Any) -> None:
+    """A forecaster's rows as it can read them: whole series keys, queries after the history.
+
+    A snapshot's query rows (blank targets, or the rows `until` holds out)
+    are each series' future; one inside a series' history is a gap in it.
+    """
+    for table in (frame, queries):
+        if table is None:
+            continue
+        for column in spec.series:
+            if table[column].null_count:
+                raise spec.error(
+                    f"series column `{column}` has missing values",
+                    param="series",
+                    hint="give every row its series, or drop the rows without one",
+                )
+    if queries is None or not queries.num_rows:
+        return
+    from generalforecast.predictors import frequency
+
+    history = {
+        key: max(map(frequency.instant, times))
+        for key, times in _series_times(spec, frame).items()
+        if None not in times
+    }
+    for key, times in _series_times(spec, queries).items():
+        last = history.get(key)
+        early = [t for t in times if last is not None and t is not None and frequency.instant(t) <= last]
+        if early:
+            shown = early[0].isoformat() if hasattr(early[0], "isoformat") else early[0]
+            raise spec.error(
+                f"{_label(key)} has a blank target at {shown}, inside its history",
+                param="target",
+                because="a forecaster's queries are the steps after each series' last value",
+                hint="fill in the target, or drop the row",
+            )
+
+
+def _forecast_queries(
+    spec: PredictorSpec, frame: pa.Table, queries: pa.Table, cadence: Any
+) -> None:
+    """Each queried series holds out exactly its next `horizon` steps, as predict and eval read them."""
+    from generalforecast.predictors import frequency
+
+    assert spec.horizon is not None
+    width = frequency.step(cadence)
+    history = {
+        key: max(frequency.coordinate(t, cadence) for t in times)
+        for key, times in _series_times(spec, frame).items()
+    }
+    for key, times in _series_times(spec, queries).items():
+        rule = (
+            f"`until: {spec.context.until}` holds out"
+            if spec.context.until is not None
+            else "it has"
+        )
+        if len(times) != spec.horizon:
+            raise spec.error(
+                f"{_label(key)}: {rule} {len(times)} query rows, "
+                f"not the {spec.horizon} steps of `horizon`",
+                param="context.until" if spec.context.until is not None else "horizon",
+                because="a forecaster predicts each series' next `horizon` steps",
+                hint="set `until` so each series holds out exactly `horizon` rows"
+                if spec.context.until is not None
+                else "give each series `horizon` future rows, or change `horizon`",
+            )
+        origin = history.get(key)
+        steps = sorted(
+            (frequency.coordinate(t, cadence) - origin) / width
+            for t in times
+            if origin is not None
+        )
+        if steps != [float(index) for index in range(1, spec.horizon + 1)]:
+            raise spec.error(
+                f"{_label(key)}: the query rows are not its next "
+                f"{spec.horizon} steps",
+                param="time",
+                because=f"they must follow its last value, one `{cadence}` apart",
+                hint="give each series the rows right after its history",
+            )
+
+
 def _frequency(
     spec: PredictorSpec, frame: pa.Table, inferred: dict[str, str]
 ) -> str | int | float:
     """The context's frequency by the one rule, `frequency.infer` or `frequency.check`."""
     from generalforecast.predictors import frequency
 
-    assert spec.time is not None
-    times: dict[tuple, list] = {}
-    for row in frame.select([*spec.series, spec.time]).to_pylist():
-        key = tuple(row[column] for column in spec.series)
-        times.setdefault(key, []).append(row[spec.time])
+    times = _series_times(spec, frame)
     try:
         if spec.frequency is not None:
             frequency.check(times, spec.frequency)
             return spec.frequency
         found = frequency.infer(times)
     except frequency.FrequencyError as error:
+        kind = frame[spec.time].type
+        zone = kind.tz if pa.types.is_timestamp(kind) else None
+        if error.code in ("AmbiguousFrequency", "FrequencyMismatch") and zone not in (
+            None,
+            "UTC",
+            "+00:00",
+            "Etc/UTC",
+        ):
+            # Daily or longer steps in a zone with daylight saving are an hour
+            # off in UTC twice a year; gf reads every time in UTC.
+            raise spec.error(
+                error.message,
+                param="time",
+                because=f"{spec.time} is in {zone}, whose days are 23 or 25 hours "
+                "long across daylight saving, and times are read in UTC",
+                hint="store daily or longer steps as dates, or as UTC times",
+            ) from None
         raise spec.error(
             error.message,
             param="frequency" if error.code != "DuplicateTime" else "time",
