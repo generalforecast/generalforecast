@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import atexit
 import json
 import os
 import shutil
@@ -13,7 +12,6 @@ import signal
 import socket
 import subprocess
 import sys
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -46,18 +44,20 @@ STOP_SECONDS = 60.0
 
 
 def _session_cache() -> Path:
-    """This process's cache directory for the servers it starts, removed at exit.
+    """This process's cache directory for the servers it starts.
 
     A worker compiles every program the servers before it recorded as it
     starts, and records live in the cache directory. Shared with every run
     on the machine, they grow with every shape any test ever asked for, and
     each start compiles them all; a directory of this session's own keeps a
-    start to what its tests asked for.
+    start to what its tests asked for. It is made as `gf serve` makes its
+    own, so it goes once this process exits, even when it is killed.
     """
     global _CACHE
     if _CACHE is None:
-        _CACHE = Path(tempfile.mkdtemp(prefix="gf-test-cache-"))
-        atexit.register(shutil.rmtree, _CACHE, ignore_errors=True)
+        from generalforecast.serve.listener import private_directory
+
+        _CACHE, _ = private_directory()
     return _CACHE
 
 
