@@ -357,3 +357,30 @@ def test_a_context_fit_with_its_queries_keeps_the_state_a_fit_alone_would(
     # a fit of it alone would, whichever came first.
     for kept, fit in zip(jax.tree.leaves(fused), jax.tree.leaves(alone), strict=True):
         assert np.asarray(kept).tobytes() == np.asarray(fit).tobytes()
+
+
+def test_a_worker_whose_server_is_gone_exits_quietly():
+    """Ctrl-C can stop gf-server while a restarted worker is still loading."""
+    import os
+    import subprocess
+    import sys
+    import tempfile
+
+    # A socket path short enough for AF_UNIX, as tests/serve/test_shutdown.py makes.
+    with tempfile.TemporaryDirectory(prefix="gfsock") as short:
+        gone = os.path.join(short, "gone.sock")
+        finished = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "generalforecast.worker_process",
+                "--socket",
+                gone,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+    assert finished.returncode == 0, finished.stderr
+    assert "Traceback" not in finished.stderr, finished.stderr

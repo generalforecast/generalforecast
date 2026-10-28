@@ -96,7 +96,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
         worker.add_model(names[name], *registry.load_engine_model(spec), spec=spec)
 
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    connection.connect(options.socket)
+    try:
+        connection.connect(options.socket)
+    except (ConnectionRefusedError, FileNotFoundError):
+        # The server stopped while this worker loaded, as when Ctrl-C lands
+        # during a restart: nothing waits for it, so it leaves as quietly as
+        # a worker whose server disconnects.
+        return 0
     ready = protocol.Ready(
         protocol=protocol.PROTOCOL_VERSION,
         models=list(names),

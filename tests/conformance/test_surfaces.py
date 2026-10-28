@@ -50,7 +50,10 @@ TINY = {
     "general-forecast/timestral-28m": "tests/timestral-catalog-forecaster",
     "general-forecast/chronos-2": "tests/chronos2-catalog-forecaster",
 }
-RELATIVE, ABSOLUTE = 1e-5, 1e-6
+# Paths may batch the same queries in different shapes, which reorders
+# float32 sums: a few units in the last place of values in the single digits,
+# as these tables' are, never a different prediction.
+RELATIVE, ABSOLUTE = 1e-5, 1e-5
 
 Outcome = tuple[str, Any]
 
