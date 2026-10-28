@@ -360,7 +360,7 @@ def test_forecast_error_has_because():
         f"{FORECASTER} forecasts series, and gf.yaml\ndeclares no `time` column"
     )
     assert str(caught.value).startswith(
-        "error: predictor sales has no cadence\n  because:"
+        "error[ValidationError]: predictor sales has no cadence\nnote:"
     )
 
 

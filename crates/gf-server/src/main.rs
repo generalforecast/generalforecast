@@ -39,7 +39,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 #[derive(Parser)]
-#[command(about = "Serve tabular foundation models over Arrow Flight; started by `gf serve` and `gf admin node`")]
+#[command(
+    about = "Serve tabular foundation models over Arrow Flight; started by `gf serve` and `gf admin node`"
+)]
 struct Arguments {
     #[command(subcommand)]
     command: Subcommand,
@@ -103,12 +105,23 @@ struct Status {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> std::process::ExitCode {
+    // A failure is one diagnostic on stderr, as gf writes its own.
+    match command().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            gf_core::diagnostics::Diagnostic::error(error.to_string()).report();
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn command() -> Result<(), Box<dyn Error>> {
     match Arguments::parse().command {
         Subcommand::Run { config, parent_fd } => {
             // An fd that cannot be watched is a usage error, as clap's own are.
             let parent = gf_server::parent::named(parent_fd).unwrap_or_else(|error| {
-                eprintln!("gf-server: {error}");
+                gf_core::diagnostics::Diagnostic::error(error.to_string()).report();
                 std::process::exit(2);
             });
             run(&config, parent).await
@@ -697,12 +710,14 @@ async fn listen_http(
         } => {
             let key = std::env::var(env).ok().filter(|key| !key.is_empty());
             if key.is_none() && !address.ip().is_loopback() {
-                eprintln!(
-                    "gf serve: warning: listening on {}:{} without an API key; anyone who can \
-                     reach this address can run inference. Set {env} to require a bearer key.",
+                gf_core::diagnostics::Diagnostic::warning(format!(
+                    "listening on {}:{} without an API key; anyone who can reach this \
+                     address can run inference",
                     address.ip(),
                     address.port()
-                );
+                ))
+                .help(format!("set {env} to require a bearer key"))
+                .report();
             }
             Box::new(Static::scoped(
                 key.as_deref(),

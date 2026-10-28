@@ -1033,6 +1033,7 @@ def present(
             hint = _unauthorized_hint(error)
         out.error(
             redact(str(getattr(error, "message", error))),
+            code=getattr(error, "code", None),
             hint=None if tip else hint,
             because=None if pointer is not None else because,
             tip=tip,

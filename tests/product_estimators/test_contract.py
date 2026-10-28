@@ -319,8 +319,8 @@ def test_download_false_names_the_pull_command_when_not_cached(monkeypatch):
     with pytest.raises(NotFound) as caught:
         Classifier(download=False)
     assert str(caught.value) == (
-        "error: model general-forecast/tabicl-v2-classifier is not cached\n"
-        "  hint: run `gf model pull general-forecast/tabicl-v2-classifier`, "
+        "error[NotFound]: model general-forecast/tabicl-v2-classifier is not cached\n"
+        "help: run `gf model pull general-forecast/tabicl-v2-classifier`, "
         "or pass download=True"
     )
 

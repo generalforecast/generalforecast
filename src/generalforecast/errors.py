@@ -173,13 +173,6 @@ def printable(message: str) -> str:
     ).strip()
 
 
-def _wrap(label: str, text: str) -> str:
-    head = f"  {label}: "
-    pad = " " * len(head)
-    lines = text.splitlines() or [""]
-    return head + ("\n" + pad).join(lines)
-
-
 # The optional wire fields of an error object, in the order they are sent.
 _DETAILS = ("param", "hint", "limit", "actual")
 
@@ -238,7 +231,9 @@ class Error(Exception):
         elif len(args) == 1:
             message = args[0]
         elif args:
-            raise TypeError("Error takes a message, a code and a message, and a status")
+            raise TypeError(
+                "an Error takes a message; a code and a message; or those and a status"
+            )
         self.code = (
             type(self).code
             if code is None
@@ -292,15 +287,29 @@ class Error(Exception):
         return {"error": self.error()}
 
     def __str__(self) -> str:
-        """The CLI's plain shape, without colour: error, because, hint, request id."""
-        lines = [f"error: {self.message}"]
-        if self.because:
-            lines.append(_wrap("because", self.because))
-        if self.hint:
-            lines.append(_wrap("hint", self.hint))
-        if self.request_id:
-            lines.append(f"  request {self.request_id}")
-        return "\n".join(lines)
+        """The diagnostic's plain shape, as `generalforecast.diagnostics` writes it.
+
+        `error[Code]: message`, then where it points, a `note:` for why and
+        for the request id, and a `help:` for what to do instead.
+        """
+        from generalforecast.diagnostics import lines
+
+        location = None
+        if self.path and self.line and self.column:
+            location = f"{self.path}:{self.line}:{self.column}"
+        return "\n".join(
+            lines(
+                "error",
+                self.message,
+                code=self.code,
+                location=location,
+                notes=[
+                    self.because or "",
+                    f"request {self.request_id}" if self.request_id else "",
+                ],
+                help=self.hint,
+            )
+        )
 
     def to_dict(self) -> dict[str, Any]:
         """The `--json` error object, with the error's own code."""

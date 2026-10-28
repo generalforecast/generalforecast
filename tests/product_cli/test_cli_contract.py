@@ -38,7 +38,7 @@ def test_flags_are_never_abbreviated(monkeypatch):
     code, stdout, stderr = gf("model", "list", "--js", monkeypatch=monkeypatch)
     assert code == 2 and not stdout
     assert stderr == (
-        "error: unexpected argument '--js'\n  tip: a similar argument exists: '--json'\n"
+        "error[UsageError]: unexpected argument '--js'\nhelp: a similar argument exists: '--json'\n"
     )
 
 
@@ -143,7 +143,9 @@ def test_ctrl_c_exits_130_with_an_interrupted_error(monkeypatch):
         }
     }
     code, _, stderr = gf("model", "list", monkeypatch=monkeypatch)
-    assert code == cli.INTERRUPTED_EXIT and stderr == "\nerror: interrupted\n"
+    assert (
+        code == cli.INTERRUPTED_EXIT and stderr == "\nerror[Interrupted]: interrupted\n"
+    )
 
 
 def test_ctrl_c_at_a_question_is_an_interruption_not_a_declined_one(monkeypatch):
@@ -233,8 +235,8 @@ def test_folded_service_errors_read_by_code_and_reason(
         envelope["message"],
     )
     _, _, stderr = gf("model", "list", monkeypatch=monkeypatch)
-    assert stderr.startswith(f"error: {envelope['message']}\n")
-    assert (f"  hint: {hint}\n" in stderr) == (hint is not None)
+    assert stderr.startswith(f"error[{body['code']}]: {envelope['message']}\n")
+    assert (f"help: {hint}\n" in stderr) == (hint is not None)
 
 
 def test_not_logged_in_is_one_error_everywhere(monkeypatch, tmp_path):
@@ -298,7 +300,7 @@ def test_a_declined_or_unanswered_question_says_so(monkeypatch):
     assert code == cli.ABORTED_EXIT
     assert stderr == (
         "Delete churn and its environments? [y/N] "
-        "error: cancelled; nothing was changed\n"
+        "error[Aborted]: cancelled; nothing was changed\n"
     )
 
 
@@ -342,7 +344,9 @@ def test_admin_actions_bind_name_and_file_and_confirm_what_they_destroy(
     code, _, stderr = gf(
         "admin", "secret", "rotate", "db", "--file", str(body), monkeypatch=monkeypatch
     )
-    assert code == 1 and stderr.startswith("error: the file's `name` is not `db`")
+    assert code == 1 and stderr.startswith(
+        "error[ValidationError]: the file's `name` is not `db`"
+    )
     code, _, stderr = gf("admin", "key", "create", monkeypatch=monkeypatch)
     assert code == 2 and "--file <FILE>" in stderr
     code, _, _ = gf("admin", "audit", "list", "--limit", "5", monkeypatch=monkeypatch)
@@ -381,7 +385,9 @@ def test_predict_on_a_catalog_model_takes_its_flags(monkeypatch, tmp_path, recor
     code, _, stderr = gf(
         "predict", TABICL, "--queries", "rows.csv", monkeypatch=monkeypatch
     )
-    assert code == 1 and stderr.startswith("error: a catalog model needs a target\n")
+    assert code == 1 and stderr.startswith(
+        "error[ValidationError]: a catalog model needs a target\n"
+    )
     code, _, stderr = gf(
         "predict",
         TABICL,
@@ -454,7 +460,7 @@ def test_a_bare_name_is_hosted_and_a_path_is_local_everywhere(
         monkeypatch=monkeypatch,
     )
     assert code == 1 and stderr.startswith(
-        "error: --env does not apply to a local predictor\n"
+        "error[ValidationError]: --env does not apply to a local predictor\n"
     )
     from generalforecast.predictor_commands import is_local
 
@@ -482,7 +488,7 @@ def test_predict_checks_its_output_before_scoring(monkeypatch, tmp_path, recorde
     )
     assert code == 1 and not recorder.made
     assert stderr == (
-        "error: cannot write `nodir/out.csv`: directory `nodir` does not exist\n"
+        "error[NotFound]: cannot write `nodir/out.csv`: directory `nodir` does not exist\n"
     )
     code, _, stderr = gf(
         "predict",
@@ -552,7 +558,7 @@ def test_typed_answers_are_checked_before_they_are_used(monkeypatch, tmp_path):
     )
     assert code == 1
     assert stderr.endswith(
-        "error: horizon must be a whole number of steps\n  hint: pass '--horizon'\n"
+        "error[ValidationError]: horizon must be a whole number of steps\nhelp: pass '--horizon'\n"
     )
 
 
@@ -671,8 +677,8 @@ def test_an_unknown_admin_noun_is_called_a_noun(monkeypatch):
     code, _, stderr = gf("admin", "keys", monkeypatch=monkeypatch)
     assert code == 2
     assert stderr == (
-        "error: unknown noun `keys` for `gf admin`\n"
-        "  tip: a similar noun exists: 'key'\n"
+        "error[UsageError]: unknown noun `keys` for `gf admin`\n"
+        "help: a similar noun exists: 'key'\n"
     )
 
 
@@ -690,7 +696,9 @@ def test_audit_pages_are_checked_before_the_request(monkeypatch):
     code, _, stderr = gf(
         "admin", "audit", "list", "--limit", "500", monkeypatch=monkeypatch
     )
-    assert code == 1 and stderr.startswith("error: --limit must be from 1 to 100")
+    assert code == 1 and stderr.startswith(
+        "error[ValidationError]: --limit must be from 1 to 100"
+    )
     assert not client.calls
 
 
@@ -709,7 +717,9 @@ def test_node_models_are_named_before_gf_server_runs(monkeypatch, tmp_path):
         monkeypatch=monkeypatch,
     )
     assert code == 1
-    assert stderr.startswith("error: --model takes NAME=MODEL, not `bad`\n")
+    assert stderr.startswith(
+        "error[ValidationError]: --model takes NAME=MODEL, not `bad`\n"
+    )
 
 
 def test_eval_reads_a_relative_directory_as_local(monkeypatch, tmp_path, recorder):
@@ -831,15 +841,15 @@ def test_a_port_out_of_range_is_a_usage_error(monkeypatch):
     code, _, stderr = gf("serve", "--port", "99999", monkeypatch=monkeypatch)
     assert code == 2
     assert stderr.startswith(
-        "error: invalid value '99999' for '--port': expected a port from 0 to 65535\n"
+        "error[UsageError]: invalid value '99999' for '--port': expected a port from 0 to 65535\n"
     )
 
 
 def test_serving_an_unknown_model_names_the_catalog_as_the_cli_does(monkeypatch):
     code, _, stderr = gf("serve", "nosuch-model", monkeypatch=monkeypatch)
     assert code == 1 and stderr == (
-        "error: model `nosuch-model` is not in the catalog\n"
-        "  hint: run `gf model list` to see the catalog\n"
+        "error[NotFound]: model `nosuch-model` is not in the catalog\n"
+        "help: run `gf model list` to see the catalog\n"
     )
 
 

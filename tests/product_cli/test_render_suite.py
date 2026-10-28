@@ -59,8 +59,8 @@ def test_init_transcript(suite):
     assert lines(suite, "init-yes")[-1] == " Initialized predictor churn in ./gf.yaml"
     assert "Queries      a random 0.2 of the rows" in lines(suite, "init-flags")
     assert lines(suite, "init-exists") == [
-        "error: gf.yaml already exists in ./churn",
-        "  hint: pass --force to overwrite it, or run `gf check` to validate it",
+        "error[ValidationError]: gf.yaml already exists in ./churn",
+        "help: pass --force to overwrite it, or run `gf check` to validate it",
     ]
 
 
@@ -81,58 +81,58 @@ def test_check(suite):
         "    Resolved churn  classification, 3 inputs, 1,840 context rows, 212 query rows"
     )
     assert lines(suite, "check-locked")[-3:] == [
-        "error: gf.lock would change",
-        "  because: 2 changes are listed above",
-        "  hint: run `gf check` without --locked to write them",
+        "error[ValidationError]: gf.lock would change",
+        "note: 2 changes are listed above",
+        "help: run `gf check` without --locked to write them",
     ]
 
 
 def test_error_shapes(suite):
     assert lines(suite, "check-typo") == [
-        "error: target column `churned` is not in the context",
+        "error[ValidationError]: target column `churned` is not in the context",
         "  --> gf.yaml:3:9",
         "   |",
         " 3 | target: churned",
         "   |         ^^^^^^^ context.csv has customer_id, spend, plan, churn",
-        "  hint: did you mean `churn`?",
+        "help: did you mean `churn`?",
     ]
     assert lines(suite, "check-cadence") == [
-        "error: predictor sales has no cadence",
-        "  because: general-forecast/chronos-2 forecasts series, and gf.yaml",
-        "           declares no `time` column",
-        "  hint: add `time: date` and `frequency: 1d`, or pick a tabular model",
-        "        with `gf model list --task classification`",
+        "error[ValidationError]: predictor sales has no cadence",
+        "note: general-forecast/chronos-2 forecasts series, and gf.yaml",
+        "      declares no `time` column",
+        "help: add `time: date` and `frequency: 1d`, or pick a tabular model",
+        "      with `gf model list --task classification`",
     ]
     assert lines(suite, "predict-capacity") == [
-        "error: queries exceed the limit for general-forecast/tabicl-v2-classifier",
-        "  because: this model accepts 100 queries per call; the request sent 1,000",
-        "  hint: split the queries, or push a predictor and call it in batches",
-        "  request r-3abb2401f119428db148927c6a0d358c",
+        "error[CapacityExceeded]: queries exceed the limit for general-forecast/tabicl-v2-classifier",
+        "note: this model accepts 100 queries per call; the request sent 1,000",
+        "note: request r-3abb2401f119428db148927c6a0d358c",
+        "help: split the queries, or push a predictor and call it in batches",
     ]
     assert (
         lines(suite, "check-bare")[0]
-        == "error: `tabicl-classifier` is not a catalog model id; "
+        == "error[ValidationError]: `tabicl-classifier` is not a catalog model id; "
         "use general-forecast/tabicl-v2-classifier"
     )
     assert not any(line.startswith("  hint:") for line in lines(suite, "check-bare"))
     assert lines(suite, "model-bare") == [
         (
-            "error: `tabicl-classifier` is not a catalog model id; "
+            "error[ValidationError]: `tabicl-classifier` is not a catalog model id; "
             "use general-forecast/tabicl-v2-classifier"
         ),
     ]
     assert lines(suite, "error-unknown-command") == [
-        "error: unknown command `chekc`",
-        "  tip: a similar command exists: 'check'",
+        "error[UsageError]: unknown command `chekc`",
+        "help: a similar command exists: 'check'",
     ]
     assert lines(suite, "error-unknown-argument") == [
-        "error: unexpected argument '--contxt'",
-        "  tip: a similar argument exists: '--context'",
+        "error[UsageError]: unexpected argument '--contxt'",
+        "help: a similar argument exists: '--context'",
     ]
     assert lines(suite, "error-internal") == [
         "    Resolved churn  classification, 1,840 context rows, 212 query rows",
-        "error: internal error",
-        "  hint: run again with -v",
+        "error[Internal]: internal error",
+        "help: run again with -v",
     ]
     assert "Traceback (most recent call last):" in suite["error-internal-verbose"]
     assert "Traceback" not in suite["error-internal"]

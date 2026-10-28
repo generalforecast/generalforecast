@@ -77,8 +77,8 @@ def test_errors_render_the_cli_shapes_without_colour() -> None:
         hint="pass --force to overwrite it, or run `gf check` to validate it",
     )
     assert str(one) == (
-        "error: gf.yaml already exists in ./churn\n"
-        "  hint: pass --force to overwrite it, or run `gf check` to validate it"
+        "error[ValidationError]: gf.yaml already exists in ./churn\n"
+        "help: pass --force to overwrite it, or run `gf check` to validate it"
     )
     three = gf.CapacityExceeded(
         f"queries exceed the limit for {MODEL}",
@@ -89,10 +89,10 @@ def test_errors_render_the_cli_shapes_without_colour() -> None:
         request_id="r-3abb2401f119428db148927c6a0d358c",
     )
     assert str(three) == (
-        f"error: queries exceed the limit for {MODEL}\n"
-        "  because: this model accepts 100 queries per call; the request sent 1,000\n"
-        "  hint: split the queries, or push a predictor and call it in batches\n"
-        "  request r-3abb2401f119428db148927c6a0d358c"
+        f"error[CapacityExceeded]: queries exceed the limit for {MODEL}\n"
+        "note: this model accepts 100 queries per call; the request sent 1,000\n"
+        "note: request r-3abb2401f119428db148927c6a0d358c\n"
+        "help: split the queries, or push a predictor and call it in batches"
     )
     assert three.code == "CapacityExceeded"
     assert three.to_dict() == {
@@ -109,8 +109,8 @@ def test_errors_render_the_cli_shapes_without_colour() -> None:
         "no `time` column so there is nothing to step along",
     )
     lines = str(long).splitlines()
-    assert lines[1].startswith("  because: ")
-    assert all(line.startswith(" " * len("  because: ")) for line in lines[2:])
+    assert lines[1].startswith("note: ")
+    assert all(line.startswith(" " * len("note: ")) for line in lines[2:])
 
 
 def test_server_error_objects_map_to_the_classes() -> None:
@@ -159,7 +159,7 @@ def test_bare_model_names_are_rejected_with_the_canonical_hint() -> None:
         with pytest.raises(gf.InvalidInput) as caught:
             gf.Predictor(bare, target="churned", context=CONTEXT).predict(CONTEXT)
         assert str(caught.value) == (
-            f"error: `{bare}` is not a catalog model id; use {MODEL}"
+            f"error[ValidationError]: `{bare}` is not a catalog model id; use {MODEL}"
         )
     with pytest.raises(gf.NotFound):
         gf.Predictor("general-forecast/no-such-model", target="churned")
@@ -182,8 +182,8 @@ def test_references_resolve_by_the_contract_rule(tmp_path: Path, monkeypatch) ->
     with pytest.raises(gf.AmbiguousReference) as caught:
         resolve_reference("churn")
     assert str(caught.value) == (
-        "error: `churn` is both a directory with gf.yaml and a hosted predictor name\n"
-        "  hint: pass ./churn for the local predictor, or env= for the hosted one"
+        "error[AmbiguousReference]: `churn` is both a directory with gf.yaml and a hosted predictor name\n"
+        "help: pass ./churn for the local predictor, or env= for the hosted one"
     )
     with pytest.raises(gf.NotFound):
         resolve_reference("./missing")
@@ -217,7 +217,7 @@ def test_requests_name_columns_and_classes_in_their_errors() -> None:
             model=MODEL, target="churn", context=CONTEXT, queries=CONTEXT
         )
     assert str(caught.value) == (
-        "error: target column `churn` is not in the context\n  hint: did you mean `churned`?"
+        "error[ValidationError]: target column `churn` is not in the context\nhelp: did you mean `churned`?"
     )
     assert caught.value.param == "target"
     with pytest.raises(gf.InvalidInput) as caught:
@@ -229,8 +229,8 @@ def test_requests_name_columns_and_classes_in_their_errors() -> None:
             inputs=["spend", "age"],
         )
     assert str(caught.value) == (
-        "error: input column `age` is not in the context\n"
-        "  hint: the context has customer_id, spend, plan, churned"
+        "error[ValidationError]: input column `age` is not in the context\n"
+        "help: the context has customer_id, spend, plan, churned"
     )
     assert caught.value.param == "inputs.age"
     request = PredictRequest.build(
@@ -270,9 +270,9 @@ def test_requests_name_columns_and_classes_in_their_errors() -> None:
             id="customer_id",
         )
     assert str(caught.value) == (
-        f"error: queries exceed the limit for {MODEL}\n"
-        "  because: this model accepts 100 queries per call; the request sent 101\n"
-        "  hint: split the queries, or push a predictor and call it in batches"
+        f"error[CapacityExceeded]: queries exceed the limit for {MODEL}\n"
+        "note: this model accepts 100 queries per call; the request sent 101\n"
+        "help: split the queries, or push a predictor and call it in batches"
     )
     assert (caught.value.limit, caught.value.actual) == (100, 101)
     with pytest.raises(gf.InvalidInput) as caught:
@@ -622,8 +622,8 @@ def test_first_download_prints_one_line_with_the_cache_path(
     with pytest.raises(gf.NotFound) as caught:
         gf.Classifier(download=False)
     assert str(caught.value) == (
-        f"error: model {MODEL} is not cached\n"
-        f"  hint: run `gf model pull {MODEL}`, or pass download=True"
+        f"error[NotFound]: model {MODEL} is not cached\n"
+        f"help: run `gf model pull {MODEL}`, or pass download=True"
     )
 
 

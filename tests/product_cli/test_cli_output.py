@@ -108,7 +108,9 @@ def test_retired_flags_and_commands_are_gone(monkeypatch):
         ("predict", "--queries", "q.csv", "--features", "a"),
     ):
         code, _, stderr = gf(*argv, monkeypatch=monkeypatch)
-        assert code == 2 and stderr.startswith("error: unexpected argument '--")
+        assert code == 2 and stderr.startswith(
+            "error[UsageError]: unexpected argument '--"
+        )
     code, stdout, stderr = gf(
         "--json", "admin", "membership", "list", monkeypatch=monkeypatch
     )
@@ -138,11 +140,11 @@ def test_typos_get_a_tip(monkeypatch):
     assert code == 2
     assert (
         stderr
-        == "error: unknown command `chekc`\n  tip: a similar command exists: 'check'\n"
+        == "error[UsageError]: unknown command `chekc`\nhelp: a similar command exists: 'check'\n"
     )
     code, _, stderr = gf("init", "--contxt", "x", monkeypatch=monkeypatch)
     assert stderr == (
-        "error: unexpected argument '--contxt'\n  tip: a similar argument exists: '--context'\n"
+        "error[UsageError]: unexpected argument '--contxt'\nhelp: a similar argument exists: '--context'\n"
     )
 
 
@@ -150,9 +152,9 @@ def test_required_arguments_align_under_the_label(monkeypatch):
     code, _, stderr = gf("predict", monkeypatch=monkeypatch)
     assert code == 2
     assert stderr == (
-        "error: the following required arguments were not provided:\n"
-        "       --queries <FILE>\n"
-        "  hint: run 'gf predict --help' for usage\n"
+        "error[UsageError]: the following required arguments were not provided:\n"
+        "                   --queries <FILE>\n"
+        "help: run 'gf predict --help' for usage\n"
     )
 
 
@@ -162,7 +164,7 @@ def test_exclusive_flags(monkeypatch):
     )
     assert code == 2
     assert stderr.startswith(
-        "error: the argument '--holdout' cannot be used with '--until'"
+        "error[UsageError]: the argument '--holdout' cannot be used with '--until'"
     )
 
 
@@ -200,7 +202,7 @@ def test_bare_model_names_are_rejected_with_the_canonical_hint(monkeypatch):
     )
     assert code == 1
     assert stderr == (
-        "error: `tabicl-v2-classifier` is not a catalog model id; "
+        "error[ValidationError]: `tabicl-v2-classifier` is not a catalog model id; "
         "use general-forecast/tabicl-v2-classifier\n"
     )
 
@@ -212,10 +214,10 @@ def test_internal_errors_never_show_a_traceback_without_verbose(monkeypatch):
     monkeypatch.setattr("generalforecast.commands.execute", boom)
     code, stdout, stderr = gf("model", "list", monkeypatch=monkeypatch)
     assert code == 1 and not stdout
-    assert stderr == "error: internal error\n  hint: run again with -v\n"
+    assert stderr == "error[Internal]: internal error\nhelp: run again with -v\n"
     code, _, stderr = gf("-v", "model", "list", monkeypatch=monkeypatch)
     assert "RuntimeError: secret internals" in stderr
-    assert stderr.endswith("error: internal error\n  hint: run again with -v\n")
+    assert stderr.endswith("error[Internal]: internal error\nhelp: run again with -v\n")
 
 
 def test_status_verbs_are_right_aligned_in_twelve_columns():
@@ -257,10 +259,12 @@ def test_error_shapes():
     out = term.Output(out=io.StringIO(), err=err, environ={"NO_COLOR": "1"})
     out.error(
         "gf.yaml already exists in ./churn",
+        code="ValidationError",
         hint="pass --force to overwrite it, or run `gf check` to validate it",
     )
     out.error(
         "target column `churned` is not in the context",
+        code="ValidationError",
         pointer=term.Pointer(
             "gf.yaml",
             3,
@@ -273,23 +277,24 @@ def test_error_shapes():
     )
     out.error(
         "queries exceed the limit for general-forecast/tabicl-v2-classifier",
+        code="CapacityExceeded",
         because="this model accepts 100 queries per call; the request sent 1,000",
         hint="split the queries, or push a predictor and call it in batches",
         request_id="r-3abb2401f119428db148927c6a0d358c",
     )
     assert err.getvalue() == (
-        "error: gf.yaml already exists in ./churn\n"
-        "  hint: pass --force to overwrite it, or run `gf check` to validate it\n"
-        "error: target column `churned` is not in the context\n"
+        "error[ValidationError]: gf.yaml already exists in ./churn\n"
+        "help: pass --force to overwrite it, or run `gf check` to validate it\n"
+        "error[ValidationError]: target column `churned` is not in the context\n"
         "  --> gf.yaml:3:9\n"
         "   |\n"
         " 3 | target: churned\n"
         "   |         ^^^^^^^ context.csv has customer_id, spend, plan, churn\n"
-        "  hint: did you mean `churn`?\n"
-        "error: queries exceed the limit for general-forecast/tabicl-v2-classifier\n"
-        "  because: this model accepts 100 queries per call; the request sent 1,000\n"
-        "  hint: split the queries, or push a predictor and call it in batches\n"
-        "  request r-3abb2401f119428db148927c6a0d358c\n"
+        "help: did you mean `churn`?\n"
+        "error[CapacityExceeded]: queries exceed the limit for general-forecast/tabicl-v2-classifier\n"
+        "note: this model accepts 100 queries per call; the request sent 1,000\n"
+        "note: request r-3abb2401f119428db148927c6a0d358c\n"
+        "help: split the queries, or push a predictor and call it in batches\n"
     )
 
 
@@ -305,8 +310,8 @@ def test_colour_follows_the_terminal_and_no_color():
     text = err.getvalue()
     assert "\x1b[1;32m      Locked\x1b[0m gf.lock" in text
     assert "\x1b[1;31merror:\x1b[0m x" in text
-    assert "\x1b[1mhint:\x1b[0m y" in text
-    assert "\x1b[2m  request r-1\x1b[0m" in text
+    assert "\x1b[1mhelp:\x1b[0m y" in text
+    assert "\x1b[1mnote:\x1b[0m request r-1" in text
 
 
 def test_help_and_version_do_not_import_the_sdk():
@@ -386,9 +391,9 @@ def test_init_until_without_a_time_column_names_the_flag(monkeypatch, tmp_path):
     )
     assert code == 1
     assert stderr.endswith(
-        "error: --until needs a time column\n"
-        "  because: rows.csv has no timestamp column to compare dates against\n"
-        "  hint: pass --holdout FRACTION for a random split\n"
+        "error[ValidationError]: --until needs a time column\n"
+        "note: rows.csv has no timestamp column to compare dates against\n"
+        "help: pass --holdout FRACTION for a random split\n"
     )
 
 
@@ -501,7 +506,10 @@ def test_wine_init_check_eval_end_to_end(monkeypatch, tmp_path):
     assert "178 context rows, 0 query rows" in stderr
     code, _, stderr = gf("eval", str(root), monkeypatch=monkeypatch)
     assert code == 1
-    assert "\nerror: predictor wine has no query rows to score\n" in stderr
+    assert (
+        "\nerror[ValidationError]: predictor wine has no query rows to score\n"
+        in stderr
+    )
     assert "`gf eval --queries FILE`" in stderr
 
 
@@ -515,8 +523,8 @@ def test_permission_denied_says_what_to_do(monkeypatch):
     code, stdout, stderr = gf("model", "list", monkeypatch=monkeypatch)
     assert code == 1 and not stdout
     assert stderr == (
-        "error: permission denied for this scope\n"
-        "  hint: run `gf login` again, or use a key that has this permission\n"
+        "error[Unauthorized]: permission denied for this scope\n"
+        "help: run `gf login` again, or use a key that has this permission\n"
     )
 
 

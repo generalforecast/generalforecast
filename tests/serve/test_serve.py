@@ -310,12 +310,13 @@ def test_public_bind_without_a_key_warns():
         warning = process.stderr.readline()
         while "warning" not in warning:
             warning = process.stderr.readline()
-        assert warning.strip().endswith(
-            "anyone who can reach this address can run inference. "
-            "Set GF_API_KEY to require a bearer key."
+        assert warning == (
+            f"warning: listening on 0.0.0.0:{port} without an API key; anyone who "
+            "can reach this address can run inference\n"
         )
-        assert warning.startswith(
-            f"gf serve: warning: listening on 0.0.0.0:{port} without an API key"
+        assert (
+            process.stderr.readline()
+            == "help: set GF_API_KEY to require a bearer key\n"
         )
     finally:
         processes.stop(process, sent=signal.SIGKILL)

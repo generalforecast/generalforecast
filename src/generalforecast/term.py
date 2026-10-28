@@ -293,46 +293,52 @@ class Output:
         if not self.quiet:
             self._write(f"{label.ljust(LABEL_WIDTH)}{value}", self.err)
 
-    def _labelled(self, label: str, text: str, *styles: str) -> None:
-        head = self.style(f"{label}:", *styles)
-        indent = " " * (2 + len(label) + 2)
-        lines = text.split("\n")
-        self._write(f"  {head} {lines[0]}", self.err)
-        for rest in lines[1:]:
-            self._write(f"{indent}{rest}", self.err)
+    def _diagnostic(self, lines: list[str]) -> None:
+        for line in lines:
+            self._write(line, self.err)
+
+    def _styled(self, text: str, kind: str) -> str:
+        """A diagnostic label in its colour: errors red, warnings yellow, the rest bold."""
+        if kind == "error":
+            return self.style(text, "bold", "red")
+        if kind == "warning":
+            return self.style(text, "bold", "yellow")
+        if kind == "location":
+            return self.quiet_text(text)
+        return self.style(text, "bold")
 
     def error(
         self,
         message: str,
         *,
+        code: str | None = None,
         hint: str | None = None,
         because: str | None = None,
         tip: str | None = None,
         pointer: Pointer | None = None,
         request_id: str | None = None,
     ) -> None:
-        """An error in one of the three shapes.
+        """An error as cargo writes one (`generalforecast.diagnostics`).
 
-        Shape one is `error:` plus `hint:`. Shape two adds a `-->` pointer into a
-        file between them. Shape three adds a `because:` line before the hint.
-        `tip:` names a near-miss on a flag or a name. The request id, when there
-        is one, is the last line.
+        `error[Code]: message`; a `-->` pointer into a file, with its source
+        line and carets; a `note:` for why and for the request id; a `help:`
+        for what to do instead, and one naming a near miss.
         """
-        head = self.style("error:", "bold", "red")
-        lines = message.split("\n")
-        self._write(f"{head} {lines[0]}", self.err)
-        for rest in lines[1:]:
-            self._write(f"       {rest}", self.err)
+        from generalforecast.diagnostics import lines
+
+        written = lines("error", message, code=code, style=self._styled)
+        self._diagnostic(written)
         if pointer is not None:
             self.pointer(pointer)
-        if because:
-            self._labelled("because", because, "bold")
-        if hint:
-            self._labelled("hint", hint, "bold")
-        if tip:
-            self._labelled("tip", tip, "bold")
-        if request_id:
-            self._write(self.quiet_text(f"  request {request_id}"), self.err)
+        self._diagnostic(
+            lines(
+                "error",
+                "",
+                notes=[because or "", f"request {request_id}" if request_id else ""],
+                help=[hint or "", tip or ""],
+                style=self._styled,
+            )[1:]
+        )
 
     def pointer(self, where: Pointer) -> None:
         """The `-->` block: location, a bar, the source line and a caret line."""
@@ -352,14 +358,18 @@ class Output:
         lead = " " * visible(where.source[: max(where.column - 1, 0)])
         self._write(f"{gutter} {quiet('|')} {lead}{carets}{label}", self.err)
 
-    def warning(self, text: str) -> None:
-        """A `warning:` line, dropped under `-q`."""
+    def warning(self, text: str, *, help: str | None = None) -> None:
+        """A `warning:` diagnostic, dropped under `-q`."""
+        from generalforecast.diagnostics import lines
+
         if not self.quiet:
-            self._write(f"{self.style('warning:', 'bold', 'yellow')} {text}", self.err)
+            self._diagnostic(lines("warning", text, help=help, style=self._styled))
 
     def hint(self, text: str) -> None:
-        """A `hint:` line on its own."""
-        self._labelled("hint", text, "bold")
+        """A `help:` line on its own."""
+        from generalforecast.diagnostics import lines
+
+        self._diagnostic(lines("error", "", help=text, style=self._styled)[1:])
 
     def table(
         self,

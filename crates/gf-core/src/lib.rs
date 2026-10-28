@@ -14,6 +14,7 @@ pub mod categories;
 pub mod civil;
 pub mod columns;
 pub mod context;
+pub mod diagnostics;
 mod distance;
 pub mod forecasting;
 pub mod node;

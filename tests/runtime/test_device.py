@@ -391,7 +391,7 @@ def test_report_fallback_warns_once_about_a_visible_gpu(cpu_backend, tmp_path):
     )
     assert (
         lines[1]
-        == '  hint: install the cuda extra to use it: pip install "generalforecast[cuda]"'
+        == 'help: install the cuda extra to use it: pip install "generalforecast[cuda]"'
     )
     assert not report_fallback(err, devices=[str(gpu)])
     assert len(err.getvalue().splitlines()) == 2
@@ -456,7 +456,7 @@ def test_report_fallback_gives_the_cuda_failure_as_the_hint(cpu_backend, tmp_pat
     err = io.StringIO()
     assert report_fallback(err, devices=[str(gpu)])
     assert err.getvalue().splitlines()[1] == (
-        "  hint: CUDA failed to start. CUDA backend failed to initialize: no device."
+        "help: CUDA failed to start. CUDA backend failed to initialize: no device."
     )
 
 
@@ -483,7 +483,7 @@ def test_report_fallback_reports_a_cuda_failure_on_a_chosen_platform(
     err = io.StringIO()
     assert report_fallback(err, devices=[str(gpu)])
     assert err.getvalue().splitlines()[1] == (
-        "  hint: CUDA failed to start. CUDA backend failed to initialize: no device."
+        "help: CUDA failed to start. CUDA backend failed to initialize: no device."
     )
 
 
@@ -497,6 +497,6 @@ def test_report_fallback_reports_a_cuda_failure_without_a_device_file(
     assert report_fallback(err, devices=[str(tmp_path / "nvidia0")])
     assert err.getvalue().splitlines() == [
         "warning: CUDA failed to start, so generalforecast runs on the CPU",
-        "  hint: CUDA backend failed to initialize: no device.",
+        "help: CUDA backend failed to initialize: no device.",
     ]
     assert not report_fallback(err, devices=[str(tmp_path / "nvidia0")])

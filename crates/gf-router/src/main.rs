@@ -33,7 +33,9 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerT
 const CHECK_SECONDS: f64 = 5.0;
 
 #[derive(Parser)]
-#[command(about = "Route clients to the generalforecast nodes that serve their tables; started by `gf admin router`")]
+#[command(
+    about = "Route clients to the generalforecast nodes that serve their tables; started by `gf admin router`"
+)]
 struct Arguments {
     #[command(subcommand)]
     command: Subcommand,
@@ -189,12 +191,23 @@ async fn reload(router: Router, path: PathBuf, mut running: Config) {
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> std::process::ExitCode {
+    // A failure is one diagnostic on stderr, as gf writes its own.
+    match command().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(error) => {
+            gf_core::diagnostics::Diagnostic::error(error.to_string()).report();
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn command() -> Result<(), Box<dyn Error>> {
     match Arguments::parse().command {
         Subcommand::Run { config, parent_fd } => {
             // An fd that cannot be watched is a usage error, as clap's own are.
             let parent = gf_server::parent::named(parent_fd).unwrap_or_else(|error| {
-                eprintln!("gf-router: {error}");
+                gf_core::diagnostics::Diagnostic::error(error.to_string()).report();
                 std::process::exit(2);
             });
             run(config, parent).await

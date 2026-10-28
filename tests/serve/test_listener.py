@@ -96,7 +96,7 @@ def test_a_failure_before_the_server_starts_removes_its_directory(
     predictor = tmp_path / "unlocked"
     predictor.mkdir()
     code, _, stderr = gf("serve", str(predictor), monkeypatch=monkeypatch)
-    assert code == 1 and stderr == f"error: no predictor at {predictor}\n"
+    assert code == 1 and stderr == f"error[NotFound]: no predictor at {predictor}\n"
     assert made and not made[0].exists()
 
 
@@ -174,7 +174,9 @@ def test_node_init_writes_through_gf_server_and_names_the_next_steps(
     code, _, stderr = gf(
         "admin", "node", "init", "--path", str(config), monkeypatch=monkeypatch
     )
-    assert code == 1 and stderr.startswith(f"error: `{config}` already exists")
+    assert code == 1 and stderr.startswith(
+        f"error[ValidationError]: `{config}` already exists"
+    )
 
 
 def test_router_check_reports_and_fails_with_the_routers_words(monkeypatch, tmp_path):
@@ -228,7 +230,9 @@ def test_serving_a_node_or_router_becomes_its_server(monkeypatch, tmp_path):
     code, _, stderr = gf(
         "admin", "node", "serve", "--config", str(config), monkeypatch=monkeypatch
     )
-    assert code == 1 and stderr.startswith(f"error: no configuration at `{config}`")
+    assert code == 1 and stderr.startswith(
+        f"error[NotFound]: no configuration at `{config}`"
+    )
     config.write_text("")
     gf(
         "admin",
@@ -431,3 +435,29 @@ def test_a_server_is_found_only_under_gf(monkeypatch, tmp_path):
     staged.unlink()
     with pytest.raises(Exception, match="servers are missing"):
         listener.binary()
+
+
+@pytest.mark.server
+def test_the_servers_write_cargo_shaped_diagnostics(tmp_path):
+    from tests.utils import processes
+    from tests.utils.server import build, build_router
+
+    for binary in (build(), build_router()):
+        # A usage error, as clap reports one, and a runtime error.
+        usage = processes.start(
+            [str(binary), "run", "--no-such-flag"], stderr=subprocess.PIPE, text=True
+        )
+        _, stderr = usage.communicate(timeout=60)
+        assert usage.returncode == 2
+        assert stderr.startswith("error: unexpected argument '--no-such-flag'"), stderr
+        missing = processes.start(
+            [str(binary), "check", "--config", str(tmp_path / "absent.toml")],
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        _, stderr = missing.communicate(timeout=60)
+        assert missing.returncode == 1
+        first, *rest = stderr.splitlines()
+        assert first.startswith("error: "), stderr
+        assert not first.endswith("."), stderr
+        assert all(line.startswith(("note: ", "help: ", " ")) for line in rest), stderr
