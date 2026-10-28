@@ -181,8 +181,8 @@ jobs:
           key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
 
   # The tests marked slow that start no server, which compile the tiny
-  # models, in five parts. Three workers a runner: each local client's cache
-  # tiers take a share of the runner's memory, and four ran it out.
+  # models, in five parts. Three workers a runner, as each holds a few GB;
+  # a test that runs ten minutes prints every thread's stack.
   slow:
     needs: changes
     if: needs.changes.outputs.python == 'true'
@@ -213,7 +213,7 @@ jobs:
           restore-keys: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-
       - run: >-
           uv run pytest -m "slow and not server and not router" -n 3
-          --shard ${{ matrix.part }}/5
+          --shard ${{ matrix.part }}/5 -o faulthandler_timeout=600
       # Saved from runs outside pull requests, so those cannot crowd out main's.
       - if: always() && github.event_name != 'pull_request'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -254,7 +254,7 @@ jobs:
           restore-keys: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-
       - run: >-
           uv run pytest -m "(server or router) and slow" -n auto
-          --shard ${{ matrix.part }}/4
+          --shard ${{ matrix.part }}/4 -o faulthandler_timeout=600
       # Saved from runs outside pull requests, so those cannot crowd out main's.
       - if: always() && github.event_name != 'pull_request'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

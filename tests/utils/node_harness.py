@@ -71,6 +71,10 @@ from generalforecast.runtime.device import DeviceSettings, default_settings
 from generalforecast.worker import Worker, WorkerStats, check_summary
 from tests.utils.driver import Driver
 
+# The most a test client's device tier takes by default, and its host tier
+# as much again: a runner's test workers each make many clients.
+TEST_TIER = 256 << 20
+
 TabularModel = tuple[TabularFunctions, Any]
 
 
@@ -502,8 +506,8 @@ class LocalClient:
 
         Args:
             device_bytes: Device memory for encoded contexts; a quarter of the
-                device's by default, at most 4 GiB, since a local client
-                shares its machine with the programs around it.
+                device's by default, as a local client takes, at most
+                `TEST_TIER`.
             host_bytes: Host memory for contexts evicted from the device; as
                 much as the device tier by default.
             slot_bytes: Granularity of cache memory.
@@ -547,7 +551,9 @@ class LocalClient:
             settings = default_settings()
         budget = MemoryBudget.measure(local=True)
         if device_bytes is None:
-            device_bytes = budget.device_tier
+            # A test process makes many clients, whose tables fill a few
+            # megabytes, so its tiers are smaller than a local client's.
+            device_bytes = min(budget.device_tier, TEST_TIER)
         if host_bytes is None:
             host_bytes = device_bytes
         self._temporary: Path | None = None
