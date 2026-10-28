@@ -76,22 +76,6 @@ fn adhoc_payload() -> Value {
     })
 }
 
-#[allow(dead_code)]
-fn infer_payload() -> Value {
-    json!({
-        "model": "tabicl-classifier",
-        "task": "classification",
-        "target": "y",
-        "features": ["x"],
-        "context": [
-            {"key": "c1", "features": {"x": 0.0}, "label": false},
-            {"key": "c2", "features": {"x": 3.0}, "label": true},
-        ],
-        "queries": [{"key": "q", "features": {"x": 1.5}}],
-        "options": {},
-    })
-}
-
 async fn call(
     front: &Arc<Front>,
     method: &str,
@@ -369,8 +353,18 @@ async fn ambiguous_and_oversized_bodies_are_refused() {
         .header("content-length", 2_000_000)
         .body(Body::empty())
         .unwrap();
-    let response = router(front).oneshot(request).await.unwrap();
+    let response = router(front.clone()).oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    // A body that states no length is refused before it is read.
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("host", "127.0.0.1:8000")
+        .header("content-type", "application/json")
+        .body(Body::from(envelope("ad-hoc", &adhoc_payload()).to_string()))
+        .unwrap();
+    let response = router(front).oneshot(request).await.unwrap();
+    assert_eq!(response.status().as_u16(), 411);
 }
 
 #[tokio::test]
@@ -1994,20 +1988,6 @@ async fn an_introspection_its_callers_left_still_ends_and_answers_the_next_one()
     let principal = keys.verify(Some("Bearer left")).await.unwrap();
     assert_eq!(principal.project.as_deref(), Some("team-a"));
     assert_eq!(asked.load(Ordering::SeqCst), 1, "its answer was cached");
-}
-
-#[tokio::test]
-async fn a_body_that_states_no_length_is_refused_before_it_is_read() {
-    let front = front(Box::new(Static::new(None)), true).await;
-    let request = Request::builder()
-        .method("POST")
-        .uri("/v1/projects/local/predict")
-        .header("host", "127.0.0.1:8000")
-        .header("content-type", "application/json")
-        .body(Body::from(envelope("ad-hoc", &adhoc_payload()).to_string()))
-        .unwrap();
-    let response = router(front).oneshot(request).await.unwrap();
-    assert_eq!(response.status().as_u16(), 411);
 }
 
 #[tokio::test]

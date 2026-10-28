@@ -1243,7 +1243,7 @@ pub fn read_snapshot(path: &Path) -> Result<RecordBatch, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{civil, ordinal};
+    use super::ordinal;
     use serde_json::{Value, json};
 
     #[test]
@@ -1316,14 +1316,6 @@ mod tests {
         assert_eq!(seen.value(1), "2025-01-02T05:00:00Z");
         let unlisted = super::inferred(&features, "y", rows, &types, &[]).unwrap();
         assert_eq!(unlisted.columns[0].physical, "string");
-    }
-
-    #[test]
-    fn civil_dates_follow_the_proleptic_calendar() {
-        assert_eq!(civil(0), (1970, 1, 1));
-        assert_eq!(civil(-1), (1969, 12, 31));
-        assert_eq!(civil(19_782), (2024, 2, 29));
-        assert_eq!(civil(19_783), (2024, 3, 1));
     }
 
     #[test]

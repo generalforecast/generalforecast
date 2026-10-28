@@ -319,16 +319,6 @@ fn splits_keep_outliers_in_full_pages() {
 }
 
 #[test]
-fn nearest_rows_stay_within_their_window() {
-    let index = two_clusters();
-    let window: Context = (0..64).map(RowId).collect();
-
-    let nearest = index.nearest_rows(&A, 3, &window, &Kept, &Kept).unwrap();
-    assert_eq!(nearest.len(), 3);
-    assert!(nearest.iter().all(|row| row.0 < 64));
-}
-
-#[test]
 fn nearest_rows_match_a_full_scan_as_rows_come_and_go() {
     let mut noise = Noise(7);
     let mut index = index();

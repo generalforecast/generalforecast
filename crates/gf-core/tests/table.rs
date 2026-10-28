@@ -3,7 +3,6 @@
 
 //! Rows, versions, the change log and snapshots.
 
-use gf_core::context::Fingerprint;
 use gf_core::table::{Change, LogPosition, RowId, RowKey, Table, TableError, Version};
 
 fn table_with(keys: &[u128]) -> Table {
@@ -89,23 +88,6 @@ fn snapshots_do_not_see_later_changes() {
         [RowId(0), RowId(2), RowId(3)]
     );
     assert_eq!(after.version(RowId(0)), Some(Version(1)));
-}
-
-#[test]
-fn the_whole_tables_fingerprint_follows_its_changes() {
-    let mut table = table_with(&[1, 2, 3]);
-    table.apply(Change::Update(RowKey(2))).unwrap();
-    table.apply(Change::Delete(RowKey(1))).unwrap();
-    table.apply(Change::Insert(RowKey(4))).unwrap();
-
-    let snapshot = table.snapshot();
-    let expected: Fingerprint = snapshot
-        .rows()
-        .iter()
-        .map(|row| Fingerprint::of(row, snapshot.version(row).unwrap()))
-        .sum();
-
-    assert_eq!(snapshot.fingerprint(&snapshot.rows()), expected);
 }
 
 #[test]

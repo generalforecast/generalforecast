@@ -71,20 +71,10 @@ fn each_table_reports_its_own_series() {
 }
 
 #[test]
-fn worker_stages_report_their_calls_and_seconds() {
+fn worker_stages_report_their_calls_seconds_and_flops_and_workers_their_compile_cache() {
     let metrics = Metrics::default();
     metrics.stage("decode").calls.add(3);
     metrics.stage("decode").seconds.add(0.5);
-
-    let text = metrics.render();
-
-    assert!(text.contains("gf_worker_stage_calls_total{stage=\"decode\"} 3\n"));
-    assert!(text.contains("gf_worker_stage_seconds_total{stage=\"decode\"} 0.5\n"));
-}
-
-#[test]
-fn worker_stages_report_their_flops_and_workers_their_compile_cache() {
-    let metrics = Metrics::default();
     metrics.stage("decode").flops.add(1.5e18);
     metrics.stage("decode").flops.add(1.5e18);
     metrics.stage("decode").flops.add(-1.0);
@@ -93,6 +83,8 @@ fn worker_stages_report_their_flops_and_workers_their_compile_cache() {
 
     let text = metrics.render();
 
+    assert!(text.contains("gf_worker_stage_calls_total{stage=\"decode\"} 3\n"));
+    assert!(text.contains("gf_worker_stage_seconds_total{stage=\"decode\"} 0.5\n"));
     assert!(text.contains("# TYPE gf_worker_stage_flops_total counter\n"));
     assert!(text.contains("gf_worker_stage_flops_total{stage=\"decode\"} 3000000000000000000\n"));
     assert!(text.contains("gf_worker_compile_cache_hits_total 4\n"));

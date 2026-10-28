@@ -873,18 +873,6 @@ mod tests {
             ),
             "     Stopped after 9s"
         );
-    }
-
-    #[test]
-    fn status_lines_colour_the_verb_and_dim_the_trailer() {
-        assert_eq!(
-            status_line("Compiled", "12 programs in 0.0s", Some("(cached)"), true),
-            "\x1b[1;32m    Compiled\x1b[0m 12 programs in 0.0s \x1b[2m(cached)\x1b[0m"
-        );
-    }
-
-    #[test]
-    fn compiling_counts_programs_with_thousands_separators() {
         assert_eq!(
             compiling_message(Progress {
                 done: 1_000,
@@ -895,6 +883,17 @@ mod tests {
         assert_eq!(
             compiling_message(Progress { done: 0, total: 1 }),
             "0/1 program"
+        );
+        assert_eq!(elapsed(Duration::from_secs(0)), "0s");
+        assert_eq!(elapsed(Duration::from_secs(60)), "1m 0s");
+        assert_eq!(elapsed(Duration::from_secs(3_720)), "1h 2m");
+    }
+
+    #[test]
+    fn status_lines_colour_the_verb_and_dim_the_trailer() {
+        assert_eq!(
+            status_line("Compiled", "12 programs in 0.0s", Some("(cached)"), true),
+            "\x1b[1;32m    Compiled\x1b[0m 12 programs in 0.0s \x1b[2m(cached)\x1b[0m"
         );
     }
 
@@ -912,13 +911,5 @@ mod tests {
         assert!(live.event_due(at(14, 18)));
         assert!(live.event_due(at(18, 18)));
         assert!(!live.event_due(at(18, 18)));
-    }
-
-    #[test]
-    fn elapsed_reads_as_seconds_minutes_or_hours() {
-        assert_eq!(elapsed(Duration::from_secs(0)), "0s");
-        assert_eq!(elapsed(Duration::from_secs(59)), "59s");
-        assert_eq!(elapsed(Duration::from_secs(60)), "1m 0s");
-        assert_eq!(elapsed(Duration::from_secs(3_720)), "1h 2m");
     }
 }

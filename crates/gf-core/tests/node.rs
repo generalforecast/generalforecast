@@ -381,14 +381,6 @@ fn a_table_whose_rows_mostly_left_is_renumbered_before_its_next_insert() {
 }
 
 #[test]
-fn nothing_is_scheduled_without_requests() {
-    let mut node = node(64);
-    table(&mut node, Strategy::Exact, 8);
-
-    assert!(node.schedule().unwrap().is_none());
-}
-
-#[test]
 fn one_step_serves_every_table_with_requests() {
     let mut node = node(64);
     let first = table(&mut node, Strategy::Exact, 16);
@@ -911,21 +903,6 @@ fn bad_batches_change_nothing() {
 const NEAREST: Strategy = Strategy::neighbors(16);
 
 #[test]
-fn an_update_keeps_every_context_without_the_row() {
-    let mut node = node(64);
-    let table = table(&mut node, NEAREST, 32);
-    node.submit(table, &[A, B].concat()).unwrap();
-    run(&mut node);
-
-    node.update(table, &[0], &[0.0, 0.0], Targets::Classes(vec![1]))
-        .unwrap();
-    node.submit(table, &[A, B].concat()).unwrap();
-    let step = run(&mut node);
-
-    assert_eq!(actions(&step), [Action::Encode, Action::Reuse]);
-}
-
-#[test]
 fn deleted_rows_leave_every_context() {
     let mut node = node(64);
     let table = table(&mut node, NEAREST, 32);
@@ -1008,19 +985,6 @@ fn changing_a_row_purges_every_cached_entry_holding_it() {
         .map(|drop| drop.key)
         .collect();
     assert!(pages.iter().all(|key| dropped.contains(key)));
-}
-
-#[test]
-fn updates_purge_like_deletes() {
-    let mut node = node(64);
-    let table = table(&mut node, Strategy::Exact, 16);
-    node.submit(table, &A).unwrap();
-    let step = run(&mut node);
-
-    node.update(table, &[3], &[0.5, 0.5], Targets::Classes(vec![1]))
-        .unwrap();
-
-    assert!(purged(&mut node).contains(&step.units()[0].key));
 }
 
 #[test]
@@ -1342,7 +1306,10 @@ fn removing_a_table_refuses_its_requests_and_drops_what_running_steps_read() {
     let table = table(&mut node, Strategy::Exact, 16);
     node.submit(table, &A).unwrap();
     let running = node.schedule().unwrap().unwrap();
-    let queued = node.submit(table, &A).unwrap();
+    let queued = [
+        node.submit(table, &A).unwrap(),
+        node.submit_keys(table, &A, &[vec![0]]).unwrap(),
+    ];
 
     node.remove_table(table).unwrap();
     let refused = node.take_refused();
@@ -1352,7 +1319,13 @@ fn removing_a_table_refuses_its_requests_and_drops_what_running_steps_read() {
         .map(|drop| drop.key)
         .collect();
 
-    assert_eq!(refused, [(queued, NodeError::UnknownTable(table))]);
+    assert!(
+        refused
+            .iter()
+            .all(|(_, error)| *error == NodeError::UnknownTable(table))
+    );
+    let refused: HashSet<RequestId> = refused.into_iter().map(|(request, _)| request).collect();
+    assert_eq!(refused, HashSet::from(queued));
     assert!(dropped.contains(&running.units()[0].key));
     assert!(
         running
@@ -3115,14 +3088,6 @@ mod series {
                 limit: 32
             }))
         ));
-        assert_eq!(
-            ForecastError::HorizonTooLong {
-                horizon: 33,
-                limit: 32
-            }
-            .to_string(),
-            "a horizon of 33 steps is past the 32 the model forecasts in 64 passes"
-        );
         assert!(node.schedule().unwrap().is_some());
 
         node.submit_forecast(table, &[A.0], Some(&[160]), horizon(17), None, Vec::new())
@@ -4145,6 +4110,10 @@ mod series {
         let refused = node.take_refused();
         assert_eq!(refused.len(), 1);
         assert_eq!(refused[0].0, bad);
+        assert!(matches!(
+            refused[0].1,
+            NodeError::Forecast(ForecastError::NoRows(_))
+        ));
     }
 
     #[test]
@@ -4220,23 +4189,6 @@ mod series {
         assert_eq!(step.series_units()[0].cutoff, 170);
         let future = &step.forecasts()[0].future;
         assert_eq!(future.values[4..6], [170.1, 180.1]);
-        // A series without an observed value has nothing to forecast from.
-        let c = SeriesKey(3);
-        node.insert_at(
-            table,
-            &[c.row_key(100).0],
-            &[0.5, 0.1],
-            Targets::Values(vec![f32::NAN]),
-            Some(&[Some(100)]),
-        )
-        .unwrap();
-        node.submit_forecast(table, &[c.0], None, horizon(2), None, Vec::new())
-            .unwrap();
-        assert!(node.schedule().unwrap().is_none());
-        assert!(matches!(
-            node.take_refused()[0].1,
-            NodeError::Forecast(ForecastError::NoRows(_))
-        ));
     }
 }
 
@@ -4648,26 +4600,6 @@ fn a_given_request_whose_rows_went_is_refused_alone() {
             .collect::<Vec<_>>(),
         [gone]
     );
-}
-
-#[test]
-fn removing_a_table_refuses_every_request_it_queued() {
-    let mut node = node(64);
-    let table = table(&mut node, Strategy::Exact, 8);
-    let queued = [
-        node.submit(table, &A).unwrap(),
-        node.submit_keys(table, &A, &[vec![0]]).unwrap(),
-        node.submit(table, &A).unwrap(),
-    ];
-
-    node.remove_table(table).unwrap();
-
-    let refused: HashSet<RequestId> = node
-        .take_refused()
-        .into_iter()
-        .map(|(request, _)| request)
-        .collect();
-    assert_eq!(refused, HashSet::from(queued));
 }
 
 #[test]

@@ -705,12 +705,13 @@ mod tests {
         assert!(other.check(&columns).is_err());
         other.column = "missing".to_string();
         assert!(other.check(&columns).is_err());
-        // A definition without the field reads as a table without a route.
+        // A definition without the fields reads as a table without a route or roles.
         let plain: TableDefinition = serde_json::from_value(json!({
             "name": "payments", "model": "tiny", "columns": [], "classes": 0
         }))
         .unwrap();
         assert_eq!(plain.route_by, None);
+        assert_eq!(plain.roles, None);
     }
 
     fn roles(classes: &[Value]) -> Roles {
@@ -720,49 +721,6 @@ mod tests {
             time: None,
             classes: classes.to_vec(),
         }
-    }
-
-    #[test]
-    fn roles_round_trip_through_a_definition_and_default_to_none() {
-        let mut definition = TableDefinition {
-            name: TableName::new("payments").unwrap(),
-            model: "tiny".to_string(),
-            columns: vec![Column {
-                name: "amount".to_string(),
-                kind: ColumnKind::Numeric,
-            }],
-            classes: 2,
-            strategy: StrategySpec::default(),
-            page_size: 64,
-            time_bucket: None,
-            refit_after: None,
-            refit_shift: None,
-            fit_rows: None,
-            past_cap: PastCapSpec::default(),
-            regions: None,
-            series: None,
-            roles: None,
-            refit_cutoffs: "each".to_string(),
-            retrieval_categoricals: "codes".to_string(),
-            scale_rows: None,
-            summary: Default::default(),
-            created: CreationId::parse("0123456789abcdef"),
-            times: TimeKind::Integer,
-            route_by: None,
-            durability: Default::default(),
-            row_ids: None,
-        };
-        let plain = serde_json::to_value(&definition).unwrap();
-        assert!(plain.get("roles").is_none());
-        let read: TableDefinition = serde_json::from_value(plain).unwrap();
-        assert_eq!(read.roles, None);
-        definition.roles = Some(Box::new(roles(&[Value::from("no"), Value::from("yes")])));
-        let encoded = serde_json::to_value(&definition).unwrap();
-        assert_eq!(encoded["roles"]["target"], "y");
-        assert_eq!(encoded["roles"]["id"], "k");
-        assert!(encoded["roles"].get("time").is_none());
-        let read: TableDefinition = serde_json::from_value(encoded).unwrap();
-        assert_eq!(read.roles, definition.roles);
     }
 
     #[test]

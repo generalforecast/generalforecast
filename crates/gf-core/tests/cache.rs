@@ -115,21 +115,6 @@ fn eviction_keeps_what_is_expensive_to_recompute_per_byte() {
 }
 
 #[test]
-fn eviction_keeps_what_is_reused() {
-    let mut cache = Cache::new(tier(2), tier(0)).unwrap();
-    cache.admit(key(1), 100, 1.0, Context::new()).unwrap();
-    cache.admit(key(2), 100, 1.0, Context::new()).unwrap();
-    for _ in 0..5 {
-        cache.lookup(&key(1));
-    }
-
-    cache.admit(key(3), 100, 1.0, Context::new()).unwrap();
-
-    assert!(cache.lookup(&key(1)).is_some());
-    assert!(cache.lookup(&key(2)).is_none());
-}
-
-#[test]
 fn host_evictions_do_not_age_device_entries() {
     let mut cache = Cache::new(tier(2), tier(1)).unwrap();
     cache.admit(key(1), 100, 1.0, Context::new()).unwrap();

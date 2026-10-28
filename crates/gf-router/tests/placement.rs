@@ -16,19 +16,6 @@ fn tables() -> Vec<String> {
 }
 
 #[test]
-fn placement_is_deterministic_and_ranks_every_node() {
-    let placement = Placement::new(nodes(4));
-
-    let ranked = placement.ranked("payments");
-
-    assert_eq!(ranked, Placement::new(nodes(4)).ranked("payments"));
-    let mut sorted = ranked.clone();
-    sorted.sort_unstable();
-    assert_eq!(sorted, [0, 1, 2, 3]);
-    assert_eq!(placement.primary("payments"), ranked[0]);
-}
-
-#[test]
 fn tables_spread_evenly_across_nodes() {
     let placement = Placement::new(nodes(4));
     let mut counts = HashMap::new();
@@ -82,6 +69,7 @@ fn placement_never_changes_between_releases() {
     // Routers of different versions must agree on where every table lives.
     let placement = Placement::new(nodes(5));
     assert_eq!(placement.ranked("payments"), [1, 2, 3, 0, 4]);
+    assert_eq!(placement.primary("payments"), 1);
     assert_eq!(placement.ranked("table-7"), [1, 0, 2, 4, 3]);
     assert_eq!(placement.ranked("clinic"), [2, 1, 4, 3, 0]);
 }

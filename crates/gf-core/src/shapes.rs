@@ -30,13 +30,9 @@ mod tests {
     }
 
     #[test]
-    fn small_tables_take_the_minimum() {
+    fn tables_take_the_minimum_doubled_until_they_fit() {
         assert_eq!(bucket(0, 8), 8);
         assert_eq!(bucket(8, 8), 8);
-    }
-
-    #[test]
-    fn larger_tables_double_the_minimum_until_they_fit() {
         assert_eq!(bucket(9, 8), 16);
         assert_eq!(bucket(1000, 8), 1024);
         assert_eq!(bucket(7, 6), 12);

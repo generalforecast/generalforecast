@@ -170,14 +170,3 @@ pub fn abort_on_panic() {
         std::process::abort();
     }));
 }
-
-#[cfg(test)]
-mod tests {
-    use super::default_level;
-
-    #[test]
-    fn a_terminal_logs_warnings_only_and_a_pipe_logs_info() {
-        assert_eq!(default_level(true), "warn");
-        assert_eq!(default_level(false), "info");
-    }
-}

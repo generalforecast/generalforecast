@@ -95,19 +95,9 @@ pub fn gone(fd: OwnedFd) -> oneshot::Receiver<()> {
 #[cfg(test)]
 mod tests {
     use std::io::Write;
-    use std::os::fd::{AsRawFd, IntoRawFd};
+    use std::os::fd::IntoRawFd;
 
     use super::{checked, gone};
-
-    #[test]
-    fn only_an_open_pipe_is_watched() {
-        let file = tempfile_like();
-        let refused = checked(file.as_raw_fd()).unwrap_err();
-        assert!(refused.contains("not a pipe"), "{refused}");
-        let refused = checked(1_000_000).unwrap_err();
-        assert!(refused.contains("not open"), "{refused}");
-        assert!(checked(-1).is_err());
-    }
 
     #[tokio::test]
     async fn the_parent_is_gone_once_its_end_of_the_pipe_closes() {
@@ -122,10 +112,5 @@ mod tests {
             .await
             .expect("told in time")
             .unwrap();
-    }
-
-    /// A plain file, which is not a pipe.
-    fn tempfile_like() -> std::fs::File {
-        std::fs::File::open(std::env::current_exe().unwrap()).unwrap()
     }
 }

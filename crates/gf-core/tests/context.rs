@@ -47,17 +47,6 @@ fn fingerprints_ignore_the_order_rows_were_added() {
 }
 
 #[test]
-fn fingerprints_change_when_a_row_changes() {
-    let mut table = table(4);
-    let rows = context(&[0, 1, 3]);
-    let before = table.snapshot().fingerprint(&rows);
-
-    table.apply(Change::Update(RowKey(1))).unwrap();
-
-    assert_ne!(table.snapshot().fingerprint(&rows), before);
-}
-
-#[test]
 fn fingerprints_update_incrementally() {
     let mut table = table(4);
     let rows = context(&[0, 1, 3]);
@@ -68,6 +57,7 @@ fn fingerprints_update_incrementally() {
     // Swapping one row's old version for its new one gives the full recompute.
     let updated =
         before - Fingerprint::of(RowId(1), Version(0)) + Fingerprint::of(RowId(1), Version(1));
+    assert_ne!(updated, before);
     assert_eq!(updated, table.snapshot().fingerprint(&rows));
 }
 

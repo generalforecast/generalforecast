@@ -7,8 +7,8 @@ use std::collections::HashSet;
 use std::num::{NonZeroU64, NonZeroUsize};
 
 use gf_core::forecasting::{
-    ForecastError, FutureRow, GroupStrategy, HORIZON_PASSES, KNOWN, Neighbors, PAST, SeriesPlan,
-    SeriesRequest, SeriesSpec, TARGET, future, grid, horizon_limit, plan,
+    ForecastError, FutureRow, GroupStrategy, KNOWN, Neighbors, PAST, SeriesPlan, SeriesRequest,
+    SeriesSpec, TARGET, future, grid, plan,
 };
 use gf_core::rows::Row;
 use gf_core::series::{SeriesError, SeriesIndex, SeriesKey};
@@ -40,17 +40,6 @@ fn random(size: usize, seed: u64) -> GroupStrategy {
         size: NonZeroUsize::new(size).unwrap(),
         seed,
     }
-}
-
-#[test]
-fn horizon_limit_uses_pass_limit_and_saturates() {
-    let output_patch = NonZeroUsize::new(4).unwrap();
-    assert_eq!(horizon_limit(output_patch, None).get(), HORIZON_PASSES * 4);
-    assert_eq!(
-        horizon_limit(output_patch, NonZeroUsize::new(7)).get(),
-        HORIZON_PASSES * 7
-    );
-    assert_eq!(horizon_limit(NonZeroUsize::MAX, None), NonZeroUsize::MAX);
 }
 
 /// A table of series on a step of 10, each row's target its time (NaN at

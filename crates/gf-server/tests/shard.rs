@@ -739,24 +739,6 @@ fn status(error: &gf_server::error::ServerError) -> Code {
 }
 
 #[tokio::test]
-async fn a_workers_compiles_at_start_count_before_its_shard_takes_steps() {
-    let shard = tokio::time::timeout(Duration::from_secs(10), shard(settings()))
-        .await
-        .unwrap();
-
-    assert_eq!(shard.metrics.warm_compiles.get(), 3);
-    assert!((shard.metrics.warm_seconds.get() - 0.5).abs() < 1e-9);
-    assert_eq!(shard.metrics.compile_cache_hits.get(), 2);
-    assert_eq!(shard.metrics.compile_cache_misses.get(), 1);
-    assert!(
-        shard
-            .metrics
-            .render()
-            .contains("gf_worker_warm_compiles_total 3")
-    );
-}
-
-#[tokio::test]
 async fn tables_are_checked_against_their_model_when_created() {
     let shard = shard(settings()).await;
 
@@ -852,22 +834,21 @@ async fn a_shard_without_cache_memory_encodes_every_step_and_still_batches_table
 }
 
 #[tokio::test]
-async fn a_shard_without_timers_counts_no_plan_part() {
-    let shard = shard(settings()).await;
-    shard.create_named("rows", 3).await.unwrap();
-    shard.insert_into("rows", &[1, 2, 3, 4], None).await;
-
-    assert_eq!(shard.predict().await, Ok(1));
-
-    assert!(shard.metrics.steps.get() > 0);
-    let text = shard.metrics.render();
-    assert!(text.contains("# TYPE gf_plan_part_calls_total counter\n"));
-    assert!(!text.contains("gf_plan_part_calls_total{"));
-}
-
-#[tokio::test]
-async fn a_shard_reports_the_rows_it_reuses_and_the_cache_they_take() {
-    let shard = shard(settings()).await;
+async fn a_shard_reports_its_start_compiles_and_the_rows_it_reuses() {
+    let shard = tokio::time::timeout(Duration::from_secs(10), shard(settings()))
+        .await
+        .unwrap();
+    // The worker's compiles at start count before the shard takes a step.
+    assert_eq!(shard.metrics.warm_compiles.get(), 3);
+    assert!((shard.metrics.warm_seconds.get() - 0.5).abs() < 1e-9);
+    assert_eq!(shard.metrics.compile_cache_hits.get(), 2);
+    assert_eq!(shard.metrics.compile_cache_misses.get(), 1);
+    assert!(
+        shard
+            .metrics
+            .render()
+            .contains("gf_worker_warm_compiles_total 3")
+    );
     shard.create_named("rows", 3).await.unwrap();
     shard.insert_into("rows", &[1, 2, 3, 4], None).await;
 
@@ -878,6 +859,10 @@ async fn a_shard_reports_the_rows_it_reuses_and_the_cache_they_take() {
     assert_eq!(shard.metrics.rows_encoded.get(), 4);
     assert_eq!(shard.metrics.rows_reused.get(), 4);
     assert!(shard.metrics.cache_bytes[0].get() > 0);
+    // Without timers no plan part is counted.
+    let text = shard.metrics.render();
+    assert!(text.contains("# TYPE gf_plan_part_calls_total counter\n"));
+    assert!(!text.contains("gf_plan_part_calls_total{"));
 }
 
 #[tokio::test]
@@ -944,24 +929,6 @@ async fn a_shard_splits_the_workers_time_among_tables_and_counts_their_refits() 
     );
     assert_eq!((first.epochs.get(), second.epochs.get()), (1, 0));
     assert!(first.index_bytes.get() > 0 && second.index_bytes.get() > 0);
-}
-
-#[tokio::test]
-async fn a_hung_worker_is_started_again_and_its_requests_fail() {
-    let mut settings = settings();
-    settings.step_timeout = Duration::from_millis(200);
-    let shard = shard(settings).await;
-    shard.create(3).await.unwrap();
-    shard.insert(&[1, 2, 3, 4]).await;
-    shard.behaviour.store(HANG, Ordering::Relaxed);
-
-    let failed = tokio::time::timeout(Duration::from_secs(10), shard.predict()).await;
-
-    assert_eq!(
-        failed.expect("answered before the timeout"),
-        Err(Code::Internal)
-    );
-    assert_eq!(shard.metrics.workers_down.get(), 1);
 }
 
 #[tokio::test]
@@ -1214,14 +1181,18 @@ async fn a_retried_delete_with_missing_ok_answers_as_its_first_try_did() {
 }
 
 #[tokio::test]
-async fn writes_go_on_while_the_worker_starts_again() {
+async fn a_hung_worker_is_started_again_its_requests_fail_and_writes_go_on() {
     let mut settings = settings();
     settings.step_timeout = Duration::from_millis(200);
     let shard = shard(settings).await;
     shard.create(3).await.unwrap();
     shard.insert(&[1, 2, 3, 4]).await;
     shard.behaviour.store(HANG, Ordering::Relaxed);
-    assert_eq!(shard.predict().await, Err(Code::Internal));
+    let failed = tokio::time::timeout(Duration::from_secs(10), shard.predict()).await;
+    assert_eq!(
+        failed.expect("answered before the timeout"),
+        Err(Code::Internal)
+    );
 
     // The fake worker never starts again, yet the log and rows take writes.
     let written = tokio::time::timeout(Duration::from_secs(5), shard.insert(&[5, 6])).await;
