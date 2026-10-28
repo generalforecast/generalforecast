@@ -30,7 +30,15 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Two runners, two workers each: the model tests alone reach 8 GB at two
+  # workers, so four on one runner ran it out of memory.
   slow:
+    strategy:
+      fail-fast: false
+      matrix:
+        tests:
+          - tests/models
+          - --ignore=tests/models
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -43,7 +51,7 @@ jobs:
           version: "0.8.0"
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run pytest -m slow -n auto
+      - run: uv run pytest -m slow -n 2 ${{ matrix.tests }}
 
   # The reference parity tests run each model upstream and in
   # generalforecast on one table; they need the reference dependency group
