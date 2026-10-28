@@ -824,14 +824,14 @@ def test_iso_text_reads_as_gf_server_reads_it():
     """
     from pathlib import Path
 
-    from generalforecast.predictors.runtime.context import _timestamps
+    from generalforecast.iso import timestamps
 
     fixture = Path(__file__).resolve().parents[2] / "crates/gf-server/tests/fixtures"
     cases = json.loads((fixture / "iso_times.json").read_text())["cases"]
     assert cases
     for text, micros in cases:
         try:
-            read = _timestamps(pa.array([text])).cast(pa.int64())[0].as_py()
+            read = timestamps(pa.array([text])).cast(pa.int64())[0].as_py()
         except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
             read = None
         assert read == micros, text

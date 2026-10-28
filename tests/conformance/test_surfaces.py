@@ -17,7 +17,6 @@ import json
 import math
 import os
 import shutil
-import socket
 import subprocess
 import time
 import urllib.error
@@ -40,7 +39,7 @@ from generalforecast.service.boundary import Scope
 from generalforecast.service.contracts import ServiceError
 from generalforecast.tabular import arrow_bytes
 from tests.utils import processes
-from tests.utils.server import build
+from tests.utils.server import build, free_port
 
 ROOT = Path(__file__).resolve().parents[2]
 SCOPE = Scope("local", "r-conformance")
@@ -74,12 +73,6 @@ def engine() -> Iterator[None]:
     tiny.close()
 
 
-def _port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
 class Served:
     """gf-server as `gf serve` configures it, for one target, on the tiny models."""
 
@@ -92,7 +85,7 @@ class Served:
         with pytest.MonkeyPatch.context() as patch:
             patch.setattr(serve_models, "checkpoint", lambda *_, **__: None)
             model = serve_models.served(target, self.directory)
-        self.url = f"http://127.0.0.1:{_port()}"
+        self.url = f"http://127.0.0.1:{free_port()}"
         (self.directory / "models.json").write_text(json.dumps([model]))
         config = self.directory / "generalforecast.toml"
         config.write_text(

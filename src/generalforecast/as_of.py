@@ -22,7 +22,6 @@ from __future__ import annotations
 import datetime
 import decimal
 import math
-import re
 from typing import Any
 
 from generalforecast.service.contracts import InputError
@@ -31,12 +30,6 @@ from generalforecast.service.contracts import InputError
 PARAM = "as_of"
 # The latest instant accepted, in microseconds: the end of year 9999.
 _LAST = 253_402_300_799_999_999
-# An RFC 3339 date-time: date, separator, time to the second, an optional
-# fraction of one to nine digits, and an optional offset.
-_RFC3339 = re.compile(
-    r"(\d{4})-(\d{2})-(\d{2})[Tt ](\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?"
-    r"(?:([Zz])|([+-])(\d{2}):(\d{2}))?"
-)
 _EPOCH = datetime.datetime(1970, 1, 1, tzinfo=datetime.UTC)
 
 
@@ -62,30 +55,15 @@ def micros(value: Any) -> int | None:
         exact = decimal.Decimal(repr(value)) * 1_000_000
         return _checked(int(exact.to_integral_value(rounding=decimal.ROUND_FLOOR)))
     if isinstance(value, str):
-        match = _RFC3339.fullmatch(value)
-        if match is None:
+        from generalforecast.iso import instant
+
+        found = instant(value)
+        if found is None:
             raise _refused(
                 "as_of is an RFC 3339 time such as 2026-10-27T08:00:00Z, "
                 "or epoch seconds"
             )
-        year, month, day, hour, minute, second = map(int, match.groups()[:6])
-        fraction, _zulu, sign, offset_hours, offset_minutes = match.groups()[6:]
-        try:
-            moment = datetime.datetime(
-                year, month, day, hour, minute, second, tzinfo=datetime.UTC
-            )
-        except ValueError:
-            raise _refused(
-                "as_of names a date or time the calendar does not have"
-            ) from None
-        offset = 0
-        if sign is not None:
-            if int(offset_hours) >= 24 or int(offset_minutes) >= 60:
-                raise _refused("as_of names an offset past 23:59")
-            offset = (int(offset_hours) * 60 + int(offset_minutes)) * 60_000_000
-            offset = offset if sign == "+" else -offset
-        whole = (moment - _EPOCH) // datetime.timedelta(microseconds=1)
-        return _checked(whole + int((fraction or "0")[:6].ljust(6, "0")) - offset)
+        return _checked(found)
     if isinstance(value, datetime.datetime):
         return _checked(_moment_micros(value))
     if isinstance(value, datetime.date):

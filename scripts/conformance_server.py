@@ -33,7 +33,6 @@ import os
 import secrets
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -51,6 +50,7 @@ from generalforecast.serve import listener
 from generalforecast.serve import models as serve_models
 from tests.utils import processes
 from tests.utils.locks import directory
+from tests.utils.server import free_port
 
 PROJECT = "local"
 # Each catalog model the stack serves, and the tiny model its worker loads.
@@ -147,12 +147,6 @@ def tiny(served: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return list(workers.values())
 
 
-def _port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
 def ready(url: str, process: subprocess.Popen[bytes]) -> None:
     """Waits until /readyz answers 200, or the server exits."""
     deadline = time.monotonic() + READY_SECONDS
@@ -191,7 +185,7 @@ def main() -> None:
     try:
         served = entries(root)
         (root / "models.json").write_text(json.dumps(served))
-        url = f"http://127.0.0.1:{_port()}"
+        url = f"http://127.0.0.1:{free_port()}"
         config = root / "generalforecast.toml"
         config.write_text(
             listener.configuration(

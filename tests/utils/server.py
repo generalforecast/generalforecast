@@ -117,7 +117,8 @@ def build() -> Path:
     return ROOT / "target" / "debug" / "gf-server"
 
 
-def _port() -> int:
+def free_port() -> int:
+    """A loopback port no process holds now, for a server a test starts."""
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         return probe.getsockname()[1]
@@ -148,7 +149,7 @@ class Server:
     ) -> None:
         self.name = name
         self.tables = directory / "data" / "tables"
-        self.port, self.metrics_port = _port(), _port()
+        self.port, self.metrics_port = free_port(), free_port()
         self.config = directory / "generalforecast.toml"
         # With `timing_log`, the server logs each request's timings here.
         self.timings = directory / "timings.jsonl"
@@ -301,8 +302,8 @@ class Router:
         write_timeout: float | None = None,
         name: str = "router",
     ) -> None:
-        self.port = _port()
-        self.metrics_port = _port()
+        self.port = free_port()
+        self.metrics_port = free_port()
         self.config = directory / f"{name}.toml"
         # What the router logs, for tests to read.
         self.log = directory / f"{name}.log"

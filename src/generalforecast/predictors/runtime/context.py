@@ -16,6 +16,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.compute as _compute
 
+from generalforecast.iso import timestamps
 from generalforecast.predictors.validation import PredictorError, ensure
 from generalforecast.tabular import physical_type, table_digest, to_arrow
 
@@ -283,7 +284,7 @@ def typed(table: pa.Table, predictor: dict[str, Any]) -> pa.Table:
         storage = physical_type(values.type) if values.type != pa.null() else None
         try:
             if kind == "timestamp" and storage == "string":
-                values = _timestamps(values)
+                values = timestamps(values)
             elif storage == "int64" and (
                 kind == "float" or (kind is None and name in inputs)
             ):
@@ -296,7 +297,7 @@ def typed(table: pa.Table, predictor: dict[str, Any]) -> pa.Table:
                 # timestamps when every value is one, as `gf check` infers
                 # a snapshot column's kind; other text stays text.
                 try:
-                    values = _timestamps(values)
+                    values = timestamps(values)
                 except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
                     continue
             else:
@@ -323,7 +324,7 @@ def conform(values: Any, expected: str) -> Any:
         if actual == "int64" and expected == "float64":
             return pc.cast(values, pa.float64())
         if actual == "string" and expected == "timestamp":
-            return _timestamps(values)
+            return timestamps(values)
         if actual == "string" and expected == "date":
             return pc.cast(values, pa.date32())
         if actual == "date" and expected == "timestamp":
@@ -331,15 +332,6 @@ def conform(values: Any, expected: str) -> Any:
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
         return None
     return None
-
-
-def _timestamps(values: Any) -> Any:
-    """ISO text as naive UTC timestamps; text with an offset is converted to UTC."""
-    try:
-        return pc.cast(values, pa.timestamp("us"))
-    except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
-        zoned = pc.cast(values, pa.timestamp("us", tz="UTC"))
-        return pc.cast(zoned, pa.timestamp("us"))
 
 
 __all__ = [

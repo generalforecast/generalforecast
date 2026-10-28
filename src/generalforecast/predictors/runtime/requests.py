@@ -8,8 +8,8 @@ from dataclasses import replace
 from typing import Any
 
 import pyarrow as pa
-import pyarrow.compute as pc
 
+from generalforecast.iso import timestamps
 from generalforecast.predictors.runtime.compile import compile_plan
 from generalforecast.predictors.runtime.compiled import CompiledPlan
 from generalforecast.predictors.validation import PredictorError
@@ -43,13 +43,9 @@ def temporal(table: pa.Table, types: Mapping[str, str]) -> pa.Table:
         index = table.column_names.index(column)
         values = table.column(index)
         try:
-            naive = pc.cast(values, pa.timestamp("us"), safe=True)
+            naive = timestamps(values)
         except (pa.ArrowException, ValueError):
-            try:
-                zoned = pc.cast(values, pa.timestamp("us", tz="UTC"), safe=True)
-            except (pa.ArrowException, ValueError):
-                continue
-            naive = pc.cast(zoned, pa.timestamp("us"))
+            continue
         table = table.set_column(
             index, table.schema.field(index).with_type(naive.type), naive
         )

@@ -274,10 +274,10 @@ def test_metrics_are_configured_only_when_asked_for(tmp_path):
 @pytest.mark.slow
 @pytest.mark.server
 def test_a_server_configured_with_metrics_serves_them_there():
-    from tests.conformance.test_surfaces import Served, _port
-    from tests.utils.server import build
+    from tests.conformance.test_surfaces import Served
+    from tests.utils.server import build, free_port
 
-    metrics = f"127.0.0.1:{_port()}"
+    metrics = f"127.0.0.1:{free_port()}"
     served = Served(build(), "general-forecast/tabicl-v2-classifier", metrics=metrics)
     try:
         for path, expected in (("/healthz", "ok"), ("/metrics", "gf_")):

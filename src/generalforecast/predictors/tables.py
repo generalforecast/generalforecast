@@ -284,9 +284,11 @@ def _binary(present: pa.ChunkedArray, distinct: int) -> bool:
 
 
 def _timestamps(present: pa.ChunkedArray) -> bool:
-    sample = present.slice(0, 1000)
+    """Whether text reads as times, by `iso.timestamps`, judged by its first rows."""
+    from generalforecast.iso import timestamps
+
     try:
-        pc.cast(sample, pa.timestamp("us"))
+        timestamps(present.slice(0, 1000))
         return True
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError):
         return False

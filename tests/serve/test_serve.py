@@ -7,7 +7,6 @@ import json
 import os
 import random
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -28,6 +27,7 @@ from tests.utils import processes
 from tests.utils.locks import directory, lock_of
 from tests.utils.processes import assert_exited as _assert_exited
 from tests.utils.processes import children as _children
+from tests.utils.server import free_port
 
 ROOT = Path(__file__).resolve().parents[2]
 MODEL = "general-forecast/tabicl-v2-classifier"
@@ -38,12 +38,6 @@ CLEAN = (
     "GF_GITHUB_CLIENT_ID",
     "GF_GITHUB_CLIENT_SECRET",
 )
-
-
-def _port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
 
 
 def envelope(resource, payload, *, project="local", request_id="r-test", kind="model"):
@@ -104,7 +98,7 @@ def _event(process, expected):
 
 @pytest.fixture(scope="module")
 def server():
-    port = _port()
+    port = free_port()
     process = _start([MODEL, "--port", str(port)], env={"GF_API_KEY": KEY})
     serving = _event(process, "serving")
     assert serving == {
@@ -278,7 +272,7 @@ def test_ten_thousand_context_rows_are_answered(server):
 @pytest.mark.server
 @pytest.mark.slow
 def test_ctrl_c_stops_the_server_and_its_workers_quietly():
-    port = _port()
+    port = free_port()
     process = _start([MODEL, "--port", str(port)], env={"GF_API_KEY": KEY})
     url = _event(process, "serving")["url"]
     _event(process, "ready")
@@ -303,7 +297,7 @@ def test_ctrl_c_stops_the_server_and_its_workers_quietly():
 @pytest.mark.server
 @pytest.mark.slow
 def test_public_bind_without_a_key_warns():
-    port = _port()
+    port = free_port()
     process = _start([MODEL, "--host", "0.0.0.0", "--port", str(port)])
     try:
         _event(process, "serving")
@@ -385,7 +379,7 @@ def predictor_predict(url, name, payload, project="local"):
 
 
 def _serving(target):
-    port = _port()
+    port = free_port()
     process = _start([str(target), "--port", str(port)], env={"GF_API_KEY": KEY})
     url = _event(process, "serving")["url"]
     _event(process, "ready")
