@@ -32,10 +32,28 @@ PARENT_FD = "GF_PARENT_FD"
 # of the pipe each one's server watches.
 _STARTED: dict[int, tuple[subprocess.Popen, int]] = {}
 _ARMED = False
+# Under pytest, whether the running test may start servers: its `server` or
+# `router` marker, which tests/conftest.py records before each test. None
+# outside a test, as when scripts/conformance_server.py starts a stack.
+MARKED: bool | None = None
+
+
+class UnmarkedServer(RuntimeError):
+    """A test started a server without the `server` or `router` marker."""
 
 
 def start(arguments: list[str], **options: Any) -> subprocess.Popen:
-    """Starts a process as the leader of a new process group, watching this one."""
+    """Starts a process as the leader of a new process group, watching this one.
+
+    Raises:
+        UnmarkedServer: Under a test not marked `server` or `router`, so the
+            CI job that runs the server tests never misses one.
+    """
+    if MARKED is False:
+        raise UnmarkedServer(
+            "this test starts a server: mark it `@pytest.mark.server` "
+            "(or `router`), so the serving job runs it"
+        )
     _arm()
     watched, holder = os.pipe()
     environment = dict(options.pop("env", None) or os.environ)

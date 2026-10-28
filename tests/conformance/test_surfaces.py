@@ -253,6 +253,7 @@ def history(task: str) -> pa.Table:
         ("general-forecast/tabicl-v2-regressor", "regression"),
     ],
 )
+@pytest.mark.server
 def test_packages_answer_alike(tmp_path, engine, model, task):
     data = history(task)
     served_root = tmp_path / "served"
@@ -308,6 +309,7 @@ def series_history() -> pa.Table:
     )
 
 
+@pytest.mark.server
 def test_package_forecasts_answer_alike(tmp_path, engine):
     data = series_history()
     served_root = tmp_path / "served"

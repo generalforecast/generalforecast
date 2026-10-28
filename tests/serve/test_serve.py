@@ -275,6 +275,7 @@ def test_ten_thousand_context_rows_are_answered(server):
     assert set(row["probabilities"]) == {"0", "1"}
 
 
+@pytest.mark.server
 @pytest.mark.slow
 def test_ctrl_c_stops_the_server_and_its_workers_quietly():
     port = _port()
@@ -299,6 +300,7 @@ def test_ctrl_c_stops_the_server_and_its_workers_quietly():
     assert left == [], left
 
 
+@pytest.mark.server
 @pytest.mark.slow
 def test_public_bind_without_a_key_warns():
     port = _port()
@@ -398,6 +400,7 @@ def _stop(process):
         processes.stop(process)
 
 
+@pytest.mark.server
 @pytest.mark.slow
 def test_snapshot_predictor_binds_once_and_answers_predictions(predictor_dir):
     url, process = _serving(predictor_dir)
@@ -471,6 +474,7 @@ def test_snapshot_predictor_binds_once_and_answers_predictions(predictor_dir):
         _stop(process)
 
 
+@pytest.mark.server
 @pytest.mark.slow
 def test_lone_lock_file_serves_request_context(lone_lock):
     url, process = _serving(lone_lock)

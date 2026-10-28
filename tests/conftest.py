@@ -75,3 +75,15 @@ def float64() -> Iterator[None]:
     """Enable float64 for tests of code that computes in double precision."""
     with jax.enable_x64(True):
         yield
+
+
+@pytest.fixture(autouse=True)
+def _servers_need_their_marker(request):
+    """Lets the test start servers only when it is marked `server` or `router`."""
+    from tests.utils import processes
+
+    processes.MARKED = any(
+        request.node.get_closest_marker(name) for name in ("server", "router")
+    )
+    yield
+    processes.MARKED = None

@@ -362,6 +362,7 @@ def _cli(
     return pd.read_parquet(output)
 
 
+@pytest.mark.server
 @pytest.mark.parametrize("case", list(CASES))
 def test_every_path_predicts_the_same_and_knows_the_same_lock(
     tmp_path, engine, monkeypatch, case
@@ -496,6 +497,7 @@ def test_every_entry_point_refuses_a_forged_lock(tmp_path, monkeypatch, forgery)
         )
 
 
+@pytest.mark.server
 def test_any_number_of_series_and_queries_predict_alike_past_one_call(tmp_path, engine):
     """2,100 series, 10,500 queries: past one call's bound, every path agrees.
 

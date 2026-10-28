@@ -124,3 +124,18 @@ def test_the_formatting_rules_catch_what_they_name():
         "7: a center dot",
         "8: a bullet",
     ]
+
+
+def test_a_test_that_starts_a_server_without_its_marker_fails(monkeypatch):
+    import pytest
+
+    from tests.utils import processes
+
+    # This test carries no `server` marker, so starting anything is refused
+    # before a process exists.
+    assert processes.MARKED is False
+    with pytest.raises(processes.UnmarkedServer, match="mark it"):
+        processes.start(["true"])
+    monkeypatch.setattr(processes, "MARKED", True)
+    process = processes.start(["true"])
+    processes.stop(process)

@@ -41,6 +41,7 @@ def _assert_quiet(stderr):
     assert not noisy, stderr
 
 
+@pytest.mark.server
 def test_a_worker_ignores_sigint_and_exits_when_its_socket_closes():
     # A socket path holds at most 104 bytes on macOS, which pytest's own
     # temporary directories outgrow; the system's is short enough.
@@ -118,6 +119,7 @@ def _wait_healthy(server, process):
             time.sleep(0.2)
 
 
+@pytest.mark.server
 def test_ctrl_c_while_serving_stops_the_workers_and_exits_zero(tmp_path):
     server, process = _server(tmp_path, stdout=subprocess.PIPE)
     _wait_healthy(server, process)
@@ -131,6 +133,7 @@ def test_ctrl_c_while_serving_stops_the_workers_and_exits_zero(tmp_path):
     _assert_exited(workers)
 
 
+@pytest.mark.server
 def test_ctrl_c_while_the_workers_start_stops_them_and_exits_zero(tmp_path):
     _, process = _server(tmp_path, stdout=subprocess.PIPE)
     deadline = time.monotonic() + 300
@@ -168,6 +171,7 @@ def _drain(fd):
     return reader, shown
 
 
+@pytest.mark.server
 def test_a_terminal_sees_one_stopped_line(tmp_path):
     parent, child = pty.openpty()
     try:
