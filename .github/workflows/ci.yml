@@ -12,8 +12,7 @@ name: CI
 # checks runs only when code it checks changes. The server and router
 # integration tests, which build both binaries and start processes, run
 # whenever the Rust crates or the Python they serve change. The other tests
-# marked slow, which compile models, run weekly in weekly.yml and before
-# every release.
+# marked slow, which compile models, run weekly in weekly.yml.
 on:
   push:
     branches: [main]
