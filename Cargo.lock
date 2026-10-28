@@ -805,13 +805,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gf-cli"
-version = "0.1.13"
-dependencies = [
- "serde_json",
-]
-
-[[package]]
 name = "gf-core"
 version = "0.1.13"
 dependencies = [

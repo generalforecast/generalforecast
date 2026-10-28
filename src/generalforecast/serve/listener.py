@@ -26,7 +26,6 @@ import secrets
 import shutil
 import subprocess
 import sys
-import sysconfig
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -91,17 +90,21 @@ def _stale(program: Path, checkout: Path) -> bool:
 
 
 def binary(name: str = SERVER) -> Path:
-    """The server program `name` runs, found in this order.
+    """The server program `name` runs: gf-server and gf-router exist only under gf.
+
+    Found in this order, never on PATH or beside Python:
 
     1. `GF_SERVER_BIN` for gf-server, `GF_ROUTER_BIN` for gf-router: a path,
-       used as given.
-    2. The package's own `bin`, where release wheels stage the servers off
-       PATH. In a source checkout a staged server older than the Rust sources
-       is stale and skipped, so it never shadows a fresh build.
-    3. The scripts directory beside Python, where images and older wheels
-       install them.
-    4. PATH, where a source checkout's `target/release` or `target/debug`
-       goes.
+       used as given, for development and tests.
+    2. The package's own `generalforecast/bin`, where a wheel carries them.
+    3. In a source checkout, the workspace's `target/release` or
+       `target/debug` build, the newer of the two. A staged or built server
+       older than the Rust sources is stale and skipped, so it never shadows
+       a fresh build.
+
+    Raises:
+        Error: `ConfigurationError` when the override names no program, or no
+            server is found.
     """
     override = os.environ.get(OVERRIDES[name])
     if override:
@@ -113,21 +116,27 @@ def binary(name: str = SERVER) -> Path:
                 hint=f"point {OVERRIDES[name]} at a built {name}, or unset it",
             )
         return program
-    staged = BIN / name
     checkout = _checkout()
-    if staged.is_file() and (checkout is None or not _stale(staged, checkout)):
-        return staged
-    scripts = Path(sysconfig.get_path("scripts")) / name
-    if scripts.is_file():
-        return scripts
-    found = shutil.which(name)
-    if found is None:
-        raise Error(
-            f"{name} is not installed with gf",
-            code="ConfigurationError",
-            hint=f"reinstall generalforecast, or set {OVERRIDES[name]}",
+    staged = BIN / name
+    candidates = [staged]
+    if checkout is not None:
+        target = Path(os.environ.get("CARGO_TARGET_DIR") or checkout / "target")
+        built = [target / profile / name for profile in ("release", "debug")]
+        candidates += sorted(
+            (path for path in built if path.is_file()),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
         )
-    return Path(found)
+    for program in candidates:
+        if program.is_file() and (checkout is None or not _stale(program, checkout)):
+            return program
+    raise Error(
+        "gf's servers are missing from this installation",
+        code="ConfigurationError",
+        hint="reinstall generalforecast"
+        if checkout is None
+        else "run `cargo build -p gf-server -p gf-router` in this checkout",
+    )
 
 
 def _become(program: Path, *arguments: str, environment: Mapping[str, str]) -> NoReturn:

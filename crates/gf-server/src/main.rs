@@ -39,7 +39,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tonic::transport::{Certificate, Identity, ServerTlsConfig};
 
 #[derive(Parser)]
-#[command(about = "Serve tabular foundation models over Arrow Flight")]
+#[command(about = "Serve tabular foundation models over Arrow Flight; started by `gf serve` and `gf admin node`")]
 struct Arguments {
     #[command(subcommand)]
     command: Subcommand,

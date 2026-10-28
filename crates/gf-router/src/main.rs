@@ -33,7 +33,7 @@ use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerT
 const CHECK_SECONDS: f64 = 5.0;
 
 #[derive(Parser)]
-#[command(about = "Route clients to the generalforecast nodes that serve their tables")]
+#[command(about = "Route clients to the generalforecast nodes that serve their tables; started by `gf admin router`")]
 struct Arguments {
     #[command(subcommand)]
     command: Subcommand,

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/gf-assign", "crates/gf-cli", "crates/gf-core", "crates/gf-py", "crates/gf-router", "crates/gf-server"]
+members = ["crates/gf-assign", "crates/gf-core", "crates/gf-py", "crates/gf-router", "crates/gf-server"]
 resolver = "3"
 
 [workspace.package]

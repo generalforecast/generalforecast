@@ -63,8 +63,7 @@ def test_a_missing_server_is_reported_before_any_weights(monkeypatch, private):
 
     monkeypatch.setattr("generalforecast.serve.models.served", served)
     monkeypatch.setattr(listener, "BIN", private / "absent")
-    monkeypatch.setattr(listener.shutil, "which", lambda name: None)
-    monkeypatch.setattr(listener.sysconfig, "get_path", lambda name: str(private))
+    monkeypatch.setattr(listener, "_checkout", lambda: None)
     monkeypatch.delenv("GF_SERVER_BIN", raising=False)
     code, stdout, stderr = gf(
         "--json",
@@ -74,7 +73,7 @@ def test_a_missing_server_is_reported_before_any_weights(monkeypatch, private):
     )
     assert code == 1 and not stdout
     error = json.loads(stderr)["error"]
-    assert error["message"] == "gf-server is not installed with gf"
+    assert error["message"] == "gf's servers are missing from this installation"
     assert error["reason"] == "configuration_error"
     assert not list(private.iterdir())
 
@@ -384,7 +383,7 @@ def test_gf_server_checks_a_hosted_configuration(tmp_path):
     assert done.returncode == 0, done.stdout + done.stderr
 
 
-def test_a_server_is_found_in_its_documented_order(monkeypatch, tmp_path):
+def test_a_server_is_found_only_under_gf(monkeypatch, tmp_path):
     def program(path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("#!/bin/sh\n")
@@ -397,19 +396,29 @@ def test_a_server_is_found_in_its_documented_order(monkeypatch, tmp_path):
     source.write_text("")
     (checkout / "Cargo.lock").write_text("")
     staged = program(tmp_path / "bin" / "gf-server")
+    debug = program(checkout / "target" / "debug" / "gf-server")
+    # A server on PATH or beside Python is never one gf runs.
     on_path = program(tmp_path / "path" / "gf-server")
     monkeypatch.setattr(listener, "BIN", staged.parent)
     monkeypatch.setattr(listener, "_checkout", lambda: checkout)
-    monkeypatch.setattr(listener.sysconfig, "get_path", lambda name: str(tmp_path))
     monkeypatch.setenv("PATH", str(on_path.parent))
     monkeypatch.delenv("GF_SERVER_BIN", raising=False)
+    monkeypatch.delenv("CARGO_TARGET_DIR", raising=False)
 
-    os.utime(source, (time.time() - 60, time.time() - 60))
+    old = time.time() - 60
+    os.utime(source, (old, old))
     assert listener.binary() == staged
-    # A source edited after the staging makes the staged server stale.
+    # A source edited after the staging makes the staged server stale; the
+    # checkout's own build is next.
     os.utime(source, None)
-    os.utime(staged, (time.time() - 60, time.time() - 60))
-    assert listener.binary() == on_path
+    os.utime(staged, (old - 60, old - 60))
+    later = time.time() + 60
+    os.utime(debug, (later, later))
+    assert listener.binary() == debug
+    # A build older than the sources is stale too.
+    os.utime(debug, (old - 60, old - 60))
+    with pytest.raises(Exception, match="servers are missing"):
+        listener.binary()
     explicit = program(tmp_path / "explicit" / "gf-server")
     monkeypatch.setenv("GF_SERVER_BIN", str(explicit))
     assert listener.binary() == explicit
@@ -419,3 +428,6 @@ def test_a_server_is_found_in_its_documented_order(monkeypatch, tmp_path):
     monkeypatch.delenv("GF_SERVER_BIN")
     monkeypatch.setattr(listener, "_checkout", lambda: None)
     assert listener.binary() == staged
+    staged.unlink()
+    with pytest.raises(Exception, match="servers are missing"):
+        listener.binary()

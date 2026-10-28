@@ -5,7 +5,6 @@
 
 import io
 import json
-import os
 import subprocess
 import sys
 
@@ -327,26 +326,6 @@ def test_help_and_version_do_not_import_the_sdk():
             timeout=60,
         )
         assert result.stdout.endswith("HEAVY="), result.stdout[-200:]
-
-
-def test_rust_launcher_runs_the_python_cli(tmp_path):
-    binary = os.environ.get("GF_CLI")
-    if not binary or not os.path.isfile(binary):
-        pytest.skip("set GF_CLI to a built gf launcher for parity")
-    ours = subprocess.run(
-        [sys.executable, "-m", "generalforecast.cli", "--help"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    theirs = subprocess.run(
-        [binary, "--help"],
-        capture_output=True,
-        text=True,
-        check=False,
-        env={**os.environ, "GF_PYTHON": sys.executable},
-    )
-    assert ours.stdout == theirs.stdout
 
 
 def _write_rows(path, rows=60, *, timed=False, blanks=0):

@@ -92,8 +92,8 @@ jobs:
           uv venv smoke
           uv pip install --python smoke/bin/python dist/*.whl
           smoke/bin/gf --help
-          smoke/bin/gf-native --help
           smoke/bin/gf serve --help
+          GF_WHEEL="$(ls dist/*.whl)" uvx --from pytest==8.4.2 pytest --noconftest tests/test_wheel.py
           for server in gf-server gf-router; do
             test ! -e "smoke/bin/$server"
             "$(smoke/bin/python -c "from generalforecast.serve.listener import binary; print(binary('$server'))")" --help

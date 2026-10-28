@@ -27,8 +27,9 @@ For deployments on large, live datasets, please take a look at the [docs](https:
 
 ## Contributing
 
-We welcome and value any contributions and collaborations. For more
-specific questions, please contact hello@generalforecast.com.
+We welcome and value any contributions and collaborations; see
+[CONTRIBUTING.md](CONTRIBUTING.md). For more specific questions, please
+contact hello@generalforecast.com.
 
 ## License
 

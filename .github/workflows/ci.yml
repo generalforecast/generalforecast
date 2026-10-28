@@ -129,12 +129,11 @@ jobs:
       # gf-py's test binary would link against libpython; the Python job
       # tests the extension it builds instead.
       - run: cargo test --workspace --exclude gf-py
-      - run: cargo build -p gf-cli --bins
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: "0.8.0"
       - run: uv sync --locked
-      - run: GF_CLI="$PWD/target/debug/gf" uv run pytest tests/product_cli -m "not slow"
+      - run: uv run pytest tests/product_cli -m "not slow"
 
   python:
     needs: changes

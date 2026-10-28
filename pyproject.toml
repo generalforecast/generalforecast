@@ -114,9 +114,9 @@ python-source = "src"
 python-packages = ["generalforecast"]
 features = ["pyo3/extension-module"]
 include = [{ path = "src/generalforecast/bin/*", format = "wheel" }]
-# A release stages gf-native into wheel-data/scripts beside Python, and
-# gf-server and gf-router, which `gf serve` runs, into generalforecast/bin.
-# data = "wheel-data"
+# A release stages gf-server and gf-router, which only gf runs, into
+# generalforecast/bin (scripts/stage_servers.sh); the wheel installs no
+# program but the gf console script.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
