@@ -1,7 +1,7 @@
 [package]
 name = "gf-cli"
 description = "gf: launches the generalforecast command under the Python beside it"
-version = "0.1.12"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

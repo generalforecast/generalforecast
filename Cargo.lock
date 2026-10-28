@@ -799,21 +799,21 @@ dependencies = [
 
 [[package]]
 name = "gf-assign"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "gf-cli"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "serde_json",
 ]
 
 [[package]]
 name = "gf-core"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "gf-py"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "arrow-array",
  "arrow-ipc",
@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "gf-router"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "arrow-array",
  "arrow-cast",
@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "gf-server"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "arrow-array",
  "arrow-cast",

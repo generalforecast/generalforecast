@@ -3,6 +3,9 @@ members = ["crates/gf-assign", "crates/gf-cli", "crates/gf-core", "crates/gf-py"
 resolver = "3"
 
 [workspace.package]
+# The one version: every crate takes it, and pyproject.toml's must equal it
+# (tests/test_repository.py).
+version = "0.1.13"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
