@@ -304,3 +304,54 @@ def test_the_style_check_refuses_a_capitalized_or_full_stopped_message():
         'RequestError::new("ValidationError", "Bad input", 422)\n'
         'ApiError::validation("as_of is an RFC 3339 time")\n'
     ) == ["1: Invalid port", "2: the port {port} is invalid.", "3: Bad input"]
+
+
+def notebook_api(source: str) -> list[str]:
+    """What notebook code uses of `gf` that gf does not have: names, and keywords of calls."""
+    import inspect
+
+    import generalforecast as gf
+
+    code = "\n".join(
+        line for line in source.splitlines() if not line.lstrip().startswith(("%", "!"))
+    )
+    missing = []
+    for node in ast.walk(ast.parse(code)):
+        target = node.func if isinstance(node, ast.Call) else node
+        if not (
+            isinstance(target, ast.Attribute)
+            and isinstance(target.value, ast.Name)
+            and target.value.id == "gf"
+        ):
+            continue
+        if target.attr not in gf.__all__:
+            missing.append(f"gf.{target.attr}")
+            continue
+        if isinstance(node, ast.Call):
+            accepted = inspect.signature(getattr(gf, target.attr)).parameters
+            for keyword in node.keywords:
+                if keyword.arg is not None and keyword.arg not in accepted:
+                    missing.append(f"gf.{target.attr}({keyword.arg}=)")
+    return sorted(set(missing))
+
+
+def test_every_notebook_uses_only_the_api_gf_has():
+    import json
+
+    notebooks = tracked("examples/*.ipynb")
+    assert notebooks
+    for path in notebooks:
+        cells = json.loads(path.read_text())["cells"]
+        source = "\n".join(
+            "".join(cell["source"]) for cell in cells if cell["cell_type"] == "code"
+        )
+        assert notebook_api(source) == [], path.name
+
+
+def test_the_notebook_check_catches_a_removed_name_or_keyword():
+    assert notebook_api(
+        "%pip install generalforecast\n"
+        "client = gf.local(allow_downloads=True)\n"
+        'model = gf.Regressor("general-forecast/tabicl-v2-regressor", allow_downloads=True)\n'
+        "fine = gf.Classifier(download=True)\n"
+    ) == ["gf.Regressor(allow_downloads=)", "gf.local"]
