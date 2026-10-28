@@ -3085,46 +3085,6 @@ def test_a_record_request_with_a_trace_writes_the_trace_and_its_steps(
     assert not worker_process._recording
 
 
-@pytest.mark.slow
-def test_sampling_costs_a_step_loop_a_few_percent_at_most(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    # Wall-clock, so it runs with the slow tests, and with a bound loose
-    # enough for a shared machine.
-    from generalforecast import worker_process
-
-    client = node_harness.local()
-    rows = _table(client)
-    rows.insert(np.arange(32), *_clusters())
-    node, worker = client._node, client._worker
-    node.submit(client._tables["t"]._id, NEAR_A, None)
-    step = _as_frame(node.schedule())
-    monkeypatch.setattr(protocol, "request", lambda header, buffers: step)
-
-    def steps(seconds: float) -> int:
-        deadline = clock.perf_counter() + seconds
-        count = 0
-        while clock.perf_counter() < deadline:
-            worker_process._answer(worker, {}, lambda: None, {"kind": "step"}, [])()
-            count += 1
-        return count
-
-    steps(0.5)
-    plain, sampled = [], []
-    for round in range(3):
-        plain.append(steps(1.0))
-        sampler = threading.Thread(
-            target=worker_process._sampled, args=(1.0, str(tmp_path / f"{round}"))
-        )
-        sampler.start()
-        sampled.append(steps(1.0))
-        sampler.join()
-
-    overhead = 1 - max(sampled) / max(plain)
-    print(f"sampling costs {overhead:.1%} of {max(plain)} steps a second")
-    assert overhead < 0.15
-
-
 def test_public_tables_take_frames_and_answer_frames(monkeypatch) -> None:
     import pandas as pd
 

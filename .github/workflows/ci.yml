@@ -181,15 +181,16 @@ jobs:
           key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
 
   # The tests marked slow that start no server, which compile the tiny
-  # models, in five parts. Three workers a runner, as each holds a few GB;
-  # a test that runs ten minutes prints every thread's stack.
+  # models, in eight parts at three workers a runner: a test process grows
+  # by a few GB over the tests it runs, and five parts ran a runner out of
+  # memory. A test that runs ten minutes prints every thread's stack.
   slow:
     needs: changes
     if: needs.changes.outputs.python == 'true'
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4, 5]
+        part: [1, 2, 3, 4, 5, 6, 7, 8]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
@@ -213,7 +214,7 @@ jobs:
           restore-keys: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-
       - run: >-
           uv run pytest -m "slow and not server and not router" -n 3
-          --shard ${{ matrix.part }}/5 -o faulthandler_timeout=600
+          --shard ${{ matrix.part }}/8 -o faulthandler_timeout=600
       # Saved from runs outside pull requests, so those cannot crowd out main's.
       - if: always() && github.event_name != 'pull_request'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
