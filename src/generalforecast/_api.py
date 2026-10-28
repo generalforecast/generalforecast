@@ -1795,24 +1795,24 @@ class LockResources(Payload):
 
 @dataclass(frozen=True, kw_only=True)
 class Lock(Payload):
-    """Gf.lock, version 2: what gf check resolved gf.yaml into.
+    """Gf.lock: what gf check resolved gf.yaml into.
 
     `digest` is the canonical JSON digest of the document without `digest`, the one
     identity of a predictor revision; `manifest` the digest of the normalized gf.yaml
-    it resolves, null for an upgraded version 1 lock
+    it resolves
     """
 
-    lock_version: Literal[2] = 2
+    lock_version: Literal[1] = 1
     digest: Digest
-    manifest: Digest | None
+    manifest: Digest
     predictor: Resolution
     model: LockedModel
     resources: LockResources | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("lock_version", "lock_version", True, _literal(2)),
+        Field("lock_version", "lock_version", True, _literal(1)),
         Field("digest", "digest", True, _decode_Digest),
-        Field("manifest", "manifest", True, _union(_decode_Digest, _null)),
+        Field("manifest", "manifest", True, _decode_Digest),
         Field("predictor", "predictor", True, _record(Resolution)),
         Field("resources", "resources", False, _record(LockResources)),
         Field("model", "model", True, _record(LockedModel)),

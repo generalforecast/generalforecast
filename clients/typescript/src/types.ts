@@ -595,15 +595,14 @@ export interface LockResources {
 }
 
 /**
- * gf.lock, version 2: what gf check resolved gf.yaml into. `digest` is the canonical
- * JSON digest of the document without `digest`, the one identity of a predictor
- * revision; `manifest` the digest of the normalized gf.yaml it resolves, null for an
- * upgraded version 1 lock
+ * gf.lock: what gf check resolved gf.yaml into. `digest` is the canonical JSON digest
+ * of the document without `digest`, the one identity of a predictor revision;
+ * `manifest` the digest of the normalized gf.yaml it resolves
  */
 export interface Lock {
-  lock_version: 2;
+  lock_version: 1;
   digest: Digest;
-  manifest: Digest | null;
+  manifest: Digest;
   predictor: Resolution;
   resources?: LockResources;
   model: LockedModel;

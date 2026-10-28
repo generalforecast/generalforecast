@@ -87,7 +87,7 @@ const PREFIX: usize = 8;
 const TAG: usize = 16;
 /// The file's plain header: a magic, the format, and the id of the key.
 const MAGIC: &[u8; 6] = b"GF_LOG";
-const FORMAT: u8 = 4;
+const FORMAT: u8 = 1;
 const HEADER: usize = MAGIC.len() + 2 + KEY_ID;
 /// Bytes of a key's id.
 const KEY_ID: usize = 8;

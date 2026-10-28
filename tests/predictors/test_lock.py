@@ -1,20 +1,18 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-import copy
 from pathlib import Path
 
 import pytest
 import yaml
 
-from generalforecast.contracts import LOCK_VERSION, PredictorLock, parse_lock
+from generalforecast.contracts import LOCK_VERSION, parse_lock
 from generalforecast.errors import InvalidInput
 from generalforecast.predictors import load, load_lock, resolve, write_lock
 from generalforecast.predictors.lock import (
     changes,
     document,
     lock_digest,
-    upgrade,
     validate,
 )
 from generalforecast.predictors.validation import PredictorError
@@ -25,7 +23,7 @@ def test_lock_shape(churn: Path):
     resolution = resolve(load(churn), churn)
     path = write_lock(resolution, churn)
     value = yaml.safe_load(path.read_text())
-    assert value["lock_version"] == LOCK_VERSION == 2
+    assert value["lock_version"] == LOCK_VERSION == 1
     assert list(value) == ["lock_version", "digest", "manifest", "predictor", "model"]
     assert value["digest"] == lock_digest(value)
     predictor = value["predictor"]
@@ -193,20 +191,19 @@ def test_load_lock_is_frozen_and_notices_any_manifest_edit(churn: Path):
     assert caught.value.hint == "run `gf check` to update it"
 
 
-def test_a_version_1_lock_asks_for_gf_check(churn: Path):
-    (churn / "gf.lock").write_text("lock_version: 1\npredictor: {name: churn}\n")
+def test_a_lock_of_another_format_asks_for_gf_check(churn: Path):
+    (churn / "gf.lock").write_text("lock_version: 2\npredictor: {name: churn}\n")
     with pytest.raises(InvalidInput) as caught:
         load_lock(churn)
-    assert (
-        caught.value.message
-        == "gf.lock is version 1; run `gf check` to write version 2"
+    assert caught.value.message == (
+        "gf.lock is not in the current format; run `gf check` to write it again"
     )
     resolution = resolve(load(churn), churn)
     assert resolution.lock_changes == ()
     write_lock(resolution, churn)
-    assert yaml.safe_load((churn / "gf.lock").read_text())["lock_version"] == 2
+    assert yaml.safe_load((churn / "gf.lock").read_text())["lock_version"] == 1
     with pytest.raises(PredictorError) as refused:
-        parse_lock({"lock_version": 1, "predictor": {}, "model": {}})
+        parse_lock({"lock_version": 2, "predictor": {}, "model": {}})
     assert refused.value.code == "UnsupportedLockVersion"
 
 
@@ -237,144 +234,3 @@ def test_a_catalog_model_change_needs_upgrade(churn: Path):
         resolution.model_digest,
     ) in upgraded.lock_changes
     assert upgraded.files == resolution.files
-
-
-def test_version_1_locks_upgrade_to_what_they_served():
-    v1 = {
-        "lock_version": 1,
-        "predictor": {
-            "name": "sales",
-            "model": "general-forecast/chronos-2",
-            "model_digest": "sha256:" + "c" * 64,
-            "task": "forecast",
-            "target": "units",
-            "target_type": "float",
-            "time": "date",
-            "series": ["sku"],
-            "frequency": "1d",
-            "horizon": 7,
-            "quantiles": [0.1, 0.5, 0.9],
-            "inputs": [
-                {"name": "promo", "type": "int"},
-                {"name": "price", "type": "float", "role": "future"},
-            ],
-            "context": {"kind": "request"},
-            "selection": {"core": None, "neighbors": 0, "kind": "stratified"},
-        },
-        "model": {"files": {"model.safetensors": "d" * 64}},
-    }
-    upgraded = upgrade(v1)
-    predictor = upgraded["predictor"]
-    assert upgraded["lock_version"] == 2 and upgraded["manifest"] is None
-    assert [column["role"] for column in predictor["inputs"]] == ["past", "future"]
-    assert predictor["outputs"] == ["value", "quantiles"]
-    assert predictor["selection"]["strategy"] == "exact"
-    assert predictor["time_type"] is None and predictor["series_types"] == [None]
-    assert PredictorLock.from_dict(upgraded).digest == upgraded["digest"]
-    regression = upgrade(
-        {
-            "lock_version": 1,
-            "predictor": {
-                "name": "price",
-                "model": "general-forecast/tabicl-v2-regressor",
-                "model_digest": "sha256:" + "e" * 64,
-                "task": "regression",
-                "target": "y",
-                "target_type": "float",
-                "inputs": [{"name": "x", "type": "float"}],
-                "context": {"kind": "request"},
-                "selection": {"core": 100, "neighbors": 20, "kind": "random"},
-            },
-            "model": {"files": {}},
-        }
-    )
-    assert regression["predictor"]["outputs"] == ["value"]
-    assert regression["predictor"]["inputs"][0]["role"] == "input"
-    assert regression["predictor"]["selection"]["core"] == 100
-
-
-def _v1_lock() -> dict:
-    return {
-        "lock_version": 1,
-        "predictor": {
-            "name": "demand",
-            "model": "general-forecast/chronos-2",
-            "model_digest": "sha256:" + "c" * 64,
-            "task": "forecast",
-            "target": "units",
-            "target_type": "float",
-            "time": "date",
-            "series": ["sku"],
-            "frequency": "1d",
-            "horizon": 7,
-            "quantiles": [0.1, 0.5, 0.9],
-            "id": "key",
-            "id_type": "text",
-            "inputs": [
-                {"name": "promo", "type": "int"},
-                {"name": "price", "type": "float", "role": "future"},
-            ],
-            "context": {"kind": "request"},
-            "selection": {"core": 10, "neighbors": 2, "kind": "stratified"},
-        },
-        "model": {"files": {"model.safetensors": "sha256:" + "d" * 64}},
-    }
-
-
-_GARBAGE = (None, True, 0, -1, 1.5, float("nan"), "", "x", [], [None], {}, {"a": 1})
-
-
-def _malformed():
-    """Version 1 locks with each key dropped or its value swapped for garbage."""
-    base = _v1_lock()
-    for key in base:
-        if key == "lock_version":
-            continue
-        dropped = copy.deepcopy(base)
-        del dropped[key]
-        yield f"drop {key}", dropped
-        for junk in _GARBAGE:
-            swapped = copy.deepcopy(base)
-            swapped[key] = junk
-            yield f"{key}={junk!r}", swapped
-    for key in base["predictor"]:
-        dropped = copy.deepcopy(base)
-        del dropped["predictor"][key]
-        yield f"drop predictor.{key}", dropped
-        for junk in _GARBAGE:
-            swapped = copy.deepcopy(base)
-            swapped["predictor"][key] = junk
-            yield f"predictor.{key}={junk!r}", swapped
-    for nested in ("inputs", "context", "selection"):
-        for junk in _GARBAGE:
-            swapped = copy.deepcopy(base)
-            value = swapped["predictor"][nested]
-            if isinstance(value, list):
-                value[0] = junk
-            else:
-                value[next(iter(value))] = junk
-            yield f"predictor.{nested}[0]={junk!r}", swapped
-    for junk in _GARBAGE:
-        swapped = copy.deepcopy(base)
-        swapped["model"]["files"] = junk
-        yield f"model.files={junk!r}", swapped
-        swapped = copy.deepcopy(base)
-        swapped["predictor"]["inputs"][0]["name"] = junk
-        yield f"inputs[0].name={junk!r}", swapped
-
-
-def test_upgrade_refuses_every_malformed_lock_with_a_predictor_error():
-    upgrade(_v1_lock())
-    refused = 0
-    for label, value in _malformed():
-        try:
-            upgrade(value)
-        except PredictorError:
-            refused += 1
-        except Exception as error:  # noqa: BLE001
-            pytest.fail(f"{label}: {type(error).__name__}: {error}")
-    assert refused > 100
-    for value in (None, [], "lock", 1, {"lock_version": 2}, {"lock_version": "1"}):
-        with pytest.raises(PredictorError) as caught:
-            upgrade(value)
-        assert caught.value.code == "UnsupportedLockVersion"

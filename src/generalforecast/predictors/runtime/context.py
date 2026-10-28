@@ -93,7 +93,7 @@ def served_context(lock: Any, table: pa.Table | None) -> pa.Table | None:
     """The rows a predictor binds, from its lock and a table of its context.
 
     Args:
-        lock: A `contracts.PredictorLock`, or a version 2 lock document.
+        lock: A `contracts.PredictorLock`, or a lock document.
         table: For a snapshot, the snapshot file's rows, or the context rows
             `gf push` uploaded, which are those rows already; for a live
             context, its captured rows; for a request context, a call's rows.
@@ -197,7 +197,7 @@ def live_context(lock: Any, snapshot: Any) -> tuple[pa.Table, Any]:
     """A live context's rows as a predictor binds them, and the version they read.
 
     Args:
-        lock: A `contracts.PredictorLock`, or a version 2 lock document, of a
+        lock: A `contracts.PredictorLock`, or a lock document, of a
             live-context predictor.
         snapshot: The `service.interfaces.ContextSnapshot` its data port
             answered: each row's key, features and label.

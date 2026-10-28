@@ -25,7 +25,7 @@ const MAX_FRAME_BYTES: u64 = 1 << 33;
 
 /// The version of the frames the server and its workers exchange, which a
 /// worker reports when it connects: both sides must come from one generalforecast.
-pub const PROTOCOL_VERSION: u32 = 14;
+pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The most buffers one frame may claim.
 const MAX_BUFFERS: u32 = 1 << 20;

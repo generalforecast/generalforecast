@@ -6,9 +6,9 @@
 `gf check` resolves `gf.yaml` against its context and the model catalog and
 writes the result here. `gf check --frozen`, `gf.Predictor`, `gf serve`,
 `gf push` and hosted serving all read this document, and nothing else, to
-know what a predictor is. Version 2:
+know what a predictor is. It has one format:
 
-    lock_version: 2
+    lock_version: 1
     digest: sha256:...            # of the document without this key
     manifest: sha256:...          # of the normalized gf.yaml it resolves
     predictor:
@@ -41,7 +41,7 @@ from typing import Any
 
 import yaml
 
-from generalforecast.errors import Error, InvalidInput
+from generalforecast.errors import InvalidInput
 from generalforecast.predictors import files
 from generalforecast.predictors.resolution import (
     ContextInfo,
@@ -61,7 +61,7 @@ from generalforecast.predictors.validation import (
 from generalforecast.predictors.validation import column as column_name
 
 LOCK = "gf.lock"
-LOCK_VERSION = 2
+LOCK_VERSION = 1
 TASKS = ("classification", "regression", "forecast")
 CONTEXT_KINDS = ("snapshot", "request", "live")
 ROLES = ("input", "past", "future")
@@ -185,23 +185,21 @@ def document(resolution: Resolution) -> dict[str, Any]:
 
 
 def validate(value: Any) -> dict[str, Any]:
-    """Checks a version 2 lock document field by field, its digest included.
+    """Checks a lock document field by field, its digest included.
 
     Returns:
         The document.
 
     Raises:
-        PredictorError: `UnsupportedLockVersion` for another version, with
-            the hint to run `gf check`; `LockMismatch` for a digest that does
+        PredictorError: `UnsupportedLockVersion` for a document of another
+            format, with the hint to run `gf check`; `LockMismatch` for a digest that does
             not match the content; `ValidationError` for a field out of shape.
     """
     ensure(type(value) is dict, "lock must be a document")
     version = value.get("lock_version")
     ensure(
         version == LOCK_VERSION,
-        f"gf.lock is version {version}; run `gf check` to write version {LOCK_VERSION}"
-        if type(version) is int
-        else "unsupported lock; run `gf check` to write a version 2 lock",
+        "gf.lock is not in the current format; run `gf check` to write it again",
         "UnsupportedLockVersion",
     )
     fields(
@@ -211,7 +209,7 @@ def validate(value: Any) -> dict[str, Any]:
     )
     hash_value(value["digest"])
     ensure(
-        value["manifest"] is None or hash_value(value["manifest"]),
+        hash_value(value["manifest"]),
         "invalid manifest digest",
     )
     ensure(
@@ -398,109 +396,10 @@ def _kind(value: Any) -> None:
     ensure(value is None or value in PHYSICAL, "invalid column kind")
 
 
-def upgrade(value: Any) -> dict[str, Any]:
-    """A version 1 lock rewritten as version 2, as hosted serving upgrades stored revisions.
-
-    A version 1 lock records no manifest, outputs, roles or seed. The
-    upgrade keeps what it served: a tabular input's role is `input` and a
-    forecaster's role-less input is `past`; a regressor outputs `value`
-    alone, as version 1 compiled it; a version 1 selection with no core is
-    exact; the seed is 0.
-
-    Raises:
-        PredictorError: `UnsupportedLockVersion` for a document that is not a
-            version 1 lock, `InvalidPredictor` for any version 1 lock out of
-            shape. Nothing else escapes, so a store upgrading many locks
-            can set aside each one that fails.
-    """
-    ensure(
-        type(value) is dict and value.get("lock_version") == 1,
-        "only a version 1 lock upgrades",
-        "UnsupportedLockVersion",
-    )
-    try:
-        return _upgraded(value)
-    except PredictorError:
-        raise
-    except (KeyError, TypeError, AttributeError, ValueError, RecursionError, Error):
-        # A version 1 field out of shape fails wherever it is first read.
-        raise PredictorError(
-            "InvalidPredictor", "the version 1 lock is out of shape"
-        ) from None
-
-
-def _upgraded(value: dict[str, Any]) -> dict[str, Any]:
-    old = fields(value, {"lock_version", "predictor", "model"})
-    ensure(type(old["predictor"]) is dict, "the lock's predictor must be an object")
-    ensure(type(old["model"]) is dict, "the lock's model must be an object")
-    source = dict(old["predictor"])
-    task = source["task"]
-    predictor: dict[str, Any] = {
-        key: source[key]
-        for key in ("name", "model", "model_digest", "task", "target", "target_type")
-    }
-    if "classes" in source:
-        predictor["classes"] = source["classes"]
-    if source.get("id") is not None:
-        predictor["id"] = source["id"]
-        predictor["id_type"] = source.get("id_type")
-    if source.get("time") is not None:
-        predictor["time"] = source["time"]
-        # A version 1 lock records no time kind; the rows a revision binds
-        # give it, as they give a request context's.
-        predictor["time_type"] = None
-    if source.get("series"):
-        predictor["series"] = list(source["series"])
-        predictor["series_types"] = [None] * len(source["series"])
-    if task == "forecast":
-        predictor["frequency"] = source.get("frequency")
-        predictor["horizon"] = source.get("horizon")
-        # Version 1 forecast every series of a predictor as one group.
-        predictor["related"] = []
-        predictor["quantiles"] = list(source.get("quantiles") or (0.1, 0.5, 0.9))
-        predictor["outputs"] = ["value", "quantiles"]
-    elif task == "regression":
-        predictor["quantiles"] = []
-        predictor["outputs"] = ["value"]
-    else:
-        predictor["outputs"] = ["label", "probabilities"]
-    predictor["inputs"] = [
-        {
-            "name": column["name"],
-            "type": column.get("type"),
-            "role": "input"
-            if task != "forecast"
-            else ("future" if column.get("role") == "future" else "past"),
-        }
-        for column in source["inputs"]
-    ]
-    predictor["context"] = dict(source["context"])
-    selection = source.get("selection") or {}
-    core = selection.get("core")
-    predictor["selection"] = (
-        SelectionInfo("exact", kind=selection.get("kind") or "stratified")
-        if core is None
-        else SelectionInfo(
-            "retrieved",
-            core=core,
-            neighbors=selection.get("neighbors") or 0,
-            kind=selection.get("kind") or "stratified",
-            recent=selection.get("recent"),
-        )
-    ).to_dict()
-    body = {
-        "lock_version": LOCK_VERSION,
-        "manifest": None,
-        "predictor": predictor,
-        "model": {"files": dict(old["model"].get("files") or {})},
-    }
-    return validate({"lock_version": LOCK_VERSION, "digest": lock_digest(body), **body})
-
-
 def read_lock(root: str | Path) -> dict[str, Any] | None:
-    """The previous `gf.lock` document, or None when there is no version 2 lock to compare with.
+    """The previous `gf.lock` document, or None when there is no current lock to compare with.
 
-    `gf check` rewrites a lock of another version.
+    `gf check` rewrites a lock of another format.
 
     Raises:
         InvalidInput: If `gf.lock` exists but is not readable YAML.
@@ -540,7 +439,7 @@ def _parsed(data: bytes) -> dict[str, Any]:
 
 
 def lock_document(root: str | Path) -> dict[str, Any]:
-    """The validated version 2 `gf.lock` in a predictor directory.
+    """The validated `gf.lock` in a predictor directory.
 
     Raises:
         InvalidInput: For no lock, a lock of another version (with the hint
@@ -694,7 +593,7 @@ def load_lock(root: str | Path, spec: PredictorSpec | None = None) -> Resolution
     resources) makes it stale.
 
     Raises:
-        InvalidInput: If there is no lock, it is not a version 2 lock, or it
+        InvalidInput: If there is no lock, it is not in the current format, or it
             was written for another manifest.
     """
     root = Path(root)
@@ -762,7 +661,6 @@ __all__ = [
     "manifest_digest",
     "read_lock",
     "resolution_of",
-    "upgrade",
     "validate",
     "write_lock",
 ]

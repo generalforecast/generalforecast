@@ -446,7 +446,7 @@ class Pushed:
     """What `push` sends for a checked predictor: its lock and its context rows.
 
     Attributes:
-        lock: The version 2 `gf.lock`, its resources included.
+        lock: The `gf.lock`, its resources included.
         snapshot: A snapshot predictor's context rows, exactly the rows the
             lock's context digest names: split, projected and normalized as
             `served_context` reads them. None for a request or live context.
@@ -472,7 +472,7 @@ def pushed(predictor: "str | Path") -> Pushed:
     never the snapshot file's query rows.
 
     Raises:
-        ServiceError: `LockRequired` for a missing, version 1 or stale lock;
+        ServiceError: `LockRequired` for a missing, stale or other-format lock;
             `ModelResolutionRequired` for a model `gf check` reported is not
             qualified for `gf push`; `SnapshotMismatch` for a snapshot that
             changed since `gf check`.

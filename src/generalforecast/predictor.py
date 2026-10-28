@@ -6,7 +6,7 @@
 A predictor is a catalog model, a target, inputs and a context. A local
 predictor's `gf.yaml` resolves as `gf check` resolves it, and an ad hoc
 predictor's settings resolve as the hosted ad hoc route resolves them, into
-a version 2 lock document. `run_local` compiles that document and binds its
+a lock document. `run_local` compiles that document and binds its
 context rows with `PredictorExecutor`, the executor hosted serving runs, so
 types, past and future covariates, `max_rows` and selection are honoured
 exactly as `gf serve` and hosted serving honour them. A served or hosted

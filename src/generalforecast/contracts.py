@@ -35,7 +35,7 @@ CONTEXT_KINDS = ("snapshot", "request", "live")
 
 @dataclass(frozen=True)
 class PredictorLock:
-    """A pushed `gf.lock` (version 2): the predictor's resolved intent, content-addressed.
+    """A pushed `gf.lock`: the predictor's resolved intent, content-addressed.
 
     The hosted plane keeps the document as `gf check` wrote it. `digest` is
     the lock's one identity, the document's own `digest` key, which revision
@@ -119,15 +119,13 @@ class PredictorLock:
 
 
 def parse_lock(value: Any) -> "PredictorLock":
-    """A pushed lock: the version 2 `gf.lock` of a catalog predictor.
+    """A pushed lock: the `gf.lock` of a catalog predictor.
 
-    A version 1 lock is refused with the hint to run `gf check`; the hosted
-    plane rewrites the version 1 locks it stored with
-    `generalforecast.predictors.lock.upgrade`.
+    A document in another format is refused with the hint to run `gf check`.
     """
     ensure(
         type(value) is dict and "predictor" in value,
-        "unsupported lock; run `gf check` to write a version 2 lock",
+        "gf.lock is not in the current format; run `gf check` to write it again",
         "UnsupportedLockVersion",
     )
     return PredictorLock.from_dict(value)

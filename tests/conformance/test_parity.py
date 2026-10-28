@@ -445,7 +445,7 @@ def _forge(root: Path, change: Any) -> None:
 
     document = yaml.safe_load((root / "gf.lock").read_text())
     change(document)
-    if document.get("lock_version") == 2:
+    if document.get("lock_version") == 1:
         document["digest"] = lock_digest(document)
     (root / "gf.lock").write_text(yaml.safe_dump(document, sort_keys=False))
 
@@ -460,7 +460,7 @@ FORGERIES = {
     "classes": lambda d: d["predictor"].update(classes=[0, 1, 2]),
     "resources": lambda d: d.update(resources={"accelerator": "L4"}),
     "context rows": lambda d: d["predictor"]["context"].update(rows=3),
-    "version 1": lambda d: d.update(lock_version=1),
+    "another format": lambda d: d.update(lock_version=2),
 }
 
 

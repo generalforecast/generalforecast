@@ -218,7 +218,7 @@ class ExecutionPlan:
 
     @classmethod
     def from_lock(cls, lock: Any) -> "ExecutionPlan":
-        """The plan a `gf.lock` (version 2) describes.
+        """The plan a `gf.lock` describes.
 
         Args:
             lock: A `contracts.PredictorLock` or its document.
@@ -336,7 +336,7 @@ class ExecutionPlan:
     def to_dict(self) -> dict:
         """A fresh normalized plan, the content its digest hashes."""
         return {
-            "plan_version": 2,
+            "plan_version": 1,
             "name": self.name,
             "model": self.model,
             "task": self.task,

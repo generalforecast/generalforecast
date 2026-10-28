@@ -847,7 +847,7 @@ class PredictorCommands:
         if _previous_lock(root) is None:
             raise Error(
                 "InvalidInput",
-                f"no version 2 {LOCK} in {_shown(root)}",
+                f"no current {LOCK} in {_shown(root)}",
                 hint="run `gf check` first",
             )
         checked = pushed(root)

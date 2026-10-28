@@ -3,7 +3,7 @@
 
 """The hosting API: what a hosted control plane builds on to serve gf predictors.
 
-A hosted plane stores pushed `gf.lock` documents (version 2) and their
+A hosted plane stores pushed `gf.lock` documents and their
 context rows, compiles and binds them with the same code `gf.Predictor` and
 `gf serve` run, and publishes revisions to gf-server. Everything it needs
 from gf is here, under these names; its modules import this one and no
@@ -13,8 +13,8 @@ The flow, for one revision:
 
 1. `parse_lock` the pushed document; `pin(lock.model).digest` must equal
    the lock's `model_digest`, and an uploaded snapshot's digest the lock's
-   `data_digest`. A stored version 1 lock is rewritten with `upgrade_lock`,
-   which raises `PredictorError` for any malformed document.
+   `data_digest`. A document in another format is refused, with the hint
+   to run `gf check`.
 2. Gather its rows: the uploaded snapshot for a snapshot context,
    `live_context(lock, snapshot)` for a live one, none for a request one.
 3. `served_context(lock, table)` gives the exact rows every path binds:
@@ -50,9 +50,8 @@ hosted plane may serve.
 Exports:
 
     Locks and revisions
-        PredictorLock, parse_lock, lock_digest, lock_name, upgrade_lock:
-            a pushed version 2 lock, read and identified; a stored version 1
-            lock rewritten.
+        PredictorLock, parse_lock, lock_digest, lock_name: a pushed lock,
+            read and identified.
         document_digest: a lock document's own digest, of its canonical
             JSON without the `digest` key; a valid lock's `digest` is it.
         Revision, Environment, PromoteRequest: a predictor's revisions and
@@ -93,7 +92,7 @@ Exports:
             SourcePin, SourceRecord: the ports and records a plane
             implements or passes through.
 
-Compatibility: these names, their signatures and the `gf.lock` version 2
+Compatibility: these names, their signatures and the `gf.lock`
 format are stable within a minor version of `generalforecast`; a change to
 any of them is a minor-version change with a migration note, and the
 recorded surface (`tests/conformance/test_hosting.py`) changes with it.
@@ -128,7 +127,6 @@ from generalforecast.models.catalog import (
 )
 from generalforecast.models.catalog import parse as parse_model
 from generalforecast.predictors.lock import lock_digest as document_digest
-from generalforecast.predictors.lock import upgrade as upgrade_lock
 from generalforecast.predictors.models import CatalogResolver, ModelPin
 from generalforecast.predictors.runtime import CONTEXT_ROWS_KEY, PredictorExecutor
 from generalforecast.predictors.runtime.compile import compile_lock
@@ -325,7 +323,6 @@ __all__ = [
     "text",
     "to_arrow",
     "unique_object",
-    "upgrade_lock",
 ]
 
 

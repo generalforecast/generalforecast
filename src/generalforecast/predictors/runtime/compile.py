@@ -81,7 +81,7 @@ def compile_lock(
     the `verified` admission every local entry point applies.
 
     Args:
-        lock: A `contracts.PredictorLock`, or a version 2 lock document.
+        lock: A `contracts.PredictorLock`, or a lock document.
         table: For a snapshot, the context rows the lock's context digest
             names (`context.served_context` reads them from a snapshot file);
             for a live context, its captured rows; None for a request

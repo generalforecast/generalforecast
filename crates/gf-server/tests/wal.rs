@@ -99,8 +99,8 @@ fn an_incompatible_storage_header_is_rejected_without_rewriting() {
     drop(written(&path, &[]));
     let original = std::fs::read(&path).unwrap();
     assert_eq!(&original[..6], b"GF_LOG");
-    assert_eq!(original[6], 4);
-    for (offset, value) in [(0, b'X'), (6, 3)] {
+    assert_eq!(original[6], 1);
+    for (offset, value) in [(0, b'X'), (6, 2)] {
         let mut incompatible = original.clone();
         incompatible[offset] = value;
         std::fs::write(&path, &incompatible).unwrap();

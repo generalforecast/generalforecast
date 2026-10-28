@@ -96,7 +96,6 @@ RECORDED = (
     "text",
     "to_arrow",
     "unique_object",
-    "upgrade_lock",
 )
 
 

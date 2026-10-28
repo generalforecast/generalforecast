@@ -133,7 +133,7 @@ def _verified(
 
 
 def read_lock(path: Path) -> dict[str, Any]:
-    """A predictor's `gf.lock`, validated as a version 2 lock.
+    """A predictor's `gf.lock`, validated as the current format.
 
     Raises:
         PredictorError: `LockRequired` for a lock of another version, with

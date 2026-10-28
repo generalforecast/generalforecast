@@ -32,7 +32,7 @@ MAX_FRAME_BYTES = 1 << 33
 # The most buffers one frame may claim.
 MAX_BUFFERS = 1 << 20
 # The version of the frames, which the server checks when a worker connects.
-PROTOCOL_VERSION = 14
+PROTOCOL_VERSION = 1
 
 
 @dataclass(frozen=True)

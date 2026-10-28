@@ -366,7 +366,7 @@ paths:
                           target_type: "0/1"
                           classes: [0, 1]
                           id: customer_id
-                          lock_digest: sha256:48dd695891fef75de34e61338027fb033a48c2bb2221f9336a5c3e06d99df7b7
+                          lock_digest: sha256:761724ce8080b6f6e1a2257adaff9c5b3f2434127f2b27b6d13ac3cf4c86777c
                           inputs:
                             - {name: spend, type: float, role: input}
                             - {name: plan, type: category, role: input}
@@ -448,7 +448,7 @@ paths:
                       target_type: "0/1"
                       classes: [0, 1]
                       id: customer_id
-                      lock_digest: sha256:48dd695891fef75de34e61338027fb033a48c2bb2221f9336a5c3e06d99df7b7
+                      lock_digest: sha256:761724ce8080b6f6e1a2257adaff9c5b3f2434127f2b27b6d13ac3cf4c86777c
                       inputs:
                         - {name: spend, type: float, role: input}
                         - {name: plan, type: category, role: input}
@@ -1054,7 +1054,7 @@ paths:
                     resource: {kind: predictor, name: churn}
                     result:
                       revisions:
-                        - {predictor: churn, number: 7, predictor_digest: sha256:48dd695891fef75de34e61338027fb033a48c2bb2221f9336a5c3e06d99df7b7, model: general-forecast/tabicl-v2-classifier, created_at: 1761300000.0, status: ready}
+                        - {predictor: churn, number: 7, predictor_digest: sha256:761724ce8080b6f6e1a2257adaff9c5b3f2434127f2b27b6d13ac3cf4c86777c, model: general-forecast/tabicl-v2-classifier, created_at: 1761300000.0, status: ready}
     post:
       operationId: revisions.register
       tags: [hosted]
@@ -1081,8 +1081,8 @@ paths:
                   resource: {kind: predictor, name: churn}
                   payload:
                     lock:
-                      lock_version: 2
-                      digest: sha256:82e622176a6ff9bbbf524b7805b72f5674832b67a1cd6028a3635f7bd3c8bb83
+                      lock_version: 1
+                      digest: sha256:b8858e48496369e48c8593d5808e8721f7b9d39fc9668bb2184230823c787da9
                       manifest: sha256:1f3e5d7c9b1a3f5e7d9c1b3a5f7e9d1c3b5a7f9e1d3c5b7a9f1e3d5c7b9a1f3e
                       predictor:
                         name: churn
@@ -1118,7 +1118,7 @@ paths:
                     project: acme
                     request_id: r-8091a2b3c4d5e6f708192a3b4c5d6e7f
                     resource: {kind: predictor, name: churn}
-                    result: {predictor: churn, number: 8, predictor_digest: sha256:82e622176a6ff9bbbf524b7805b72f5674832b67a1cd6028a3635f7bd3c8bb83, model: general-forecast/tabicl-v2-classifier, created_at: 1761400000.0, status: pending}
+                    result: {predictor: churn, number: 8, predictor_digest: sha256:b8858e48496369e48c8593d5808e8721f7b9d39fc9668bb2184230823c787da9, model: general-forecast/tabicl-v2-classifier, created_at: 1761400000.0, status: pending}
 
   /v1/projects/{project}/predictors/{name}/revisions/{number}:
     get:
@@ -1147,10 +1147,10 @@ paths:
                     request_id: r-91a2b3c4d5e6f708192a3b4c5d6e7f80
                     resource: {kind: predictor, name: churn}
                     result:
-                      revision: {predictor: churn, number: 7, predictor_digest: sha256:48dd695891fef75de34e61338027fb033a48c2bb2221f9336a5c3e06d99df7b7, model: general-forecast/tabicl-v2-classifier, created_at: 1761300000.0, status: ready}
+                      revision: {predictor: churn, number: 7, predictor_digest: sha256:761724ce8080b6f6e1a2257adaff9c5b3f2434127f2b27b6d13ac3cf4c86777c, model: general-forecast/tabicl-v2-classifier, created_at: 1761300000.0, status: ready}
                       lock:
-                        lock_version: 2
-                        digest: sha256:48dd695891fef75de34e61338027fb033a48c2bb2221f9336a5c3e06d99df7b7
+                        lock_version: 1
+                        digest: sha256:761724ce8080b6f6e1a2257adaff9c5b3f2434127f2b27b6d13ac3cf4c86777c
                         manifest: sha256:1f3e5d7c9b1a3f5e7d9c1b3a5f7e9d1c3b5a7f9e1d3c5b7a9f1e3d5c7b9a1f3e
                         predictor:
                           name: churn
@@ -4399,19 +4399,16 @@ components:
     Lock:
       type: object
       description: |
-        gf.lock, version 2: what gf check resolved gf.yaml into. `digest` is
-        the canonical JSON digest of the document without `digest`, the one
+        gf.lock: what gf check resolved gf.yaml into. `digest` is the
+        canonical JSON digest of the document without `digest`, the one
         identity of a predictor revision; `manifest` the digest of the
-        normalized gf.yaml it resolves, null for an upgraded version 1 lock
+        normalized gf.yaml it resolves
       required: [lock_version, digest, manifest, predictor, model]
       additionalProperties: false
       properties:
-        lock_version: {type: integer, const: 2}
+        lock_version: {type: integer, const: 1}
         digest: {$ref: "#/components/schemas/Digest"}
-        manifest:
-          oneOf:
-            - $ref: "#/components/schemas/Digest"
-            - type: "null"
+        manifest: {$ref: "#/components/schemas/Digest"}
         predictor: {$ref: "#/components/schemas/Resolution"}
         resources: {$ref: "#/components/schemas/LockResources"}
         model: {$ref: "#/components/schemas/LockedModel"}
