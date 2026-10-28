@@ -225,7 +225,8 @@ jobs:
 
   # Tests marked server or router start gf-server and gf-router processes;
   # those also marked slow run here, in five parts beside the other jobs
-  # rather than after them, and only when what they exercise changed.
+  # rather than after them, and only when what they exercise changed. Three
+  # workers leave a core to the servers, whose failover waits on timers.
   serving:
     needs: changes
     if: needs.changes.outputs.serving == 'true'
@@ -255,7 +256,7 @@ jobs:
           key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
           restore-keys: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-
       - run: >-
-          uv run pytest -m "(server or router) and slow" -n auto
+          uv run pytest -m "(server or router) and slow" -n 3
           --shard ${{ matrix.part }}/5 --durations=10
           -o faulthandler_timeout=600
       # Saved from runs outside pull requests, so those cannot crowd out main's.
