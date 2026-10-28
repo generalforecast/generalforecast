@@ -126,9 +126,10 @@ def _fresh(
         at = [f for f in step.forecasts if f.request == forecast.request].index(
             forecast
         )
+        # The worker rearranges a forecast's quantiles in ascending order.
         np.testing.assert_allclose(
             predictions[forecast.request][at],
-            outputs[forecast.target * 2],
+            np.sort(outputs[forecast.target * 2], axis=-1),
             rtol=1e-4,
             atol=1e-4,
         )
@@ -185,7 +186,8 @@ def _expected(
         None if future_observed is None else jnp.asarray(future_observed),
     )
     outputs = np.asarray(functions.forecast(parameters, group, horizon))
-    return outputs[[0, 2]]
+    # The worker rearranges a forecast's quantiles in ascending order.
+    return np.sort(outputs[[0, 2]], axis=-1)
 
 
 CASES = [
