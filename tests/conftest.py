@@ -68,22 +68,38 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+def _unit(item: pytest.Item) -> str:
+    """The tests that go to one part: a module's that share one of its fixtures, else one."""
+    info = getattr(item, "_fixtureinfo", None)
+    shared = info is not None and any(
+        definitions[-1].scope == "module"
+        for definitions in info.name2fixturedefs.values()
+    )
+    return item.nodeid.split("::")[0] if shared else item.nodeid
+
+
 class _Shard:
-    """Keeps every N-th selected test, from the K-th on, under `--shard K/N`."""
+    """Keeps the K-th of N parts of the selected tests under `--shard K/N`."""
 
     def __init__(self, part: int, count: int) -> None:
         self.part, self.count = part, count
 
-    # Last, so the parts split what `-m` and `-k` selected; every N-th of the
-    # collection order, so each part takes a share of every file.
+    # Last, so the parts split what `-m` and `-k` selected. Tests sharing a
+    # module's fixture stay together, so one part sets it up; the largest
+    # units go first, each to the part with the fewest tests yet.
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(
         self, config: pytest.Config, items: list[pytest.Item]
     ) -> None:
-        kept, left = [], []
-        for position, item in enumerate(items):
-            (kept if position % self.count == self.part - 1 else left).append(item)
-        items[:] = kept
+        units: dict[str, list[pytest.Item]] = {}
+        for item in items:
+            units.setdefault(_unit(item), []).append(item)
+        parts: list[list[pytest.Item]] = [[] for _ in range(self.count)]
+        for unit in sorted(units.values(), key=len, reverse=True):
+            min(parts, key=len).extend(unit)
+        kept = {id(item) for item in parts[self.part - 1]}
+        left = [item for item in items if id(item) not in kept]
+        items[:] = [item for item in items if id(item) in kept]
         config.hook.pytest_deselected(items=left)
 
 

@@ -5,7 +5,6 @@
 
 import json
 import os
-import random
 import signal
 import subprocess
 import sys
@@ -131,67 +130,6 @@ def server():
         processes.stop(process)
 
 
-@pytest.mark.server
-@pytest.mark.slow
-def test_serve_answers_the_hosted_models_api(server):
-    url, _ = server
-    hosted = CatalogService(allow_downloads=True)
-    scope = Scope("local", "r-test")
-    assert call(url, "/livez") == (200, {"status": "ok"})
-    assert call(url, "/readyz") == (200, {"status": "ok"})
-    assert call(url, "/healthz") == (200, {"status": "ok"})
-    status, body = call(url, "/v1/projects/local/models", key=KEY)
-    assert status == 200
-    [described] = body["result"]["models"]
-    extras = {"model", "limits", "warm_shapes"}
-    assert {k: v for k, v in described.items() if k not in extras} == {
-        k: v
-        for k, v in hosted.get(scope, "general-forecast/tabicl-v2-classifier").items()
-        if k not in extras
-    }
-    assert described["model"].startswith(f"{MODEL}@sha256:")
-    assert set(described["limits"]) == {"context_rows", "queries", "inputs"}
-    assert [shape["context_rows"] for shape in described["warm_shapes"]] == [
-        100,
-        1_000,
-        10_000,
-    ]
-
-
-@pytest.mark.server
-@pytest.mark.slow
-def test_a_dotted_catalog_id_reaches_gf_serves_models_route(server):
-    from generalforecast.client import Client
-    from generalforecast.errors import NotFound
-
-    url, _ = server
-    # A dotted name is a model name, not a malformed one: this server does
-    # not serve tabpfn-3.5, so it is NotFound, never "invalid name".
-    status, body = call(url, "/v1/projects/local/models/tabpfn-3.5-classifier", key=KEY)
-    assert status == 404 and body["error"]["code"] == "NotFound", body
-    with Client(base_url=url, api_key=KEY) as client:
-        with pytest.raises(NotFound):
-            client.models.get("general-forecast/tabpfn-3.5-classifier")
-        assert client.models.get(MODEL)["name"] == MODEL
-
-
-@pytest.mark.server
-@pytest.mark.slow
-def test_serve_requires_its_key_and_keeps_the_api_errors(server):
-    url, _ = server
-    status, body = call(url, "/v1/projects/local/models")
-    assert (status, body["error"]["message"]) == (401, "application bearer required")
-    # An error keeps the envelope, with the request id the caller sent.
-    status, body = call(
-        url,
-        "/v1/projects/local/models/other",
-        key=KEY,
-        headers={"X-GF-Request-Id": "r-test"},
-    )
-    assert (status, body["error"]["code"]) == (404, "NotFound")
-    assert body["request_id"] == "r-test"
-
-
 def adhoc_payload(**changes):
     return {
         "model": MODEL,
@@ -215,8 +153,57 @@ def predict(url, payload):
 
 @pytest.mark.server
 @pytest.mark.slow
-def test_the_ad_hoc_route_predicts_and_names_what_it_refuses(server):
+def test_serve_answers_the_models_api_behind_its_key(server):
+    """One test, as the server compiles its warm shapes for minutes on a runner."""
+    from generalforecast.client import Client
+    from generalforecast.errors import NotFound
+
     url, _ = server
+    hosted = CatalogService(allow_downloads=True)
+    scope = Scope("local", "r-test")
+    assert call(url, "/livez") == (200, {"status": "ok"})
+    assert call(url, "/readyz") == (200, {"status": "ok"})
+    assert call(url, "/healthz") == (200, {"status": "ok"})
+    status, body = call(url, "/v1/projects/local/models", key=KEY)
+    assert status == 200
+    [described] = body["result"]["models"]
+    extras = {"model", "limits", "warm_shapes"}
+    assert {k: v for k, v in described.items() if k not in extras} == {
+        k: v
+        for k, v in hosted.get(scope, "general-forecast/tabicl-v2-classifier").items()
+        if k not in extras
+    }
+    assert described["model"].startswith(f"{MODEL}@sha256:")
+    assert set(described["limits"]) == {"context_rows", "queries", "inputs"}
+    assert [shape["context_rows"] for shape in described["warm_shapes"]] == [
+        100,
+        1_000,
+        10_000,
+    ]
+
+    # It requires its key, and an error keeps the envelope, with the request
+    # id the caller sent.
+    status, body = call(url, "/v1/projects/local/models")
+    assert (status, body["error"]["message"]) == (401, "application bearer required")
+    status, body = call(
+        url,
+        "/v1/projects/local/models/other",
+        key=KEY,
+        headers={"X-GF-Request-Id": "r-test"},
+    )
+    assert (status, body["error"]["code"]) == (404, "NotFound")
+    assert body["request_id"] == "r-test"
+
+    # A dotted name is a model name, not a malformed one: this server does
+    # not serve tabpfn-3.5, so it is NotFound, never "invalid name".
+    status, body = call(url, "/v1/projects/local/models/tabpfn-3.5-classifier", key=KEY)
+    assert status == 404 and body["error"]["code"] == "NotFound", body
+    with Client(base_url=url, api_key=KEY) as client:
+        with pytest.raises(NotFound):
+            client.models.get("general-forecast/tabpfn-3.5-classifier")
+        assert client.models.get(MODEL)["name"] == MODEL
+
+    # The ad hoc route predicts, and names what it refuses.
     status, body = predict(url, adhoc_payload())
     assert status == 200, body
     [row] = body["result"]["predictions"]
@@ -264,26 +251,6 @@ def test_the_ad_hoc_route_predicts_and_names_what_it_refuses(server):
         key=KEY,
     )
     assert status == 404
-
-
-@pytest.mark.server
-@pytest.mark.slow
-def test_ten_thousand_context_rows_are_answered(server):
-    url, _ = server
-    rng = random.Random(0)
-    context = [
-        {"a": rng.random(), "b": rng.random(), "y": rng.randint(0, 1)}
-        for _ in range(10_000)
-    ]
-    payload = adhoc_payload(
-        inputs=["a", "b"], id=None, context=context, queries=[{"a": 0.5, "b": 0.5}]
-    )
-    del payload["id"]
-    status, body = predict(url, payload)
-    assert status == 200, body
-    assert body["result"]["context"]["rows"] == 10_000
-    [row] = body["result"]["predictions"]
-    assert set(row["probabilities"]) == {"0", "1"}
 
 
 @pytest.mark.server

@@ -32,7 +32,7 @@ from tests.utils.server import (
 pytestmark = pytest.mark.router
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture(scope="session")
 def binaries() -> tuple[Path, Path]:
     return build(), build_router()
 
