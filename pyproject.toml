@@ -127,7 +127,7 @@ addopts = ["--import-mode=importlib"]
 markers = [
     "server: starts gf-server processes",
     "router: starts gf-router and gf-server processes",
-    "slow: compiles models or starts servers; CI runs the server and router ones in a job of their own, and the weekly workflow runs them all",
+    "slow: compiles models or starts servers; CI runs these in jobs of their own, split over runners with --shard",
     "conformance: replays api/openapi.yaml examples against GF_CONFORMANCE_URL; deselected when it is unset",
 ]
 

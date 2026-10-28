@@ -14,7 +14,9 @@ path. That override is for development and tests alone.
 
 ## Checks
 
-`uv run pytest -m "not slow" -n auto` runs the fast suite, and
+`uv run pytest -m "not slow" -n auto` runs the fast suite, `-m slow` the
+tests that compile models or start servers, and `--shard K/N` the K-th of N
+parts of whatever is selected, as CI splits it over runners;
 `tests/test_repository.py` holds every tracked file to the repository's
 conventions. A test that starts a server is marked `server` (or `router`);
 one that is not cannot start one.

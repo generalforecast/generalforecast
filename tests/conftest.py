@@ -24,8 +24,8 @@ jax.config.update("jax_default_matmul_precision", "highest")
 # most compiles.
 use_compile_cache()
 
-# Tests that compile models or start servers; CI leaves them out, since its
-# 2-core runner takes most of an hour on them, and a plain pytest runs them.
+# Tests that compile models or start servers; CI runs them in jobs of their
+# own, split over runners, and a plain pytest runs them.
 SLOW = (
     "tests/models/",
     "tests/test_estimators.py",
@@ -58,6 +58,43 @@ def pytest_collection_modifyitems(
     for item in marked:
         items.remove(item)
     config.hook.pytest_deselected(items=marked)
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--shard",
+        metavar="K/N",
+        help="run the K-th of N parts of the selected tests, as CI's runners split them",
+    )
+
+
+class _Shard:
+    """Keeps every N-th selected test, from the K-th on, under `--shard K/N`."""
+
+    def __init__(self, part: int, count: int) -> None:
+        self.part, self.count = part, count
+
+    # Last, so the parts split what `-m` and `-k` selected; every N-th of the
+    # collection order, so each part takes a share of every file.
+    @pytest.hookimpl(trylast=True)
+    def pytest_collection_modifyitems(
+        self, config: pytest.Config, items: list[pytest.Item]
+    ) -> None:
+        kept, left = [], []
+        for position, item in enumerate(items):
+            (kept if position % self.count == self.part - 1 else left).append(item)
+        items[:] = kept
+        config.hook.pytest_deselected(items=left)
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    shard = config.getoption("shard")
+    if shard is None:
+        return
+    part, _, count = shard.partition("/")
+    if not (part.isdigit() and count.isdigit() and 1 <= int(part) <= int(count)):
+        raise pytest.UsageError(f"--shard takes K/N with 1 <= K <= N, not {shard!r}")
+    config.pluginmanager.register(_Shard(int(part), int(count)), "gf-shard")
 
 
 @pytest.fixture(scope="session")

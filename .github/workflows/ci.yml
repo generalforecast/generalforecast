@@ -9,10 +9,11 @@ name: CI
 # - pushes to main, unless the merged PR already passed on the same tree;
 # - from release.yml, which runs every job before it builds wheels.
 # Changes to documentation alone run nothing, and each job but the Python
-# checks runs only when code it checks changes. The server and router
+# checks and tests runs only when code it checks changes. The server and router
 # integration tests, which build both binaries and start processes, run
-# whenever the Rust crates or the Python they serve change. The other tests
-# marked slow, which compile models, run weekly in weekly.yml.
+# whenever the Rust crates or the Python they serve change. Every test runs
+# here, split over runners so that each job takes about eight minutes; only
+# the reference parity tests, which need the gated checkpoints, run weekly.
 on:
   push:
     branches: [main]
@@ -75,9 +76,9 @@ jobs:
             echo "called to run every job"
           elif [ "$EVENT" = pull_request ]; then
             files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')
-            grep -qE '^(crates/|Cargo\.|rust-toolchain|tests/product_cli/|\.github/workflows/ci\.yml)|^src/generalforecast/[^/]*$|^src/generalforecast/(service|predictors)/' <<<"$files" || rust=false
+            grep -qE '^(crates/|Cargo\.|rust-toolchain|\.github/workflows/ci\.yml)' <<<"$files" || rust=false
             # The binaries, the Python workers and engine they start, and the tests' harness.
-            grep -qE '^(crates/|Cargo\.|rust-toolchain|src/generalforecast/|tests/(conftest|test_server|test_router|test_remote|test_placement|test_estimators)\.py|tests/(utils|models)/|pyproject\.toml|uv\.lock|\.github/workflows/ci\.yml)' <<<"$files" || serving=false
+            grep -qE '^(crates/|Cargo\.|rust-toolchain|src/generalforecast/|tests/(conftest|test_server|test_router|test_remote|test_placement|test_estimators|test_cli)\.py|tests/(utils|models|serve)/|pyproject\.toml|uv\.lock|\.github/workflows/ci\.yml)' <<<"$files" || serving=false
             grep -qE '^(clients/typescript/|api/|\.github/workflows/ci\.yml)' <<<"$files" || typescript=false
           elif [ "$EVENT" = push ]; then
             # A merge whose tree is the PR head's repeats checks that passed.
@@ -89,8 +90,10 @@ jobs:
                 passed=false
                 for run in $(gh api "repos/$REPO/actions/runs?head_sha=$head&event=pull_request" \
                     --jq '.workflow_runs[] | select(.name == "CI" and .conclusion == "success") | .id'); do
+                  # Every part of the Python tests ran and passed.
                   if gh api "repos/$REPO/actions/runs/$run/jobs" \
-                      --jq '.jobs[] | select(.name == "python") | .conclusion' | grep -qx success; then
+                      --jq '[.jobs[] | select(.name | startswith("python")) | .conclusion]
+                        | length > 0 and all(. == "success")' | grep -qx true; then
                     passed=true
                   fi
                 done
@@ -127,46 +130,81 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       # gf-py's test binary would link against libpython; the Python job
       # tests the extension it builds instead.
+      # The Python job runs the CLI's tests, tests/product_cli among them,
+      # whenever this one runs.
       - run: cargo test --workspace --exclude gf-py
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-        with:
-          version: "0.8.0"
-      - run: uv sync --locked
-      - run: uv run pytest tests/product_cli -m "not slow"
 
+  # The checks, and the tests not marked slow in two parts, each on its own
+  # runner's four cores.
   python:
     needs: changes
     if: needs.changes.outputs.python == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: python scripts/spdx.py --check
-      # uv sync builds the Rust extension.
+      - if: matrix.part == 1
+        run: python scripts/spdx.py --check
+      # uv sync builds the Rust extension, as the slow job's does.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          shared-key: python
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: "0.8.0"
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run ty check
-      # Tests that compile models or start servers are marked slow and run
-      # weekly; the rest run on both cores.
-      - run: uv run pytest -m "not slow" -n auto
+      - if: matrix.part == 1
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+          uv run ty check
+      - run: uv run pytest -m "not slow" -n auto --shard ${{ matrix.part }}/2
 
-  # Tests marked server or router start gf-server and gf-router processes,
-  # which they build; those also marked slow are left out of the Python job.
-  # They take about half an hour on two cores, beside the other jobs rather
-  # than after them, and only when what they exercise changed.
+  # The tests marked slow that start no server, which compile the tiny
+  # models, in four parts. Three workers a runner: each local client's cache
+  # tiers take a share of the runner's memory, and four ran it out.
+  slow:
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: python
+          save-if: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.8.0"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: >-
+          uv run pytest -m "slow and not server and not router" -n 3
+          --shard ${{ matrix.part }}/4
+
+  # Tests marked server or router start gf-server and gf-router processes;
+  # those also marked slow run here, in four parts beside the other jobs
+  # rather than after them, and only when what they exercise changed.
   serving:
     needs: changes
     if: needs.changes.outputs.serving == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4]
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -178,7 +216,9 @@ jobs:
           enable-cache: true
       - run: uv sync --locked
       - run: cargo build -p gf-server -p gf-router
-      - run: uv run pytest -m "(server or router) and slow" -n auto
+      - run: >-
+          uv run pytest -m "(server or router) and slow" -n auto
+          --shard ${{ matrix.part }}/4
 
   # Replays api/openapi.yaml's examples, and checks real predictions'
   # meaning, against a gf serve stack on the tiny test models, so a reply

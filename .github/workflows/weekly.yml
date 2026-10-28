@@ -1,7 +1,7 @@
 name: Weekly
 
-# Tests marked slow compile models or start servers, so they run once a week
-# instead of on every pull request.
+# The reference parity tests, which need the gated checkpoints and download
+# the upstream models; every other test runs in ci.yml.
 on:
   schedule:
     - cron: "0 7 * * 1"
@@ -15,29 +15,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Two runners, two workers each: the model tests alone reach 8 GB at two
-  # workers, so four on one runner ran it out of memory.
-  slow:
-    strategy:
-      fail-fast: false
-      matrix:
-        tests:
-          - tests/models
-          - --ignore=tests/models
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: false
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-        with:
-          version: "0.8.0"
-          enable-cache: true
-      - run: uv sync --locked
-      - run: uv run pytest -m slow -n 2 ${{ matrix.tests }}
-
   # The reference parity tests run each model upstream and in
   # generalforecast on one table; they need the reference dependency group
   # and the gated checkpoints, so they run here, required to run, not skip.
@@ -45,7 +22,7 @@ jobs:
   # at once, and two such pairs outgrow the runner's memory.
   reference:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
