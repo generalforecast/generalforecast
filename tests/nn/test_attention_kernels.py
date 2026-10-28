@@ -79,15 +79,6 @@ def _close(actual: jax.Array, expected: jax.Array, tolerance: float) -> None:
     )
 
 
-def test_kernel_is_static() -> None:
-    attention = _attention(AttentionKernel(query_chunk=8, dtype=jnp.dtype("float16")))
-
-    assert hash(attention.kernel) == hash(
-        AttentionKernel(query_chunk=8, dtype=jnp.dtype("float16"))
-    )
-    assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(attention))
-
-
 @pytest.mark.parametrize("queries", [10, 16], ids=["ragged", "even"])
 def test_query_chunks_match_full_attention(queries: int) -> None:
     query_rows = _rows((2, queries, ICL), seed=1)

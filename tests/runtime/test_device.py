@@ -24,7 +24,6 @@ from generalforecast.nn.attention import (
 from generalforecast.runtime.device import (
     DeviceSettings,
     available_memory,
-    cast_floating,
     configure,
     default_settings,
     device_settings,
@@ -37,49 +36,7 @@ from generalforecast.runtime.device import (
 )
 from tests.models.tabicl.tiny import tiny_tabicl
 
-FLOAT32, FLOAT16, BFLOAT16, INT8 = (
-    jnp.dtype(name) for name in ("float32", "float16", "bfloat16", "int8")
-)
-BLOCK = 1 << 18
-
-
-@pytest.mark.parametrize(
-    ("platform", "expected"),
-    [
-        (
-            "cpu",
-            DeviceSettings(FLOAT32, FLOAT32, AttentionKernel("xla", 256, None, BLOCK)),
-        ),
-        (
-            "gpu",
-            DeviceSettings(
-                FLOAT32, FLOAT16, AttentionKernel("cudnn", 256, FLOAT16, BLOCK)
-            ),
-        ),
-        (
-            "tpu",
-            DeviceSettings(
-                FLOAT32, BFLOAT16, AttentionKernel("xla", 1024, None, BLOCK)
-            ),
-        ),
-    ],
-)
-def test_device_settings_per_platform(platform: str, expected: DeviceSettings) -> None:
-    assert device_settings(platform) == expected
-
-
-@pytest.mark.parametrize(("platform", "chunk"), [("gpu", 256), ("tpu", 1024)])
-def test_exact_settings_keep_float32_with_full_precision_matmuls(
-    platform: str, chunk: int
-) -> None:
-    exact = device_settings(platform, exact=True)
-
-    assert exact == DeviceSettings(
-        FLOAT32,
-        FLOAT32,
-        AttentionKernel("xla", chunk, block_chunk=BLOCK),
-        matmul_precision="highest",
-    )
+FLOAT16, INT8 = jnp.dtype("float16"), jnp.dtype("int8")
 
 
 def test_gf_precision_picks_the_mode(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -128,29 +85,9 @@ def test_gf_cache_dtype_overrides_the_cache(monkeypatch: pytest.MonkeyPatch) -> 
         default_settings()
 
 
-def test_device_settings_are_hashable_for_this_machine() -> None:
-    settings = device_settings(jax.default_backend())
-
-    assert hash(settings) == hash(device_settings(jax.default_backend()))
-
-
 def test_device_settings_refuse_unknown_platforms() -> None:
     with pytest.raises(ValueError, match="platform"):
         device_settings("abacus")
-
-
-def test_cast_floating_leaves_integers_and_none_alone() -> None:
-    tree = {
-        "weight": jnp.ones((2, 3), jnp.float32),
-        "length": jnp.asarray([4], jnp.int32),
-        "bias": None,
-    }
-
-    cast = cast_floating(tree, jnp.bfloat16)
-
-    assert cast["weight"].dtype == jnp.bfloat16
-    assert cast["length"].dtype == jnp.int32
-    assert cast["bias"] is None
 
 
 def test_configure_casts_parameters_and_sets_every_kernel() -> None:

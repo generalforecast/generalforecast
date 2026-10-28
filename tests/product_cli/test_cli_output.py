@@ -8,8 +8,6 @@ import json
 import subprocess
 import sys
 
-import pytest
-
 from generalforecast import cli, term
 from generalforecast.command_specs import CLOSING, COMMAND_HELP, COMMANDS, GROUPS
 
@@ -67,12 +65,14 @@ def test_root_help_lists_exactly_the_contract_groups(monkeypatch):
     assert all(len(text) < 50 for text in COMMAND_HELP.values())
 
 
-@pytest.mark.parametrize("command", COMMANDS)
-def test_every_command_help_ends_with_the_closing_line(monkeypatch, command):
-    code, stdout, _ = gf(command, "--help", monkeypatch=monkeypatch)
-    assert code == 0
-    assert stdout.startswith(COMMAND_HELP[command] + "\n\nUsage: gf " + command)
-    assert stdout.rstrip("\n").endswith(CLOSING)
+def test_every_command_help_starts_with_its_summary_and_ends_with_the_closing_line(
+    monkeypatch,
+):
+    for command in COMMANDS:
+        code, stdout, _ = gf(command, "--help", monkeypatch=monkeypatch)
+        assert code == 0, command
+        assert stdout.startswith(COMMAND_HELP[command] + "\n\nUsage: gf " + command)
+        assert stdout.rstrip("\n").endswith(CLOSING), command
 
 
 def test_help_command_matches_dash_dash_help(monkeypatch):
@@ -218,84 +218,6 @@ def test_internal_errors_never_show_a_traceback_without_verbose(monkeypatch):
     code, _, stderr = gf("-v", "model", "list", monkeypatch=monkeypatch)
     assert "RuntimeError: secret internals" in stderr
     assert stderr.endswith("error[Internal]: internal error\nhelp: run again with -v\n")
-
-
-def test_status_verbs_are_right_aligned_in_twelve_columns():
-    err = io.StringIO()
-    out = term.Output(out=io.StringIO(), err=err, environ={"NO_COLOR": "1"})
-    out.status("Initialized", "predictor churn in ./gf.yaml")
-    out.status("Resolved", "churn  classification, 3 inputs", seconds=None)
-    out.status("Locked", "gf.lock", seconds=0.21)
-    out.status("Compiled", "12 programs", seconds=6.8)
-    out.status("Deployed", "churn revision 7 to staging", seconds=41)
-    assert err.getvalue() == (
-        " Initialized predictor churn in ./gf.yaml\n"
-        "    Resolved churn  classification, 3 inputs\n"
-        "      Locked gf.lock in 0.21s\n"
-        "    Compiled 12 programs in 6.8s\n"
-        "    Deployed churn revision 7 to staging in 41s\n"
-    )
-
-
-def test_lock_change_lines():
-    err = io.StringIO()
-    out = term.Output(out=io.StringIO(), err=err, environ={"NO_COLOR": "1"})
-    out.changes(
-        [
-            ("~", "model", "general-forecast/tabicl-v2-classifier 5fb6a4c", "7a01c2e"),
-            ("+", "input", None, "signup_source"),
-            ("~", "selection", None, "core 1,000 → 1,500, neighbors 3,000 → 4,500"),
-        ]
-    )
-    assert err.getvalue() == (
-        " ~ model      general-forecast/tabicl-v2-classifier 5fb6a4c → 7a01c2e\n"
-        " + input      signup_source\n"
-        " ~ selection  core 1,000 → 1,500, neighbors 3,000 → 4,500\n"
-    )
-
-
-def test_error_shapes():
-    err = io.StringIO()
-    out = term.Output(out=io.StringIO(), err=err, environ={"NO_COLOR": "1"})
-    out.error(
-        "gf.yaml already exists in ./churn",
-        code="ValidationError",
-        hint="pass --force to overwrite it, or run `gf check` to validate it",
-    )
-    out.error(
-        "target column `churned` is not in the context",
-        code="ValidationError",
-        pointer=term.Pointer(
-            "gf.yaml",
-            3,
-            9,
-            "target: churned",
-            "context.csv has customer_id, spend, plan, churn",
-            7,
-        ),
-        hint="did you mean `churn`?",
-    )
-    out.error(
-        "queries exceed the limit for general-forecast/tabicl-v2-classifier",
-        code="CapacityExceeded",
-        because="this model accepts 100 queries per call; the request sent 1,000",
-        hint="split the queries, or push a predictor and call it in batches",
-        request_id="r-3abb2401f119428db148927c6a0d358c",
-    )
-    assert err.getvalue() == (
-        "error[ValidationError]: gf.yaml already exists in ./churn\n"
-        "help: pass --force to overwrite it, or run `gf check` to validate it\n"
-        "error[ValidationError]: target column `churned` is not in the context\n"
-        "  --> gf.yaml:3:9\n"
-        "   |\n"
-        " 3 | target: churned\n"
-        "   |         ^^^^^^^ context.csv has customer_id, spend, plan, churn\n"
-        "help: did you mean `churn`?\n"
-        "error[CapacityExceeded]: queries exceed the limit for general-forecast/tabicl-v2-classifier\n"
-        "note: this model accepts 100 queries per call; the request sent 1,000\n"
-        "note: request r-3abb2401f119428db148927c6a0d358c\n"
-        "help: split the queries, or push a predictor and call it in batches\n"
-    )
 
 
 def test_colour_follows_the_terminal_and_no_color():

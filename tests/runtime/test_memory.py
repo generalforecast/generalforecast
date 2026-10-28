@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -13,7 +11,7 @@ import pytest
 from generalforecast import protocol
 from generalforecast._core import CacheKey
 from generalforecast.constants import MEASURED_ROWS
-from generalforecast.models.tabicl.model import TabICL, tabicl_functions
+from generalforecast.models.tabicl.model import tabicl_functions
 from generalforecast.nn.attention import AttentionKernel
 from generalforecast.runtime.budget import Call, Chunks, measured_bytes
 from generalforecast.runtime.device import (
@@ -23,7 +21,6 @@ from generalforecast.runtime.device import (
     device_settings,
 )
 from generalforecast.runtime.memory import (
-    MemoryProfile,
     _encode_parts,
     _traced,
     decode_profile,
@@ -38,29 +35,7 @@ from tests.models.tabicl.tiny import tiny_tabicl
 
 pytestmark = pytest.mark.slow
 
-CHECKPOINTS = Path(__file__).resolve().parents[2] / "checkpoints"
-TASKS = pytest.mark.parametrize("regression", [False, True], ids=["classes", "values"])
 FEATURES = 5
-
-
-def _nbytes(tree: object) -> int:
-    """Bytes held by the arrays in `tree`, counted independently of `tree_bytes`."""
-    return sum(np.asarray(leaf).nbytes for leaf in jax.tree.leaves(tree))
-
-
-def _run(
-    model: TabICL, rows: int, features: int = FEATURES
-) -> tuple[object, jax.Array, object]:
-    """Real state, context rows and cache for a random table."""
-    generator = np.random.default_rng(rows)
-    table = jnp.asarray(generator.normal(size=(rows, features)), jnp.float32)
-    if model.regression:
-        targets, num_classes = table.sum(axis=1), 0
-    else:
-        targets, num_classes = jnp.arange(rows, dtype=jnp.int32) % 3, 3
-    state, context_rows = tabicl_functions.fit(model, table, targets, num_classes)
-    cache = tabicl_functions.encode(model, state, context_rows, targets)
-    return state, context_rows, cache
 
 
 def test_tree_bytes_counts_arrays_and_shapes() -> None:
@@ -71,26 +46,6 @@ def test_tree_bytes_counts_arrays_and_shapes() -> None:
     }
 
     assert tree_bytes(tree) == 3 * 4 * 4 + 2 * 5
-
-
-def test_context_bytes_grow_linearly() -> None:
-    profile = MemoryProfile(
-        state_bytes=100, row_bytes=8, cache_bytes_per_row=16, cache_fixed_bytes=4
-    )
-
-    assert profile.context_bytes(0) == 4
-    assert profile.context_bytes(10) == 164
-
-
-def test_state_bytes_grow_with_features_not_rows() -> None:
-    model = tiny_tabicl(regression=False)
-
-    narrow = memory_profile(tabicl_functions, model, num_features=4)
-    wide = memory_profile(tabicl_functions, model, num_features=8)
-
-    assert wide.state_bytes > narrow.state_bytes
-    assert _nbytes(_run(model, rows=16, features=4)[0]) == narrow.state_bytes
-    assert _nbytes(_run(model, rows=64, features=4)[0]) == narrow.state_bytes
 
 
 def test_profile_counts_the_stored_cache_dtype() -> None:

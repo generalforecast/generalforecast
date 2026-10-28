@@ -21,7 +21,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -36,7 +36,6 @@ from generalforecast.predictors.runtime import PredictorExecutor
 from generalforecast.serve import listener
 from generalforecast.serve import models as serve_models
 from generalforecast.service.boundary import Scope
-from generalforecast.service.contracts import ServiceError
 from generalforecast.tabular import arrow_bytes
 from tests.utils import processes
 from tests.utils.server import build, free_port
@@ -54,8 +53,6 @@ TINY = {
 # float32 sums: a few units in the last place of values in the single digits,
 # as these tables' are, never a different prediction.
 RELATIVE, ABSOLUTE = 1e-5, 1e-5
-
-Outcome = tuple[str, Any]
 
 
 @pytest.fixture(scope="module")
@@ -159,13 +156,6 @@ def servers(engine) -> Iterator[dict[str, Served]]:
     finally:
         for server in started.values():
             server.stop()
-
-
-def _outcome(call: Callable[[], Any]) -> Outcome:
-    try:
-        return "result", call()
-    except ServiceError as error:
-        return "error", (error.code, error.message, error.status)
 
 
 def _same(left: Any, right: Any, at: str = "") -> None:

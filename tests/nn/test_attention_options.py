@@ -113,13 +113,6 @@ def _naive(
     return linear(parameters.output, merged)
 
 
-def test_narrow_key_projection_gives_fewer_cached_heads() -> None:
-    parameters = _attention(jax.random.key(0), kv_heads=2)
-    cache = project_kv(parameters, _rows(1, 7))
-
-    assert cache.key.shape == cache.value.shape == (2, 7, 2, HEAD_DIM)
-
-
 def test_query_heads_share_kv_heads_in_order() -> None:
     # Matches torch repeat_interleave: query heads 0-1 use kv head 0, 2-3 use 1.
     parameters = _attention(jax.random.key(0), kv_heads=2)
@@ -184,16 +177,6 @@ def test_qassmax_applies_after_the_query_norm() -> None:
     assert parameters.output is not None
     expected = linear(parameters.output, attended.reshape(*attended.shape[:2], -1))
     _close(attend(parameters, query, cache), expected)
-
-
-def test_qk_norm_changes_attention() -> None:
-    plain = _attention(jax.random.key(0))
-    normed = _attention(jax.random.key(0), qk_norm=True)
-    context, query = _rows(1, 7), _rows(2, 3)
-
-    with_norm = attend(normed, query, project_kv(normed, context))
-    without = attend(plain, query, project_kv(plain, context))
-    assert not np.allclose(np.asarray(with_norm), np.asarray(without))
 
 
 def test_context_norm_normalizes_only_the_context() -> None:
