@@ -177,6 +177,26 @@ def close(actual: Any, expected: Any, tolerance: float = 1e-5) -> None:
     )
 
 
+def _forecasts_close(actual: Any, expected: Any, tolerance: float) -> None:
+    """Raises unless two forecasts match within `tolerance` at each series' scale.
+
+    A forecast near zero in a series that reaches tens carries float32's last
+    places at the series' scale, which a tolerance on each value alone misses,
+    so each row's allowance grows with its largest finite forecast, from 1.
+    """
+    expected = np.asarray(expected, dtype=np.float32)
+    size = np.where(np.isfinite(expected), np.abs(expected), 0)
+    scale = size.reshape(len(expected), -1).max(axis=1, initial=1.0)
+    scale = scale.reshape((-1,) + (1,) * (expected.ndim - 1))
+    # |a - e| <= tolerance * (scale + |e|), both sides over the row's scale.
+    np.testing.assert_allclose(
+        np.asarray(actual, dtype=np.float32) / scale,
+        expected / scale,
+        rtol=tolerance,
+        atol=tolerance,
+    )
+
+
 def _require(condition: bool, message: str) -> None:
     if not condition:
         raise AssertionError(message)
@@ -824,7 +844,7 @@ def _series_padding(functions, model, properties, tolerance):
     horizon = _long_horizon(properties)
     data = group(steps=4 * properties.patch, horizon=horizon)
     pad = padded_group(data, rows=5, steps=6 * properties.patch)
-    close(
+    _forecasts_close(
         functions.forecast(model, pad, horizon)[:3],
         functions.forecast(model, data, horizon),
         tolerance,
@@ -846,7 +866,7 @@ def _series_vmap(functions, model, properties, tolerance):
     batched = jax.vmap(lambda data: functions.forecast(model, data, horizon))(stacked)
     for index, data in enumerate(groups):
         rows = data.values.shape[0]
-        close(
+        _forecasts_close(
             batched[index, :rows], functions.forecast(model, data, horizon), tolerance
         )
 
@@ -856,7 +876,7 @@ def _series_jits(functions, model, properties, tolerance):
     data = group(steps=4 * properties.patch, horizon=properties.output_patch)
     horizon = properties.output_patch
     jitted = jax.jit(functions.forecast, static_argnums=2)
-    close(
+    _forecasts_close(
         jitted(model, data, horizon),
         functions.forecast(model, data, horizon),
         tolerance,
@@ -892,7 +912,7 @@ def _series_reuse(functions, model, properties, tolerance):
             f"a cache leaf of shape {leaf.shape} became {grown.shape} with one more "
             "patch; leaves grow on their first axis or not at all",
         )
-    close(
+    _forecasts_close(
         functions.decode(model, cache, horizon),
         functions.forecast(model, data, horizon),
         tolerance,
@@ -905,7 +925,7 @@ def _series_reuse(functions, model, properties, tolerance):
             jax.tree.leaves(cache), jax.tree.leaves(longer), strict=True
         )
     ]
-    close(
+    _forecasts_close(
         functions.decode(model, paged_series(cache, grows, 3), horizon),
         functions.decode(model, cache, horizon),
         tolerance,
@@ -951,7 +971,7 @@ def _series_reuse(functions, model, properties, tolerance):
     added = SeriesGroup(data.values[:, -patch:], data.observed[:, -patch:], data.roles)
     grown = functions.extend(model, functions.encode(model, shorter), added)
     close(grown, functions.encode(model, data), tolerance)
-    close(
+    _forecasts_close(
         functions.decode(model, grown, horizon),
         functions.forecast(model, data, horizon),
         tolerance,

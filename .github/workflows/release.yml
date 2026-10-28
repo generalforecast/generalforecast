@@ -34,6 +34,8 @@ jobs:
     uses: ./.github/workflows/weekly.yml
     permissions:
       contents: read
+    secrets:
+      HF_TOKEN: ${{ secrets.HF_TOKEN }}
 
   version:
     runs-on: ubuntu-24.04

@@ -15,6 +15,10 @@ on:
         description: Run in a concurrency group of this run's own
         type: boolean
         default: true
+    secrets:
+      HF_TOKEN:
+        description: Reads the gated checkpoints the reference tests compare
+        required: false
 
 permissions:
   contents: read
@@ -44,6 +48,8 @@ jobs:
   # The reference parity tests run each model upstream and in
   # generalforecast on one table; they need the reference dependency group
   # and the gated checkpoints, so they run here, required to run, not skip.
+  # They run one at a time: each holds an upstream model and generalforecast's
+  # at once, and two such pairs outgrow the runner's memory.
   reference:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -57,7 +63,7 @@ jobs:
           version: "0.8.0"
           enable-cache: true
       - run: uv sync --locked --group reference
-      - run: uv run pytest tests/models/reference -n 2
+      - run: uv run pytest tests/models/reference
         env:
           GF_REFERENCE_REQUIRED: "1"
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
