@@ -12,15 +12,31 @@ uv pip install generalforecast
 Predict or forecast with an `sklearn`-compatible interface.
 
 ```python
+import numpy as np
+import pandas as pd
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import train_test_split
+
 import generalforecast as gf
+
+X, y = load_breast_cancer(return_X_y=True)
+X_context, X_queries, y_context, y_queries = train_test_split(X, y, random_state=0)
 
 clf = gf.Classifier(model="general-forecast/tabicl-v2-classifier")
 clf.fit(X_context, y_context)
-clf.predict_proba(X_queries)
+probabilities = clf.predict_proba(X_queries)
 
-fc = gf.Forecaster(model="general-forecast/chronos-2", horizon=7)
-fc.fit(history)  # columns: date, sku, units
-fc.forecast()  # quantiles 0.1, 0.5, 0.9 per sku per step
+days = pd.date_range("2025-01-01", periods=60, freq="D")
+history = pd.DataFrame(
+    {
+        "date": np.tile(days, 2),
+        "sku": np.repeat(["a", "b"], 60),
+        "units": np.r_[np.arange(60.0) % 7, 10 + np.arange(60.0) % 5],
+    }
+)
+fc = gf.Forecaster(target="units", time="date", series="sku", horizon=7)
+fc.fit(history)
+quantiles = fc.forecast()  # 0.1, 0.5 and 0.9 for each sku and step
 ```
 
 For deployments on large, live datasets, please take a look at the [docs](https://docs.generalforecast.com/).

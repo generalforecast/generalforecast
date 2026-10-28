@@ -98,11 +98,14 @@ jobs:
             test ! -e "smoke/bin/$server"
             "$(smoke/bin/python -c "from generalforecast.serve.listener import binary; print(binary('$server'))")" --help
           done
-      # The README's example, end to end on the wheel's own engine.
-      - name: Fit and predict with the wheel
+      # Every README example, end to end on the wheel's own engine and the
+      # real checkpoints.
+      - name: Run the README with the wheel
+        env:
+          GF_README_MODELS: catalog
         run: |
-          uv pip install --python smoke/bin/python "$(ls dist/*.whl)"
-          smoke/bin/python scripts/readme_example.py
+          uv pip install --python smoke/bin/python "$(ls dist/*.whl)" pytest==8.4.2
+          smoke/bin/python -m pytest --noconftest -p no:cacheprovider tests/test_readme.py
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: wheel-${{ matrix.target }}
