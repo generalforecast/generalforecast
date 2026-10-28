@@ -35,10 +35,6 @@ def model(case: SeriesCase) -> Any:
     return case.build(0)
 
 
-def test_functions_follow_the_contract(functions: SeriesFunctions) -> None:
-    assert isinstance(functions, SeriesFunctions)
-
-
 def test_models_pass_the_conformance_check(
     case: SeriesCase, functions: SeriesFunctions, model: Any
 ) -> None:

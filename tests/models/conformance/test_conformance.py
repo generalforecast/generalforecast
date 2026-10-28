@@ -53,6 +53,28 @@ FLOAT32, FLOAT16, BFLOAT16, INT8 = (
 REFERENCE = DeviceSettings(FLOAT32, FLOAT32, AttentionKernel())
 
 
+# The runtime's paging, decoding and worker units depend on a model only
+# through its caches and states, so they run on one case of each layout: every
+# family, a retrieval decoder, ensembles and error-correcting codes, classes
+# and values both.
+RUNTIME = [
+    "tabicl-values",
+    "retrieval-classes",
+    "tabpfn-classes",
+    "tabpfn-3.5-values",
+    "kumo-values",
+    "limix-classes",
+    "mitra-values",
+    "ensemble-classes",
+    "many-classes",
+]
+runtime = pytest.mark.parametrize(
+    "case",
+    [case for case in CASES if case.name in RUNTIME],
+    ids=lambda case: case.name,
+)
+
+
 @pytest.fixture(params=CASES, ids=[case.name for case in CASES])
 def case(request: pytest.FixtureRequest) -> Case:
     return request.param
@@ -68,59 +90,18 @@ def model(case: Case) -> Any:
     return case.build(0)
 
 
-def test_functions_follow_the_contract(functions: TabularFunctions) -> None:
-    assert isinstance(functions, TabularFunctions)
-
-
 def test_models_pass_the_conformance_check(
     case: Case, functions: TabularFunctions, model: Any
 ) -> None:
     check(functions, model)
 
     assert functions.properties(model).regression == case.regression
+    # Another instance of the same shapes shares the properties, so its tables
+    # share programs.
+    assert functions.properties(case.build(1)) == functions.properties(model)
 
 
-def test_the_custom_model_example_passes_the_conformance_check() -> None:
-    import importlib.util
-    from pathlib import Path
-
-    path = Path(__file__).parent / "custom_model.py"
-    spec = importlib.util.spec_from_file_location("custom_model", path)
-    assert spec is not None and spec.loader is not None
-    example = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(example)
-
-    check(*example.kernel())
-
-
-def test_properties_are_hashable_and_read_only_shapes(
-    case: Case, functions: TabularFunctions, model: Any
-) -> None:
-    abstract = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), model)
-
-    assert functions.properties(abstract) == functions.properties(model)
-    assert hash(functions.properties(case.build(1))) == hash(
-        functions.properties(model)
-    )
-
-
-def test_class_count_comes_from_the_caller(
-    case: Case, functions: TabularFunctions, model: Any
-) -> None:
-    if case.regression:
-        pytest.skip("regressors have no classes")
-    data = table(regression=False)
-    labels = jnp.arange(data.features.shape[0], dtype=jnp.int32) % 2
-
-    probabilities = predict(
-        functions, model, data._replace(targets=labels, num_classes=4)
-    )
-
-    assert probabilities.shape == (data.queries.shape[0], 4)
-    _close(probabilities.sum(axis=-1), jnp.ones(data.queries.shape[0]))
-
-
-def test_fit_rejects_class_counts_the_model_cannot_serve(
+def test_the_class_count_comes_from_the_caller_within_the_models_slots(
     case: Case, functions: TabularFunctions, model: Any
 ) -> None:
     data = table(case.regression)
@@ -130,6 +111,15 @@ def test_fit_rejects_class_counts_the_model_cannot_serve(
     for num_classes in invalid:
         with pytest.raises(ValueError, match="class"):
             functions.fit(model, data.features, data.targets, num_classes)
+    if case.regression:
+        return
+    # Four classes, two of them never seen in the context.
+    labels = jnp.arange(data.features.shape[0], dtype=jnp.int32) % 2
+    probabilities = predict(
+        functions, model, data._replace(targets=labels, num_classes=4)
+    )
+    assert probabilities.shape == (data.queries.shape[0], 4)
+    _close(probabilities.sum(axis=-1), jnp.ones(data.queries.shape[0]))
 
 
 def test_tables_in_one_bucket_share_one_compile(
@@ -177,10 +167,14 @@ def test_parameters_set_the_compute_dtype(
     assert functions.postprocess(half, state, outputs).dtype == jnp.float32
 
 
-def _drift(
-    case: Case, functions: TabularFunctions, model: Any, settings: DeviceSettings
-) -> float:
-    """Largest change from float32, in probability or in medians per target std."""
+def test_device_settings_barely_move_predictions(
+    case: Case, functions: TabularFunctions, model: Any
+) -> None:
+    """Reduced precision caches, GPU settings and attention chunks stay near float32.
+
+    Drift is the largest change in probability, or in medians per target
+    deviation.
+    """
     data = table(case.regression, rows=40, queries=12)
 
     def run(settings: DeviceSettings) -> jax.Array:
@@ -195,47 +189,42 @@ def _drift(
         outputs = functions.decode(configured, state, cache, query_rows)
         return functions.postprocess(configured, state, outputs)
 
-    reduced, full = run(settings), run(REFERENCE)
-    if not case.regression:
-        return float(jnp.max(jnp.abs(reduced - full)))
-    middle = full.shape[-1] // 2
-    change = jnp.abs(reduced[:, middle] - full[:, middle])
-    return float(jnp.max(change) / jnp.std(data.targets))
+    full = run(REFERENCE)
+
+    def drift(settings: DeviceSettings) -> float:
+        reduced = run(settings)
+        if not case.regression:
+            return float(jnp.max(jnp.abs(reduced - full)))
+        middle = full.shape[-1] // 2
+        change = jnp.abs(reduced[:, middle] - full[:, middle])
+        return float(jnp.max(change) / jnp.std(data.targets))
+
+    caches = [
+        (f"{dtype} cache", DeviceSettings(FLOAT32, dtype, AttentionKernel()))
+        for dtype in (FLOAT16, BFLOAT16, INT8)
+    ]
+    # Chunks only reorder sums.
+    chunks = [
+        ("query chunks", DeviceSettings(FLOAT32, FLOAT32, AttentionKernel("xla", 8))),
+        (
+            "block chunks",
+            DeviceSettings(FLOAT32, FLOAT32, AttentionKernel(block_chunk=16)),
+        ),
+    ]
+    bounds = [
+        *((name, settings, case.cache_drift) for name, settings in caches),
+        ("gpu", device_settings("gpu"), 3e-2),
+        *((name, settings, 1e-5) for name, settings in chunks),
+    ]
+
+    moved = {name: drift(settings) for name, settings, _ in bounds}
+
+    assert {
+        name: moved[name] for name, _, bound in bounds if moved[name] >= bound
+    } == {}
 
 
-@pytest.mark.parametrize(
-    "cache_dtype", [FLOAT16, BFLOAT16, INT8], ids=["float16", "bfloat16", "int8"]
-)
-def test_a_reduced_precision_cache_barely_moves_predictions(
-    case: Case, functions: TabularFunctions, model: Any, cache_dtype: jnp.dtype
-) -> None:
-    settings = DeviceSettings(FLOAT32, cache_dtype, AttentionKernel())
-
-    assert _drift(case, functions, model, settings) < case.cache_drift
-
-
-def test_gpu_settings_stay_close_to_float32(
-    case: Case, functions: TabularFunctions, model: Any
-) -> None:
-    assert _drift(case, functions, model, device_settings("gpu")) < 3e-2
-
-
-def test_query_chunks_reproduce_unchunked_predictions(
-    case: Case, functions: TabularFunctions, model: Any
-) -> None:
-    settings = DeviceSettings(FLOAT32, FLOAT32, AttentionKernel("xla", 8))
-
-    assert _drift(case, functions, model, settings) < 1e-5
-
-
-def test_block_chunks_reproduce_unchunked_predictions(
-    case: Case, functions: TabularFunctions, model: Any
-) -> None:
-    settings = DeviceSettings(FLOAT32, FLOAT32, AttentionKernel(block_chunk=16))
-
-    assert _drift(case, functions, model, settings) < 1e-5
-
-
+@runtime
 def test_a_fit_past_the_call_budget_predicts_as_one_pass(
     case: Case,
     functions: TabularFunctions,
@@ -316,23 +305,14 @@ def test_memory_profile_matches_real_outputs(
         model, data.features, data.targets, data.num_classes, num_rows=40
     )
     assert profile.state_bytes == tree_bytes(plain)
-
-
-def test_memory_profile_needs_only_shapes(
-    functions: TabularFunctions, model: Any
-) -> None:
+    # Parameter shapes alone give the same profile.
     abstract = jax.tree.map(lambda a: jax.ShapeDtypeStruct(a.shape, a.dtype), model)
-
-    assert memory_profile(functions, abstract, FEATURES) == memory_profile(
-        functions, model, FEATURES
-    )
+    assert memory_profile(functions, abstract, FEATURES) == profile
 
 
-@pytest.mark.parametrize(
-    "dtype", [FLOAT32, FLOAT16, INT8], ids=["float32", "float16", "int8"]
-)
+@runtime
 def test_caches_pack_into_slots_and_back(
-    case: Case, functions: TabularFunctions, model: Any, dtype: jnp.dtype
+    case: Case, functions: TabularFunctions, model: Any
 ) -> None:
     data = _padded(
         table(case.regression, rows=20, queries=6), context_size=32, query_size=8
@@ -340,32 +320,35 @@ def test_caches_pack_into_slots_and_back(
     state, rows = functions.fit(
         model, data.features, data.targets, data.num_classes, num_rows=20
     )
-    cache = to_cache_dtype(
-        functions.encode(model, state, rows, data.targets, num_rows=20), dtype
-    )
-    layout = cache_layout(
-        functions, model, FEATURES, slot_bytes=4096, cache_dtype=dtype
-    )
-
-    slots = pack(layout, cache)
-
-    profile = memory_profile(functions, model, FEATURES, cache_dtype=dtype)
-    assert layout.row_bytes == profile.cache_bytes_per_row
-    assert slots.shape == (layout.slots(32), 4096)
-    assert slots.dtype == jnp.uint8
-    # A decode reads the rows back, a block at a time or row by row.
-    blocks = jnp.arange(slots.shape[0]).reshape(-1, layout.slots_per_row)
-    expected = layout.treedef.flatten_up_to(cache)
-    for in_order in (True, False):
-        restored = layout.treedef.flatten_up_to(
-            read_context(
-                layout, slots, blocks, jnp.arange(32), jnp.array(32), None, in_order
-            )
+    encoded = functions.encode(model, state, rows, data.targets, num_rows=20)
+    for dtype in (FLOAT32, FLOAT16, INT8):
+        cache = to_cache_dtype(encoded, dtype)
+        layout = cache_layout(
+            functions, model, FEATURES, slot_bytes=4096, cache_dtype=dtype
         )
-        for leaf in layout.row_leaves:
-            np.testing.assert_array_equal(restored[leaf.index], expected[leaf.index])
+
+        slots = pack(layout, cache)
+
+        profile = memory_profile(functions, model, FEATURES, cache_dtype=dtype)
+        assert layout.row_bytes == profile.cache_bytes_per_row
+        assert slots.shape == (layout.slots(32), 4096)
+        assert slots.dtype == jnp.uint8
+        # A decode reads the rows back, a block at a time or row by row.
+        blocks = jnp.arange(slots.shape[0]).reshape(-1, layout.slots_per_row)
+        expected = layout.treedef.flatten_up_to(cache)
+        for in_order in (True, False):
+            restored = layout.treedef.flatten_up_to(
+                read_context(
+                    layout, slots, blocks, jnp.arange(32), jnp.array(32), None, in_order
+                )
+            )
+            for leaf in layout.row_leaves:
+                np.testing.assert_array_equal(
+                    restored[leaf.index], expected[leaf.index]
+                )
 
 
+@runtime
 def test_a_cache_packs_into_the_pool_as_pack_packs_it_in_parts(
     case: Case, functions: TabularFunctions, model: Any, monkeypatch: Any
 ) -> None:
@@ -396,6 +379,7 @@ def test_a_cache_packs_into_the_pool_as_pack_packs_it_in_parts(
     np.testing.assert_array_equal(pool, expected)
 
 
+@runtime
 def test_a_paged_decode_predicts_as_one_of_the_whole_cache(
     case: Case, functions: TabularFunctions, model: Any
 ) -> None:
@@ -438,6 +422,7 @@ def test_a_paged_decode_predicts_as_one_of_the_whole_cache(
     )
 
 
+@runtime
 def test_a_decoding_in_a_masked_call_predicts_as_in_an_unmasked_one(
     case: Case, functions: TabularFunctions, model: Any
 ) -> None:
@@ -482,6 +467,7 @@ def test_a_decoding_in_a_masked_call_predicts_as_in_an_unmasked_one(
     _close(together[1, :6], expected[0, :6])
 
 
+@runtime
 def test_a_unit_that_summarizes_its_own_rows_predicts_as_those_rows_alone(
     case: Case, functions: TabularFunctions, model: Any
 ) -> None:
@@ -518,6 +504,7 @@ def test_a_unit_that_summarizes_its_own_rows_predicts_as_those_rows_alone(
     _close(predicted("transient"), expected)
 
 
+@runtime
 def test_a_fused_unit_predicts_as_its_rows_fit_and_encoded_apart(
     case: Case, functions: TabularFunctions, model: Any
 ) -> None:

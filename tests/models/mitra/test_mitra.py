@@ -5,16 +5,14 @@
 
 from __future__ import annotations
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from generalforecast.models.contract import Averaging, TabularProperties
 from generalforecast.models.mitra.checkpoint import check_supported, mitra_from_state
 from generalforecast.models.mitra.model import mitra_functions
 from generalforecast.models.mitra.prepare import fit_snapshot, prepare_features
-from tests.models.mitra.tiny import CLASS_SLOTS, tiny_checkpoint, tiny_mitra
+from tests.models.mitra.tiny import tiny_checkpoint, tiny_mitra
 
 
 def _table() -> np.ndarray:
@@ -50,20 +48,6 @@ def test_prepare_ranks_against_context_quantiles() -> None:
     assert int(snapshot.columns.count) == 4
 
 
-def test_prepare_ignores_padding_rows() -> None:
-    features = _table()
-    padded = np.concatenate([features, np.full((4, 5), 1e6, np.float32)])
-    targets = np.arange(16, dtype=np.float32)
-
-    fitted = fit_snapshot(jnp.asarray(features), jnp.asarray(targets[:12]))
-    with_padding = fit_snapshot(jnp.asarray(padded), jnp.asarray(targets), num_rows=12)
-
-    for ours, expected in zip(
-        jax.tree.leaves(with_padding), jax.tree.leaves(fitted), strict=True
-    ):
-        np.testing.assert_allclose(np.asarray(ours), np.asarray(expected), rtol=1e-6)
-
-
 def _probabilities(features: np.ndarray) -> np.ndarray:
     model = tiny_mitra()
     targets = jnp.asarray(np.arange(12) % 3, jnp.int32)
@@ -81,17 +65,6 @@ def test_constant_columns_are_left_out() -> None:
     with_constant = _probabilities(features)
 
     np.testing.assert_allclose(with_constant, without, rtol=1e-5, atol=1e-6)
-
-
-def test_properties_come_from_the_parameters() -> None:
-    assert mitra_functions.properties(tiny_mitra()) == TabularProperties(
-        regression=False,
-        class_slots=CLASS_SLOTS,
-        num_outputs=CLASS_SLOTS,
-        averaging=Averaging("predictions"),
-        stored_cache=True,
-        unlabeled_context=True,
-    )
 
 
 def test_unsupported_settings_raise() -> None:

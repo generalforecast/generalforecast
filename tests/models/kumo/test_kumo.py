@@ -14,7 +14,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from generalforecast.models.contract import TabularProperties
 from generalforecast.models.kumo.checkpoint import load_kumo, save_kumo
 from generalforecast.models.kumo.model import kumo_functions
 from generalforecast.models.kumo.prepare import (
@@ -27,28 +26,11 @@ from generalforecast.runtime.device import FLOAT32, DeviceSettings, configure
 from generalforecast.runtime.memory import memory_profile
 from tests.models.conformance.cases import table
 from tests.models.kumo.tiny import (
-    CLASS_SLOTS,
-    QUANTILES,
     SETTINGS,
     tiny_kumo,
     tiny_kumo_state,
 )
 from tests.utils import node_harness
-
-
-def test_properties_come_from_the_parameters() -> None:
-    classifier = kumo_functions.properties(tiny_kumo(regression=False))
-    regressor = kumo_functions.properties(tiny_kumo(regression=True))
-
-    assert classifier == TabularProperties(
-        regression=False,
-        class_slots=CLASS_SLOTS,
-        num_outputs=CLASS_SLOTS,
-        stored_cache=True,
-        column_summary=True,
-    )
-    assert regressor.class_slots == 0
-    assert regressor.num_outputs == QUANTILES
 
 
 def test_queries_read_only_their_key_value_heads() -> None:

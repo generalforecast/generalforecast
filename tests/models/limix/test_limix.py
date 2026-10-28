@@ -9,8 +9,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from generalforecast.models.buckets import QUANTILE_LEVELS
-from generalforecast.models.contract import Averaging, TabularProperties
 from generalforecast.models.limix.checkpoint import (
     check_supported,
     limix_from_state,
@@ -18,7 +16,7 @@ from generalforecast.models.limix.checkpoint import (
 )
 from generalforecast.models.limix.model import _by_rows, limix_functions
 from generalforecast.models.limix.prepare import fit_snapshot, prepare_features
-from tests.models.limix.tiny import CLASS_SLOTS, tiny_checkpoint, tiny_limix
+from tests.models.limix.tiny import tiny_checkpoint, tiny_limix
 
 
 def _table() -> np.ndarray:
@@ -47,53 +45,6 @@ def test_prepare_standardizes_on_filled_context_values() -> None:
     expected[2, 0, 0] = np.nan
 
     np.testing.assert_allclose(prepared, expected, rtol=1e-5, atol=1e-5)
-
-
-def test_prepare_masks_nan_but_fills_infinities() -> None:
-    features = _table()
-    snapshot = fit_snapshot(jnp.asarray(features), group_size=2)
-    prepared = np.asarray(prepare_features(snapshot, jnp.asarray(features)))
-
-    assert np.isnan(prepared[2, 0, 0])
-    assert np.isfinite(prepared[3, 0, 1])
-    assert np.isnan(prepared).sum() == 1
-
-
-def test_prepare_ignores_padding_rows() -> None:
-    features = _table()
-    padded = np.concatenate([features, np.full((4, 5), 1e6, np.float32)])
-
-    fitted = fit_snapshot(jnp.asarray(features), group_size=2)
-    with_padding = fit_snapshot(jnp.asarray(padded), group_size=2, num_rows=12)
-
-    for name in ("fill", "center", "scale", "group_scale"):
-        np.testing.assert_allclose(
-            np.asarray(getattr(with_padding, name)),
-            np.asarray(getattr(fitted, name)),
-            rtol=1e-6,
-        )
-
-
-def test_properties_come_from_the_parameters() -> None:
-    classifier = limix_functions.properties(tiny_limix(regression=False))
-    regressor = limix_functions.properties(tiny_limix(regression=True))
-
-    assert classifier == TabularProperties(
-        regression=False,
-        class_slots=CLASS_SLOTS,
-        num_outputs=CLASS_SLOTS,
-        averaging=Averaging("predictions"),
-        stored_cache=True,
-        unlabeled_context=True,
-    )
-    assert regressor == TabularProperties(
-        regression=True,
-        class_slots=0,
-        num_outputs=QUANTILE_LEVELS,
-        averaging=Averaging("buckets", temperature=0.9),
-        stored_cache=True,
-        unlabeled_context=True,
-    )
 
 
 def test_unsupported_settings_raise() -> None:

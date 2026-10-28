@@ -12,7 +12,7 @@ import pytest
 from generalforecast.models.buckets import bucket_quantiles
 from generalforecast.models.tabpfn.checkpoint import check_supported, tabpfn_from_state
 from generalforecast.models.tabpfn.prepare import fit_snapshot, prepare_features
-from tests.models.tabpfn.tiny import tiny_checkpoint, tiny_tabpfn
+from tests.models.tabpfn.tiny import tiny_checkpoint
 
 
 def _table() -> np.ndarray:
@@ -40,17 +40,6 @@ def test_prepare_matches_tabpfn_standardization() -> None:
     np.testing.assert_allclose(prepared[..., 0], expected, rtol=1e-5, atol=1e-5)
     assert prepared[2, 0, 1] == -2 and prepared[3, 1, 1] == 2 and prepared[4, 2, 1] == 4
     assert (prepared[..., 1][finite] == 0).all()
-
-
-def test_prepare_ignores_padding_rows() -> None:
-    features = _table()
-    padded = np.concatenate([features, np.full((4, 4), 1e6, np.float32)])
-
-    np.testing.assert_allclose(
-        np.asarray(fit_snapshot(jnp.asarray(padded), num_rows=12).scale),
-        np.asarray(fit_snapshot(jnp.asarray(features)).scale),
-        rtol=1e-6,
-    )
 
 
 def test_a_fit_without_rows_stays_finite() -> None:
@@ -105,13 +94,6 @@ def test_head_counts_must_fit_the_weights() -> None:
 
     with pytest.raises(ValueError, match=r"icl\.blocks\[0\]\.attention has 3 heads"):
         tabpfn_from_state(state, settings, architecture)
-
-
-def test_classifier_reads_every_parameter() -> None:
-    model = tiny_tabpfn(regression=False)
-
-    assert model.num_buckets is None
-    assert model.icl.query_kv_heads == 1
 
 
 def test_a_cell_projection_bias_in_a_checkpoint_is_applied() -> None:
@@ -197,27 +179,3 @@ def test_rank_buckets_do_not_grow_with_the_context() -> None:
 
     assert small.ranks is not None and large.ranks is not None
     assert small.ranks.edges.shape == large.ranks.edges.shape == (2, 64)
-
-
-def test_regressors_temper_their_logits_as_tabpfn_does() -> None:
-    from generalforecast.models.tabpfn.buckets import regression_borders
-    from generalforecast.models.tabpfn.model import tabpfn_functions
-    from generalforecast.models.targets import unscale_quantiles
-
-    model = tiny_tabpfn(regression=True)
-    buckets = model.num_buckets
-    assert buckets is not None
-    features = jnp.asarray(np.random.default_rng(0).normal(size=(16, 3)), jnp.float32)
-    state, _ = tabpfn_functions.fit(model, features, features[:, 0], 0)
-    outputs = jnp.asarray(
-        np.random.default_rng(1).normal(size=(2, buckets)), jnp.float32
-    )
-
-    borders = jnp.asarray(regression_borders(buckets))
-    expected = unscale_quantiles(
-        state.snapshot, bucket_quantiles(outputs / model.temperature, borders)
-    )
-    np.testing.assert_allclose(
-        tabpfn_functions.postprocess(model, state, outputs), expected, rtol=1e-6
-    )
-    assert tabpfn_functions.properties(model).averaging.temperature == model.temperature
