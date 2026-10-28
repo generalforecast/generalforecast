@@ -672,10 +672,8 @@ paths:
                 live:
                   value: {status: ok}
 
-  # ---------------------------------------------------------------------------
   # Hosted control plane. These are the resources `gf admin`, `gf push`,
   # `gf status`, `gf promote`, `gf rollback`, `gf context` and the SDK call.
-  # ---------------------------------------------------------------------------
 
   /v1/projects:
     get:
@@ -4043,7 +4041,7 @@ components:
       properties:
         error: {$ref: "#/components/schemas/Error"}
 
-    # -- hosted control plane ------------------------------------------------
+    # hosted control plane
 
     Empty:
       type: object

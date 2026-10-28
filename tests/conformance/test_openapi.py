@@ -326,7 +326,7 @@ def test_generated_python_is_formatted():
     assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
-# -- replay against a running server -----------------------------------------
+# replay against a running server
 
 
 def served():

@@ -967,7 +967,7 @@ class Predictor:
         self._context_frame = resolution.context_table
         self._query_frame = resolution.query_table
 
-    # -- facts --------------------------------------------------------------
+    # facts
 
     @property
     def env(self) -> str | None:
@@ -1043,7 +1043,7 @@ class Predictor:
             f"context={context[len('Context(') : -1]}, env={self._env!r})"
         )
 
-    # -- prediction ---------------------------------------------------------
+    # prediction
 
     def request(
         self, queries: Any, context: Any = None, *, as_of: Any = None
@@ -1247,7 +1247,7 @@ class Predictor:
         clone._as_of = ts
         return clone
 
-    # -- served HTTP --------------------------------------------------------
+    # served HTTP
 
     def _served_transport(self) -> Any:
         """The SDK transport to a `gf serve`, with its key, made once.
@@ -1310,7 +1310,7 @@ class Predictor:
             )
             return dict(unwrap(value, request))
 
-    # -- evaluation ---------------------------------------------------------
+    # evaluation
 
     def eval(self, queries: Any = None, *, models: Sequence[str] = ()) -> Evaluation:
         """Scores held-out rows whose target is known.
@@ -1477,7 +1477,7 @@ class Predictor:
             quantiles = {0.5: frame["value"].tolist()}
         return forecast_metrics(truth, quantiles, history=history, series=held_keys)
 
-    # -- lifecycle ----------------------------------------------------------
+    # lifecycle
 
     def explain(self) -> Any:
         """The resolved schema: model, task, target, inputs, context and selection.

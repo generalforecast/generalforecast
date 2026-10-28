@@ -3,7 +3,7 @@
 
 """Tunable runtime constants for the worker and its runtime."""
 
-# --- Worker ---
+# Worker
 
 # XLA's GPU autotuner times kernels on buffers of its own while it compiles,
 # beside what a step holds; a call leaves it a sixteenth of its working memory.
@@ -28,7 +28,7 @@ SCATTER_THREADS = 8
 # stacks of this many, which compile in a tenth of that and run as fast.
 STACK_CHUNK = 64
 
-# --- Memory measurement ---
+# Memory measurement
 
 # Context sizes the cache is measured at. Tracing does no arithmetic, so any two work.
 CACHE_TRACE_SMALL, CACHE_TRACE_LARGE = 8, 16
@@ -61,7 +61,7 @@ MIN_SUMMARY_ROWS = 64
 # too large for it alone does.
 MIN_FIT_ROWS = 4096
 
-# --- Programs ---
+# Programs
 
 # Table shapes, a model, task and width each, a worker keeps compiled programs
 # for while memory is short. JAX keeps every program it compiles, about 200 MiB
@@ -106,7 +106,7 @@ RECORDED_SECONDS = 30 * 24 * 3600
 # before it takes steps; it compiles the rest ahead while it serves.
 STARTED_PROGRAMS = 16
 
-# --- Paging ---
+# Paging
 
 # Two traced context sizes; the axis that grows between them is the row axis.
 PAGE_TRACE_SMALL, PAGE_TRACE_LARGE = 16, 48
@@ -122,7 +122,7 @@ MOVE_SLOTS = 64
 # rounded down to a power of two of blocks.
 PACK_BYTES = 1 << 30
 
-# --- Device ---
+# Device
 
 # The most device memory a local client keeps contexts in by default.
 LOCAL_DEVICE_TIER = 4 << 30
@@ -130,7 +130,7 @@ LOCAL_DEVICE_TIER = 4 << 30
 # fit in memory; smaller ones run in one step.
 ATTENTION_BLOCK_CHUNK = 1 << 18
 
-# --- Profiling ---
+# Profiling
 
 # How often the sampler reads every thread's stack.
 SAMPLE_INTERVAL = 0.001

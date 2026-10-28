@@ -35,7 +35,7 @@ JSON = "application/json"
 Json = dict[str, Any]
 
 
-# -- the spec -----------------------------------------------------------------
+# the spec
 
 
 @dataclass(frozen=True)
@@ -250,7 +250,7 @@ def python_name(key: str) -> str:
     return name
 
 
-# -- a black-compatible layout -------------------------------------------------
+# a black-compatible layout
 
 
 class Node:
@@ -358,7 +358,7 @@ def quote(text: str) -> str:
     return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-# -- Python --------------------------------------------------------------------
+# Python
 
 RUNTIME = '''# SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
@@ -826,7 +826,7 @@ def assign(head: str, value: Node, indent: int) -> list[str]:
     return lines
 
 
-# -- TypeScript ----------------------------------------------------------------
+# TypeScript
 
 
 class TypeScriptEmitter:
@@ -994,7 +994,7 @@ def ts_key(key: str) -> str:
     return key if re.fullmatch(r"[A-Za-z_$][A-Za-z0-9_$]*", key) else f'"{key}"'
 
 
-# -- entry point ----------------------------------------------------------------
+# entry point
 
 
 def render(spec_path: Path = SPEC) -> dict[Path, str]:
