@@ -41,6 +41,21 @@ def test_a_date_is_its_midnight_in_utc_and_fractions_are_kept():
 
 
 @pytest.mark.parametrize(
+    ("seconds", "written"),
+    [
+        (MOMENT + 0.0000007, "2026-10-27T08:00:00Z"),
+        (MOMENT + 0.8665, "2026-10-27T08:00:00.866500Z"),
+        (MOMENT + 0.999999, "2026-10-27T08:00:00.999999Z"),
+    ],
+)
+def test_a_written_as_of_is_cut_to_the_microsecond_never_rounded_later(
+    seconds, written
+):
+    assert as_of.format(seconds) == written
+    assert as_of.format(as_of.parse(written)) == written
+
+
+@pytest.mark.parametrize(
     "given",
     ["yesterday", "", "2026-10-27", True, float("nan"), float("inf"), -1, [MOMENT]],
 )

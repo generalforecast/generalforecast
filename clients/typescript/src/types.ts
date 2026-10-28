@@ -615,7 +615,7 @@ export interface Lock {
 export interface RevisionRegister {
   lock: Lock;
   snapshot: Digest | null;
-  manifest?: Record<string, unknown> | null;
+  manifest: Record<string, unknown>;
 }
 
 export interface RevisionRegisterRequest extends Envelope {

@@ -381,7 +381,7 @@ def test_every_path_predicts_the_same_and_knows_the_same_lock(
 
     sent = pushed(root)
     assert sent.lock.digest == digest
-    plan = hosting.compile_lock(sent.lock, sent.snapshot)
+    plan = hosting.compile_lock(sent.lock, sent.snapshot, manifest=sent.manifest)
     published = hosting.published_entry(plan)
     hosted = (
         hosting.PredictorExecutor()
@@ -535,7 +535,7 @@ def test_any_number_of_series_and_queries_predict_alike_past_one_call(tmp_path, 
 
     local = gf.Predictor(root).predict(queries)
     sent = pushed(root)
-    plan = hosting.compile_lock(sent.lock, sent.snapshot)
+    plan = hosting.compile_lock(sent.lock, sent.snapshot, manifest=sent.manifest)
     prepared = hosting.PredictorExecutor().prepare(plan, sent.snapshot)
     hosted = pd.concat(
         [

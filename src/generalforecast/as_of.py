@@ -49,11 +49,7 @@ def micros(value: Any) -> int | None:
     if isinstance(value, bool):
         raise _refused("as_of is an RFC 3339 time or epoch seconds, not a boolean")
     if isinstance(value, (int, float)):
-        if not math.isfinite(value):
-            raise _refused("as_of seconds must be a finite time after the epoch")
-        # The shortest decimal spelling, as JSON carries the number.
-        exact = decimal.Decimal(repr(value)) * 1_000_000
-        return _checked(int(exact.to_integral_value(rounding=decimal.ROUND_FLOOR)))
+        return _seconds_micros(value)
     if isinstance(value, str):
         from generalforecast.iso import instant
 
@@ -80,6 +76,15 @@ def micros(value: Any) -> int | None:
     raise _refused(
         f"as_of is an RFC 3339 time or epoch seconds, not {type(value).__name__}"
     )
+
+
+def _seconds_micros(seconds: float) -> int:
+    if not math.isfinite(seconds):
+        raise _refused("as_of seconds must be a finite time after the epoch")
+    # The shortest decimal spelling, as JSON carries the number, cut to the
+    # microsecond: never a later instant than the one given.
+    exact = decimal.Decimal(repr(seconds)) * 1_000_000
+    return _checked(int(exact.to_integral_value(rounding=decimal.ROUND_FLOOR)))
 
 
 def _moment_micros(moment: datetime.datetime) -> int:
@@ -110,13 +115,14 @@ def parse(value: Any) -> float | None:
 def format(seconds: float | None) -> str | None:
     """UTC seconds as a reply's RFC 3339 `as_of`, `2026-10-27T08:00:00Z`; None stays None.
 
-    Fractions of a second are written to the microsecond, six digits.
+    Fractions of a second are written to the microsecond, six digits, cut
+    as a request's seconds are read: never rounded up to a later instant.
     """
     if seconds is None:
         return None
     if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
         raise _refused("as_of seconds must be a number")
-    return _written(_checked(round(seconds * 1_000_000)))
+    return _written(_seconds_micros(seconds))
 
 
 def _written(whole: int) -> str:

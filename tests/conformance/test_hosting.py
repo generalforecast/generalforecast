@@ -12,6 +12,8 @@ import ast
 import inspect
 from pathlib import Path
 
+import pytest
+
 from generalforecast import hosting
 
 SOURCE = Path(__file__).resolve().parents[2] / "src" / "generalforecast"
@@ -65,6 +67,7 @@ RECORDED = (
     "compile_lock",
     "configuration",
     "context_version",
+    "diagnostic_lines",
     "document_digest",
     "entries",
     "failure",
@@ -87,6 +90,7 @@ RECORDED = (
     "prefetch_catalog",
     "published_entry",
     "read_table",
+    "report_diagnostic",
     "request_table",
     "require",
     "resource_name",
@@ -110,6 +114,14 @@ def test_every_hosting_function_says_what_it_does():
         value = getattr(hosting, name)
         if inspect.isfunction(value) or inspect.isclass(value):
             assert inspect.getdoc(value), name
+
+
+def test_compile_lock_cannot_be_called_without_naming_the_manifest():
+    parameter = inspect.signature(hosting.compile_lock).parameters["manifest"]
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is inspect.Parameter.empty
+    with pytest.raises(TypeError, match="manifest"):
+        hosting.compile_lock({}, None)  # ty: ignore[missing-argument]
 
 
 def test_hosting_imports_nothing_hosted_and_no_private_predictor_module():

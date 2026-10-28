@@ -1102,6 +1102,15 @@ paths:
                       model:
                         files: {"model.safetensors": 7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0}
                     snapshot: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e
+                    manifest:
+                      name: churn
+                      model: general-forecast/tabicl-v2-classifier
+                      target: churned
+                      id: customer_id
+                      inputs: [spend, plan]
+                      context: {snapshot: context.csv}
+                      selection: {core: 1200, neighbors: 3000, kind: stratified}
+                      resources: {accelerator: L4}
       responses:
         "200":
           description: the new revision; the same lock registers the same number again
@@ -4417,7 +4426,7 @@ components:
         a checked predictor's lock, its uploaded snapshot's digest, and the
         normalized gf.yaml the lock was written for, which the plane holds
         the lock to field by field
-      required: [lock, snapshot]
+      required: [lock, snapshot, manifest]
       additionalProperties: false
       properties:
         lock: {$ref: "#/components/schemas/Lock"}
@@ -4426,7 +4435,7 @@ components:
             - $ref: "#/components/schemas/Digest"
             - type: "null"
         manifest:
-          type: [object, "null"]
+          type: object
           description: |
             the normalized gf.yaml, as `PredictorSpec.to_dict` writes it; its
             digest is the lock's `manifest`

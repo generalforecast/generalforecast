@@ -1829,12 +1829,12 @@ class RevisionRegister(Payload):
 
     lock: Lock
     snapshot: Digest | None
-    manifest: dict[str, Any] | None = None
+    manifest: dict[str, Any]
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("lock", "lock", True, _record(Lock)),
         Field("snapshot", "snapshot", True, _union(_decode_Digest, _null)),
-        Field("manifest", "manifest", False, _union(_mapping(_any), _null)),
+        Field("manifest", "manifest", True, _mapping(_any)),
     )
 
 

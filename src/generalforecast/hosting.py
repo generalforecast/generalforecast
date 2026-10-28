@@ -20,8 +20,9 @@ The flow, for one revision:
 3. `served_context(lock, table)` gives the exact rows every path binds:
    the lock's split, projection to its columns in order, its roles' kinds
    and a classifier's integer labels; an uploaded snapshot is those rows
-   already and comes back as it is. `compile_lock(lock, rows)` compiles them
-   into a `CompiledPlan`, whose `spec.selection` every binder applies per
+   already and comes back as it is. `compile_lock(lock, rows, manifest=...)`,
+   given the normalized gf.yaml the push carried (`RevisionRegister.manifest`),
+   holds the lock to it field by field and compiles them into a `CompiledPlan`, whose `spec.selection` every binder applies per
    query. `PredictorExecutor().prepare(plan, rows)` predicts in process;
    for gf-server, `published_entry(plan)` is the entry (its `strategy` is the
    selection) and `json_rows(bound_rows(plan, rows))` the rows, in the order
@@ -64,7 +65,8 @@ Exports:
             write it (contract C1): `generalforecast.as_of.parse` and
             `format`, the one reading gf serve, the SDK and gf-server share.
     Compiling and predicting
-        compile_lock, CompiledPlan: a lock and its rows, compiled.
+        compile_lock, CompiledPlan: a lock and its rows, held to the pushed
+            manifest and compiled.
         served_context, live_context, bound_rows, json_rows: the rows a
             revision binds, and how gf-server takes them.
         PredictorExecutor: in-process prediction of a compiled plan.
@@ -85,6 +87,8 @@ Exports:
             JsonObject, VERSION, parse_body, success, failure, json_object,
             unique_object: the request envelope and reply.
         Error, ServiceError, InputError, PredictorError: errors with codes.
+        diagnostic_lines, report_diagnostic: a diagnostic in gf's cargo
+            shape, as lines or written to standard error.
         fields, require, name, text, number, model_id: field checks with
             the same rules gf applies.
         ModelPort, NativeExecutor, PreparedExecution, AcceptedWrite,
@@ -117,6 +121,8 @@ from generalforecast.contracts import (
     lock_name,
     parse_lock,
 )
+from generalforecast.diagnostics import lines as diagnostic_lines
+from generalforecast.diagnostics import report as report_diagnostic
 from generalforecast.errors import Error
 from generalforecast.models.catalog import (
     ALIASES,
@@ -129,7 +135,7 @@ from generalforecast.models.catalog import parse as parse_model
 from generalforecast.predictors.lock import lock_digest as document_digest
 from generalforecast.predictors.models import CatalogResolver, ModelPin
 from generalforecast.predictors.runtime import CONTEXT_ROWS_KEY, PredictorExecutor
-from generalforecast.predictors.runtime.compile import compile_lock
+from generalforecast.predictors.runtime import compile as _compile
 from generalforecast.predictors.runtime.compiled import CompiledPlan
 from generalforecast.predictors.runtime.context import (
     json_rows,
@@ -207,6 +213,35 @@ def limits(model: str) -> Any:
     return _registry.limits(model)
 
 
+def compile_lock(
+    lock: Any,
+    rows: Any,
+    *,
+    manifest: dict[str, Any] | None,
+    outputs: tuple[str, ...] | list[str] | None = None,
+) -> CompiledPlan:
+    """A revision's lock and context rows, held to its manifest and compiled.
+
+    `manifest` is the normalized `gf.yaml` the push carried
+    (`RevisionRegister.manifest`); the lock must be what `gf check` writes
+    for it and these rows. It is required so a plane cannot skip the check
+    by omission: pass None only for a lock built here by `ad_hoc_lock`.
+
+    Args:
+        lock: A `PredictorLock`, or a lock document.
+        rows: `served_context`'s rows for a snapshot or live context; None
+            for a request context.
+        manifest: The pushed manifest, or None for an ad hoc lock.
+        outputs: An ad hoc call's own outputs; the lock's otherwise.
+
+    Raises:
+        PredictorError: `LockMismatch` naming the first field that differs
+            from the manifest, `SnapshotMismatch` for rows other than the
+            lock's, and the refusals of compiling.
+    """
+    return _compile.compile_lock(lock, rows, outputs=outputs, manifest=manifest)
+
+
 def ad_hoc_lock(manifest: dict[str, Any], rows: Any) -> PredictorLock:
     """The lock of an ad hoc call: its manifest fragment resolved against its rows.
 
@@ -214,7 +249,7 @@ def ad_hoc_lock(manifest: dict[str, Any], rows: Any) -> PredictorLock:
     `id`, `time`, `series`, `frequency`, `horizon`, `quantiles`,
     `selection`); its context is the call's `rows`, as a request context.
     The call then compiles and runs as a revision does: `compile_lock(lock,
-    rows, outputs=...)`, `PredictorExecutor().prepare(plan, None)` and
+    rows, manifest=None, outputs=...)`, `PredictorExecutor().prepare(plan, None)` and
     `predict(queries, context=rows)`. Its selection is honoured.
 
     Raises:
@@ -292,6 +327,7 @@ __all__ = [
     "compile_lock",
     "configuration",
     "context_version",
+    "diagnostic_lines",
     "document_digest",
     "entries",
     "failure",
@@ -314,6 +350,7 @@ __all__ = [
     "prefetch_catalog",
     "published_entry",
     "read_table",
+    "report_diagnostic",
     "request_table",
     "require",
     "resource_name",
