@@ -30,7 +30,7 @@ from generalforecast.runtime.memory import NoMemoryAnalysis, memory_profile
 from generalforecast.runtime.paging import DevicePool, read_context
 from generalforecast.worker import Worker
 from generalforecast.worker import admission as worker_admission
-from tests.models.conformance.cases import RUNTIME_CASES, Case, table
+from tests.models.conformance.cases import CASES, Case, table
 from tests.models.kumo.tiny import tiny_kumo
 from tests.models.tabicl.tiny import tiny_tabicl
 from tests.models.timestral.tiny import tiny_timestral
@@ -45,6 +45,7 @@ TABICL = "tests/tabicl-classifier"
 TABICL_REGRESSOR = "tests/tabicl-regressor"
 KUMO = "tests/kumo-classifier"
 LIMIX = "tests/limix-classifier"
+PUBLIC = {"tabpfn-classes", "tabicl-values", "many-classes"}
 
 
 def _clusters(rows: int = 32) -> tuple[np.ndarray, np.ndarray]:
@@ -71,7 +72,14 @@ def _table(
     )
 
 
-@pytest.mark.parametrize("case", RUNTIME_CASES, ids=[c.name for c in RUNTIME_CASES])
+# The public client loads a model from its spec and runs it as the worker
+# tests run every case: a classifier, a regressor and a wrapper of several
+# estimators cover what it adds, and each case takes minutes on a runner.
+@pytest.mark.parametrize(
+    "case",
+    [case for case in CASES if case.name in PUBLIC],
+    ids=lambda case: case.name,
+)
 def test_local_predictions_match_predict(case: Case) -> None:
     functions, model = case.functions(), case.build(0)
     data = table(case.regression, rows=40)
