@@ -43,7 +43,7 @@ from generalforecast.runtime.device import (
 from generalforecast.runtime.memory import fit_profile, memory_profile, tree_bytes
 from generalforecast.runtime.paging import cache_layout, pack, pack_into, read_context
 from generalforecast.worker import Worker
-from tests.models.conformance.cases import CASES, FEATURES, Case
+from tests.models.conformance.cases import CASES, FEATURES, RUNTIME_CASES, Case
 from tests.utils import node_harness
 from tests.utils.predict import predict as gf_predict
 
@@ -51,27 +51,9 @@ FLOAT32, FLOAT16, BFLOAT16, INT8 = (
     jnp.dtype(name) for name in ("float32", "float16", "bfloat16", "int8")
 )
 REFERENCE = DeviceSettings(FLOAT32, FLOAT32, AttentionKernel())
-
-
-# The runtime's paging, decoding and worker units depend on a model only
-# through its caches and states, so they run on one case of each layout: every
-# family, a retrieval decoder, ensembles and error-correcting codes, classes
-# and values both.
-RUNTIME = [
-    "tabicl-values",
-    "retrieval-classes",
-    "tabpfn-classes",
-    "tabpfn-3.5-values",
-    "kumo-values",
-    "limix-classes",
-    "mitra-values",
-    "ensemble-classes",
-    "many-classes",
-]
+BUDGETED = {"tabicl-values", "limix-classes", "ensemble-classes"}
 runtime = pytest.mark.parametrize(
-    "case",
-    [case for case in CASES if case.name in RUNTIME],
-    ids=lambda case: case.name,
+    "case", RUNTIME_CASES, ids=[case.name for case in RUNTIME_CASES]
 )
 
 
@@ -224,7 +206,13 @@ def test_device_settings_barely_move_predictions(
     } == {}
 
 
-@runtime
+# The node sizes such a fit from a model's state alone: one whose state
+# summarizes columns, one whose does not, and an ensemble's stacked states.
+@pytest.mark.parametrize(
+    "case",
+    [case for case in CASES if case.name in BUDGETED],
+    ids=lambda case: case.name,
+)
 def test_a_fit_past_the_call_budget_predicts_as_one_pass(
     case: Case,
     functions: TabularFunctions,

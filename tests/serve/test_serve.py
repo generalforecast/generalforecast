@@ -108,15 +108,30 @@ def server():
         "auth": "bearer",
     }
     _event(process, "ready")
+    workers = _children(process.pid)
+    assert workers
     try:
         yield serving["url"], process
-        process.send_signal(signal.SIGTERM)
+        # A terminal's Ctrl-C reaches the whole group, and stops it quietly.
+        os.killpg(process.pid, signal.SIGINT)
         assert _event(process, "stopped")["url"] == serving["url"]
         assert process.wait(60) == 0
+        assert process.stdout.read() == ""
+        stderr = process.stderr.read()
+        assert "Traceback" not in stderr and "KeyboardInterrupt" not in stderr, stderr
+        _assert_exited(workers)
+        # The server removed its workers' socket directories as it stopped.
+        left = [
+            entry.name
+            for entry in Path(tempfile.gettempdir()).iterdir()
+            if any(entry.name.startswith(f"gf-{pid}-") for pid in workers)
+        ]
+        assert left == [], left
     finally:
         processes.stop(process)
 
 
+@pytest.mark.server
 @pytest.mark.slow
 def test_serve_answers_the_hosted_models_api(server):
     url, _ = server
@@ -143,6 +158,7 @@ def test_serve_answers_the_hosted_models_api(server):
     ]
 
 
+@pytest.mark.server
 @pytest.mark.slow
 def test_a_dotted_catalog_id_reaches_gf_serves_models_route(server):
     from generalforecast.client import Client
@@ -159,6 +175,7 @@ def test_a_dotted_catalog_id_reaches_gf_serves_models_route(server):
         assert client.models.get(MODEL)["name"] == MODEL
 
 
+@pytest.mark.server
 @pytest.mark.slow
 def test_serve_requires_its_key_and_keeps_the_api_errors(server):
     url, _ = server
@@ -196,6 +213,7 @@ def predict(url, payload):
     )
 
 
+@pytest.mark.server
 @pytest.mark.slow
 def test_the_ad_hoc_route_predicts_and_names_what_it_refuses(server):
     url, _ = server
@@ -248,6 +266,7 @@ def test_the_ad_hoc_route_predicts_and_names_what_it_refuses(server):
     assert status == 404
 
 
+@pytest.mark.server
 @pytest.mark.slow
 def test_ten_thousand_context_rows_are_answered(server):
     url, _ = server
@@ -267,31 +286,6 @@ def test_ten_thousand_context_rows_are_answered(server):
     assert body["result"]["context"]["rows"] == 10_000
     [row] = body["result"]["predictions"]
     assert set(row["probabilities"]) == {"0", "1"}
-
-
-@pytest.mark.server
-@pytest.mark.slow
-def test_ctrl_c_stops_the_server_and_its_workers_quietly():
-    port = free_port()
-    process = _start([MODEL, "--port", str(port)], env={"GF_API_KEY": KEY})
-    url = _event(process, "serving")["url"]
-    _event(process, "ready")
-    workers = _children(process.pid)
-    assert workers
-    os.killpg(process.pid, signal.SIGINT)
-    assert _event(process, "stopped")["url"] == url
-    assert process.wait(60) == 0
-    assert process.stdout.read() == ""
-    stderr = process.stderr.read()
-    assert "Traceback" not in stderr and "KeyboardInterrupt" not in stderr, stderr
-    _assert_exited(workers)
-    # Each server removed its workers' socket directories as it stopped.
-    left = [
-        entry.name
-        for entry in Path(tempfile.gettempdir()).iterdir()
-        if any(entry.name.startswith(f"gf-{pid}-") for pid in workers)
-    ]
-    assert left == [], left
 
 
 @pytest.mark.server

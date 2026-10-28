@@ -18,6 +18,7 @@ from generalforecast.models.series import SeriesFunctions
 __all__ = [
     "CASES",
     "FEATURES",
+    "RUNTIME_CASES",
     "SERIES_CASES",
     "Case",
     "SeriesCase",
@@ -213,6 +214,27 @@ CASES = [
     Case("ensemble-classes", False, *_ensemble(_tabicl_functions, _tabicl(False))),
     Case("ensemble-values", True, *_ensemble(_kumo_functions, _kumo(True))),
     Case("many-classes", False, *_many_class(_kumo_functions, _kumo(False))),
+]
+
+# The runtime's paging, decoding, worker units and local tables depend on a
+# model only through its caches and states, so their tests run on one case of
+# each layout: every family, a retrieval decoder, ensembles and
+# error-correcting codes, classes and values both.
+RUNTIME_CASES = [
+    case
+    for case in CASES
+    if case.name
+    in {
+        "tabicl-values",
+        "retrieval-classes",
+        "tabpfn-classes",
+        "tabpfn-3.5-values",
+        "kumo-values",
+        "limix-classes",
+        "mitra-values",
+        "ensemble-classes",
+        "many-classes",
+    }
 ]
 
 

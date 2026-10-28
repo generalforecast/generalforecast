@@ -30,7 +30,7 @@ from generalforecast.runtime.memory import NoMemoryAnalysis, memory_profile
 from generalforecast.runtime.paging import DevicePool, read_context
 from generalforecast.worker import Worker
 from generalforecast.worker import admission as worker_admission
-from tests.models.conformance.cases import CASES, Case, table
+from tests.models.conformance.cases import RUNTIME_CASES, Case, table
 from tests.models.kumo.tiny import tiny_kumo
 from tests.models.tabicl.tiny import tiny_tabicl
 from tests.models.timestral.tiny import tiny_timestral
@@ -71,7 +71,7 @@ def _table(
     )
 
 
-@pytest.mark.parametrize("case", CASES, ids=[case.name for case in CASES])
+@pytest.mark.parametrize("case", RUNTIME_CASES, ids=[c.name for c in RUNTIME_CASES])
 def test_local_predictions_match_predict(case: Case) -> None:
     functions, model = case.functions(), case.build(0)
     data = table(case.regression, rows=40)
