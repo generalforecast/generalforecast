@@ -144,7 +144,7 @@ jobs:
       matrix:
         part: [1, 2]
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - if: matrix.part == 1
@@ -164,10 +164,24 @@ jobs:
           uv run ruff check .
           uv run ruff format --check .
           uv run ty check
+      # JAX's compile cache from this part's last run on main: a program
+      # whose code did not change loads instead of compiling, which takes
+      # most of these tests' time on a cold cache.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/generalforecast/jax
+          key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+          restore-keys: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-
       - run: uv run pytest -m "not slow" -n auto --shard ${{ matrix.part }}/2
+      # Saved from runs outside pull requests, so those cannot crowd out main's.
+      - if: always() && github.event_name != 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/generalforecast/jax
+          key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
 
   # The tests marked slow that start no server, which compile the tiny
-  # models, in four parts. Three workers a runner: each local client's cache
+  # models, in five parts. Three workers a runner: each local client's cache
   # tiers take a share of the runner's memory, and four ran it out.
   slow:
     needs: changes
@@ -175,9 +189,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4]
+        part: [1, 2, 3, 4, 5]
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -189,9 +203,23 @@ jobs:
           version: "0.8.0"
           enable-cache: true
       - run: uv sync --locked
+      # JAX's compile cache from this part's last run on main: a program
+      # whose code did not change loads instead of compiling, which takes
+      # most of these tests' time on a cold cache.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/generalforecast/jax
+          key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+          restore-keys: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-
       - run: >-
           uv run pytest -m "slow and not server and not router" -n 3
-          --shard ${{ matrix.part }}/4
+          --shard ${{ matrix.part }}/5
+      # Saved from runs outside pull requests, so those cannot crowd out main's.
+      - if: always() && github.event_name != 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/generalforecast/jax
+          key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
 
   # Tests marked server or router start gf-server and gf-router processes;
   # those also marked slow run here, in four parts beside the other jobs
@@ -204,7 +232,7 @@ jobs:
       matrix:
         part: [1, 2, 3, 4]
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -216,9 +244,23 @@ jobs:
           enable-cache: true
       - run: uv sync --locked
       - run: cargo build -p gf-server -p gf-router
+      # JAX's compile cache from this part's last run on main: a program
+      # whose code did not change loads instead of compiling, which takes
+      # most of these tests' time on a cold cache.
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/generalforecast/jax
+          key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+          restore-keys: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-
       - run: >-
           uv run pytest -m "(server or router) and slow" -n auto
           --shard ${{ matrix.part }}/4
+      # Saved from runs outside pull requests, so those cannot crowd out main's.
+      - if: always() && github.event_name != 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/generalforecast/jax
+          key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
 
   # Replays api/openapi.yaml's examples, and checks real predictions'
   # meaning, against a gf serve stack on the tiny test models, so a reply

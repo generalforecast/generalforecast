@@ -51,7 +51,7 @@ FLOAT32, FLOAT16, BFLOAT16, INT8 = (
     jnp.dtype(name) for name in ("float32", "float16", "bfloat16", "int8")
 )
 REFERENCE = DeviceSettings(FLOAT32, FLOAT32, AttentionKernel())
-BUDGETED = {"tabicl-values", "limix-classes", "ensemble-classes"}
+BUDGETED = {"tabicl-values", "limix-classes", "ensemble-values"}
 runtime = pytest.mark.parametrize(
     "case", RUNTIME_CASES, ids=[case.name for case in RUNTIME_CASES]
 )
@@ -207,7 +207,8 @@ def test_device_settings_barely_move_predictions(
 
 
 # The node sizes such a fit from a model's state alone: one whose state
-# summarizes columns, one whose does not, and an ensemble's stacked states.
+# summarizes columns, one whose does not, and an ensemble's stacked states,
+# whose categorical columns can be crowded.
 @pytest.mark.parametrize(
     "case",
     [case for case in CASES if case.name in BUDGETED],

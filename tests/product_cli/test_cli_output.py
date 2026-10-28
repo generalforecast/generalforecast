@@ -220,6 +220,23 @@ def test_internal_errors_never_show_a_traceback_without_verbose(monkeypatch):
     assert stderr.endswith("error[Internal]: internal error\nhelp: run again with -v\n")
 
 
+def test_status_verbs_are_right_aligned_in_twelve_columns():
+    err = io.StringIO()
+    out = term.Output(out=io.StringIO(), err=err, environ={"NO_COLOR": "1"})
+    out.status("Initialized", "predictor churn in ./gf.yaml")
+    out.status("Resolved", "churn  classification, 3 inputs", seconds=None)
+    out.status("Locked", "gf.lock", seconds=0.21)
+    out.status("Compiled", "12 programs", seconds=6.8)
+    out.status("Deployed", "churn revision 7 to staging", seconds=41)
+    assert err.getvalue() == (
+        " Initialized predictor churn in ./gf.yaml\n"
+        "    Resolved churn  classification, 3 inputs\n"
+        "      Locked gf.lock in 0.21s\n"
+        "    Compiled 12 programs in 6.8s\n"
+        "    Deployed churn revision 7 to staging in 41s\n"
+    )
+
+
 def test_colour_follows_the_terminal_and_no_color():
     assert not term.color_enabled(io.StringIO(), {})
     assert term.color_enabled(Tty(), {})
