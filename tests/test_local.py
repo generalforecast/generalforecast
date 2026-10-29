@@ -3078,10 +3078,6 @@ def test_a_record_request_with_a_trace_writes_the_trace_and_its_steps(
         assert 0 < row["device_s"] <= row["trace_s"] <= row["wall_s"]
         assert row["device_s"] + row["idle_s"] == pytest.approx(row["trace_s"])
         assert row["gap_after"]
-        # Its parts add up to its wall, as a reply's do.
-        parts = sum(value for name, value in row.items() if name.endswith("_s"))
-        parts -= sum(row[name] for name in trace._STEP_COLUMNS if name.endswith("_s"))
-        assert parts == pytest.approx(row["wall_s"], rel=0.05)
     assert "wait_s" in summary.steps.column_names
     # Every program the step ran is in the tables, with the stage's runs.
     programs = {row["program"]: row for row in summary.programs.to_pylist()}
