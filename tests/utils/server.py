@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import shutil
@@ -117,11 +118,26 @@ def build() -> Path:
     return ROOT / "target" / "debug" / "gf-server"
 
 
+# Ports below the kernels' ephemeral ranges (Linux from 32768, macOS from
+# 49152), a block of them per xdist worker: a port the kernel hands one worker
+# to probe can go to another's server before the first binds it.
+PORTS_FROM, PORTS_PER_WORKER = 20000, 400
+_ports = itertools.count()
+
+
 def free_port() -> int:
-    """A loopback port no process holds now, for a server a test starts."""
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
+    """A loopback port no process holds now, from this test worker's own block."""
+    worker = int(os.environ.get("PYTEST_XDIST_WORKER", "gw0").removeprefix("gw"))
+    first = PORTS_FROM + worker * PORTS_PER_WORKER
+    for _ in range(PORTS_PER_WORKER):
+        port = first + next(_ports) % PORTS_PER_WORKER
+        with socket.socket() as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+        return port
+    raise RuntimeError(f"no free port in {first} to {first + PORTS_PER_WORKER - 1}")
 
 
 class Server:
