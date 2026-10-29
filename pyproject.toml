@@ -35,7 +35,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://generalforecast.com"
-Repository = "https://github.com/generalforecast/gf"
+Repository = "https://github.com/generalforecast/generalforecast"
 
 [project.scripts]
 gf = "generalforecast.cli:main"

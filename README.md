@@ -58,6 +58,6 @@ If you use General Forecast, please cite our work:
     author={Tejas Prabhune and Ayushi Batwara},
     year={2026},
     publisher={GitHub},
-    howpublished={\url{https://github.com/generalforecast/gf}}
+    howpublished={\url{https://github.com/generalforecast/generalforecast}}
 }
 ```
