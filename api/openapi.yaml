@@ -3446,7 +3446,7 @@ components:
 
     ResourceKind:
       type: string
-      enum: [predictor, model, project, api-key, secret, context, source, workspace]
+      enum: [predictor, model, project, api-key, secret, context, source, workspace, corpus, run]
 
     Resource:
       type: object

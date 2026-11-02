@@ -250,6 +250,8 @@ ResourceKind = Literal[
     "context",
     "source",
     "workspace",
+    "corpus",
+    "run",
 ]
 _decode_ResourceKind: Decoder = _literal(
     "predictor",
@@ -260,6 +262,8 @@ _decode_ResourceKind: Decoder = _literal(
     "context",
     "source",
     "workspace",
+    "corpus",
+    "run",
 )
 
 
