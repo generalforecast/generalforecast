@@ -175,14 +175,14 @@ jobs:
   # gf's extension, its editable install and the debug servers, built once
   # for these Rust sources and pyproject.toml and cached under their hash;
   # a run whose sources an earlier run built (any change to Python alone)
-  # finds them and builds nothing.
+  # finds them and builds nothing. It runs beside `changes` rather than after
+  # it, since nearly every run needs it, and a lookup that finds the build
+  # costs seconds.
   native:
-    needs: changes
     if: >-
-      (needs.changes.outputs.fast == 'true' && (needs.changes.outputs.python == 'true' ||
-      needs.changes.outputs.serving == 'true' || needs.changes.outputs.typescript == 'true')) ||
-      (needs.changes.outputs.slow == 'true' && (needs.changes.outputs.python == 'true' ||
-      needs.changes.outputs.serving == 'true'))
+      github.event_name != 'pull_request' ||
+      (!github.event.pull_request.draft &&
+      (github.event.action != 'labeled' || github.event.label.name == 'ci'))
     runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 20
     outputs:
