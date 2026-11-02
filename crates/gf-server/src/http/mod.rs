@@ -80,7 +80,7 @@ const DEFAULT_ENVIRONMENT: &str = "production";
 /// The first path segment of the control plane's service-to-service routes.
 const INTERNAL: &str = "internal";
 /// The kinds of resource an envelope may name.
-const RESOURCE_KINDS: [&str; 9] = [
+const RESOURCE_KINDS: [&str; 11] = [
     "workspace",
     "project",
     "context",
@@ -90,6 +90,8 @@ const RESOURCE_KINDS: [&str; 9] = [
     "operator",
     "api-key",
     "secret",
+    "corpus",
+    "run",
 ];
 /// The most query and context rows a predictor's `/predictions` takes.
 const MAX_QUERY_ROWS: usize = 10_000;
