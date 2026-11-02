@@ -1,0 +1,60 @@
+# Keeps AI and bot attribution out of this repository: no commit authored by or crediting Claude
+# or Blacksmith, and no such footer in a pull request's title or description. A pull request is
+# checked as it opens, changes or is edited; main is checked on every push, to flag anything that
+# got past a pull request.
+name: attribution
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize, reopened]
+  push:
+    branches: [main]
+
+jobs:
+  attribution:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    timeout-minutes: 5
+    steps:
+      - name: No AI or bot attribution
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          # Trailers, footers and session links that credit an assistant or a bot.
+          text='co-authored-by:.*(claude|anthropic|blacksmith|codesmith)|claude-session:|generated (with|by) \[?claude|claude\.ai/code|codesmith'
+          # Authors and committers that are an assistant or a bot.
+          who='claude|anthropic|blacksmith|codesmith'
+          : >/tmp/found
+          check() { # $1 says what was read; the text comes on stdin
+            if grep -inE "$text" >/tmp/hits; then
+              { echo "::error::$1 carries AI or bot attribution:"; cat /tmp/hits; } | tee -a /tmp/found
+            fi
+          }
+          if [ -n "$PR" ]; then
+            gh api "repos/$REPO/pulls/$PR" --jq '(.title // "") + "\n" + (.body // "")' >/tmp/description
+            check "The pull request's title or description" </tmp/description
+            gh api --paginate "repos/$REPO/pulls/$PR/commits" >/tmp/commits.json
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != 0000000000000000000000000000000000000000 ] \
+            && gh api "repos/$REPO/compare/$BEFORE...$AFTER" --jq '.commits' >/tmp/commits.json 2>/dev/null; then
+            :
+          else
+            gh api "repos/$REPO/commits/$AFTER" --jq '[.]' >/tmp/commits.json
+          fi
+          jq -r '.[] | .commit.message' /tmp/commits.json >/tmp/messages
+          check "A commit message" </tmp/messages
+          jq -r '.[] | "\(.sha[0:8]) \(.commit.author.name) <\(.commit.author.email)> / \(.commit.committer.name) <\(.commit.committer.email)>"' /tmp/commits.json >/tmp/people
+          if grep -iE "$who" /tmp/people >/tmp/hits; then
+            { echo "::error::Commits authored or committed by an assistant or a bot:"; cat /tmp/hits; } | tee -a /tmp/found
+          fi
+          if [ -s /tmp/found ]; then
+            echo "Remove the attribution: edit the description, or rewrite the commits under your own name without the trailers."
+            exit 1
+          fi
+          echo "No AI or bot attribution."
