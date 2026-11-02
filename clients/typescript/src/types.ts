@@ -26,7 +26,7 @@ export type Digest = string;
 
 export type Task = "classification" | "regression" | "forecast";
 
-export type ResourceKind = "predictor" | "model" | "project" | "api-key" | "secret" | "context" | "source" | "workspace";
+export type ResourceKind = "predictor" | "model" | "project" | "api-key" | "secret" | "context" | "source" | "workspace" | "corpus" | "run";
 
 /** what the envelope is about; GET lists use the collection name */
 export interface Resource {
