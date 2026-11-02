@@ -1,0 +1,38 @@
+name: gf's environment, built once
+description: >-
+  Installs the locked dependencies, then gf's extension, its editable install
+  and the debug gf-server and gf-router that ci.yml's native job built for
+  these Rust sources, so a test job compiles nothing.
+inputs:
+  key:
+    description: The native job's cache key
+    required: true
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      with:
+        version: "0.8.0"
+        enable-cache: true
+    - shell: bash
+      run: uv sync --locked --no-install-project
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: native.tar
+        key: ${{ inputs.key }}
+        fail-on-cache-miss: true
+    # The servers are newer than the checkout's sources, so gf never takes
+    # them for stale builds, and the tests run them by GF_SERVER_BIN and
+    # GF_ROUTER_BIN rather than building them; every `uv run` keeps the
+    # install rather than building the extension.
+    - shell: bash
+      run: |
+        set -euo pipefail
+        tar -xf native.tar
+        rm native.tar
+        touch target/debug/gf-server target/debug/gf-router
+        {
+          echo "GF_SERVER_BIN=$PWD/target/debug/gf-server"
+          echo "GF_ROUTER_BIN=$PWD/target/debug/gf-router"
+          echo "UV_NO_SYNC=1"
+        } >> "$GITHUB_ENV"

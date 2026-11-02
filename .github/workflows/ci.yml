@@ -6,14 +6,24 @@ name: CI
 #   drafts and stacked PRs based on other branches run nothing;
 # - on request: add the `ci` label to a PR (remove and add it to run again),
 #   or run the workflow by hand on any branch;
-# - pushes to main, unless the merged PR already passed on the same tree;
+# - the merge queue, for every pull request about to merge;
+# - pushes to main, unless the merge queue or the merged PR already passed on
+#   the same tree;
 # - from release.yml, which runs every job before it builds wheels.
-# Changes to documentation alone run nothing, and each job but the Python
-# checks and tests runs only when code it checks changes. The server and router
-# integration tests, which build both binaries and start processes, run
-# whenever the Rust crates or the Python they serve change. Every test runs
-# here, split over runners so that each job takes about eight minutes; only
-# the reference parity tests, which need the gated checkpoints, run weekly.
+#
+# Two tiers. A pull request runs the fast one: Rust, the checks, the tests
+# not marked slow, the conformance replay and the TypeScript client. The
+# merge queue, a push to main that the queue did not check, a run by hand and
+# a release run both: the fast tier, and the slow tests and the server and
+# router integration tests besides. Changes to documentation alone run
+# nothing, and each job but the Python checks and tests runs only when code it
+# checks changes. Only the reference parity tests, which need the gated
+# checkpoints, run weekly.
+#
+# gf's Rust is compiled once a run, in the native job, and only when the Rust
+# sources changed: every test job installs the extension and the servers it
+# built (.github/actions/native) instead of compiling them again. The `result`
+# job is the one check branch protection and the merge queue require.
 on:
   push:
     branches: [main]
@@ -22,6 +32,7 @@ on:
     branches: [main]
     types: [opened, reopened, ready_for_review, labeled]
     paths-ignore: ["**.md"]
+  merge_group:
   workflow_dispatch:
   # The release workflow runs these checks before it builds wheels.
   workflow_call:
@@ -33,7 +44,8 @@ on:
 
 # A newer run for the same PR or branch cancels the older one; adding any
 # other label gets a group of its own, so it cannot cancel a real run, and
-# so does a release's run, which a push to its branch must not cancel.
+# so does a release's run, which a push to its branch must not cancel. Each
+# merge queue entry has a ref of its own.
 concurrency:
   group: >-
     ${{ (inputs.everything ||
@@ -45,7 +57,7 @@ concurrency:
 jobs:
   # Decides which jobs run, from the API alone so it needs no checkout.
   changes:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: blacksmith-2vcpu-ubuntu-2404
     timeout-minutes: 3
     if: >-
       github.event_name != 'pull_request' ||
@@ -60,6 +72,8 @@ jobs:
       python: ${{ steps.decide.outputs.python }}
       serving: ${{ steps.decide.outputs.serving }}
       typescript: ${{ steps.decide.outputs.typescript }}
+      fast: ${{ steps.decide.outputs.fast }}
+      slow: ${{ steps.decide.outputs.slow }}
     steps:
       - id: decide
         env:
@@ -68,62 +82,86 @@ jobs:
           EVENT: ${{ github.event_name }}
           PR: ${{ github.event.pull_request.number }}
           SHA: ${{ github.sha }}
+          QUEUE_BASE: ${{ github.event.merge_group.base_sha }}
+          QUEUE_HEAD: ${{ github.event.merge_group.head_sha }}
           # Set only when release.yml calls this workflow.
           EVERYTHING: ${{ inputs.everything == true }}
         run: |
-          rust=true python=true serving=true typescript=true
+          # What the changed files touch, and which tiers run on it.
+          rust=true python=true serving=true typescript=true fast=true slow=true
+          only() {
+            grep -qE '^(crates/|Cargo\.|rust-toolchain|\.github/workflows/ci\.yml|\.github/actions/)' <<<"$1" || rust=false
+            # The binaries, the Python workers and engine they start, and the tests' harness.
+            grep -qE '^(crates/|Cargo\.|rust-toolchain|src/generalforecast/|tests/(conftest|test_server|test_router|test_remote|test_placement|test_estimators|test_cli)\.py|tests/durations\.json|tests/(utils|models|serve)/|pyproject\.toml|uv\.lock|\.github/workflows/ci\.yml|\.github/actions/)' <<<"$1" || serving=false
+            grep -qE '^(clients/typescript/|api/|\.github/workflows/ci\.yml)' <<<"$1" || typescript=false
+          }
           if [ "$EVERYTHING" = true ]; then
             echo "called to run every job"
           elif [ "$EVENT" = pull_request ]; then
-            files=$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')
-            grep -qE '^(crates/|Cargo\.|rust-toolchain|\.github/workflows/ci\.yml)' <<<"$files" || rust=false
-            # The binaries, the Python workers and engine they start, and the tests' harness.
-            grep -qE '^(crates/|Cargo\.|rust-toolchain|src/generalforecast/|tests/(conftest|test_server|test_router|test_remote|test_placement|test_estimators|test_cli)\.py|tests/(utils|models|serve)/|pyproject\.toml|uv\.lock|\.github/workflows/ci\.yml)' <<<"$files" || serving=false
-            grep -qE '^(clients/typescript/|api/|\.github/workflows/ci\.yml)' <<<"$files" || typescript=false
+            only "$(gh api "repos/$REPO/pulls/$PR/files" --paginate --jq '.[].filename')"
+            # The slow tier runs in the merge queue.
+            slow=false
+          elif [ "$EVENT" = merge_group ]; then
+            only "$(gh api "repos/$REPO/compare/$QUEUE_BASE...$QUEUE_HEAD" --jq '.files[].filename')"
           elif [ "$EVENT" = push ]; then
-            # A merge whose tree is the PR head's repeats checks that passed.
-            pr=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[0].number // empty')
-            if [ -n "$pr" ]; then
-              head=$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)
-              tree() { gh api "repos/$REPO/git/commits/$1" --jq .tree.sha; }
-              if [ "$(tree "$SHA")" = "$(tree "$head")" ]; then
-                passed=false
-                for run in $(gh api "repos/$REPO/actions/runs?head_sha=$head&event=pull_request" \
-                    --jq '.workflow_runs[] | select(.name == "CI" and .conclusion == "success") | .id'); do
-                  # Every part of the Python tests ran and passed.
-                  if gh api "repos/$REPO/actions/runs/$run/jobs" \
-                      --jq '[.jobs[] | select(.name | startswith("python")) | .conclusion]
-                        | length > 0 and all(. == "success")' | grep -qx true; then
-                    passed=true
-                  fi
-                done
-                if $passed; then
-                  rust=false python=false serving=false typescript=false
-                  echo "PR #$pr passed on this tree"
+            # Every job ran and passed for this commit in the merge queue,
+            # which then moved main to it.
+            queued=false
+            for run in $(gh api "repos/$REPO/actions/runs?head_sha=$SHA&event=merge_group" \
+                --jq '.workflow_runs[] | select(.name == "CI" and .conclusion == "success") | .id'); do
+              if gh api "repos/$REPO/actions/runs/$run/jobs" \
+                  --jq '[.jobs[] | select(.name == "result") | .conclusion] | any(. == "success")' | grep -qx true; then
+                queued=true
+              fi
+            done
+            if $queued; then
+              fast=false slow=false
+              echo "the merge queue passed this commit"
+            else
+              # A merge whose tree is the PR head's repeats the fast tier,
+              # which passed there; the slow tier never runs on a PR.
+              pr=$(gh api "repos/$REPO/commits/$SHA/pulls" --jq '.[0].number // empty')
+              if [ -n "$pr" ]; then
+                head=$(gh api "repos/$REPO/pulls/$pr" --jq .head.sha)
+                tree() { gh api "repos/$REPO/git/commits/$1" --jq .tree.sha; }
+                if [ "$(tree "$SHA")" = "$(tree "$head")" ]; then
+                  for run in $(gh api "repos/$REPO/actions/runs?head_sha=$head&event=pull_request" \
+                      --jq '.workflow_runs[] | select(.name == "CI" and .conclusion == "success") | .id'); do
+                    if gh api "repos/$REPO/actions/runs/$run/jobs" \
+                        --jq '[.jobs[] | select(.name == "result") | .conclusion] | any(. == "success")' | grep -qx true; then
+                      fast=false
+                      echo "PR #$pr passed the fast tier on this tree"
+                    fi
+                  done
                 fi
               fi
             fi
           fi
-          echo "rust=$rust python=$python serving=$serving typescript=$typescript"
+          echo "rust=$rust python=$python serving=$serving typescript=$typescript fast=$fast slow=$slow"
           {
             echo "rust=$rust"
             echo "python=$python"
             echo "serving=$serving"
             echo "typescript=$typescript"
+            echo "fast=$fast"
+            echo "slow=$slow"
           } >>"$GITHUB_OUTPUT"
 
   # The checks run side by side, so a run takes as long as the slowest one.
   rust:
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    if: needs.changes.outputs.rust == 'true' && needs.changes.outputs.fast == 'true'
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
-      - uses: useblacksmith/checkout@v1 # v7
-      # Dependencies and build outputs carry over from main's last run; only
-      # main saves them, so pull requests cannot crowd out its cache.
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+      # Dependencies and build outputs, gf's own crates among them, carry
+      # over from main's last run, so a change recompiles only what it
+      # touches; only main saves them, so pull requests cannot crowd out its
+      # cache.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
+          cache-workspace-crates: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # rustup installs the toolchain pinned in rust-toolchain.toml.
       - run: cargo fmt --check
@@ -134,162 +172,242 @@ jobs:
       # whenever this one runs.
       - run: cargo test --workspace --exclude gf-py
 
-  # The checks, and the tests not marked slow in three parts, each on its
-  # own runner's four cores.
-  python:
+  # gf's extension, its editable install and the debug servers, built once
+  # for these Rust sources and pyproject.toml and cached under their hash;
+  # a run whose sources an earlier run built (any change to Python alone)
+  # finds them and builds nothing.
+  native:
     needs: changes
-    if: needs.changes.outputs.python == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [1, 2, 3]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 25
+    if: >-
+      (needs.changes.outputs.fast == 'true' && (needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.serving == 'true' || needs.changes.outputs.typescript == 'true')) ||
+      (needs.changes.outputs.slow == 'true' && (needs.changes.outputs.python == 'true' ||
+      needs.changes.outputs.serving == 'true'))
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 20
+    outputs:
+      key: ${{ steps.key.outputs.key }}
     steps:
-      - uses: useblacksmith/checkout@v1 # v7
-      - if: matrix.part == 1
-        run: python scripts/spdx.py --check
-      # uv sync builds the Rust extension, as the slow job's does.
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+      - id: key
+        run: echo "key=gf-native-v1-${{ hashFiles('crates/**', 'Cargo.toml', 'Cargo.lock', 'rust-toolchain.toml', 'pyproject.toml') }}" >> "$GITHUB_OUTPUT"
+      - id: cached
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          shared-key: python
+          path: native.tar
+          key: ${{ steps.key.outputs.key }}
+          lookup-only: true
+      - if: steps.cached.outputs.cache-hit != 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: native
+          cache-workspace-crates: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - if: steps.cached.outputs.cache-hit != 'true'
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.8.0"
+          enable-cache: true
+      # Line tables keep a panic's file and line, at a quarter of the size
+      # full debug info gives the servers.
+      - if: steps.cached.outputs.cache-hit != 'true'
+        name: Build the extension and the servers
+        env:
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: |
+          set -euo pipefail
+          # Built afresh: an editable install that uv kept in its cache would
+          # leave the extension out of src/.
+          uv sync --locked --reinstall-package generalforecast
+          cargo build -p gf-server -p gf-router
+          site=$(echo .venv/lib/python3*/site-packages)
+          tar -cf native.tar src/generalforecast/_core.abi3.so \
+            target/debug/gf-server target/debug/gf-router \
+            "$site"/generalforecast.pth "$site"/generalforecast-*.dist-info .venv/bin/gf
+      - if: steps.cached.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: native.tar
+          key: ${{ steps.key.outputs.key }}
+
+  # The checks that need no tests: license headers, lint, format and types.
+  lint:
+    needs: changes
+    if: needs.changes.outputs.python == 'true' && needs.changes.outputs.fast == 'true'
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+      - run: python scripts/spdx.py --check
       - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
         with:
           version: "0.8.0"
           enable-cache: true
-      - run: uv sync --locked
-      - if: matrix.part == 1
-        run: |
-          uv run ruff check .
-          uv run ruff format --check .
-          uv run ty check
+      # ty reads gf's own modules from src/, the extension from its stub.
+      - run: uv sync --locked --no-install-project
+      - run: |
+          uv run --no-sync ruff check .
+          uv run --no-sync ruff format --check .
+          uv run --no-sync ty check
+
+  # The tests not marked slow, in two parts on sixteen cores each, balanced
+  # by tests/durations.json.
+  python:
+    needs: [changes, native]
+    if: needs.changes.outputs.python == 'true' && needs.changes.outputs.fast == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2]
+    runs-on: blacksmith-16vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+      - uses: ./.github/actions/native
+        with:
+          key: ${{ needs.native.outputs.key }}
       # JAX's compile cache from this part's last run on main: a program
       # whose code did not change loads instead of compiling, which takes
-      # most of these tests' time on a cold cache.
+      # most of these tests' time on a cold cache. A new lock falls back to
+      # the cache of an older one, whose programs JAX keys by its version.
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/generalforecast/jax
           key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
-          restore-keys: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-
-      - run: uv run pytest -m "not slow" -n auto --shard ${{ matrix.part }}/3 --durations=10
+          restore-keys: |
+            jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-
+            jax-${{ github.job }}-${{ matrix.part }}-
+      - run: >-
+          uv run pytest -m "not slow" -n auto --shard ${{ matrix.part }}/2 --durations=10
+          --record-durations durations-${{ github.job }}-${{ matrix.part }}.json
       # Saved from runs outside pull requests, so those cannot crowd out main's.
       - if: always() && github.event_name != 'pull_request'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/generalforecast/jax
           key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+      # What scripts/durations.py turns into tests/durations.json.
+      - if: always() && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: durations-${{ github.job }}-${{ matrix.part }}
+          path: durations-${{ github.job }}-${{ matrix.part }}.json
+          if-no-files-found: ignore
+          retention-days: 14
 
   # The tests marked slow that start no server, which compile the tiny
-  # models, in ten parts at three workers a runner: a test process grows
-  # by a few GB over the tests it runs, and five parts ran a runner out of
-  # memory. A test that runs ten minutes prints every thread's stack.
+  # models, in four parts at twelve workers a runner: a test process grows by
+  # a few GB over the tests it runs, which twelve leave room for in 64 GB. A
+  # test that runs ten minutes prints every thread's stack.
   slow:
-    needs: changes
-    if: needs.changes.outputs.python == 'true'
+    needs: [changes, native]
+    if: needs.changes.outputs.python == 'true' && needs.changes.outputs.slow == 'true'
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+        part: [1, 2, 3, 4]
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: useblacksmith/checkout@v1 # v7
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+      - uses: ./.github/actions/native
         with:
-          shared-key: python
-          save-if: false
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-        with:
-          version: "0.8.0"
-          enable-cache: true
-      - run: uv sync --locked
-      # JAX's compile cache from this part's last run on main: a program
-      # whose code did not change loads instead of compiling, which takes
-      # most of these tests' time on a cold cache.
+          key: ${{ needs.native.outputs.key }}
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/generalforecast/jax
           key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
-          restore-keys: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-
+          restore-keys: |
+            jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-
+            jax-${{ github.job }}-${{ matrix.part }}-
       - run: >-
-          uv run pytest -m "slow and not server and not router" -n 3
-          --shard ${{ matrix.part }}/10 --durations=10
+          uv run pytest -m "slow and not server and not router" -n 12
+          --shard ${{ matrix.part }}/4 --durations=10
           -o faulthandler_timeout=600
-      # Saved from runs outside pull requests, so those cannot crowd out main's.
+          --record-durations durations-${{ github.job }}-${{ matrix.part }}.json
       - if: always() && github.event_name != 'pull_request'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/generalforecast/jax
           key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+      - if: always() && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: durations-${{ github.job }}-${{ matrix.part }}
+          path: durations-${{ github.job }}-${{ matrix.part }}.json
+          if-no-files-found: ignore
+          retention-days: 14
 
   # Tests marked server or router start gf-server and gf-router processes;
-  # those also marked slow run here, in five parts beside the other jobs
-  # rather than after them, and only when what they exercise changed. Three
-  # workers leave a core to the servers, whose failover waits on timers.
+  # those also marked slow run here, in two parts beside the other jobs
+  # rather than after them, and only when what they exercise changed. Twelve
+  # workers leave four cores to the servers, whose failover waits on timers.
   serving:
-    needs: changes
-    if: needs.changes.outputs.serving == 'true'
+    needs: [changes, native]
+    if: needs.changes.outputs.serving == 'true' && needs.changes.outputs.slow == 'true'
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3, 4, 5]
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+        part: [1, 2]
+    runs-on: blacksmith-16vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: useblacksmith/checkout@v1 # v7
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+      - uses: ./.github/actions/native
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
-        with:
-          version: "0.8.0"
-          enable-cache: true
-      - run: uv sync --locked
-      - run: cargo build -p gf-server -p gf-router
-      # JAX's compile cache from this part's last run on main: a program
-      # whose code did not change loads instead of compiling, which takes
-      # most of these tests' time on a cold cache.
+          key: ${{ needs.native.outputs.key }}
       - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/generalforecast/jax
           key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
-          restore-keys: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-
+          restore-keys: |
+            jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-
+            jax-${{ github.job }}-${{ matrix.part }}-
       - run: >-
-          uv run pytest -m "(server or router) and slow" -n 3
-          --shard ${{ matrix.part }}/5 --durations=10
+          uv run pytest -m "(server or router) and slow" -n 12
+          --shard ${{ matrix.part }}/2 --durations=10
           -o faulthandler_timeout=600
-      # Saved from runs outside pull requests, so those cannot crowd out main's.
+          --record-durations durations-${{ github.job }}-${{ matrix.part }}.json
       - if: always() && github.event_name != 'pull_request'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.cache/generalforecast/jax
           key: jax-${{ github.job }}-${{ matrix.part }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+      - if: always() && github.event_name != 'pull_request'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: durations-${{ github.job }}-${{ matrix.part }}
+          path: durations-${{ github.job }}-${{ matrix.part }}.json
+          if-no-files-found: ignore
+          retention-days: 14
 
   # Replays api/openapi.yaml's examples, and checks real predictions'
   # meaning, against a gf serve stack on the tiny test models, so a reply
   # that drifts from the spec fails here rather than in a client.
   conformance:
-    needs: changes
-    if: needs.changes.outputs.serving == 'true' || needs.changes.outputs.typescript == 'true'
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    needs: [changes, native]
+    if: >-
+      needs.changes.outputs.fast == 'true' &&
+      (needs.changes.outputs.serving == 'true' || needs.changes.outputs.typescript == 'true')
+    runs-on: blacksmith-8vcpu-ubuntu-2404
     timeout-minutes: 45
     steps:
-      - uses: useblacksmith/checkout@v1 # v7
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+      - uses: ./.github/actions/native
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+          key: ${{ needs.native.outputs.key }}
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          version: "0.8.0"
-          enable-cache: true
-      - run: uv sync --locked
-      - run: cargo build -p gf-server
+          path: ~/.cache/generalforecast/jax
+          key: jax-${{ github.job }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
+          restore-keys: |
+            jax-${{ github.job }}-${{ hashFiles('uv.lock') }}-
+            jax-${{ github.job }}-
       # The stack prints one JSON line once it answers /readyz, after its
       # worker compiles; the suite runs against it, then it is stopped.
       - name: Replay the spec against gf serve
         run: |
-          uv run python scripts/conformance_server.py --binary target/debug/gf-server >server.json &
+          uv run python scripts/conformance_server.py --binary "$GF_SERVER_BIN" >server.json &
           stack=$!
           until [ -s server.json ]; do
             kill -0 "$stack" || exit 1
@@ -304,20 +422,47 @@ jobs:
           kill "$stack"
           wait "$stack" || true
           exit "$status"
+      - if: always() && github.event_name != 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/generalforecast/jax
+          key: jax-${{ github.job }}-${{ hashFiles('uv.lock') }}-${{ github.sha }}
 
   typescript:
     needs: changes
-    if: needs.changes.outputs.typescript == 'true'
+    if: needs.changes.outputs.typescript == 'true' && needs.changes.outputs.fast == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     defaults:
       run:
         working-directory: clients/typescript
     steps:
-      - uses: useblacksmith/checkout@v1 # v7
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22.23.3"
+          cache: npm
+          cache-dependency-path: clients/typescript/package-lock.json
       - run: npm ci
       # Builds the client, then checks it against the spec's examples.
       - run: npm test
+
+  # The one required check: it passes when every job this run needed passed
+  # (a job its changes did not need is skipped, which counts), so branch
+  # protection and the merge queue need not track the parts' names.
+  result:
+    needs: [changes, rust, native, lint, python, slow, serving, conformance, typescript]
+    if: always()
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 2
+    steps:
+      - env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          for result in $RESULTS; do
+            case "$result" in
+              success | skipped) ;;
+              *) exit 1 ;;
+            esac
+          done
