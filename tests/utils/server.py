@@ -24,6 +24,7 @@ import pyarrow as pa
 import pytest
 from pyarrow import flight
 
+from generalforecast.system import usable_cpus
 from tests.utils import processes
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -183,9 +184,12 @@ class Server:
         profiling = (
             f'\n[profiling]\ndirectory = "{self.profiles}"\n' if profiles else ""
         )
+        # One process per [[workers]] entry, on every usable core, however
+        # many cores the machine has: by default a server starts one per four.
         worker = f"""
 [[workers]]
 command = ["{sys.executable}", "-m", "generalforecast.worker_process"]
+cpu_threads = {usable_cpus()}
 models = {{ tiny = "tests/tabicl-classifier", tiny-capped = "tests/tabicl-classifier-capped", tiny-regressor = "tests/tabicl-regressor", tiny-forecaster = "tests/timestral-forecaster" }}
 """
         tls_section = ""
