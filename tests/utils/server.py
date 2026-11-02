@@ -24,6 +24,7 @@ import pyarrow as pa
 import pytest
 from pyarrow import flight
 
+from generalforecast.system import usable_cpus
 from tests.utils import processes
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -110,8 +111,16 @@ def _ready(process: subprocess.Popen, what: str, probe: Callable[[], object]) ->
         time.sleep(0.2)
 
 
+def _prebuilt(variable: str) -> Path | None:
+    """The program `variable` names, which CI builds once for every test job."""
+    override = os.environ.get(variable)
+    return Path(override) if override else None
+
+
 def build() -> Path:
-    """Builds the server binary, or skips without cargo."""
+    """Builds the server binary, or skips without cargo; GF_SERVER_BIN names one built."""
+    if (prebuilt := _prebuilt("GF_SERVER_BIN")) is not None:
+        return prebuilt
     if shutil.which("cargo") is None:
         pytest.skip("cargo is not installed")
     subprocess.run(["cargo", "build", "-q", "-p", "gf-server"], cwd=ROOT, check=True)
@@ -175,9 +184,12 @@ class Server:
         profiling = (
             f'\n[profiling]\ndirectory = "{self.profiles}"\n' if profiles else ""
         )
+        # One process per [[workers]] entry, on every usable core, however
+        # many cores the machine has: by default a server starts one per four.
         worker = f"""
 [[workers]]
 command = ["{sys.executable}", "-m", "generalforecast.worker_process"]
+cpu_threads = {usable_cpus()}
 models = {{ tiny = "tests/tabicl-classifier", tiny-capped = "tests/tabicl-classifier-capped", tiny-regressor = "tests/tabicl-regressor", tiny-forecaster = "tests/timestral-forecaster" }}
 """
         tls_section = ""
@@ -405,7 +417,9 @@ def wait_until(condition: Callable[[], bool], timeout: float = SETTLE_SECONDS) -
 
 
 def build_router() -> Path:
-    """Builds the router binary, or skips without cargo."""
+    """Builds the router binary, or skips without cargo; GF_ROUTER_BIN names one built."""
+    if (prebuilt := _prebuilt("GF_ROUTER_BIN")) is not None:
+        return prebuilt
     if shutil.which("cargo") is None:
         pytest.skip("cargo is not installed")
     subprocess.run(["cargo", "build", "-q", "-p", "gf-router"], cwd=ROOT, check=True)
