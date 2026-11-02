@@ -16,7 +16,10 @@ path. That override is for development and tests alone.
 
 `uv run pytest -m "not slow" -n auto` runs the fast suite, `-m slow` the
 tests that compile models or start servers, and `--shard K/N` the K-th of N
-parts of whatever is selected, as CI splits it over runners;
+parts of whatever is selected, as CI splits it over runners, balanced by the
+seconds `tests/durations.json` records for each test (`scripts/durations.py`
+refreshes it from a CI run's recorded durations);
 `tests/test_repository.py` holds every tracked file to the repository's
-conventions. A test that starts a server is marked `server` (or `router`);
+conventions. A pull request runs the fast suite, the conformance replay and
+the Rust checks; the merge queue runs those and the slow tests. A test that starts a server is marked `server` (or `router`);
 one that is not cannot start one.
