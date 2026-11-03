@@ -82,11 +82,14 @@ Exports:
         pin, limits, entries, parse_model, resource_name, ALIASES,
             ModelRefError, V1_POLICY, CatalogService, prefetch_catalog: the
             catalog, its pins and bounds, and the serving policy.
-        Derived, DerivedResolver, use_derived: derived models,
-            `<owner>/<name>@ft<version>`, which a plane keeps over a catalog
-            base. The plane installs a `DerivedResolver` with `use_derived`,
-            and `pin`, `parse_lock` and admission ask it what a derived id
-            is made of: base, base digest, weights digest and bags. The
+        Derived, DerivedResolver, DerivedWeights, use_derived: derived
+            models, `<owner>/<name>@ft<version>`, which a plane keeps over a
+            catalog base. The plane installs a `DerivedResolver` with
+            `use_derived`, or names it to engine workers by
+            `GF_DERIVED_RESOLVER=module:attribute`; `pin`, `parse_lock` and
+            admission ask it what a derived id is made of (base, base digest,
+            weights digest and bags), and loading asks it for the
+            `DerivedWeights` it runs as bags over one copy of the base. The
             resolver decides who may use a model; gf never sees how it was
             made. A lock that pins one is `lock_version: 2`, with a
             `predictor.derived` block of `base`, `base_digest` and `bags`.
@@ -142,6 +145,7 @@ from generalforecast.models.catalog import (
 from generalforecast.models.catalog import parse as parse_model
 from generalforecast.models.derived import Derived
 from generalforecast.models.derived import Resolver as DerivedResolver
+from generalforecast.models.derived import Weights as DerivedWeights
 from generalforecast.models.derived import use as use_derived
 from generalforecast.predictors.lock import lock_digest as document_digest
 from generalforecast.predictors.models import CatalogResolver, ModelPin
@@ -303,6 +307,7 @@ __all__ = [
     "ContextVersion",
     "Derived",
     "DerivedResolver",
+    "DerivedWeights",
     "Environment",
     "Error",
     "ImportOutcome",
