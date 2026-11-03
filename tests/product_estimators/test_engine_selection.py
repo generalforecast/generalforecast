@@ -114,8 +114,9 @@ def test_the_default_rule_is_the_engines() -> None:
     for cap in (2, 3, 7, 8, 10, 100, 1000, 100_000):
         for rows in (0, 1, cap - 1, cap, cap + 1, 2 * cap, 50 * cap):
             for timed in (False, True):
-                core = round(0.25 * cap)
-                neighbors = cap - core
+                context = min(cap, 16_384)
+                core = round(0.25 * context)
+                neighbors = context - core
                 expected = (
                     Retrieved(core=None, neighbors=0)
                     if rows <= cap
@@ -128,7 +129,7 @@ def test_the_default_rule_is_the_engines() -> None:
                 )
                 selection = default_selection(rows, cap, timed=timed)
                 assert selection == expected, (rows, cap, timed)
-                assert selection.strategy(cap) == Strategy.adaptive().resolve(
+                assert selection.strategy(cap) == Strategy.adaptive_whole().resolve(
                     rows, cap, timed
                 ), (rows, cap, timed)
 

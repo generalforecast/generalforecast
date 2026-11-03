@@ -418,7 +418,9 @@ fn many_queries_searched_side_by_side_read_what_each_reads_alone() {
 
 #[test]
 fn adaptive_whole_reads_a_table_past_the_cap_whole_where_the_worker_can_hold_it() {
-    use gf_core::planner::{ADAPTIVE_SEED, ADAPTIVE_WHOLE_FROM_CAP, ADAPTIVE_WHOLE_PAST_CAP};
+    use gf_core::planner::{
+        ADAPTIVE_SEED, ADAPTIVE_WHOLE_CONTEXT, ADAPTIVE_WHOLE_FROM_CAP, ADAPTIVE_WHOLE_PAST_CAP,
+    };
     use std::num::NonZeroU64;
 
     for cap in [8u64, 1_000, ADAPTIVE_WHOLE_FROM_CAP, 60_000] {
@@ -436,11 +438,17 @@ fn adaptive_whole_reads_a_table_past_the_cap_whole_where_the_worker_can_hold_it(
                         && whole.is_some_and(|whole| rows <= whole)
                         && rows <= largest;
                     let (cap, whole) = (NonZeroU64::new(cap), whole.and_then(NonZeroU64::new));
-                    // Where it cannot read whole, it reads as `Adaptive` does.
+                    // Where it cannot read whole, it reads as `Adaptive` does
+                    // past the cap, with contexts of at most
+                    // `ADAPTIVE_WHOLE_CONTEXT` rows.
                     let expected = if held {
                         Strategy::Exact
-                    } else {
+                    } else if rows <= cap.map_or(0, NonZeroU64::get) {
                         Strategy::Adaptive.resolve(rows, cap, timed)
+                    } else {
+                        let smaller = cap
+                            .map(|cap| cap.min(NonZeroU64::new(ADAPTIVE_WHOLE_CONTEXT).unwrap()));
+                        Strategy::Adaptive.resolve(rows, smaller, timed)
                     };
                     assert_eq!(
                         Strategy::AdaptiveWhole.resolve_within(rows, cap, whole, timed),
@@ -456,6 +464,19 @@ fn adaptive_whole_reads_a_table_past_the_cap_whole_where_the_worker_can_hold_it(
             }
         }
     }
+    // Past what a worker holds, a 60,000-row cap reads contexts of 16,384
+    // rows: a stratified core of 4,096 and 12,288 nearest rows.
+    let past =
+        Strategy::AdaptiveWhole.resolve_within(300_000, NonZeroU64::new(60_000), None, false);
+    let Strategy::Retrieved {
+        core: Some(core),
+        neighbors,
+        ..
+    } = past
+    else {
+        panic!("{past:?}");
+    };
+    assert_eq!((core.rows, neighbors), (4_096, 12_288));
     assert_eq!(Strategy::AdaptiveWhole.capped(8), Strategy::AdaptiveWhole);
     assert_eq!(Strategy::AdaptiveWhole.seed(), Some(ADAPTIVE_SEED));
 }

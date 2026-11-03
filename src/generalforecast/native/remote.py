@@ -697,8 +697,8 @@ class RemoteClient:
             strategy: How each query's context is chosen. By default
                 `Strategy.adaptive_whole()`: every row while the table is
                 within the model's cap and the device holds its context, and
-                past them a core and each query's nearest rows, so a table is
-                never refused for its size. Pass `Strategy.exact()` to read
+                past them a core and each query's nearest rows in contexts of
+                at most 16,384 rows, so a table is never refused for its size. Pass `Strategy.exact()` to read
                 every row however large the table, which a context the device
                 cannot hold refuses.
             page_size: Rows per page.

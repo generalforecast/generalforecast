@@ -254,11 +254,13 @@ def default_selection(rows: int, cap: int, *, timed: bool = False) -> Retrieved:
 
     Up to the model's row cap, every query reads the whole table. Past it,
     a stratified core of a quarter of the cap plus the nearest rows that fill
-    the rest; with a time role the neighbors lean to the newest rows. The
-    engine applies the same rule to a table's live rows at each prediction,
-    so a `Table` without a selection follows its size as it grows or shrinks.
+    the rest, in contexts of at most 16,384 rows; with a time role the
+    neighbors lean to the newest rows. The engine applies the same rule to a
+    table's live rows at each prediction, so a `Table` without a selection
+    follows its size as it grows or shrinks; past a cap of 10,000 rows or
+    more it still reads whole while its worker holds the table.
     """
-    return selection_of(Strategy.adaptive().resolve(rows, cap, timed))
+    return selection_of(Strategy.adaptive_whole().resolve(rows, cap, timed))
 
 
 def selection_of(strategy: Strategy) -> Retrieved:
@@ -691,8 +693,9 @@ class Table(_Held[_NativeTable]):
         schema: Which columns the table reads.
         selection: How each query's context is drawn. None follows the
             table's size: every query reads the whole table up to the model's
-            row cap, and past it a stratified core plus nearest rows, resolved
-            anew at each prediction as rows come and go (`default_selection`).
+            row cap, and past it a stratified core plus nearest rows in
+            contexts of at most 16,384 rows, resolved anew at each prediction
+            as rows come and go (`default_selection`).
             A table past a cap of 10,000 rows or more still reads whole up to
             four times the cap, while its worker can hold the whole context
             on its device; `selection` says which it reads.
