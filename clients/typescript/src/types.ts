@@ -573,6 +573,239 @@ export interface SecretDeletedReply extends Envelope {
   result: SecretDeleted;
 }
 
+export interface Prior {
+  name: string;
+  version: string;
+  params?: Record<string, unknown>;
+}
+
+export interface SnapshotsMember {
+  snapshots: Digest[];
+}
+
+export interface PriorMember {
+  prior: Prior;
+}
+
+export type CorpusMember = SnapshotsMember | PriorMember;
+
+export interface Corpus {
+  name: Name;
+  digest: Digest;
+  members: Record<string, CorpusMember>;
+  parent: Name | null;
+  created: number;
+}
+
+export interface CorpusReply extends Envelope {
+  result: Corpus;
+}
+
+export interface CorpusList {
+  corpora: Corpus[];
+}
+
+export interface CorpusListReply extends Envelope {
+  result: CorpusList;
+}
+
+export interface CorpusCreate {
+  name: Name;
+  members: Record<string, CorpusMember>;
+  parent?: Name;
+}
+
+export interface CorpusCreateRequest extends Envelope {
+  payload: CorpusCreate;
+}
+
+export interface CorpusRef {
+  name: Name;
+}
+
+export interface CorpusRefRequest extends Envelope {
+  payload: CorpusRef;
+}
+
+export interface CorpusDeleted {
+  name: Name;
+  deleted: true;
+  released_snapshots: number;
+}
+
+export interface CorpusDeletedReply extends Envelope {
+  result: CorpusDeleted;
+}
+
+export type RunState = "queued" | "setting_up" | "ready" | "training" | "preempted" | "finished" | "cancelling" | "cancelled" | "failed";
+
+export interface RunCorpus {
+  name: Name;
+  digest: Digest;
+}
+
+export interface Run {
+  name: Name;
+  state: RunState;
+  reason: string | null;
+  attempt: number;
+  base_model: ModelId;
+  corpus: RunCorpus;
+  changes: Record<string, unknown>[];
+  evaluation: Record<string, unknown>;
+  checkpoint_policy: Record<string, unknown>;
+  budget: Record<string, unknown> | null;
+  seed: number;
+  tags: Name[];
+  plan: Record<string, unknown> | null;
+  created: number;
+  updated: number;
+}
+
+export interface RunReply extends Envelope {
+  result: Run;
+}
+
+export interface RunList {
+  runs: Run[];
+}
+
+export interface RunListReply extends Envelope {
+  result: RunList;
+}
+
+export interface RunCreate {
+  name: Name;
+  base_model: ModelId;
+  corpus: Name;
+  changes: Record<string, unknown>[];
+  evaluation: Record<string, unknown>;
+  plan?: Record<string, unknown>;
+  checkpoint_policy?: Record<string, unknown>;
+  budget?: Record<string, unknown>;
+  seed?: number;
+  tags?: Name[];
+}
+
+export interface RunCreateRequest extends Envelope {
+  payload: RunCreate;
+}
+
+export interface RunTrain {
+  plan: Record<string, unknown>;
+}
+
+export interface RunTrainRequest extends Envelope {
+  payload: RunTrain;
+}
+
+export interface RunRef {
+  name: Name;
+}
+
+export interface RunRefRequest extends Envelope {
+  payload: RunRef;
+}
+
+export interface RunEvent {
+  at: number;
+  kind: string;
+  body: Record<string, unknown>;
+}
+
+export interface RunLineage {
+  run: Name;
+  events: RunEvent[];
+}
+
+export interface RunLineageReply extends Envelope {
+  result: RunLineage;
+}
+
+export type UploadState = "open" | "verifying" | "verified" | "rejected" | "expired" | "deleted";
+
+export interface SnapshotColumn {
+  name: string;
+  type: string;
+}
+
+export interface TrainingSnapshot {
+  digest: Digest;
+  bytes: number;
+  rows: number;
+  columns: SnapshotColumn[];
+  metadata: Record<string, unknown>;
+}
+
+export interface Upload {
+  id: Name;
+  state: UploadState;
+  bytes: number;
+  digest: Digest | null;
+  error: string | null;
+  metadata: Record<string, unknown> | null;
+  expires: number | null;
+  snapshot?: TrainingSnapshot;
+}
+
+export interface UploadReply extends Envelope {
+  result: Upload;
+}
+
+export interface UploadOpened {
+  id: Name;
+  state: UploadState;
+  bytes: number;
+  digest: Digest | null;
+  error: string | null;
+  metadata: Record<string, unknown> | null;
+  expires: number | null;
+  url: string | null;
+  method: "PUT";
+  chunk_bytes: number;
+}
+
+export interface UploadOpenedReply extends Envelope {
+  result: UploadOpened;
+}
+
+export interface UploadMetadata {
+  target: string;
+  task: "classification" | "regression";
+  column_types?: Record<string, string>;
+  time?: string;
+  group?: string;
+  origin?: Record<string, unknown>;
+}
+
+export interface UploadCreate {
+  bytes: number;
+  format: "parquet";
+  metadata: UploadMetadata;
+}
+
+export interface UploadCreateRequest extends Envelope {
+  payload: UploadCreate;
+}
+
+export interface UploadRef {
+}
+
+export interface UploadRefRequest extends Envelope {
+  payload: UploadRef;
+}
+
+export interface UploadDeleted {
+  id: Name;
+  state: "deleted";
+  digest: Digest | null;
+  uploads: Name[];
+}
+
+export interface UploadDeletedReply extends Envelope {
+  result: UploadDeleted;
+}
+
 /** an immutable pushed predictor */
 export interface Revision {
   predictor: Name;
@@ -1732,6 +1965,20 @@ export const ROUTES = {
   "sources.pin": { method: "POST", path: "/v1/projects/{project}/sources", request: "SourcePinRequest", reply: "SourcePinReply", body: "application/json" },
   "sources.get": { method: "GET", path: "/v1/projects/{project}/sources/{source}", request: "null", reply: "SourcePinReply", body: null },
   "snapshots.upload": { method: "POST", path: "/v1/projects/{project}/snapshots", request: "null", reply: "UploadReceiptReply", body: "application/vnd.apache.arrow.stream" },
+  "corpora.list": { method: "GET", path: "/v1/projects/{project}/corpora", request: "null", reply: "CorpusListReply", body: null },
+  "corpora.create": { method: "POST", path: "/v1/projects/{project}/corpora", request: "CorpusCreateRequest", reply: "CorpusReply", body: "application/json" },
+  "corpora.get": { method: "GET", path: "/v1/projects/{project}/corpora/{corpus}", request: "null", reply: "CorpusReply", body: null },
+  "corpora.delete": { method: "POST", path: "/v1/projects/{project}/corpora/{corpus}/delete", request: "CorpusRefRequest", reply: "CorpusDeletedReply", body: "application/json" },
+  "runs.list": { method: "GET", path: "/v1/projects/{project}/runs", request: "null", reply: "RunListReply", body: null },
+  "runs.create": { method: "POST", path: "/v1/projects/{project}/runs", request: "RunCreateRequest", reply: "RunReply", body: "application/json" },
+  "runs.get": { method: "GET", path: "/v1/projects/{project}/runs/{run}", request: "null", reply: "RunReply", body: null },
+  "runs.train": { method: "POST", path: "/v1/projects/{project}/runs/{run}/train", request: "RunTrainRequest", reply: "RunReply", body: "application/json" },
+  "runs.cancel": { method: "POST", path: "/v1/projects/{project}/runs/{run}/cancel", request: "RunRefRequest", reply: "RunReply", body: "application/json" },
+  "runs.lineage": { method: "GET", path: "/v1/projects/{project}/runs/{run}/lineage", request: "null", reply: "RunLineageReply", body: null },
+  "uploads.create": { method: "POST", path: "/v1/projects/{project}/uploads", request: "UploadCreateRequest", reply: "UploadOpenedReply", body: "application/json" },
+  "uploads.get": { method: "GET", path: "/v1/projects/{project}/uploads/{upload}", request: "null", reply: "UploadReply", body: null },
+  "uploads.complete": { method: "POST", path: "/v1/projects/{project}/uploads/{upload}/complete", request: "UploadRefRequest", reply: "UploadReply", body: "application/json" },
+  "uploads.delete": { method: "POST", path: "/v1/projects/{project}/uploads/{upload}/delete", request: "UploadRefRequest", reply: "UploadDeletedReply", body: "application/json" },
   "auth.status": { method: "GET", path: "/v1/auth/status", request: "null", reply: "AuthStatusReply", body: null },
   "auth.logout": { method: "POST", path: "/v1/auth/logout", request: "EmptyRequest", reply: "LoggedOutReply", body: "application/json" },
   "workspace.get": { method: "GET", path: "/v1/workspace", request: "null", reply: "ProjectListReply", body: null },
