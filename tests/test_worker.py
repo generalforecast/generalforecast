@@ -384,3 +384,39 @@ def test_a_worker_whose_server_is_gone_exits_quietly():
         )
     assert finished.returncode == 0, finished.stderr
     assert "Traceback" not in finished.stderr, finished.stderr
+
+
+def test_a_fit_profile_is_kept_for_later_processes_unless_unmeasured(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from generalforecast.runtime.memory import Cost, FitProfile
+    from generalforecast.worker import admission
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    measured: list[int] = []
+    # Widths XLA measures, by their costs; any other it cannot measure.
+    costs = {FEATURES: (Cost(1.0, 2.0), Cost(3.0, 4.0))}
+
+    def measure(functions: Any, model: Any, width: int, cache: Any) -> FitProfile:
+        measured.append(width)
+        return FitProfile(width, *costs.get(width, ()))
+
+    def started() -> Worker:
+        worker = Worker()
+        worker.add_model(
+            0, tabicl_functions, tiny_tabicl(regression=False), spec="tiny"
+        )
+        return worker
+
+    monkeypatch.setattr(admission, "fit_profile", measure)
+    expected = FitProfile(FEATURES, *costs[FEATURES])
+    assert started().fit_profile(0, FEATURES) == expected
+    # A later process reads it without measuring.
+    assert started().fit_profile(0, FEATURES) == expected
+    assert measured == [FEATURES]
+
+    # One XLA could not measure is measured again by the next process.
+    wider = FEATURES + 1
+    assert started().fit_profile(0, wider) == FitProfile(wider)
+    started().fit_profile(0, wider)
+    assert measured == [FEATURES, wider, wider]

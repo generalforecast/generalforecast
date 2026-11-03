@@ -45,6 +45,28 @@ def ladder(first: int, count: int) -> list[int]:
     return [first << step for step in range(count)]
 
 
+# Widths up to this many columns compile as they are; wider tables pad to
+# one of `WIDTH_STEPS` widths an octave, so a table pads by at most a quarter.
+EXACT_WIDTHS = 8
+WIDTH_STEPS = 4
+# Set to `0` to compile every width as it is.
+PADDED_WIDTHS_ENV = "GF_PADDED_WIDTHS"
+
+
+def padded_width(features: int) -> int:
+    """The width a table of `features` columns compiles at, for a model whose properties allow padding it.
+
+    Tables of nearby widths then share their programs and measures: 17 to
+    20 columns compile at 20, 21 to 24 at 24. `GF_PADDED_WIDTHS=0` keeps
+    every width as it is.
+    """
+    if features <= EXACT_WIDTHS or os.environ.get(PADDED_WIDTHS_ENV) == "0":
+        return features
+    octave = 1 << ((features - 1).bit_length() - 1)
+    step = octave // WIDTH_STEPS
+    return -(-features // step) * step
+
+
 def counts_up_to(counts: Iterable[int]) -> list[int]:
     """Item counts a kind of call is compiled for at start: each power of two up to the most it took, and those it took."""
     taken = set(counts)

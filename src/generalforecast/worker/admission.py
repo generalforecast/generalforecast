@@ -35,6 +35,7 @@ from generalforecast.runtime.memory import (
     memory_profile,
 )
 from generalforecast.runtime.paging import CacheLayout, cache_layout
+from generalforecast.runtime.programs import padded_width
 from generalforecast.runtime.series import (
     SeriesBytes,
     abstract_group,
@@ -52,11 +53,25 @@ logger = logging.getLogger(__name__)
 WHOLE_ROWS_LIMIT = 1 << 26
 
 
+class _Unmeasured(Exception):
+    """A fit profile XLA could not measure, which is not kept."""
+
+
 class Admission:
     """How a worker measures its models and refuses work past its memory."""
 
+    def width(self: "Worker", model: int, features: int) -> int:
+        """The width a loaded model runs a table of `features` columns at: padded to a shared width where its properties allow.
+
+        A padded width is its own, so the width of a width is itself.
+        """
+        if not self.properties(model).padded_width:
+            return features
+        return padded_width(features)
+
     def profile(self: "Worker", model: int, features: int) -> MemoryProfile:
         """A loaded model's sizes for tables with `features` columns, as stored."""
+        features = self.width(model, features)
         entry = self._tabular(model)
         cache_dtype = None if self._settings is None else self._settings.cache_dtype
         return self._profiles.get(
@@ -237,14 +252,31 @@ class Admission:
         return self._encode_bytes.get((model, fit, features, rows), measure)
 
     def fit_profile(self: "Worker", model: int, features: int) -> FitProfile:
-        """What a loaded model's fit takes for tables with `features` columns, measured once."""
+        """What a loaded model's fit takes for tables with `features` columns, measured once.
+
+        Kept with the model's other measures, so a later process reads it
+        without tracing the four fits it measures.
+        """
         entry = self._tabular(model)
-        return self._fit_profiles.get(
-            (model, features),
-            lambda: fit_profile(
+        unmeasured = FitProfile(features)
+
+        def measure() -> FitProfile:
+            profile = fit_profile(
                 entry.functions, entry.parameters, features, self._fit_cache
-            ),
-        )
+            )
+            # A fit XLA could not measure is not kept for later processes,
+            # which measure it again.
+            if profile == unmeasured:
+                raise _Unmeasured
+            return profile
+
+        def kept() -> FitProfile:
+            try:
+                return self._measured(model, ("fit_profile", features), measure)
+            except _Unmeasured:
+                return unmeasured
+
+        return self._fit_profiles.get((model, features), kept)
 
     def fit_rows(self: "Worker", model: int, features: int) -> tuple[int, int]:
         """The most rows a fit takes within the call budget, for tables with `features` columns.
@@ -259,7 +291,7 @@ class Admission:
             The most rows a state alone is fit on, and the most a fit embeds
             in the call that fits its state; `sys.maxsize` for any.
         """
-        profile = self.fit_profile(model, features)
+        profile = self.fit_profile(model, self.width(model, features))
         return (
             self._padded_floor(profile.state_rows(self._call_bytes)),
             self._padded_floor(profile.fused_rows(self._call_bytes)),
@@ -279,6 +311,7 @@ class Admission:
         Returns:
             The rows, a padded size or none.
         """
+        features = self.width(model, features)
         rows = self.profile(model, features).row_bytes
         per_row = FIT_CELL_BYTES * (features + 4) + FIT_ROW_SCALE * rows
         return self._padded_floor(self._call_bytes // per_row)
@@ -309,6 +342,7 @@ class Admission:
             ValueError: If the model refuses such a table, so it is refused
                 when created rather than at its first fit.
         """
+        features = self.width(model, features)
         size = self._size(1)
 
         def check() -> bool:
@@ -338,6 +372,7 @@ class Admission:
         Raises:
             ValueError: If a slot cannot hold one of the model's context rows.
         """
+        features = self.width(model, features)
         entry = self._tabular(model)
         cache_dtype = None if self._settings is None else self._settings.cache_dtype
         return self._layouts.get(

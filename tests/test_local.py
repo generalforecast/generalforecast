@@ -1414,7 +1414,11 @@ def _as_frame(step: Any) -> protocol.Step:
     """A step from the bindings as a server's worker receives it."""
 
     def copy(kind: Any, item: Any) -> Any:
-        return kind(**{f.name: getattr(item, f.name) for f in dataclasses.fields(kind)})
+        # The native node's batches carry no levels; the protocol's default them.
+        fields = dataclasses.fields(kind)
+        return kind(
+            **{f.name: getattr(item, f.name) for f in fields if hasattr(item, f.name)}
+        )
 
     return protocol.Step(
         movements=[copy(protocol.Movement, item) for item in step.movements],
@@ -3232,6 +3236,49 @@ def test_gated_local_clients_keep_their_tables_until_the_last_closes() -> None:
     second.close()
     assert wired not in engine.tables()
     engine.close()
+
+
+def test_a_table_pads_to_a_shared_width_where_its_model_allows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nine columns run at ten, as a constant tenth, and predict as nine do.
+    data = table(False, rows=40, queries=6, features=9)
+    model = tiny_tabicl(regression=False)
+
+    def padding(parameters: Any) -> Any:
+        return dataclasses.replace(
+            tabicl_functions.properties(parameters), padded_width=True
+        )
+
+    functions = tabicl_functions._replace(properties=padding)
+
+    def predicted(served: bool = False) -> tuple[np.ndarray, int]:
+        client = node_harness.local()
+        rows = client.create_table(
+            "rows", model=(functions, model), features=9, classes=data.num_classes
+        )
+        rows.insert(np.arange(40), np.asarray(data.features), np.asarray(data.targets))
+        if served:
+            # As a server's worker runs a step it receives.
+            node = client._node
+            request = node.submit(rows._id, np.asarray(data.queries), None)
+            answered, failed = client._worker.run_apart(_as_frame(node.schedule()))
+            assert failed == {}
+            predictions = answered[request]
+        else:
+            predictions = rows.predict(np.asarray(data.queries))
+        widths = {spec.features for spec in client._worker._tables.values()}
+        client.close()
+        return predictions, widths.pop()
+
+    padded, width = predicted()
+    assert width == 10
+    served, _ = predicted(served=True)
+    monkeypatch.setenv("GF_PADDED_WIDTHS", "0")
+    unpadded, width = predicted()
+    assert width == 9
+    np.testing.assert_allclose(padded, unpadded, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(served, unpadded, rtol=1e-5, atol=1e-5)
 
 
 def test_query_pieces_pad_little_and_take_only_compiled_sizes() -> None:
