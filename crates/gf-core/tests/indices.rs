@@ -647,7 +647,7 @@ fn series_windows_match_a_naive_list_through_random_changes() {
 #[test]
 fn a_scan_finds_exactly_the_rows_nearest_rows_finds() {
     // The last spread puts float32's squared differences among subnormals.
-    let runs = [(2usize, 1.0f32), (9, 1.0), (40, 1.0), (9, 1e-22)];
+    let runs = [(2usize, 1.0f32), (9, 1.0), (40, 1.0), (9, 1e-23)];
     for (run, (dimensions, spread)) in (1u32..).zip(runs) {
         let mut noise = Noise(11 + u64::from(run));
         let mut index = PageIndex::new(
@@ -662,7 +662,9 @@ fn a_scan_finds_exactly_the_rows_nearest_rows_finds() {
             let vector: Vec<f32> = if row % 5 == 4 {
                 placed[(row as usize * 7) % placed.len()].clone()
             } else {
-                (0..dimensions).map(|_| noise.next() * 30.0 * spread).collect()
+                (0..dimensions)
+                    .map(|_| noise.next() * 30.0 * spread)
+                    .collect()
             };
             index
                 .put(RowId(row), Bucket(u64::from(row % 2)), &vector)
@@ -689,7 +691,9 @@ fn a_scan_finds_exactly_the_rows_nearest_rows_finds() {
                     // Exactly on a row, and on its repeats.
                     placed[query * 13].clone()
                 } else {
-                    (0..dimensions).map(|_| noise.next() * 35.0 * spread).collect()
+                    (0..dimensions)
+                        .map(|_| noise.next() * 35.0 * spread)
+                        .collect()
                 }
             })
             .collect();
@@ -706,7 +710,10 @@ fn a_scan_finds_exactly_the_rows_nearest_rows_finds() {
                 );
             }
         }
-        assert_eq!(scan.nearest(&points, 0).unwrap(), vec![Context::new(); points.len()]);
+        assert_eq!(
+            scan.nearest(&points, 0).unwrap(),
+            vec![Context::new(); points.len()]
+        );
         assert!(scan.nearest(&[&[0.0][..]], 3).is_err());
     }
 }
