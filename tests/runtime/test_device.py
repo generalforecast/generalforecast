@@ -54,6 +54,19 @@ def test_gf_precision_picks_the_mode(monkeypatch: pytest.MonkeyPatch) -> None:
         default_settings()
 
 
+def test_gf_matmul_precision_overrides_the_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GF_PRECISION", raising=False)
+    monkeypatch.setenv("GF_MATMUL_PRECISION", "bfloat16")
+    settings = default_settings()
+    assert settings.matmul_precision == "bfloat16"
+    assert settings.kernel == device_settings(jax.default_backend()).kernel
+    monkeypatch.setenv("GF_MATMUL_PRECISION", "half")
+    with pytest.raises(ValueError, match="GF_MATMUL_PRECISION"):
+        default_settings()
+
+
 def test_matmul_precision_is_traced_into_programs() -> None:
     def product(left: jax.Array, right: jax.Array) -> jax.Array:
         return left @ right

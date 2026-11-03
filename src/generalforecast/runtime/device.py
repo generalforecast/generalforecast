@@ -119,17 +119,40 @@ def device_settings(platform: str, exact: bool = False) -> DeviceSettings:
     return DeviceSettings(FLOAT32, FLOAT32, kernel, matmul_precision="highest")
 
 
+# JAX's names for the precision of float32 matrix multiplies a run may pick
+# with GF_MATMUL_PRECISION: `default` (TF32 on a GPU), `bfloat16` (bfloat16
+# inputs, float32 sums, twice TF32's throughput on an H100), `high` or
+# `highest`. Attention keeps its own dtype whatever is picked.
+MATMUL_PRECISIONS = (
+    "default",
+    "bfloat16",
+    "tensorfloat32",
+    "high",
+    "highest",
+    "float32",
+)
+
+
 def default_settings() -> DeviceSettings:
     """This machine's settings, from the environment.
 
-    `GF_PRECISION` names the mode, `fast` (default) or `exact`, and
+    `GF_PRECISION` names the mode, `fast` (default) or `exact`;
     `GF_CACHE_DTYPE` overrides the dtype caches are stored in: `float32`,
-    `float16`, `bfloat16`, or `int8` with a scale per row and head.
+    `float16`, `bfloat16`, or `int8` with a scale per row and head; and
+    `GF_MATMUL_PRECISION` overrides the precision of float32 matrix
+    multiplies (`MATMUL_PRECISIONS`), as to measure `bfloat16` against TF32.
     """
     mode = os.environ.get("GF_PRECISION", "fast")
     if mode not in ("fast", "exact"):
         raise ValueError(f"GF_PRECISION must be fast or exact, not {mode!r}")
     settings = device_settings(jax.default_backend(), exact=mode == "exact")
+    matmul = os.environ.get("GF_MATMUL_PRECISION")
+    if matmul is not None:
+        if matmul not in MATMUL_PRECISIONS:
+            raise ValueError(
+                f"GF_MATMUL_PRECISION must be one of {MATMUL_PRECISIONS}, not {matmul!r}"
+            )
+        settings = dataclasses.replace(settings, matmul_precision=matmul)
     cache = os.environ.get("GF_CACHE_DTYPE")
     if cache is None:
         return settings
