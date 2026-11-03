@@ -1076,6 +1076,9 @@ impl PageIndex {
             return Ok(Context::new());
         }
         let reachable = usize::try_from(allowed.len()).unwrap_or(usize::MAX);
+        if count.saturating_mul(SCAN_SHARE) >= reachable {
+            return self.nearest_by_scan(query, count, allowed, vectors, keys);
+        }
         let mut best: BinaryHeap<Near> =
             BinaryHeap::with_capacity(count.min(reachable).saturating_add(1));
         let mut frontier: BinaryHeap<Reverse<Ranked>> = self
@@ -1119,6 +1122,30 @@ impl PageIndex {
         Ok(best.into_iter().map(|Near(_, _, row)| row).collect())
     }
 
+    /// The `count` rows within `allowed` nearest `query`, as `nearest_rows`
+    /// finds them, from the distance to every allowed row the index holds.
+    fn nearest_by_scan(
+        &self,
+        query: &[f32],
+        count: usize,
+        allowed: &Context,
+        vectors: &dyn Vectors,
+        keys: &dyn Keys,
+    ) -> Result<Context, IndexError> {
+        let mut near = Vec::with_capacity(usize::try_from(allowed.len()).unwrap_or(0));
+        for row in allowed
+            .iter()
+            .filter(|&row| self.assignment.get(row).is_some())
+        {
+            near.push(Near(vectors.squared_to(row, query)?, keys.key(row), row));
+        }
+        if near.len() > count {
+            near.select_nth_unstable(count - 1);
+            near.truncate(count);
+        }
+        Ok(near.into_iter().map(|Near(_, _, row)| row).collect())
+    }
+
     /// Pages nearest `vector` first, ties by id, optionally only those in `bucket`.
     fn search<'a>(
         &'a self,
@@ -1149,6 +1176,11 @@ impl PageIndex {
         })
     }
 }
+
+/// A search whose count is at least one in this many of its allowed rows
+/// reads every allowed row and selects the nearest, where opening pages best
+/// first would read nearly all of them anyway, a heap push each.
+const SCAN_SHARE: usize = 8;
 
 /// A row, its distance and its key, ordered by distance, then key.
 #[derive(Clone, Copy, Debug, PartialEq)]
