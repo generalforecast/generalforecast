@@ -34,12 +34,12 @@ from generalforecast.runtime.decoding import PROGRAMS, Context
 from generalforecast.runtime.device import (
     DeviceSettings,
     cache_root,
+    command_buffers,
     configure,
     portable_cpu_programs,
     report_fallback,
     store_cache,
     use_compile_cache,
-    without_command_buffers,
 )
 from generalforecast.runtime.memory import (
     EncodeProfile,
@@ -170,7 +170,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
                 (see `Programs`); without it, each compiles when first called.
             timers: Time each part of a step; see `WorkerStats.parts`.
         """
-        without_command_buffers()
+        command_buffers()
         portable_cpu_programs()
         report_fallback()
         self._settings, self._minimum = settings, bucket_minimum
