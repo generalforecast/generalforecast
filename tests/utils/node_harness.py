@@ -1166,8 +1166,15 @@ def _check_task(name: str, properties: TabularProperties, classes: int | None) -
         raise ValueError(f"{name} predicts classes; give the table its classes")
     _check_classes(classes)
     if classes > properties.class_slots:
+        remedy = (
+            ""
+            if "@" in name
+            else f'; serve the table with error-correcting output codes, as "{name}@4", '
+            "which serve more"
+        )
         raise ValueError(
-            f"{name} serves at most {properties.class_slots} classes, not {classes}"
+            f"{name} serves at most {properties.class_slots} classes, not "
+            f"{classes}{remedy}"
         )
     return classes
 

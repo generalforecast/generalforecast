@@ -337,8 +337,18 @@ impl Shard {
                 ));
             }
             (Task::Classes(classes), false) if u64::from(classes) > class_slots => {
+                // A model without codes yet serves more classes with them.
+                let remedy = if served.contains('@') {
+                    String::new()
+                } else {
+                    format!(
+                        "; serve the table with error-correcting output codes, as \
+                         \"{served}@4\", which serve more"
+                    )
+                };
                 return Err(ServerError::Invalid(format!(
-                    "model {served:?} serves at most {class_slots} classes, not {classes}"
+                    "model {served:?} serves at most {class_slots} classes, not \
+                     {classes}{remedy}"
                 )));
             }
             _ => {}
