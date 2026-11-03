@@ -22,6 +22,7 @@ from generalforecast.runtime.device import (
     DeviceSettings,
     configure,
     device_settings,
+    with_summary_chunk,
 )
 from generalforecast.runtime.memory import (
     MEASURE_OPTIONS,
@@ -245,3 +246,33 @@ def test_fits_at_their_limits_stay_in_the_call_budget(
         assert analysis is not None
         taken = analysis.temp_size_in_bytes + analysis.output_size_in_bytes
         assert taken + tree_bytes(inputs) <= budget, stage
+
+
+def test_a_streamed_column_summary_steps_within_the_call_budget() -> None:
+    model = tiny_tabicl(regression=False)
+    profile = memory.fit_profile(tabicl_functions, model, FEATURES)
+    # On an H100, TabICL v2's step holds 1.2 MB per row it reads, and its fused
+    # fit 0.2 MB, so a step sized by the fused fit took twice the budget.
+    assert profile.step.row > 0
+    budget = int(profile.state.fixed + 512 * profile.step.row) * 2
+    chunk = profile.summary_chunk(budget)
+    rows = 8 * (chunk // FEATURES)
+
+    def state(model: Any, features: Any, targets: Any) -> Any:
+        configured = with_summary_chunk(model, chunk)
+        return tabicl_functions.fit(configured, features, targets, 3)[0]
+
+    analysis = (
+        jax.jit(state)
+        .lower(
+            model,
+            jax.ShapeDtypeStruct((rows, FEATURES), jnp.float32),
+            jax.ShapeDtypeStruct((rows,), jnp.int32),
+        )
+        .compile()
+        .memory_analysis()
+    )
+    assert analysis is not None
+    # The state's fit, past its step's rows, keeps within the budget.
+    held = analysis.temp_size_in_bytes + analysis.output_size_in_bytes
+    assert held <= budget

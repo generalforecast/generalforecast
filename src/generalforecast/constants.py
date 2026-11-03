@@ -8,6 +8,12 @@
 # XLA's GPU autotuner times kernels on buffers of its own while it compiles,
 # beside what a step holds; a call leaves it a sixteenth of its working memory.
 AUTOTUNE_SHARE = 16
+# Contexts at least this large put no device limit on a table's context: a
+# worker looks for the largest that fits up to here, and past it says none.
+MEMORY_ROWS_LIMIT = 1 << 24
+# Context sizes a worker compiles an encode at, at most, to find the largest
+# context that fits the device, where its profiles would refuse one.
+MEMORY_ROWS_MEASURES = 3
 
 # What `Worker.fit_bound` takes a fit to hold per cell, and per byte of its
 # rows' representations: built-in models' fits hold at most about a fifth of
@@ -53,6 +59,11 @@ FIT_MARGIN = 1.1
 # Rows a step of a measured fit's column summary reads, so what the fit holds
 # per row besides its steps shows.
 FIT_STEP_ROWS = 8
+# Rows a step of a measured fit's column summary reads to measure what a step
+# holds per row it reads: against `FIT_STEP_ROWS`, a step's rows' cost shows.
+# A step holds its rows' cells through every block, several times what a
+# fused fit holds per row, so a step is sized by this and not by the fused fit.
+FIT_CHUNK_ROWS = 1024
 # The fewest rows a step of a streamed column summary reads, whatever the call
 # budget leaves it: fewer would loop over the rows for little memory saved.
 MIN_SUMMARY_ROWS = 64
