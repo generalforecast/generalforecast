@@ -1836,7 +1836,7 @@ class Lock(Payload):
     resources: LockResources | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("lock_version", "lock_version", True, _union(_literal(1), _literal(2))),
+        Field("lock_version", "lock_version", True, _literal(1, 2)),
         Field("digest", "digest", True, _decode_Digest),
         Field("manifest", "manifest", True, _decode_Digest),
         Field("predictor", "predictor", True, _record(Resolution)),

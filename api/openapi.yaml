@@ -4429,10 +4429,9 @@ components:
       additionalProperties: false
       properties:
         lock_version:
+          type: integer
+          enum: [1, 2]
           description: 2 when the predictor runs a derived model, which only that version has
-          oneOf:
-            - {type: integer, const: 1}
-            - {type: integer, const: 2}
         digest: {$ref: "#/components/schemas/Digest"}
         manifest: {$ref: "#/components/schemas/Digest"}
         predictor: {$ref: "#/components/schemas/Resolution"}
