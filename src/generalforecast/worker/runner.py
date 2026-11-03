@@ -624,7 +624,12 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
             levels = getattr(batch, "levels", None)
             if known is not None and levels is not None:
                 values = predictions.get(batch.request)
-                if values is not None and values.ndim == 2:
+                # A decode that fetched a few columns answered at the levels.
+                if (
+                    values is not None
+                    and values.ndim == 2
+                    and values.shape[-1] == len(known)
+                ):
                     predictions[batch.request] = protocol.at_levels(
                         values, known, levels
                     )

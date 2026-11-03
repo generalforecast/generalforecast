@@ -344,13 +344,10 @@ def _levels(given: list[float] | None) -> np.ndarray | None:
     return None if given is None else np.asarray(given, dtype=np.float64)
 
 
-def at_levels(values: np.ndarray, known: np.ndarray, levels: np.ndarray) -> np.ndarray:
-    """Predictions at `levels`, each linearly between the two `known` levels around it.
-
-    As the server's `quantile_values` computes them, in float64 then cast to
-    float32, so a caller gets the same answer whichever end interpolates; a
-    level beyond the outermost known level takes that level.
-    """
+def _neighbors(
+    known: np.ndarray, levels: np.ndarray
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """For each level, the known columns below and above it and the weight of the one above."""
     columns = len(known)
     upper = np.minimum(np.searchsorted(known, levels, side="left"), columns - 1)
     lower = np.maximum(upper - 1, 0)
@@ -360,9 +357,33 @@ def at_levels(values: np.ndarray, known: np.ndarray, levels: np.ndarray) -> np.n
         np.clip((levels - known[lower]) / np.where(span > 0, span, 1.0), 0.0, 1.0),
         0.0,
     )
-    rows = np.asarray(values, dtype=np.float64)
-    picked = rows[:, lower] * (1.0 - weight) + rows[:, upper] * weight
-    return picked.astype(np.float32)
+    return lower, upper, weight
+
+
+def at_levels(values: np.ndarray, known: np.ndarray, levels: np.ndarray) -> np.ndarray:
+    """Predictions at `levels`, each linearly between the two `known` levels around it.
+
+    As the server's `quantile_values` computes them, in float64 then cast to
+    float32, so a caller gets the same answer whichever end interpolates; a
+    level beyond the outermost known level takes that level. Only the columns
+    read are widened to float64.
+    """
+    lower, upper, weight = _neighbors(known, levels)
+    values = np.asarray(values)
+    below = values[:, lower].astype(np.float64)
+    above = values[:, upper].astype(np.float64)
+    return (below * (1.0 - weight) + above * weight).astype(np.float32)
+
+
+def level_columns(known: np.ndarray, levels: np.ndarray) -> np.ndarray:
+    """The columns `at_levels` reads for these levels, in order.
+
+    `at_levels` of those columns alone, against `known` at them, gives the
+    same predictions as of every column: each level's neighbors among them
+    are its neighbors among all.
+    """
+    lower, upper, _ = _neighbors(known, levels)
+    return np.unique(np.concatenate([lower, upper]))
 
 
 def step(header: dict[str, Any], buffers: list[memoryview]) -> Step:

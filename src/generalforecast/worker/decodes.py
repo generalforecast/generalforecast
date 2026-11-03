@@ -6,7 +6,7 @@
 import dataclasses
 import logging
 from collections import OrderedDict, defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Container, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -130,6 +130,64 @@ def split_queries(
     return pieces, placement
 
 
+@jax.jit
+def _columns(values: jax.Array, columns: jax.Array) -> jax.Array:
+    """`values`' columns `columns`, on the device."""
+    return jnp.take(values, columns, axis=-1)
+
+
+def _same(given: np.ndarray | None, expected: np.ndarray) -> bool:
+    """Whether a request's levels are given and equal `expected`."""
+    return given is not None and np.array_equal(given, expected)
+
+
+def _picks(
+    batches: Sequence[QueryBatch], parts: list[list[tuple[int, int, int]]]
+) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """For each joined batch whose requests all ask the same levels, the columns they read.
+
+    Each value is the columns `protocol.level_columns` gives, the known levels
+    at them and the levels asked. A batch whose requests ask several sets of
+    levels, or the levels known, keeps every column.
+    """
+    asked = {
+        batch.request: (getattr(batch, "known", None), getattr(batch, "levels", None))
+        for batch in batches
+    }
+    picks = {}
+    for index, owned in enumerate(parts):
+        known, levels = asked.get(owned[0][0], (None, None))
+        if known is None or levels is None or len(levels) == len(known):
+            continue
+        if not all(
+            _same(asked[request][0], known) and _same(asked[request][1], levels)
+            for request, _, _ in owned[1:]
+        ):
+            continue
+        columns = protocol.level_columns(known, levels)
+        if len(columns) < len(known):
+            picks[index] = (columns, known[columns], levels)
+    return picks
+
+
+def _groups(units: Sequence[int]) -> dict[int, list[int]]:
+    """Each unit a batch's queries read, with the queries that read it, in order."""
+    if not len(units):
+        return {}
+    reads = np.asarray(units)
+    if (reads == reads[0]).all():
+        return {int(reads[0]): list(range(len(reads)))}
+    order = np.argsort(reads, kind="stable")
+    found, starts = np.unique(reads[order], return_index=True)
+    ends = [*starts[1:], len(order)]
+    groups = {
+        int(unit): order[start:end].tolist()
+        for unit, start, end in zip(found, starts, ends, strict=True)
+    }
+    # In order of each unit's first query, as reading the batch in order gives.
+    return dict(sorted(groups.items(), key=lambda item: item[1][0]))
+
+
 def _query_index(queries: list[int], count: int) -> np.ndarray:
     """The positions of a context's queries in their batch, padded to `count` by repeating the last."""
     index = np.full(count, queries[-1], dtype=np.int32)
@@ -155,14 +213,27 @@ class Decodes:
         encoded and decoded as dense arrays.
         """
         joined, parts = merged(batches)
+        # A regressor's requests that ask a few levels fetch only the columns
+        # those levels read, and answer at the levels here.
+        picks = _picks(batches, parts)
         pieces, placement = split_queries(joined, self._size)
-        predictions = self._decode_batches(pieces, units, transient, placement)
-        return {
-            request: predictions[index][start:stop]
-            for index, owned in enumerate(parts)
-            if index in predictions
-            for request, start, stop in owned
+        columns = {
+            piece: picks[joined_index][0]
+            for piece, (joined_index, _, _) in enumerate(placement)
+            if joined_index in picks
         }
+        predictions = self._decode_batches(pieces, units, transient, placement, columns)
+        answers = {}
+        for index, owned in enumerate(parts):
+            if index not in predictions:
+                continue
+            values = predictions[index]
+            if index in picks and values.ndim == 2:
+                _, known, levels = picks[index]
+                values = protocol.at_levels(values, known, levels)
+            for request, start, stop in owned:
+                answers[request] = values[start:stop]
+        return answers
 
     def _decode_fused(
         self: "Worker", batches: Sequence[QueryBatch], units: Sequence[Unit]
@@ -217,8 +288,12 @@ class Decodes:
         units: Sequence[Unit],
         transient: Transient,
         placement: Sequence[tuple[int, int, int]] | None = None,
+        columns: dict[int, np.ndarray] | None = None,
     ) -> dict[int, np.ndarray]:
         """Decodes batches whose requests are their positions; see `_decode`.
+
+        With `columns`, a batch's predictions come to the host as those
+        columns alone, keyed by the batch's request.
 
         A table that summarizes each context embeds its queries against their
         unit's own state, in the decode, so each decoding reads one unit.
@@ -230,7 +305,7 @@ class Decodes:
         # decode's program: its features go with the decode, so the step
         # makes no embed call and no device copy of its rows to gather.
         fused = [
-            not mine and all(unit not in transient for unit in batch.units)
+            not mine and transient.keys().isdisjoint(batch.units)
             for batch, mine in zip(batches, fit_own, strict=True)
         ]
         hosts, features = [], []
@@ -263,9 +338,7 @@ class Decodes:
             batches, features, hosts, fit_own, fused, strict=True
         ):
             rows = host if inline else raw if mine else next(embedded)
-            groups: dict[int, list[int]] = defaultdict(list)
-            for query, unit in enumerate(batch.units):
-                groups[unit].append(query)
+            groups = _groups(batch.units)
             table = self._tables[batch.table]
             layout = self._layouts[table.model, table.features]
             together: list[Group] = []
@@ -287,8 +360,28 @@ class Decodes:
         for (model, num_classes, layout, own, _, inline), decodings in paged.items():
             for same in alike(decodings, layout.slots_per_row, self._size):
                 outputs += self._decode_paged(
-                    model, num_classes, layout, same, own, embeds=inline
+                    model,
+                    num_classes,
+                    layout,
+                    same,
+                    own,
+                    embeds=inline,
+                    quiet=columns or {},
                 )
+        if columns:
+            on_device = {
+                request: jnp.asarray(picked, dtype=jnp.int32)
+                for request, picked in columns.items()
+            }
+            outputs = [
+                (
+                    where,
+                    _columns(values, on_device[where[0].request])
+                    if where[0].request in on_device and np.ndim(values) == 2
+                    else values,
+                )
+                for where, values in outputs
+            ]
         with self.stats.timed("fetch"):
             fetched = jax.device_get([values for _, values in outputs])
         predictions: dict[int, np.ndarray] = {}
@@ -576,6 +669,7 @@ class Decodes:
         decodings: list[Decoding],
         own: StateLayout | None = None,
         embeds: bool = False,
+        quiet: Container[int] = (),
     ) -> list[tuple[tuple[QueryBatch, list[int]], np.ndarray]]:
         """Decodes contexts read from their slots, as few calls as the budget allows.
 
@@ -585,7 +679,8 @@ class Decodes:
         decoding reads one unit, whose state is read from its slots and embeds
         the queries' features. With `embeds`, the decodings carry their
         queries' features, which embed against their tables' states in the
-        decode's program.
+        decode's program. A decoding whose batch's request is in `quiet`
+        starts no copy to the host: a few of its columns go instead.
         """
         key = ("paged", model, num_classes, layout, own, embeds)
         limit = self._chunks.parts(key)
@@ -635,8 +730,9 @@ class Decodes:
                 with self.stats.timed("unstack"):
                     item = _item(values, np.int32(position))
                 # Its copy to the host runs beside the step's later calls.
-                for leaf in jax.tree.leaves(item):
-                    leaf.copy_to_host_async()
+                if decoding.batch.request not in quiet:
+                    for leaf in jax.tree.leaves(item):
+                        leaf.copy_to_host_async()
                 results.append(((decoding.batch, decoding.queries), item))
 
         # A context and the working copy beside it, and the queries' rows; and
@@ -665,7 +761,7 @@ class Decodes:
             self._chunks.split(key, max(self._size(1), most // 2))
             rest = decodings[len(results) :]
             return results + self._decode_paged(
-                model, num_classes, layout, rest, own, embeds
+                model, num_classes, layout, rest, own, embeds, quiet
             )
         return results
 

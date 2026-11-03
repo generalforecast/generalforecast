@@ -243,3 +243,22 @@ def test_query_batches_carry_the_levels_their_caller_asked() -> None:
     assert plain.known is None and plain.levels is None
     np.testing.assert_array_equal(picked.known, [0.25, 0.5, 0.75])
     np.testing.assert_array_equal(picked.levels, [0.5, 0.1])
+
+
+def test_the_columns_a_level_reads_give_its_value_alone() -> None:
+    generator = np.random.default_rng(1)
+    known = np.arange(1, 1000) / 1000
+    values = np.sort(generator.normal(size=(7, 999)).astype(np.float32), axis=1)
+    for levels in (
+        np.asarray([0.1, 0.5, 0.9]),
+        np.asarray([0.5, 0.05, 0.95, 0.0005, 0.9995, 0.5, 0.123456]),
+        np.asarray([0.0001]),
+        np.asarray([0.99995, 0.001]),
+    ):
+        columns = protocol.level_columns(known, levels)
+
+        assert len(columns) <= 2 * len(levels)
+        np.testing.assert_array_equal(
+            protocol.at_levels(values[:, columns], known[columns], levels),
+            protocol.at_levels(values, known, levels),
+        )
