@@ -18,7 +18,7 @@ layout decides how many of its rows fit in one.
 import gc
 import math
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from functools import partial
 from pathlib import Path
 from typing import Any
@@ -37,6 +37,20 @@ from generalforecast.models.contract import TabularFunctions
 from generalforecast.nn.attention import AttentionCache
 from generalforecast.runtime.device import to_cache_dtype
 from generalforecast.runtime.shapes import bucket_size
+
+
+def _cached_hash(layout: Any) -> int:
+    """A frozen layout's hash, computed once.
+
+    A layout keys every program, budget and stack a decode looks up, several
+    times a call, and hashing its leaves' shapes and dtypes each time took a
+    warm call's host time.
+    """
+    cached = layout.__dict__.get("_hash")
+    if cached is None:
+        cached = hash(tuple(getattr(layout, field.name) for field in fields(layout)))
+        object.__setattr__(layout, "_hash", cached)
+    return cached
 
 
 @dataclass(frozen=True)
@@ -73,6 +87,14 @@ class CacheLayout:
     rows_per_slot: int
     slot_bytes: int
     slots_per_row: int = 1
+
+    def __hash__(self) -> int:
+        """Its fields' hash, computed once."""
+        return _cached_hash(self)
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Its fields, without the hash: another process hashes strings apart."""
+        return {k: v for k, v in self.__dict__.items() if k != "_hash"}
 
     @property
     def block_bytes(self) -> int:
@@ -289,6 +311,14 @@ class StateLayout:
     treedef: Any
     leaves: tuple[jax.ShapeDtypeStruct, ...]
     slot_bytes: int
+
+    def __hash__(self) -> int:
+        """Its fields' hash, computed once."""
+        return _cached_hash(self)
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Its fields, without the hash: another process hashes strings apart."""
+        return {k: v for k, v in self.__dict__.items() if k != "_hash"}
 
     @property
     def slots(self) -> int:

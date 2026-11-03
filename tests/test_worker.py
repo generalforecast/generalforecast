@@ -491,3 +491,18 @@ def test_requests_asking_the_same_levels_fetch_the_columns_those_levels_read() -
         [batch(1, levels), batch(2, levels[:2])], [[(1, 0, 2), (2, 2, 4)]]
     )
     assert not _picks([batch(1, None)], [[(1, 0, 2)]])
+
+
+def test_a_layout_hashes_once_and_pickles_without_its_hash() -> None:
+    import pickle
+
+    from generalforecast.runtime.paging import StateLayout
+
+    layout = StateLayout(None, (jax.ShapeDtypeStruct((2, 3), jnp.float32),), 1 << 20)
+    same = StateLayout(None, (jax.ShapeDtypeStruct((2, 3), jnp.float32),), 1 << 20)
+
+    assert hash(layout) == hash(same) and layout == same
+    assert "_hash" in layout.__dict__
+    copy = pickle.loads(pickle.dumps(layout))
+    assert "_hash" not in copy.__dict__ and copy == layout
+    assert hash(copy) == hash(layout)
