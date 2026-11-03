@@ -95,7 +95,10 @@ Exports:
             `GF_DERIVED_RESOLVER=module:attribute`; `pin`, `parse_lock` and
             admission ask it what a derived id is made of (base, base digest,
             weights digest and bags), and loading asks it for the
-            `DerivedWeights` it runs as bags over one copy of the base. The
+            `DerivedWeights` it runs as bags over one copy of the base.
+        training: the trainer's surface, `generalforecast.training`: a
+            catalog model's contract calls and parameters as gf serves
+            them, and the parameter types fine-tuning adapts. The
             resolver decides who may use a model; gf never sees how it was
             made. A lock that pins one is `lock_version: 2`, with a
             `predictor.derived` block of `base`, `base_digest` and `bags`.
@@ -123,6 +126,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from generalforecast import training
 from generalforecast.as_of import format as format_as_of
 from generalforecast.as_of import parse as parse_as_of
 from generalforecast.contracts import (
@@ -446,6 +450,7 @@ __all__ = [
     "table_digest",
     "text",
     "to_arrow",
+    "training",
     "unique_object",
     "use_derived",
 ]

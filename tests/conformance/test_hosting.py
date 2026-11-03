@@ -107,6 +107,7 @@ RECORDED = (
     "table_digest",
     "text",
     "to_arrow",
+    "training",
     "unique_object",
     "use_derived",
 )
@@ -161,3 +162,30 @@ def test_the_image_prefetch_is_a_hosting_entry_point(monkeypatch):
     assert hosting._main(["prefetch"]) == 0
     assert calls == [1]
     assert hosting._main([]) == 2
+
+
+def test_the_training_surface_loads_a_tabular_model_as_gf_serves_it(monkeypatch):
+    from generalforecast.models import registry
+    from generalforecast.models.tabicl.model import tabicl_functions
+    from tests.models.tabicl.tiny import tiny_tabicl
+
+    training = hosting.training
+    assert training.VERSION == 1
+    assert sorted(training.__all__) == [
+        "LinearParameters",
+        "TabularFunctions",
+        "VERSION",
+        "load",
+    ]
+    asked = []
+
+    def load(spec, *, surface, allow_downloads):
+        asked.append((spec, surface))
+        return tabicl_functions, tiny_tabicl(regression=False)
+
+    monkeypatch.setattr(registry, "load", load)
+    functions, _ = training.load("general-forecast/tabicl-v2-classifier")
+    assert functions is tabicl_functions and isinstance(
+        functions, training.TabularFunctions
+    )
+    assert asked == [("general-forecast/tabicl-v2-classifier", "predictor")]
