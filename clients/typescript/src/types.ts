@@ -806,6 +806,38 @@ export interface UploadDeletedReply extends Envelope {
   result: UploadDeleted;
 }
 
+export interface FineTune {
+  model: ModelId;
+  name: Name;
+  version: number;
+  base: ModelId;
+  base_digest: Digest;
+  digest: Digest;
+  bags: number;
+  created: number;
+}
+
+export interface FineTuneReply extends Envelope {
+  result: FineTune;
+}
+
+export interface FineTuneList {
+  fine_tunes: FineTune[];
+}
+
+export interface FineTuneListReply extends Envelope {
+  result: FineTuneList;
+}
+
+export interface FineTuneVersions {
+  name: Name;
+  versions: FineTune[];
+}
+
+export interface FineTuneVersionsReply extends Envelope {
+  result: FineTuneVersions;
+}
+
 /** an immutable pushed predictor */
 export interface Revision {
   predictor: Name;
@@ -1978,6 +2010,9 @@ export const ROUTES = {
   "uploads.create": { method: "POST", path: "/v1/projects/{project}/uploads", request: "UploadCreateRequest", reply: "UploadOpenedReply", body: "application/json" },
   "uploads.get": { method: "GET", path: "/v1/projects/{project}/uploads/{upload}", request: "null", reply: "UploadReply", body: null },
   "uploads.delete": { method: "POST", path: "/v1/projects/{project}/uploads/{upload}/delete", request: "UploadRefRequest", reply: "UploadDeletedReply", body: "application/json" },
+  "fine-tunes.list": { method: "GET", path: "/v1/projects/{project}/fine-tunes", request: "null", reply: "FineTuneListReply", body: null },
+  "fine-tunes.get": { method: "GET", path: "/v1/projects/{project}/fine-tunes/{fine_tune}", request: "null", reply: "FineTuneVersionsReply", body: null },
+  "fine-tunes.version": { method: "GET", path: "/v1/projects/{project}/fine-tunes/{fine_tune}/versions/{version}", request: "null", reply: "FineTuneReply", body: null },
   "auth.status": { method: "GET", path: "/v1/auth/status", request: "null", reply: "AuthStatusReply", body: null },
   "auth.logout": { method: "POST", path: "/v1/auth/logout", request: "EmptyRequest", reply: "LoggedOutReply", body: "application/json" },
   "workspace.get": { method: "GET", path: "/v1/workspace", request: "null", reply: "ProjectListReply", body: null },

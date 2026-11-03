@@ -1148,6 +1148,22 @@ def _show_requests(out: term.Output) -> None:
     REQUESTS.propagate = False
 
 
+def _resolve_fine_tunes() -> None:
+    """Resolves fine-tunes through the user's connection, unless a plane already does.
+
+    A predictor on a fine-tune, `<project>/<name>@ft<version>`, locks with
+    what its project's plane says it is made of
+    (`generalforecast.derived_service`); nothing is asked unless a command
+    names one.
+    """
+    from generalforecast.models import derived
+
+    if derived.resolver() is None:
+        from generalforecast.derived_service import ServiceResolver
+
+        derived.use(ServiceResolver())
+
+
 def main(argv: Sequence[str] | None = None) -> None:
     """Runs one command; failures print in the error grammar and exit nonzero."""
     global _ARGV
@@ -1163,6 +1179,7 @@ def main(argv: Sequence[str] | None = None) -> None:
         out = term.Output(quiet=args.json or args.quiet, verbose=args.verbose)
         if args.verbose:
             _show_requests(out)
+        _resolve_fine_tunes()
         result = run(args, root, out)
         if result is not None:
             from generalforecast.render import emit, render
