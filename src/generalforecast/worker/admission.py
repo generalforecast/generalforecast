@@ -49,6 +49,10 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class _Unmeasured(Exception):
+    """A fit profile XLA could not measure, which is not kept."""
+
+
 class Admission:
     """How a worker measures its models and refuses work past its memory."""
 
@@ -234,14 +238,31 @@ class Admission:
         return self._encode_bytes.get((model, fit, features, rows), measure)
 
     def fit_profile(self: "Worker", model: int, features: int) -> FitProfile:
-        """What a loaded model's fit takes for tables with `features` columns, measured once."""
+        """What a loaded model's fit takes for tables with `features` columns, measured once.
+
+        Kept with the model's other measures, so a later process reads it
+        without tracing the four fits it measures.
+        """
         entry = self._tabular(model)
-        return self._fit_profiles.get(
-            (model, features),
-            lambda: fit_profile(
+        unmeasured = FitProfile(features)
+
+        def measure() -> FitProfile:
+            profile = fit_profile(
                 entry.functions, entry.parameters, features, self._fit_cache
-            ),
-        )
+            )
+            # A fit XLA could not measure is not kept for later processes,
+            # which measure it again.
+            if profile == unmeasured:
+                raise _Unmeasured
+            return profile
+
+        def kept() -> FitProfile:
+            try:
+                return self._measured(model, ("fit_profile", features), measure)
+            except _Unmeasured:
+                return unmeasured
+
+        return self._fit_profiles.get((model, features), kept)
 
     def fit_rows(self: "Worker", model: int, features: int) -> tuple[int, int]:
         """The most rows a fit takes within the call budget, for tables with `features` columns.

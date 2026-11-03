@@ -332,7 +332,9 @@ def load_state(
             f"not a {architecture} checkpoint: {metadata['architecture_name']!r}"
         )
     state = load_file(directory / "model.safetensors")
-    arrays = {key: jnp.asarray(value) for key, value in state.items()}
+    # One transfer for every array: `jnp.asarray` would compile a program
+    # for each parameter's shape, about a second of a first call in all.
+    arrays = jax.device_put(state)
     return arrays, Settings(metadata["config"])
 
 
