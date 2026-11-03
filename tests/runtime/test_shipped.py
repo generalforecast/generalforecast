@@ -159,3 +159,16 @@ def test_measures_taken_apart_keep_together(tmp_path) -> None:
         ("fit_profile", 16): 2,
     }
     assert shipped.padded_widths(24) == [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24]
+
+
+def test_the_hosting_api_asks_a_process_of_its_own_for_measures(tmp_path) -> None:
+    from generalforecast import hosting
+    from generalforecast.runtime.programs import encoded
+
+    spec = "tests.models.conformance.cases:tabicl_classes"
+    assert hosting.measures_identity() == shipped.identity()
+    assert hosting.padded_widths(10) == shipped.padded_widths(10)
+    measures = encoded({("fit_profile", 8): 1})
+    written = hosting.keep_measures(tmp_path, spec, measures)
+    assert written.is_file()
+    assert hosting.kept_measures(tmp_path, spec) == measures

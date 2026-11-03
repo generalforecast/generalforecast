@@ -48,6 +48,12 @@ An offline image runs `python -m generalforecast.hosting prefetch` (or
 `prefetch_catalog()`) once, to download, convert and verify every model a
 hosted plane may serve.
 
+A hosted pool takes its workers' measures once per GPU type: on each,
+`measured(spec, padded_widths(columns))` gives a served model's measures,
+`keep_measures(directory / measures_identity(), spec, measures)` keeps them
+for its workers to read through `GF_MEASURES`, and `kept_measures` reads
+them back.
+
 Exports:
 
     Locks and revisions
@@ -114,6 +120,7 @@ recorded surface (`tests/conformance/test_hosting.py`) changes with it.
 """
 
 import sys
+from pathlib import Path
 from typing import Any
 
 from generalforecast.as_of import format as format_as_of
@@ -293,6 +300,63 @@ def prefetch_catalog() -> None:
     preload()
 
 
+def _shipped(*arguments: str, given: Any = None) -> Any:
+    """What `python -m generalforecast.runtime.shipped` answers, as JSON: the worker side measures, this process only asks.
+
+    Raises:
+        ServiceError: `ModelUnavailable` if the command fails.
+    """
+    import json
+    import subprocess
+    import sys
+
+    done = subprocess.run(
+        [sys.executable, "-m", "generalforecast.runtime.shipped", *arguments],
+        input=None if given is None else json.dumps(given),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if done.returncode != 0:
+        raise ServiceError(
+            "ModelUnavailable",
+            f"measuring failed: {done.stderr.strip().splitlines()[-1:]}",
+            500,
+        )
+    return json.loads(done.stdout.strip().splitlines()[-1])
+
+
+def measures_identity() -> str:
+    """The identity this machine's measures are kept under, as `GF_MEASURES/<identity>`: gf's traced code, JAX, the device and padding."""
+    return _shipped("identity")
+
+
+def padded_widths(most: int) -> list[int]:
+    """The widths gf pads tables of up to `most` columns to, which measures are kept per."""
+    return _shipped("widths", str(most))
+
+
+def measured(spec: str, widths: Any) -> dict[str, Any]:
+    """A served model's measures at these padded widths, as a gf-server worker on this machine takes them, as JSON; none for a forecaster.
+
+    A pool takes them once per GPU type and keeps them with
+    `keep_measures`, so its workers read them in place of compiling the
+    model to take them (`GF_MEASURES`). They are taken in a process of
+    their own, as a worker's.
+    """
+    return _shipped("measured", spec, ",".join(str(width) for width in widths))
+
+
+def keep_measures(directory: Path, spec: str, measures: Any) -> Path:
+    """Adds a model's `measured` measures to those `directory`, one identity's, keeps for it; returns its file."""
+    return Path(_shipped("keep", str(directory), spec, given=measures))
+
+
+def kept_measures(directory: Path, spec: str) -> dict[str, Any]:
+    """The measures `directory` keeps for a model, as JSON as `measured` gives them; empty if none."""
+    return _shipped("kept", str(directory), spec)
+
+
 __all__ = [
     "ALIASES",
     "CONTEXT_ROWS_KEY",
@@ -353,13 +417,18 @@ __all__ = [
     "format_as_of",
     "json_object",
     "json_rows",
+    "keep_measures",
+    "kept_measures",
     "limits",
     "live_context",
     "lock_digest",
     "lock_name",
+    "measured",
+    "measures_identity",
     "model_id",
     "name",
     "number",
+    "padded_widths",
     "parse_as_of",
     "parse_body",
     "parse_lock",
