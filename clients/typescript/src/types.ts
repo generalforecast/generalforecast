@@ -722,7 +722,7 @@ export interface RunLineageReply extends Envelope {
   result: RunLineage;
 }
 
-export type UploadState = "open" | "verifying" | "verified" | "rejected" | "expired" | "deleted";
+export type UploadState = "open" | "verified" | "rejected" | "expired" | "deleted";
 
 export interface SnapshotColumn {
   name: string;
@@ -1977,7 +1977,6 @@ export const ROUTES = {
   "runs.lineage": { method: "GET", path: "/v1/projects/{project}/runs/{run}/lineage", request: "null", reply: "RunLineageReply", body: null },
   "uploads.create": { method: "POST", path: "/v1/projects/{project}/uploads", request: "UploadCreateRequest", reply: "UploadOpenedReply", body: "application/json" },
   "uploads.get": { method: "GET", path: "/v1/projects/{project}/uploads/{upload}", request: "null", reply: "UploadReply", body: null },
-  "uploads.complete": { method: "POST", path: "/v1/projects/{project}/uploads/{upload}/complete", request: "UploadRefRequest", reply: "UploadReply", body: "application/json" },
   "uploads.delete": { method: "POST", path: "/v1/projects/{project}/uploads/{upload}/delete", request: "UploadRefRequest", reply: "UploadDeletedReply", body: "application/json" },
   "auth.status": { method: "GET", path: "/v1/auth/status", request: "null", reply: "AuthStatusReply", body: null },
   "auth.logout": { method: "POST", path: "/v1/auth/logout", request: "EmptyRequest", reply: "LoggedOutReply", body: "application/json" },

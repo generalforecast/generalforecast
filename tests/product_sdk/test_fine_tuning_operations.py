@@ -43,7 +43,7 @@ def test_a_chunk_is_a_raw_post_with_its_content_range():
     assert prepared.request.resource.kind == "corpus"
 
 
-def test_an_upload_the_service_takes_is_sent_in_chunks_then_completed():
+def test_an_upload_the_service_takes_is_sent_in_chunks_then_awaited():
     body = ops.parquet_bytes(TABLE)
     opened = {"id": "up-1", "url": None, "chunk_bytes": 1024, "state": "open"}
     chunks = -(-len(body) // 1024)
@@ -57,7 +57,8 @@ def test_an_upload_the_service_takes_is_sent_in_chunks_then_completed():
     sent = [s for s in steps if isinstance(s, ops.Chunk)]
     assert len(sent) == chunks and b"".join(s.data for s in sent) == body
     assert [s.start for s in sent] == list(range(0, len(body), 1024))
-    # The metadata opens the upload; completing it carries nothing.
+    # The metadata opens the upload, and nothing completes it: the service
+    # verifies it once every byte is stored, and the client reads it back.
     opening = steps[1]
     assert opening.path == "/uploads"
     assert opening.payload == {
@@ -65,27 +66,32 @@ def test_an_upload_the_service_takes_is_sent_in_chunks_then_completed():
         "format": "parquet",
         "metadata": {"target": "y", "task": "classification"},
     }
-    complete = steps[-1]
-    assert complete.path == "/uploads/up-1/complete" and complete.payload == {}
+    assert not [s for s in steps if "complete" in getattr(s, "path", "")]
+    assert steps[-1].method == "GET" and steps[-1].path == "/uploads/up-1"
     assert result["state"] == "verified"
 
 
 def test_an_upload_to_storage_puts_its_chunks_at_the_url():
-    opened = {"id": "up-1", "url": "https://storage/session", "chunk_bytes": 1 << 20}
-    replies = ["run", opened, 200, {"state": "verifying"}, {"state": "verified"}]
+    opened = {
+        "id": "up-1",
+        "url": "https://storage/session",
+        "chunk_bytes": 1 << 20,
+        "state": "open",
+    }
+    replies = ["run", opened, 200, {"state": "open"}, {"state": "verified"}]
     steps, result = _drive(
         ops.training_upload(TABLE, {"target": "y", "task": "regression"}, wait=True),
         replies,
     )
     puts = [s for s in steps if isinstance(s, ops.Work) and s.function is ops.put_chunk]
     assert len(puts) == 1 and puts[0].args[0] == "https://storage/session"
-    # It waited once for verification.
-    assert any(isinstance(s, ops.Pause) for s in steps)
+    # It waited for verification.
+    assert sum(isinstance(s, ops.Pause) for s in steps) == 2
     assert result["state"] == "verified"
 
 
 def test_a_rejected_upload_raises_its_reason():
-    opened = {"id": "up-1", "url": None, "chunk_bytes": 1 << 20}
+    opened = {"id": "up-1", "url": None, "chunk_bytes": 1 << 20, "state": "open"}
     rejected = {"state": "rejected", "error": "the table has no column y"}
     with pytest.raises(ServiceError, match="no column y"):
         _drive(
