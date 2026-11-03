@@ -60,7 +60,10 @@ class Resolution:
     Attributes:
         name: The predictor name.
         model: The canonical model id, without a digest.
-        model_digest: The pinned artifact digest, `sha256:...`, if the model has one.
+        model_digest: The pinned artifact digest, `sha256:...`, if the model has
+            one; a derived model's is its weights'.
+        derived: A derived model's catalog base: `base`, `base_digest` and
+            `bags`; None for a catalog model.
         task: `classification`, `regression` or `forecast`.
         target: The target column.
         target_type: The target's kind, when the context is known.
@@ -123,6 +126,7 @@ class Resolution:
     related: tuple[str, ...] | None = None
     context_table: Any = field(default=None, compare=False, repr=False)
     query_table: Any = field(default=None, compare=False, repr=False)
+    derived: Mapping[str, Any] | None = None
 
     @property
     def pinned(self) -> str:
@@ -308,6 +312,15 @@ def resolve(
         name=spec.name,
         model=spec.model,
         model_digest=digest,
+        derived=None
+        if pin.derived is None
+        else MappingProxyType(
+            {
+                "base": pin.derived.base,
+                "base_digest": pin.derived.base_digest,
+                "bags": pin.derived.bags,
+            }
+        ),
         task=task,
         target=spec.target,
         target_type=target_type,
@@ -577,7 +590,7 @@ def _model_digest(
     *,
     upgrade: bool,
 ) -> str | None:
-    digest = pin.digest or None
+    digest = pin.model_digest or None
     if previous is None or upgrade:
         return digest
     before = previous.get("predictor", {})

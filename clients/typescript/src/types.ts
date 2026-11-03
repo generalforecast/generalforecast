@@ -17,8 +17,9 @@ export type Name = string;
 export type ModelName = string;
 
 /**
- * a catalog model id, `general-forecast/<name>`, with an optional variant suffix
- * (`@4*2`) or digest pin (`@sha256:<digest>`)
+ * a catalog model id, `general-forecast/<name>`, or a derived model's,
+ * `<owner>/<name>@ft<version>`; then an optional digest pin (`@sha256:<digest>`) and
+ * variant suffix (`@4*2`)
  */
 export type ModelId = string;
 
@@ -265,11 +266,23 @@ export interface ResolvedSelection {
   seed: number;
 }
 
+/**
+ * what a derived model runs on: the catalog base and its digest, which its weights are
+ * only valid with, and how many bags of weights it averages; each bag counts as one
+ * estimator
+ */
+export interface DerivedBase {
+  base: ModelId;
+  base_digest: Digest;
+  bags: number;
+}
+
 /** the resolved predictor gf.lock pins */
 export interface Resolution {
   name: Name;
   model: ModelId;
   model_digest: Digest;
+  derived?: DerivedBase;
   task: Task;
   target: string;
   target_type: Kind | null;
@@ -600,7 +613,7 @@ export interface LockResources {
  * `manifest` the digest of the normalized gf.yaml it resolves
  */
 export interface Lock {
-  lock_version: 1;
+  lock_version: 1 | 2;
   digest: Digest;
   manifest: Digest;
   predictor: Resolution;
