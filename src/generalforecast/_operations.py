@@ -118,6 +118,16 @@ class Upload:
 
 
 @dataclass(frozen=True)
+class Chunk:
+    """A chunk of a training upload the service takes, `POST /uploads/{id}/bytes`."""
+
+    upload: str
+    start: int
+    data: bytes
+    total: int
+
+
+@dataclass(frozen=True)
 class Work:
     """A CPU-bound function the asynchronous client runs in a worker thread."""
 
@@ -133,7 +143,7 @@ class Pause:
     seconds: float
 
 
-Step = Call | Upload | Work | Pause
+Step = Call | Upload | Chunk | Work | Pause
 type Operation[T] = Generator[Step, Any, T]
 
 
@@ -149,9 +159,23 @@ class Prepared:
     deadline: float | None = None
 
 
-def prepare(project: str, step: Call | Upload) -> Prepared:
+def prepare(project: str, step: Call | Upload | Chunk) -> Prepared:
     """The path, body and headers a client sends for a step."""
     request_id = "r-" + uuid.uuid4().hex
+    if isinstance(step, Chunk):
+        end = step.start + len(step.data) - 1
+        return Prepared(
+            "POST",
+            f"/v1/projects/{project}/uploads/{name(step.upload)}/bytes",
+            step.data,
+            {
+                "Content-Type": "application/octet-stream",
+                "Content-Range": f"bytes {step.start}-{end}/{step.total}",
+                "X-GF-Project": project,
+                "X-GF-Request-ID": request_id,
+            },
+            Request(Scope(project, request_id), Resource("corpus", step.upload), {}),
+        )
     if isinstance(step, Upload):
         return Prepared(
             "POST",
@@ -538,6 +562,137 @@ def source_pin(spec: JsonObject) -> Operation[SourcePin]:
     """Pins server-relative bytes; this does not upload a client-side path."""
     result = yield from created("source", "sources", "new", spec)
     return cast(SourcePin, result)
+
+
+# Training uploads and runs that are done waiting.
+UPLOAD_DONE = ("verified", "rejected", "expired")
+RUN_DONE = ("finished", "cancelled", "failed")
+
+
+def parquet_bytes(data: Any) -> bytes:
+    """A training table as Parquet bytes: a path or bytes as given, else a table written."""
+    import io
+
+    import pyarrow.parquet as pq
+
+    if isinstance(data, bytes | bytearray):
+        return bytes(data)
+    if isinstance(data, str | Path):
+        return Path(data).read_bytes()
+    sink = io.BytesIO()
+    pq.write_table(table(data), sink)
+    return sink.getvalue()
+
+
+def put_chunk(url: str, start: int, data: bytes, total: int) -> int:
+    """Sends one chunk to a resumable upload URL; returns the reply's status.
+
+    308 means the upload wants more; 200 or 201 means it is complete.
+    """
+    import urllib.error
+    import urllib.request
+
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method="PUT",
+        headers={
+            "Content-Range": f"bytes {start}-{start + len(data) - 1}/{total}",
+            "Content-Type": "application/octet-stream",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as reply:
+            return reply.status
+    except urllib.error.HTTPError as error:
+        if error.code == 308:
+            return 308
+        raise ServiceError(
+            "ProviderUnavailable",
+            f"the upload's storage refused a chunk ({error.code})",
+            503,
+        ) from None
+
+
+def training_upload(
+    data: Any, metadata: JsonObject, *, wait: bool, poll: float = 1.0
+) -> Operation[JsonObject]:
+    """Uploads a training table in chunks and waits for the service to verify it.
+
+    The upload opens with the table's size and metadata, so the service
+    refuses a bad one before any bytes move. The chunks go where it says:
+    straight to object storage when it returns a URL, else to the service.
+    Once every declared byte is stored, the service verifies the upload on
+    its own. A rejected upload raises with the reason the service gave.
+    """
+    body = yield Work(parquet_bytes, (data,))
+    state = yield Call(
+        "POST",
+        "/uploads",
+        "corpus",
+        "new",
+        {"bytes": len(body), "format": "parquet", "metadata": metadata},
+    )
+    upload, url, size = state["id"], state.get("url"), state["chunk_bytes"]
+    for start in range(0, len(body), size):
+        part = body[start : start + size]
+        if url:
+            yield Work(put_chunk, (url, start, part, len(body)))
+        else:
+            yield Chunk(upload, start, part, len(body))
+    while wait and state["state"] not in UPLOAD_DONE:
+        yield Pause(poll)
+        state = yield from got("corpus", "uploads", upload)
+    if state["state"] in ("rejected", "expired"):
+        raise ServiceError(
+            "ValidationError",
+            f"upload {upload} was {state['state']}: {state.get('error') or ''}".strip(),
+            422,
+        )
+    return state
+
+
+def upload_metadata(
+    target: str,
+    task: str,
+    *,
+    column_types: Mapping[str, str] | None = None,
+    time: str | None = None,
+    group: str | None = None,
+    origin: JsonObject | None = None,
+) -> JsonObject:
+    """A training upload's metadata, leaving out what was not given."""
+    found: JsonObject = {"target": target, "task": task}
+    if column_types is not None:
+        found["column_types"] = dict(column_types)
+    for key, value in (("time", time), ("group", group), ("origin", origin)):
+        if value is not None:
+            found[key] = value
+    return found
+
+
+def run_spec(name_: str, **settings: Any) -> JsonObject:
+    """A run's `POST /runs` payload, leaving out settings that were not given."""
+    return {"name": name_, **{k: v for k, v in settings.items() if v is not None}}
+
+
+def run_lineage(run: str) -> Operation[JsonObject]:
+    """`GET /runs/{run}/lineage`: every change to a run, oldest first."""
+    return (yield Call("GET", f"/runs/{name(run)}/lineage", "run", run))
+
+
+def run_wait(run: str, *, timeout: float | None, poll: float) -> Operation[JsonObject]:
+    """Polls a run until it finishes, is cancelled or fails."""
+    deadline = None if timeout is None else time.monotonic() + timeout
+    state = yield from got("run", "runs", run)
+    while state["state"] not in RUN_DONE:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ServiceError(
+                "WaitTimeout", f"run {run} is still {state['state']}", 504
+            )
+        yield Pause(poll)
+        state = yield from got("run", "runs", run)
+    return state
 
 
 def _predictor(predictor: str, suffix: str = "") -> str:

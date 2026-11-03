@@ -25,15 +25,24 @@ pinned bytes, license evidence and runtime qualification with real weights.
 A model goes by its canonical id alone, `general-forecast/<name>`, on every
 surface. `ALIASES` is the one table of old spellings (bare names, upstream
 repository ids); `parse` rejects them with the canonical id as a hint.
+
+A derived model, `<owner>/<name>@ft<version>`, is weights a hosted plane
+keeps over one of these models. It has no entry here: `resolve_derived`
+asks the plane's resolver (`generalforecast.models.derived`) for its base,
+and it takes the base's capability, gates and bounds, each of its bags
+counting as one estimator.
 """
 
 import re
 from dataclasses import dataclass, field
 from types import MappingProxyType
-from typing import Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 from generalforecast.errors import InvalidInput, NotFound
 from generalforecast.serialization import content_digest
+
+if TYPE_CHECKING:
+    from generalforecast.models.derived import Derived
 
 Task = Literal["classification", "regression", "forecast"]
 Surface = Literal["local", "predictor", "remote", "self-hosted"]
@@ -437,15 +446,19 @@ class ModelRefError(ValueError):
         super().__init__(message)
 
 
-# A canonical id, then optionally an `@sha256:` content pin, `@K`
-# error-correcting codes and `*N` estimators, each once, in that order.
+# A canonical id, then optionally an `@ft<version>` derived version, an
+# `@sha256:` content pin, `@K` error-correcting codes and `*N` estimators,
+# each once, in that order.
 _REF = re.compile(
     r"(?P<name>[^@*]+)"
+    r"(?:@ft(?P<version>\d+))?"
     r"(?:@(?P<digest>sha256:[0-9a-f]{64}))?"
     r"(?:@(?P<codes>\d+))?"
     r"(?:\*(?P<estimators>\d+))?"
 )
 _BASE = re.compile(r"(?P<name>[^@*]+)(?:[@*].*)?", re.DOTALL)
+# A derived model's owner and name, before its `@ft<version>`.
+_DERIVED = re.compile(r"[a-z][a-z0-9-]{0,62}/[a-z0-9][a-z0-9.-]{0,62}")
 # A custom model: a Python module's dotted name, a colon and an attribute.
 _CUSTOM = re.compile(r"[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*:[A-Za-z_]\w*")
 
@@ -460,13 +473,27 @@ class ModelRef:
             `module:attribute`.
         codes: `@K` error-correcting codes, if any.
         estimators: `*N` ensemble estimators, if any.
-        digest: The `@sha256:` artifact digest it is pinned to, if any.
+        digest: The `@sha256:` artifact digest it is pinned to, if any; a
+            derived model's pins its own weights.
+        version: A derived model's `@ft<version>`; None for a catalog or
+            custom model.
     """
 
     name: str
     codes: int | None = None
     estimators: int | None = None
     digest: str | None = None
+    version: int | None = None
+
+    @property
+    def derived(self) -> bool:
+        """Whether it names a derived model, `<owner>/<name>@ft<version>`."""
+        return self.version is not None
+
+    @property
+    def model(self) -> str:
+        """The model it names without pin or variant: a derived one with its version."""
+        return self.name + (f"@ft{self.version}" if self.derived else "")
 
     @property
     def variant(self) -> bool:
@@ -493,17 +520,19 @@ class ModelRef:
         """
         if self.custom:
             raise ModelRefError("UnsupportedModel", custom_refused(self.name))
+        if self.derived:
+            return ENTRIES[resolve_derived(self).base]
         return ENTRIES[self.name]
 
     @property
     def base(self) -> "ModelRef":
         """The same model without its variant."""
-        return ModelRef(self.name, digest=self.digest)
+        return ModelRef(self.name, digest=self.digest, version=self.version)
 
     def __str__(self) -> str:
         """The canonical spelling, which parses back to the same reference."""
         return (
-            self.name
+            self.model
             + (f"@{self.digest}" if self.digest else "")
             + (f"@{self.codes}" if self.codes is not None else "")
             + (f"*{self.estimators}" if self.estimators is not None else "")
@@ -525,6 +554,33 @@ def admit(ref: ModelRef, surface: Surface) -> None:
             raise ModelRefError(
                 "UnsupportedCapability",
                 f"a custom model takes no pin, codes or estimators: {ref}",
+            )
+        return
+    if ref.derived:
+        found = resolve_derived(ref)
+        base = ENTRIES[found.base]
+        if not base.allows(surface, variant=ref.variant or found.bags > 1):
+            raise ModelRefError(
+                "UnsupportedModel",
+                f"{ref} runs on {found.base}, which is not qualified for "
+                f"{surface} use: {base.gates.evidence}",
+            )
+        if ref.variant and not base.capability.tabular:
+            raise ModelRefError(
+                "UnsupportedCapability",
+                f"a forecaster takes no codes or estimators: {ref}",
+            )
+        if ref.codes is not None and base.capability.task != "classification":
+            raise ModelRefError(
+                "UnsupportedCapability",
+                f"error-correcting codes need a classifier: {ref}",
+            )
+        # Each bag is one more estimator run.
+        members = ModelRef(found.base, ref.codes, (ref.estimators or 1) * found.bags)
+        if surface != "local" and (refused := V1_POLICY.admits(members)):
+            raise ModelRefError(
+                "CapacityExceeded",
+                f"serving policy allows {refused}; {ref} has {found.bags} bags",
             )
         return
     entry = ref.entry
@@ -579,12 +635,26 @@ def parse(spec: str) -> ModelRef:
         raise ModelRefError(
             "InvalidModel", f"counts in a model spec are positive: {spec!r}"
         )
+    version = match.group("version")
     ref = ModelRef(
         name,
         int(codes) if codes is not None else None,
         int(estimators) if estimators is not None else None,
         digest,
+        int(version) if version is not None else None,
     )
+    if version is not None:
+        if _DERIVED.fullmatch(name) is None or name.startswith(f"{ORGANIZATION}/"):
+            raise ModelRefError(
+                "InvalidModel",
+                f"a derived model is <owner>/<name>@ft<version>, owned outside "
+                f"{ORGANIZATION}: {spec!r}",
+            )
+        if int(version) == 0:
+            raise ModelRefError(
+                "InvalidModel", f"derived versions start at 1: {spec!r}"
+            )
+        return ref
     if ":" in name:
         if _CUSTOM.fullmatch(name) is None:
             raise ModelRefError(
@@ -619,6 +689,40 @@ def parse(spec: str) -> ModelRef:
             f"error-correcting codes need a classifier: {spec!r}",
         )
     return ref
+
+
+def resolve_derived(ref: ModelRef) -> "Derived":
+    """What a derived reference is made of, from the installed resolver.
+
+    Raises:
+        ModelRefError: `UnknownModel` when no resolver is installed or it
+            keeps no such model; `ModelMismatch` when the reference pins
+            other weights, or the resolver names a base the catalog lacks.
+    """
+    from generalforecast.models import derived
+
+    found = derived.resolver()
+    if found is None:
+        raise ModelRefError(
+            "UnknownModel",
+            f"{ref.model} is a derived model; only the hosted plane that keeps it "
+            "resolves it",
+        )
+    made = found.resolve(ref.model)
+    if made.base not in ENTRIES:
+        raise ModelRefError(
+            "ModelMismatch", f"{ref.model} runs on {made.base}, not a catalog model"
+        )
+    if made.base_digest != ENTRIES[made.base].artifact.digest:
+        raise ModelRefError(
+            "ModelMismatch",
+            f"{ref.model} was made against another {made.base} than the catalog ships",
+        )
+    if ref.digest is not None and ref.digest != made.digest:
+        raise ModelRefError(
+            "ModelMismatch", "requested model pin differs from its weights"
+        )
+    return made
 
 
 def _base(ref: str) -> str:

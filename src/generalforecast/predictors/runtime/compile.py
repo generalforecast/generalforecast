@@ -124,7 +124,7 @@ def compile_lock(
     compiled = compile_plan(plan, table, resolver=resolver, lock_digest=locked.digest)
     pin = locked.predictor["model_digest"]
     ensure(
-        compiled.model.digest == pin,
+        compiled.model.model_digest == pin,
         "the catalog's model digest differs from the lock's; run `gf check --upgrade`",
         "ModelMismatch",
     )

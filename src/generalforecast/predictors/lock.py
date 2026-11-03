@@ -8,11 +8,15 @@ writes the result here. `gf check --frozen`, `gf.Predictor`, `gf serve`,
 `gf push` and hosted serving all read this document, and nothing else, to
 know what a predictor is. It has one format:
 
-    lock_version: 1
+    lock_version: 1               # 2 when the predictor runs a derived model
     digest: sha256:...            # of the document without this key
     manifest: sha256:...          # of the normalized gf.yaml it resolves
     predictor:
       name, model, model_digest, task, target, target_type
+      derived: {base, base_digest, bags}   # a derived model's catalog base and
+                                  # bag count, in lock_version 2 alone; then
+                                  # model is `<owner>/<name>@ft<version>` and
+                                  # model_digest pins its weights
       classes                     # a classifier's labels, when the context has them
       id, id_type                 # when the manifest names an id
       time, time_type             # when it names a time
@@ -62,6 +66,10 @@ from generalforecast.predictors.validation import column as column_name
 
 LOCK = "gf.lock"
 LOCK_VERSION = 1
+# The version of a lock whose predictor runs a derived model; locks of
+# catalog models stay at LOCK_VERSION, so none of them changes.
+DERIVED_LOCK_VERSION = 2
+LOCK_VERSIONS = (LOCK_VERSION, DERIVED_LOCK_VERSION)
 TASKS = ("classification", "regression", "forecast")
 CONTEXT_KINDS = ("snapshot", "request", "live")
 ROLES = ("input", "past", "future")
@@ -92,6 +100,7 @@ OPTIONAL_FIELDS = frozenset(
         "frequency",
         "horizon",
         "quantiles",
+        "derived",
     }
 )
 CONTEXT_FIELDS = frozenset(
@@ -126,6 +135,8 @@ def document(resolution: Resolution) -> dict[str, Any]:
         "target": resolution.target,
         "target_type": resolution.target_type,
     }
+    if resolution.derived is not None:
+        predictor["derived"] = dict(resolution.derived)
     if resolution.classes is not None:
         predictor["classes"] = list(resolution.classes)
     if resolution.id is not None:
@@ -172,8 +183,9 @@ def document(resolution: Resolution) -> dict[str, Any]:
             context["max_rows"] = spec.context.max_rows
     predictor["context"] = context
     predictor["selection"] = resolution.selection.to_dict()
+    version = LOCK_VERSION if resolution.derived is None else DERIVED_LOCK_VERSION
     value: dict[str, Any] = {
-        "lock_version": LOCK_VERSION,
+        "lock_version": version,
         "manifest": resolution.manifest,
         "predictor": predictor,
     }
@@ -181,7 +193,7 @@ def document(resolution: Resolution) -> dict[str, Any]:
     if resources:
         value["resources"] = dict(resources)
     value["model"] = {"files": dict(resolution.files)}
-    return {"lock_version": LOCK_VERSION, "digest": lock_digest(value), **value}
+    return {"lock_version": version, "digest": lock_digest(value), **value}
 
 
 def validate(value: Any) -> dict[str, Any]:
@@ -198,7 +210,7 @@ def validate(value: Any) -> dict[str, Any]:
     ensure(type(value) is dict, "lock must be a document")
     version = value.get("lock_version")
     ensure(
-        version == LOCK_VERSION,
+        type(version) is int and version in LOCK_VERSIONS,
         "gf.lock is not in the current format; run `gf check` to write it again",
         "UnsupportedLockVersion",
     )
@@ -221,10 +233,19 @@ def validate(value: Any) -> dict[str, Any]:
     name(predictor["name"])
     text(predictor["model"])
     ensure(
-        predictor["model"].startswith("general-forecast/"),
-        f"model `{predictor['model']}` is not a catalog id; use general-forecast/<name>",
+        ("derived" in predictor) == (version == DERIVED_LOCK_VERSION),
+        f"a lock with a derived model is lock_version {DERIVED_LOCK_VERSION}, "
+        f"and only it has `derived`",
         "ValidationError",
     )
+    if "derived" in predictor:
+        _derived(predictor["model"], predictor["derived"])
+    else:
+        ensure(
+            predictor["model"].startswith("general-forecast/"),
+            f"model `{predictor['model']}` is not a catalog id; use general-forecast/<name>",
+            "ValidationError",
+        )
     ensure(
         predictor["model_digest"] is not None,
         f"{predictor['model']} has no published artifact digest, so a lock cannot pin it",
@@ -378,6 +399,34 @@ def validate(value: Any) -> dict[str, Any]:
     return value
 
 
+def _derived(model: str, value: Any) -> None:
+    """Checks a derived model's id and its block: base, base digest and bags."""
+    from generalforecast.models.catalog import ModelRefError, parse
+
+    try:
+        ref = parse(model)
+    except ModelRefError as error:
+        raise PredictorError("ValidationError", str(error)) from None
+    ensure(
+        ref.derived and not ref.variant and ref.digest is None,
+        f"model `{model}` is not a derived id, <owner>/<name>@ft<version>",
+        "ValidationError",
+    )
+    fields(value, {"base", "base_digest", "bags"})
+    text(value["base"])
+    ensure(
+        value["base"].startswith("general-forecast/"),
+        "a derived model's base is a catalog id",
+        "ValidationError",
+    )
+    hash_value(value["base_digest"])
+    ensure(
+        type(value["bags"]) is int and 1 <= value["bags"] <= 64,
+        "a derived model has 1 to 64 bags",
+        "ValidationError",
+    )
+
+
 def _iso(value: Any) -> bool:
     import datetime as dt
 
@@ -409,7 +458,7 @@ def read_lock(root: str | Path) -> dict[str, Any] | None:
         return None
     value = _parsed(data)
     if (
-        value.get("lock_version") != LOCK_VERSION
+        value.get("lock_version") not in LOCK_VERSIONS
         or type(value.get("predictor")) is not dict
     ):
         return None
@@ -618,6 +667,9 @@ def resolution_of(value: dict[str, Any], spec: PredictorSpec | None) -> Resoluti
         name=predictor["name"],
         model=predictor["model"],
         model_digest=predictor["model_digest"],
+        derived=MappingProxyType(dict(predictor["derived"]))
+        if "derived" in predictor
+        else None,
         task=predictor["task"],
         target=predictor["target"],
         target_type=predictor.get("target_type"),
@@ -651,8 +703,10 @@ def resolution_of(value: dict[str, Any], spec: PredictorSpec | None) -> Resoluti
 
 
 __all__ = [
+    "DERIVED_LOCK_VERSION",
     "LOCK",
     "LOCK_VERSION",
+    "LOCK_VERSIONS",
     "changes",
     "document",
     "load_lock",

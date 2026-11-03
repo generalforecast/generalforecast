@@ -27,6 +27,8 @@ RECORDED = (
     "CompiledPlan",
     "ContextImportRef",
     "ContextVersion",
+    "Derived",
+    "DerivedResolver",
     "Environment",
     "Error",
     "ImportOutcome",
@@ -100,6 +102,7 @@ RECORDED = (
     "text",
     "to_arrow",
     "unique_object",
+    "use_derived",
 )
 
 
