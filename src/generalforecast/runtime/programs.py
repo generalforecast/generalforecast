@@ -33,12 +33,6 @@ from generalforecast.system import mappings_short
 
 logger = logging.getLogger(__name__)
 
-# How a paged decode compiles on a GPU: without autotuning, which took 40%
-# of its compile and moved no decode's time on an H100 (TabICL v2, 1,024 to
-# 8,192 queries: 3.6 s against 6.1 s to compile; 5.1, 11.1 and 20.7 ms to
-# run either way), so a step that meets a new query count waits less.
-DECODE_OPTIONS = {"xla_gpu_autotune_level": 0}
-
 
 def ladder(first: int, count: int) -> list[int]:
     """`count` padded sizes from `first`, a padded size, each double the last, as buckets are."""
@@ -251,12 +245,6 @@ def zeros(tree: Any) -> Any | None:
         return np.zeros(leaf.shape, leaf.dtype)
 
     return jax.tree.unflatten(structure, [zero(leaf) for leaf in leaves])
-
-
-def _options_for(key: Hashable) -> dict[str, Any] | None:
-    """The compiler options a program under `key` compiles with: `DECODE_OPTIONS` for a paged decode on a GPU, else XLA's own."""
-    paged = isinstance(key, tuple) and bool(key) and key[0] == "paged"
-    return DECODE_OPTIONS if paged and jax.default_backend() == "gpu" else None
 
 
 def _compile(function: Callable[..., Any], arguments: tuple) -> None:
@@ -523,8 +511,7 @@ class Programs:
         function = build()
         if self._settings is not None:
             function = with_precision(function, self._settings.matmul_precision)
-        options = _options_for(key)
-        compiled = jax.jit(function, compiler_options=options)
+        compiled = jax.jit(function)
         with self._lock:
             return self._compiled.setdefault(key, compiled)
 
