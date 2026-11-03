@@ -85,13 +85,21 @@ class Unit:
 
 @dataclass(frozen=True)
 class QueryBatch:
-    """One request's queries, and the unit each decodes against."""
+    """One request's queries, and the unit each decodes against.
+
+    `levels` are the quantile levels a regressor's caller asked for, and
+    `known` the levels of the model's prediction columns: with them the
+    worker answers with the predictions at `levels` alone, as the server
+    would interpolate them, so the step's reply carries those columns only.
+    """
 
     request: int
     table: int
     epoch: int
     features: np.ndarray
     units: list[int]
+    known: np.ndarray | None = None
+    levels: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -332,6 +340,31 @@ def movements(entries: list[dict[str, Any]]) -> list[Movement]:
     ]
 
 
+def _levels(given: list[float] | None) -> np.ndarray | None:
+    return None if given is None else np.asarray(given, dtype=np.float64)
+
+
+def at_levels(values: np.ndarray, known: np.ndarray, levels: np.ndarray) -> np.ndarray:
+    """Predictions at `levels`, each linearly between the two `known` levels around it.
+
+    As the server's `quantile_values` computes them, in float64 then cast to
+    float32, so a caller gets the same answer whichever end interpolates; a
+    level beyond the outermost known level takes that level.
+    """
+    columns = len(known)
+    upper = np.minimum(np.searchsorted(known, levels, side="left"), columns - 1)
+    lower = np.maximum(upper - 1, 0)
+    span = known[upper] - known[lower]
+    weight = np.where(
+        span > 0,
+        np.clip((levels - known[lower]) / np.where(span > 0, span, 1.0), 0.0, 1.0),
+        0.0,
+    )
+    rows = np.asarray(values, dtype=np.float64)
+    picked = rows[:, lower] * (1.0 - weight) + rows[:, upper] * weight
+    return picked.astype(np.float32)
+
+
 def step(header: dict[str, Any], buffers: list[memoryview]) -> Step:
     """A step from its frame."""
     queries = [
@@ -343,6 +376,8 @@ def step(header: dict[str, Any], buffers: list[memoryview]) -> Step:
                 entry["count"], -1
             ),
             units=entry["units"],
+            known=_levels(entry.get("known")),
+            levels=_levels(entry.get("levels")),
         )
         for entry in header["queries"]
     ]

@@ -51,6 +51,14 @@ fn probabilities(classes: &[Label], inferred: &Inferred) -> Vec<Map<String, Valu
         .collect()
 }
 
+/// The increasing levels a regressor's answer reads: its median and `levels`.
+fn answer_levels(levels: &[f64]) -> Vec<f64> {
+    let mut read: Vec<f64> = levels.iter().copied().chain([0.5]).collect();
+    read.sort_by(f64::total_cmp);
+    read.dedup();
+    read
+}
+
 /// Each query's values at `levels`, keyed by level, from the table's own levels.
 pub(super) fn quantiles(
     inferred: &Inferred,
@@ -497,6 +505,10 @@ pub(super) async fn served_predict(
         require(features == predictor.inputs, "inputs differ from lock")?;
         predictor.target.clone().unwrap_or_default()
     };
+    // A regressor's answer reads its median and the predictor's levels, so
+    // the worker keeps only those columns.
+    let pick = matches!(predictor.task()?, gf_core::catalog::Task::Regression)
+        .then(|| answer_levels(&predictor.quantiles));
     let (inferred, classes, used) = match predictor.context {
         ContextMode::Snapshot => {
             if !context.is_empty() {
@@ -510,7 +522,7 @@ pub(super) async fn served_predict(
             let encoded = bound
                 .encoder
                 .encode(&predictors::records(&predictor.schema.columns, queries)?)?;
-            let inferred = engine.predicted(bound, encoded).await?;
+            let inferred = engine.predicted(bound, encoded, pick).await?;
             (
                 inferred,
                 bound.classes.clone(),
@@ -553,7 +565,7 @@ pub(super) async fn served_predict(
                 shared,
             )?;
             let inferred = engine
-                .ask(context, Asked::Rows(encoded), &fingerprint)
+                .ask(context, Asked::Rows(encoded), &fingerprint, pick)
                 .await?;
             (inferred, bound.classes, Used::request(bound.rows))
         }

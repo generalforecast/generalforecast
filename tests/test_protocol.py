@@ -9,6 +9,7 @@ import json
 import socket
 import struct
 
+import numpy as np
 import pytest
 
 from generalforecast import protocol
@@ -172,3 +173,73 @@ def test_progress_replies_carry_the_warm_up_count_only_when_given() -> None:
         "done": 3,
         "total": 12,
     }
+
+
+def _server_levels(values, known, levels):
+    """The server's `quantile_values`, level by level, as its Rust computes them."""
+    rows, columns = values.shape
+    picked = np.zeros((rows, len(levels)), np.float32)
+    for index, level in enumerate(levels):
+        upper = min(int(np.searchsorted(known, level, side="left")), columns - 1)
+        lower = max(upper - 1, 0)
+        span = known[upper] - known[lower]
+        weight = min(max((level - known[lower]) / span, 0.0), 1.0) if span > 0 else 0.0
+        for row in range(rows):
+            low, high = float(values[row, lower]), float(values[row, upper])
+            picked[row, index] = np.float32(low * (1.0 - weight) + high * weight)
+    return picked
+
+
+def test_workers_take_the_levels_a_caller_asks_as_the_server_would() -> None:
+    generator = np.random.default_rng(0)
+    known = np.arange(1, 1000) / 1000
+    values = np.sort(generator.normal(size=(5, 999)).astype(np.float32), axis=1)
+    # Unordered and repeated levels keep their order; levels outside the
+    # known ones take the outermost; one exactly at a known level is its column.
+    levels = np.asarray([0.5, 0.05, 0.95, 0.0005, 0.9995, 0.5, 0.123456])
+
+    picked = protocol.at_levels(values, known, levels)
+
+    assert picked.dtype == np.float32
+    assert picked.shape == (5, len(levels))
+    np.testing.assert_array_equal(picked, _server_levels(values, known, levels))
+    np.testing.assert_array_equal(picked[:, 0], values[:, 499])
+
+
+def test_query_batches_carry_the_levels_their_caller_asked() -> None:
+    features = np.zeros((2, 3), "<f4")
+    header = {
+        "kind": "step",
+        "movements": [],
+        "fits": [],
+        "pages": [],
+        "units": [],
+        "queries": [
+            {
+                "request": 1,
+                "table": 0,
+                "epoch": 0,
+                "count": 2,
+                "features": 0,
+                "units": [0, 0],
+            },
+            {
+                "request": 2,
+                "table": 0,
+                "epoch": 0,
+                "count": 2,
+                "features": 0,
+                "units": [0, 0],
+                "known": [0.25, 0.5, 0.75],
+                "levels": [0.5, 0.1],
+            },
+        ],
+        "series_units": [],
+        "forecasts": [],
+    }
+
+    plain, picked = protocol.step(header, [memoryview(features.tobytes())]).queries
+
+    assert plain.known is None and plain.levels is None
+    np.testing.assert_array_equal(picked.known, [0.25, 0.5, 0.75])
+    np.testing.assert_array_equal(picked.levels, [0.5, 0.1])

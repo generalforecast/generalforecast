@@ -720,6 +720,7 @@ impl Harness {
             before: None,
             given: None,
             trace: String::new(),
+            pick: None,
             reply,
         };
         self.commands.send(command).await.unwrap();
@@ -1976,6 +1977,7 @@ impl Harness {
             context: Box::new(context),
             asked: Asked::Rows(vec![0.5, 0.0, 1.5, 0.0]),
             trace: String::new(),
+            pick: None,
             reply,
         };
         self.commands.send(command).await.unwrap();
