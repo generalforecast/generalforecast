@@ -390,6 +390,32 @@ fn retrieved_contexts_hold_the_core_and_each_querys_nearest_rows_outside_it() {
     }
 }
 
+#[test]
+fn many_queries_searched_side_by_side_read_what_each_reads_alone() {
+    let (table, index) = world();
+    let snapshot = table.snapshot();
+    let strategy = Strategy::Retrieved {
+        core: Some(Core {
+            rows: 8,
+            seed: 3,
+            kind: CoreKind::Random,
+        }),
+        neighbors: 5,
+        among: None,
+        recency: None,
+    };
+    // Enough queries for the plan to read the rows once and search them on
+    // many threads; three plan one at a time.
+    let many: Vec<Vec<f32>> = (0..40).map(|query| queries()[query % 3].clone()).collect();
+
+    let alone = make(&strategy, &snapshot, &index);
+    let together = plan(&strategy, &source(&snapshot, &index), &many).unwrap();
+
+    for query in 0..many.len() {
+        assert_eq!(read(&together, query), read(&alone, query % 3));
+    }
+}
+
 /// Rows below 48 in one stratum and the rest in another.
 struct Halves;
 

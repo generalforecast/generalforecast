@@ -26,7 +26,7 @@ use std::num::NonZeroU64;
 
 use crate::context::{Context, Fingerprint, mix};
 use crate::distance::squared;
-use crate::pages::{IndexError, PageIndex, Vectors};
+use crate::pages::{Dense, IndexError, PageIndex, Vectors};
 use crate::table::{Keys, RowId, Snapshot};
 use crate::time_index::TimeIndex;
 
@@ -1016,15 +1016,24 @@ pub fn plan_with(
         } else {
             Cow::Owned(allowed - &core)
         };
-        for query in members {
-            let vector = queries[query].as_ref();
-            let nearest = source.index.nearest_rows(
-                vector,
-                among.unwrap_or(neighbors),
-                &outside,
-                source.vectors,
-                source.keys,
-            )?;
+        let count = among.unwrap_or(neighbors);
+        let found = if members.len() >= DENSE_QUERIES {
+            nearest_dense(source, &outside, queries, &members, count)?
+        } else {
+            members
+                .iter()
+                .map(|&query| {
+                    source.index.nearest_rows(
+                        queries[query].as_ref(),
+                        count,
+                        &outside,
+                        source.vectors,
+                        source.keys,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (&query, nearest) in members.iter().zip(found) {
             let nearest = match among {
                 Some(_) => source.times.latest_of(&nearest, neighbors as u64),
                 None => nearest,
@@ -1034,6 +1043,58 @@ pub fn plan_with(
     }
     builder.plan.queries = planned;
     Ok(builder.plan)
+}
+
+/// Queries of one window from which a plan reads the rows they search once
+/// into a `Dense` and searches on every core: fewer search too few rows again
+/// to repay reading them all.
+const DENSE_QUERIES: usize = 16;
+
+/// Each of `members`' `count` nearest rows within `outside`, as
+/// `PageIndex::nearest_rows` finds them, with the rows read once and the
+/// queries searched side by side on the host's cores.
+fn nearest_dense(
+    source: &Source<'_>,
+    outside: &Context,
+    queries: &[impl AsRef<[f32]>],
+    members: &[usize],
+    count: usize,
+) -> Result<Vec<Context>, PlanError> {
+    let dimensions = queries[members[0]].as_ref().len();
+    let dense =
+        Dense::read(outside, dimensions, source.vectors, source.keys).map_err(IndexError::from)?;
+    let index = source.index;
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZeroUsize::get)
+        .min(members.len());
+    let share = members.len().div_ceil(threads);
+    let points: Vec<&[f32]> = members
+        .iter()
+        .map(|&query| queries[query].as_ref())
+        .collect();
+    let found: Vec<Result<Vec<Context>, IndexError>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = points
+            .chunks(share)
+            .map(|chunk| {
+                let dense = &dense;
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|point| index.nearest_rows(point, count, outside, dense, dense))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a search thread does not panic"))
+            .collect()
+    });
+    let mut nearest = Vec::with_capacity(members.len());
+    for part in found {
+        nearest.extend(part?);
+    }
+    Ok(nearest)
 }
 
 /// The recent rows of `window` that `recency` keeps; `before`, if given, is

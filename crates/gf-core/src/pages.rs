@@ -74,6 +74,86 @@ pub trait Vectors {
     ///
     /// If the row's values cannot be read.
     fn vector(&self, row: RowId) -> Result<Vec<f32>, RowsError>;
+
+    /// The squared distance from a row's vector to `point`, as `squared` sums it.
+    ///
+    /// # Errors
+    ///
+    /// If the row's values cannot be read.
+    fn squared_to(&self, row: RowId, point: &[f32]) -> Result<f64, RowsError> {
+        Ok(squared(&self.vector(row)?, point))
+    }
+}
+
+/// Rows' vectors and keys read once into flat buffers, so a plan of many
+/// queries, each reading many of the same rows, reads each row once and can
+/// search from many threads.
+#[derive(Debug)]
+pub struct Dense {
+    dimensions: usize,
+    /// Each row's place in `values` and `keys`, by row id; `u32::MAX` for none.
+    slots: Vec<u32>,
+    values: Vec<f32>,
+    keys: Vec<u128>,
+}
+
+impl Dense {
+    /// Reads `rows`' vectors, each of `dimensions` values, and their keys.
+    ///
+    /// # Errors
+    ///
+    /// If a row's values cannot be read.
+    pub fn read(
+        rows: &Context,
+        dimensions: usize,
+        vectors: &dyn Vectors,
+        keys: &dyn Keys,
+    ) -> Result<Self, RowsError> {
+        let last = rows.iter().last().map_or(0, |row| row.0 as usize + 1);
+        let count = usize::try_from(rows.len()).unwrap_or(usize::MAX);
+        let mut dense = Self {
+            dimensions,
+            slots: vec![u32::MAX; last],
+            values: Vec::with_capacity(count.saturating_mul(dimensions)),
+            keys: Vec::with_capacity(count),
+        };
+        for row in rows.iter() {
+            dense.slots[row.0 as usize] = dense.keys.len() as u32;
+            dense.values.extend(vectors.vector(row)?);
+            dense.keys.push(keys.key(row));
+        }
+        Ok(dense)
+    }
+
+    fn slot(&self, row: RowId) -> usize {
+        let slot = self.slots.get(row.0 as usize).copied().unwrap_or(u32::MAX);
+        assert!(
+            slot != u32::MAX,
+            "a dense search reads only the rows it read"
+        );
+        slot as usize
+    }
+
+    fn values(&self, row: RowId) -> &[f32] {
+        let start = self.slot(row) * self.dimensions;
+        &self.values[start..start + self.dimensions]
+    }
+}
+
+impl Vectors for Dense {
+    fn vector(&self, row: RowId) -> Result<Vec<f32>, RowsError> {
+        Ok(self.values(row).to_vec())
+    }
+
+    fn squared_to(&self, row: RowId, point: &[f32]) -> Result<f64, RowsError> {
+        Ok(squared(self.values(row), point))
+    }
+}
+
+impl Keys for Dense {
+    fn key(&self, row: RowId) -> u128 {
+        self.keys[self.slot(row)]
+    }
 }
 
 impl fmt::Display for IndexError {
@@ -1027,7 +1107,7 @@ impl PageIndex {
                         if !allowed.contains(row) {
                             continue;
                         }
-                        let distance = squared(&vectors.vector(row)?, query);
+                        let distance = vectors.squared_to(row, query)?;
                         best.push(Near(distance, keys.key(row), row));
                         if best.len() > count {
                             best.pop();
