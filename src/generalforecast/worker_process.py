@@ -423,13 +423,21 @@ def _profiled(worker: Worker, model: int, features: int) -> protocol.Profiled:
         regression=properties.regression,
         class_slots=properties.class_slots,
         outputs=properties.num_outputs,
-        context_rows=properties.context_rows,
+        context_rows=_fewest(
+            properties.context_rows, worker.memory_rows(model, features)
+        ),
         state_bytes=profile.state_bytes,
         categorical_state_bytes=profile.categorical_state_bytes,
         column_summary=properties.column_summary,
         unlabeled_context=properties.unlabeled_context,
         fit_bound=_limit(worker.fit_bound(model, features)),
     )
+
+
+def _fewest(*limits: int | None) -> int | None:
+    """The smallest of the limits given, or None where none is."""
+    given = [limit for limit in limits if limit is not None]
+    return min(given) if given else None
 
 
 def _limit(rows: int) -> int | None:

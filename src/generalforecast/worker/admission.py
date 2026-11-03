@@ -20,6 +20,8 @@ from generalforecast.constants import (
     FIT_CELL_BYTES,
     FIT_ROW_SCALE,
     MEASURED_ROWS,
+    MEMORY_ROWS_LIMIT,
+    MEMORY_ROWS_MEASURES,
 )
 from generalforecast.runtime.memory import (
     EncodeProfile,
@@ -182,18 +184,24 @@ class Admission:
         )
 
     def encode_bytes(
-        self: "Worker", model: int, features: int, rows: int, fit: bool = False
+        self: "Worker",
+        model: int,
+        features: int,
+        rows: int,
+        fit: bool = False,
+        exact: bool = False,
     ) -> int | None:
         """Bytes a loaded model's encode of a context of `rows` padded rows takes at most.
 
-        From the model's profile where it holds, and otherwise measured at the
-        context's own width and size. None where XLA gives no measure.
+        From the model's profile where it holds, and otherwise, or with
+        `exact`, measured at the context's own width and size. None where XLA
+        gives no measure.
 
         Raises:
             ValueError: If the encode cannot even be compiled to measure it.
         """
         per_row = self.profile(model, features).cache_bytes_per_row
-        if rows >= MEASURED_ROWS:
+        if rows >= MEASURED_ROWS and not exact:
             profile = self.encode_profile(model, features, fit)
             if profile is not None:
                 return profile.working_bytes(per_row, rows)
@@ -374,31 +382,91 @@ class Admission:
         context = self._context_bytes(unit)
         decode = self.decode_profile(table.model)
         working = decode.working_bytes(per_row, size)
-        measured = self.encode_bytes(
-            table.model, table.features, size, table.own is not None
-        )
-        encode = 0 if measured is None else measured
-        if unit.action == "transient":
-            needed = max(encode, 2 * context + working)
-        else:
-            # A unit's own state is read from its slots and unpacked beside it.
-            state = 0 if table.own is None else 2 * table.own.slots * self._slot_bytes
-            needed = max(encode, working + state)
-        if not self.budget.cpu:
-            needed += max(encode, working) // AUTOTUNE_SHARE
         room = self.budget.device - self._pool_bytes
+        fit = table.own is not None
+
+        def needs(measured: int | None) -> int:
+            encode = 0 if measured is None else measured
+            if unit.action == "transient":
+                needed = max(encode, 2 * context + working)
+            else:
+                # A unit's own state is read from its slots and unpacked beside it.
+                state = (
+                    0 if table.own is None else 2 * table.own.slots * self._slot_bytes
+                )
+                needed = max(encode, working + state)
+            if not self.budget.cpu:
+                needed += max(encode, working) // AUTOTUNE_SHARE
+            return needed
+
+        measured = self.encode_bytes(table.model, table.features, size, fit)
+        needed = needs(measured)
+        if needed > room:
+            # The profile's line through small contexts can overstate a large
+            # one's encode several times, so a context it refuses is measured
+            # at its own size before it is refused.
+            measured = self.encode_bytes(
+                table.model, table.features, size, fit, exact=True
+            )
+            needed = needs(measured)
+        encode = 0 if measured is None else measured
         if needed > room:
             encoding = (
                 "" if measured is None else f"encoding it {encode >> 20} MiB and "
             )
             raise ValueError(
-                f"a context of {len(unit.rows)} rows takes {context >> 20} MiB as the "
+                f"a context of {len(unit.rows)} rows ({unit.action}, padded to "
+                f"{size}) takes {context >> 20} MiB as the "
                 f"model caches it, {encoding}decoding "
                 f"{decode.queries} queries against it {working >> 20} MiB, which "
                 f"needs {needed >> 20} MiB, but the device has {room >> 20} MiB "
                 "beside the contexts it keeps; use a strategy that reads fewer "
                 "rows, such as neighbors, or a device with more memory"
             )
+
+    def memory_rows(self: "Worker", model: int, features: int) -> int | None:
+        """The most rows a context of a table this wide holds on this device, a padded size; None for any.
+
+        A context past it would not fit as `_fits_device` checks: its cache
+        kept in the pool, and its encode and the decode of a chunk of queries
+        beside the pool. So an adaptive table resolves against it as against
+        the model's own cap, reading a core and each query's neighbors rather
+        than a context the device cannot hold. Sizes double from the smallest
+        until one does not fit, by the model's profiles, and a size they
+        refuse is measured at its own size before it ends the search, since
+        the profiles' line through small contexts can overstate a large one.
+        None on a CPU, whose memory the host's caches share, and where XLA
+        gives no measure.
+        """
+        if self.budget.cpu or not self._pool_bytes:
+            return None
+        per_row = self.profile(model, features).cache_bytes_per_row
+        layout = self.layout(model, features)
+        decode = self.decode_profile(model)
+        room = self.budget.device - self._pool_bytes
+
+        def fits(size: int, exact: bool) -> bool | None:
+            if layout.slots(size) * self._slot_bytes > self._pool_bytes:
+                return False
+            encode = self.encode_bytes(model, features, size, exact=exact)
+            if encode is None:
+                return None
+            needed = max(encode, decode.working_bytes(per_row, size))
+            return needed + needed // AUTOTUNE_SHARE <= room
+
+        size, measures = self._size(MEASURED_ROWS), 0
+        while size < MEMORY_ROWS_LIMIT:
+            larger = size * 2
+            found = fits(larger, exact=False)
+            if found is None:
+                return None
+            if not found and measures < MEMORY_ROWS_MEASURES:
+                measures += 1
+                found = fits(larger, exact=True)
+            if not found:
+                return size
+            size = larger
+        return None
 
     def _context_bytes(self: "Worker", unit: Unit) -> int:
         """Bytes of a unit's context as the model caches it, padding and own state included."""

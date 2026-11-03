@@ -22,6 +22,7 @@ import pytest
 from generalforecast import errors as generalforecast_errors
 from generalforecast import protocol
 from generalforecast.columns import MAX_WORDS, Column, datetime_parts
+from generalforecast.constants import AUTOTUNE_SHARE, MEASURED_ROWS
 from generalforecast.models import registry
 from generalforecast.models.kumo.model import kumo_functions
 from generalforecast.models.tabicl.model import tabicl_functions
@@ -346,6 +347,50 @@ def test_contexts_whose_calls_would_not_fit_the_device_are_refused() -> None:
         whole.predict(NEAR_A)
     assert client.stats.encoded == 0
     assert nearest.predict(NEAR_A).shape == (2, 3)
+
+
+@pytest.mark.slow
+def test_adaptive_tables_read_no_more_rows_than_the_device_holds() -> None:
+    client = node_harness.local()
+    worker = client._worker
+    small, large = MEASURED_ROWS, 2 * MEASURED_ROWS
+    features, targets = _clusters(large)
+    first = _table(client, name="first", model=TABICL)
+    (loaded,) = worker._models
+    row = worker.profile(loaded, 5).cache_bytes_per_row
+    decode = worker.decode_profile(loaded)
+
+    def needs(rows: int) -> int:
+        encode = worker.encode_bytes(loaded, 5, rows, exact=True)
+        assert encode is not None
+        needed = max(encode, decode.working_bytes(row, rows))
+        return needed + needed // AUTOTUNE_SHARE
+
+    # A device, beside its pool, that holds a context of `small` rows as
+    # `_fits_device` checks it, but not one of `large`; as an accelerator is.
+    room = (needs(small) + needs(large)) // 2
+    worker.budget = dataclasses.replace(
+        worker.budget, device=worker._pool_bytes + room, cpu=False
+    )
+    assert worker.memory_rows(loaded, 5) == small
+    del first
+
+    whole = _table(client, name="whole", model=TABICL)
+    adaptive = _table(
+        client,
+        name="adaptive",
+        model=TABICL,
+        strategy=generalforecast.Strategy.adaptive(),
+    )
+    for handle in (whole, adaptive):
+        handle.insert(np.arange(large), features, targets)
+
+    # Every row would not fit, and the exact table says so; the adaptive one
+    # reads a core and each query's neighbors, at most what the device holds.
+    with pytest.raises(ValueError, match="encoding it"):
+        whole.predict(NEAR_A)
+    assert adaptive.predict(NEAR_A).shape == (2, 3)
+    assert adaptive.describe().context_rows == small
 
 
 def test_representations_are_reused_until_their_page_changes() -> None:

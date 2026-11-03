@@ -608,7 +608,9 @@ class Profiled:
     padded row of a group and `patch_bytes` what it takes beside them;
     `outputs` is its quantile count, and the series fields describe it.
     `fit_bound` is the most rows a table's fit takes before the server asks
-    for its `Limited`, or None where fits are not limited.
+    for its `Limited`, or None where fits are not limited. `context_rows` is
+    the most rows a context holds: the model's own cap, or the most a context
+    of the table's width takes on the worker's device, whichever is fewer.
     """
 
     bytes_per_row: int
