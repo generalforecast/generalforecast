@@ -5,7 +5,7 @@
 
 import dataclasses
 import logging
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -15,7 +15,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from generalforecast.constants import SCATTER_ROWS
+from generalforecast import protocol
+from generalforecast.constants import (
+    HELD_STATES,
+    SCATTER_ROWS,
+    SPLIT_QUERIES,
+    SPLIT_WASTE,
+)
 from generalforecast.runtime.budget import Call, out_of_memory
 from generalforecast.runtime.decoding import (
     Decoding,
@@ -71,6 +77,58 @@ class _Dense:
         ]
 
 
+def query_pieces(count: int, size: Callable[[int], int]) -> list[int]:
+    """Query counts a batch of `count` queries decodes in, so padding wastes little.
+
+    Each call pads its queries to `size`'s bucket, a power of two, so 9,769
+    queries in one call compute 16,384 rows. Past `SPLIT_QUERIES` a batch
+    instead takes the largest bucket that it fills while padding would waste
+    more than `SPLIT_WASTE` of what is left, then decodes the rest the same
+    way: 9,769 queries decode as 8,192 and 1,577 padded to 2,048, so 10,240
+    rows. Every piece is a size the worker compiles anyway.
+    """
+    pieces = []
+    left = count
+    while left:
+        padded = size(left)
+        if padded <= SPLIT_QUERIES or padded - left <= left * SPLIT_WASTE:
+            pieces.append(left)
+            break
+        pieces.append(padded // 2)
+        left -= padded // 2
+    return pieces
+
+
+def split_queries(
+    batches: Sequence[QueryBatch], size: Callable[[int], int]
+) -> tuple[list[QueryBatch], list[tuple[int, int, int]]]:
+    """Each batch as `query_pieces` splits it, and where each piece's predictions go.
+
+    A piece's request is its position, as `merged` numbers its batches; its
+    placement is its batch's request, its first query there and the batch's
+    queries, so the pieces of a batch fill one array.
+    """
+    pieces: list[QueryBatch] = []
+    placement = []
+    for batch in batches:
+        start = 0
+        for count in query_pieces(len(batch.units), size):
+            stop = start + count
+            whole = start == 0 and stop == len(batch.units)
+            pieces.append(
+                protocol.QueryBatch(
+                    len(pieces),
+                    batch.table,
+                    batch.epoch,
+                    batch.features if whole else batch.features[start:stop],
+                    batch.units if whole else batch.units[start:stop],
+                )
+            )
+            placement.append((batch.request, start, len(batch.units)))
+            start = stop
+    return pieces, placement
+
+
 class Decodes:
     """How a worker decodes a step's queries, and scatters their predictions back."""
 
@@ -89,7 +147,8 @@ class Decodes:
         encoded and decoded as dense arrays.
         """
         joined, parts = merged(batches)
-        predictions = self._decode_batches(joined, units, transient)
+        pieces, placement = split_queries(joined, self._size)
+        predictions = self._decode_batches(pieces, units, transient, placement)
         return {
             request: predictions[index][start:stop]
             for index, owned in enumerate(parts)
@@ -149,29 +208,42 @@ class Decodes:
         batches: Sequence[QueryBatch],
         units: Sequence[Unit],
         transient: Transient,
+        placement: Sequence[tuple[int, int, int]] | None = None,
     ) -> dict[int, np.ndarray]:
         """Decodes batches whose requests are their positions; see `_decode`.
 
         A table that summarizes each context embeds its queries against their
         unit's own state, in the decode, so each decoding reads one unit.
+        With `placement`, each batch's predictions go to the request, at the
+        first query, of an array of the queries `split_queries` gives it.
         """
-        features = []
-        for batch in batches:
-            with self.stats.timed("pad"):
-                padded = _host_padded(batch.features, self._size(len(batch.units)))
-            with self.stats.timed("dispatch"):
-                features.append(jnp.asarray(padded))
-                self._settled(features[-1])
         fit_own = [self._tables[batch.table].own is not None for batch in batches]
+        # A batch whose every query reads a cached context embeds in its
+        # decode's program: its features go with the decode, so the step
+        # makes no embed call and no device copy of its rows to gather.
+        fused = [
+            not mine and all(unit not in transient for unit in batch.units)
+            for batch, mine in zip(batches, fit_own, strict=True)
+        ]
+        hosts, features = [], []
+        for batch, inline in zip(batches, fused, strict=True):
+            with self.stats.timed("pad"):
+                hosts.append(_host_padded(batch.features, self._size(len(batch.units))))
+            if inline:
+                features.append(None)
+                continue
+            with self.stats.timed("dispatch"):
+                features.append(jnp.asarray(hosts[-1]))
+                self._settled(features[-1])
         embedded = iter(
             self._call(
                 "embed",
                 [
                     (batch.table, (self._tables[batch.table].state, rows))
-                    for batch, rows, mine in zip(
-                        batches, features, fit_own, strict=True
+                    for batch, rows, mine, inline in zip(
+                        batches, features, fit_own, fused, strict=True
                     )
-                    if not mine
+                    if not mine and not inline
                 ],
             )
         )
@@ -179,8 +251,10 @@ class Decodes:
             self._warm_query_embeds(batch)
         dense: list[_Dense] = []
         paged: dict[tuple, list[Decoding]] = defaultdict(list)
-        for batch, raw, mine in zip(batches, features, fit_own, strict=True):
-            rows = raw if mine else next(embedded)
+        for batch, raw, host, mine, inline in zip(
+            batches, features, hosts, fit_own, fused, strict=True
+        ):
+            rows = host if inline else raw if mine else next(embedded)
             groups: dict[int, list[int]] = defaultdict(list)
             for query, unit in enumerate(batch.units):
                 groups[unit].append(query)
@@ -195,16 +269,18 @@ class Decodes:
             # Only states of one structure stack: a table with categorical
             # columns can keep more state than one without.
             structure = jax.tree.structure(table.state)
-            key = (table.model, table.num_classes, layout, table.own, structure)
+            key = (table.model, table.num_classes, layout, table.own, structure, inline)
             packs = (
                 [[one] for one in together] if mine else self._packed(together, units)
             )
             for groups_of in packs:
                 paged[key].append(self._decoding(batch, rows, groups_of, units))
         outputs = self._decode_dense(dense, units, transient)
-        for (model, num_classes, layout, own, _), decodings in paged.items():
+        for (model, num_classes, layout, own, _, inline), decodings in paged.items():
             for same in alike(decodings, layout.slots_per_row, self._size):
-                outputs += self._decode_paged(model, num_classes, layout, same, own)
+                outputs += self._decode_paged(
+                    model, num_classes, layout, same, own, embeds=inline
+                )
         with self.stats.timed("fetch"):
             fetched = jax.device_get([values for _, values in outputs])
         predictions: dict[int, np.ndarray] = {}
@@ -212,14 +288,19 @@ class Decodes:
             parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
             for ((batch, queries), _), values in zip(outputs, fetched, strict=True):
                 values = np.asarray(values)
-                if batch.request not in predictions:
-                    shape = (len(batch.units), values.shape[-1])
-                    predictions[batch.request] = np.zeros(shape, dtype=values.dtype)
-                at = np.asarray(queries, dtype=np.intp)
+                request, offset, total = (
+                    (batch.request, 0, len(batch.units))
+                    if placement is None
+                    else placement[batch.request]
+                )
+                if request not in predictions:
+                    shape = (total, values.shape[-1])
+                    predictions[request] = np.zeros(shape, dtype=values.dtype)
+                at = np.asarray(queries, dtype=np.intp) + offset
                 for start in range(0, len(at), SCATTER_ROWS):
                     stop = start + SCATTER_ROWS
                     parts.append(
-                        (predictions[batch.request], at[start:stop], values[start:stop])
+                        (predictions[request], at[start:stop], values[start:stop])
                     )
             self._scatter(parts)
         return predictions
@@ -362,6 +443,7 @@ class Decodes:
         layout: CacheLayout,
         decodings: list[Decoding],
         own: StateLayout | None = None,
+        embeds: bool = False,
     ) -> list[tuple[tuple[QueryBatch, list[int]], np.ndarray]]:
         """Decodes contexts read from their slots, as few calls as the budget allows.
 
@@ -369,16 +451,23 @@ class Decodes:
         parts, halved until they fit, down to the smallest chunk; later calls
         start at that size. With `own`, how units keep their own states, each
         decoding reads one unit, whose state is read from its slots and embeds
-        the queries' features.
+        the queries' features. With `embeds`, the decodings carry their
+        queries' features, which embed against their tables' states in the
+        decode's program.
         """
-        key = ("paged", model, num_classes, layout, own)
+        key = ("paged", model, num_classes, layout, own, embeds)
         limit = self._chunks.parts(key)
         if limit is not None:
             decodings = [part for d in decodings for part in split(d, limit)]
         shape = paged_shape(decodings, layout, self._size)
         signature = (key, shape)
         program = self._paged_key(
-            model, num_classes, layout, shape.masked, shape.in_order, own is not None
+            model,
+            num_classes,
+            layout,
+            shape.masked,
+            shape.in_order,
+            own is not None or embeds,
         )
         compiled = self._program(program)
         parameters = self._models[model].parameters
@@ -396,12 +485,7 @@ class Decodes:
                 states = self._own_states(decodings[first:stop], own, padded)
                 index = np.arange(len(index), dtype=np.int32)
             else:
-                with self.stats.timed("stack"):
-                    states = _stacked(
-                        padded_items(
-                            [self._tables[table].state for table in tables], padded
-                        )
-                    )
+                states = self._stacked_states(tables, padded)
             # Rows come straight from the pool into the decode's cache, so it
             # holds neither the slots' bytes whole nor a copy of the pool.
             source, blocks = self._device.source(blocks)
@@ -418,6 +502,9 @@ class Decodes:
             for position, decoding in enumerate(decodings[first:stop]):
                 with self.stats.timed("unstack"):
                     item = _item(values, np.int32(position))
+                # Its copy to the host runs beside the step's later calls.
+                for leaf in jax.tree.leaves(item):
+                    leaf.copy_to_host_async()
                 results.append(((decoding.batch, decoding.queries), item))
 
         # A context and the working copy beside it, and the queries' rows; and
@@ -445,8 +532,34 @@ class Decodes:
                 raise
             self._chunks.split(key, max(self._size(1), most // 2))
             rest = decodings[len(results) :]
-            return results + self._decode_paged(model, num_classes, layout, rest, own)
+            return results + self._decode_paged(
+                model, num_classes, layout, rest, own, embeds
+            )
         return results
+
+    def _stacked_states(self: "Worker", tables: list[int], padded: int) -> Any:
+        """The tables' states stacked over a call's `padded` items.
+
+        A call of one table reuses the stack it made last, while the table
+        keeps that state, so a warm step makes no stacking dispatch. The
+        worker holds at most `HELD_STATES` such stacks, of tables it still
+        serves: each is a copy of a state.
+        """
+        states = [self._tables[table].state for table in tables]
+        held = self.__dict__.setdefault("_held_states", OrderedDict())
+        key = (tables[0], padded) if len(tables) == 1 else None
+        if key is not None and key in held and held[key][0] is states[0]:
+            held.move_to_end(key)
+            return held[key][1]
+        with self.stats.timed("stack"):
+            stacked = _stacked(padded_items(states, padded))
+        if key is not None:
+            held[key] = (states[0], stacked)
+            for gone in [k for k in held if k[0] not in self._tables]:
+                del held[gone]
+            while len(held) > HELD_STATES:
+                held.popitem(last=False)
+        return stacked
 
     def _own_states(
         self: "Worker", decodings: list[Decoding], own: StateLayout, count: int

@@ -229,6 +229,7 @@ impl Shard {
                 table,
                 bytes,
                 arrived: Instant::now(),
+                pick: None,
             },
         );
     }

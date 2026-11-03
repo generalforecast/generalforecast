@@ -23,6 +23,15 @@ SCATTER_ROWS = 4096
 # scatter's share of a step barely shrinks and workers sharing a host's cores
 # would contend for them.
 SCATTER_THREADS = 8
+# Queries a decode pads to one bucket whatever it wastes; a batch past it
+# splits where padding would waste more than `SPLIT_WASTE` of its queries.
+# Below it a call leaves the device short of work, so padding costs little.
+SPLIT_QUERIES = 4096
+SPLIT_WASTE = 1 / 8
+# Single-table decode calls whose stacked state a worker keeps for the next
+# step, so a warm step skips stacking the state on the device. Each holds a
+# copy of its table's state.
+HELD_STATES = 4
 # Items a device stack takes in one program. A stack's compile grows faster
 # than its items, about 14 s at 2,048 on a CPU, so a larger stack joins
 # stacks of this many, which compile in a tenth of that and run as fast.
