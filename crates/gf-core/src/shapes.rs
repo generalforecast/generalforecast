@@ -120,7 +120,10 @@ mod tests {
         assert_eq!(bucket(200_000, 8), 229_376);
         for rows in [16_385, 19_451, 50_000, 131_073, 793_076] {
             let size = bucket(rows, 8);
-            assert!(rows <= size && 4 * size <= 5 * rows + 4 * FINE_BUCKETS_PAST, "{rows}");
+            assert!(
+                rows <= size && 4 * size <= 5 * rows + 4 * FINE_BUCKETS_PAST,
+                "{rows}"
+            );
             // A padded size pads to itself.
             assert_eq!(bucket(size, 8), size);
         }

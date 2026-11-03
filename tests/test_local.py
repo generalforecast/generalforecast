@@ -272,9 +272,10 @@ def test_rows_packed_across_slots_read_back_bit_for_bit(in_order: bool) -> None:
     layout = cache_layout(tabicl_functions, model, 5, slot_bytes)
     assert layout.rows_per_slot > 1 and layout.slots_per_row > 1
     rows = 40
-    features, targets = _clusters(rows)
+    features, labels = _clusters(rows)
+    targets = jnp.asarray(labels)
     state, context_rows = tabicl_functions.fit(
-        model, features, targets, 3, num_rows=rows
+        model, jnp.asarray(features), targets, 3, num_rows=rows
     )
     cache = tabicl_functions.encode(model, state, context_rows, targets, num_rows=rows)
     packed = np.asarray(pack(layout, cache))
