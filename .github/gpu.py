@@ -28,14 +28,21 @@ UV = (
     "uv==0.8.0 --hash=sha256:"
     "fb939490ce24d5f88ddebf2ceaf30c613b2bd27f2e67ae62ec0960baa5f8412d"
 )
-TRACKED = frozenset(
-    subprocess.run(
-        ["git", "-C", str(ROOT), "ls-files", "-z"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.split("\0")
-) - {""}
+# Modal imports this file again inside the container, where there is no
+# checkout; only the local side builds the image, so only it lists files.
+TRACKED = (
+    frozenset(
+        subprocess.run(
+            ["git", "-C", str(ROOT), "ls-files", "-z"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.split("\0")
+    )
+    - {""}
+    if modal.is_local()
+    else frozenset()
+)
 
 
 def untracked(path: Path) -> bool:
