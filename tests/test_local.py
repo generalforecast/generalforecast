@@ -1764,6 +1764,36 @@ def test_step_rows_too_many_for_the_device_are_gathered_on_the_host(
     np.testing.assert_allclose(predictions[0], predictions[1], rtol=1e-5, atol=1e-5)
 
 
+def test_contexts_whose_fused_call_runs_out_of_memory_encode_and_decode_apart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tiny_tabicl(regression=False)
+    unit = memory_profile(tabicl_functions, model, 5).context_bytes(16)
+    features, targets = _clusters(64)
+    queries = np.concatenate([NEAR_A, NEAR_B, NEAR_A + 0.5])
+    predictions = []
+    for fails in (False, True):
+        # No room on the device: every context is transient.
+        client = node_harness.local(device_bytes=unit // 2, slot_bytes=unit // 2)
+        worker = client._worker
+        if fails:
+
+            def out_of_memory(*_: Any) -> Any:
+                raise jax.errors.JaxRuntimeError(
+                    "RESOURCE_EXHAUSTED: Out of memory while trying to allocate"
+                )
+
+            monkeypatch.setattr(worker, "_encode_decode", out_of_memory)
+        rows = _table(
+            client, strategy=generalforecast.Strategy.neighbors(16), model=TABICL
+        )
+        rows.insert(np.arange(64), features, targets)
+        predictions.append(rows.predict(queries))
+        assert client.stats.transient > 0
+
+    np.testing.assert_allclose(predictions[0], predictions[1], rtol=1e-5, atol=1e-5)
+
+
 def test_dense_contexts_are_encoded_a_call_budget_at_a_time(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

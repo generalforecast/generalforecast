@@ -54,8 +54,8 @@ class _Gather:
 
     Attributes:
         values: The step's rows' representations for the unit's table, on
-            the device, or on the host where they would not fit beside the
-            device's pool and a call.
+            the device, or on the host where they would take more than half
+            a call's budget there.
         targets: Their targets, where `values` are.
         index: Each of the unit's padded rows' place in `values`; padding
             points past them, and reads as zeros.
@@ -130,8 +130,8 @@ class Encoding:
         # the device once: such units are many, each a context of its own,
         # and gathering each on the host and copying it over took most of
         # their encode. Padded to a bucket, so few sizes compile a gather.
-        # Where they would not fit the device beside its pool and a call,
-        # they stay on the host, and each unit gathers its own there.
+        # Where they would take more than half a call's budget, they stay
+        # on the host, and each unit gathers its own there.
         gathered: dict[int, tuple[Any, Any]] = {}
         work: dict[str, list[tuple[int, tuple]]] = defaultdict(list)
         group: dict[str, list[int]] = defaultdict(list)
@@ -232,8 +232,8 @@ class Encoding:
                         jnp.asarray(_host_padded(targets, padded)),
                     )
             else:
-                # Too many for the device beside its pool and a call, as a
-                # wide model's representations of many rows are: each unit
+                # More than half a call's budget, as a wide model's
+                # representations of many rows are: each unit
                 # gathers its own rows on the host as it is encoded.
                 gathered[unit.table] = (values, targets)
         step_values, step_targets = gathered[unit.table]
@@ -250,17 +250,17 @@ class Encoding:
     def _joins_on_device(
         self: "Worker", values: np.ndarray, targets: np.ndarray, padded: int
     ) -> bool:
-        """Whether a step's rows, padded, fit the device beside its pool and one call.
+        """Whether a step's rows, padded, take at most half a call's budget on the device.
 
-        Put-off units gather from them through the step's calls, which each
-        take up to a call's budget beside them. On a CPU, whose memory is the
-        host's, they always do.
+        Put-off units gather from them through the step's fused calls, whose
+        budget they take from, so the step holds them and a call within the
+        device beside its pool. On a CPU, whose memory is the host's, they
+        always go to the device.
         """
         if self.budget.cpu:
             return True
         row = (values.nbytes + targets.nbytes) // max(1, len(values))
-        room = self.budget.device - self._pool_bytes - self._call_bytes
-        return padded * row <= room
+        return padded * row <= self._call_bytes // 2
 
     def _transient_size(self: "Worker", rows: int) -> int:
         """Rows a put-off context of `rows` rows pads to: its bucket, or past `TRANSIENT_ROWS`, the next multiple of it."""
