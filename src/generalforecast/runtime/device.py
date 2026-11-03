@@ -312,16 +312,26 @@ def _darwin_available() -> int | None:
     return (info[0] + info[2]) * os.sysconf("SC_PAGE_SIZE")
 
 
-def without_command_buffers() -> None:
-    """Turns off XLA's command buffers (CUDA graphs) unless `XLA_FLAGS` sets them.
+# What XLA's command buffers (CUDA graphs) capture: a program's fusions,
+# matrix multiplies and cuDNN calls, launched as one graph rather than one
+# kernel at a time. A warm step launches hundreds of kernels from the worker's
+# thread; captured, an H100 ran the hillclimb set's steps 1.2 to 1.9 times as
+# fast, with the same predictions.
+COMMAND_BUFFERS = "FUSION,CUBLAS,CUBLASLT,CUSTOM_CALL,CUDNN"
+# Set to `0` to turn command buffers off.
+COMMAND_BUFFERS_ENV = "GF_COMMAND_BUFFERS"
 
-    With them, steps vectorized over many tables failed on GPUs with
-    `cudaErrorStreamCaptureInvalidated` while XLA captured a command buffer.
+
+def command_buffers() -> None:
+    """Sets XLA's command buffers to `COMMAND_BUFFERS` unless `XLA_FLAGS` sets them; `GF_COMMAND_BUFFERS=0` turns them off.
+
     It takes effect only before JAX starts its first backend.
     """
     flags = os.environ.get("XLA_FLAGS", "")
-    if "xla_gpu_enable_command_buffer" not in flags:
-        os.environ["XLA_FLAGS"] = f"{flags} --xla_gpu_enable_command_buffer=".strip()
+    if "xla_gpu_enable_command_buffer" in flags:
+        return
+    kinds = "" if os.environ.get(COMMAND_BUFFERS_ENV) == "0" else COMMAND_BUFFERS
+    os.environ["XLA_FLAGS"] = f"{flags} --xla_gpu_enable_command_buffer={kinds}".strip()
 
 
 def portable_cpu_programs() -> None:
