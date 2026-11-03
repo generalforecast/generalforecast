@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
 from generalforecast.models.catalog import SERIES_TYPES, TABULAR_TYPES
+from generalforecast.models.derived import Derived
 from generalforecast.predictors.validation import (
     PredictorError,
     digest,
@@ -53,19 +54,32 @@ class ModelPin:
     quantile_step: float | None = None
     codes: int | None = None
     estimators: int | None = None
+    derived: Derived | None = None
 
     @property
     def model(self) -> str:
-        """The catalog id, `general-forecast/<name>`; the repository may be upstream's."""
+        """The model's id: the catalog's `general-forecast/<name>`, or a derived one's.
+
+        For a catalog model the repository may be upstream's. A derived
+        model's own id is `<owner>/<name>@ft<version>`, and the rest of its
+        pin describes its catalog base.
+        """
         from generalforecast.models.catalog import ORGANIZATION
 
+        if self.derived is not None:
+            return self.derived.model
         return f"{ORGANIZATION}/{self.name}"
+
+    @property
+    def model_digest(self) -> str:
+        """The digest a lock pins: a derived model's weights, else the artifact's."""
+        return self.derived.digest if self.derived is not None else self.digest
 
     @property
     def resolved(self) -> str:
         """A portable content-addressed model reference, never a moving alias."""
         return (
-            f"{self.model}@{self.digest}"
+            f"{self.model}@{self.model_digest}"
             + (f"@{self.codes}" if self.codes is not None else "")
             + (f"*{self.estimators}" if self.estimators is not None else "")
         )
@@ -94,6 +108,20 @@ class ModelPin:
             "cpu": self.cpu,
             "memory": self.memory,
             "quantile_step": self.quantile_step,
+            # Only a derived pin has the key, so catalog pins keep their form.
+            **(
+                {
+                    "derived": {
+                        "model": self.derived.model,
+                        "base": self.derived.base,
+                        "base_digest": self.derived.base_digest,
+                        "digest": self.derived.digest,
+                        "bags": self.derived.bags,
+                    }
+                }
+                if self.derived is not None
+                else {}
+            ),
         }
 
     def identity(self) -> dict:
@@ -129,7 +157,7 @@ class ModelPin:
             "memory",
             "quantile_step",
         }
-        fields(value, required)
+        fields(value, required, {"derived"})
         for key in ("name", "repository", "revision", "memory"):
             text(value[key])
         ensure(
@@ -188,10 +216,40 @@ class ModelPin:
             "invalid model quantile step",
         )
         normalized: dict[str, Any] = dict(value)
+        if "derived" in value:
+            normalized["derived"] = _derived(value["derived"], value)
         normalized["files"] = tuple(sorted(value["files"].items()))
         for key in ("tasks", "outputs", "input_types", "quantiles"):
             normalized[key] = tuple(value[key])
         return cls(**normalized)
+
+
+def _derived(value: Any, pin: dict) -> Derived:
+    """A derived pin's own part, which must run on the base the rest describes."""
+    from generalforecast.models.catalog import ORGANIZATION, ModelRefError, parse
+
+    fields(value, {"model", "base", "base_digest", "digest", "bags"})
+    try:
+        ref = parse(value["model"])
+    except ModelRefError as error:
+        raise PredictorError("InvalidPredictor", str(error)) from None
+    ensure(ref.derived and str(ref) == value["model"], "invalid derived model id")
+    ensure(
+        value["base"] == f"{ORGANIZATION}/{pin['name']}"
+        and value["base_digest"] == pin["digest"],
+        "a derived model's base differs from its pin",
+        "ModelMismatch",
+    )
+    hash_value(value["digest"])
+    integer(value["bags"])
+    ensure(value["bags"] >= 1, "a derived model has at least one bag")
+    return Derived(
+        value["model"],
+        value["base"],
+        value["base_digest"],
+        value["digest"],
+        value["bags"],
+    )
 
 
 def project(entry: Any, ref: Any, policy: Any) -> ModelPin:
@@ -366,6 +424,17 @@ class CatalogResolver:
             raise PredictorError(code, message) from None
         if ref.custom:
             raise PredictorError("UnsupportedModel", custom_refused(ref.name))
+        made = None
+        if ref.derived:
+            from generalforecast.models.catalog import resolve_derived
+
+            try:
+                made = resolve_derived(ref)
+            except ModelRefError as error:
+                code = {"UnknownModel": "ModelResolutionRequired"}.get(
+                    error.code, error.code
+                )
+                raise PredictorError(code, str(error)) from None
         entry = ref.entry
         if not entry.gates.allows(self.surface):
             raise PredictorError(
@@ -377,9 +446,25 @@ class CatalogResolver:
             f"{ref} variants are not qualified for hosted predictors",
             "UnsupportedCapability",
         )
-        refused = V1_POLICY.admits(ref)
+        if made is not None:
+            ensure(
+                entry.gates.allows(self.surface, variant=made.bags > 1),
+                f"bagged {entry.id} is not qualified for hosted predictors",
+                "UnsupportedCapability",
+            )
+        # Each bag of a derived model is one more estimator run.
+        members = (
+            ref
+            if made is None
+            else type(ref)(entry.id, ref.codes, (ref.estimators or 1) * made.bags)
+        )
+        refused = V1_POLICY.admits(members)
         ensure(refused is None, f"serving policy allows {refused}", "CapacityExceeded")
         result = project(entry, ref, V1_POLICY)
+        if made is not None:
+            from dataclasses import replace
+
+            result = replace(result, derived=made)
         if not offline:
             from huggingface_hub import HfApi
 
