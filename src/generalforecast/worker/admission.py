@@ -443,6 +443,12 @@ class Admission:
                 high = middle - 1
         return low
 
+    def _input_bytes(self: "Worker", unit: Unit) -> int:
+        """Bytes of a unit's padded rows as its encode reads them: their representations."""
+        table = self._tables[unit.table]
+        profile = self.profile(table.model, table.features)
+        return self._size(len(unit.rows)) * profile.row_bytes
+
     def _context_bytes(self: "Worker", unit: Unit) -> int:
         """Bytes of a unit's context as the model caches it, padding and own state included."""
         table = self._tables[unit.table]
