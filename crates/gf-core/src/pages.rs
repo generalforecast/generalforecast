@@ -186,10 +186,12 @@ impl Scan<'_> {
     /// float32, eight lanes at a time. The float32 sum of a distance's terms
     /// is within `(dimensions + 32)` units of float32 rounding of the true
     /// distance, relatively, and `squared`'s float64 sum within
-    /// `(dimensions + 2)` of float64's. So the rows whose float32 distance is
-    /// within those bounds of the `count`th nearest by float32 hold every row
-    /// nearest by `squared`; those alone are measured by `squared` and ranked
-    /// as `nearest_rows` ranks them, ties to the lower key.
+    /// `(dimensions + 2)` of float64's, away from float32's subnormal range,
+    /// where its error is at most a few `f32::MIN_POSITIVE` per term. So the
+    /// rows whose float32 distance is within those bounds of the `count`th
+    /// nearest by float32 hold every row nearest by `squared`; those alone
+    /// are measured by `squared` and ranked as `nearest_rows` ranks them,
+    /// ties to the lower key.
     ///
     /// # Errors
     ///
@@ -217,6 +219,7 @@ impl Scan<'_> {
         let float32 = (self.dimensions as f64 + 32.0) * f64::from(f32::EPSILON) / 2.0;
         let float64 = (self.dimensions as f64 + 2.0) * f64::EPSILON / 2.0;
         let widen = (1.0 + float32) / (1.0 - float32) * (1.0 + float64) / (1.0 - float64);
+        let underflow = 4.0 * (self.dimensions as f64 + 3.0) * f64::from(f32::MIN_POSITIVE);
         let mut found = Vec::with_capacity(queries.len());
         let mut measured = vec![0.0f32; SCAN_QUERIES * rows];
         let mut order: Vec<u32> = Vec::with_capacity(rows);
@@ -239,8 +242,9 @@ impl Scan<'_> {
                     .map(|&index| f64::from(distances[index as usize]))
                     .fold(0.0f64, f64::max);
                 // Twice the widening, once for the count-th row's own bound
-                // and once for the candidate's.
-                let within = farthest * widen * widen * (1.0 + 1e-9);
+                // and once for the candidate's, and room for float32
+                // underflow, whose error is absolute rather than relative.
+                let within = farthest * widen * widen * (1.0 + 1e-9) + underflow;
                 let mut near: Vec<Near> = distances
                     .iter()
                     .enumerate()

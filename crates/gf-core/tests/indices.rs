@@ -646,21 +646,23 @@ fn series_windows_match_a_naive_list_through_random_changes() {
 
 #[test]
 fn a_scan_finds_exactly_the_rows_nearest_rows_finds() {
-    for dimensions in [2usize, 9, 40] {
-        let mut noise = Noise(11 + dimensions as u64);
+    // The last spread puts float32's squared differences among subnormals.
+    let runs = [(2usize, 1.0f32), (9, 1.0), (40, 1.0), (9, 1e-22)];
+    for (run, (dimensions, spread)) in (1u32..).zip(runs) {
+        let mut noise = Noise(11 + u64::from(run));
         let mut index = PageIndex::new(
             NonZeroUsize::new(dimensions).unwrap(),
             NonZeroUsize::new(PAGE).unwrap(),
         );
         // Each run's rows of their own, as the kept vectors are per row id.
-        let first = dimensions as u32 * 1_000;
+        let first = run * 1_000;
         let mut placed: Vec<Vec<f32>> = Vec::new();
         for row in first..first + 900 {
             // Every fifth row repeats one before it, so equal distances tie.
             let vector: Vec<f32> = if row % 5 == 4 {
                 placed[(row as usize * 7) % placed.len()].clone()
             } else {
-                (0..dimensions).map(|_| noise.next() * 30.0).collect()
+                (0..dimensions).map(|_| noise.next() * 30.0 * spread).collect()
             };
             index
                 .put(RowId(row), Bucket(u64::from(row % 2)), &vector)
@@ -687,7 +689,7 @@ fn a_scan_finds_exactly_the_rows_nearest_rows_finds() {
                     // Exactly on a row, and on its repeats.
                     placed[query * 13].clone()
                 } else {
-                    (0..dimensions).map(|_| noise.next() * 35.0).collect()
+                    (0..dimensions).map(|_| noise.next() * 35.0 * spread).collect()
                 }
             })
             .collect();
@@ -700,7 +702,7 @@ fn a_scan_finds_exactly_the_rows_nearest_rows_finds() {
                     index
                         .nearest_rows(query, count, &allowed, &Kept, &Kept)
                         .unwrap(),
-                    "{dimensions} dimensions, count {count}"
+                    "{dimensions} dimensions, spread {spread}, count {count}"
                 );
             }
         }
