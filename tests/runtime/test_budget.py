@@ -11,6 +11,7 @@ import pytest
 
 from generalforecast.runtime import budget as budget_module
 from generalforecast.runtime.budget import (
+    UNTUNED_OPTIONS,
     Call,
     Chunks,
     MemoryBudget,
@@ -171,9 +172,10 @@ def test_a_call_whose_autotuning_runs_out_of_memory_runs_compiled_without_it(
         chunks.run("decode", "key", 2, 1 << 20, lambda: 32, prepare, consume)
 
     # The first call fails autotuning; the program compiles once without it
-    # and serves both runs, whose answers are the program's.
+    # and serves both runs, whose answers are the program's. The kind's
+    # first call is measured by a compile without autotuning too.
     assert tuned == [2]
-    assert compiled == [budget_module.UNTUNED_OPTIONS]
+    assert compiled == [budget_module.UNTUNED_OPTIONS] * 2
     for answer in outputs:
         np.testing.assert_array_equal(answer, items * 2)
 
@@ -518,3 +520,161 @@ def test_a_kinds_first_call_at_a_count_is_seen_though_compiled_before() -> None:
     _run(chunks, doubled, items, 8 * items[0].nbytes)
 
     assert seen == [2]
+
+
+def test_a_call_that_runs_out_of_memory_beside_a_compile_runs_again_once_it_is_done() -> (
+    None
+):
+    compiling = [True]
+    sizes: list[int] = []
+
+    def crowded(values: np.ndarray) -> np.ndarray:
+        sizes.append(len(values))
+        # A compile beside the call holds the device's memory as it autotunes.
+        if compiling[0]:
+            raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: Out of memory")
+        return values
+
+    def settle() -> bool:
+        was = compiling[0]
+        compiling[0] = False
+        return was
+
+    chunks = Chunks(lambda *_: None)
+    chunks.settle = settle
+    items = np.ones((3, 4), np.float32)
+
+    # Even a lone item runs again rather than raising, at its size.
+    assert _run(chunks, crowded, items[:1], 8 * items[0].nbytes) == [1]
+    assert sizes == [1, 1]
+
+    # With nothing beside it, a call that runs out halves as before.
+    compiling[0] = True
+    sizes.clear()
+    chunks.settle = lambda: False
+    with pytest.raises(jax.errors.JaxRuntimeError, match="RESOURCE_EXHAUSTED"):
+        _run(chunks, crowded, items[:1], 8 * items[0].nbytes)
+    assert sizes == [1]
+
+
+def test_a_call_too_large_to_autotune_beside_the_device_s_holdings_compiles_without_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast.runtime import budget
+
+    jitted = jax.jit(lambda values: values * 2)
+    tuned: list[int] = []
+
+    class Autotuned:
+        """A program that would autotune if called as it is."""
+
+        def __call__(self, values: Any) -> Any:
+            tuned.append(len(values))
+            return jitted(values)
+
+        def lower(self, *arguments: Any) -> Any:
+            return jitted.lower(*arguments)
+
+    compiled: list[dict] = []
+    real = jax.stages.Lowered.compile
+
+    def compile(lowered: Any, compiler_options: Any = None) -> Any:
+        compiled.append(compiler_options or {})
+        return real(lowered, compiler_options=compiler_options)
+
+    monkeypatch.setattr(jax.stages.Lowered, "compile", compile)
+    items = np.arange(8, dtype=np.float32).reshape(2, 4)
+    program = Autotuned()
+
+    def prepare(first: int, stop: int, padded: int) -> Call:
+        return Call(program, (), (items[first:stop],), padded)
+
+    outputs: list[np.ndarray] = []
+
+    def consume(first: int, stop: int, values: Any) -> None:
+        outputs.append(np.asarray(values))
+
+    # Room for the call's items twice over: it runs as compiled, autotuned.
+    monkeypatch.setattr(budget, "free_device_bytes", lambda: 1 << 20)
+    chunks = Chunks(lambda *_: None)
+    chunks.run("decode", "roomy", 2, 1 << 20, lambda: 32, prepare, consume)
+    assert tuned == [2]
+
+    # Less than twice its items free: its program compiles without autotuning.
+    monkeypatch.setattr(budget, "free_device_bytes", lambda: 100)
+    tuned.clear()
+    compiled.clear()
+    chunks.run("decode", "crowded", 2, 1 << 20, lambda: 32, prepare, consume)
+    assert tuned == []
+    assert UNTUNED_OPTIONS in compiled
+    np.testing.assert_array_equal(outputs[-1], items * 2)
+
+    # Where the device does not say, as on a CPU, nothing changes: a program
+    # of its own, as the untuned one serves the last one's shapes.
+    monkeypatch.setattr(budget, "free_device_bytes", lambda: None)
+    program = Autotuned()
+    chunks.run("decode", "cpu", 2, 1 << 20, lambda: 32, prepare, consume)
+    assert tuned == [2]
+
+
+def test_a_program_compiled_without_autotuning_compiles_with_it_once_there_is_room(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast.runtime import budget
+
+    jitted = jax.jit(lambda values: values * 2)
+
+    class Program:
+        def __call__(self, values: Any) -> Any:
+            return jitted(values)
+
+        def lower(self, *arguments: Any) -> Any:
+            return jitted.lower(*arguments)
+
+    compiled: list[dict] = []
+    real = jax.stages.Lowered.compile
+
+    def compile(lowered: Any, compiler_options: Any = None) -> Any:
+        compiled.append(compiler_options or {})
+        return real(lowered, compiler_options=compiler_options)
+
+    monkeypatch.setattr(jax.stages.Lowered, "compile", compile)
+    items = np.arange(8, dtype=np.float32).reshape(2, 4)
+    program = Program()
+
+    def prepare(first: int, stop: int, padded: int) -> Call:
+        return Call(program, (), (items[first:stop],), padded)
+
+    outputs: list[np.ndarray] = []
+    chunks = Chunks(lambda *_: None)
+    gaps: list[Any] = []
+    chunks.later = gaps.append
+    free = [100]
+    monkeypatch.setattr(budget, "free_device_bytes", lambda: free[0])
+
+    def run() -> None:
+        chunks.run(
+            "decode",
+            "key",
+            2,
+            1 << 20,
+            lambda: 32,
+            prepare,
+            lambda first, stop, values: outputs.append(np.asarray(values)),
+        )
+
+    run()
+    # Untuned for want of room, with a tuned compile waiting for a quiet gap.
+    assert compiled[-1] == UNTUNED_OPTIONS and len(gaps) == 1
+    # No room in that gap either: it stays untuned, and the next call asks again.
+    gaps.pop()()
+    assert compiled[-1] == UNTUNED_OPTIONS
+    run()
+    assert len(gaps) == 1
+    free[0] = 1 << 20
+    gaps.pop()()
+    assert compiled[-1] == {}
+    run()
+    # Tuned now, it asks for nothing more, and answers as before.
+    assert not gaps
+    np.testing.assert_array_equal(outputs[-1], items * 2)

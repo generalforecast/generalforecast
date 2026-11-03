@@ -11,6 +11,7 @@ import os
 import threading
 import time
 from collections.abc import Callable, Hashable, Iterable, Iterator
+from concurrent import futures
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -473,6 +474,9 @@ class Programs:
         # wait on, which it never does.
         self._later: list[Future] = []
         self._pending: list[Future] = []
+        # Tasks run from `later` that are past their quiet gap, as each
+        # finishes its future: those a step that runs out of memory waits for.
+        self._ahead_running: set[Future] = set()
         self._lock = threading.Lock()
         # Whether a step runs, and when the last ended; compiles ahead wait on
         # them. A drop moves the generation on, so those queued before it end.
@@ -701,6 +705,25 @@ class Programs:
             self._pending = [future for future in self._pending if not future.done()]
             self._pending.append(self._soon.submit(task))
 
+    def settle(self) -> bool:
+        """Waits for the tasks running beside steps, such as compiles; whether any were running.
+
+        Such a compile autotunes its kernels on buffers of their own on the
+        device, which a step's call running beside it cannot then take. A
+        task waiting for a quiet gap is not waited for: it starts only once
+        no step runs, so waiting for it from a step would never end. One that
+        started in a gap may still be compiling as the next step runs, so it
+        is.
+        """
+        with self._lock:
+            running = [
+                *(future for future in self._pending if not future.done()),
+                *self._ahead_running,
+            ]
+        # Each task reports its own failure, so this only waits.
+        futures.wait(running)
+        return bool(running)
+
     def later(self, task: Callable[[], Any]) -> None:
         """Runs a task that only saves time, such as compiling ahead, in a quiet gap.
 
@@ -720,12 +743,18 @@ class Programs:
             if not self._wait_quiet(generation):
                 return
             self._running_generation.value = generation
+            running: Future = Future()
+            with self._lock:
+                self._ahead_running.add(running)
             try:
                 task()
             except Exception:  # noqa: BLE001
                 return
             finally:
                 self._running_generation.value = None
+                with self._lock:
+                    self._ahead_running.discard(running)
+                running.set_result(None)
 
         with self._lock:
             self._later = [future for future in self._later if not future.done()]

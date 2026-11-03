@@ -12,6 +12,8 @@ runs as one vectorized call.
 """
 
 import dataclasses
+import gc
+import logging
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -29,7 +31,7 @@ from generalforecast.constants import SCATTER_THREADS
 from generalforecast.models.contract import TabularFunctions, TabularProperties
 from generalforecast.models.series import SeriesFunctions, SeriesProperties
 from generalforecast.runtime import shipped
-from generalforecast.runtime.budget import Chunks, MemoryBudget
+from generalforecast.runtime.budget import Chunks, MemoryBudget, out_of_memory
 from generalforecast.runtime.decoding import PROGRAMS, Context
 from generalforecast.runtime.device import (
     DeviceSettings,
@@ -79,6 +81,8 @@ from generalforecast.worker.series import Series
 from generalforecast.worker.slots import Slots
 from generalforecast.worker.stats import WorkerStats
 
+logger = logging.getLogger(__name__)
+
 
 def check_summary(properties: TabularProperties, summary: str) -> None:
     """Refuses a column-summary scope a model cannot serve.
@@ -120,6 +124,20 @@ def _replaced(record: Any, **changes: Any) -> Any:
         if hasattr(record, field.name)
     }
     return kind(**(fields | changes))
+
+
+def _halves(step: protocol.Step) -> list[protocol.Step]:
+    """The step's requests in two steps, each with the step's fits, pages and units; one step if it has a single request."""
+    queries = list(step.queries)
+    if len(queries) < 2:
+        return [step]
+    middle = len(queries) // 2
+    return [
+        dataclasses.replace(step, movements=[], queries=queries[:middle], forecasts=[]),
+        dataclasses.replace(
+            step, movements=[], queries=queries[middle:], forecasts=step.forecasts
+        ),
+    ]
 
 
 def _part(step: protocol.Step, table: int) -> protocol.Step:
@@ -247,6 +265,8 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
             shipped=_shipped_measures(bucket_minimum, slot_bytes),
             dropped=self._chunks.forget_counts,
         )
+        self._chunks.settle = self.programs.settle
+        self._chunks.later = self.programs.later
         self._models: dict[int, _Model] = {}
         # The spec each model was loaded from, under which its kinds of call are recorded.
         self._specs: dict[int, str] = {}
@@ -496,7 +516,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         with self.stats.timed("move"):
             for movement in step.movements:
                 self.apply(movement)
-        return self._counted(self._widened(step))
+        return self._answered(self._widened(step))
 
     def _widened(self, step: Step) -> Step:
         """The step with each table's rows and queries padded to the table's width with constant columns, which its model sets aside.
@@ -556,7 +576,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         # A protocol step widens to a protocol step.
         step = cast(protocol.Step, self._widened(step))
         try:
-            return self._counted(step), {}
+            return self._answered(step), {}
         except PoolLost:
             # Every table reads the pool, so no part can run alone.
             raise
@@ -574,11 +594,39 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         failed: dict[int, str] = {}
         for table in tables:
             try:
-                predictions.update(self._counted(_part(step, table)))
+                predictions.update(self._answered(_part(step, table)))
             except Exception as error:  # noqa: BLE001
                 failed[table] = _message(error)
                 self.deferred.pop(table, None)
         return predictions, failed
+
+    def _answered(self, step: Any) -> dict[int, np.ndarray]:
+        """Computes a step; one of several requests that runs out of device memory runs again in halves.
+
+        Many requests joined in one step read many contexts at once, put off
+        for want of room and held together, and their calls' memory beside
+        them. A step that runs out runs again as two, each half's requests
+        alone, after what the failed one held is freed, down to one request
+        a step, which fails as before. Each half repeats the step's fits and
+        page embeds, which give the same state again.
+        """
+        try:
+            return self._counted(step)
+        except jax.errors.JaxRuntimeError as error:
+            halves = dataclasses.is_dataclass(step) and len(step.queries) > 1
+            if not out_of_memory(error) or not halves:
+                raise
+            logger.warning(
+                "a step of %d requests ran out of device memory; its requests "
+                "run again in halves",
+                len(step.queries),
+            )
+        # Outside the handler, so the failed step's frames and arrays are gone.
+        gc.collect()
+        predictions: dict[int, np.ndarray] = {}
+        for half in _halves(cast(protocol.Step, step)):
+            predictions.update(self._answered(half))
+        return predictions
 
     def _counted(self, step: Step) -> dict[int, np.ndarray]:
         """Computes a step, keeping its counts in `stats` only if it succeeds.
