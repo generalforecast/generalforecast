@@ -103,3 +103,59 @@ def test_gf_precompiled_0_installs_nothing(tmp_path, monkeypatch) -> None:
         tmp_path / "fresh", IDENTITY, MODEL, [_raw(key)], _fetch(tmp_path / "out")
     )
     assert not (tmp_path / "fresh").exists()
+
+
+def test_shipped_measures_are_what_a_worker_measures_and_spare_it_measuring(
+    tmp_path, monkeypatch
+) -> None:
+    from generalforecast.worker import Worker, admission
+    from tests.models.conformance.cases import FEATURES
+
+    spec = "tests.models.conformance.cases:tabicl_classes"
+    out = tmp_path / "shipped"
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "built"))
+    [written] = shipped.measure(out, [spec], widths=(FEATURES,), classes=(2,))
+    assert written.parent.parent == out and written.suffix == ".measures"
+
+    # A worker on another machine, with no measures of its own, reads them.
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "serving"))
+    monkeypatch.setenv("GF_MEASURES", str(out))
+    measuring = []
+    for name in ("fit_profile", "memory_profile", "cache_layout", "encode_profile"):
+        original = getattr(admission, name)
+
+        def counted(*arguments, name=name, original=original, **options):
+            measuring.append(name)
+            return original(*arguments, **options)
+
+        monkeypatch.setattr(admission, name, counted)
+    from generalforecast.models import registry
+    from generalforecast.runtime.device import default_settings
+
+    # Measures are kept under the settings, which gf-server's workers take.
+    worker = Worker(default_settings())
+    worker.add_model(0, *registry.load_engine_model(spec), spec=spec)
+    worker.profile(0, FEATURES)
+    worker.layout(0, FEATURES)
+    worker.fit_rows(0, FEATURES)
+    worker.check(0, 2, FEATURES)
+    worker.encode_profile(0, FEATURES)
+    assert measuring == []
+
+    # What it measures itself, as at another width, it keeps over them.
+    worker.profile(0, FEATURES + 1)
+    assert measuring == ["memory_profile"]
+
+
+def test_measures_taken_apart_keep_together(tmp_path) -> None:
+    from generalforecast.runtime.programs import Manifest, encoded
+
+    # As containers measuring a width each return them for one writer.
+    spec = "tests.models.conformance.cases:tabicl_classes"
+    shipped.keep_measures(tmp_path, spec, encoded({("fit_profile", 8): 1}))
+    written = shipped.keep_measures(tmp_path, spec, encoded({("fit_profile", 16): 2}))
+    assert Manifest(written.with_suffix(".json")).measured() == {
+        ("fit_profile", 8): 1,
+        ("fit_profile", 16): 2,
+    }
+    assert shipped.padded_widths(24) == [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24]

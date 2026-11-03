@@ -74,6 +74,20 @@ def _manifests(bucket_minimum: int, slot_bytes: int) -> Path:
     return cache_root() / "programs" / digest
 
 
+# A directory of measures shipped with the package or image, as `shipped`
+# writes them: one directory per `_manifests` identity.
+SHIPPED_MEASURES_ENV = "GF_MEASURES"
+
+
+def _shipped_measures(bucket_minimum: int, slot_bytes: int) -> Path | None:
+    """Where measures shipped for these programs are, under `GF_MEASURES`; None where none are."""
+    root = os.environ.get(SHIPPED_MEASURES_ENV)
+    if not root:
+        return None
+    directory = Path(root) / _manifests(bucket_minimum, slot_bytes).name
+    return directory if directory.is_dir() else None
+
+
 def _cpu_features() -> str:
     """The instruction sets XLA may compile this machine's CPU programs with, which a program shipped from another must match.
 

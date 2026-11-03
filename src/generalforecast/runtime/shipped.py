@@ -11,12 +11,14 @@ only if a key in `PUBLIC_KEYS` signed it, since both hold code it runs.
 
 import hashlib
 import io
+import json
 import logging
 import os
 import re
 import tarfile
 from collections.abc import Callable, Iterable
 from pathlib import Path
+from typing import Any
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -214,6 +216,139 @@ def build(
     return bundles
 
 
+# Widths `measure` measures each model at by default: every padded width to
+# 512 columns, which `padded_width` maps a table's width to.
+MEASURED_WIDTHS = tuple(range(1, 513))
+# Class counts a classifier's tables are checked at by default.
+MEASURED_CLASSES = tuple(range(2, 11))
+
+
+def identity(bucket_minimum: int = 8, slot_bytes: int = 1 << 20) -> str:
+    """The identity this machine's programs and measures are kept under: its code, JAX, device and padding."""
+    from generalforecast.runtime.device import portable_cpu_programs
+    from generalforecast.worker import _manifests
+
+    # As a worker starts: a CPU's programs are identified by the features
+    # they compile for.
+    portable_cpu_programs()
+    return _manifests(bucket_minimum, slot_bytes).name
+
+
+def padded_widths(most: int) -> list[int]:
+    """The padded widths of tables of up to `most` columns."""
+    from generalforecast.runtime.programs import padded_width
+
+    return sorted({padded_width(width) for width in range(1, most + 1)})
+
+
+def measured(
+    spec: str,
+    widths: Iterable[int] = MEASURED_WIDTHS,
+    classes: Iterable[int] = MEASURED_CLASSES,
+    bucket_minimum: int = 8,
+    slot_bytes: int = 1 << 20,
+) -> dict[str, Any]:
+    """A model's measures at each padded width of `widths`, as a gf-server worker on this machine takes them, as JSON.
+
+    The measures are what a worker takes by tracing and compiling the model
+    before a table's first steps: its cache layout and sizes, its fit,
+    encode and decode, and its check of each task. They follow from the
+    model, the code that traces it, JAX and the device, so they hold for
+    this machine's `identity` alone. A forecaster has none. The worker
+    takes them in a cache of its own and holds no device pool.
+    """
+    import shutil
+    import tempfile
+
+    from generalforecast.constants import MEASURED_ROWS
+    from generalforecast.models import registry
+    from generalforecast.models.series import SeriesFunctions
+    from generalforecast.runtime.device import cache_root, default_settings
+    from generalforecast.runtime.programs import ladder
+    from generalforecast.worker import Worker
+    from generalforecast.worker.ahead import SHIPPED_MEASURES_ENV
+
+    functions, parameters = registry.load_engine_model(spec)
+    if isinstance(functions, SeriesFunctions):
+        return {}
+    environment = {SHIPPED_MEASURES_ENV: None, "XDG_CACHE_HOME": tempfile.mkdtemp()}
+    previous = {name: os.environ.get(name) for name in environment}
+    try:
+        for name, value in environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        worker = Worker(default_settings(), bucket_minimum, slot_bytes)
+        worker.add_model(0, functions, parameters, spec=spec)
+        properties = worker.properties(0)
+        tasks = [0] if properties.regression else list(classes)
+        worker.decode_profile(0)
+        small = [rows for rows in ladder(bucket_minimum, 32) if rows < MEASURED_ROWS]
+        for width in sorted({worker.width(0, width) for width in widths}):
+            worker.layout(0, width)
+            worker.profile(0, width)
+            worker.fit_rows(0, width)
+            for task in tasks:
+                worker.check(0, task, width)
+            for fit in (False, True) if properties.column_summary else (False,):
+                worker.encode_profile(0, width, fit)
+                for rows in small:
+                    worker.encode_bytes(0, width, rows, fit)
+        worker.close()
+        manifest = worker.programs.manifest(spec)
+        assert manifest is not None
+        text = manifest.path.with_suffix(".measures").read_text()
+        shutil.rmtree(cache_root(), ignore_errors=True)
+        return json.loads(text)
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+def keep_measures(directory: Path, spec: str, measures: Any) -> Path:
+    """Adds a model's measures, as `measured` gives them, to those `directory` keeps for it; returns its file.
+
+    `directory` is one identity's, as `<GF_MEASURES>/<identity>`. Measures
+    kept already stay where these hold no other; one process writes at a
+    time, under the file's lock.
+    """
+    from generalforecast.runtime.programs import Manifest, decoded
+
+    manifest = Manifest(directory / f"{_digest(spec)}.json")
+    for key, value in decoded(measures).items():
+        manifest.keep_measured(key, value)
+    return manifest.path.with_suffix(".measures")
+
+
+def measure(
+    out: Path,
+    models: Iterable[str],
+    widths: Iterable[int] = MEASURED_WIDTHS,
+    classes: Iterable[int] = MEASURED_CLASSES,
+    bucket_minimum: int = 8,
+    slot_bytes: int = 1 << 20,
+) -> list[Path]:
+    """Measures each model at each padded width and keeps the measures to ship, as `<out>/<identity>/<digest>.measures`.
+
+    A worker given `out` as `GF_MEASURES` reads them in place of measuring;
+    see `measured`.
+
+    Returns:
+        The measures files written.
+    """
+    directory = out / identity(bucket_minimum, slot_bytes)
+    written = []
+    for spec in models:
+        found = measured(spec, widths, classes, bucket_minimum, slot_bytes)
+        if found:
+            written.append(keep_measures(directory, spec, found))
+    return written
+
+
 def built(models: int = 2) -> bool:
     """Whether `REPOSITORY` holds a bundle of each released model for this machine's programs, as gf-server's default padding lays them out."""
     from huggingface_hub import HfApi
@@ -233,6 +368,18 @@ def built(models: int = 2) -> bool:
 
 if __name__ == "__main__":
     import sys
+
+    if sys.argv[1:2] == ["measures"]:
+        # python -m generalforecast.runtime.shipped measures OUT SPEC... [--widths N,...]
+        arguments = sys.argv[2:]
+        chosen = MEASURED_WIDTHS
+        if "--widths" in arguments:
+            at = arguments.index("--widths")
+            chosen = tuple(int(width) for width in arguments[at + 1].split(","))
+            del arguments[at : at + 2]
+        for written in measure(Path(arguments[0]), arguments[1:], chosen):
+            print(written)
+        sys.exit()
 
     from cryptography.hazmat.primitives.serialization import load_pem_private_key
 

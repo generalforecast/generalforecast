@@ -423,3 +423,35 @@ def test_wide_tables_pad_to_one_of_four_widths_an_octave(
         assert width <= padded <= max(width, 1.25 * width)
     monkeypatch.setenv(PADDED_WIDTHS_ENV, "0")
     assert padded_width(21) == 21
+
+
+def test_shipped_measures_read_under_this_machines_and_without_manifests(
+    tmp_path,
+) -> None:
+    shipping = Programs(None, lambda: False, ahead=False, manifests=tmp_path / "built")
+    shipping.measured("model", ("fit", 8), lambda: 3)
+    shipping.measured("model", ("fit", 16), lambda: 5)
+    shipped = tmp_path / "built"
+
+    def taken(value: int) -> Any:
+        def measure() -> int:
+            measured.append(value)
+            return value
+
+        return measure
+
+    # This machine measured one key itself; it reads that over the shipped one.
+    local = Programs(None, lambda: False, ahead=False, manifests=tmp_path / "local")
+    local.measured("model", ("fit", 16), lambda: 7)
+    measured: list[int] = []
+    serving = Programs(
+        None, lambda: False, ahead=False, manifests=tmp_path / "local", shipped=shipped
+    )
+    assert serving.measured("model", ("fit", 8), taken(0)) == 3
+    assert serving.measured("model", ("fit", 16), taken(0)) == 7
+    assert serving.measured("model", ("fit", 32), taken(9)) == 9
+    # Without manifests, a shipped measure is read and any other is taken.
+    alone = Programs(None, lambda: False, ahead=False, shipped=shipped)
+    assert alone.measured("model", ("fit", 8), taken(0)) == 3
+    assert alone.measured("model", ("fit", 64), taken(11)) == 11
+    assert measured == [9, 11]
