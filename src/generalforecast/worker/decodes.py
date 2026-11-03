@@ -136,6 +136,11 @@ def _columns(values: jax.Array, columns: jax.Array) -> jax.Array:
     return jnp.take(values, columns, axis=-1)
 
 
+def _same(given: np.ndarray | None, expected: np.ndarray) -> bool:
+    """Whether a request's levels are given and equal `expected`."""
+    return given is not None and np.array_equal(given, expected)
+
+
 def _picks(
     batches: Sequence[QueryBatch], parts: list[list[tuple[int, int, int]]]
 ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
@@ -155,8 +160,7 @@ def _picks(
         if known is None or levels is None or len(levels) == len(known):
             continue
         if not all(
-            np.array_equal(asked[request][0], known)
-            and np.array_equal(asked[request][1], levels)
+            _same(asked[request][0], known) and _same(asked[request][1], levels)
             for request, _, _ in owned[1:]
         ):
             continue
