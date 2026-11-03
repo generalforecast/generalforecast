@@ -35,6 +35,7 @@ from generalforecast.runtime.memory import (
     memory_profile,
 )
 from generalforecast.runtime.paging import CacheLayout, cache_layout
+from generalforecast.runtime.programs import padded_width
 from generalforecast.runtime.series import (
     SeriesBytes,
     abstract_group,
@@ -56,8 +57,18 @@ class _Unmeasured(Exception):
 class Admission:
     """How a worker measures its models and refuses work past its memory."""
 
+    def width(self: "Worker", model: int, features: int) -> int:
+        """The width a loaded model runs a table of `features` columns at: padded to a shared width where its properties allow.
+
+        A padded width is its own, so the width of a width is itself.
+        """
+        if not self.properties(model).padded_width:
+            return features
+        return padded_width(features)
+
     def profile(self: "Worker", model: int, features: int) -> MemoryProfile:
         """A loaded model's sizes for tables with `features` columns, as stored."""
+        features = self.width(model, features)
         entry = self._tabular(model)
         cache_dtype = None if self._settings is None else self._settings.cache_dtype
         return self._profiles.get(
@@ -277,7 +288,7 @@ class Admission:
             The most rows a state alone is fit on, and the most a fit embeds
             in the call that fits its state; `sys.maxsize` for any.
         """
-        profile = self.fit_profile(model, features)
+        profile = self.fit_profile(model, self.width(model, features))
         return (
             self._padded_floor(profile.state_rows(self._call_bytes)),
             self._padded_floor(profile.fused_rows(self._call_bytes)),
@@ -297,6 +308,7 @@ class Admission:
         Returns:
             The rows, a padded size or none.
         """
+        features = self.width(model, features)
         rows = self.profile(model, features).row_bytes
         per_row = FIT_CELL_BYTES * (features + 4) + FIT_ROW_SCALE * rows
         return self._padded_floor(self._call_bytes // per_row)
@@ -327,6 +339,7 @@ class Admission:
             ValueError: If the model refuses such a table, so it is refused
                 when created rather than at its first fit.
         """
+        features = self.width(model, features)
         size = self._size(1)
 
         def check() -> bool:
@@ -356,6 +369,7 @@ class Admission:
         Raises:
             ValueError: If a slot cannot hold one of the model's context rows.
         """
+        features = self.width(model, features)
         entry = self._tabular(model)
         cache_dtype = None if self._settings is None else self._settings.cache_dtype
         return self._layouts.get(

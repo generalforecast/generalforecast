@@ -15,6 +15,7 @@ caches fold estimators into their head axis, so a cache's rows stay its first
 axis and page into slots like any other.
 """
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -235,7 +236,10 @@ def ensemble_functions(functions: TabularFunctions) -> TabularFunctions:
         return _combined(predictions, averaging)
 
     def properties(ensemble: Ensemble) -> TabularProperties:
-        return functions.properties(ensemble.model)
+        # Each estimator's column order follows from the width.
+        return dataclasses.replace(
+            functions.properties(ensemble.model), padded_width=False
+        )
 
     return TabularFunctions(
         fit=fit,

@@ -9,9 +9,11 @@ from typing import Any
 
 import jax
 import jax.numpy as jnp
+import pytest
 
 from generalforecast.constants import RECORDED_PROGRAMS, RECORDED_SECONDS
 from generalforecast.runtime.programs import (
+    PADDED_WIDTHS_ENV,
     Kind,
     Manifest,
     Programs,
@@ -20,6 +22,7 @@ from generalforecast.runtime.programs import (
     counts_up_to,
     ladder,
     most_rows,
+    padded_width,
     signature,
     zeros,
 )
@@ -399,3 +402,24 @@ def test_a_drop_ends_the_compiles_ahead_a_dropped_one_queues() -> None:
 
     # Queued under the dropped generation, the inner compile never runs.
     assert events == []
+
+
+def test_wide_tables_pad_to_one_of_four_widths_an_octave(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert [padded_width(width) for width in (1, 5, 8)] == [1, 5, 8]
+    assert [padded_width(width) for width in (9, 11, 17, 21, 24)] == [
+        10,
+        12,
+        20,
+        24,
+        24,
+    ]
+    assert padded_width(1558) == 1792
+    # A padded width is its own, and pads a table by at most a quarter.
+    for width in range(1, 3000):
+        padded = padded_width(width)
+        assert padded_width(padded) == padded
+        assert width <= padded <= max(width, 1.25 * width)
+    monkeypatch.setenv(PADDED_WIDTHS_ENV, "0")
+    assert padded_width(21) == 21
