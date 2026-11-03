@@ -8,14 +8,19 @@ use std::num::NonZeroUsize;
 /// Past this many rows, padded sizes step by a quarter of the power of two
 /// below them rather than doubling.
 pub const FINE_BUCKETS_PAST: usize = 1 << 14;
+/// Past this many rows, padded sizes step by an eighth of the power of two
+/// below them.
+pub const FINER_BUCKETS_PAST: usize = 1 << 18;
 
 /// The padded size for `rows` rows: `minimum` doubled until it fits, and past
 /// `FINE_BUCKETS_PAST` rows, the power of two below `rows` and quarters of
-/// it, so a large context pads by at most a quarter rather than doubling.
+/// it, so a large context pads by at most a quarter rather than doubling;
+/// past `FINER_BUCKETS_PAST`, eighths, so by at most an eighth.
 ///
 /// Padding to a few sizes keeps the number of compiled programs small: four
-/// to each doubling past `FINE_BUCKETS_PAST`, where a context's padding costs
-/// more memory and work than a program's compile.
+/// to each doubling past `FINE_BUCKETS_PAST` and eight past
+/// `FINER_BUCKETS_PAST`, where a context's padding costs more memory and work
+/// than a program's compile.
 ///
 /// # Panics
 ///
@@ -27,7 +32,7 @@ pub fn bucket_size(rows: usize, minimum: NonZeroUsize) -> usize {
         size = size.checked_mul(2).expect("padded size overflows usize");
     }
     let below = size / 2;
-    let step = below / 4;
+    let step = below / if below >= FINER_BUCKETS_PAST { 8 } else { 4 };
     if below >= FINE_BUCKETS_PAST && step >= minimum.get() && rows > below {
         return below + (rows - below).div_ceil(step) * step;
     }
@@ -118,6 +123,9 @@ mod tests {
         assert_eq!(bucket(28_673, 8), 32_768);
         assert_eq!(bucket(32_769, 8), 40_960);
         assert_eq!(bucket(200_000, 8), 229_376);
+        // Past 262,144 rows, by an eighth.
+        assert_eq!(bucket(262_145, 8), 294_912);
+        assert_eq!(bucket(793_076, 8), 851_968);
         for rows in [16_385, 19_451, 50_000, 131_073, 793_076] {
             let size = bucket(rows, 8);
             assert!(
