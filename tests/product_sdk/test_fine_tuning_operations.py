@@ -57,9 +57,16 @@ def test_an_upload_the_service_takes_is_sent_in_chunks_then_completed():
     sent = [s for s in steps if isinstance(s, ops.Chunk)]
     assert len(sent) == chunks and b"".join(s.data for s in sent) == body
     assert [s.start for s in sent] == list(range(0, len(body), 1024))
+    # The metadata opens the upload; completing it carries nothing.
+    opening = steps[1]
+    assert opening.path == "/uploads"
+    assert opening.payload == {
+        "bytes": len(body),
+        "format": "parquet",
+        "metadata": {"target": "y", "task": "classification"},
+    }
     complete = steps[-1]
-    assert complete.path == "/uploads/up-1/complete"
-    assert complete.payload == {"metadata": {"target": "y", "task": "classification"}}
+    assert complete.path == "/uploads/up-1/complete" and complete.payload == {}
     assert result["state"] == "verified"
 
 

@@ -2502,9 +2502,10 @@ paths:
       operationId: uploads.create
       tags:
       - hosted
-      summary: open an upload of a Parquet training table
-      description: '`url` is a resumable session to `PUT` the bytes to in `chunk_bytes` chunks with `Content-Range`;
-        when it is null, the bytes go to `/uploads/{upload}/bytes`. An upload left open for a day expires.'
+      summary: open an upload of a Parquet training table, with its size and metadata
+      description: '`url` is a resumable session to `PUT` the bytes to, in `chunk_bytes` chunks with `Content-Range`.
+        The metadata names the target and task, and the columns verification checks. An upload left open
+        for a day expires.'
       parameters:
       - $ref: '#/components/parameters/project'
       requestBody:
@@ -2525,6 +2526,9 @@ paths:
                   payload:
                     bytes: 52428800
                     format: parquet
+                    metadata:
+                      target: defaulted
+                      task: classification
       responses:
         '200':
           description: ok
@@ -2547,9 +2551,13 @@ paths:
                       bytes: 52428800
                       digest: null
                       error: null
-                      metadata: null
+                      metadata:
+                        target: defaulted
+                        task: classification
+                        origin:
+                          kind: uploaded
                       expires: 1761286400.0
-                      url: null
+                      url: https://storage.googleapis.com/upload/storage/v1/b/gf-artifacts/o?uploadType=resumable&upload_id=ADPycdu
                       method: PUT
                       chunk_bytes: 8388608
   /v1/projects/{project}/uploads/{upload}:
@@ -2608,9 +2616,10 @@ paths:
       operationId: uploads.complete
       tags:
       - hosted
-      summary: finish an upload and queue it for verification
-      description: Verification reads the Parquet footer, checks the named columns exist and hashes the
-        bytes; the upload becomes `verified` or `rejected` with an `error`.
+      summary: say every byte is sent, and queue the upload for verification
+      description: Verification reads the Parquet footer, checks the columns the metadata names exist and
+        hashes the bytes; the upload becomes `verified` or `rejected` with an `error`. Completing again
+        returns the upload as it is.
       parameters:
       - $ref: '#/components/parameters/project'
       - $ref: '#/components/parameters/upload'
@@ -2619,7 +2628,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/UploadCompleteRequest'
+              $ref: '#/components/schemas/UploadRefRequest'
             examples:
               complete:
                 value:
@@ -2629,10 +2638,7 @@ paths:
                   resource:
                     kind: corpus
                     name: up-3f1c2a9b8e7d6c5b4a392817
-                  payload:
-                    metadata:
-                      target: defaulted
-                      task: classification
+                  payload: {}
       responses:
         '200':
           description: ok
@@ -2710,58 +2716,6 @@ paths:
                       digest: sha256:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f
                       uploads:
                       - up-3f1c2a9b8e7d6c5b4a392817
-  /v1/projects/{project}/uploads/{upload}/bytes:
-    post:
-      operationId: uploads.bytes
-      tags:
-      - hosted
-      summary: send a chunk of an upload the plane takes itself
-      description: For an upload whose `url` is null. The body is raw bytes, not an envelope, so the request
-        id and project ride in headers; chunks arrive in order.
-      parameters:
-      - $ref: '#/components/parameters/project'
-      - $ref: '#/components/parameters/upload'
-      - name: X-GF-Request-ID
-        in: header
-        required: true
-        schema:
-          type: string
-          minLength: 1
-          maxLength: 128
-      - name: Content-Range
-        in: header
-        required: true
-        schema:
-          type: string
-          pattern: ^bytes [0-9]+-[0-9]+/[0-9]+$
-      requestBody:
-        required: true
-        content:
-          application/octet-stream:
-            schema:
-              type: string
-              format: binary
-      responses:
-        '200':
-          description: how many bytes the plane holds
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/UploadReceivedReply'
-              examples:
-                bytes:
-                  value:
-                    api_version: gf/v1
-                    project: acme
-                    request_id: r-0f7c1e9a2b4d6f8031a5c7e9b2d4f6a8
-                    resource:
-                      kind: corpus
-                      name: up-3f1c2a9b8e7d6c5b4a392817
-                    result:
-                      id: up-3f1c2a9b8e7d6c5b4a392817
-                      received: 8388608
-                      bytes: 52428800
-
   /v1/auth/status:
     get:
       operationId: auth.status
@@ -5694,6 +5648,7 @@ components:
       required:
       - bytes
       - format
+      - metadata
       additionalProperties: false
       properties:
         bytes:
@@ -5703,6 +5658,8 @@ components:
         format:
           type: string
           const: parquet
+        metadata:
+          $ref: '#/components/schemas/UploadMetadata'
     UploadCreateRequest:
       allOf:
       - $ref: '#/components/schemas/Envelope'
@@ -5737,23 +5694,6 @@ components:
           type: string
         origin:
           type: object
-    UploadComplete:
-      type: object
-      required:
-      - metadata
-      additionalProperties: false
-      properties:
-        metadata:
-          $ref: '#/components/schemas/UploadMetadata'
-    UploadCompleteRequest:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - payload
-        properties:
-          payload:
-            $ref: '#/components/schemas/UploadComplete'
     UploadRef:
       type: object
       required: []
@@ -5799,32 +5739,6 @@ components:
         properties:
           result:
             $ref: '#/components/schemas/UploadDeleted'
-    UploadReceived:
-      type: object
-      required:
-      - id
-      - received
-      - bytes
-      additionalProperties: false
-      properties:
-        id:
-          $ref: '#/components/schemas/Name'
-        received:
-          type: integer
-          minimum: 0
-        bytes:
-          type: integer
-          minimum: 1
-    UploadReceivedReply:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - result
-        properties:
-          result:
-            $ref: '#/components/schemas/UploadReceived'
-
     State:
       type: string
       enum: [pending, building, ready, failed, stopped]

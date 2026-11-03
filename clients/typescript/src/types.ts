@@ -756,15 +756,6 @@ export interface UploadOpenedReply extends Envelope {
   result: UploadOpened;
 }
 
-export interface UploadCreate {
-  bytes: number;
-  format: "parquet";
-}
-
-export interface UploadCreateRequest extends Envelope {
-  payload: UploadCreate;
-}
-
 export interface UploadMetadata {
   target: string;
   task: "classification" | "regression";
@@ -774,12 +765,14 @@ export interface UploadMetadata {
   origin?: Record<string, unknown>;
 }
 
-export interface UploadComplete {
+export interface UploadCreate {
+  bytes: number;
+  format: "parquet";
   metadata: UploadMetadata;
 }
 
-export interface UploadCompleteRequest extends Envelope {
-  payload: UploadComplete;
+export interface UploadCreateRequest extends Envelope {
+  payload: UploadCreate;
 }
 
 export interface UploadRef {
@@ -798,16 +791,6 @@ export interface UploadDeleted {
 
 export interface UploadDeletedReply extends Envelope {
   result: UploadDeleted;
-}
-
-export interface UploadReceived {
-  id: Name;
-  received: number;
-  bytes: number;
-}
-
-export interface UploadReceivedReply extends Envelope {
-  result: UploadReceived;
 }
 
 /** an immutable pushed predictor */
@@ -1981,9 +1964,8 @@ export const ROUTES = {
   "runs.lineage": { method: "GET", path: "/v1/projects/{project}/runs/{run}/lineage", request: "null", reply: "RunLineageReply", body: null },
   "uploads.create": { method: "POST", path: "/v1/projects/{project}/uploads", request: "UploadCreateRequest", reply: "UploadOpenedReply", body: "application/json" },
   "uploads.get": { method: "GET", path: "/v1/projects/{project}/uploads/{upload}", request: "null", reply: "UploadReply", body: null },
-  "uploads.complete": { method: "POST", path: "/v1/projects/{project}/uploads/{upload}/complete", request: "UploadCompleteRequest", reply: "UploadReply", body: "application/json" },
+  "uploads.complete": { method: "POST", path: "/v1/projects/{project}/uploads/{upload}/complete", request: "UploadRefRequest", reply: "UploadReply", body: "application/json" },
   "uploads.delete": { method: "POST", path: "/v1/projects/{project}/uploads/{upload}/delete", request: "UploadRefRequest", reply: "UploadDeletedReply", body: "application/json" },
-  "uploads.bytes": { method: "POST", path: "/v1/projects/{project}/uploads/{upload}/bytes", request: "null", reply: "UploadReceivedReply", body: "application/octet-stream" },
   "auth.status": { method: "GET", path: "/v1/auth/status", request: "null", reply: "AuthStatusReply", body: null },
   "auth.logout": { method: "POST", path: "/v1/auth/logout", request: "EmptyRequest", reply: "LoggedOutReply", body: "application/json" },
   "workspace.get": { method: "GET", path: "/v1/workspace", request: "null", reply: "ProjectListReply", body: null },
