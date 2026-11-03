@@ -1072,6 +1072,8 @@ pub fn plan_with(
             Cow::Owned(allowed - &core)
         };
         let count = among.unwrap_or(neighbors);
+        let timing = std::env::var_os("GF_PLAN_TIMING").is_some();
+        let started = std::time::Instant::now();
         let found = if members.len() >= DENSE_QUERIES {
             nearest_dense(source, &outside, queries, &members, count)?
         } else {
@@ -1088,12 +1090,22 @@ pub fn plan_with(
                 })
                 .collect::<Result<Vec<_>, _>>()?
         };
+        let searched = started.elapsed();
         for (&query, nearest) in members.iter().zip(found) {
             let nearest = match among {
                 Some(_) => source.times.latest_of(&nearest, neighbors as u64),
                 None => nearest,
             };
             planned[query] = builder.unit(&core | &nearest);
+        }
+        if timing {
+            eprintln!(
+                "plan timing: {} queries, {} outside rows, count {count}: search {:.3} s, units {:.3} s",
+                members.len(),
+                outside.len(),
+                searched.as_secs_f64(),
+                (started.elapsed() - searched).as_secs_f64()
+            );
         }
     }
     builder.plan.queries = planned;
@@ -1116,9 +1128,14 @@ fn nearest_dense(
     count: usize,
 ) -> Result<Vec<Context>, PlanError> {
     let dimensions = queries[members[0]].as_ref().len();
+    let started = std::time::Instant::now();
     let dense =
         Dense::read(outside, dimensions, source.vectors, source.keys).map_err(IndexError::from)?;
+    if std::env::var_os("GF_PLAN_TIMING").is_some() {
+        eprintln!("plan timing: dense read {:.3} s, {dimensions} dims", started.elapsed().as_secs_f64());
+    }
     let index = source.index;
+    let scan = index.scan(outside, &dense);
     let threads = std::thread::available_parallelism()
         .map_or(1, std::num::NonZeroUsize::get)
         .min(members.len());
@@ -1131,13 +1148,8 @@ fn nearest_dense(
         let handles: Vec<_> = points
             .chunks(share)
             .map(|chunk| {
-                let dense = &dense;
-                scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|point| index.nearest_rows(point, count, outside, dense, dense))
-                        .collect::<Result<Vec<_>, _>>()
-                })
+                let scan = &scan;
+                scope.spawn(move || scan.nearest(chunk, count))
             })
             .collect();
         handles
