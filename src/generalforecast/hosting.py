@@ -48,6 +48,12 @@ An offline image runs `python -m generalforecast.hosting prefetch` (or
 `prefetch_catalog()`) once, to download, convert and verify every model a
 hosted plane may serve.
 
+A hosted pool takes its workers' measures once per GPU type: on each,
+`measured(spec, padded_widths(columns))` gives a served model's measures,
+`keep_measures(directory / measures_identity(), spec, measures)` keeps them
+for its workers to read through `GF_MEASURES`, and `kept_measures` reads
+them back.
+
 Exports:
 
     Locks and revisions
@@ -114,6 +120,7 @@ recorded surface (`tests/conformance/test_hosting.py`) changes with it.
 """
 
 import sys
+from pathlib import Path
 from typing import Any
 
 from generalforecast.as_of import format as format_as_of
@@ -293,6 +300,47 @@ def prefetch_catalog() -> None:
     preload()
 
 
+def measures_identity() -> str:
+    """The identity this machine's measures are kept under, as `GF_MEASURES/<identity>`: gf's traced code, JAX, the device and padding."""
+    from generalforecast.runtime import shipped
+
+    return shipped.identity()
+
+
+def padded_widths(most: int) -> list[int]:
+    """The widths gf pads tables of up to `most` columns to, which measures are kept per."""
+    from generalforecast.runtime import shipped
+
+    return shipped.padded_widths(most)
+
+
+def measured(spec: str, widths: Any) -> dict[str, Any]:
+    """A served model's measures at these padded widths, as a gf-server worker on this machine takes them, as JSON; none for a forecaster.
+
+    A pool takes them once per GPU type and keeps them with
+    `keep_measures`, so its workers read them in place of compiling the
+    model to take them (`GF_MEASURES`).
+    """
+    from generalforecast.runtime import shipped
+
+    return shipped.measured(spec, widths)
+
+
+def keep_measures(directory: Path, spec: str, measures: Any) -> Path:
+    """Adds a model's `measured` measures to those `directory`, one identity's, keeps for it; returns its file."""
+    from generalforecast.runtime import shipped
+
+    return shipped.keep_measures(directory, spec, measures)
+
+
+def kept_measures(directory: Path, spec: str) -> dict[Any, Any]:
+    """The measures `directory` keeps for a model, by key; empty if none."""
+    from generalforecast.runtime.programs import Manifest
+    from generalforecast.runtime.shipped import _digest
+
+    return Manifest(directory / f"{_digest(spec)}.json").measured()
+
+
 __all__ = [
     "ALIASES",
     "CONTEXT_ROWS_KEY",
@@ -353,13 +401,18 @@ __all__ = [
     "format_as_of",
     "json_object",
     "json_rows",
+    "keep_measures",
+    "kept_measures",
     "limits",
     "live_context",
     "lock_digest",
     "lock_name",
+    "measured",
+    "measures_identity",
     "model_id",
     "name",
     "number",
+    "padded_widths",
     "parse_as_of",
     "parse_body",
     "parse_lock",
