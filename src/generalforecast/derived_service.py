@@ -69,7 +69,12 @@ class ServiceResolver:
             raise ModelRefError("UnknownModel", f"{model} is not a fine-tune")
         parts = found["derived"]
         made = Derived(
-            model, parts["base"], parts["base_digest"], parts["digest"], parts["bags"]
+            model,
+            parts["base"],
+            parts["base_digest"],
+            parts["digest"],
+            parts["bags"],
+            parts["kind"],
         )
         self._found[model] = made
         return made
