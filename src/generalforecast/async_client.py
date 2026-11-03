@@ -178,6 +178,9 @@ class AsyncClient:
         )
         self.contexts = Contexts(self)
         self.sources = Sources(self)
+        self.corpora = Corpora(self)
+        self.uploads = Uploads(self)
+        self.runs = Runs(self)
         self.models = Models(self)
         self.predictors = Predictors(self)
         self.identity = Identity(self)
@@ -430,6 +433,124 @@ class Sources(Collection):
     async def pin(self, spec: JsonObject) -> SourcePin:
         """Pins server-relative bytes; this does not upload a client-side path."""
         return await self.client._run(ops.source_pin(spec))
+
+
+class Corpora(Collection):
+    """Named, immutable lists of training data: snapshots, and priors drawn while training."""
+
+    kind: ResourceKind = "corpus"
+    collection = "corpora"
+
+    async def create(
+        self, name: str, members: JsonObject, *, parent: str | None = None
+    ) -> JsonObject:
+        """Creates a corpus from named members, each `{"snapshots": [...]}` or `{"prior": {...}}`.
+
+        A corpus never changes; a new one may name the corpus it updates as `parent`.
+        """
+        payload: JsonObject = {"name": name, "members": members}
+        if parent is not None:
+            payload["parent"] = parent
+        return await self.client._run(ops.created("corpus", "corpora", name, payload))
+
+    async def delete(self, name: str) -> JsonObject:
+        """Deletes a corpus no run reads, releasing its snapshots."""
+        return await self.client._run(
+            ops.posted("corpus", "corpora", name, "delete", {"name": name})
+        )
+
+
+class Uploads(Collection):
+    """Training tables uploaded in chunks and verified into training snapshots."""
+
+    kind: ResourceKind = "corpus"
+    collection = "uploads"
+
+    async def create(
+        self,
+        data: Any,
+        *,
+        target: str,
+        task: str,
+        column_types: Mapping[str, str] | None = None,
+        time: str | None = None,
+        group: str | None = None,
+        origin: JsonObject | None = None,
+        wait: bool = True,
+    ) -> JsonObject:
+        """Uploads a table (a frame, an Arrow table, or a Parquet path or bytes).
+
+        With `wait`, returns once the service has verified it; its `digest`
+        then names the training snapshot that corpora list.
+        """
+        metadata = ops.upload_metadata(
+            target,
+            task,
+            column_types=column_types,
+            time=time,
+            group=group,
+            origin=origin,
+        )
+        return await self.client._run(ops.training_upload(data, metadata, wait=wait))
+
+
+class Runs(Collection):
+    """Fine-tuning runs: created once, trained once, followed until they end."""
+
+    kind: ResourceKind = "run"
+    collection = "runs"
+
+    async def create(
+        self,
+        name: str,
+        *,
+        base_model: str,
+        corpus: str,
+        changes: builtins.list[JsonObject],
+        evaluation: JsonObject,
+        plan: JsonObject | None = None,
+        checkpoint_policy: JsonObject | None = None,
+        budget: JsonObject | None = None,
+        seed: int | None = None,
+        tags: builtins.list[str] | None = None,
+    ) -> JsonObject:
+        """Creates a run; with a `plan` it trains as soon as it is set up.
+
+        Creating the same run again returns it.
+        """
+        payload = ops.run_spec(
+            name,
+            base_model=base_model,
+            corpus=corpus,
+            changes=changes,
+            evaluation=evaluation,
+            plan=plan,
+            checkpoint_policy=checkpoint_policy,
+            budget=budget,
+            seed=seed,
+            tags=tags,
+        )
+        return await self.client._run(ops.created("run", "runs", name, payload))
+
+    async def train(self, run: str, plan: JsonObject) -> JsonObject:
+        """Sets the plan of a run created without one."""
+        return await self.client._run(
+            ops.posted("run", "runs", run, "train", {"plan": plan})
+        )
+
+    async def cancel(self, run: str) -> JsonObject:
+        """Cancels a run; one that is training stops at its next step."""
+        return await self.client._run(ops.posted("run", "runs", run, "cancel", {}))
+
+    async def lineage(self, run: str) -> JsonObject:
+        """Every change to a run, oldest first."""
+        return await self.client._run(ops.run_lineage(run))
+
+    async def wait(
+        self, run: str, *, timeout: float | None = None, poll: float = 5.0
+    ) -> JsonObject:
+        """Polls a run until it finishes, is cancelled or fails."""
+        return await self.client._run(ops.run_wait(run, timeout=timeout, poll=poll))
 
 
 class Models(Collection):
