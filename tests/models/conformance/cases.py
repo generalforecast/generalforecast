@@ -91,6 +91,18 @@ def _retrieval(seed: int) -> Any:
     return model._replace(icl=dataclasses.replace(model.icl, decoder=decoder))
 
 
+def _tabfm_functions() -> TabularFunctions:
+    from generalforecast.models.tabfm.model import tabfm_functions
+
+    return tabfm_functions
+
+
+def _tabfm(seed: int) -> Any:
+    from tests.models.tabfm.tiny import tiny_tabfm
+
+    return tiny_tabfm(seed=seed)
+
+
 def _tabpfn_functions() -> TabularFunctions:
     from generalforecast.models.tabpfn.model import tabpfn_functions
 
@@ -199,6 +211,7 @@ CASES = [
     Case("tabicl-classes", False, _tabicl_functions, _tabicl(False)),
     Case("tabicl-values", True, _tabicl_functions, _tabicl(True)),
     Case("retrieval-classes", False, _tabicl_functions, _retrieval),
+    Case("tabfm-classes", False, _tabfm_functions, _tabfm),
     Case("tabpfn-classes", False, _tabpfn_functions, _tabpfn(False)),
     Case("tabpfn-values", True, _tabpfn_functions, _tabpfn(True)),
     # Int8 also quantizes the retrieval decoder's keys, which TabPFN keeps exact;
@@ -227,6 +240,7 @@ RUNTIME_CASES = [
     in {
         "tabicl-values",
         "retrieval-classes",
+        "tabfm-classes",
         "tabpfn-classes",
         "tabpfn-3.5-values",
         "kumo-values",

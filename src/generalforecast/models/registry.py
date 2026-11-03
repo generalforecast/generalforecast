@@ -158,6 +158,7 @@ _FAMILIES: dict[str, tuple[str, str, str]] = {
     "tabpfn": ("tabpfn", "load_tabpfn", "tabpfn_functions"),
     "limix": ("limix", "load_limix", "limix_functions"),
     "mitra": ("mitra", "load_mitra", "mitra_functions"),
+    "tabfm": ("tabfm", "load_tabfm", "tabfm_functions"),
     "chronos2": ("chronos2", "load_chronos2", "chronos2_functions"),
     "timestral": ("timestral", "load_timestral", "timestral_functions"),
     "timesfm3": ("timesfm3", "load_timesfm", "timesfm_functions"),

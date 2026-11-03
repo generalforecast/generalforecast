@@ -21,11 +21,17 @@ class RoPE(NamedTuple):
             contiguous layout, dimensions `0 .. rotary_dim / 2` of each half;
             interleaved, the first `rotary_dim` dimensions. The rest pass
             through unrotated.
+        frequencies: The inverse frequencies, one per pair of dimensions, as a
+            checkpoint stores them, in place of those `theta` gives: a model
+            trained with frequencies rounded to a low precision rotates by
+            those, and computing them afresh would differ more at each
+            position. Hashable, as the settings are static.
     """
 
     theta: float
     interleaved: bool
     rotary_dim: int | None = None
+    frequencies: tuple[float, ...] | None = None
 
 
 def _angles(
@@ -42,8 +48,11 @@ def _angles(
     if positions is None:
         positions = jnp.arange(rows)
     dim = head_dim if rope.rotary_dim is None else rope.rotary_dim
-    indices = jnp.arange(0, dim, 2, dtype=jnp.float32)
-    inverse_freq = 1.0 / (rope.theta ** (indices / dim))
+    if rope.frequencies is not None:
+        inverse_freq = jnp.asarray(rope.frequencies, dtype=jnp.float32)
+    else:
+        indices = jnp.arange(0, dim, 2, dtype=jnp.float32)
+        inverse_freq = 1.0 / (rope.theta ** (indices / dim))
     inverse_freq = jnp.pad(inverse_freq, (0, head_dim // 2 - inverse_freq.shape[0]))
     angles = positions.astype(jnp.float32)[..., :, None] * inverse_freq
     return angles[..., :, None, :]
