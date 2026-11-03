@@ -113,14 +113,22 @@ fn resource_name(kind: &str, value: &str) -> Result<String, ApiError> {
 /// Whether `value` is a catalog model id, the one grammar the catalog's
 /// `generalforecast.service.contracts.MODEL_ID` has: an organization, a
 /// lowercase letter then up to 62 letters, digits or `-`; `/`; a model
-/// name as `model_name` reads it; then optionally `@sha256:<64 hex>`, `@`
-/// digits and `*` digits, in that order.
+/// name as `model_name` reads it; then optionally a derived model's
+/// `@ft<version>` (from 1, no leading zero), `@sha256:<64 hex>`, `@` digits
+/// and `*` digits, in that order.
 pub(super) fn model_id(value: &str) -> bool {
     let Some((organization, rest)) = value.split_once('/') else {
         return false;
     };
     let end = rest.find(['@', '*']).unwrap_or(rest.len());
     let (bare, mut suffix) = rest.split_at(end);
+    if let Some(version) = suffix.strip_prefix("@ft") {
+        let digits = version.bytes().take_while(u8::is_ascii_digit).count();
+        if digits == 0 || version.starts_with('0') {
+            return false;
+        }
+        suffix = &version[digits..];
+    }
     if let Some(pin) = suffix.strip_prefix("@sha256:") {
         let hex = pin
             .bytes()
@@ -493,6 +501,8 @@ mod tests {
             format!("general-forecast/tabpfn-3.5-regressor@sha256:{digest}"),
             format!("general-forecast/tabpfn-3.5-regressor@sha256:{digest}@8*3"),
             "general-forecast/2-stage".to_string(),
+            "acme/credit-default@ft3".to_string(),
+            format!("acme/credit-default@ft12@sha256:{digest}@4*2"),
         ] {
             assert!(model_id(&id), "{id}");
         }
@@ -508,6 +518,10 @@ mod tests {
             "general-forecast/tabpfn@sha256:abc",
             "general-forecast/tabpfn*2@4",
             "general-forecast/tabpfn@4x",
+            "acme/credit-default@ft",
+            "acme/credit-default@ft0",
+            "acme/credit-default@ft03",
+            "acme/credit-default@4@ft3",
         ] {
             assert!(!model_id(id), "{id}");
         }

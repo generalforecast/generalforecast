@@ -43,12 +43,13 @@ def _load(
     """The process engine and the locked model, verified against its pins, for predictors."""
     from generalforecast import engine as engines
     from generalforecast.models.artifacts import ArtifactError
-    from generalforecast.models.catalog import ModelRefError
+    from generalforecast.models.catalog import ModelRefError, parse
 
     pin = lock.model
-    ref = ModelRef(pin.model, pin.codes, pin.estimators, pin.digest)
     engine = engines.local(surface, allow_downloads)
     try:
+        # The pin's own spelling: a derived model's id pinned to its weights.
+        ref = parse(pin.resolved)
         engine.load(ref)
     except ArtifactError as error:
         raise ServiceError(error.code, str(error), 503) from None

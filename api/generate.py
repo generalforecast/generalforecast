@@ -600,7 +600,13 @@ class PythonEmitter:
         if "const" in schema:
             return f"Literal[{quote(schema['const']) if isinstance(schema['const'], str) else schema['const']}]"
         if "enum" in schema:
-            return "Literal[" + ", ".join(quote(v) for v in schema["enum"]) + "]"
+            return (
+                "Literal["
+                + ", ".join(
+                    quote(v) if isinstance(v, str) else str(v) for v in schema["enum"]
+                )
+                + "]"
+            )
         kind = schema.get("type")
         if isinstance(kind, list):
             return " | ".join(

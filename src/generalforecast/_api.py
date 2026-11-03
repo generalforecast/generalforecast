@@ -229,7 +229,7 @@ _decode_ModelName: Decoder = _pattern("^[a-z0-9][a-z0-9.-]{0,62}$")
 
 ModelId = str
 _decode_ModelId: Decoder = _pattern(
-    "^general-forecast/[a-z0-9][a-z0-9.-]{0,62}(@[^@\\s]+)?$",
+    "^[a-z][a-z0-9-]{0,62}/[a-z0-9][a-z0-9.-]{0,62}(?:@ft[1-9]\\d*)?(?:@sha256:[0-9a-f]{64})?(?:@\\d+)?(?:\\*\\d+)?$",
 )
 
 
@@ -784,6 +784,26 @@ class ResolvedSelection(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class DerivedBase(Payload):
+    """The DerivedBase schema.
+
+    what a derived model runs on: the catalog base and its digest, which its weights
+    are only valid with, and how many bags of weights it averages; each bag counts as
+    one estimator
+    """
+
+    base: ModelId
+    base_digest: Digest
+    bags: int
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("base", "base", True, _decode_ModelId),
+        Field("base_digest", "base_digest", True, _decode_Digest),
+        Field("bags", "bags", True, _integer),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class Resolution(Payload):
     """The resolved predictor gf.lock pins."""
 
@@ -797,6 +817,7 @@ class Resolution(Payload):
     inputs: tuple[LockInput, ...]
     context: ContextLock
     selection: ResolvedSelection
+    derived: DerivedBase | None = None
     classes: tuple[str | int | bool, ...] | None = None
     id: str | None = None
     id_type: Kind | None = None
@@ -813,6 +834,7 @@ class Resolution(Payload):
         Field("name", "name", True, _decode_Name),
         Field("model", "model", True, _decode_ModelId),
         Field("model_digest", "model_digest", True, _decode_Digest),
+        Field("derived", "derived", False, _record(DerivedBase)),
         Field("task", "task", True, _decode_Task),
         Field("target", "target", True, _text),
         Field("target_type", "target_type", True, _union(_decode_Kind, _null)),
@@ -1806,7 +1828,7 @@ class Lock(Payload):
     it resolves
     """
 
-    lock_version: Literal[1] = 1
+    lock_version: Literal[1, 2]
     digest: Digest
     manifest: Digest
     predictor: Resolution
@@ -1814,7 +1836,7 @@ class Lock(Payload):
     resources: LockResources | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("lock_version", "lock_version", True, _literal(1)),
+        Field("lock_version", "lock_version", True, _literal(1, 2)),
         Field("digest", "digest", True, _decode_Digest),
         Field("manifest", "manifest", True, _decode_Digest),
         Field("predictor", "predictor", True, _record(Resolution)),

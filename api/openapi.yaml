@@ -3431,10 +3431,11 @@ components:
 
     ModelId:
       type: string
-      pattern: "^general-forecast/[a-z0-9][a-z0-9.-]{0,62}(@[^@\\s]+)?$"
+      pattern: "^[a-z][a-z0-9-]{0,62}/[a-z0-9][a-z0-9.-]{0,62}(?:@ft[1-9]\\d*)?(?:@sha256:[0-9a-f]{64})?(?:@\\d+)?(?:\\*\\d+)?$"
       description: |
-        a catalog model id, `general-forecast/<name>`, with an optional
-        variant suffix (`@4*2`) or digest pin (`@sha256:<digest>`)
+        a catalog model id, `general-forecast/<name>`, or a derived model's,
+        `<owner>/<name>@ft<version>`; then an optional digest pin
+        (`@sha256:<digest>`) and variant suffix (`@4*2`)
 
     Digest:
       type: string
@@ -3813,6 +3814,19 @@ components:
         recent: {type: [integer, "null"], minimum: 0}
         seed: {type: integer, minimum: 0}
 
+    DerivedBase:
+      type: object
+      description: |
+        what a derived model runs on: the catalog base and its digest, which
+        its weights are only valid with, and how many bags of weights it
+        averages; each bag counts as one estimator
+      required: [base, base_digest, bags]
+      additionalProperties: false
+      properties:
+        base: {$ref: "#/components/schemas/ModelId"}
+        base_digest: {$ref: "#/components/schemas/Digest"}
+        bags: {type: integer, minimum: 1, maximum: 64}
+
     Resolution:
       type: object
       description: the resolved predictor gf.lock pins
@@ -3822,6 +3836,7 @@ components:
         name: {$ref: "#/components/schemas/Name"}
         model: {$ref: "#/components/schemas/ModelId"}
         model_digest: {$ref: "#/components/schemas/Digest"}
+        derived: {$ref: "#/components/schemas/DerivedBase"}
         task: {$ref: "#/components/schemas/Task"}
         target: {type: string}
         target_type:
@@ -4413,7 +4428,10 @@ components:
       required: [lock_version, digest, manifest, predictor, model]
       additionalProperties: false
       properties:
-        lock_version: {type: integer, const: 1}
+        lock_version:
+          type: integer
+          enum: [1, 2]
+          description: 2 when the predictor runs a derived model, which only that version has
         digest: {$ref: "#/components/schemas/Digest"}
         manifest: {$ref: "#/components/schemas/Digest"}
         predictor: {$ref: "#/components/schemas/Resolution"}
