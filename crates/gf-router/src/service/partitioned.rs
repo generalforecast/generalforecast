@@ -185,7 +185,10 @@ impl Router {
         // context gathered from them all would pass it again. An adaptive
         // strategy is resolved within the length for the table as a whole,
         // so there is nothing for the partitions to cut.
-        let adaptive = body.pointer("/strategy/kind").and_then(Value::as_str) == Some("adaptive");
+        let adaptive = matches!(
+            body.pointer("/strategy/kind").and_then(Value::as_str),
+            Some("adaptive" | "adaptive_whole")
+        );
         if gathered && !adaptive && body.get("past_cap").and_then(Value::as_str) == Some("clamp") {
             return Err(Status::invalid_argument(
                 "past_cap = \"clamp\" needs a table of one partition or a route",
@@ -456,7 +459,7 @@ impl Router {
     pub(super) async fn strategy_of(&self, table: &str, count: usize) -> Result<Strategy, Status> {
         let definition = self.definition_of(table, count).await?;
         let strategy = definition.config().map_err(Status::internal)?.strategy;
-        if strategy != Strategy::Adaptive {
+        if !matches!(strategy, Strategy::Adaptive | Strategy::AdaptiveWhole) {
             return Ok(strategy);
         }
         let whole = self
@@ -495,7 +498,10 @@ impl Router {
         // A description is the definition's fields, flat, with the rows'.
         whole["name"] = json!(table);
         whole["partitions"] = json!(count);
-        if whole.pointer("/strategy/kind").and_then(Value::as_str) == Some("adaptive") {
+        if matches!(
+            whole.pointer("/strategy/kind").and_then(Value::as_str),
+            Some("adaptive" | "adaptive_whole")
+        ) {
             whole["resolved_strategy"] = json!(StrategySpec::of(resolved_whole(&whole)));
         }
         Ok(whole)
@@ -986,7 +992,8 @@ async fn encoded(path: Vec<String>, batches: Vec<RecordBatch>) -> Result<Vec<Fli
 
 /// An adaptive strategy resolved against a whole table's description: its
 /// rows over every partition and its model's cap. Gathered rows carry no
-/// times, so the resolution leans to none.
+/// times, so the resolution leans to none. A gathered context is assembled
+/// on no one worker's device, so `adaptive_whole` resolves as `adaptive`.
 fn resolved_whole(whole: &Value) -> Strategy {
     let rows = whole.get("rows").and_then(Value::as_u64).unwrap_or(0);
     let cap = whole

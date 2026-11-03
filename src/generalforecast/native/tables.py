@@ -523,7 +523,7 @@ def _retrieved_of(described: Described) -> Retrieved | None:
     reads the current resolution from the engine.
     """
     spec = json.loads(described.strategy.spec())
-    if spec["kind"] == "adaptive":
+    if spec["kind"] in ("adaptive", "adaptive_whole"):
         return None
     core = spec.get("core") or {}
     recency = spec.get("recency") or {}
@@ -693,6 +693,9 @@ class Table(_Held[_NativeTable]):
             table's size: every query reads the whole table up to the model's
             row cap, and past it a stratified core plus nearest rows, resolved
             anew at each prediction as rows come and go (`default_selection`).
+            A table past a cap of 10,000 rows or more still reads whole up to
+            four times the cap, while its worker can hold the whole context
+            on its device; `selection` says which it reads.
         time: How time orders rows.
         ops: Operational settings.
         client: The engine to hold the table; this process's if None.
@@ -867,7 +870,7 @@ class Table(_Held[_NativeTable]):
             return
         cap = registry.limits(self.model).context_rows
         if selection is None:
-            strategy = Strategy.adaptive()
+            strategy = Strategy.adaptive_whole()
         else:
             selection = selection.resolved(cap)
             strategy = selection.strategy(cap)
@@ -943,10 +946,11 @@ class Table(_Held[_NativeTable]):
             )
             classes = max(len(self._classes), 2)
         # Without a selection the engine follows the table's size, with the
-        # retrieval settings the table was opened with, or their defaults.
+        # retrieval settings the table was opened with, or their defaults,
+        # reading it whole past the cap while the worker can hold it.
         selection = self._selection or self._retrieval
         if self._selection is None:
-            strategy = Strategy.adaptive()
+            strategy = Strategy.adaptive_whole()
         else:
             selection = selection.resolved(limits.context_rows)
             strategy = selection.strategy(limits.context_rows)

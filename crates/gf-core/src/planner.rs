@@ -100,6 +100,12 @@ pub enum Strategy {
     /// the live row count at each plan, so a table that grows past the cap
     /// crosses into retrieval on its own and one that shrinks reads whole again.
     Adaptive,
+    /// As `Adaptive`, but past the cap a table reads whole while it holds at
+    /// most `ADAPTIVE_WHOLE_PAST_CAP` times a cap of at least
+    /// `ADAPTIVE_WHOLE_FROM_CAP` and the worker can hold its whole context on
+    /// the device: the table's `whole` rows, which `resolve_within` takes.
+    /// Without a `whole` it resolves as `Adaptive` does.
+    AdaptiveWhole,
     /// A core shared by every query of a window, plus each query's
     /// `neighbors` nearest rows outside it, encoded together. Without
     /// neighbors it is a subsample; without a core, each query's nearest rows.
@@ -135,6 +141,20 @@ pub const ADAPTIVE_SEED: u64 = 0;
 
 /// The share of the cap an adaptive strategy's core takes past the cap.
 const ADAPTIVE_CORE_SHARE: f64 = 0.25;
+
+/// How many times its model's cap a table `AdaptiveWhole` still reads whole
+/// may hold, for a model whose cap is at least `ADAPTIVE_WHOLE_FROM_CAP`.
+/// One shared context is encoded once and cached for every query, where a
+/// retrieved one encodes a context of the cap per query: on TabICL v2's
+/// 60,000-row cap, 83,000 to 200,000-row tables read whole scored within
+/// 0.003 of per-query contexts or better, at thousands of times the rows a
+/// second.
+pub const ADAPTIVE_WHOLE_PAST_CAP: u64 = 4;
+
+/// The least cap past which `AdaptiveWhole` reads a table whole up to
+/// `ADAPTIVE_WHOLE_PAST_CAP` times it; a model trained on smaller contexts
+/// is held to its cap.
+pub const ADAPTIVE_WHOLE_FROM_CAP: u64 = 10_000;
 
 /// How many nearest rows an adaptive strategy's neighbors are the latest of,
 /// per neighbor, when the table has times.
@@ -248,12 +268,35 @@ impl Strategy {
     /// nearest when `timed`. Any other strategy is itself.
     #[must_use]
     pub fn resolve(self, rows: u64, cap: Option<NonZeroU64>, timed: bool) -> Self {
-        let Self::Adaptive = self else {
-            return self;
+        self.resolve_within(rows, cap, None, timed)
+    }
+
+    /// As `resolve`, where `whole` is the most rows the table's worker can
+    /// hold as one context on its device: `AdaptiveWhole` reads a table past
+    /// the cap whole up to it, within `ADAPTIVE_WHOLE_PAST_CAP` times a cap of
+    /// at least `ADAPTIVE_WHOLE_FROM_CAP`.
+    #[must_use]
+    pub fn resolve_within(
+        self,
+        rows: u64,
+        cap: Option<NonZeroU64>,
+        whole: Option<NonZeroU64>,
+        timed: bool,
+    ) -> Self {
+        let whole = match self {
+            Self::Adaptive => None,
+            Self::AdaptiveWhole => whole.map(NonZeroU64::get),
+            _ => return self,
         };
         let Some(cap) = cap.map(NonZeroU64::get).filter(|&cap| rows > cap) else {
             return Self::Exact;
         };
+        let within = cap >= ADAPTIVE_WHOLE_FROM_CAP
+            && whole.is_some_and(|whole| rows <= whole)
+            && rows <= cap.saturating_mul(ADAPTIVE_WHOLE_PAST_CAP);
+        if within {
+            return Self::Exact;
+        }
         #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
         #[allow(clippy::cast_sign_loss)]
         let core = ((cap as f64) * ADAPTIVE_CORE_SHARE).round_ties_even() as u64;
@@ -279,7 +322,7 @@ impl Strategy {
     #[must_use]
     pub fn capped(self, rows: u64) -> Self {
         match self {
-            Self::Adaptive => Self::Adaptive,
+            Self::Adaptive | Self::AdaptiveWhole => self,
             Self::Exact => Self::subsample(rows, CAP_SEED, CoreKind::Random),
             Self::Retrieved {
                 core,
@@ -307,7 +350,7 @@ impl Strategy {
     #[must_use]
     pub fn seed(&self) -> Option<u64> {
         match self {
-            Self::Adaptive => Some(ADAPTIVE_SEED),
+            Self::Adaptive | Self::AdaptiveWhole => Some(ADAPTIVE_SEED),
             Self::Retrieved {
                 core: Some(core), ..
             } => Some(core.seed),

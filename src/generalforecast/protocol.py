@@ -456,10 +456,14 @@ class Profile:
 
 @dataclass(frozen=True)
 class FitLimits:
-    """Asks how many rows a model's fit takes within the call budget, for `features` columns."""
+    """Asks how many rows a model's fit takes within the call budget, for `features` columns.
+
+    With `whole`, also how many rows the worker can hold as one context on its device.
+    """
 
     model: str
     features: int
+    whole: bool = False
 
 
 @dataclass(frozen=True)
@@ -677,10 +681,13 @@ class Limited:
         state_rows: The most rows a state alone is fit on, or None for any.
         fused_rows: The most a fit embeds in the call that fits its state,
             or None for any.
+        whole_rows: The most rows the worker can hold as one context on its
+            device, when asked; None where it can hold none or was not asked.
     """
 
     state_rows: int | None
     fused_rows: int | None
+    whole_rows: int | None = None
 
 
 @dataclass(frozen=True)

@@ -48,6 +48,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The most rows `Admission.whole_rows` searches up to.
+WHOLE_ROWS_LIMIT = 1 << 26
+
 
 class Admission:
     """How a worker measures its models and refuses work past its memory."""
@@ -399,6 +402,46 @@ class Admission:
                 "beside the contexts it keeps; use a strategy that reads fewer "
                 "rows, such as neighbors, or a device with more memory"
             )
+
+    def whole_rows(self: "Worker", model: int, features: int) -> int | None:
+        """The most rows this worker can hold as one kept context on its device.
+
+        A context of them fits the device pool, so it stays cached for every
+        query that reads it, and its encode, or its decode of the smallest
+        chunk of queries, fits beside the pool, with the autotuner's headroom,
+        as `_fits_device` holds a unit to. An `adaptive_whole` table past its
+        model's cap reads whole within it. None where the model's encode
+        cannot be measured, so such a table reads as an adaptive one does.
+        """
+        profile = self.encode_profile(model, features)
+        if profile is None:
+            return None
+        per_row = self.profile(model, features).cache_bytes_per_row
+        decode = self.decode_profile(model)
+        room = self.budget.device - self._pool_bytes
+
+        def fits(rows: int) -> bool:
+            size = self._size(rows)
+            if size * per_row > self._pool_bytes:
+                return False
+            needed = max(
+                profile.working_bytes(per_row, size),
+                decode.working_bytes(per_row, size),
+            )
+            if not self.budget.cpu:
+                needed += needed // AUTOTUNE_SHARE
+            return needed <= room
+
+        if not fits(1):
+            return None
+        low, high = 1, WHOLE_ROWS_LIMIT
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits(middle):
+                low = middle
+            else:
+                high = middle - 1
+        return low
 
     def _context_bytes(self: "Worker", unit: Unit) -> int:
         """Bytes of a unit's context as the model caches it, padding and own state included."""

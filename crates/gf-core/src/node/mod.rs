@@ -28,8 +28,9 @@ use crate::forecasting::{
 };
 use crate::pages::{Bucket, IndexError, IndexLayout, PageId, PageIndex, PageLayout, Vectors};
 use crate::planner::{
-    Core, CoreKind, Cores, Plan, PlanError, Ranking, Recency, Source, Strata, Strategy,
-    StrategyError, UnitId, Windows, draw_core, plan_given, plan_with, recent, smallest,
+    ADAPTIVE_WHOLE_FROM_CAP, ADAPTIVE_WHOLE_PAST_CAP, Core, CoreKind, Cores, Plan, PlanError,
+    Ranking, Recency, Source, Strata, Strategy, StrategyError, UnitId, Windows, draw_core,
+    plan_given, plan_with, recent, smallest,
 };
 use crate::regions::{Built, Rebuild, RegionSpec, RegionStats, Regions, RegionsError};
 use crate::rows::{RowMemory, RowSnapshot, RowStore, RowsError, Sealer};

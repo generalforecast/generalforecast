@@ -71,10 +71,13 @@ impl Node {
     }
 
     /// Tables that, since the last call, came to wait for the worker to
-    /// measure how many rows their fit takes; each table once.
+    /// measure how many rows their fit takes, or how many it can hold as one
+    /// context; each table once.
     ///
     /// A table waits once a fit would read more than its `EntrySizes::fit_bound`
-    /// rows, and its requests stay pending until `set_fit_limits`.
+    /// rows, and its requests stay pending until `set_fit_limits`; an
+    /// `AdaptiveWhole` table past its model's cap waits until `set_whole_rows`
+    /// too, and both are set for each table named.
     pub fn take_unmeasured(&mut self) -> Vec<TableId> {
         std::mem::take(&mut self.untold)
     }
@@ -100,6 +103,42 @@ impl Node {
         state.spec.sizes.fit_bound = usize::MAX;
         self.unmeasured.remove(&table);
         self.untold.retain(|&untold| untold != table);
+        Ok(())
+    }
+
+    /// Whether a table reads past its model's cap whole once its worker says
+    /// how many rows it can hold as one context, and has not said yet: an
+    /// `AdaptiveWhole` table, which `take_unmeasured` names, for
+    /// `set_whole_rows` to answer.
+    ///
+    /// # Errors
+    ///
+    /// If the table does not exist.
+    pub fn wants_whole_rows(&self, table: TableId) -> Result<bool, NodeError> {
+        let state = self
+            .tables
+            .get(&table)
+            .ok_or(NodeError::UnknownTable(table))?;
+        Ok(state.spec.strategy == Strategy::AdaptiveWhole && state.spec.whole_rows.is_none())
+    }
+
+    /// Sets the most rows a table's worker can hold as one context on its
+    /// device, None where it can hold none, so an `AdaptiveWhole` table past
+    /// its model's cap plans again.
+    ///
+    /// # Errors
+    ///
+    /// If the table does not exist.
+    pub fn set_whole_rows(&mut self, table: TableId, rows: Option<u64>) -> Result<(), NodeError> {
+        let state = self
+            .tables
+            .get_mut(&table)
+            .ok_or(NodeError::UnknownTable(table))?;
+        state.spec.whole_rows = Some(rows.and_then(NonZeroU64::new));
+        if !state.unmeasured_fit() {
+            self.unmeasured.remove(&table);
+            self.untold.retain(|&untold| untold != table);
+        }
         Ok(())
     }
 

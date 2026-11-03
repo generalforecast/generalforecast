@@ -264,6 +264,7 @@ fn a_steps_series_units_and_forecasts_travel_as_grids() {
             refit: RefitPolicy::default(),
             fit_rows: NonZeroUsize::new(DEFAULT_FIT_ROWS).unwrap(),
             context_rows: None,
+            whole_rows: None,
             past_cap: PastCap::Warn,
             regions: None,
             scale_rows: None,

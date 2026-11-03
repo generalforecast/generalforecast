@@ -319,7 +319,7 @@ impl Node {
         // worker measures its limits waits for them.
         waiting.retain(|id| {
             let state = &self.tables[id];
-            let held = state.unmeasured_fit();
+            let held = state.unmeasured_fit() || state.unmeasured_whole();
             if held && self.unmeasured.insert(*id) {
                 self.untold.push(*id);
             }

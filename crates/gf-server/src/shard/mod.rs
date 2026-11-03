@@ -976,6 +976,9 @@ pub struct Shard {
     /// How many rows the worker's fits take, by model and feature count:
     /// the most a state alone is fit on, and the most a fit embeds.
     fit_limits: HashMap<(String, usize), (usize, usize)>,
+    /// The most rows the worker can hold as one context, by model and
+    /// feature count, as `measure_fits` asked it for `adaptive_whole` tables.
+    whole_limits: HashMap<(String, usize), Option<u64>>,
     key: EncryptionKey,
     directory: PathBuf,
     bucket_minimum: NonZeroUsize,
@@ -1065,6 +1068,7 @@ impl Shard {
             names: HashMap::new(),
             profiles: HashMap::new(),
             fit_limits: HashMap::new(),
+            whole_limits: HashMap::new(),
             key,
             directory,
             bucket_minimum: NonZeroUsize::new(memory.bucket_minimum)
