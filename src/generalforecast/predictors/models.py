@@ -117,6 +117,7 @@ class ModelPin:
                         "base_digest": self.derived.base_digest,
                         "digest": self.derived.digest,
                         "bags": self.derived.bags,
+                        "kind": self.derived.kind,
                     }
                 }
                 if self.derived is not None
@@ -227,8 +228,9 @@ class ModelPin:
 def _derived(value: Any, pin: dict) -> Derived:
     """A derived pin's own part, which must run on the base the rest describes."""
     from generalforecast.models.catalog import ORGANIZATION, ModelRefError, parse
+    from generalforecast.models.derived import KINDS
 
-    fields(value, {"model", "base", "base_digest", "digest", "bags"})
+    fields(value, {"model", "base", "base_digest", "digest", "bags", "kind"})
     try:
         ref = parse(value["model"])
     except ModelRefError as error:
@@ -243,12 +245,14 @@ def _derived(value: Any, pin: dict) -> Derived:
     hash_value(value["digest"])
     integer(value["bags"])
     ensure(value["bags"] >= 1, "a derived model has at least one bag")
+    ensure(value["kind"] in KINDS, "a derived model's kind is lora, adapter or full")
     return Derived(
         value["model"],
         value["base"],
         value["base_digest"],
         value["digest"],
         value["bags"],
+        value["kind"],
     )
 
 
