@@ -200,6 +200,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         # On an accelerator a program compiles for tens of seconds, so a
         # stacked count not yet compiled compiles on the side; see `Chunks.run`.
         self._on_side = self._stacks and compile_ahead
+        self._compile_cache = compile_cache
         if compile_cache:
             use_compile_cache()
         # Where measured fits are kept for later processes, beside compiled programs.
@@ -228,7 +229,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
             ),
             ahead=compile_ahead,
             manifests=self._manifest_dir,
-            dropped=self._chunks.forget_counts,
+            dropped=self._dropped,
         )
         self._models: dict[int, _Model] = {}
         # The spec each model was loaded from, under which its kinds of call are recorded.
@@ -319,8 +320,18 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         """Whether the device pool lost its contexts; see `forget_cache`."""
         return self._device.lost
 
+    def _dropped(self) -> None:
+        """Forgets, as every program drops, the counts kinds compiled for and what the compile helper was asked."""
+        self._chunks.forget_counts()
+        helper = self.__dict__.get("_helper")
+        if helper is not None:
+            helper.reset()
+
     def close(self) -> None:
-        """Frees the device pool and forgets every cached context and page."""
+        """Frees the device pool, forgets every cached context and page, and stops the compile helper."""
+        helper = self.__dict__.pop("_helper", None)
+        if helper is not None:
+            helper.close()
         if self._alongside is not None:
             self._alongside.shutdown()
             self._alongside = None

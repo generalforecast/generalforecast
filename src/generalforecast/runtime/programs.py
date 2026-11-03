@@ -226,6 +226,30 @@ def zeros(tree: Any) -> Any | None:
     return jax.tree.unflatten(structure, [zero(leaf) for leaf in leaves])
 
 
+class Loaded:
+    """A program compiled elsewhere for one signature, called as the function it was compiled from.
+
+    `lower(...).compile()` gives the program back, so what reads a call's
+    program, such as its memory or its FLOPs, reads it without compiling.
+    """
+
+    def __init__(self, compiled: Any) -> None:
+        """Holds `compiled`, a program XLA compiled."""
+        self.compiled = compiled
+
+    def __call__(self, *arguments: Any) -> Any:
+        """Runs the program."""
+        return self.compiled(*arguments)
+
+    def lower(self, *_: Any) -> "Loaded":
+        """Itself, as the program is lowered already."""
+        return self
+
+    def compile(self, **_: Any) -> Any:
+        """The program, compiled already."""
+        return self.compiled
+
+
 def _options_for(key: Hashable) -> dict[str, Any] | None:
     """The compiler options a program under `key` compiles with: `DECODE_OPTIONS` for a paged decode on a GPU, else XLA's own."""
     paged = isinstance(key, tuple) and bool(key) and key[0] == "paged"
@@ -445,6 +469,10 @@ class Programs:
         self._done: set[Hashable] = set()
         self._thread = ThreadPoolExecutor(1, thread_name_prefix="gf-warm")
         self._soon = ThreadPoolExecutor(1, thread_name_prefix="gf-soon")
+        # Each kind of call's query counts with a program, as it ran at them
+        # or as programs compiled elsewhere arrived, and those programs.
+        self._sizes: dict[Hashable, set[int]] = {}
+        self._loaded: dict[tuple[Hashable, int], Loaded] = {}
         # Tasks that only save time, which a drop cancels, and tasks steps
         # wait on, which it never does.
         self._later: list[Future] = []
@@ -622,10 +650,51 @@ class Programs:
             self._compiled.clear()
             self._shapes.clear()
             self._done.clear()
+            self._sizes.clear()
+            self._loaded.clear()
         forget_compiled()
         self.drops += 1
         if self._dropped is not None:
             self._dropped()
+
+    @property
+    def generation(self) -> int:
+        """How many times programs were dropped, so what was asked for before a drop can tell."""
+        with self._steps:
+            return self._generation
+
+    def sizes(self, kind: Hashable) -> frozenset[int]:
+        """The query counts a kind of call has a program for."""
+        with self._lock:
+            return frozenset(self._sizes.get(kind, ()))
+
+    def ran(self, kind: Hashable, size: int) -> None:
+        """Counts a query count a kind of call ran at, and so has a program for."""
+        with self._lock:
+            self._sizes.setdefault(kind, set()).add(size)
+
+    def loaded(self, kind: Hashable, size: int) -> Loaded | None:
+        """The program compiled elsewhere for a kind of call at a query count, if one arrived."""
+        with self._lock:
+            return self._loaded.get((kind, size))
+
+    def offer(
+        self,
+        kind: Hashable,
+        size: int,
+        compiled: Any,
+        arguments: tuple,
+        generation: int,
+    ) -> None:
+        """Keeps a program compiled elsewhere for a kind of call at a query count, unless programs dropped since `generation`."""
+        loaded = Loaded(compiled)
+        note_compiled(loaded, arguments, compiled)
+        with self._steps:
+            if self._generation != generation:
+                return
+        with self._lock:
+            self._loaded[kind, size] = loaded
+            self._sizes.setdefault(kind, set()).add(size)
 
     def first(self, marker: Hashable) -> bool:
         """Whether `marker` is new since programs were last dropped; it is not after this."""

@@ -5,8 +5,9 @@
 
 import dataclasses
 import logging
+import os
 from collections import OrderedDict, defaultdict
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -16,7 +17,9 @@ import jax.numpy as jnp
 import numpy as np
 
 from generalforecast import protocol
+from generalforecast._core import bucket_size
 from generalforecast.constants import (
+    GROWN_QUERIES,
     HELD_STATES,
     SCATTER_ROWS,
     SPLIT_QUERIES,
@@ -43,6 +46,7 @@ from generalforecast.runtime.paging import (
 from generalforecast.runtime.shapes import padded as padded_items
 from generalforecast.worker.calls import _host_padded, _item, _stacked
 from generalforecast.worker.encoding import Transient
+from generalforecast.worker.helper import HELPER_ENV, CompileHelper, compiles_aside
 from generalforecast.worker.records import QueryBatch, Unit
 
 if TYPE_CHECKING:
@@ -127,6 +131,39 @@ def split_queries(
             placement.append((batch.request, start, len(batch.units)))
             start = stop
     return pieces, placement
+
+
+def near_larger(queries: int) -> list[int]:
+    """The padded query counts up to `GROWN_QUERIES` times `queries`, a bucket: steps merging more callers reach them."""
+    return [queries << step for step in range(1, GROWN_QUERIES.bit_length())]
+
+
+def _with_queries(call: Call, queries: int) -> tuple:
+    """A paged decode call's arguments as shapes, its query rows and reads at `queries` an item."""
+
+    def shape_of(value: Any, rows: int | None = None) -> jax.ShapeDtypeStruct:
+        shape = list(np.shape(value))
+        if rows is not None:
+            shape[1] = rows
+        return jax.ShapeDtypeStruct(
+            tuple(shape),
+            value.dtype,
+            weak_type=bool(getattr(value, "weak_type", False)),
+        )
+
+    parameters, source = call.shared
+    states, index, blocks, positions, counts, rows, *reads = call.items
+    return (
+        jax.tree.map(shape_of, parameters),
+        shape_of(source),
+        jax.tree.map(shape_of, states),
+        shape_of(index),
+        shape_of(blocks),
+        shape_of(positions),
+        shape_of(counts),
+        shape_of(rows, queries),
+        *[shape_of(read, queries) for read in reads],
+    )
 
 
 class Decodes:
@@ -448,6 +485,8 @@ class Decodes:
         decodings: list[Decoding],
         own: StateLayout | None = None,
         embeds: bool = False,
+        queries: int | None = None,
+        wants: int | None = None,
     ) -> list[tuple[tuple[QueryBatch, list[int]], np.ndarray]]:
         """Decodes contexts read from their slots, as few calls as the budget allows.
 
@@ -458,13 +497,21 @@ class Decodes:
         the queries' features. With `embeds`, the decodings carry their
         queries' features, which embed against their tables' states in the
         decode's program.
+
+        A model the compile helper can rebuild never compiles a decode in a
+        step once its kind has a program for any query count: a decode pads
+        to a larger count with one, at most `GROWN_QUERIES` times its own, or
+        else runs in parts of the largest smaller one, while the helper
+        compiles the count it wanted, and, once a count first runs, those up
+        to `GROWN_QUERIES` times larger (see `_compile_aside`). `queries`, if
+        given, is the count the decodings pad to, and `wants` the count to
+        compile for them.
         """
         key = ("paged", model, num_classes, layout, own, embeds)
         limit = self._chunks.parts(key)
         if limit is not None:
             decodings = [part for d in decodings for part in split(d, limit)]
         shape = paged_shape(decodings, layout, self._size)
-        signature = (key, shape)
         program = self._paged_key(
             model,
             num_classes,
@@ -473,6 +520,34 @@ class Decodes:
             shape.in_order,
             own is not None or embeds,
         )
+        family = dataclasses.replace(shape, queries=0)
+
+        def kind(padded: int) -> Hashable:
+            return (program, family, padded)
+
+        wanted = wants or shape.queries
+        aside = self._aside(model)
+        if queries is not None:
+            shape = dataclasses.replace(shape, queries=queries)
+        elif aside:
+            ready = self.programs.sizes(kind(bucket_size(len(decodings), 1)))
+            if ready and wanted not in ready:
+                larger = [n for n in ready if wanted < n <= GROWN_QUERIES * wanted]
+                smaller = [n for n in ready if n < wanted]
+                if larger:
+                    shape = dataclasses.replace(shape, queries=min(larger))
+                elif smaller:
+                    return self._decode_parts_of(
+                        model,
+                        num_classes,
+                        layout,
+                        decodings,
+                        own,
+                        embeds,
+                        max(smaller),
+                        wanted,
+                    )
+        signature = (key, shape)
         compiled = self._program(program)
         parameters = self._models[model].parameters
         results: list[tuple[tuple[QueryBatch, list[int]], np.ndarray]] = []
@@ -494,14 +569,24 @@ class Decodes:
             # holds neither the slots' bytes whole nor a copy of the pool.
             source, blocks = self._device.source(blocks)
             arguments = (states, index, blocks, *rest)
+            function = compiled
+            if aside:
+                function = self.programs.loaded(kind(padded), shape.queries) or compiled
             latest[:] = [
-                Call(compiled, (parameters, source), arguments, len(index), program)
+                Call(function, (parameters, source), arguments, len(index), program)
             ]
             return latest[0]
 
         def taken(first: int, stop: int, values: Any) -> None:
+            call = latest[0]
+            if aside:
+                self.programs.ran(kind(call.padded), shape.queries)
+                if wanted != shape.queries:
+                    self._compile_aside(model, kind(call.padded), wanted, call, 0)
+                if self.programs.first(("grown", kind(call.padded), shape.queries)):
+                    for more in near_larger(shape.queries):
+                        self._compile_aside(model, kind(call.padded), more, call, 1)
             if self.programs.first(("decodes", signature)):
-                call = latest[0]
                 self._warm_decodes(compiled, call.shared, call.items, shape.queries)
             for position, decoding in enumerate(decodings[first:stop]):
                 with self.stats.timed("unstack"):
@@ -540,6 +625,76 @@ class Decodes:
                 model, num_classes, layout, rest, own, embeds
             )
         return results
+
+    def _decode_parts_of(
+        self: "Worker",
+        model: int,
+        num_classes: int,
+        layout: CacheLayout,
+        decodings: list[Decoding],
+        own: StateLayout | None,
+        embeds: bool,
+        queries: int,
+        wants: int,
+    ) -> list[tuple[tuple[QueryBatch, list[int]], np.ndarray]]:
+        """Decodes in parts of at most `queries` queries, padded to it, a part of each decoding a round.
+
+        Each call then stacks as many decodings as the whole would have, at a
+        count with a program; `wants`, the count the whole wanted, compiles
+        aside.
+        """
+        parts = [split(decoding, queries) for decoding in decodings]
+        results: list[tuple[tuple[QueryBatch, list[int]], np.ndarray]] = []
+        for round_ in range(max(len(each) for each in parts)):
+            chunk = [each[round_] for each in parts if round_ < len(each)]
+            results += self._decode_paged(
+                model, num_classes, layout, chunk, own, embeds, queries, wants
+            )
+        return results
+
+    def _aside(self: "Worker", model: int) -> bool:
+        """Whether a model's decodes compile in the compile helper: on an accelerator, compiling ahead, for a catalog model."""
+        if not self._on_side or os.environ.get(HELPER_ENV) == "0":
+            return False
+        return compiles_aside(self._specs.get(model))
+
+    def _compile_aside(
+        self: "Worker", model: int, kind: Hashable, size: int, call: Call, priority: int
+    ) -> None:
+        """Asks the compile helper for a paged decode's program at `size` queries, once per kind and count.
+
+        The program serves the kind's calls at that count once it arrives,
+        unless programs dropped meanwhile. A count the helper could not
+        compile compiles in the step that next needs it.
+        """
+        if self.programs.loaded(kind, size) is not None:
+            return
+        if not self.programs.first(("aside", kind, size)):
+            return
+        shapes = _with_queries(call, size)
+        generation = self.programs.generation
+
+        def done(executable: Any) -> None:
+            if executable is not None:
+                self.programs.offer(kind, size, executable, shapes, generation)
+
+        request = {"spec": self._specs[model], "key": call.program, "shapes": shapes}
+        self._compile_helper().submit((kind, size), priority, request, done)
+
+    def _compile_helper(self: "Worker") -> CompileHelper:
+        """The worker's compile helper, made when first asked for."""
+        helper = self.__dict__.get("_helper")
+        if helper is None:
+            helper = CompileHelper(
+                {
+                    "settings": self._settings,
+                    "bucket_minimum": self._minimum,
+                    "slot_bytes": self._slot_bytes,
+                    "compile_cache": self._compile_cache,
+                }
+            )
+            self.__dict__["_helper"] = helper
+        return helper
 
     def _stacked_states(self: "Worker", tables: list[int], padded: int) -> Any:
         """The tables' states stacked over a call's `padded` items.

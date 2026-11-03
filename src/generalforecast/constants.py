@@ -94,6 +94,10 @@ WARMED_PAGES = 4
 # decoded, this many buckets above the smallest: steps merging many callers'
 # requests reach them.
 WARMED_QUERIES = 5
+# How many times its own query count a decode pads to, at most, rather than
+# wait for the compile helper to compile its count; and how many times a
+# count first run the counts it then compiles reach.
+GROWN_QUERIES = 4
 # The stacked counts an accelerator's fused calls take, each its own program
 # that compiles for tens of seconds: a step's new contexts pad up to one, or
 # split across the most, rather than compile for every power of two.
