@@ -394,3 +394,27 @@ def test_a_dotted_catalog_id_is_read_by_its_name(wire, asynchronous):
     for kind in ("predictor", "context"):
         with pytest.raises(ServiceError):
             Resource(kind, "tabpfn-3.5")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_run_names_the_model_it_trains_from_as_base(wire, asynchronous):
+    spec = {
+        "name": "r1",
+        "base": "general-forecast/tabicl-v2-classifier",
+        "corpus": "credit-v1",
+        "changes": [{"kind": "lora", "rank": 16}],
+        "evaluation": {"bagging": {"k": 8}},
+    }
+    wire.expect("POST", "/runs", {"name": "r1"}, payload=spec)
+    created = run(
+        asynchronous,
+        wire.url,
+        lambda c: c.runs.create(
+            "r1",
+            base="general-forecast/tabicl-v2-classifier",
+            corpus="credit-v1",
+            changes=[{"kind": "lora", "rank": 16}],
+            evaluation={"bagging": {"k": 8}},
+        ),
+    )
+    assert created == {"name": "r1"}

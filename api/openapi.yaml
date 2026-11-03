@@ -2163,7 +2163,7 @@ paths:
                         state: queued
                         reason: null
                         attempt: 0
-                        base_model: general-forecast/tabicl-v2-classifier
+                        base: general-forecast/tabicl-v2-classifier
                         corpus:
                           name: credit-v1
                           digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2209,7 +2209,7 @@ paths:
                     name: r1
                   payload:
                     name: r1
-                    base_model: general-forecast/tabicl-v2-classifier
+                    base: general-forecast/tabicl-v2-classifier
                     corpus: credit-v1
                     changes:
                     - kind: lora
@@ -2238,7 +2238,7 @@ paths:
                       state: queued
                       reason: null
                       attempt: 0
-                      base_model: general-forecast/tabicl-v2-classifier
+                      base: general-forecast/tabicl-v2-classifier
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2288,7 +2288,7 @@ paths:
                       state: queued
                       reason: null
                       attempt: 0
-                      base_model: general-forecast/tabicl-v2-classifier
+                      base: general-forecast/tabicl-v2-classifier
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2358,7 +2358,7 @@ paths:
                       state: queued
                       reason: null
                       attempt: 0
-                      base_model: general-forecast/tabicl-v2-classifier
+                      base: general-forecast/tabicl-v2-classifier
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2428,7 +2428,7 @@ paths:
                       state: cancelled
                       reason: null
                       attempt: 0
-                      base_model: general-forecast/tabicl-v2-classifier
+                      base: general-forecast/tabicl-v2-classifier
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2479,7 +2479,7 @@ paths:
                       - at: 1761200000.0
                         kind: created
                         body:
-                          base_model: general-forecast/tabicl-v2-classifier
+                          base: general-forecast/tabicl-v2-classifier
                           corpus:
                             name: credit-v1
                             digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -5307,7 +5307,7 @@ components:
       - state
       - reason
       - attempt
-      - base_model
+      - base
       - corpus
       - changes
       - evaluation
@@ -5331,8 +5331,9 @@ components:
         attempt:
           type: integer
           minimum: 0
-        base_model:
+        base:
           $ref: '#/components/schemas/ModelId'
+          description: the catalog model the run trains from
         corpus:
           $ref: '#/components/schemas/RunCorpus'
         changes:
@@ -5393,7 +5394,7 @@ components:
       type: object
       required:
       - name
-      - base_model
+      - base
       - corpus
       - changes
       - evaluation
@@ -5401,8 +5402,9 @@ components:
       properties:
         name:
           $ref: '#/components/schemas/Name'
-        base_model:
+        base:
           $ref: '#/components/schemas/ModelId'
+          description: the catalog model the run trains from; a fine-tune is refused with 422
         corpus:
           $ref: '#/components/schemas/Name'
         changes:
