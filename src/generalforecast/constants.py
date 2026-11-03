@@ -150,3 +150,9 @@ ATTENTION_BLOCK_CHUNK = 1 << 18
 
 # How often the sampler reads every thread's stack.
 SAMPLE_INTERVAL = 0.001
+
+# The most queries a context with no room to keep may have to encode and
+# decode in one call with many others: one per query under neighbors, or a
+# few. A context more queries read decodes them on its own, in parts if
+# they do not fit at once.
+FUSED_QUERIES = 8
