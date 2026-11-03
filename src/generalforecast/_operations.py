@@ -617,30 +617,29 @@ def put_chunk(url: str, start: int, data: bytes, total: int) -> int:
 def training_upload(
     data: Any, metadata: JsonObject, *, wait: bool, poll: float = 1.0
 ) -> Operation[JsonObject]:
-    """Uploads a training table in chunks, completes it, and waits for verification.
+    """Uploads a training table in chunks and waits for the service to verify it.
 
-    The chunks go where the service says: straight to object storage when it
-    returns a URL, else to the service. A rejected upload raises with the
-    reason the service gave.
+    The upload opens with the table's size and metadata, so the service
+    refuses a bad one before any bytes move. The chunks go where it says:
+    straight to object storage when it returns a URL, else to the service.
+    Once every declared byte is stored, the service verifies the upload on
+    its own. A rejected upload raises with the reason the service gave.
     """
     body = yield Work(parquet_bytes, (data,))
-    opened = yield Call(
-        "POST", "/uploads", "corpus", "new", {"bytes": len(body), "format": "parquet"}
+    state = yield Call(
+        "POST",
+        "/uploads",
+        "corpus",
+        "new",
+        {"bytes": len(body), "format": "parquet", "metadata": metadata},
     )
-    upload, url, size = opened["id"], opened.get("url"), opened["chunk_bytes"]
+    upload, url, size = state["id"], state.get("url"), state["chunk_bytes"]
     for start in range(0, len(body), size):
         part = body[start : start + size]
         if url:
             yield Work(put_chunk, (url, start, part, len(body)))
         else:
             yield Chunk(upload, start, part, len(body))
-    state = yield Call(
-        "POST",
-        f"/uploads/{name(upload)}/complete",
-        "corpus",
-        upload,
-        {"metadata": metadata},
-    )
     while wait and state["state"] not in UPLOAD_DONE:
         yield Pause(poll)
         state = yield from got("corpus", "uploads", upload)
