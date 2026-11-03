@@ -29,6 +29,7 @@ from generalforecast.runtime.memory import (
     MemoryProfile,
     NoMemoryAnalysis,
     WorkingProfile,
+    concurrently,
     decode_profile,
     encode_bytes,
     encode_profile,
@@ -491,6 +492,14 @@ class Admission:
         features = self.width(model, features)
         per_row = self.profile(model, features).cache_bytes_per_row
         layout = self.layout(model, features)
+        # The two profiles every size reads compile side by side, then are read
+        # as each is kept.
+        concurrently(
+            [
+                lambda: self.decode_profile(model),
+                lambda: self.encode_profile(model, features),
+            ]
+        )
         decode = self.decode_profile(model)
         room = self.budget.device - self._pool_bytes
         measures = 0
@@ -507,10 +516,38 @@ class Admission:
             needed = max(encode, 2 * size * per_row + working)
             return needed + max(encode, working) // AUTOTUNE_SHARE <= room
 
-        def measured_fits(size: int) -> bool | None:
+        def ahead(size: int, larger: bool) -> None:
+            """Measures `size` and the sizes the search would measure after it, side by side.
+
+            A search that measures one size and finds it fits measures the
+            next padded size, then the one after, each a compile of an encode
+            many times the device's working sizes; at once they take about
+            as long as one. A size the search then stops short of was
+            measured for nothing.
+            """
+            sizes = [size]
+            while len(sizes) < MEMORY_ROWS_MEASURES - measures:
+                last = sizes[-1]
+                step = self._size(last + 1) if larger else self._size(last // 2)
+                if step == last or (not larger and step < self._minimum):
+                    break
+                sizes.append(step)
+
+            def measure(rows: int) -> None:
+                # A size that cannot compile raises when the search reads it.
+                try:
+                    self.encode_bytes(model, features, rows, exact=True)
+                except ValueError:
+                    pass
+
+            concurrently([lambda rows=rows: measure(rows) for rows in sizes])
+
+        def measured_fits(size: int, larger: bool = True) -> bool | None:
             nonlocal measures
             found = fits(size, exact=False)
             if found is False and measures < MEMORY_ROWS_MEASURES:
+                if measures == 0:
+                    ahead(size, larger)
                 measures += 1
                 found = fits(size, exact=True)
             return found
@@ -522,7 +559,7 @@ class Admission:
         if not found:
             while size > self._minimum:
                 size = self._size(size // 2)
-                found = measured_fits(size)
+                found = measured_fits(size, larger=False)
                 if found is None:
                     return None
                 if found:
