@@ -504,7 +504,7 @@ class Runs(Collection):
         self,
         name: str,
         *,
-        base_model: str,
+        base: str,
         corpus: str,
         changes: builtins.list[JsonObject],
         evaluation: JsonObject,
@@ -516,11 +516,12 @@ class Runs(Collection):
     ) -> JsonObject:
         """Creates a run; with a `plan` it trains as soon as it is set up.
 
-        Creating the same run again returns it.
+        `base` is the catalog model the run trains from. Creating the same
+        run again returns it.
         """
         payload = ops.run_spec(
             name,
-            base_model=base_model,
+            base=base,
             corpus=corpus,
             changes=changes,
             evaluation=evaluation,

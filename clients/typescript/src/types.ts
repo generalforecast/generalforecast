@@ -673,7 +673,7 @@ export interface Run {
   state: RunState;
   reason: string | null;
   attempt: number;
-  base_model: ModelId;
+  base: ModelId;
   corpus: RunCorpus;
   changes: Record<string, unknown>[];
   evaluation: Record<string, unknown>;
@@ -700,7 +700,7 @@ export interface RunListReply extends Envelope {
 
 export interface RunCreate {
   name: Name;
-  base_model: ModelId;
+  base: ModelId;
   corpus: Name;
   changes: Record<string, unknown>[];
   evaluation: Record<string, unknown>;
