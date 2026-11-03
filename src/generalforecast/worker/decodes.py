@@ -15,6 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from generalforecast import protocol
 from generalforecast.constants import (
     HELD_STATES,
     SCATTER_ROWS,
@@ -115,11 +116,12 @@ def split_queries(
             stop = start + count
             whole = start == 0 and stop == len(batch.units)
             pieces.append(
-                dataclasses.replace(
-                    batch,
-                    request=len(pieces),
-                    features=batch.features if whole else batch.features[start:stop],
-                    units=batch.units if whole else batch.units[start:stop],
+                protocol.QueryBatch(
+                    len(pieces),
+                    batch.table,
+                    batch.epoch,
+                    batch.features if whole else batch.features[start:stop],
+                    batch.units if whole else batch.units[start:stop],
                 )
             )
             placement.append((batch.request, start, len(batch.units)))
@@ -226,9 +228,7 @@ class Decodes:
         hosts, features = [], []
         for batch, inline in zip(batches, fused, strict=True):
             with self.stats.timed("pad"):
-                hosts.append(
-                    _host_padded(batch.features, self._size(len(batch.units)))
-                )
+                hosts.append(_host_padded(batch.features, self._size(len(batch.units))))
             if inline:
                 features.append(None)
                 continue
@@ -299,7 +299,9 @@ class Decodes:
                 at = np.asarray(queries, dtype=np.intp) + offset
                 for start in range(0, len(at), SCATTER_ROWS):
                     stop = start + SCATTER_ROWS
-                    parts.append((predictions[request], at[start:stop], values[start:stop]))
+                    parts.append(
+                        (predictions[request], at[start:stop], values[start:stop])
+                    )
             self._scatter(parts)
         return predictions
 

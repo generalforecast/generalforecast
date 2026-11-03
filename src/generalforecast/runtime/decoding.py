@@ -274,11 +274,11 @@ def paged_inputs(
     # The query rows stay on the device, where the embed left them; features
     # a decode embeds itself stack on the host and go with the call.
     if all(isinstance(d.rows, np.ndarray) for d in chunk):
-        rows = np.stack(padded([_host_rows(d.rows, shape.queries) for d in chunk], count))
-    else:
-        rows = jnp.stack(
-            padded([_padded(d.rows, shape.queries) for d in chunk], count)
+        rows = np.stack(
+            padded([_host_rows(d.rows, shape.queries) for d in chunk], count)
         )
+    else:
+        rows = jnp.stack(padded([_padded(d.rows, shape.queries) for d in chunk], count))
     # Which rows each query reads, when any decoding says; padding rows read
     # every row. Queries by rows, so only a masked call builds it.
     masked = (count, shape.queries, shape.context_rows) if shape.masked else (0, 0, 0)

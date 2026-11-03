@@ -3207,7 +3207,9 @@ def test_queries_split_past_the_threshold_predict_as_one_batch(
     whole = rows.predict(queries)
 
     monkeypatch.setattr(worker_decodes, "SPLIT_QUERIES", 2)
-    assert len(query_pieces(len(queries), lambda rows: 1 << (rows - 1).bit_length())) > 1
+    assert (
+        len(query_pieces(len(queries), lambda rows: 1 << (rows - 1).bit_length())) > 1
+    )
     split = rows.predict(queries)
 
     np.testing.assert_allclose(split, whole, rtol=1e-5, atol=1e-6)
