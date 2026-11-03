@@ -885,6 +885,14 @@ async fn revision_predict(
     Ok(result)
 }
 
+/// Whether a reference names a derived model, `<owner>/<name>@ft<version>`:
+/// a catalog model's name holds no `@`, so `@ft` after its `/` is a version.
+fn derived(reference: &str) -> bool {
+    reference
+        .split_once('/')
+        .is_some_and(|(_, rest)| rest.contains("@ft"))
+}
+
 async fn native_predict(
     front: &Front,
     served: &ServedModel,
@@ -898,14 +906,18 @@ async fn native_predict(
     let base = front
         .models
         .iter()
-        .find(|model| model.predictor.is_none() && model.resolved == served.resolved)
-        .ok_or_else(|| {
-            ApiError::new(
+        .find(|model| model.predictor.is_none() && model.resolved == served.resolved);
+    let worker = match base {
+        Some(base) => base.worker.clone(),
+        None if derived(&served.reference) => front.derived_worker(served).await?,
+        None => {
+            return Err(ApiError::new(
                 "ModelUnavailable",
                 "the revision's model is not served here",
                 503,
-            )
-        })?;
+            ));
+        }
+    };
     // A revision's snapshot or live rows come with it, so they bind with
     // each request, shared, so every prediction is the one gf serve's
     // durable binding of the same rows answers.
@@ -914,7 +926,7 @@ async fn native_predict(
             .ok_or_else(failed)
     })?;
     let mut ephemeral = served.clone();
-    ephemeral.worker.clone_from(&base.worker);
+    ephemeral.worker = worker;
     let mut bound = predictor.clone();
     bound.context = ContextMode::Request;
     bound.snapshot = None;

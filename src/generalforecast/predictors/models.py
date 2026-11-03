@@ -302,6 +302,16 @@ def describe(requested: str) -> ModelPin:
         raise PredictorError(error.code, str(error)) from None
     if ref.custom:
         raise PredictorError("UnsupportedModel", custom_refused(ref.name))
+    if ref.derived:
+        from dataclasses import replace
+
+        from generalforecast.models.catalog import resolve_derived
+
+        try:
+            made = resolve_derived(ref)
+        except ModelRefError as error:
+            raise PredictorError(error.code, str(error)) from None
+        return replace(project(ref.entry, ref, V1_POLICY), derived=made)
     return project(ref.entry, ref, V1_POLICY)
 
 

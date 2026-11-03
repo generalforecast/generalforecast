@@ -11,7 +11,7 @@
 //! Bearer keys are checked by a `KeyStore`: one static key, or the control
 //! plane's introspection behind a short cache.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -357,6 +357,9 @@ pub struct Front {
     /// The shape buckets compiled at startup, by the model's resolved id,
     /// which `GET models` reports as each model's `warm_shapes`.
     warm: OnceLock<Vec<(String, Value)>>,
+    /// The derived models every worker has loaded on demand, by the name
+    /// the workers serve them by.
+    derived: Mutex<HashSet<String>>,
 }
 
 /// A forecast predictor's context: its series aligned once, and checked as
@@ -392,7 +395,30 @@ impl Front {
             upstream: None,
             revisions: None,
             warm: OnceLock::new(),
+            derived: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// The worker model a revision's derived model runs as, which every
+    /// worker loads the first time a revision needs it: a derived model,
+    /// `<owner>/<name>@ft<version>`, is weights its plane keeps over a
+    /// catalog base, so no startup list names it. The workers load it
+    /// through the plane's resolver, which checks its weights.
+    async fn derived_worker(&self, served: &ServedModel) -> Result<String, ApiError> {
+        let worker = served.worker.clone();
+        let known = self
+            .derived
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(&worker);
+        if !known {
+            self.engine()?.add_model(&worker, &worker).await?;
+            self.derived
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(worker.clone());
+        }
+        Ok(worker)
     }
 
     /// Compiles the common shape buckets for every tabular catalog model

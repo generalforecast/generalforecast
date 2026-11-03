@@ -154,3 +154,18 @@ def test_a_derived_block_and_lock_version_2_go_together(plane, fine_tuned, churn
         change(forged)
         with pytest.raises(PredictorError):
             parse_lock(forged)
+
+
+def test_gf_server_runs_a_derived_model_as_its_own_worker_model(plane):
+    from generalforecast.predictors.models import describe
+    from generalforecast.serve.models import resolved_id, worker_model
+
+    ref = catalog.parse(f"{FINE_TUNE}*2")
+    plane.bags = 4
+    # Its own pinned id, owner kept, and the worker model it loads on demand.
+    assert resolved_id(ref) == f"{FINE_TUNE}@{WEIGHTS}*2"
+    assert worker_model(ref) == FINE_TUNE
+    assert describe(FINE_TUNE).model_digest == WEIGHTS
+    catalog_ref = catalog.parse(MODEL)
+    assert worker_model(catalog_ref) == MODEL
+    assert resolved_id(catalog_ref).startswith(f"{MODEL}@sha256:")
