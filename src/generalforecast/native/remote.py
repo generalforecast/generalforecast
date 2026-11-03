@@ -694,7 +694,13 @@ class RemoteClient:
                 see `generalforecast.columns.infer`.
             classes: Number of classes, for a classifier's table. A regressor's
                 table takes none: the model decides what a table predicts.
-            strategy: How each query's context is chosen; exact by default.
+            strategy: How each query's context is chosen. By default
+                `Strategy.adaptive_whole()`: every row while the table is
+                within the model's cap and the device holds its context, and
+                past them a core and each query's nearest rows, so a table is
+                never refused for its size. Pass `Strategy.exact()` to read
+                every row however large the table, which a context the device
+                cannot hold refuses.
             page_size: Rows per page.
             time_bucket: A window of time that pages never straddle, in the
                 units of row times, or a timedelta for a datetime table; with
@@ -765,7 +771,7 @@ class RemoteClient:
         made = columns_of(features, columns)
         _check_times(times)
         _check_classes(classes)
-        spec = json.loads((strategy or Strategy.exact()).spec())
+        spec = json.loads((strategy or Strategy.adaptive_whole()).spec())
         self._action(
             "create_table",
             {

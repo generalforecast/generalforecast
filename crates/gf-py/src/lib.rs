@@ -79,7 +79,7 @@ fn block_shape(row_bytes: i64, slot_bytes: i64) -> PyResult<(u64, u64)> {
     ))
 }
 
-/// The padded size for `rows` rows: `minimum` doubled until it fits, past 16384 rows in quarters of the power of two below.
+/// The padded size for `rows` rows: `minimum` doubled until it fits, past 16384 rows in quarters of the power of two below and past 262144 in eighths.
 #[pyfunction]
 #[pyo3(signature = (rows, minimum = 8))]
 fn bucket_size(rows: i64, minimum: i64) -> PyResult<usize> {

@@ -468,6 +468,7 @@ class Decodes:
             if (
                 deferred.stage == "encode"
                 and isinstance(arguments[1], _Gather)
+                and arguments[1].on_device
                 and len(item.queries) <= FUSED_QUERIES
             ):
                 # Alike calls: one table, one batch's query rows, one padded
@@ -479,7 +480,18 @@ class Decodes:
                 rest.append(item)
         outputs: list[tuple[tuple[QueryBatch, list[int]], Any]] = []
         for (_, _, _, count), same in fused.items():
-            outputs += self._encode_decode(same, transient, count)
+            try:
+                outputs += self._encode_decode(same, transient, count)
+            except jax.errors.JaxRuntimeError as error:
+                if not out_of_memory(error):
+                    raise
+                # One context's encode and decode in one call outgrew the
+                # device: its contexts encode, then decode, as the rest do.
+                logger.warning(
+                    "a fused encode and decode of one context ran out of device "
+                    "memory; its contexts encode and decode apart"
+                )
+                rest += same
         if not rest:
             return outputs
         work = rest
@@ -541,11 +553,13 @@ class Decodes:
             for position in range(start, stop):
                 results[position] = values[position - start]
 
+        # The step's rows the call gathers from are held beside it.
+        joined = gather.values.nbytes + gather.targets.nbytes
         self._chunks.run(
             "encode",
             key,
             len(work),
-            self._call_bytes,
+            max(1, self._call_bytes - joined),
             lambda: per_context,
             prepare,
             consume,

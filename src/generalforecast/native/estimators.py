@@ -314,7 +314,9 @@ class _Estimator(BaseEstimator):
         client = self.client if self.client is not None else _local(self.download)
         name = f"estimator-{uuid.uuid4().hex}"
         kinds = getattr(self, "_kinds", None)
-        strategy = Strategy.exact()
+        # Without a selection the table follows its size, as an engine table
+        # does: whole while the model's cap and the device allow it.
+        strategy = Strategy.adaptive_whole()
         if self.selection is not None:
             cap = (
                 registry.limits(self.model).context_rows

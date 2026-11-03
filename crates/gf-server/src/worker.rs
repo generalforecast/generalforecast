@@ -901,7 +901,8 @@ impl WorkerConnection {
 
     /// Sends a frame and waits for its reply while the worker reports
     /// progress at least every `timeout`, as it does for each program it
-    /// compiles. A worker silent for longer is killed, as `request_within`
+    /// compiles and, at most once a second, for the calls it finishes. A
+    /// worker silent for longer is killed, as `request_within`
     /// kills it.
     ///
     /// # Errors

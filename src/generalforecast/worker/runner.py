@@ -202,6 +202,9 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         # Takes the keys of programs readied beside steps for deferred
         # tables; without it, no table's part waits for a program.
         self.announce: Callable[[list[str]], None] | None = None
+        # Told of each call a step finishes, so a step of many long calls
+        # reads to the server as moving rather than hung.
+        self.progressed: Callable[[], None] | None = None
         # The tables the running step defers, by the program they wait for.
         self.deferred: dict[int, str] = {}
         # Programs being readied beside steps, and those that failed to be,

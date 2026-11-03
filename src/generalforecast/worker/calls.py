@@ -318,6 +318,8 @@ class Calls:
             self.stats.calls[stage] = self.stats.calls.get(stage, 0) + 1
             self.stats.seconds[stage] = self.stats.seconds.get(stage, 0.0) + seconds
             self.stats.flops[stage] = self.stats.flops.get(stage, 0.0) + flops
+        if self.progressed is not None:
+            self.progressed()
 
     def _compiled(self: "Worker", stage: str) -> None:
         """Counts a call of a stage whose shape its program had not seen."""

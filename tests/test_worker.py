@@ -92,6 +92,22 @@ def test_a_worker_is_allocated_only_once_told_its_tiers() -> None:
     assert worker.allocated
 
 
+def test_each_call_a_step_finishes_tells_of_its_progress() -> None:
+    # The server counts a worker silent for long on a step as hung, so a step
+    # of many calls compiled long before says it is moving as each finishes.
+    worker = Worker(slot_bytes=4096, compile_cache=False, compile_ahead=False)
+    _, step = _fused(worker, 2)
+    worker.run(step([0, 1]))
+    calls = sum(worker.stats.calls.values())
+    told: list[None] = []
+    worker.progressed = lambda: told.append(None)
+
+    worker.run(step([0, 1]))
+
+    assert calls > 0
+    assert len(told) == sum(worker.stats.calls.values()) - calls
+
+
 def test_a_table_its_part_answers_after_the_whole_step_failed_is_not_deferred(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

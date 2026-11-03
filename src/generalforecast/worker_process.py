@@ -45,6 +45,8 @@ from generalforecast.worker import Worker
 Frame = tuple[dict[str, Any], list[bytes]]
 # The event JAX records as XLA finishes compiling a program.
 BACKEND_COMPILE = "/jax/core/compile/backend_compile_duration"
+# Seconds between the progress a step's finished calls report.
+CALL_PROGRESS_SECONDS = 1.0
 
 
 def main(arguments: Sequence[str] | None = None) -> int:
@@ -165,6 +167,17 @@ def main(arguments: Sequence[str] | None = None) -> int:
         replies.put(lambda: (frame, []))
 
     worker.announce = announced
+    # When a call last told the server the step is moving: a step of many
+    # short calls says so once a second, not once a call.
+    last_call = [0.0]
+
+    def called() -> None:
+        now = time.monotonic()
+        if now - last_call[0] >= CALL_PROGRESS_SECONDS:
+            last_call[0] = now
+            replies.put(lambda: (progress, []))
+
+    worker.progressed = called
 
     def loaded(frame: dict[str, Any]) -> None:
         replies.put(lambda: (frame, []))

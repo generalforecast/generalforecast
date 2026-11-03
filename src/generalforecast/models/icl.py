@@ -15,6 +15,7 @@ from generalforecast.nn.attention import (
     AttentionCache,
     attention_block,
     block_kv,
+    in_chunks,
 )
 from generalforecast.nn.linear import (
     LinearParameters,
@@ -32,6 +33,12 @@ from generalforecast.nn.target import (
     ValueEncoder,
     embed_targets,
 )
+
+# Positions of a row block an in-context row counts for, in its kernel's
+# `block_chunk`: an ICL row holds its feed-forward's hidden width several
+# times over where a row block's position holds its model width, so an
+# encode steps an eighth as many rows.
+ICL_ROW_POSITIONS = 8
 
 
 @jax.tree_util.register_dataclass
@@ -86,6 +93,11 @@ def encode_context(
     hidden = context + embed_targets(parameters.target_encoder, targets)
     retrieval = isinstance(parameters.decoder, RetrievalParameters)
     layers: list[AttentionCache] = []
+    # Each row's update reads the layer's keys and values and itself alone, so
+    # rows go a step at a time past the kernel's block chunk: a context's
+    # encode then holds its cache and a step's activations, not every row's.
+    chunk = parameters.blocks[0].attention.kernel.block_chunk
+    per_step = None if chunk is None else max(1, chunk // ICL_ROW_POSITIONS)
     for index, block in enumerate(parameters.blocks):
         cache = block_kv(block, hidden, length)
         if heads is None:
@@ -99,7 +111,14 @@ def encode_context(
         # An MLP decoder reads only the queries' last outputs, so context rows stop
         # at the last keys; a retrieval decoder reads theirs too.
         if retrieval or index < len(parameters.blocks) - 1:
-            hidden = attention_block(block, hidden, cache)
+            hidden = in_chunks(
+                lambda rows, block=block, cache=cache: attention_block(
+                    block, rows, cache
+                ),
+                (hidden,),
+                per_step,
+                axis=1,
+            )
     if not isinstance(parameters.decoder, RetrievalParameters):
         return ICLCache(layers=tuple(layers))
     labels = retrieval_cache(

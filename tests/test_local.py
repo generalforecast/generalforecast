@@ -455,8 +455,10 @@ def test_adaptive_tables_read_no_more_rows_than_the_device_holds() -> None:
     def needs(rows: int) -> int:
         encode = worker.encode_bytes(loaded, 5, rows, exact=True)
         assert encode is not None
-        needed = max(encode, decode.working_bytes(row, rows))
-        return needed + needed // AUTOTUNE_SHARE
+        working = decode.working_bytes(row, rows)
+        # As a put-off context needs, which holds no less than a kept one.
+        needed = max(encode, 2 * rows * row + working)
+        return needed + max(encode, working) // AUTOTUNE_SHARE
 
     # A device, beside its pool, that holds a context of `small` rows as
     # `_fits_device` checks it, but not one of `large`; as an accelerator is.
@@ -481,6 +483,45 @@ def test_adaptive_tables_read_no_more_rows_than_the_device_holds() -> None:
     # reads a core and each query's neighbors, at most what the device holds.
     with pytest.raises(ValueError, match="encoding it"):
         whole.predict(NEAR_A)
+    assert adaptive.predict(NEAR_A).shape == (2, 3)
+    assert adaptive.describe().context_rows == small
+
+
+@pytest.mark.slow
+def test_a_model_whose_measured_contexts_overfill_the_device_reads_fewer_rows() -> None:
+    client = node_harness.local()
+    worker = client._worker
+    small = MEASURED_ROWS // 4
+    features, targets = _clusters(MEASURED_ROWS)
+    first = _table(client, name="first", model=TABICL)
+    (loaded,) = worker._models
+    row = worker.profile(loaded, 5).cache_bytes_per_row
+    decode = worker.decode_profile(loaded)
+
+    def needs(rows: int) -> int:
+        encode = worker.encode_bytes(loaded, 5, rows, exact=True)
+        assert encode is not None
+        working = decode.working_bytes(row, rows)
+        needed = max(encode, 2 * rows * row + working)
+        return needed + max(encode, working) // AUTOTUNE_SHARE
+
+    # A device too small beside its pool for even the smallest measured
+    # context, as for a wide model whose rows cache many megabytes each: the
+    # cap shrinks from it to the largest that fits, rather than holding at it.
+    room = (needs(small) + needs(2 * small)) // 2
+    worker.budget = dataclasses.replace(
+        worker.budget, device=worker._pool_bytes + room, cpu=False
+    )
+    assert worker.memory_rows(loaded, 5) == small
+    del first
+
+    adaptive = _table(
+        client,
+        name="adaptive",
+        model=TABICL,
+        strategy=generalforecast.Strategy.adaptive(),
+    )
+    adaptive.insert(np.arange(MEASURED_ROWS), features, targets)
     assert adaptive.predict(NEAR_A).shape == (2, 3)
     assert adaptive.describe().context_rows == small
 
@@ -1691,6 +1732,66 @@ def test_contexts_with_no_room_are_encoded_only_as_their_decode_needs_them(
     assert client.stats.transient >= 8
     assert len(calls) >= 8
     assert max(calls) <= 2, calls
+
+
+def test_step_rows_too_many_for_the_device_are_gathered_on_the_host(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tiny_tabicl(regression=False)
+    unit = memory_profile(tabicl_functions, model, 5).context_bytes(16)
+    features, targets = _clusters(64)
+    queries = np.concatenate([NEAR_A, NEAR_B, NEAR_A + 0.5])
+    predictions, fused = [], []
+    for on_device in (True, False):
+        # No room on the device: every context is transient.
+        client = node_harness.local(device_bytes=unit // 2, slot_bytes=unit // 2)
+        worker = client._worker
+        # A wide model's representations of a step's rows can outgrow the
+        # device beside its pool and a call; its units then gather on the host.
+        monkeypatch.setattr(
+            worker, "_joins_on_device", lambda *_, joins=on_device: joins
+        )
+        calls = _fused_calls(monkeypatch, worker)
+        rows = _table(
+            client, strategy=generalforecast.Strategy.neighbors(16), model=TABICL
+        )
+        rows.insert(np.arange(64), features, targets)
+        predictions.append(rows.predict(queries))
+        fused.append(len(calls))
+        assert client.stats.transient > 0
+
+    assert fused[0] > 0 and fused[1] == 0
+    np.testing.assert_allclose(predictions[0], predictions[1], rtol=1e-5, atol=1e-5)
+
+
+def test_contexts_whose_fused_call_runs_out_of_memory_encode_and_decode_apart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tiny_tabicl(regression=False)
+    unit = memory_profile(tabicl_functions, model, 5).context_bytes(16)
+    features, targets = _clusters(64)
+    queries = np.concatenate([NEAR_A, NEAR_B, NEAR_A + 0.5])
+    predictions = []
+    for fails in (False, True):
+        # No room on the device: every context is transient.
+        client = node_harness.local(device_bytes=unit // 2, slot_bytes=unit // 2)
+        worker = client._worker
+        if fails:
+
+            def out_of_memory(*_: Any) -> Any:
+                raise jax.errors.JaxRuntimeError(
+                    "RESOURCE_EXHAUSTED: Out of memory while trying to allocate"
+                )
+
+            monkeypatch.setattr(worker, "_encode_decode", out_of_memory)
+        rows = _table(
+            client, strategy=generalforecast.Strategy.neighbors(16), model=TABICL
+        )
+        rows.insert(np.arange(64), features, targets)
+        predictions.append(rows.predict(queries))
+        assert client.stats.transient > 0
+
+    np.testing.assert_allclose(predictions[0], predictions[1], rtol=1e-5, atol=1e-5)
 
 
 def test_dense_contexts_are_encoded_a_call_budget_at_a_time(
