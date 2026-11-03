@@ -20,7 +20,10 @@ type CoreKind = Literal["random", "stratified", "balanced", "diverse"]
 DEFAULT_FIT_ROWS: int
 
 def bucket_size(rows: int, minimum: int = 8) -> int:
-    """The padded size for `rows` rows: `minimum` doubled until it fits."""
+    """The padded size for `rows` rows: `minimum` doubled until it fits, past 16384 rows in quarters of the power of two below."""
+
+def block_shape(row_bytes: int, slot_bytes: int) -> tuple[int, int]:
+    """The rows a block of a context's cache holds and the slots it takes, for rows of `row_bytes` bytes in slots of `slot_bytes`."""
 
 type Surface = Literal["local", "remote", "self-hosted"]
 type Label = str | bool | int

@@ -127,6 +127,57 @@ def test_an_item_that_alone_runs_out_of_memory_raises() -> None:
         _run(Chunks(lambda *_: None), refusing, items, 8 * items[0].nbytes)
 
 
+def test_a_call_whose_autotuning_runs_out_of_memory_runs_compiled_without_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jitted = jax.jit(lambda values: values * 2)
+    tuned: list[int] = []
+
+    class Autotuned:
+        """A program whose compile fails autotuning, as XLA's does when its buffers do not fit."""
+
+        def __call__(self, values: Any) -> Any:
+            tuned.append(len(values))
+            raise jax.errors.JaxRuntimeError(
+                "RESOURCE_EXHAUSTED: Failed to get configs for: 8 out of 24 "
+                "instructions. Example failure: Out of memory while trying to "
+                "allocate 24.00MiB"
+            )
+
+        def lower(self, *arguments: Any) -> Any:
+            return jitted.lower(*arguments)
+
+    compiled: list[dict] = []
+    real = jax.stages.Lowered.compile
+
+    def compile(lowered: Any, compiler_options: Any = None) -> Any:
+        if compiler_options:
+            compiled.append(compiler_options)
+        return real(lowered, compiler_options=compiler_options)
+
+    monkeypatch.setattr(jax.stages.Lowered, "compile", compile)
+    items = np.arange(8, dtype=np.float32).reshape(2, 4)
+    outputs: list[np.ndarray] = []
+    chunks = Chunks(lambda *_: None)
+    program = Autotuned()
+
+    def prepare(first: int, stop: int, padded: int) -> Call:
+        return Call(program, (), (items[first:stop],), padded)
+
+    def consume(first: int, stop: int, values: Any) -> None:
+        outputs.append(np.asarray(values))
+
+    for _ in range(2):
+        chunks.run("decode", "key", 2, 1 << 20, lambda: 32, prepare, consume)
+
+    # The first call fails autotuning; the program compiles once without it
+    # and serves both runs, whose answers are the program's.
+    assert tuned == [2]
+    assert compiled == [budget_module.UNTUNED_OPTIONS]
+    for answer in outputs:
+        np.testing.assert_array_equal(answer, items * 2)
+
+
 def test_a_run_past_one_call_pads_its_last_call_to_the_chunk() -> None:
     # Four items fit a call: seven items run as a call of four and one of
     # three padded to four, so the program compiles for one shape, and each

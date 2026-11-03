@@ -35,17 +35,14 @@ pub struct EntrySizes {
 }
 
 impl EntrySizes {
-    /// Bytes a context of `rows` rows takes: whole slots, each holding as many
-    /// padded rows as fit, as the worker packs them, then its state's slots.
+    /// Bytes a context of `rows` rows takes: whole blocks of slots, each
+    /// holding the padded rows `block_shape` says, as the worker packs them,
+    /// then its state's slots.
     pub(super) fn bytes(&self, rows: usize, slot_bytes: u64) -> u64 {
         let padded = bucket_size(rows, self.bucket_minimum) as u64;
-        let per_row = self.bytes_per_row.max(1);
         let state = self.state_bytes.div_ceil(slot_bytes) * slot_bytes;
-        if per_row > slot_bytes {
-            // A row wider than a slot takes whole slots of its own.
-            return padded * per_row.div_ceil(slot_bytes) * slot_bytes + state;
-        }
-        padded.div_ceil(slot_bytes / per_row) * slot_bytes + state
+        let (per_block, slots) = block_shape(self.bytes_per_row, slot_bytes);
+        padded.div_ceil(per_block) * slots * slot_bytes + state
     }
 
     /// Bytes a series unit's cache takes: whole slots of patches, as the

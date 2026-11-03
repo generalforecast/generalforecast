@@ -69,7 +69,17 @@ fn count<T: TryFrom<i64>>(value: i64, name: &str) -> PyResult<T> {
     })
 }
 
-/// The padded size for `rows` rows: `minimum` doubled until it fits.
+/// The rows a block of a context's cache holds and the slots it takes, for rows of `row_bytes` bytes in slots of `slot_bytes`.
+#[pyfunction]
+fn block_shape(row_bytes: i64, slot_bytes: i64) -> PyResult<(u64, u64)> {
+    let slot: NonZeroUsize = positive(slot_bytes, "slot_bytes")?;
+    Ok(gf_core::shapes::block_shape(
+        count(row_bytes, "row_bytes")?,
+        slot.get() as u64,
+    ))
+}
+
+/// The padded size for `rows` rows: `minimum` doubled until it fits, past 16384 rows in quarters of the power of two below.
 #[pyfunction]
 #[pyo3(signature = (rows, minimum = 8))]
 fn bucket_size(rows: i64, minimum: i64) -> PyResult<usize> {
@@ -1970,6 +1980,7 @@ fn bind_predictor(
 #[pymodule]
 fn _core(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(bucket_size, module)?)?;
+    module.add_function(wrap_pyfunction!(block_shape, module)?)?;
     module.add_function(wrap_pyfunction!(resolve_model, module)?)?;
     module.add_function(wrap_pyfunction!(parse_inference, module)?)?;
     module.add_function(wrap_pyfunction!(quantile_levels, module)?)?;

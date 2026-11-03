@@ -459,3 +459,23 @@ def test_a_fit_profile_is_kept_for_later_processes_unless_unmeasured(
     assert started().fit_profile(0, wider) == FitProfile(wider)
     started().fit_profile(0, wider)
     assert measured == [FEATURES, wider, wider]
+
+
+def test_a_fit_profile_kept_before_steps_were_measured_is_measured_again(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from generalforecast.runtime.memory import Cost, FitProfile
+    from generalforecast.worker import admission
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    worker = Worker()
+    worker.add_model(0, tabicl_functions, tiny_tabicl(regression=False), spec="tiny")
+    # As a process kept it before fit profiles measured a step: two costs.
+    old = FitProfile(FEATURES, Cost(1.0, 2.0), Cost(3.0, 4.0))
+    worker.programs.measured(
+        "tiny", ("fit_profile", FEATURES, repr(worker._settings)), lambda: old
+    )
+    fresh = FitProfile(FEATURES, Cost(1.0, 2.0), Cost(3.0, 4.0), Cost(0.0, 5.0))
+    monkeypatch.setattr(admission, "fit_profile", lambda *_: fresh)
+
+    assert worker.fit_profile(0, FEATURES) == fresh
