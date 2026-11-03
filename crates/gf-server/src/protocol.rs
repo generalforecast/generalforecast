@@ -9,10 +9,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::Arc;
 
 use gf_core::cache::{CacheKey, Movement, SlotId};
 use gf_core::forecasting::{Forecast, Grid, SeriesUnit};
-use gf_core::node::{QueryBatch, Step, SummaryScope, Targets, Unit};
+use gf_core::node::{QueryBatch, RequestId, Step, SummaryScope, Targets, Unit};
 use gf_core::planner::{Core, CoreKind, Recency, Strategy};
 use gf_core::table::{RowId, TableId};
 use serde::{Deserialize, Serialize};
@@ -449,9 +450,19 @@ pub fn movements_json(movements: &[Movement]) -> Value {
     )
 }
 
-/// A step as a frame for a worker.
+/// The quantile levels a regressor's caller asked for, and the levels of the
+/// model's prediction columns: the worker answers with predictions at
+/// `levels` alone, as `quantile_values` would interpolate them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pick {
+    pub known: Arc<Vec<f64>>,
+    pub levels: Vec<f64>,
+}
+
+/// A step as a frame for a worker; `picks` gives the levels a request's
+/// predictions keep, if its caller named them.
 #[must_use]
-pub fn step_frame(step: &Step) -> Frame {
+pub fn step_frame(step: &Step, picks: &dyn Fn(RequestId) -> Option<Pick>) -> Frame {
     let mut frame = Frame::header(Value::Null);
     let fits: Vec<Value> = step
         .fits()
@@ -513,7 +524,7 @@ pub fn step_frame(step: &Step) -> Frame {
     let queries: Vec<Value> = step
         .queries()
         .iter()
-        .map(|batch| batch_json(&mut frame, batch))
+        .map(|batch| batch_json(&mut frame, batch, picks(batch.request)))
         .collect();
     let series_units: Vec<Value> = step
         .series_units()
@@ -633,15 +644,20 @@ fn unit_json(frame: &mut Frame, unit: &Unit) -> Value {
     })
 }
 
-fn batch_json(frame: &mut Frame, batch: &QueryBatch) -> Value {
-    json!({
+fn batch_json(frame: &mut Frame, batch: &QueryBatch, pick: Option<Pick>) -> Value {
+    let mut value = json!({
         "request": batch.request.0,
         "table": batch.table.0,
         "epoch": batch.epoch.0,
         "count": batch.units.len(),
         "features": frame.push(f32_bytes(&batch.features)),
         "units": batch.units.iter().map(|unit| unit.0).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(pick) = pick {
+        value["known"] = json!(pick.known.as_slice());
+        value["levels"] = json!(pick.levels);
+    }
+    value
 }
 
 /// What the server asks a worker, beside steps, which `step_frame` builds

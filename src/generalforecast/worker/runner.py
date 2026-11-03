@@ -565,4 +565,11 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         predictions = self._decode(reads, step.units, transient)
         predictions.update(self._decode_fused(alone, step.units))
         predictions.update(self._forecast(step.series_units, step.forecasts))
+        for batch in step.queries:
+            if batch.levels is not None and batch.known is not None:
+                values = predictions.get(batch.request)
+                if values is not None and values.ndim == 2:
+                    predictions[batch.request] = protocol.at_levels(
+                        values, batch.known, batch.levels
+                    )
         return predictions

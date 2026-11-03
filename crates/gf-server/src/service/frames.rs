@@ -673,6 +673,34 @@ pub(super) fn quantile_batch(
         .map_err(|error| Status::internal(error.to_string()))
 }
 
+/// Predictions the worker already took at `levels`, one column each in
+/// their order, named `q<level>` as `quantile_batch` names them.
+pub(super) fn picked_batch(
+    predictions: &Predictions,
+    levels: &[f64],
+) -> Result<RecordBatch, Status> {
+    if predictions.columns != levels.len() {
+        return Err(Status::internal(
+            "the worker's predictions are not at the levels asked",
+        ));
+    }
+    let (fields, arrays): (Vec<Field>, Vec<ArrayRef>) = levels
+        .iter()
+        .enumerate()
+        .map(|(column, &level)| {
+            let values: Vec<f32> = (0..predictions.rows)
+                .map(|row| predictions.values[row * predictions.columns + column])
+                .collect();
+            (
+                Field::new(format!("q{level}"), DataType::Float32, false),
+                Arc::new(Float32Array::from(values)) as ArrayRef,
+            )
+        })
+        .unzip();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+        .map_err(|error| Status::internal(error.to_string()))
+}
+
 /// Forecasts as a long batch: each series' digest and the time of each step,
 /// then one `q<level>` column per level, the table's own without `levels`.
 pub(super) fn forecasted(
