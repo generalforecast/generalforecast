@@ -415,12 +415,15 @@ def test_wide_tables_pad_to_one_of_four_widths_an_octave(
         24,
         24,
     ]
-    assert padded_width(1558) == 1792
+    # Past 512 columns, a table pads by at most 64.
+    assert padded_width(1558) == 1600
+    assert padded_width(600) == 640
     # A padded width is its own, and pads a table by at most a quarter.
     for width in range(1, 3000):
         padded = padded_width(width)
         assert padded_width(padded) == padded
         assert width <= padded <= max(width, 1.25 * width)
+        assert padded - width < 64
     monkeypatch.setenv(PADDED_WIDTHS_ENV, "0")
     assert padded_width(21) == 21
 
