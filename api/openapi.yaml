@@ -2398,8 +2398,8 @@ paths:
         With `save`, a run that is training stops at its next report and publishes the weights trained
         so far as the next version of the fine-tune named after the run, as a run stopped by its budget
         does; its lineage records the version under `published`. Without `save` nothing is published.
-        A run no trainer has begun training (queued, setting up or ready) has no weights yet, so `save`
-        saves nothing. Cancelling an ended or cancelling run returns it unchanged.
+        A run that is not training (queued, setting up, ready or preempted) has no weights in hand, so
+        `save` publishes nothing. Cancelling an ended or cancelling run returns it unchanged.
       parameters:
       - $ref: '#/components/parameters/project'
       - $ref: '#/components/parameters/run'
