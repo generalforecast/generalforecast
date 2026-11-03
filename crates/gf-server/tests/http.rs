@@ -1072,11 +1072,25 @@ fn published(revision: u64) -> Value {
     } else {
         ("snapshot", Value::Null)
     };
+    // Revision 5 runs a derived model, which no startup list names.
+    let (reference, worker, resolved) = if revision == 5 {
+        (
+            "acme/scorer@ft2",
+            "acme/scorer@ft2",
+            "acme/scorer@ft2@sha256:1111111",
+        )
+    } else {
+        (
+            "tabicl-v2-classifier",
+            "tabicl-v2-classifier",
+            "general-forecast/tabicl-v2-classifier@5fb6a4c",
+        )
+    };
     let served = json!({
         "name": "scorer",
-        "reference": "tabicl-v2-classifier",
-        "worker": "tabicl-v2-classifier",
-        "resolved": "general-forecast/tabicl-v2-classifier@5fb6a4c",
+        "reference": reference,
+        "worker": worker,
+        "resolved": resolved,
         "outputs": ["label", "probabilities"],
         "license_source": null,
         "description": {"name": "scorer", "kind": "predictor"},
@@ -1298,6 +1312,27 @@ async fn score_at(
     )
     .await;
     (status, body)
+}
+
+#[tokio::test]
+async fn a_revision_of_a_derived_model_has_the_workers_load_it_on_demand() {
+    let state = Arc::new(Plane {
+        serving: 5.into(),
+        predictors: 0.into(),
+        records: std::sync::Mutex::new(Vec::new()),
+        as_ofs: std::sync::Mutex::new(Vec::new()),
+    });
+    let origin = plane(state.clone()).await;
+    let front = revision_front(&origin, 1 << 20).await;
+    let queries = json!({"queries": [{"id": "q", "x": 2.5}]});
+    // The startup list serves only the catalog model; the derived one loads
+    // the first time its revision predicts, and once.
+    for _ in 0..2 {
+        let (status, body) = score(&front, "environments/prod", SCORER, &queries).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["result"]["model"], "acme/scorer@ft2@sha256:1111111");
+        assert_eq!(body["result"]["predictions"][0]["id"], "q");
+    }
 }
 
 #[tokio::test]

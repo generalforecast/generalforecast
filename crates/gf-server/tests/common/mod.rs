@@ -69,6 +69,23 @@ pub fn fake_worker(mut stream: UnixStream) {
                         ..ModelProfile::default()
                     })
                     .frame(),
+                    // A model added on demand loads at once: the worker
+                    // answers that it is loading, then reports it loaded.
+                    WorkerRequest::AddModel { name, .. } => {
+                        if WorkerReply::Loading
+                            .frame()
+                            .write_to(&mut stream)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        WorkerReply::Loaded {
+                            name,
+                            failure: None,
+                        }
+                        .frame()
+                    }
                     _ => WorkerReply::Ok.frame(),
                 }
             };

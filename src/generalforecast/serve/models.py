@@ -48,9 +48,24 @@ def canonical(reference: str) -> ModelRef:
 
 
 def resolved_id(ref: ModelRef) -> str:
-    """The pinned id results report, `general-forecast/<name>@sha256:<digest>`."""
+    """The pinned id results report, `general-forecast/<name>@sha256:<digest>`.
+
+    A derived model reports its own, `<owner>/<name>@ft<version>@sha256:<weights>`.
+    """
     pin = describe(str(ref)).resolved
+    if ref.derived:
+        return pin
     return f"{ORG}/{pin.split('/', 1)[1]}" if "/" in pin else f"{ORG}/{pin}"
+
+
+def worker_model(ref: ModelRef) -> str:
+    """The model gf-server's workers load for `ref`, without its variant.
+
+    A catalog model's id, or a derived model's `<owner>/<name>@ft<version>`,
+    which the workers load on demand, through the plane's resolver, when a
+    revision first needs it.
+    """
+    return ref.model if ref.derived else ref.entry.id
 
 
 def served(
@@ -310,7 +325,7 @@ def published_entry(plan: Any, *, snapshot: Path | None = None) -> dict[str, Any
     return {
         "name": spec.name,
         "reference": str(ref),
-        "worker": ref.entry.id,
+        "worker": worker_model(ref),
         "resolved": resolved,
         "outputs": list(plan.outputs),
         "license_source": ref.entry.artifact.license_source,
