@@ -119,18 +119,28 @@ def device_settings(platform: str, exact: bool = False) -> DeviceSettings:
     return DeviceSettings(FLOAT32, FLOAT32, kernel, matmul_precision="highest")
 
 
-# JAX's names for the precision of float32 matrix multiplies a run may pick
-# with GF_MATMUL_PRECISION: `default` (TF32 on a GPU), `bfloat16` (bfloat16
-# inputs, float32 sums, twice TF32's throughput on an H100), `high` or
-# `highest`. Attention keeps its own dtype whatever is picked.
+# The precisions of float32 matrix multiplies a run may pick with
+# GF_MATMUL_PRECISION: `default` (TF32 on a GPU), `tensorfloat32`, `high`,
+# `highest` or `float32` as JAX names them, and `bfloat16` or `float16`
+# for inputs rounded to that dtype with float32 sums. Attention keeps its
+# own dtype whatever is picked.
 MATMUL_PRECISIONS = (
     "default",
     "bfloat16",
+    "float16",
     "tensorfloat32",
     "high",
     "highest",
     "float32",
 )
+# JAX reads `bfloat16` as its default precision, TF32 on a GPU, so the two
+# rounded kinds name XLA's dot algorithms instead. On an H100, Mitra-2's
+# warm decodes ran 1.28x faster with float16 inputs (adult and kings_county,
+# 5,000 context rows), and its drift from float32 doubled: probabilities
+# 0.00055 on average against fast mode's 0.00023, medians 0.0039 target
+# deviations against 0.0017. With bfloat16 inputs Mitra-2 and LimiX-2 drift
+# 5 to 15 times fast mode's.
+_DOT_ALGORITHMS = {"bfloat16": "BF16_BF16_F32", "float16": "F16_F16_F32"}
 
 
 def default_settings() -> DeviceSettings:
@@ -140,7 +150,8 @@ def default_settings() -> DeviceSettings:
     `GF_CACHE_DTYPE` overrides the dtype caches are stored in: `float32`,
     `float16`, `bfloat16`, or `int8` with a scale per row and head; and
     `GF_MATMUL_PRECISION` overrides the precision of float32 matrix
-    multiplies (`MATMUL_PRECISIONS`), as to measure `bfloat16` against TF32.
+    multiplies (`MATMUL_PRECISIONS`), as to measure `float16` inputs
+    against TF32.
     """
     mode = os.environ.get("GF_PRECISION", "fast")
     if mode not in ("fast", "exact"):
@@ -152,7 +163,8 @@ def default_settings() -> DeviceSettings:
             raise ValueError(
                 f"GF_MATMUL_PRECISION must be one of {MATMUL_PRECISIONS}, not {matmul!r}"
             )
-        settings = dataclasses.replace(settings, matmul_precision=matmul)
+        precision = _DOT_ALGORITHMS.get(matmul, matmul)
+        settings = dataclasses.replace(settings, matmul_precision=precision)
     cache = os.environ.get("GF_CACHE_DTYPE")
     if cache is None:
         return settings

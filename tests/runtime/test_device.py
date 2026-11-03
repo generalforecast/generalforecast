@@ -58,13 +58,35 @@ def test_gf_matmul_precision_overrides_the_modes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("GF_PRECISION", raising=False)
-    monkeypatch.setenv("GF_MATMUL_PRECISION", "bfloat16")
+    monkeypatch.setenv("GF_MATMUL_PRECISION", "highest")
     settings = default_settings()
-    assert settings.matmul_precision == "bfloat16"
+    assert settings.matmul_precision == "highest"
     assert settings.kernel == device_settings(jax.default_backend()).kernel
     monkeypatch.setenv("GF_MATMUL_PRECISION", "half")
     with pytest.raises(ValueError, match="GF_MATMUL_PRECISION"):
         default_settings()
+
+
+@pytest.mark.parametrize(
+    ("name", "algorithm"), [("bfloat16", "BF16_BF16_F32"), ("float16", "F16_F16_F32")]
+)
+def test_rounded_matmul_precisions_name_dot_algorithms(
+    monkeypatch: pytest.MonkeyPatch, name: str, algorithm: str
+) -> None:
+    # JAX reads a bare `bfloat16` as its default precision, TF32 on a GPU.
+    monkeypatch.delenv("GF_PRECISION", raising=False)
+    monkeypatch.setenv("GF_MATMUL_PRECISION", name)
+    settings = default_settings()
+    assert settings.matmul_precision == algorithm
+
+    def product(left: jax.Array, right: jax.Array) -> jax.Array:
+        return left @ right
+
+    ones = jnp.ones((4, 4))
+    traced = str(
+        jax.make_jaxpr(with_precision(product, settings.matmul_precision))(ones, ones)
+    )
+    assert algorithm in traced
 
 
 def test_matmul_precision_is_traced_into_programs() -> None:
