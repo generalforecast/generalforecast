@@ -256,15 +256,25 @@ def _gpu_generation() -> tuple[int, int] | None:
     return major, minor
 
 
-def _implementation(kernel: AttentionKernel, q: Array) -> Literal["xla", "cudnn"]:
-    """The kernel's implementation if it supports `q` on this device, else XLA.
+# Keys at or below which attention runs on XLA even where cuDNN could: a
+# row's few column tokens leave cuDNN's flash tiles mostly empty, and on an
+# H100 XLA attends 32,768 rows of 20 tokens in a third of cuDNN's time.
+SHORT_KEYS = 64
+
+
+def _implementation(
+    kernel: AttentionKernel, q: Array, keys: int | None = None
+) -> Literal["xla", "cudnn"]:
+    """The kernel's implementation if it supports `q` and `keys` keys on this device, else XLA.
 
     cuDNN's flash attention needs an Ampere or newer GPU, and heads of at most
     128 before Hopper or 256 from it, so older GPUs such as T4s take XLA.
+    Attention to at most `SHORT_KEYS` keys takes XLA too.
     """
     generation = _gpu_generation()
     supported = (
-        generation is not None
+        (keys is None or keys > SHORT_KEYS)
+        and generation is not None
         and generation >= (8, 0)
         and q.dtype in (jnp.float16, jnp.bfloat16)
         and q.shape[-1] % 8 == 0
@@ -323,7 +333,11 @@ def _dot_product_attention(
     q = q.astype(dtype)
     scaled = cache.key_scale is not None and cache.value_scale is not None
     # cuDNN takes lengths but not a mask per query.
-    implementation = "xla" if cache.mask is not None else _implementation(kernel, q)
+    implementation = (
+        "xla"
+        if cache.mask is not None
+        else _implementation(kernel, q, cache.key.shape[-3])
+    )
 
     def run(queries: Array, mask: Array | None) -> Array:
         if scaled:
