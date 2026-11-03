@@ -338,7 +338,11 @@ class Decodes:
         held = 0
         for item in work:
             window.append(item)
-            held += self._context_bytes(units[item.unit])
+            # A put-off context holds its rows, gathered for its encode, beside
+            # its cache: for a model whose row representations are wide, more.
+            held += self._context_bytes(units[item.unit]) + self._input_bytes(
+                units[item.unit]
+            )
             if held >= self._window_bytes:
                 outputs += self._decode_window(window, transient)
                 window, held = [], 0

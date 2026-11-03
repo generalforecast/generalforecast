@@ -311,9 +311,13 @@ def _handled(
                 answer = _recorded(seconds, path, trace)
             case protocol.Profile(model=model, features=features):
                 answer = _profiled(worker, names[model], features)
-            case protocol.FitLimits(model=model, features=features):
+            case protocol.FitLimits(model=model, features=features, whole=whole):
                 state_rows, fused_rows = worker.fit_rows(names[model], features)
-                answer = protocol.Limited(_limit(state_rows), _limit(fused_rows))
+                answer = protocol.Limited(
+                    _limit(state_rows),
+                    _limit(fused_rows),
+                    worker.whole_rows(names[model], features) if whole else None,
+                )
             case protocol.Check(
                 model=model, classes=classes, features=features, series=series
             ):

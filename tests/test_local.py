@@ -314,6 +314,55 @@ def test_contexts_past_the_models_length_warn_once_or_are_clamped() -> None:
         tables["warn"].predict(NEAR_B)
 
 
+def test_an_adaptive_whole_table_past_the_cap_reads_whole_where_its_worker_holds_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tiny_tabicl(regression=False)
+    cap = 10_000
+    # The tiny model as if it were trained on contexts of 10,000 rows.
+    functions = tabicl_functions._replace(
+        properties=lambda parameters: dataclasses.replace(
+            tabicl_functions.properties(parameters), context_rows=cap
+        )
+    )
+    rows = cap + 2_000
+    features, targets = _clusters(rows)
+
+    def predicted(name: str, held: int | None) -> tuple[Any, np.ndarray]:
+        client = node_harness.local()
+        monkeypatch.setattr(client._worker, "whole_rows", lambda *_: held)
+        handle = client.create_table(
+            name,
+            model=(functions, model),
+            features=5,
+            classes=3,
+            page_size=PAGE,
+            strategy=generalforecast.Strategy.adaptive_whole(),
+        )
+        handle.insert(np.arange(rows), features, targets)
+        predictions = handle.predict(NEAR_A)
+        return handle.describe().resolved_strategy, predictions
+
+    whole, _ = predicted("held", rows)
+    assert whole == generalforecast.Strategy.exact()
+    # A worker that cannot hold the table reads it as an adaptive table does.
+    for held in (None, rows - 1):
+        resolved, _ = predicted("short", held)
+        assert resolved == generalforecast.Strategy.adaptive().resolve(rows, cap)
+
+
+def test_the_worker_holds_whole_contexts_its_pool_can_keep() -> None:
+    client = node_harness.local()
+    _table(client).insert(np.arange(32), *_clusters())
+    worker = client._worker
+    (loaded,) = worker._models
+    whole = worker.whole_rows(loaded, 5)
+    assert whole is not None
+    per_row = worker.profile(loaded, 5).cache_bytes_per_row
+    assert worker._size(whole) * per_row <= worker._pool_bytes
+    assert worker._size(2 * whole) * per_row > worker._pool_bytes or whole >= (1 << 25)
+
+
 def test_contexts_whose_calls_would_not_fit_the_device_are_refused() -> None:
     model = tiny_tabicl(regression=False)
     client = node_harness.local()

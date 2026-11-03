@@ -390,6 +390,76 @@ fn retrieved_contexts_hold_the_core_and_each_querys_nearest_rows_outside_it() {
     }
 }
 
+#[test]
+fn many_queries_searched_side_by_side_read_what_each_reads_alone() {
+    let (table, index) = world();
+    let snapshot = table.snapshot();
+    let strategy = Strategy::Retrieved {
+        core: Some(Core {
+            rows: 8,
+            seed: 3,
+            kind: CoreKind::Random,
+        }),
+        neighbors: 5,
+        among: None,
+        recency: None,
+    };
+    // Enough queries for the plan to read the rows once and search them on
+    // many threads; three plan one at a time.
+    let many: Vec<Vec<f32>> = (0..40).map(|query| queries()[query % 3].clone()).collect();
+
+    let alone = make(&strategy, &snapshot, &index);
+    let together = plan(&strategy, &source(&snapshot, &index), &many).unwrap();
+
+    for query in 0..many.len() {
+        assert_eq!(read(&together, query), read(&alone, query % 3));
+    }
+}
+
+#[test]
+fn adaptive_whole_reads_a_table_past_the_cap_whole_where_the_worker_can_hold_it() {
+    use gf_core::planner::{ADAPTIVE_SEED, ADAPTIVE_WHOLE_FROM_CAP, ADAPTIVE_WHOLE_PAST_CAP};
+    use std::num::NonZeroU64;
+
+    for cap in [8u64, 1_000, ADAPTIVE_WHOLE_FROM_CAP, 60_000] {
+        let largest = cap * ADAPTIVE_WHOLE_PAST_CAP;
+        for whole in [
+            None,
+            Some(cap),
+            Some(2 * cap),
+            Some(largest),
+            Some(100 * cap),
+        ] {
+            for rows in [cap, cap + 1, 2 * cap, largest, largest + 1] {
+                for timed in [false, true] {
+                    let held = cap >= ADAPTIVE_WHOLE_FROM_CAP
+                        && whole.is_some_and(|whole| rows <= whole)
+                        && rows <= largest;
+                    let (cap, whole) = (NonZeroU64::new(cap), whole.and_then(NonZeroU64::new));
+                    // Where it cannot read whole, it reads as `Adaptive` does.
+                    let expected = if held {
+                        Strategy::Exact
+                    } else {
+                        Strategy::Adaptive.resolve(rows, cap, timed)
+                    };
+                    assert_eq!(
+                        Strategy::AdaptiveWhole.resolve_within(rows, cap, whole, timed),
+                        expected,
+                        "rows {rows}, whole {whole:?}, timed {timed}"
+                    );
+                    // `Adaptive` reads a table past the cap whole nowhere.
+                    assert_eq!(
+                        Strategy::Adaptive.resolve_within(rows, cap, whole, timed),
+                        Strategy::Adaptive.resolve(rows, cap, timed)
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(Strategy::AdaptiveWhole.capped(8), Strategy::AdaptiveWhole);
+    assert_eq!(Strategy::AdaptiveWhole.seed(), Some(ADAPTIVE_SEED));
+}
+
 /// Rows below 48 in one stratum and the rest in another.
 struct Halves;
 

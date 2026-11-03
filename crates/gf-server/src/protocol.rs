@@ -678,10 +678,13 @@ pub enum WorkerRequest {
         features: usize,
     },
     /// How many rows a model's fit takes within the worker's call budget,
-    /// for a table of `features` columns.
+    /// for a table of `features` columns, and with `whole`, how many it can
+    /// hold as one context on its device.
     FitLimits {
         model: String,
         features: usize,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        whole: bool,
     },
     /// Loads a model the worker did not start with, under `name`, from its
     /// spec, beside the worker's steps: the worker answers `Loading` at
@@ -788,6 +791,10 @@ pub enum WorkerReply {
     FitLimits {
         state_rows: Option<u64>,
         fused_rows: Option<u64>,
+        /// The most rows the worker can hold as one context on its device,
+        /// when asked; None where it can hold none or was not asked.
+        #[serde(default)]
+        whole_rows: Option<u64>,
     },
     Ok,
     /// A check the model refuses.
@@ -1135,6 +1142,9 @@ pub enum StrategySpec {
     Exact,
     /// Exact up to the model's cap, retrieved past it; see `Strategy::Adaptive`.
     Adaptive,
+    /// As `Adaptive`, reading a table past the cap whole while the worker can
+    /// hold it; see `Strategy::AdaptiveWhole`.
+    AdaptiveWhole,
     Retrieved {
         #[serde(default)]
         core: Option<CoreSpec>,
@@ -1206,6 +1216,7 @@ impl StrategySpec {
         match *self {
             Self::Exact => Strategy::Exact,
             Self::Adaptive => Strategy::Adaptive,
+            Self::AdaptiveWhole => Strategy::AdaptiveWhole,
             Self::Retrieved {
                 core,
                 neighbors,
@@ -1235,6 +1246,7 @@ impl StrategySpec {
         match strategy {
             Strategy::Exact => Self::Exact,
             Strategy::Adaptive => Self::Adaptive,
+            Strategy::AdaptiveWhole => Self::AdaptiveWhole,
             Strategy::Retrieved {
                 core,
                 neighbors,

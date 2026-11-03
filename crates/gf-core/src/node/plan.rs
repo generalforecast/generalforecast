@@ -127,6 +127,7 @@ impl TableState {
         let mut ids: HashMap<Fingerprint, UnitId> = HashMap::new();
         let mut planned = vec![UnitId(0); vectors.len()];
         let mut fresh: Vec<(usize, usize)> = Vec::new();
+        let live = snapshot.rows();
         for (query, vector) in vectors.iter().enumerate() {
             let region = regions.of(vector);
             match &mut regions.built[region] {
@@ -136,6 +137,17 @@ impl TableState {
                     } else {
                         counts.hits += 1;
                     }
+                    planned[query] = add_unit(&mut plan, &mut ids, &built.rows, built.key);
+                }
+                // A built context the cache let go, not due a rebuild and
+                // holding only live rows, is encoded again from its rows,
+                // without retrieving them again.
+                Some(built)
+                    if window_of[query].is_none()
+                        && built.due.is_none()
+                        && built.rows.bitmap().is_subset(live.bitmap()) =>
+                {
+                    counts.misses += 1;
                     planned[query] = add_unit(&mut plan, &mut ids, &built.rows, built.key);
                 }
                 _ => fresh.push((query, region)),

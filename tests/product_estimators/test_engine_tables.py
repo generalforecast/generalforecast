@@ -155,12 +155,16 @@ def test_open_reproduces_an_existing_table_and_predicts(catalog) -> None:
         assert len(again) == 35
         assert len(engine.Table.open("reopened", download=False)) == 35
         # An opened table keeps following its size: no frozen selection, and a
-        # table it makes anew is adaptive too.
+        # table it makes anew is adaptive too, reading whole past the cap
+        # where its worker can hold it.
         assert again._selection is None
         again.drop()
         again.insert(rows)
         assert again._selection is None
-        assert json.loads(again._table.describe().strategy.spec())["kind"] == "adaptive"
+        assert (
+            json.loads(again._table.describe().strategy.spec())["kind"]
+            == "adaptive_whole"
+        )
         assert (
             again.selection is not None and again.selection.describe() == "whole table"
         )
@@ -435,7 +439,7 @@ def test_open_keeps_the_retrieval_settings_of_an_adaptive_table(catalog) -> None
         again.drop()
         again.insert(rows)
         described = again._table.describe()
-        assert json.loads(described.strategy.spec())["kind"] == "adaptive"
+        assert json.loads(described.strategy.spec())["kind"] == "adaptive_whole"
         assert described.retrieval_categoricals == "one_hot"
     finally:
         table.drop()

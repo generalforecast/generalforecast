@@ -61,6 +61,7 @@ fn spec(strategy: Strategy) -> TableSpec {
         refit: RefitPolicy::default(),
         fit_rows: NonZeroUsize::new(DEFAULT_FIT_ROWS).unwrap(),
         context_rows: None,
+        whole_rows: None,
         past_cap: PastCap::Warn,
         regions: None,
         scale_rows: None,
@@ -5048,6 +5049,47 @@ fn an_adaptive_table_crosses_into_retrieval_as_it_grows_and_back_as_it_shrinks()
         node.set_strategy(table, Strategy::neighbors(0)),
         Err(NodeError::Strategy(StrategyError::Empty))
     ));
+}
+
+#[test]
+fn an_adaptive_whole_table_past_the_cap_waits_for_the_rows_its_worker_holds() {
+    let mut node = node(64);
+    let cap = NonZeroU64::new(10_000);
+    let table = node
+        .create_table(TableSpec {
+            context_rows: cap,
+            ..spec(Strategy::AdaptiveWhole)
+        })
+        .unwrap();
+    let adaptive = node
+        .create_table(TableSpec {
+            context_rows: cap,
+            ..spec(Strategy::Adaptive)
+        })
+        .unwrap();
+    let (keys, features, targets) = rows(12_000);
+    node.insert(table, &keys, &features, targets.clone())
+        .unwrap();
+    node.insert(adaptive, &keys, &features, targets).unwrap();
+    assert!(node.wants_whole_rows(table).unwrap());
+    assert!(!node.wants_whole_rows(adaptive).unwrap());
+    node.submit(table, &A).unwrap();
+
+    // It waits for its worker, and is named once.
+    assert!(node.schedule().unwrap().is_none());
+    assert_eq!(node.take_unmeasured(), [table]);
+
+    // A worker that holds fewer rows than the table reads it as `Adaptive` does.
+    node.set_whole_rows(table, Some(11_000)).unwrap();
+    assert!(!node.wants_whole_rows(table).unwrap());
+    let retrieved = Strategy::Adaptive.resolve(12_000, cap, false);
+    assert_eq!(node.strategy(table).unwrap(), retrieved);
+    assert_eq!(node.strategy(adaptive).unwrap(), retrieved);
+    node.set_whole_rows(table, Some(12_000)).unwrap();
+    assert_eq!(node.strategy(table).unwrap(), Strategy::Exact);
+    // One that holds none, likewise.
+    node.set_whole_rows(table, None).unwrap();
+    assert_eq!(node.strategy(table).unwrap(), retrieved);
 }
 
 #[test]
