@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
 """The fine-tuning operations' steps, driven without a service."""
 
 import pyarrow as pa
