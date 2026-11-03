@@ -117,7 +117,8 @@ pub struct Config {
     #[serde(default, deserialize_with = "eviction")]
     pub eviction: Eviction,
     /// How long a worker may go without progress on a step before it counts
-    /// as hung and is started again; each compile it finishes is progress.
+    /// as hung and is started again; each compile or call it finishes is
+    /// progress.
     #[serde(default = "step_timeout_seconds")]
     pub step_timeout_seconds: f64,
     /// How long one client call may take, including a prediction that waits
