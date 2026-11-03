@@ -1365,7 +1365,11 @@ def _as_frame(step: Any) -> protocol.Step:
     """A step from the bindings as a server's worker receives it."""
 
     def copy(kind: Any, item: Any) -> Any:
-        return kind(**{f.name: getattr(item, f.name) for f in dataclasses.fields(kind)})
+        # The native node's batches carry no levels; the protocol's default them.
+        fields = dataclasses.fields(kind)
+        return kind(
+            **{f.name: getattr(item, f.name) for f in fields if hasattr(item, f.name)}
+        )
 
     return protocol.Step(
         movements=[copy(protocol.Movement, item) for item in step.movements],
