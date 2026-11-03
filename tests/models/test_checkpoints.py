@@ -300,6 +300,7 @@ def test_built_in_classifiers_say_their_native_class_slots() -> None:
         "general-forecast/limix-2-classifier": 10,
         "general-forecast/mitra-classifier": 10,
         "general-forecast/mitra-2-classifier": 10,
+        "general-forecast/tabfm-1-classifier": 10,
     }
     assert (
         catalog.ENTRIES["general-forecast/tabpfn-3-classifier"].capacity(

@@ -29,6 +29,7 @@
     "general-forecast/mitra-classifier": "mitra-classifier",
     "general-forecast/mitra-2-classifier": "mitra-2-classifier",
     "general-forecast/mitra-2-regressor": "mitra-2-regressor",
+    "general-forecast/tabfm-1-classifier": "tabfm-1-classifier",
     "general-forecast/chronos-2": "chronos-2",
     "general-forecast/timestral-209m": "timestral-209m",
     "general-forecast/timestral-209m-unmirrored": "timestral-209m-unmirrored",
@@ -54,6 +55,7 @@
     "mitra-2-classifier": "general-forecast/mitra-2-classifier",
     "mitra-2-regressor": "general-forecast/mitra-2-regressor",
     "mitra-classifier": "general-forecast/mitra-classifier",
+    "tabfm-1-classifier": "general-forecast/tabfm-1-classifier",
     "tabicl-classifier": "general-forecast/tabicl-v2-classifier",
     "tabicl-regressor": "general-forecast/tabicl-v2-regressor",
     "tabicl-v2-classifier": "general-forecast/tabicl-v2-classifier",
@@ -480,6 +482,29 @@
         "variants": [
           "remote"
         ]
+      }
+    },
+    {
+      "id": "general-forecast/tabfm-1-classifier",
+      "name": "tabfm-1-classifier",
+      "task": "classification",
+      "limits": {
+        "context_rows": 100000,
+        "queries": 100,
+        "inputs": 32
+      },
+      "digest": "sha256:b01aab8399bbd491b566526b1b59b3ac5781acb740e6ad78731bbe1965ac0169",
+      "pinned": true,
+      "hostable": false,
+      "bounds": {
+        "classes": 10,
+        "quantiles": [],
+        "quantile_step": null
+      },
+      "gates": {
+        "predictor": false,
+        "remote": false,
+        "variants": []
       }
     },
     {

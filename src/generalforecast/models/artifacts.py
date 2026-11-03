@@ -603,6 +603,12 @@ def convert(entry: ModelEntry, raw: Path, directory: Path) -> None:
             )
         regression = entry.capability.task == "regression"
         save_state(directory, architecture, settings, one_task(state, regression))
+    elif entry.family == "tabfm":
+        # One directory a task, with the upstream settings beside the weights.
+        task = entry.capability.task
+        settings = json.loads((raw / task / "config.json").read_text())
+        state = load_file(raw / task / "model.safetensors")
+        save_state(directory, entry.artifact.convert, settings, state)
     else:
         settings = json.loads((raw / "config.json").read_text())
         save_state(

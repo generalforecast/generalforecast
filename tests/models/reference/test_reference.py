@@ -21,6 +21,7 @@ from typing import Any, NamedTuple
 
 import jax.numpy as jnp
 import numpy as np
+import pandas as pd
 import pytest
 
 from tests.utils.synthetic_table import synthetic_table
@@ -213,6 +214,22 @@ def _limix_ours(regression: bool) -> Callable[[Prepared], np.ndarray]:
     return run
 
 
+def _tabfm_upstream(prepared: Prepared) -> np.ndarray:
+    # The reference group does not hold tabfm yet: `uv lock` cannot resolve
+    # the group anew while jax[cuda13] lacks wheels for one of the locked
+    # environments, so its tests skip where it is not installed.
+    pytest.importorskip("tabfm")
+    from tests.models.reference.tabfm import upstream_outputs
+
+    return upstream_outputs(prepared)
+
+
+def _tabfm_ours(prepared: Prepared) -> np.ndarray:
+    from tests.models.reference.tabfm import our_outputs
+
+    return our_outputs(prepared)
+
+
 def _mitra_upstream(name: str, regression: bool) -> Callable[[Prepared], np.ndarray]:
     def run(prepared: Prepared) -> np.ndarray:
         from tests.models.reference.mitra import upstream_outputs
@@ -322,6 +339,16 @@ REFERENCES = [
             "general-forecast/mitra-2-classifier",
             "general-forecast/mitra-2-regressor",
         )
+    ),
+    # Through 24 in-context blocks 2,048 wide, behind two column and row stages,
+    # float32 rounding alone moves TabFM's logits, as large as 200, by up to 9e-3
+    # from a float64 run, upstream's as much as generalforecast's.
+    Reference(
+        "general-forecast/tabfm-1-classifier",
+        False,
+        _tabfm_upstream,
+        _tabfm_ours,
+        tolerance=1e-2,
     ),
 ]
 
@@ -515,6 +542,41 @@ def test_tabicl_preprocessing_matches_upstreams_on_raw_columns() -> None:
 # Largest difference allowed between prepared inputs, float32's own rounding
 # of values standardized in float64.
 PREPARED = 1e-6
+
+
+def test_tabfm_preprocessing_matches_upstreams_on_raw_columns() -> None:
+    pytest.importorskip("tabfm")
+    from tabfm.src.classifier_and_regressor import (
+        PreprocessingPipeline,
+        TransformToNumerical,
+        UniqueFeatureFilter,
+    )
+
+    from generalforecast.models.tabicl.prepare import (
+        apply_numeric_snapshot,
+        fit_numeric_snapshot,
+    )
+
+    rows = _raw_columns()
+    context = rows[:160]
+    # The package's estimator, for one member without a normalizer: numeric
+    # columns mean-imputed, constant ones dropped, then scaled and clipped.
+    frame = pd.DataFrame(context)
+    encoder = TransformToNumerical().fit(frame)
+    filtered = UniqueFeatureFilter().fit(encoder.transform(frame))
+    pipeline = PreprocessingPipeline(normalization_method="none").fit(
+        filtered.transform(encoder.transform(frame))
+    )
+    expected = pipeline.transform(
+        filtered.transform(encoder.transform(pd.DataFrame(rows)))
+    )
+    snapshot = fit_numeric_snapshot(jnp.asarray(context, jnp.float32))
+    ours = np.asarray(apply_numeric_snapshot(snapshot, jnp.asarray(rows, jnp.float32)))
+
+    assert int(snapshot.columns.count) == expected.shape[1]
+    np.testing.assert_allclose(
+        ours[:, : expected.shape[1]], expected, rtol=PREPARED, atol=PREPARED
+    )
 
 
 def _raw_columns() -> np.ndarray:
