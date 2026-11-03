@@ -17,6 +17,7 @@ import numpy as np
 
 from generalforecast import protocol
 from generalforecast.constants import (
+    FUSED_QUERIES,
     HELD_STATES,
     SCATTER_ROWS,
     SPLIT_QUERIES,
@@ -42,7 +43,7 @@ from generalforecast.runtime.paging import (
 )
 from generalforecast.runtime.shapes import padded as padded_items
 from generalforecast.worker.calls import _host_padded, _item, _stacked
-from generalforecast.worker.encoding import Transient
+from generalforecast.worker.encoding import Transient, _Gather
 from generalforecast.worker.records import QueryBatch, Unit
 
 if TYPE_CHECKING:
@@ -127,6 +128,13 @@ def split_queries(
             placement.append((batch.request, start, len(batch.units)))
             start = stop
     return pieces, placement
+
+
+def _query_index(queries: list[int], count: int) -> np.ndarray:
+    """The positions of a context's queries in their batch, padded to `count` by repeating the last."""
+    index = np.full(count, queries[-1], dtype=np.int32)
+    index[: len(queries)] = queries
+    return index
 
 
 class Decodes:
@@ -351,16 +359,136 @@ class Decodes:
     def _decode_window(
         self: "Worker", work: list[_Dense], transient: Transient
     ) -> list[tuple[tuple[QueryBatch, list[int]], Any]]:
-        """Decodes some dense queries, encoding the units they read first."""
+        """Decodes some dense queries, encoding the units they read first.
+
+        Contexts that gather their rows from the step's rows on the device,
+        each read by a few queries, encode and decode in one call for many of
+        them, which never keeps their caches outside it; the rest encode
+        first, then decode, a context's many queries in parts if they do not
+        fit at once.
+        """
+        fused: dict[tuple, list[_Dense]] = defaultdict(list)
+        rest: list[_Dense] = []
+        for item in work:
+            deferred = transient[item.unit]
+            arguments = deferred.arguments
+            if (
+                deferred.stage == "encode"
+                and isinstance(arguments[1], _Gather)
+                and len(item.queries) <= FUSED_QUERIES
+            ):
+                # Alike calls: one table, one batch's query rows, one padded
+                # size of context, and queries per context within one count.
+                count = self._size(len(item.queries))
+                size = len(arguments[1].index)
+                fused[(item.batch.table, id(item.batch), size, count)].append(item)
+            else:
+                rest.append(item)
+        outputs: list[tuple[tuple[QueryBatch, list[int]], Any]] = []
+        for (_, _, _, count), same in fused.items():
+            outputs += self._encode_decode(same, transient, count)
+        if not rest:
+            return outputs
+        work = rest
         encoded = self._encode_deferred([item.unit for item in work], transient)
         kinds: dict[tuple, list[_Dense]] = defaultdict(list)
         for item in work:
             table = self._tables[item.batch.table]
             kinds["dense", table.model, table.num_classes, table.features].append(item)
-        outputs: list[tuple[tuple[QueryBatch, list[int]], Any]] = []
         for key, same in kinds.items():
             outputs += self._decode_parts(key, same, encoded)
         return outputs
+
+    def _encode_decode(
+        self: "Worker", work: list[_Dense], transient: Transient, count: int
+    ) -> list[tuple[tuple[QueryBatch, list[int]], Any]]:
+        """Encodes put-off contexts of one table and decodes their queries, many to a call.
+
+        Each context's rows are gathered from the step's rows on the device,
+        encoded, and read by its queries in the same program, vectorized over
+        the contexts of a call, so a step of many such contexts takes a few
+        calls rather than an encode, an unstack and a decode for each. Calls
+        are sized to the worker's call budget as any other's.
+        """
+        first = transient[work[0].unit]
+        table_id = first.table
+        table = self._tables[table_id]
+        state, gather, _ = first.arguments
+        size = len(gather.index)
+        index = np.stack([transient[item.unit].arguments[1].index for item in work])
+        lengths = np.asarray(
+            [transient[item.unit].arguments[2] for item in work], np.int32
+        )
+        queries = np.stack([_query_index(item.queries, count) for item in work])
+        rows = work[0].rows
+        model, num_classes = table.model, table.num_classes
+        compiled = self._compiled_encode_decode(model, num_classes)
+        parameters = self._models[model].parameters
+        shared = (parameters, state, gather.values, gather.targets, rows)
+        key = ("encode_decode", model, num_classes, size, count, rows.shape[1:])
+        # Before a call is measured: a context's cache and its gathered rows.
+        profile = self.profile(model, table.features)
+        per_context = size * (profile.cache_bytes_per_row + profile.row_bytes)
+        results: dict[int, np.ndarray] = {}
+
+        def prepare(start: int, stop: int, padded: int) -> Call:
+            # Padding repeats the last context, as `padded_items` pads items.
+            def taken(values: np.ndarray) -> np.ndarray:
+                part = values[start:stop]
+                extra = padded - len(part)
+                return np.concatenate([part, np.repeat(part[-1:], extra, axis=0)])
+
+            with self.stats.timed("stack"):
+                stacked = (taken(index), taken(lengths), taken(queries))
+            return Call(compiled, shared, stacked, padded, None)
+
+        def consume(start: int, stop: int, outputs: Any) -> None:
+            with self.stats.timed("fetch"):
+                values = np.asarray(outputs)
+            for position in range(start, stop):
+                results[position] = values[position - start]
+
+        self._chunks.run(
+            "encode",
+            key,
+            len(work),
+            self._call_bytes,
+            lambda: per_context,
+            prepare,
+            consume,
+            None,
+            None,
+        )
+        for item in work:
+            deferred = transient[item.unit]
+            if not deferred.encoded:
+                deferred.encoded = True
+                self.stats.encoded += 1
+                self.stats.transient += 1
+                self.stats.rows_encoded += deferred.rows
+        return [
+            ((item.batch, item.queries), results[position][: len(item.queries)])
+            for position, item in enumerate(work)
+        ]
+
+    def _compiled_encode_decode(
+        self: "Worker", model: int, num_classes: int
+    ) -> Callable[..., Any]:
+        """A context's gather, encode and decode of its queries, vectorized over contexts."""
+
+        def build() -> Callable[..., Any]:
+            encode = self._stage("encode", model, num_classes)
+            decode = self._stage("decode", model, num_classes)
+
+            def one(parameters, state, values, targets, rows, index, length, queries):
+                context = jnp.take(values, index, axis=0, mode="fill", fill_value=0)
+                labels = jnp.take(targets, index, axis=0, mode="fill", fill_value=0)
+                cache = encode(parameters, state, context, labels, length)
+                return decode(parameters, state, cache, rows[queries])
+
+            return jax.vmap(one, in_axes=(None,) * 5 + (0,) * 3)
+
+        return self.programs.compiled(("encode_decode", model, num_classes), build)
 
     def _decode_parts(
         self: "Worker",
