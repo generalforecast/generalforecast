@@ -48,7 +48,12 @@ from generalforecast.nn.attention import (
     block_kv,
     in_chunks,
 )
-from generalforecast.nn.induced import InducedAttentionParameters, compress, expand
+from generalforecast.nn.induced import (
+    InducedAttentionParameters,
+    compress,
+    compress_layers,
+    expand,
+)
 from generalforecast.nn.linear import LinearParameters, MLPParameters, linear
 from generalforecast.nn.norm import RMSNormParameters, rms_norm
 from generalforecast.nn.target import ClassEncoder, embed_targets
@@ -194,6 +199,77 @@ def _fit_columns(
     return tuple(states), _unfold(output, cells.shape[0])
 
 
+def _step_rows(model: TabFM, prepared: Float[Array, " rows features"]) -> int:
+    """Rows whose cells fit the kernel's `summary_chunk` a step, or every row without one."""
+    chunk = model.columns[0].blocks[0].compress.attention.kernel.summary_chunk
+    if chunk is None:
+        return prepared.shape[0]
+    return max(1, chunk // prepared.shape[1])
+
+
+def _summarized(
+    model: TabFM,
+    prepared: Float[Array, " rows features"],
+    targets: Array,
+    categorical: Bool[Array, " features"],
+    count: Int[Array, " batch"] | None,
+    length: Int[Array, " batch"] | None,
+    step: int,
+) -> tuple[tuple[Array, ...], tuple[Array, ...]]:
+    """Both column stages' inducing points, from the context `step` rows at a time.
+
+    As `column_embedding.summarize_columns` does for one stage: each block's
+    points read every row's cells through the blocks before it, made again
+    for each chunk, by a running softmax, so memory does not grow with the
+    rows. The second stage reads each chunk's tokens from the first stage's
+    finished points.
+    """
+    rows = prepared.shape[0]
+    coded = categorical[None]
+
+    def cells(start: Array, size: int) -> Array:
+        values = jax.lax.dynamic_slice_in_dim(prepared[None], start, size, axis=1)
+        labels = jax.lax.dynamic_slice_in_dim(targets[None], start, size, axis=1)
+        return _cells(model, values, labels, coded, count)
+
+    def through(stage: ColumnStage, hidden: Array, earlier: tuple[Array, ...]) -> Array:
+        hidden = _fold(hidden)
+        for block, state in zip(stage.blocks, earlier, strict=False):
+            hidden = expand(block, hidden, state)
+        return hidden
+
+    def folded(per_row: int) -> Array | None:
+        # Columns are folded into the batch axis, so each column needs its length.
+        return None if length is None else jnp.repeat(length, per_row)
+
+    groups = jax.eval_shape(lambda: cells(jnp.int32(0), 1)).shape[2]
+    first = compress_layers(
+        model.columns[0].blocks,
+        lambda start, size, earlier: through(
+            model.columns[0], cells(start, size), earlier
+        ),
+        rows,
+        step,
+        folded(groups),
+    )
+
+    def tokens(start: Array, size: int) -> Array:
+        embedded = _embed_columns(model.columns[0], first, cells(start, size))
+        return _first_rows(model, embedded, count)
+
+    width = jax.eval_shape(lambda: tokens(jnp.int32(0), 1)).shape[2]
+    second = compress_layers(
+        model.columns[1].blocks,
+        lambda start, size, earlier: through(
+            model.columns[1], tokens(start, size), earlier
+        ),
+        rows,
+        step,
+        folded(width),
+    )
+    return first, second
+
+
 def _embed_columns(
     stage: ColumnStage,
     inducing: tuple[Array, ...],
@@ -305,6 +381,12 @@ def fit(
     count = batch_length(snapshot.columns.count)
     length = batch_length(num_rows)
     coded = _categorical(snapshot.columns.order, categorical)
+    step = _step_rows(model, prepared)
+    if step < prepared.shape[0]:
+        inducing = _summarized(model, prepared, targets, coded, count, length, step)
+        columns = TabFMColumns(inducing=inducing, categorical=coded)
+        state = TableState(snapshot=snapshot, columns=columns, num_classes=num_classes)
+        return state, embed(model, state, features, targets)
     cells = _cells(model, prepared[None], targets[None], coded[None], count)
     first, cells = _fit_columns(model.columns[0], cells, length)
     tokens = _first_rows(model, cells, count)

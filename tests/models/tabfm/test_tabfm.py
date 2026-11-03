@@ -62,3 +62,43 @@ def test_the_contract_calls_predict_as_one_pass_over_the_prepared_table() -> Non
     np.testing.assert_allclose(
         predict(tabfm_functions, model, data), expected, atol=1e-5
     )
+
+
+@pytest.mark.parametrize("step_rows", [1, 5, 8])
+def test_a_fit_read_a_few_rows_a_step_fits_the_state_a_fit_in_one_pass_does(
+    step_rows: int,
+) -> None:
+    import jax
+
+    from generalforecast.runtime.device import with_summary_chunk
+
+    model = tiny_tabfm()
+    # Padding rows past `num_rows` and a categorical column, so masks and
+    # both column stages' chunks run.
+    data = table(False, rows=24, queries=6, features=4, seed=4)
+    coded = jnp.array([False, True, False, False])
+    whole_state, whole_rows = tabfm_functions.fit(
+        model,
+        data.features,
+        data.targets,
+        data.num_classes,
+        num_rows=20,
+        categorical=coded,
+    )
+    chunked = with_summary_chunk(model, step_rows * data.features.shape[1])
+    state, rows = tabfm_functions.fit(
+        chunked,
+        data.features,
+        data.targets,
+        data.num_classes,
+        num_rows=20,
+        categorical=coded,
+    )
+
+    for whole, read in zip(
+        jax.tree.leaves(whole_state.columns),
+        jax.tree.leaves(state.columns),
+        strict=True,
+    ):
+        np.testing.assert_allclose(read, whole, atol=1e-5)
+    np.testing.assert_allclose(rows[:20], whole_rows[:20], atol=1e-5)

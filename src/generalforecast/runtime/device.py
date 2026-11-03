@@ -335,25 +335,27 @@ def _darwin_available() -> int | None:
     return (info[0] + info[2]) * os.sysconf("SC_PAGE_SIZE")
 
 
-# What XLA's command buffers (CUDA graphs) capture: a program's fusions,
-# matrix multiplies and cuDNN calls, launched as one graph rather than one
-# kernel at a time. A warm step launches hundreds of kernels from the worker's
-# thread; captured, an H100 ran the hillclimb set's steps 1.2 to 1.9 times as
-# fast, with the same predictions.
+# What XLA's command buffers (CUDA graphs) capture when a run asks for them:
+# a program's fusions, matrix multiplies and cuDNN calls, launched as one
+# graph rather than one kernel at a time. They are off by default: on the
+# hillclimb set they moved warm throughput by -23% to +19%, and with them on,
+# Mitra-2's and LimiX-2's per-query contexts failed on an H100 with
+# CUDA_ERROR_LAUNCH_FAILED while checking stream capture, which with them off
+# they did not.
 COMMAND_BUFFERS = "FUSION,CUBLAS,CUBLASLT,CUSTOM_CALL,CUDNN"
-# Set to `0` to turn command buffers off.
+# Set to `1` to turn command buffers on.
 COMMAND_BUFFERS_ENV = "GF_COMMAND_BUFFERS"
 
 
 def command_buffers() -> None:
-    """Sets XLA's command buffers to `COMMAND_BUFFERS` unless `XLA_FLAGS` sets them; `GF_COMMAND_BUFFERS=0` turns them off.
+    """Turns XLA's command buffers off unless `XLA_FLAGS` sets them; `GF_COMMAND_BUFFERS=1` sets `COMMAND_BUFFERS`.
 
     It takes effect only before JAX starts its first backend.
     """
     flags = os.environ.get("XLA_FLAGS", "")
     if "xla_gpu_enable_command_buffer" in flags:
         return
-    kinds = "" if os.environ.get(COMMAND_BUFFERS_ENV) == "0" else COMMAND_BUFFERS
+    kinds = COMMAND_BUFFERS if os.environ.get(COMMAND_BUFFERS_ENV) == "1" else ""
     os.environ["XLA_FLAGS"] = f"{flags} --xla_gpu_enable_command_buffer={kinds}".strip()
 
 
