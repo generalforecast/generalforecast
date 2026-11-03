@@ -110,7 +110,7 @@ MODEL_NAME_PATTERN = r"[a-z0-9][a-z0-9.-]{0,62}"
 MODEL_NAME = re.compile(MODEL_NAME_PATTERN)
 MODEL_ID = re.compile(
     rf"[a-z][a-z0-9-]{{0,62}}/{MODEL_NAME_PATTERN}"
-    r"(?:@sha256:[0-9a-f]{64})?(?:@\d+)?(?:\*\d+)?"
+    r"(?:@ft[1-9]\d*)?(?:@sha256:[0-9a-f]{64})?(?:@\d+)?(?:\*\d+)?"
 )
 
 

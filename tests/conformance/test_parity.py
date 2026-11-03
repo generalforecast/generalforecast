@@ -461,7 +461,7 @@ FORGERIES = {
     "classes": lambda d: d["predictor"].update(classes=[0, 1, 2]),
     "resources": lambda d: d.update(resources={"accelerator": "L4"}),
     "context rows": lambda d: d["predictor"]["context"].update(rows=3),
-    "another format": lambda d: d.update(lock_version=2),
+    "another format": lambda d: d.update(lock_version=3),
 }
 
 

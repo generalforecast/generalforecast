@@ -192,7 +192,7 @@ def test_load_lock_is_frozen_and_notices_any_manifest_edit(churn: Path):
 
 
 def test_a_lock_of_another_format_asks_for_gf_check(churn: Path):
-    (churn / "gf.lock").write_text("lock_version: 2\npredictor: {name: churn}\n")
+    (churn / "gf.lock").write_text("lock_version: 3\npredictor: {name: churn}\n")
     with pytest.raises(InvalidInput) as caught:
         load_lock(churn)
     assert caught.value.message == (
@@ -203,7 +203,7 @@ def test_a_lock_of_another_format_asks_for_gf_check(churn: Path):
     write_lock(resolution, churn)
     assert yaml.safe_load((churn / "gf.lock").read_text())["lock_version"] == 1
     with pytest.raises(PredictorError) as refused:
-        parse_lock({"lock_version": 2, "predictor": {}, "model": {}})
+        parse_lock({"lock_version": 3, "predictor": {}, "model": {}})
     assert refused.value.code == "UnsupportedLockVersion"
 
 
