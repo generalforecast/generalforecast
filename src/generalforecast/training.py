@@ -21,15 +21,29 @@ Exports:
         layout, and bias: what low-rank and full fine-tuning adapt.
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from generalforecast.models.contract import TabularFunctions
-from generalforecast.nn.linear import LinearParameters
+if TYPE_CHECKING:
+    from generalforecast.models.contract import TabularFunctions
+    from generalforecast.nn.linear import LinearParameters
 
 VERSION = 1
 
 
-def load(model: str, *, allow_downloads: bool = True) -> tuple[TabularFunctions, Any]:
+def __getattr__(name: str) -> Any:
+    """The parameter types, imported on first use: `hosting` stays free of JAX."""
+    if name == "TabularFunctions":
+        from generalforecast.models.contract import TabularFunctions
+
+        return TabularFunctions
+    if name == "LinearParameters":
+        from generalforecast.nn.linear import LinearParameters
+
+        return LinearParameters
+    raise AttributeError(name)
+
+
+def load(model: str, *, allow_downloads: bool = True) -> "tuple[TabularFunctions, Any]":
     """A catalog tabular model's contract calls and verified parameters.
 
     The model loads as hosted predictors load it, under the predictor
@@ -40,6 +54,7 @@ def load(model: str, *, allow_downloads: bool = True) -> tuple[TabularFunctions,
             hosted predictors.
     """
     from generalforecast.models import registry
+    from generalforecast.models.contract import TabularFunctions
 
     functions, parameters = registry.load(
         model, surface="predictor", allow_downloads=allow_downloads

@@ -189,3 +189,14 @@ def test_the_training_surface_loads_a_tabular_model_as_gf_serves_it(monkeypatch)
         functions, training.TabularFunctions
     )
     assert asked == [("general-forecast/tabicl-v2-classifier", "predictor")]
+
+
+def test_importing_hosting_loads_no_jax():
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; import generalforecast.hosting; "
+        "assert not [m for m in sys.modules if m.split('.')[0] == 'jax'], 'jax'"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
