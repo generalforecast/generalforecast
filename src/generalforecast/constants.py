@@ -87,6 +87,13 @@ MAPPINGS_SHORT = 3 / 4
 # only up to `WARM_RUN_ROWS` rows, and past that only compiles them.
 TABLE_STAGES = frozenset({"fit", "state", "encode"})
 WARM_RUN_ROWS = 1024
+# The most bytes of zeros a warm start runs a program on. A paged decode
+# reads the device pool, and zeros the pool's size are a second pool, which
+# the device holding the first cannot take; past this it only compiles.
+WARM_RUN_BYTES = 256 << 20
+# Programs a warm start compiles at once: compiles are mostly host work, and
+# a machine of a few cores takes about this many side by side.
+WARM_COMPILES = 4
 # Page counts a table's embeds compile for once it is fit, this many buckets
 # from one page: a write changes one page or a few.
 WARMED_PAGES = 4
