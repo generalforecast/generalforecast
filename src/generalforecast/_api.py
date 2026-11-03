@@ -2197,10 +2197,9 @@ class RunLineageReply(Payload):
     )
 
 
-UploadState = Literal["open", "verifying", "verified", "rejected", "expired", "deleted"]
+UploadState = Literal["open", "verified", "rejected", "expired", "deleted"]
 _decode_UploadState: Decoder = _literal(
     "open",
-    "verifying",
     "verified",
     "rejected",
     "expired",
@@ -6339,14 +6338,6 @@ ROUTES: tuple[Route, ...] = (
         None,
         UploadReply,
         None,
-    ),
-    Route(
-        "uploads.complete",
-        "POST",
-        "/v1/projects/{project}/uploads/{upload}/complete",
-        UploadRefRequest,
-        UploadReply,
-        "application/json",
     ),
     Route(
         "uploads.delete",

@@ -2504,8 +2504,10 @@ paths:
       - hosted
       summary: open an upload of a Parquet training table, with its size and metadata
       description: '`url` is a resumable session to `PUT` the bytes to, in `chunk_bytes` chunks with `Content-Range`.
-        The metadata names the target and task, and the columns verification checks. An upload left open
-        for a day expires.'
+        The metadata names the target and task, and the columns verification checks. Once every declared
+        byte is stored, the plane verifies the upload on its own: it reads the Parquet footer, checks the
+        named columns exist and hashes the bytes, and the upload becomes `verified` or `rejected` with an
+        `error`. An upload left open for a day expires.'
       parameters:
       - $ref: '#/components/parameters/project'
       requestBody:
@@ -2611,62 +2613,6 @@ paths:
                           task: classification
                           origin:
                             kind: uploaded
-  /v1/projects/{project}/uploads/{upload}/complete:
-    post:
-      operationId: uploads.complete
-      tags:
-      - hosted
-      summary: say every byte is sent, and queue the upload for verification
-      description: Verification reads the Parquet footer, checks the columns the metadata names exist and
-        hashes the bytes; the upload becomes `verified` or `rejected` with an `error`. Completing again
-        returns the upload as it is.
-      parameters:
-      - $ref: '#/components/parameters/project'
-      - $ref: '#/components/parameters/upload'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/UploadRefRequest'
-            examples:
-              complete:
-                value:
-                  api_version: gf/v1
-                  project: acme
-                  request_id: r-0d7c1e9a2b4d6f8031a5c7e9b2d4f6a8
-                  resource:
-                    kind: corpus
-                    name: up-3f1c2a9b8e7d6c5b4a392817
-                  payload: {}
-      responses:
-        '200':
-          description: ok
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/UploadReply'
-              examples:
-                complete:
-                  value:
-                    api_version: gf/v1
-                    project: acme
-                    request_id: r-0d7c1e9a2b4d6f8031a5c7e9b2d4f6a8
-                    resource:
-                      kind: corpus
-                      name: up-3f1c2a9b8e7d6c5b4a392817
-                    result:
-                      id: up-3f1c2a9b8e7d6c5b4a392817
-                      state: verifying
-                      bytes: 52428800
-                      digest: null
-                      error: null
-                      metadata:
-                        target: defaulted
-                        task: classification
-                        origin:
-                          kind: uploaded
-                      expires: null
   /v1/projects/{project}/uploads/{upload}/delete:
     post:
       operationId: uploads.delete
@@ -5517,7 +5463,6 @@ components:
       type: string
       enum:
       - open
-      - verifying
       - verified
       - rejected
       - expired
