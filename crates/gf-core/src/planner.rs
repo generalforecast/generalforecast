@@ -104,7 +104,8 @@ pub enum Strategy {
     /// most `ADAPTIVE_WHOLE_PAST_CAP` times a cap of at least
     /// `ADAPTIVE_WHOLE_FROM_CAP` and the worker can hold its whole context on
     /// the device: the table's `whole` rows, which `resolve_within` takes.
-    /// Without a `whole` it resolves as `Adaptive` does.
+    /// Past that, and without a `whole`, it resolves as `Adaptive` does but
+    /// with contexts of at most `ADAPTIVE_WHOLE_CONTEXT` rows.
     AdaptiveWhole,
     /// A core shared by every query of a window, plus each query's
     /// `neighbors` nearest rows outside it, encoded together. Without
@@ -155,6 +156,15 @@ pub const ADAPTIVE_WHOLE_PAST_CAP: u64 = 4;
 /// `ADAPTIVE_WHOLE_PAST_CAP` times it; a model trained on smaller contexts
 /// is held to its cap.
 pub const ADAPTIVE_WHOLE_FROM_CAP: u64 = 10_000;
+
+/// The most rows of each query's context `AdaptiveWhole` reads past the
+/// rows its worker holds whole: a stratified core of a quarter, the rest
+/// the query's nearest rows. Each query's context is encoded on its own, so
+/// its size sets the speed. On an H100 with TabICL v2 (60,000-row cap),
+/// contexts of 16,384 rows scored as well as contexts of the cap or better
+/// on ieee_fraud_detection (590k rows), covertype (580k) and smoking (990k),
+/// at 6 to 8 times the rows a second.
+pub const ADAPTIVE_WHOLE_CONTEXT: u64 = 16_384;
 
 /// How many nearest rows an adaptive strategy's neighbors are the latest of,
 /// per neighbor, when the table has times.
@@ -274,7 +284,8 @@ impl Strategy {
     /// As `resolve`, where `whole` is the most rows the table's worker can
     /// hold as one context on its device: `AdaptiveWhole` reads a table past
     /// the cap whole up to it, within `ADAPTIVE_WHOLE_PAST_CAP` times a cap of
-    /// at least `ADAPTIVE_WHOLE_FROM_CAP`.
+    /// at least `ADAPTIVE_WHOLE_FROM_CAP`, and past that resolves as `resolve`
+    /// does under a cap of at most `ADAPTIVE_WHOLE_CONTEXT`.
     #[must_use]
     pub fn resolve_within(
         self,
@@ -283,9 +294,9 @@ impl Strategy {
         whole: Option<NonZeroU64>,
         timed: bool,
     ) -> Self {
-        let whole = match self {
-            Self::Adaptive => None,
-            Self::AdaptiveWhole => whole.map(NonZeroU64::get),
+        let (whole, most) = match self {
+            Self::Adaptive => (None, u64::MAX),
+            Self::AdaptiveWhole => (whole.map(NonZeroU64::get), ADAPTIVE_WHOLE_CONTEXT),
             _ => return self,
         };
         let Some(cap) = cap.map(NonZeroU64::get).filter(|&cap| rows > cap) else {
@@ -297,6 +308,7 @@ impl Strategy {
         if within {
             return Self::Exact;
         }
+        let cap = cap.min(most);
         #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
         #[allow(clippy::cast_sign_loss)]
         let core = ((cap as f64) * ADAPTIVE_CORE_SHARE).round_ties_even() as u64;

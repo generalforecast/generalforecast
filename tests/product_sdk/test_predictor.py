@@ -335,12 +335,13 @@ def test_frame_reads_every_row_shape_and_names_what_it_cannot(tmp_path: Path) ->
 def test_selection_settings_resolve_against_the_model_cap() -> None:
     whole = tables.default_selection(1_000, cap=60_000)
     assert (whole.core, whole.neighbors, whole.whole) == (None, 0, True)
-    drawn = tables.default_selection(100_000, cap=60_000, timed=True)
+    # Past the cap, contexts of at most 16,384 rows: a quarter core.
+    drawn = tables.default_selection(300_000, cap=60_000, timed=True)
     assert (drawn.core, drawn.neighbors, drawn.kind, drawn.recent) == (
-        15_000,
-        45_000,
+        4_096,
+        12_288,
         "stratified",
-        180_000,
+        49_152,
     )
     fractions = tables.Retrieved(core=0.25, neighbors=0.75, kind="stratified").resolved(
         1_000
