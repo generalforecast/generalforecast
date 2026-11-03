@@ -459,3 +459,35 @@ def test_a_fit_profile_is_kept_for_later_processes_unless_unmeasured(
     assert started().fit_profile(0, wider) == FitProfile(wider)
     started().fit_profile(0, wider)
     assert measured == [FEATURES, wider, wider]
+
+
+def test_queries_group_by_the_unit_they_read_in_order_of_first_read() -> None:
+    from generalforecast.worker.decodes import _groups
+
+    assert _groups([]) == {}
+    assert _groups([4, 4, 4]) == {4: [0, 1, 2]}
+    assert _groups([3, 1, 3, 2, 1]) == {3: [0, 2], 1: [1, 4], 2: [3]}
+    assert list(_groups([3, 1, 3, 2, 1])) == [3, 1, 2]
+
+
+def test_requests_asking_the_same_levels_fetch_the_columns_those_levels_read() -> None:
+    from generalforecast.worker.decodes import _picks
+
+    known = np.arange(1, 1000) / 1000
+    levels = np.asarray([0.1, 0.5, 0.9])
+
+    def batch(request: int, asked: np.ndarray | None) -> protocol.QueryBatch:
+        return protocol.QueryBatch(
+            request, 0, 0, np.zeros((2, 1), np.float32), [0, 0], known, asked
+        )
+
+    same = _picks([batch(1, levels), batch(2, levels)], [[(1, 0, 2), (2, 2, 4)]])
+    columns, at, asked = same[0]
+    np.testing.assert_array_equal(columns, protocol.level_columns(known, levels))
+    np.testing.assert_array_equal(at, known[columns])
+    np.testing.assert_array_equal(asked, levels)
+    # Requests asking different levels, or none, keep every column.
+    assert not _picks(
+        [batch(1, levels), batch(2, levels[:2])], [[(1, 0, 2), (2, 2, 4)]]
+    )
+    assert not _picks([batch(1, None)], [[(1, 0, 2)]])
