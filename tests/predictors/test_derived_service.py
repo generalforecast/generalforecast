@@ -22,6 +22,8 @@ FOUND = {
         "base_digest": BASE_DIGEST,
         "digest": DIGEST,
         "bags": 4,
+        "kind": "lora",
+        "run": "credit-default",
         "version": 3,
         "created": 0.0,
     },

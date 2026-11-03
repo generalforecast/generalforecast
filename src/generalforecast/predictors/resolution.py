@@ -319,6 +319,7 @@ def resolve(
                 "base": pin.derived.base,
                 "base_digest": pin.derived.base_digest,
                 "bags": pin.derived.bags,
+                "kind": pin.derived.kind,
             }
         ),
         task=task,
