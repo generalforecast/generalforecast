@@ -274,13 +274,14 @@ export interface ResolvedSelection {
 
 /**
  * what a derived model runs on: the catalog base and its digest, which its weights are
- * only valid with, and how many bags of weights it averages; each bag counts as one
- * estimator
+ * only valid with, how many bags of weights it averages (each counts as one estimator),
+ * and what kind of change its weights make
  */
 export interface DerivedBase {
   base: ModelId;
   base_digest: Digest;
   bags: number;
+  kind: "lora" | "adapter" | "full";
 }
 
 /** the resolved predictor gf.lock pins */
@@ -378,6 +379,7 @@ export interface DerivedModel {
   base_digest: Digest;
   digest: Digest;
   bags: number;
+  kind: "lora" | "adapter" | "full";
   version: number;
   created: number;
 }

@@ -101,7 +101,8 @@ Exports:
             them, and the parameter types fine-tuning adapts. The
             resolver decides who may use a model; gf never sees how it was
             made. A lock that pins one is `lock_version: 2`, with a
-            `predictor.derived` block of `base`, `base_digest` and `bags`.
+            `predictor.derived` block of `base`, `base_digest`, `bags`
+            and `kind`.
     Service plumbing
         Request, Resource, ResourceKind, Scope, Capability, RateLimit,
             JsonObject, VERSION, parse_body, success, failure, json_object,
