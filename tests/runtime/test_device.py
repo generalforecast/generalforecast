@@ -22,8 +22,10 @@ from generalforecast.nn.attention import (
     AttentionParameters,
 )
 from generalforecast.runtime.device import (
+    COMMAND_BUFFERS,
     DeviceSettings,
     available_memory,
+    command_buffers,
     configure,
     default_settings,
     device_settings,
@@ -32,7 +34,6 @@ from generalforecast.runtime.device import (
     store_cache,
     to_cache_dtype,
     with_precision,
-    without_command_buffers,
 )
 from tests.models.tabicl.tiny import tiny_tabicl
 
@@ -50,6 +51,19 @@ def test_gf_precision_picks_the_mode(monkeypatch: pytest.MonkeyPatch) -> None:
     assert exact == device_settings(backend, exact=True)
     assert fast == device_settings(backend)
     with pytest.raises(ValueError, match="GF_PRECISION"):
+        default_settings()
+
+
+def test_gf_matmul_precision_overrides_the_modes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GF_PRECISION", raising=False)
+    monkeypatch.setenv("GF_MATMUL_PRECISION", "bfloat16")
+    settings = default_settings()
+    assert settings.matmul_precision == "bfloat16"
+    assert settings.kernel == device_settings(jax.default_backend()).kernel
+    monkeypatch.setenv("GF_MATMUL_PRECISION", "half")
+    with pytest.raises(ValueError, match="GF_MATMUL_PRECISION"):
         default_settings()
 
 
@@ -146,16 +160,21 @@ def test_a_worker_starts_without_process_affinity(
     Worker().close()
 
 
-def test_command_buffers_are_off_unless_xla_flags_set_them(
+def test_command_buffers_are_on_unless_xla_flags_or_gf_turn_them_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("GF_COMMAND_BUFFERS", raising=False)
     monkeypatch.setenv("XLA_FLAGS", "--xla_dump_to=/tmp/x")
-    without_command_buffers()
+    command_buffers()
     assert os.environ["XLA_FLAGS"] == (
-        "--xla_dump_to=/tmp/x --xla_gpu_enable_command_buffer="
+        f"--xla_dump_to=/tmp/x --xla_gpu_enable_command_buffer={COMMAND_BUFFERS}"
     )
+    monkeypatch.setenv("XLA_FLAGS", "")
+    monkeypatch.setenv("GF_COMMAND_BUFFERS", "0")
+    command_buffers()
+    assert os.environ["XLA_FLAGS"] == "--xla_gpu_enable_command_buffer="
     monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_enable_command_buffer=FUSION")
-    without_command_buffers()
+    command_buffers()
     assert os.environ["XLA_FLAGS"] == "--xla_gpu_enable_command_buffer=FUSION"
 
 

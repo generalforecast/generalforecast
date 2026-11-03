@@ -119,17 +119,40 @@ def device_settings(platform: str, exact: bool = False) -> DeviceSettings:
     return DeviceSettings(FLOAT32, FLOAT32, kernel, matmul_precision="highest")
 
 
+# JAX's names for the precision of float32 matrix multiplies a run may pick
+# with GF_MATMUL_PRECISION: `default` (TF32 on a GPU), `bfloat16` (bfloat16
+# inputs, float32 sums, twice TF32's throughput on an H100), `high` or
+# `highest`. Attention keeps its own dtype whatever is picked.
+MATMUL_PRECISIONS = (
+    "default",
+    "bfloat16",
+    "tensorfloat32",
+    "high",
+    "highest",
+    "float32",
+)
+
+
 def default_settings() -> DeviceSettings:
     """This machine's settings, from the environment.
 
-    `GF_PRECISION` names the mode, `fast` (default) or `exact`, and
+    `GF_PRECISION` names the mode, `fast` (default) or `exact`;
     `GF_CACHE_DTYPE` overrides the dtype caches are stored in: `float32`,
-    `float16`, `bfloat16`, or `int8` with a scale per row and head.
+    `float16`, `bfloat16`, or `int8` with a scale per row and head; and
+    `GF_MATMUL_PRECISION` overrides the precision of float32 matrix
+    multiplies (`MATMUL_PRECISIONS`), as to measure `bfloat16` against TF32.
     """
     mode = os.environ.get("GF_PRECISION", "fast")
     if mode not in ("fast", "exact"):
         raise ValueError(f"GF_PRECISION must be fast or exact, not {mode!r}")
     settings = device_settings(jax.default_backend(), exact=mode == "exact")
+    matmul = os.environ.get("GF_MATMUL_PRECISION")
+    if matmul is not None:
+        if matmul not in MATMUL_PRECISIONS:
+            raise ValueError(
+                f"GF_MATMUL_PRECISION must be one of {MATMUL_PRECISIONS}, not {matmul!r}"
+            )
+        settings = dataclasses.replace(settings, matmul_precision=matmul)
     cache = os.environ.get("GF_CACHE_DTYPE")
     if cache is None:
         return settings
@@ -312,16 +335,26 @@ def _darwin_available() -> int | None:
     return (info[0] + info[2]) * os.sysconf("SC_PAGE_SIZE")
 
 
-def without_command_buffers() -> None:
-    """Turns off XLA's command buffers (CUDA graphs) unless `XLA_FLAGS` sets them.
+# What XLA's command buffers (CUDA graphs) capture: a program's fusions,
+# matrix multiplies and cuDNN calls, launched as one graph rather than one
+# kernel at a time. A warm step launches hundreds of kernels from the worker's
+# thread; captured, an H100 ran the hillclimb set's steps 1.2 to 1.9 times as
+# fast, with the same predictions.
+COMMAND_BUFFERS = "FUSION,CUBLAS,CUBLASLT,CUSTOM_CALL,CUDNN"
+# Set to `0` to turn command buffers off.
+COMMAND_BUFFERS_ENV = "GF_COMMAND_BUFFERS"
 
-    With them, steps vectorized over many tables failed on GPUs with
-    `cudaErrorStreamCaptureInvalidated` while XLA captured a command buffer.
+
+def command_buffers() -> None:
+    """Sets XLA's command buffers to `COMMAND_BUFFERS` unless `XLA_FLAGS` sets them; `GF_COMMAND_BUFFERS=0` turns them off.
+
     It takes effect only before JAX starts its first backend.
     """
     flags = os.environ.get("XLA_FLAGS", "")
-    if "xla_gpu_enable_command_buffer" not in flags:
-        os.environ["XLA_FLAGS"] = f"{flags} --xla_gpu_enable_command_buffer=".strip()
+    if "xla_gpu_enable_command_buffer" in flags:
+        return
+    kinds = "" if os.environ.get(COMMAND_BUFFERS_ENV) == "0" else COMMAND_BUFFERS
+    os.environ["XLA_FLAGS"] = f"{flags} --xla_gpu_enable_command_buffer={kinds}".strip()
 
 
 def portable_cpu_programs() -> None:

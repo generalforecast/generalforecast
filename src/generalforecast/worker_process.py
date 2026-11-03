@@ -33,11 +33,11 @@ from generalforecast.models import registry
 from generalforecast.profiling import memory
 from generalforecast.runtime.budget import MemoryBudget
 from generalforecast.runtime.device import (
+    command_buffers,
     compile_cache_counts,
     default_settings,
     portable_cpu_programs,
     report_fallback,
-    without_command_buffers,
 )
 from generalforecast.system import pin_cpus
 from generalforecast.worker import Worker
@@ -75,7 +75,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         pin_cpus(int(cpu) for cpu in options.cpus.split(","))
 
     # Before `default_settings` starts JAX's backend, which reads XLA's flags.
-    without_command_buffers()
+    command_buffers()
     portable_cpu_programs()
     report_fallback()
     budget = MemoryBudget.measure(workers=options.workers)
