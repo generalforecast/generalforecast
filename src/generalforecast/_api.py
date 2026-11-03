@@ -1695,6 +1695,801 @@ class SecretDeletedReply(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class Prior(Payload):
+    """The Prior schema."""
+
+    name: str
+    version: str
+    params: dict[str, Any] | None = None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("name", "name", True, _text),
+        Field("version", "version", True, _text),
+        Field("params", "params", False, _mapping(_any)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class SnapshotsMember(Payload):
+    """The SnapshotsMember schema."""
+
+    snapshots: tuple[Digest, ...]
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("snapshots", "snapshots", True, _items(_decode_Digest)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class PriorMember(Payload):
+    """The PriorMember schema."""
+
+    prior: Prior
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("prior", "prior", True, _record(Prior)),
+    )
+
+
+CorpusMember = SnapshotsMember | PriorMember
+_decode_CorpusMember: Decoder = _union(_record(SnapshotsMember), _record(PriorMember))
+
+
+@dataclass(frozen=True, kw_only=True)
+class Corpus(Payload):
+    """The Corpus schema."""
+
+    name: Name
+    digest: Digest
+    members: dict[str, CorpusMember]
+    parent: Name | None
+    created: float
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("name", "name", True, _decode_Name),
+        Field("digest", "digest", True, _decode_Digest),
+        Field("members", "members", True, _mapping(_decode_CorpusMember)),
+        Field("parent", "parent", True, _union(_decode_Name, _null)),
+        Field("created", "created", True, _number),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class CorpusReply(Payload):
+    """The CorpusReply schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    result: Corpus
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("result", "result", True, _record(Corpus)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class CorpusList(Payload):
+    """The CorpusList schema."""
+
+    corpora: tuple[Corpus, ...]
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("corpora", "corpora", True, _items(_record(Corpus))),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class CorpusListReply(Payload):
+    """The CorpusListReply schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    result: CorpusList
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("result", "result", True, _record(CorpusList)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class CorpusCreate(Payload):
+    """The CorpusCreate schema."""
+
+    name: Name
+    members: dict[str, CorpusMember]
+    parent: Name | None = None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("name", "name", True, _decode_Name),
+        Field("members", "members", True, _mapping(_decode_CorpusMember)),
+        Field("parent", "parent", False, _decode_Name),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class CorpusCreateRequest(Payload):
+    """The CorpusCreateRequest schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    payload: CorpusCreate
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("payload", "payload", True, _record(CorpusCreate)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class CorpusRef(Payload):
+    """The CorpusRef schema."""
+
+    name: Name
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (Field("name", "name", True, _decode_Name),)
+
+
+@dataclass(frozen=True, kw_only=True)
+class CorpusRefRequest(Payload):
+    """The CorpusRefRequest schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    payload: CorpusRef
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("payload", "payload", True, _record(CorpusRef)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class CorpusDeleted(Payload):
+    """The CorpusDeleted schema."""
+
+    name: Name
+    deleted: Literal[True] = True
+    released_snapshots: int
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("name", "name", True, _decode_Name),
+        Field("deleted", "deleted", True, _literal(True)),
+        Field("released_snapshots", "released_snapshots", True, _integer),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class CorpusDeletedReply(Payload):
+    """The CorpusDeletedReply schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    result: CorpusDeleted
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("result", "result", True, _record(CorpusDeleted)),
+    )
+
+
+RunState = Literal[
+    "queued",
+    "setting_up",
+    "ready",
+    "training",
+    "preempted",
+    "finished",
+    "cancelling",
+    "cancelled",
+    "failed",
+]
+_decode_RunState: Decoder = _literal(
+    "queued",
+    "setting_up",
+    "ready",
+    "training",
+    "preempted",
+    "finished",
+    "cancelling",
+    "cancelled",
+    "failed",
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunCorpus(Payload):
+    """The RunCorpus schema."""
+
+    name: Name
+    digest: Digest
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("name", "name", True, _decode_Name),
+        Field("digest", "digest", True, _decode_Digest),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class Run(Payload):
+    """The Run schema."""
+
+    name: Name
+    state: RunState
+    reason: str | None
+    attempt: int
+    base_model: ModelId
+    corpus: RunCorpus
+    changes: tuple[dict[str, Any], ...]
+    evaluation: dict[str, Any]
+    checkpoint_policy: dict[str, Any]
+    budget: dict[str, Any] | None
+    seed: int
+    tags: tuple[Name, ...]
+    plan: dict[str, Any] | None
+    created: float
+    updated: float
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("name", "name", True, _decode_Name),
+        Field("state", "state", True, _decode_RunState),
+        Field("reason", "reason", True, _union(_text, _null)),
+        Field("attempt", "attempt", True, _integer),
+        Field("base_model", "base_model", True, _decode_ModelId),
+        Field("corpus", "corpus", True, _record(RunCorpus)),
+        Field("changes", "changes", True, _items(_mapping(_any))),
+        Field("evaluation", "evaluation", True, _mapping(_any)),
+        Field("checkpoint_policy", "checkpoint_policy", True, _mapping(_any)),
+        Field("budget", "budget", True, _union(_mapping(_any), _null)),
+        Field("seed", "seed", True, _integer),
+        Field("tags", "tags", True, _items(_decode_Name)),
+        Field("plan", "plan", True, _union(_mapping(_any), _null)),
+        Field("created", "created", True, _number),
+        Field("updated", "updated", True, _number),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunReply(Payload):
+    """The RunReply schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    result: Run
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("result", "result", True, _record(Run)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunList(Payload):
+    """The RunList schema."""
+
+    runs: tuple[Run, ...]
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("runs", "runs", True, _items(_record(Run))),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunListReply(Payload):
+    """The RunListReply schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    result: RunList
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("result", "result", True, _record(RunList)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunCreate(Payload):
+    """The RunCreate schema."""
+
+    name: Name
+    base_model: ModelId
+    corpus: Name
+    changes: tuple[dict[str, Any], ...]
+    evaluation: dict[str, Any]
+    plan: dict[str, Any] | None = None
+    checkpoint_policy: dict[str, Any] | None = None
+    budget: dict[str, Any] | None = None
+    seed: int | None = None
+    tags: tuple[Name, ...] | None = None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("name", "name", True, _decode_Name),
+        Field("base_model", "base_model", True, _decode_ModelId),
+        Field("corpus", "corpus", True, _decode_Name),
+        Field("changes", "changes", True, _items(_mapping(_any))),
+        Field("evaluation", "evaluation", True, _mapping(_any)),
+        Field("plan", "plan", False, _mapping(_any)),
+        Field("checkpoint_policy", "checkpoint_policy", False, _mapping(_any)),
+        Field("budget", "budget", False, _mapping(_any)),
+        Field("seed", "seed", False, _integer),
+        Field("tags", "tags", False, _items(_decode_Name)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunCreateRequest(Payload):
+    """The RunCreateRequest schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    payload: RunCreate
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("payload", "payload", True, _record(RunCreate)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunTrain(Payload):
+    """The RunTrain schema."""
+
+    plan: dict[str, Any]
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (Field("plan", "plan", True, _mapping(_any)),)
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunTrainRequest(Payload):
+    """The RunTrainRequest schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    payload: RunTrain
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("payload", "payload", True, _record(RunTrain)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunRef(Payload):
+    """The RunRef schema."""
+
+    name: Name
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (Field("name", "name", True, _decode_Name),)
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunRefRequest(Payload):
+    """The RunRefRequest schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    payload: RunRef
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("payload", "payload", True, _record(RunRef)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunEvent(Payload):
+    """The RunEvent schema."""
+
+    at: float
+    kind: str
+    body: dict[str, Any]
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("at", "at", True, _number),
+        Field("kind", "kind", True, _text),
+        Field("body", "body", True, _mapping(_any)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunLineage(Payload):
+    """The RunLineage schema."""
+
+    run: Name
+    events: tuple[RunEvent, ...]
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("run", "run", True, _decode_Name),
+        Field("events", "events", True, _items(_record(RunEvent))),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunLineageReply(Payload):
+    """The RunLineageReply schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    result: RunLineage
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("result", "result", True, _record(RunLineage)),
+    )
+
+
+UploadState = Literal["open", "verifying", "verified", "rejected", "expired", "deleted"]
+_decode_UploadState: Decoder = _literal(
+    "open",
+    "verifying",
+    "verified",
+    "rejected",
+    "expired",
+    "deleted",
+)
+
+
+@dataclass(frozen=True, kw_only=True)
+class SnapshotColumn(Payload):
+    """The SnapshotColumn schema."""
+
+    name: str
+    type: str
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("name", "name", True, _text),
+        Field("type", "type", True, _text),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class TrainingSnapshot(Payload):
+    """The TrainingSnapshot schema."""
+
+    digest: Digest
+    bytes: int
+    rows: int
+    columns: tuple[SnapshotColumn, ...]
+    metadata: dict[str, Any]
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("digest", "digest", True, _decode_Digest),
+        Field("bytes", "bytes", True, _integer),
+        Field("rows", "rows", True, _integer),
+        Field("columns", "columns", True, _items(_record(SnapshotColumn))),
+        Field("metadata", "metadata", True, _mapping(_any)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class Upload(Payload):
+    """The Upload schema."""
+
+    id: Name
+    state: UploadState
+    bytes: int
+    digest: Digest | None
+    error: str | None
+    metadata: dict[str, Any] | None
+    expires: float | None
+    snapshot: TrainingSnapshot | None = None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("id", "id", True, _decode_Name),
+        Field("state", "state", True, _decode_UploadState),
+        Field("bytes", "bytes", True, _integer),
+        Field("digest", "digest", True, _union(_decode_Digest, _null)),
+        Field("error", "error", True, _union(_text, _null)),
+        Field("metadata", "metadata", True, _union(_mapping(_any), _null)),
+        Field("expires", "expires", True, _union(_number, _null)),
+        Field("snapshot", "snapshot", False, _record(TrainingSnapshot)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadReply(Payload):
+    """The UploadReply schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    result: Upload
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("result", "result", True, _record(Upload)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadOpened(Payload):
+    """The UploadOpened schema."""
+
+    id: Name
+    state: UploadState
+    bytes: int
+    digest: Digest | None
+    error: str | None
+    metadata: dict[str, Any] | None
+    expires: float | None
+    url: str | None
+    method: Literal["PUT"] = "PUT"
+    chunk_bytes: int
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("id", "id", True, _decode_Name),
+        Field("state", "state", True, _decode_UploadState),
+        Field("bytes", "bytes", True, _integer),
+        Field("digest", "digest", True, _union(_decode_Digest, _null)),
+        Field("error", "error", True, _union(_text, _null)),
+        Field("metadata", "metadata", True, _union(_mapping(_any), _null)),
+        Field("expires", "expires", True, _union(_number, _null)),
+        Field("url", "url", True, _union(_text, _null)),
+        Field("method", "method", True, _literal("PUT")),
+        Field("chunk_bytes", "chunk_bytes", True, _integer),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadOpenedReply(Payload):
+    """The UploadOpenedReply schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    result: UploadOpened
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("result", "result", True, _record(UploadOpened)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadCreate(Payload):
+    """The UploadCreate schema."""
+
+    bytes: int
+    format: Literal["parquet"] = "parquet"
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("bytes", "bytes", True, _integer),
+        Field("format", "format", True, _literal("parquet")),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadCreateRequest(Payload):
+    """The UploadCreateRequest schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    payload: UploadCreate
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("payload", "payload", True, _record(UploadCreate)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadMetadata(Payload):
+    """The UploadMetadata schema."""
+
+    target: str
+    task: Literal["classification", "regression"]
+    column_types: dict[str, str] | None = None
+    time: str | None = None
+    group: str | None = None
+    origin: dict[str, Any] | None = None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("target", "target", True, _text),
+        Field("task", "task", True, _literal("classification", "regression")),
+        Field("column_types", "column_types", False, _mapping(_text)),
+        Field("time", "time", False, _text),
+        Field("group", "group", False, _text),
+        Field("origin", "origin", False, _mapping(_any)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadComplete(Payload):
+    """The UploadComplete schema."""
+
+    metadata: UploadMetadata
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("metadata", "metadata", True, _record(UploadMetadata)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadCompleteRequest(Payload):
+    """The UploadCompleteRequest schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    payload: UploadComplete
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("payload", "payload", True, _record(UploadComplete)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadRef(Payload):
+    """The UploadRef schema."""
+
+    FIELDS: ClassVar[tuple[Field, ...]] = ()
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadRefRequest(Payload):
+    """The UploadRefRequest schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    payload: UploadRef
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("payload", "payload", True, _record(UploadRef)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadDeleted(Payload):
+    """The UploadDeleted schema."""
+
+    id: Name
+    state: Literal["deleted"] = "deleted"
+    digest: Digest | None
+    uploads: tuple[Name, ...]
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("id", "id", True, _decode_Name),
+        Field("state", "state", True, _literal("deleted")),
+        Field("digest", "digest", True, _union(_decode_Digest, _null)),
+        Field("uploads", "uploads", True, _items(_decode_Name)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadDeletedReply(Payload):
+    """The UploadDeletedReply schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    result: UploadDeleted
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("result", "result", True, _record(UploadDeleted)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadReceived(Payload):
+    """The UploadReceived schema."""
+
+    id: Name
+    received: int
+    bytes: int
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("id", "id", True, _decode_Name),
+        Field("received", "received", True, _integer),
+        Field("bytes", "bytes", True, _integer),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadReceivedReply(Payload):
+    """The UploadReceivedReply schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    result: UploadReceived
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("result", "result", True, _record(UploadReceived)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class Revision(Payload):
     """An immutable pushed predictor."""
 
@@ -5502,6 +6297,112 @@ ROUTES: tuple[Route, ...] = (
         None,
         UploadReceiptReply,
         "application/vnd.apache.arrow.stream",
+    ),
+    Route(
+        "corpora.list",
+        "GET",
+        "/v1/projects/{project}/corpora",
+        None,
+        CorpusListReply,
+        None,
+    ),
+    Route(
+        "corpora.create",
+        "POST",
+        "/v1/projects/{project}/corpora",
+        CorpusCreateRequest,
+        CorpusReply,
+        "application/json",
+    ),
+    Route(
+        "corpora.get",
+        "GET",
+        "/v1/projects/{project}/corpora/{corpus}",
+        None,
+        CorpusReply,
+        None,
+    ),
+    Route(
+        "corpora.delete",
+        "POST",
+        "/v1/projects/{project}/corpora/{corpus}/delete",
+        CorpusRefRequest,
+        CorpusDeletedReply,
+        "application/json",
+    ),
+    Route("runs.list", "GET", "/v1/projects/{project}/runs", None, RunListReply, None),
+    Route(
+        "runs.create",
+        "POST",
+        "/v1/projects/{project}/runs",
+        RunCreateRequest,
+        RunReply,
+        "application/json",
+    ),
+    Route("runs.get", "GET", "/v1/projects/{project}/runs/{run}", None, RunReply, None),
+    Route(
+        "runs.train",
+        "POST",
+        "/v1/projects/{project}/runs/{run}/train",
+        RunTrainRequest,
+        RunReply,
+        "application/json",
+    ),
+    Route(
+        "runs.cancel",
+        "POST",
+        "/v1/projects/{project}/runs/{run}/cancel",
+        RunRefRequest,
+        RunReply,
+        "application/json",
+    ),
+    Route(
+        "runs.lineage",
+        "GET",
+        "/v1/projects/{project}/runs/{run}/lineage",
+        None,
+        RunLineageReply,
+        None,
+    ),
+    Route(
+        "uploads.create",
+        "POST",
+        "/v1/projects/{project}/uploads",
+        UploadCreateRequest,
+        UploadOpenedReply,
+        "application/json",
+    ),
+    Route(
+        "uploads.get",
+        "GET",
+        "/v1/projects/{project}/uploads/{upload}",
+        None,
+        UploadReply,
+        None,
+    ),
+    Route(
+        "uploads.complete",
+        "POST",
+        "/v1/projects/{project}/uploads/{upload}/complete",
+        UploadCompleteRequest,
+        UploadReply,
+        "application/json",
+    ),
+    Route(
+        "uploads.delete",
+        "POST",
+        "/v1/projects/{project}/uploads/{upload}/delete",
+        UploadRefRequest,
+        UploadDeletedReply,
+        "application/json",
+    ),
+    Route(
+        "uploads.bytes",
+        "POST",
+        "/v1/projects/{project}/uploads/{upload}/bytes",
+        None,
+        UploadReceivedReply,
+        "application/octet-stream",
     ),
     Route("auth.status", "GET", "/v1/auth/status", None, AuthStatusReply, None),
     Route(
