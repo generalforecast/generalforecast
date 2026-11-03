@@ -27,6 +27,7 @@ RECORDED = (
     "CompiledPlan",
     "ContextImportRef",
     "ContextVersion",
+    "DERIVED_KINDS",
     "Derived",
     "DerivedResolver",
     "DerivedWeights",

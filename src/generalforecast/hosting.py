@@ -88,7 +88,8 @@ Exports:
         pin, limits, entries, parse_model, resource_name, ALIASES,
             ModelRefError, V1_POLICY, CatalogService, prefetch_catalog: the
             catalog, its pins and bounds, and the serving policy.
-        Derived, DerivedResolver, DerivedWeights, use_derived: derived
+        Derived, DerivedResolver, DerivedWeights, DERIVED_KINDS,
+            use_derived: derived
             models, `<owner>/<name>@ft<version>`, which a plane keeps over a
             catalog base. The plane installs a `DerivedResolver` with
             `use_derived`, or names it to engine workers by
@@ -155,6 +156,7 @@ from generalforecast.models.catalog import (
     resource_name,
 )
 from generalforecast.models.catalog import parse as parse_model
+from generalforecast.models.derived import KINDS as DERIVED_KINDS
 from generalforecast.models.derived import Derived
 from generalforecast.models.derived import Resolver as DerivedResolver
 from generalforecast.models.derived import Weights as DerivedWeights
@@ -365,6 +367,7 @@ def kept_measures(directory: Path, spec: str) -> dict[str, Any]:
 __all__ = [
     "ALIASES",
     "CONTEXT_ROWS_KEY",
+    "DERIVED_KINDS",
     "PHYSICAL_TYPES",
     "V1_POLICY",
     "VERSION",
