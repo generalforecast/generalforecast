@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import Any, cast
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -13,6 +15,7 @@ from generalforecast._core import CacheKey
 from generalforecast.constants import MEASURED_ROWS
 from generalforecast.models.tabicl.model import tabicl_functions
 from generalforecast.nn.attention import AttentionKernel
+from generalforecast.runtime import memory
 from generalforecast.runtime.budget import Call, Chunks, measured_bytes
 from generalforecast.runtime.device import (
     FLOAT32,
@@ -21,8 +24,10 @@ from generalforecast.runtime.device import (
     device_settings,
 )
 from generalforecast.runtime.memory import (
+    MEASURE_OPTIONS,
     _encode_parts,
     _traced,
+    concurrently,
     decode_profile,
     encode_profile,
     encode_widths,
@@ -36,6 +41,35 @@ from tests.models.tabicl.tiny import tiny_tabicl
 pytestmark = pytest.mark.slow
 
 FEATURES = 5
+
+
+def test_measuring_compiles_run_together_in_order_and_raise() -> None:
+    assert concurrently([lambda value=value: value for value in range(9)]) == list(
+        range(9)
+    )
+
+    def fails() -> int:
+        raise ValueError("no analysis")
+
+    with pytest.raises(ValueError, match="no analysis"):
+        concurrently([lambda: 1, fails, lambda: 3])
+
+
+def test_a_measured_program_skips_autotuning_on_a_gpu_alone(monkeypatch) -> None:
+    asked: list[object] = []
+
+    class Lowered:
+        def compile(self, compiler_options=None):
+            asked.append(compiler_options)
+            return "compiled"
+
+    for backend, options in (("cpu", None), ("gpu", MEASURE_OPTIONS)):
+        monkeypatch.setattr(
+            memory.jax, "default_backend", lambda backend=backend: backend
+        )
+        assert memory.measure_compiled(cast(Any, Lowered())) == "compiled"
+        assert asked.pop() == options
+    assert MEASURE_OPTIONS == {"xla_gpu_autotune_level": 0}
 
 
 def test_tree_bytes_counts_arrays_and_shapes() -> None:
