@@ -9,8 +9,11 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
+from generalforecast._core import bucket_size
 from generalforecast.worker.calls import _host_padded
 from generalforecast.worker.pages import Representations
 from generalforecast.worker.records import Page, Unit
@@ -44,6 +47,37 @@ class _Deferred:
 Transient = dict[int, _Deferred]
 
 
+@dataclass(frozen=True)
+class _Gather:
+    """A put-off unit's rows, gathered on the device from its step's rows once it is encoded.
+
+    Attributes:
+        values: The step's rows' representations for the unit's table, on the device.
+        targets: Their targets, on the device.
+        index: Each of the unit's padded rows' place in `values`; padding
+            points past them, and reads as zeros.
+    """
+
+    values: jax.Array
+    targets: jax.Array
+    index: np.ndarray
+
+
+@jax.jit
+def _taken(values: jax.Array, index: jax.Array) -> jax.Array:
+    """`values`' rows at `index`, zeros where it points past them."""
+    return jnp.take(values, index, axis=0, mode="fill", fill_value=0)
+
+
+def _expanded(arguments: tuple) -> tuple:
+    """A put-off unit's encode arguments, its rows gathered on the device."""
+    if len(arguments) != 3 or not isinstance(arguments[1], _Gather):
+        return arguments
+    state, gather, rows = arguments
+    index = jnp.asarray(gather.index)
+    return (state, _taken(gather.values, index), _taken(gather.targets, index), rows)
+
+
 class Encoding:
     """How a worker encodes a step's units."""
 
@@ -69,6 +103,11 @@ class Encoding:
             len(unit.rows) for unit in units if unit.action == "reuse"
         )
         joined = self._tables_rows(pages, computed) if waiting else {}
+        # The step's rows of each table that put-off units gather from, on
+        # the device once: such units are many, each a context of its own,
+        # and gathering each on the host and copying it over took most of
+        # their encode. Padded to a bucket, so few sizes compile a gather.
+        on_device: dict[int, tuple[jax.Array, jax.Array]] = {}
         work: dict[str, list[tuple[int, tuple]]] = defaultdict(list)
         group: dict[str, list[int]] = defaultdict(list)
         for index in waiting:
@@ -76,6 +115,9 @@ class Encoding:
             self._fits_device(unit)
             if self._tables[unit.table].own is not None:
                 stage, arguments = "fit_encode", self._own_arguments(unit)
+            elif unit.action == "transient":
+                stage = "encode"
+                arguments = self._gathered_later(unit, joined, on_device)
             else:
                 stage, arguments = "encode", self._gathered(unit, joined)
             if unit.action == "transient":
@@ -137,6 +179,41 @@ class Encoding:
                 len(unit.rows),
             )
 
+    def _gathered_later(
+        self: "Worker",
+        unit: Unit,
+        joined: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]],
+        on_device: dict[int, tuple[jax.Array, jax.Array]],
+    ) -> tuple:
+        """A put-off unit's encode arguments, its rows to gather on the device once encoded.
+
+        Only the places of its rows are kept meanwhile, so a step of many
+        put-off units holds one copy of its rows rather than one per unit.
+        """
+        rows, values, targets = joined[unit.table]
+        wanted = np.asarray(unit.rows)
+        positions = np.searchsorted(rows, wanted)
+        if np.any(positions >= len(rows)) or np.any(rows[positions] != wanted):
+            raise RuntimeError(
+                f"a unit of table {unit.table} reads rows that are in none "
+                "of the step's pages"
+            )
+        if unit.table not in on_device:
+            padded = bucket_size(len(rows), self._minimum)
+            with self.stats.timed("pad"):
+                on_device[unit.table] = (
+                    jnp.asarray(_host_padded(values, padded)),
+                    jnp.asarray(_host_padded(targets, padded)),
+                )
+        device_values, device_targets = on_device[unit.table]
+        index = np.full(self._size(len(unit.rows)), len(device_values), np.int32)
+        index[: len(positions)] = positions
+        return (
+            self._tables[unit.table].state,
+            _Gather(device_values, device_targets, index),
+            len(unit.rows),
+        )
+
     def _own_arguments(self: "Worker", unit: Unit) -> tuple:
         """A unit's fit arguments, from the rows it came with."""
         if unit.features is None or unit.targets is None:
@@ -163,7 +240,9 @@ class Encoding:
         """
         wanted = list(dict.fromkeys(indices))
         deferred = [transient[unit] for unit in wanted]
-        outputs = self._staged([(d.stage, d.table, d.arguments) for d in deferred])
+        outputs = self._staged(
+            [(d.stage, d.table, _expanded(d.arguments)) for d in deferred]
+        )
         encoded: dict[int, tuple[Any, Any]] = {}
         for unit, put_off, output in zip(wanted, deferred, outputs, strict=True):
             state, cache = output if put_off.stage == "fit_encode" else (None, output)
