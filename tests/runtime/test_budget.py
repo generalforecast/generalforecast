@@ -172,10 +172,9 @@ def test_a_call_whose_autotuning_runs_out_of_memory_runs_compiled_without_it(
         chunks.run("decode", "key", 2, 1 << 20, lambda: 32, prepare, consume)
 
     # The first call fails autotuning; the program compiles once without it
-    # and serves both runs, whose answers are the program's. The kind's
-    # first call is measured by a compile without autotuning too.
+    # and serves both runs, whose answers are the program's.
     assert tuned == [2]
-    assert compiled == [budget_module.UNTUNED_OPTIONS] * 2
+    assert compiled == [budget_module.UNTUNED_OPTIONS]
     for answer in outputs:
         np.testing.assert_array_equal(answer, items * 2)
 

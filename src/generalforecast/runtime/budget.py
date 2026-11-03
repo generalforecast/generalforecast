@@ -185,18 +185,21 @@ def _traces(function: Callable[..., Any]) -> int:
     return int(cache_size()) if callable(cache_size) else 0
 
 
-def measured_bytes(call: Call) -> int:
+def measured_bytes(call: Call, untuned: bool = False) -> int:
     """Bytes per item a call takes, by XLA's own analysis, or 0 when XLA cannot say.
 
     Its temporaries and outputs, with the items' own inputs, spread over the
-    items; arguments every item shares are held anyway.
+    items; arguments every item shares are held anyway. Compiling here is the
+    compile the call would do anyway, which JAX then finds in its caches;
+    with `untuned`, for a call too large to autotune beside what the device
+    holds, it compiles without autotuning instead, whose kernels time on
+    buffers of their own.
     """
     try:
         jitted = cast(jax.stages.Wrapped, call.function)
-        # Its memory, not its kernels' speed, so without autotuning, which
-        # would time kernels on buffers of their own beside the step's.
         lowered = jitted.lower(*call.shared, *call.items)
-        analysis = lowered.compile(compiler_options=UNTUNED_OPTIONS).memory_analysis()
+        options = UNTUNED_OPTIONS if untuned else None
+        analysis = lowered.compile(compiler_options=options).memory_analysis()
     except Exception:  # noqa: BLE001
         return 0
     if analysis is None:
@@ -435,7 +438,7 @@ class Chunks:
             call = prepare(first, stop, padded)
             if self._first_measure(key):
                 started = time.perf_counter()
-                measured = measured_bytes(call)
+                measured = measured_bytes(call, untuned=self._crowded(key, padded))
                 measuring += time.perf_counter() - started
                 with self._lock:
                     larger = measured > self._item_bytes[key]
