@@ -279,9 +279,19 @@ def test_built_in_models_say_the_contexts_they_were_trained_on() -> None:
         limits.append((found.context_rows, found.context_features))
 
     assert limits == [(512, 16), (5_120, 50), (1_000_000, 2_000)]
-    assert (
-        registry._trained(catalog.ENTRIES["general-forecast/limix-2-classifier"], model)
-        is model
+    # A model trained on any context says no limits; like every built-in
+    # model, it pads widths, and otherwise keeps its properties and parameters.
+    functions, parameters = registry._trained(
+        catalog.ENTRIES["general-forecast/limix-2-classifier"], model
+    )
+    assert isinstance(functions, TabularFunctions)
+    assert parameters is model[1]
+    found, own = functions.properties(parameters), model[0].properties(model[1])
+    assert found.padded_width
+    assert found == dataclasses.replace(own, padded_width=True)
+    assert (found.context_rows, found.context_features) == (
+        own.context_rows,
+        own.context_features,
     )
 
 

@@ -401,10 +401,14 @@ def test_a_primary_cut_off_while_running_is_fenced_then_catches_up(
     primary.process.send_signal(signal.SIGSTOP)
     try:
         # A write larger than a connection's window stalls partway, and gives
-        # up after the write timeout rather than the call's.
+        # up after the write timeout rather than the call's. A router whose
+        # health checks already found the primary unreachable refuses it at
+        # once instead; either way it fails well before the call's timeout.
         many = np.tile(features, (1_000, 1))
         started = time.monotonic()
-        with pytest.raises(pa.ArrowException, match="no progress"):
+        with pytest.raises(
+            pa.ArrowException, match=r"no progress|is unavailable for writes"
+        ):
             table.upsert(np.arange(len(many)), many, np.tile(targets, 1_000))
         assert time.monotonic() - started < 60
         wait_until(
