@@ -379,6 +379,7 @@ fn a_query_batch_carries_the_levels_its_caller_asked_and_others_do_not() {
             refit: RefitPolicy::default(),
             fit_rows: NonZeroUsize::new(DEFAULT_FIT_ROWS).unwrap(),
             context_rows: None,
+            whole_rows: None,
             past_cap: PastCap::Warn,
             regions: None,
             scale_rows: None,
