@@ -380,6 +380,7 @@ export interface DerivedModel {
   digest: Digest;
   bags: number;
   kind: "lora" | "adapter" | "full";
+  run: string | null;
   version: number;
   created: number;
 }

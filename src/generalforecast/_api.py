@@ -1021,6 +1021,7 @@ class DerivedModel(Payload):
     digest: Digest
     bags: int
     kind: Literal["lora", "adapter", "full"]
+    run: str | None
     version: int
     created: float
 
@@ -1030,6 +1031,7 @@ class DerivedModel(Payload):
         Field("digest", "digest", True, _decode_Digest),
         Field("bags", "bags", True, _integer),
         Field("kind", "kind", True, _literal("lora", "adapter", "full")),
+        Field("run", "run", True, _union(_text, _null)),
         Field("version", "version", True, _integer),
         Field("created", "created", True, _number),
     )

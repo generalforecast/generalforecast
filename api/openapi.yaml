@@ -4736,7 +4736,7 @@ components:
         what a fine-tune is made of, as a predictor's lock records it: its
         base, pinned, and its weights; present on the project's fine-tunes
         alone, which otherwise describe themselves as their base does
-      required: [base, base_digest, digest, bags, kind, version, created]
+      required: [base, base_digest, digest, bags, kind, run, version, created]
       additionalProperties: false
       properties:
         base: {$ref: "#/components/schemas/ModelId"}
@@ -4749,6 +4749,9 @@ components:
           description: |
             what the weights change of the base: low-rank adapters on its
             layers, an input adapter in front of it, or every weight
+        run:
+          type: [string, "null"]
+          description: the project's run that trained the weights, if one did
         version: {type: integer, minimum: 1}
         created: {type: number, description: when the version was published, in seconds since the epoch}
 
