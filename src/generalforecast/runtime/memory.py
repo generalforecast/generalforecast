@@ -22,6 +22,7 @@ import jax.numpy as jnp
 from generalforecast.constants import (
     CACHE_TRACE_LARGE,
     CACHE_TRACE_SMALL,
+    FIT_CHUNK_ROWS,
     FIT_MARGIN,
     FIT_ROWS,
     FIT_STEP_ROWS,
@@ -575,23 +576,28 @@ class FitProfile:
             reading its column summary at once.
         state: A fit of the state alone whose column summary reads a few rows
             a step: what it holds besides the steps.
+        step: What a step of that column summary holds, by the rows it reads,
+            beside `state`: each of its rows' cells through every block.
     """
 
     width: int
     fused: Cost = Cost()
     state: Cost = Cost()
+    step: Cost = Cost()
 
     def fused_rows(self, budget: int) -> int:
         """The most rows a fit embeds in the call that fits its state, in `budget` bytes."""
         return self.fused.rows(budget)
 
     def summary_chunk(self, budget: int) -> int:
-        """Cells a column summary reads a step: half of `budget`, at a fused fit's bytes per row.
+        """Cells a column summary reads a step: what half of `budget` holds, at a step's bytes per row.
 
-        At least `MIN_SUMMARY_ROWS` rows' cells, where what a fit holds besides
-        its rows takes that half.
+        At least `MIN_SUMMARY_ROWS` rows' cells, where what a step holds
+        besides its rows takes that half. Without a measured step, at a fused
+        fit's bytes per row, which a step holds several times over.
         """
-        rows = self.fused.rows(budget // 2)
+        cost = self.step if self.step.row > 0 else self.fused
+        rows = cost.rows(budget // 2)
         return max(MIN_SUMMARY_ROWS, min(rows, sys.maxsize // self.width)) * self.width
 
     def state_rows(self, budget: int) -> int:
@@ -610,8 +616,10 @@ def fit_profile(
     XLA's analysis of the fit compiled at two row counts gives what it takes
     besides its rows, and per row: once as one call that also embeds every
     row, and once for the state alone with its column summary read a few rows
-    a step. Fits are measured at the table's own width, since what a row
-    takes need not grow with the columns in a line, as with grouped columns.
+    a step. The state's fit compiled once more with larger steps gives what a
+    step holds per row it reads. Fits are measured at the table's own width,
+    since what a row takes need not grow with the columns in a line, as with
+    grouped columns.
 
     Args:
         functions: The model's contract calls.
@@ -628,8 +636,10 @@ def fit_profile(
     classes = 0 if properties.regression else min(properties.class_slots, 2)
     few, many = FIT_ROWS
 
-    def lowered(rows: int, state: bool) -> jax.stages.Lowered:
-        chunk = FIT_STEP_ROWS * width if state else None
+    def lowered(
+        rows: int, state: bool, step: int = FIT_STEP_ROWS
+    ) -> jax.stages.Lowered:
+        chunk = step * width if state else None
 
         def fit(model: Any, features: Any, targets: Any, mask: Any) -> Any:
             configured = with_summary_chunk(model, chunk)
@@ -661,21 +671,27 @@ def fit_profile(
     try:
         programs = [
             lowered(rows, state) for state in (False, True) for rows in (few, many)
-        ]
+        ] + [lowered(many, True, FIT_CHUNK_ROWS)]
         key = hashlib.sha256(jax.devices()[0].device_kind.encode())
         for program in programs:
             key.update(program.as_text().encode())
         path = None if cache is None else cache / f"{key.hexdigest()}.json"
         if path is not None and path.is_file():
-            fused, state = json.loads(path.read_text())
-            return FitProfile(width, Cost(*fused), Cost(*state))
+            fused, state, step = json.loads(path.read_text())
+            return FitProfile(width, Cost(*fused), Cost(*state), Cost(*step))
         bytes = concurrently(
             [
                 partial(measured, program, rows)
-                for program, rows in zip(programs, (few, many) * 2, strict=True)
+                for program, rows in zip(
+                    programs, (few, many) * 2 + (many,), strict=True
+                )
             ]
         )
-        profile = FitProfile(width, cost(*bytes[:2]), cost(*bytes[2:]))
+        # A step's rows beyond `FIT_STEP_ROWS`, on top of the state's fit at as many rows.
+        step = Cost(
+            0.0, max(0.0, (bytes[4] - bytes[3]) / (FIT_CHUNK_ROWS - FIT_STEP_ROWS))
+        )
+        profile = FitProfile(width, cost(*bytes[:2]), cost(*bytes[2:4]), step)
     except Exception as error:  # noqa: BLE001
         logger.warning(
             "could not measure the model's fit (%s); its rows are not limited", error
@@ -690,6 +706,7 @@ def fit_profile(
                     [
                         dataclasses.astuple(profile.fused),
                         dataclasses.astuple(profile.state),
+                        dataclasses.astuple(profile.step),
                     ]
                 )
             )

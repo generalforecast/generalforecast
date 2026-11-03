@@ -799,6 +799,17 @@ class LocalClient:
             self._worker.layout(model_id, features)
             self._worker.check(model_id, count, features)
             bound = self._worker.fit_bound(model_id, features)
+            # As a server's worker says: the model's cap, or the most the
+            # device holds, whichever is fewer.
+            capped = [
+                rows
+                for rows in (
+                    properties.context_rows,
+                    self._worker.memory_rows(model_id, features),
+                )
+                if rows is not None
+            ]
+            context_rows = min(capped) if capped else None
             table_id = self._node.create_table(
                 model_id,
                 width(made),
@@ -812,7 +823,7 @@ class LocalClient:
                 refit_after=refit_after,
                 refit_shift=refit_shift,
                 fit_rows=fit_rows,
-                context_rows=properties.context_rows,
+                context_rows=context_rows,
                 past_cap=past_cap,
                 region_rows=region_rows,
                 **_rebuild_arguments(rebuild),
@@ -852,7 +863,7 @@ class LocalClient:
                 refit_shift=refit_shift,
                 fit_rows=fit_rows,
                 past_cap=past_cap,
-                context_rows=properties.context_rows,
+                context_rows=context_rows,
                 region_rows=region_rows,
                 rebuild=rebuild,
                 rebuild_wait=rebuild_wait,

@@ -22,12 +22,13 @@ import pytest
 from generalforecast import errors as generalforecast_errors
 from generalforecast import protocol
 from generalforecast.columns import MAX_WORDS, Column, datetime_parts
+from generalforecast.constants import AUTOTUNE_SHARE, MEASURED_ROWS
 from generalforecast.models import registry
 from generalforecast.models.kumo.model import kumo_functions
 from generalforecast.models.tabicl.model import tabicl_functions
 from generalforecast.runtime.device import device_settings
 from generalforecast.runtime.memory import NoMemoryAnalysis, memory_profile
-from generalforecast.runtime.paging import DevicePool, read_context
+from generalforecast.runtime.paging import DevicePool, cache_layout, pack, read_context
 from generalforecast.worker import Worker
 from generalforecast.worker import admission as worker_admission
 from generalforecast.worker import decodes as worker_decodes
@@ -250,7 +251,8 @@ def test_rows_wider_than_a_slot_span_slots(strategy: str) -> None:
     queries = np.concatenate([NEAR_A, NEAR_B, spread])
     predictions = []
     # Odd slot sizes, so the bytes of a padding block land misaligned.
-    for slot_bytes in (1 << 20, row // 3 + 1, 257):
+    # And slots a little short of two rows, whose rows share blocks of slots.
+    for slot_bytes in (1 << 20, row // 3 + 1, 257, row * 19 // 10):
         client = node_harness.local(slot_bytes=slot_bytes)
         rows = _table(client, strategy=chosen, model=TABICL)
         rows.insert(np.arange(64), features, targets)
@@ -260,6 +262,46 @@ def test_rows_wider_than_a_slot_span_slots(strategy: str) -> None:
 
     for predicted in predictions[1:]:
         np.testing.assert_allclose(predicted, predictions[0], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("in_order", [True, False], ids=["in order", "by row"])
+def test_rows_packed_across_slots_read_back_bit_for_bit(in_order: bool) -> None:
+    model = tiny_tabicl(regression=False)
+    row = memory_profile(tabicl_functions, model, 5).cache_bytes_per_row
+    # Slots a little short of two rows: a slot of whole rows would hold one
+    # and leave almost half of it empty, so rows share blocks of slots.
+    slot_bytes = row * 19 // 10
+    layout = cache_layout(tabicl_functions, model, 5, slot_bytes)
+    assert layout.rows_per_slot > 1 and layout.slots_per_row > 1
+    rows = 40
+    features, labels = _clusters(rows)
+    targets = jnp.asarray(labels)
+    state, context_rows = tabicl_functions.fit(
+        model, jnp.asarray(features), targets, 3, num_rows=rows
+    )
+    cache = tabicl_functions.encode(model, state, context_rows, targets, num_rows=rows)
+    packed = np.asarray(pack(layout, cache))
+    # The entry's slots, scattered through a larger pool.
+    generator = np.random.default_rng(0)
+    places = generator.permutation(3 * len(packed))[: len(packed)]
+    pool = np.zeros((3 * len(packed), slot_bytes), np.uint8)
+    pool[places] = packed
+    blocks = places.reshape(-1, layout.slots_per_row).astype(np.int32)
+    order = np.arange(rows) if in_order else generator.permutation(rows)
+
+    read = jax.jit(lambda *values: read_context(layout, *values, in_order=in_order))(
+        jnp.asarray(pool),
+        jnp.asarray(blocks),
+        jnp.asarray(order, jnp.int32),
+        jnp.int32(rows),
+    )
+
+    expected = layout.treedef.flatten_up_to(cache)
+    got_leaves = layout.treedef.flatten_up_to(read)
+    for leaf in layout.row_leaves:
+        got = np.moveaxis(np.asarray(got_leaves[leaf.index]), leaf.axis, 0)
+        want = np.moveaxis(np.asarray(expected[leaf.index]), leaf.axis, 0)[order]
+        np.testing.assert_array_equal(got.view(np.uint8), want.view(np.uint8))
 
 
 def test_pools_never_pass_the_nodes_slots() -> None:
@@ -397,6 +439,50 @@ def test_contexts_whose_calls_would_not_fit_the_device_are_refused() -> None:
         whole.predict(NEAR_A)
     assert client.stats.encoded == 0
     assert nearest.predict(NEAR_A).shape == (2, 3)
+
+
+@pytest.mark.slow
+def test_adaptive_tables_read_no_more_rows_than_the_device_holds() -> None:
+    client = node_harness.local()
+    worker = client._worker
+    small, large = MEASURED_ROWS, 2 * MEASURED_ROWS
+    features, targets = _clusters(large)
+    first = _table(client, name="first", model=TABICL)
+    (loaded,) = worker._models
+    row = worker.profile(loaded, 5).cache_bytes_per_row
+    decode = worker.decode_profile(loaded)
+
+    def needs(rows: int) -> int:
+        encode = worker.encode_bytes(loaded, 5, rows, exact=True)
+        assert encode is not None
+        needed = max(encode, decode.working_bytes(row, rows))
+        return needed + needed // AUTOTUNE_SHARE
+
+    # A device, beside its pool, that holds a context of `small` rows as
+    # `_fits_device` checks it, but not one of `large`; as an accelerator is.
+    room = (needs(small) + needs(large)) // 2
+    worker.budget = dataclasses.replace(
+        worker.budget, device=worker._pool_bytes + room, cpu=False
+    )
+    assert worker.memory_rows(loaded, 5) == small
+    del first
+
+    whole = _table(client, name="whole", model=TABICL)
+    adaptive = _table(
+        client,
+        name="adaptive",
+        model=TABICL,
+        strategy=generalforecast.Strategy.adaptive(),
+    )
+    for handle in (whole, adaptive):
+        handle.insert(np.arange(large), features, targets)
+
+    # Every row would not fit, and the exact table says so; the adaptive one
+    # reads a core and each query's neighbors, at most what the device holds.
+    with pytest.raises(ValueError, match="encoding it"):
+        whole.predict(NEAR_A)
+    assert adaptive.predict(NEAR_A).shape == (2, 3)
+    assert adaptive.describe().context_rows == small
 
 
 def test_representations_are_reused_until_their_page_changes() -> None:

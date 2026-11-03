@@ -36,7 +36,7 @@ from generalforecast.constants import (
 from generalforecast.models.contract import TabularFunctions
 from generalforecast.nn.attention import AttentionCache
 from generalforecast.runtime.device import to_cache_dtype
-from generalforecast.runtime.shapes import bucket_size
+from generalforecast.runtime.shapes import block_shape, bucket_size
 
 
 def _cached_hash(layout: Any) -> int:
@@ -75,8 +75,9 @@ class CacheLayout:
         row_bytes: Bytes of one context row, across every leaf.
         rows_per_slot: Rows one block holds: one if a row is wider than a slot.
         slot_bytes: Bytes in a slot.
-        slots_per_row: Slots in a block: more than one only for a row wider
-            than a slot.
+        slots_per_row: Slots in a block: more than one for a row wider than a
+            slot, or for a block of rows that would leave much of one slot
+            empty, whose rows may then cross a slot's end (see `block_shape`).
     """
 
     treedef: Any
@@ -156,7 +157,12 @@ def cache_layout(
         return jax.eval_shape(encoded, model, features, targets, count)
 
     return traced_layout(
-        traced, slot_bytes, PAGE_TRACE_SMALL, PAGE_TRACE_LARGE, lengths_only=True
+        traced,
+        slot_bytes,
+        PAGE_TRACE_SMALL,
+        PAGE_TRACE_LARGE,
+        lengths_only=True,
+        blocks=True,
     )
 
 
@@ -166,6 +172,7 @@ def traced_layout(
     small: int,
     large: int,
     lengths_only: bool = False,
+    blocks: bool = False,
 ) -> CacheLayout:
     """Lays out a cache from its shapes at two row counts.
 
@@ -179,6 +186,9 @@ def traced_layout(
         large: The larger.
         lengths_only: Whether a fixed leaf must be a scalar, as a tabular
             cache's attention lengths are.
+        blocks: Whether rows no wider than a slot pack into blocks of slots
+            as `block_shape` says, as the scheduler counts a tabular
+            context's; otherwise a block is one slot of whole rows.
 
     Returns:
         The layout.
@@ -214,7 +224,12 @@ def traced_layout(
         row_leaves.append(_RowLeaf(index, axis, dtype, shape, row_bytes))
     row_bytes = sum(leaf.row_bytes for leaf in row_leaves)
     # A row wider than a slot takes whole slots of its own, as the node counts.
-    slots_per_row = -(-row_bytes // slot_bytes)
+    rows_per_slot, slots_per_row = (
+        max(1, slot_bytes // row_bytes),
+        -(-row_bytes // slot_bytes),
+    )
+    if blocks:
+        rows_per_slot, slots_per_row = block_shape(row_bytes, slot_bytes)
     return CacheLayout(
         treedef,
         tuple(row_leaves),
@@ -223,7 +238,7 @@ def traced_layout(
             jax.ShapeDtypeStruct(shapes[i].shape, shapes[i].dtype) for i in fixed_leaves
         ),
         row_bytes,
-        max(1, slot_bytes // row_bytes),
+        rows_per_slot,
         slot_bytes,
         slots_per_row,
     )
@@ -448,6 +463,10 @@ def read_context(
             starts = jnp.full(blocks.shape[0], offset, jnp.int32)
             data = _slices(source, blocks[:, 0], starts, width)
             data = data.reshape(-1, leaf.row_bytes)[:rows]
+        elif layout.rows_per_slot > 1 and layout.slots_per_row > 1:
+            data = _spread_rows(
+                layout, source, blocks, block, within, offset, leaf.row_bytes, in_order
+            )[:rows]
         else:
             data = _leaf_rows(
                 layout, source, blocks, block, within, offset, leaf.row_bytes
@@ -502,6 +521,58 @@ def _leaf_rows(
         starts = jnp.full(block.shape, low - slot * slot_bytes, jnp.int32)
         pieces.append(_slices(source, blocks[block, slot], starts, high - low))
     return jnp.concatenate(pieces, axis=1)
+
+
+def _spread_rows(
+    layout: CacheLayout,
+    source: jax.Array,
+    blocks: jax.Array,
+    block: jax.Array,
+    within: jax.Array,
+    offset: int,
+    row_bytes: int,
+    in_order: bool,
+) -> jax.Array:
+    """One leaf's bytes for each row of blocks of several rows over several slots, `(rows, row_bytes)`.
+
+    A block's leaves lie one after another, each its rows in order, from
+    `offset`, across the block's slots as if they were one; a row may cross a
+    slot's end. Read in order, each block's rows of the leaf come a slot's
+    piece at a time, as one run. Otherwise each row comes from the slot it
+    starts in and, where it crosses that slot's end, the next: the last
+    `row_bytes` of the first slot and the first of the next, joined, hold it
+    at a known shift. A row is no wider than a slot here, so it touches at
+    most two.
+    """
+    slot_bytes = layout.slot_bytes
+    if in_order:
+        width = layout.rows_per_slot * row_bytes
+        pieces = []
+        for slot in range(offset // slot_bytes, (offset + width - 1) // slot_bytes + 1):
+            low = max(offset, slot * slot_bytes)
+            high = min(offset + width, (slot + 1) * slot_bytes)
+            starts = jnp.full(blocks.shape[0], low - slot * slot_bytes, jnp.int32)
+            pieces.append(_slices(source, blocks[:, slot], starts, high - low))
+        return jnp.concatenate(pieces, axis=1).reshape(-1, row_bytes)
+    at = offset + within * row_bytes
+    first = at // slot_bytes
+    start = at % slot_bytes
+    crosses = start + row_bytes > slot_bytes
+    following = jnp.minimum(first + 1, layout.slots_per_row - 1)
+    head = _slices(
+        source,
+        blocks[block, first],
+        jnp.where(crosses, slot_bytes - row_bytes, start).astype(jnp.int32),
+        row_bytes,
+    )
+    tail = _slices(
+        source, blocks[block, following], jnp.zeros_like(start, jnp.int32), row_bytes
+    )
+    joined = jnp.concatenate([head, tail], axis=1)
+    shift = jnp.where(crosses, start - (slot_bytes - row_bytes), 0).astype(jnp.int32)
+    return jax.vmap(
+        lambda bytes, at: jax.lax.dynamic_slice(bytes, (at,), (row_bytes,))
+    )(joined, shift)
 
 
 def _slices(
