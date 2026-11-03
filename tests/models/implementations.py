@@ -94,6 +94,12 @@ def _timesfm3_forecaster() -> tuple[Any, Any]:
     return forecaster()
 
 
+def _tabfm_classifier() -> tuple[Any, Any]:
+    from tests.models.tabfm.tiny import classifier
+
+    return classifier()
+
+
 def _chronos2_forecaster() -> tuple[Any, Any]:
     from tests.models.chronos2.tiny import forecaster
 
@@ -116,6 +122,7 @@ TINY_MODELS = {
     "tests/limix-regressor": _limix_regressor,
     "tests/tabpfn-classifier": _tabpfn_classifier,
     "tests/tabpfn-regressor": _tabpfn_regressor,
+    "tests/tabfm-classifier": _tabfm_classifier,
     "tests/timestral-forecaster": _timestral_forecaster,
     "tests/timestral-catalog-forecaster": _timestral_catalog_forecaster,
     "tests/timesfm3-forecaster": _timesfm3_forecaster,

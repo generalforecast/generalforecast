@@ -43,11 +43,23 @@ class PerDimScaleParameters(NamedTuple):
     scale: Float[Array, " head_dim"]
 
 
+class SoftplusScaleParameters(NamedTuple):
+    """Scales each query dimension by `1.442695041 * softplus(scale)`, on top of `1 / sqrt(d)`.
+
+    TabFM's per-dimension scale: the same learned factor as
+    `PerDimScaleParameters`, but its attention divides by `sqrt(d)` as well,
+    where TimesFM's does not.
+    """
+
+    scale: Float[Array, " head_dim"]
+
+
 QueryScale = (
     QASSMaxParameters
     | LogScaleParameters
     | GatedLogScaleParameters
     | PerDimScaleParameters
+    | SoftplusScaleParameters
 )
 
 
@@ -124,7 +136,7 @@ def scale_queries(
     query: Float[Array, " batch rows heads head_dim"],
     n_keys: int | Int[Array, "..."],
 ) -> Float[Array, " batch rows heads head_dim"]:
-    """Applies QASSMax, log scaling, gated log scaling or per-dimension scaling.
+    """Applies QASSMax, log scaling, gated log scaling or a per-dimension scaling.
 
     Args:
         parameters: Scaling parameters.
@@ -139,6 +151,9 @@ def scale_queries(
         return qassmax(parameters, query, n_keys)
     if isinstance(parameters, PerDimScaleParameters):
         return per_dim_scale(parameters, query)
+    if isinstance(parameters, SoftplusScaleParameters):
+        factor = 1.442695041 * jnn.softplus(parameters.scale)
+        return query * factor.astype(query.dtype)
     if isinstance(parameters, GatedLogScaleParameters):
         return gated_log_scale(parameters, query, n_keys)
     return log_scale(parameters, query, n_keys)

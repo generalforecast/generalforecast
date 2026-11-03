@@ -385,6 +385,11 @@ _FILES: dict[str, dict[str, str]] = {
         "LICENSE": "9570fdd687bb76ed45499412ad57d6ba949848e6d731f1242572bb57f2f73ae1",
         "tabpfn-v3.5-20260909.safetensors": "ece4d67eadfea42eb0e610df5189bea60cb7f31073d81e9c7a019b76eacf0be3",
     },
+    "general-forecast/tabfm-1-classifier": {
+        "LICENSE": "26d8c4748b755fd202668ca89471b1847f2e0e0d9a88707642b1a3a1d2edb276",
+        "classification/config.json": "d61e14960ab879bf9d0d23a10acac6e09f780ea548deac2fe3999eb131377e16",
+        "classification/model.safetensors": "928cb350becdc77cdb7a9e8c36deda88917bfd14a3091894a2dc516db58a2085",
+    },
     "general-forecast/mitra-2-classifier": {
         "LICENSE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
         "NOTICE": "e10e58970f1c1e7ef200d45f274fb5330533a8d2553dda5a6e2d88c0fdf00fab",
@@ -920,6 +925,9 @@ _TIMESTRAL = {
         "645062a557cc9c032883031788991f3582c74d5a",
     ),
 }
+# Google Research's TabFM 1.0 PyTorch weights: its classifier alone, as its
+# regressor predicts one value rather than quantiles.
+_TABFM = ("google/tabfm-1.0.0-pytorch", "77cb9cc1b4fd3a9c77fbb9552c218200bb4dab83")
 _MITRA_2 = {
     "general-forecast/mitra-2-classifier": (
         "autogluon/mitra-classifier-2",
@@ -1054,6 +1062,18 @@ _ALL: tuple[ModelEntry, ...] = (
             aliases=(upstream,),
         )
         for name, (upstream, revision) in _MITRA_2.items()
+    ),
+    _tabular(
+        "general-forecast/tabfm-1-classifier",
+        "tabfm",
+        _TABFM[1],
+        artifact=_upstream(
+            "general-forecast/tabfm-1-classifier",
+            *_TABFM,
+            "tabfm_v1",
+            "LicenseRef-tabfm-non-commercial-v1.0",
+            "LICENSE",
+        ),
     ),
     _forecaster(
         "general-forecast/chronos-2",

@@ -38,6 +38,7 @@ FAMILIES = [
     "limix-2-regressor",
     "mitra-classifier",
     "mitra-2-regressor",
+    "tabfm-1-classifier",
     "chronos-2",
     "timestral-28m",
     "timestral-209m-unmirrored",

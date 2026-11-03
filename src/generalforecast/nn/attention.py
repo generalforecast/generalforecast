@@ -13,7 +13,14 @@ import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Bool, Float, Int
 
-from generalforecast.nn.linear import LinearParameters, MLPParameters, linear, mlp
+from generalforecast.nn.linear import (
+    GatedMLPParameters,
+    LinearParameters,
+    MLPParameters,
+    gated_mlp,
+    linear,
+    mlp,
+)
 from generalforecast.nn.norm import Norm, RMSNormParameters, normalize, rms_norm
 from generalforecast.nn.qassmax import QASSMaxParameters
 from generalforecast.nn.rope import Positions, RoPE, apply_rope
@@ -129,14 +136,18 @@ class AttentionBlockParameters(NamedTuple):
     """A pre-norm attention layer followed by a feed-forward layer.
 
     Context rows are normalized with `context_norm` if set, otherwise with
-    `attention_norm`.
+    `attention_norm`. The feed-forward layer is an MLP or a SwiGLU. A block
+    with output norms normalizes each layer's output before adding it back,
+    as sandwich-norm transformers such as TabFM's do.
     """
 
     attention_norm: Norm
     feed_forward_norm: Norm
     attention: AttentionParameters
-    feed_forward: MLPParameters
+    feed_forward: MLPParameters | GatedMLPParameters
     context_norm: Norm | None = None
+    attention_output_norm: Norm | None = None
+    feed_forward_output_norm: Norm | None = None
 
 
 class AttentionCache(NamedTuple):
@@ -526,9 +537,10 @@ def attention_block(
         Updated query rows.
     """
     normed = normalize(parameters.attention_norm, query_rows)
-    return _feed_forward(
-        parameters, query_rows + attend(parameters.attention, normed, cache)
+    attended = _output_norm(
+        parameters.attention_output_norm, attend(parameters.attention, normed, cache)
     )
+    return _feed_forward(parameters, query_rows + attended)
 
 
 def attention_block_streamed(
@@ -553,16 +565,25 @@ def attention_block_streamed(
     """
     normed = normalize(parameters.attention_norm, query_rows)
     attended = attend_streamed(parameters.attention, normed, keys, steps, n_keys)
+    attended = _output_norm(parameters.attention_output_norm, attended)
     return _feed_forward(parameters, query_rows + attended)
+
+
+def _output_norm(norm: Norm | None, values: Array) -> Array:
+    """A layer's output, normalized if the block has an output norm for it."""
+    return values if norm is None else normalize(norm, values)
 
 
 def _feed_forward(
     parameters: AttentionBlockParameters, hidden: Float[Array, " batch rows model"]
 ) -> Float[Array, " batch rows model"]:
     """The block's feed-forward layer, with its residual."""
-    return hidden + mlp(
-        parameters.feed_forward, normalize(parameters.feed_forward_norm, hidden)
-    )
+    normed = normalize(parameters.feed_forward_norm, hidden)
+    if isinstance(parameters.feed_forward, GatedMLPParameters):
+        fed = gated_mlp(parameters.feed_forward, normed)
+    else:
+        fed = mlp(parameters.feed_forward, normed)
+    return hidden + _output_norm(parameters.feed_forward_output_norm, fed)
 
 
 def in_chunks(
