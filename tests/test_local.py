@@ -1278,8 +1278,9 @@ def test_small_tables_run_together_in_one_compiled_call() -> None:
 
     together = client.predict({name: NEAR_A for name in tables})
 
-    # Every table pads to 32 rows, so each stage runs once for all six.
-    assert client.stats.calls == {"fit": 1, "embed": 1, "encode": 1, "decode": 1}
+    # Every table pads to 32 rows, so each stage runs once for all six; the
+    # queries read cached contexts, so they embed inside the decode.
+    assert client.stats.calls == {"fit": 1, "encode": 1, "decode": 1}
     # Warming compiles larger sizes once the worker is idle; let it finish.
     client._worker.programs.wait()
     traces.clear()
@@ -1411,7 +1412,7 @@ def test_a_failing_table_fails_only_its_own_part_of_a_step(
     )
     # Only the good table's part counts, once, though the whole step ran first.
     assert worker.stats.encoded == 1
-    assert worker.stats.calls == {"fit": 1, "embed": 1, "encode": 1, "decode": 1}
+    assert worker.stats.calls == {"fit": 1, "encode": 1, "decode": 1}
     # A step with no table to blame raises.
     with pytest.raises(ValueError, match="bad rows"):
         worker.run_apart(protocol.Step([], [], [], [], []))
@@ -2821,14 +2822,13 @@ def test_a_steps_parts_add_up_to_its_seconds(monkeypatch: pytest.MonkeyPatch) ->
     stages = sum(spent["seconds"] for spent in header["stages"].values())
     # A step that fits, encodes and decodes runs every part once at least;
     # a call's handing to the device is `compile` for a shape its program
-    # had not seen and `dispatch` otherwise, and the decode's query arrays
-    # go to the device as `dispatch` either way.
-    assert set(parts) - {"compile"} == {
+    # had not seen and `dispatch` otherwise. Queries that read a cached
+    # context go to the device with their decode's call.
+    assert set(parts) - {"compile", "dispatch"} == {
         "frame",
         "move",
         "pad",
         "stack",
-        "dispatch",
         "wait",
         "unstack",
         "fetch",
@@ -2940,8 +2940,9 @@ def test_timed_parts_wait_for_the_device_work_they_start(
 
     worker.timers = True
     timed, _ = worker_process._answer(worker, {}, lambda: None, {"kind": "step"}, [])()
-    # The context's store and the queries' dispatch each wait for the device.
-    assert len(waited) >= 2
+    # The context's store waits for the device; the queries go with their
+    # decode's call, which waits on its own.
+    assert len(waited) >= 1
     waited.clear()
     worker.timers = False
     untimed, _ = worker_process._answer(
