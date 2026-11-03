@@ -44,7 +44,7 @@ gf = "generalforecast.cli:main"
 polars = ["polars>=1.30,<2"]
 # NVIDIA GPUs: JAX's CUDA 13 plugin, with CUDA and cuDNN from pip, the CUDA
 # PyTorch's default build uses, so both can share one environment.
-cuda = ["jax[cuda13]>=0.12"]
+cuda = ["jax[cuda13]>=0.12; sys_platform == 'linux'"]
 
 [dependency-groups]
 dev = [
@@ -63,6 +63,9 @@ reference = [
     "loguru==0.7.3",
     "structured-data-models",
     "tabicl==2.2.0",
+    # Its package needs JAX's CUDA plugin, which has no macOS wheels; the
+    # reference job runs on Linux.
+    "tabfm[pytorch]; sys_platform == 'linux'",
     "tabpfn==9.1.0",
     "timesfm",
     "timestral",
@@ -87,7 +90,9 @@ environments = [
 ]
 
 # AutoGluon caps pyarrow and pandas below generalforecast's (Mitra doesn't use these).
-override-dependencies = ["pyarrow>=24", "pandas>=2"]
+# tabfm caps jaxtyping below 0.3 for typeguard 2's sake; gf's floor stands
+# instead, as jaxtyping 0.3 checks through typeguard 2 as well.
+override-dependencies = ["pyarrow>=24", "pandas>=2", "jaxtyping>=0.2.38"]
 
 [[tool.uv.index]]
 name = "pytorch-cpu"
@@ -101,6 +106,8 @@ structured-data-models = { git = "https://github.com/NVIDIA/structured-data-mode
 limix = { git = "https://github.com/limix-ldm-ai/LimiX", rev = "516bf396333feb3198cf7aff8a6c10421f218e24" }
 timestral = { git = "https://github.com/mistralai/timestral", rev = "a534bdbd244d64f3d9d743f46c7bf6fc330ed4ff" }
 timesfm = { git = "https://github.com/google-research/timesfm", rev = "e51928e27119cb17bebc005be2696b75e0a9e688" }
+# TabFM 1.0.1, at the commit TabArena benchmarked.
+tabfm = { git = "https://github.com/google-research/tabfm", rev = "fbb665569425fd2f490c6576b3af967876fe11ff" }
 
 [build-system]
 requires = ["maturin>=1.15,<2"]
