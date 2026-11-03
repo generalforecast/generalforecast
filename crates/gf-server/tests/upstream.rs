@@ -140,6 +140,8 @@ fn the_fronts_routes_are_owned_however_they_are_spelled() {
         (Method::GET, "/v1/projects/p/models/"),
         (Method::GET, "//v1//projects/p//models"),
         (Method::GET, "/V1/Projects/p/Models/m"),
+        // Not a fine-tune's spelling: the front refuses it.
+        (Method::GET, "/v1/projects/p/models/credit@ft0"),
         (Method::POST, "/v1/projects/p/predict"),
         (Method::POST, "/v1/projects/p/predictors/x/predict"),
         (Method::POST, "/v1/projects/p/Predictors/x/PREDICT"),
@@ -170,6 +172,9 @@ fn the_fronts_routes_are_owned_however_they_are_spelled() {
         (Method::GET, "/v1/projects/p/predictors/x/predict"),
         (Method::POST, "/v1/projects/p/models"),
         (Method::DELETE, "/v1/projects/p/models/m"),
+        // A project's fine-tunes are the plane's.
+        (Method::GET, "/v1/projects/p/models/credit@ft3"),
+        (Method::GET, "/v1/projects/p/models/credit-default@ft12"),
     ] {
         assert!(!owns(&method, path), "{method} {path}");
     }

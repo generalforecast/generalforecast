@@ -15,7 +15,17 @@ FINE_TUNE = "acme/credit-default@ft3"
 BASE = "tabular-classifier"
 BASE_DIGEST = "sha256:" + "0" * 64
 DIGEST = "sha256:" + "1" * 64
-FOUND = {"base": BASE, "base_digest": BASE_DIGEST, "digest": DIGEST, "bags": 4}
+FOUND = {
+    "name": FINE_TUNE,
+    "derived": {
+        "base": BASE,
+        "base_digest": BASE_DIGEST,
+        "digest": DIGEST,
+        "bags": 4,
+        "version": 3,
+        "created": 0.0,
+    },
+}
 MADE = derived.Derived(FINE_TUNE, BASE, BASE_DIGEST, DIGEST, 4)
 
 
@@ -48,7 +58,7 @@ def test_a_fine_tune_resolves_through_its_projects_route():
     assert made == MADE
     assert projects == ["acme"]
     (call,) = connection.calls
-    assert (call.method, call.path) == ("GET", "/fine-tunes/credit-default/versions/3")
+    assert (call.method, call.path) == ("GET", "/models/credit-default@ft3")
 
 
 def test_each_fine_tune_is_asked_for_once():
@@ -75,6 +85,14 @@ def test_other_service_errors_pass_through():
 
     with pytest.raises(ServiceError):
         resolver.resolve(FINE_TUNE)
+
+
+def test_a_catalog_answer_is_not_a_fine_tune():
+    resolver = ServiceResolver(lambda project: Connection({"name": BASE}))
+
+    with pytest.raises(ModelRefError) as raised:
+        resolver.resolve(FINE_TUNE)
+    assert raised.value.code == "UnknownModel"
 
 
 def test_weights_stay_on_the_plane():

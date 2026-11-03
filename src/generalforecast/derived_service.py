@@ -5,8 +5,8 @@
 
 A hosted plane keeps a project's fine-tunes, `<project>/<name>@ft<version>`,
 and answers what one is made of on the project's own route,
-`GET /v1/projects/{project}/fine-tunes/{name}/versions/{version}`, to the
-project's keys. The CLI installs `ServiceResolver` when nothing else
+`GET /v1/projects/{project}/models/{name}@ft{version}`, to the project's
+keys: the base's catalog entry with a `derived` block. The CLI installs `ServiceResolver` when nothing else
 resolves derived models, so `gf check` and `gf push` lock a predictor on a
 fine-tune with the same profile, key and project every other command uses.
 Each model is asked for once per process.
@@ -53,9 +53,7 @@ class ServiceResolver:
 
         def read() -> Any:
             return (
-                yield ops.Call(
-                    "GET", f"/fine-tunes/{name}/versions/{ref.version}", "model", name
-                )
+                yield ops.Call("GET", f"/models/{name}@ft{ref.version}", "model", name)
             )
 
         try:
@@ -67,8 +65,11 @@ class ServiceResolver:
                     f"{model} is not a fine-tune this connection may read: {error.message}",
                 ) from None
             raise
+        if not isinstance(found.get("derived"), dict):
+            raise ModelRefError("UnknownModel", f"{model} is not a fine-tune")
+        parts = found["derived"]
         made = Derived(
-            model, found["base"], found["base_digest"], found["digest"], found["bags"]
+            model, parts["base"], parts["base_digest"], parts["digest"], parts["bags"]
         )
         self._found[model] = made
         return made

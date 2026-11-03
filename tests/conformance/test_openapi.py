@@ -5,6 +5,7 @@
 generated module round-trips them, regenerating changes nothing, and (with
 `GF_CONFORMANCE_URL`) a running gf serve answers them the same way."""
 
+import re
 import subprocess
 import sys
 from typing import Any
@@ -406,6 +407,16 @@ def test_model_ids_have_one_grammar() -> None:
     assert MODEL_ID.fullmatch("acme/credit-default@ft12@4*2")
     for bad in ("acme/credit-default@ft0", "acme/credit-default@4@ft3"):
         assert not MODEL_ID.fullmatch(bad)
+    # `models/{model}` takes a catalog name or a project's fine-tune.
     parameter = SPEC["components"]["parameters"]["model"]["schema"]
-    assert parameter == {"$ref": "#/components/schemas/ModelName"}
+    assert parameter == {
+        "oneOf": [
+            {"$ref": "#/components/schemas/ModelName"},
+            {"$ref": "#/components/schemas/FineTuneName"},
+        ]
+    }
+    fine_tune = re.compile(schemas["FineTuneName"]["pattern"])
+    assert fine_tune.fullmatch("credit-default@ft3")
+    for bad in ("credit-default@ft0", "credit-default", "acme/credit@ft3"):
+        assert not fine_tune.fullmatch(bad)
     assert MODEL_ID.fullmatch("general-forecast/tabpfn-3.5-classifier")

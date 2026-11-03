@@ -17,6 +17,12 @@ export type Name = string;
 export type ModelName = string;
 
 /**
+ * a project's fine-tune version by its name and version, as `credit-default@ft3` names
+ * `<project>/credit-default@ft3`
+ */
+export type FineTuneName = string;
+
+/**
  * a catalog model id, `general-forecast/<name>`, or a derived model's,
  * `<owner>/<name>@ft<version>`; then an optional digest pin (`@sha256:<digest>`) and
  * variant suffix (`@4*2`)
@@ -362,6 +368,20 @@ export interface PredictorListReply extends Envelope {
   result: PredictorList;
 }
 
+/**
+ * what a fine-tune is made of, as a predictor's lock records it: its base, pinned, and
+ * its weights; present on the project's fine-tunes alone, which otherwise describe
+ * themselves as their base does
+ */
+export interface DerivedModel {
+  base: ModelId;
+  base_digest: Digest;
+  digest: Digest;
+  bags: number;
+  version: number;
+  created: number;
+}
+
 export interface Artifact {
   repository: string;
   revision: string;
@@ -393,6 +413,7 @@ export interface Capability {
 export interface Model {
   model: string;
   name: ModelId;
+  derived?: DerivedModel;
   task: Task;
   repository: string;
   revision: string;
@@ -804,38 +825,6 @@ export interface UploadDeleted {
 
 export interface UploadDeletedReply extends Envelope {
   result: UploadDeleted;
-}
-
-export interface FineTune {
-  model: ModelId;
-  name: Name;
-  version: number;
-  base: ModelId;
-  base_digest: Digest;
-  digest: Digest;
-  bags: number;
-  created: number;
-}
-
-export interface FineTuneReply extends Envelope {
-  result: FineTune;
-}
-
-export interface FineTuneList {
-  fine_tunes: FineTune[];
-}
-
-export interface FineTuneListReply extends Envelope {
-  result: FineTuneList;
-}
-
-export interface FineTuneVersions {
-  name: Name;
-  versions: FineTune[];
-}
-
-export interface FineTuneVersionsReply extends Envelope {
-  result: FineTuneVersions;
 }
 
 /** an immutable pushed predictor */
@@ -2010,9 +1999,6 @@ export const ROUTES = {
   "uploads.create": { method: "POST", path: "/v1/projects/{project}/uploads", request: "UploadCreateRequest", reply: "UploadOpenedReply", body: "application/json" },
   "uploads.get": { method: "GET", path: "/v1/projects/{project}/uploads/{upload}", request: "null", reply: "UploadReply", body: null },
   "uploads.delete": { method: "POST", path: "/v1/projects/{project}/uploads/{upload}/delete", request: "UploadRefRequest", reply: "UploadDeletedReply", body: "application/json" },
-  "fine-tunes.list": { method: "GET", path: "/v1/projects/{project}/fine-tunes", request: "null", reply: "FineTuneListReply", body: null },
-  "fine-tunes.get": { method: "GET", path: "/v1/projects/{project}/fine-tunes/{fine_tune}", request: "null", reply: "FineTuneVersionsReply", body: null },
-  "fine-tunes.version": { method: "GET", path: "/v1/projects/{project}/fine-tunes/{fine_tune}/versions/{version}", request: "null", reply: "FineTuneReply", body: null },
   "auth.status": { method: "GET", path: "/v1/auth/status", request: "null", reply: "AuthStatusReply", body: null },
   "auth.logout": { method: "POST", path: "/v1/auth/logout", request: "EmptyRequest", reply: "LoggedOutReply", body: "application/json" },
   "workspace.get": { method: "GET", path: "/v1/workspace", request: "null", reply: "ProjectListReply", body: null },

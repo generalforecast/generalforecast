@@ -2662,116 +2662,6 @@ paths:
                       digest: sha256:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f
                       uploads:
                       - up-3f1c2a9b8e7d6c5b4a392817
-  /v1/projects/{project}/fine-tunes:
-    get:
-      operationId: fine-tunes.list
-      tags:
-      - hosted
-      summary: list the project's published fine-tune versions
-      description: Every version the project's runs published, by name then version.
-      parameters:
-      - $ref: '#/components/parameters/project'
-      responses:
-        '200':
-          description: ok
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FineTuneListReply'
-              examples:
-                list:
-                  value:
-                    api_version: gf/v1
-                    project: acme
-                    request_id: r-f1e2d3c4b5a69788
-                    resource:
-                      kind: model
-                      name: fine-tunes
-                    result:
-                      fine_tunes:
-                      - model: acme/credit-default@ft3
-                        name: credit-default
-                        version: 3
-                        base: general-forecast/tabicl-v2-classifier
-                        base_digest: sha256:b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1
-                        digest: sha256:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c
-                        bags: 1
-                        created: 1761200000.0
-  /v1/projects/{project}/fine-tunes/{fine_tune}:
-    get:
-      operationId: fine-tunes.get
-      tags:
-      - hosted
-      summary: list one fine-tune's versions
-      description: A fine-tune's versions, oldest first; each never changes.
-      parameters:
-      - $ref: '#/components/parameters/project'
-      - $ref: '#/components/parameters/fine_tune'
-      responses:
-        '200':
-          description: ok
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FineTuneVersionsReply'
-              examples:
-                get:
-                  value:
-                    api_version: gf/v1
-                    project: acme
-                    request_id: r-f2e3d4c5b6a79889
-                    resource:
-                      kind: model
-                      name: credit-default
-                    result:
-                      name: credit-default
-                      versions:
-                      - model: acme/credit-default@ft3
-                        name: credit-default
-                        version: 3
-                        base: general-forecast/tabicl-v2-classifier
-                        base_digest: sha256:b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1
-                        digest: sha256:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c
-                        bags: 1
-                        created: 1761200000.0
-  /v1/projects/{project}/fine-tunes/{fine_tune}/versions/{version}:
-    get:
-      operationId: fine-tunes.version
-      tags:
-      - hosted
-      summary: show what a fine-tune version is made of
-      description: 'Its catalog base, pinned by digest, its weights'' digest and its bags: what `gf check`
-        locks a predictor on `<project>/<name>@ft<version>` with.'
-      parameters:
-      - $ref: '#/components/parameters/project'
-      - $ref: '#/components/parameters/fine_tune'
-      - $ref: '#/components/parameters/version'
-      responses:
-        '200':
-          description: ok
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/FineTuneReply'
-              examples:
-                version:
-                  value:
-                    api_version: gf/v1
-                    project: acme
-                    request_id: r-f3e4d5c6b7a8999a
-                    resource:
-                      kind: model
-                      name: credit-default
-                    result:
-                      model: acme/credit-default@ft3
-                      name: credit-default
-                      version: 3
-                      base: general-forecast/tabicl-v2-classifier
-                      base_digest: sha256:b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1
-                      digest: sha256:0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c
-                      bags: 1
-                      created: 1761200000.0
-
   /v1/auth/status:
     get:
       operationId: auth.status
@@ -4175,19 +4065,6 @@ components:
       required: true
       schema:
         $ref: '#/components/schemas/Name'
-    fine_tune:
-      name: fine_tune
-      in: path
-      required: true
-      schema:
-        $ref: '#/components/schemas/Name'
-    version:
-      name: version
-      in: path
-      required: true
-      schema:
-        type: integer
-        minimum: 1
     secret:
       name: secret
       in: path
@@ -4209,10 +4086,15 @@ components:
       name: model
       in: path
       required: true
-      schema: {$ref: "#/components/schemas/ModelName"}
+      schema:
+        oneOf:
+          - {$ref: "#/components/schemas/ModelName"}
+          - {$ref: "#/components/schemas/FineTuneName"}
       description: |
         a catalog model's name without its `general-forecast/` prefix, such
-        as `tabicl-v2-classifier`, since a path segment holds no `/`
+        as `tabicl-v2-classifier`, or one of the project's fine-tunes as
+        `<name>@ft<version>`, such as `credit-default@ft3`; a path segment
+        holds no `/`, so a fine-tune's owner is the path's project
 
     workspace:
       name: workspace
@@ -4268,6 +4150,13 @@ components:
         a catalog model's name, its id without `general-forecast/`, such as
         `tabpfn-3.5-classifier`; unlike a chosen resource name it may start
         with a digit and hold dots
+
+    FineTuneName:
+      type: string
+      pattern: "^[a-z][a-z0-9-]{0,62}@ft[1-9]\\d*$"
+      description: |
+        a project's fine-tune version by its name and version, as
+        `credit-default@ft3` names `<project>/credit-default@ft3`
 
     ModelId:
       type: string
@@ -4805,8 +4694,14 @@ components:
       required: [model, name, task, artifact, bounds, capabilities, runtime, license, repository, revision, limits, warm_shapes]
       additionalProperties: false
       properties:
-        model: {type: string, description: "`general-forecast/<name>@sha256:<digest>`"}
+        model:
+          type: string
+          description: |
+            the id with its content digest: `general-forecast/<name>@sha256:<digest>`
+            for a catalog model, `<project>/<name>@ft<version>@sha256:<digest>`
+            with the weights' digest for a fine-tune
         name: {$ref: "#/components/schemas/ModelId"}
+        derived: {$ref: "#/components/schemas/DerivedModel"}
         task: {$ref: "#/components/schemas/Task"}
         repository: {type: string}
         revision: {type: string}
@@ -4832,6 +4727,22 @@ components:
         warm_shapes:
           type: array
           items: {$ref: "#/components/schemas/Shape"}
+
+    DerivedModel:
+      type: object
+      description: |
+        what a fine-tune is made of, as a predictor's lock records it: its
+        base, pinned, and its weights; present on the project's fine-tunes
+        alone, which otherwise describe themselves as their base does
+      required: [base, base_digest, digest, bags, version, created]
+      additionalProperties: false
+      properties:
+        base: {$ref: "#/components/schemas/ModelId"}
+        base_digest: {$ref: "#/components/schemas/Digest"}
+        digest: {$ref: "#/components/schemas/Digest"}
+        bags: {type: integer, minimum: 1, description: estimators the weights hold, averaged when served}
+        version: {type: integer, minimum: 1}
+        created: {type: number, description: when the version was published, in seconds since the epoch}
 
     ModelVariant:
       type: object
@@ -5822,89 +5733,6 @@ components:
         properties:
           result:
             $ref: '#/components/schemas/UploadDeleted'
-    FineTune:
-      type: object
-      required:
-      - model
-      - name
-      - version
-      - base
-      - base_digest
-      - digest
-      - bags
-      - created
-      additionalProperties: false
-      properties:
-        model:
-          $ref: '#/components/schemas/ModelId'
-        name:
-          $ref: '#/components/schemas/Name'
-        version:
-          type: integer
-          minimum: 1
-        base:
-          $ref: '#/components/schemas/ModelId'
-        base_digest:
-          $ref: '#/components/schemas/Digest'
-        digest:
-          $ref: '#/components/schemas/Digest'
-        bags:
-          type: integer
-          minimum: 1
-          maximum: 64
-        created:
-          type: number
-    FineTuneReply:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - result
-        properties:
-          result:
-            $ref: '#/components/schemas/FineTune'
-    FineTuneList:
-      type: object
-      required:
-      - fine_tunes
-      additionalProperties: false
-      properties:
-        fine_tunes:
-          type: array
-          items:
-            $ref: '#/components/schemas/FineTune'
-    FineTuneListReply:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - result
-        properties:
-          result:
-            $ref: '#/components/schemas/FineTuneList'
-    FineTuneVersions:
-      type: object
-      required:
-      - name
-      - versions
-      additionalProperties: false
-      properties:
-        name:
-          $ref: '#/components/schemas/Name'
-        versions:
-          type: array
-          items:
-            $ref: '#/components/schemas/FineTune'
-    FineTuneVersionsReply:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - result
-        properties:
-          result:
-            $ref: '#/components/schemas/FineTuneVersions'
-
     State:
       type: string
       enum: [pending, building, ready, failed, stopped]
