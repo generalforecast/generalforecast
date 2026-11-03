@@ -549,7 +549,8 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         with self.stats.timed("move"):
             for movement in step.movements:
                 self.apply(movement)
-        step = self._widened(step)
+        # A protocol step widens to a protocol step.
+        step = cast(protocol.Step, self._widened(step))
         try:
             return self._counted(step), {}
         except PoolLost:
