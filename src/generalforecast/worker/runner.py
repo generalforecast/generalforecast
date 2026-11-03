@@ -62,7 +62,7 @@ from generalforecast.runtime.programs import Programs
 from generalforecast.runtime.series import SeriesBytes
 from generalforecast.system import usable_cpus
 from generalforecast.worker.admission import Admission
-from generalforecast.worker.ahead import Ahead, _manifests
+from generalforecast.worker.ahead import Ahead, _manifests, _shipped_measures
 from generalforecast.worker.calls import Calls, _item, _only_item, _stack_columns
 from generalforecast.worker.decodes import Decodes
 from generalforecast.worker.encoding import Encoding
@@ -241,6 +241,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
             ),
             ahead=compile_ahead,
             manifests=self._manifest_dir,
+            shipped=_shipped_measures(bucket_minimum, slot_bytes),
             dropped=self._chunks.forget_counts,
         )
         self._models: dict[int, _Model] = {}

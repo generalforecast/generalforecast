@@ -214,6 +214,91 @@ def build(
     return bundles
 
 
+# Widths `measure` measures each model at by default: every padded width to
+# 512 columns, which `padded_width` maps a table's width to.
+MEASURED_WIDTHS = tuple(range(1, 513))
+# Class counts a classifier's tables are checked at by default.
+MEASURED_CLASSES = tuple(range(2, 11))
+
+
+def measure(
+    out: Path,
+    models: Iterable[str],
+    widths: Iterable[int] = MEASURED_WIDTHS,
+    classes: Iterable[int] = MEASURED_CLASSES,
+    bucket_minimum: int = 8,
+    slot_bytes: int = 1 << 20,
+) -> list[Path]:
+    """Measures each model as a worker of gf-server would, at each padded width, and writes the measures to ship.
+
+    The measures are what a worker takes by tracing and compiling the model
+    before a table's first steps: its cache layout and sizes, its fit,
+    encode and decode, and its check of each task. They follow from the
+    model, the code that traces it, JAX and the device, so they are written
+    under the `_manifests` identity of this machine's programs, as
+    `<out>/<identity>/<digest>.measures`, which a worker given `out` as
+    `GF_MEASURES` reads in place of measuring.
+
+    Returns:
+        The measures files written.
+    """
+    import shutil
+    import tempfile
+
+    from generalforecast.constants import MEASURED_ROWS
+    from generalforecast.models import registry
+    from generalforecast.runtime.device import cache_root, default_settings
+    from generalforecast.runtime.programs import ladder
+    from generalforecast.worker import Worker, _manifests
+    from generalforecast.worker.ahead import SHIPPED_MEASURES_ENV
+
+    environment = {SHIPPED_MEASURES_ENV: None, "XDG_CACHE_HOME": tempfile.mkdtemp()}
+    previous = {name: os.environ.get(name) for name in environment}
+    try:
+        for name, value in environment.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        worker = Worker(default_settings(), bucket_minimum, slot_bytes)
+        identity = _manifests(bucket_minimum, slot_bytes).name
+        written = []
+        for model, spec in enumerate(models):
+            worker.add_model(model, *registry.load_engine_model(spec), spec=spec)
+            properties = worker.properties(model)
+            tasks = [0] if properties.regression else list(classes)
+            worker.decode_profile(model)
+            small = [
+                rows for rows in ladder(bucket_minimum, 32) if rows < MEASURED_ROWS
+            ]
+            for width in sorted({worker.width(model, width) for width in widths}):
+                worker.layout(model, width)
+                worker.profile(model, width)
+                worker.fit_rows(model, width)
+                for task in tasks:
+                    worker.check(model, task, width)
+                for fit in (False, True) if properties.column_summary else (False,):
+                    worker.encode_profile(model, width, fit)
+                    for rows in small:
+                        worker.encode_bytes(model, width, rows, fit)
+            kept = worker.programs.manifest(spec)
+            assert kept is not None
+            measures = kept.path.with_suffix(".measures")
+            target = out / identity / measures.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(measures, target)
+            written.append(target)
+        worker.close()
+        shutil.rmtree(cache_root(), ignore_errors=True)
+        return written
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
 def built(models: int = 2) -> bool:
     """Whether `REPOSITORY` holds a bundle of each released model for this machine's programs, as gf-server's default padding lays them out."""
     from huggingface_hub import HfApi
@@ -233,6 +318,18 @@ def built(models: int = 2) -> bool:
 
 if __name__ == "__main__":
     import sys
+
+    if sys.argv[1:2] == ["measures"]:
+        # python -m generalforecast.runtime.shipped measures OUT SPEC... [--widths N,...]
+        arguments = sys.argv[2:]
+        chosen = MEASURED_WIDTHS
+        if "--widths" in arguments:
+            at = arguments.index("--widths")
+            chosen = tuple(int(width) for width in arguments[at + 1].split(","))
+            del arguments[at : at + 2]
+        for written in measure(Path(arguments[0]), arguments[1:], chosen):
+            print(written)
+        sys.exit()
 
     from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
