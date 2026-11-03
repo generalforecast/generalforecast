@@ -134,6 +134,7 @@ def test_gf_check_writes_lock_version_2_for_a_derived_model(plane, fine_tuned):
         "base": MODEL,
         "base_digest": catalog.ENTRIES[MODEL].artifact.digest,
         "bags": 8,
+        "kind": "lora",
     }
     frozen = load_lock(fine_tuned)
     assert frozen.derived == predictor["derived"]
@@ -151,6 +152,8 @@ def test_a_derived_block_and_lock_version_2_go_together(plane, fine_tuned, churn
         lambda d: d.update(lock_version=1),
         lambda d: d["predictor"].pop("derived"),
         lambda d: d["predictor"]["derived"].update(bags=0),
+        lambda d: d["predictor"]["derived"].update(kind="merged"),
+        lambda d: d["predictor"]["derived"].pop("kind"),
         lambda d: d["predictor"].update(model=MODEL),
     ):
         forged = yaml.safe_load(yaml.safe_dump(value))
@@ -172,3 +175,9 @@ def test_gf_server_runs_a_derived_model_as_its_own_worker_model(plane):
     catalog_ref = catalog.parse(MODEL)
     assert worker_model(catalog_ref) == MODEL
     assert resolved_id(catalog_ref).startswith(f"{MODEL}@sha256:")
+
+
+def test_a_derived_model_says_what_kind_of_change_its_weights_make():
+    assert derived.Derived(FINE_TUNE, MODEL, WEIGHTS, WEIGHTS).kind == "lora"
+    with pytest.raises(ValueError):
+        derived.Derived(FINE_TUNE, MODEL, WEIGHTS, WEIGHTS, 1, "merged")  # ty: ignore[invalid-argument-type]

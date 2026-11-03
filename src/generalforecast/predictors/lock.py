@@ -13,7 +13,7 @@ know what a predictor is. It has one format:
     manifest: sha256:...          # of the normalized gf.yaml it resolves
     predictor:
       name, model, model_digest, task, target, target_type
-      derived: {base, base_digest, bags}   # a derived model's catalog base and
+      derived: {base, base_digest, bags, kind}   # a derived model's catalog base and
                                   # bag count, in lock_version 2 alone; then
                                   # model is `<owner>/<name>@ft<version>` and
                                   # model_digest pins its weights
@@ -400,8 +400,9 @@ def validate(value: Any) -> dict[str, Any]:
 
 
 def _derived(model: str, value: Any) -> None:
-    """Checks a derived model's id and its block: base, base digest and bags."""
+    """Checks a derived model's id and its block: base, base digest, bags, kind."""
     from generalforecast.models.catalog import ModelRefError, parse
+    from generalforecast.models.derived import KINDS
 
     try:
         ref = parse(model)
@@ -412,7 +413,7 @@ def _derived(model: str, value: Any) -> None:
         f"model `{model}` is not a derived id, <owner>/<name>@ft<version>",
         "ValidationError",
     )
-    fields(value, {"base", "base_digest", "bags"})
+    fields(value, {"base", "base_digest", "bags", "kind"})
     text(value["base"])
     ensure(
         value["base"].startswith("general-forecast/"),
@@ -423,6 +424,11 @@ def _derived(model: str, value: Any) -> None:
     ensure(
         type(value["bags"]) is int and 1 <= value["bags"] <= 64,
         "a derived model has 1 to 64 bags",
+        "ValidationError",
+    )
+    ensure(
+        value["kind"] in KINDS,
+        "a derived model's kind is lora, adapter or full",
         "ValidationError",
     )
 

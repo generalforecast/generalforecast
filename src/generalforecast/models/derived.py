@@ -31,10 +31,17 @@ import importlib
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 # Names the resolver engine workers import: `module:attribute`.
 RESOLVER = "GF_DERIVED_RESOLVER"
+
+
+# What a derived model changes of its base: low-rank adapters on its layers
+# (`lora`), an input adapter in front of it (`adapter`), or every weight
+# (`full`).
+Kind = Literal["lora", "adapter", "full"]
+KINDS: tuple[Kind, ...] = ("lora", "adapter", "full")
 
 
 @dataclass(frozen=True)
@@ -49,6 +56,7 @@ class Derived:
         digest: The digest of its own weights, `sha256:...`.
         bags: How many sets of weights it averages; each counts as one
             estimator against the serving policy.
+        kind: What its weights change of the base, one of `KINDS`.
     """
 
     model: str
@@ -56,6 +64,12 @@ class Derived:
     base_digest: str
     digest: str
     bags: int = 1
+    kind: Kind = "lora"
+
+    def __post_init__(self) -> None:
+        """Refuses a kind of change gf does not know."""
+        if self.kind not in KINDS:
+            raise ValueError(f"a derived model's kind is one of {', '.join(KINDS)}")
 
 
 @dataclass(frozen=True)

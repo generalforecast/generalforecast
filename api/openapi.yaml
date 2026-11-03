@@ -4547,14 +4547,16 @@ components:
       type: object
       description: |
         what a derived model runs on: the catalog base and its digest, which
-        its weights are only valid with, and how many bags of weights it
-        averages; each bag counts as one estimator
-      required: [base, base_digest, bags]
+        its weights are only valid with, how many bags of weights it
+        averages (each counts as one estimator), and what kind of change
+        its weights make
+      required: [base, base_digest, bags, kind]
       additionalProperties: false
       properties:
         base: {$ref: "#/components/schemas/ModelId"}
         base_digest: {$ref: "#/components/schemas/Digest"}
         bags: {type: integer, minimum: 1, maximum: 64}
+        kind: {type: string, enum: [lora, adapter, full]}
 
     Resolution:
       type: object
@@ -4734,13 +4736,22 @@ components:
         what a fine-tune is made of, as a predictor's lock records it: its
         base, pinned, and its weights; present on the project's fine-tunes
         alone, which otherwise describe themselves as their base does
-      required: [base, base_digest, digest, bags, version, created]
+      required: [base, base_digest, digest, bags, kind, run, version, created]
       additionalProperties: false
       properties:
         base: {$ref: "#/components/schemas/ModelId"}
         base_digest: {$ref: "#/components/schemas/Digest"}
         digest: {$ref: "#/components/schemas/Digest"}
         bags: {type: integer, minimum: 1, description: estimators the weights hold, averaged when served}
+        kind:
+          type: string
+          enum: [lora, adapter, full]
+          description: |
+            what the weights change of the base: low-rank adapters on its
+            layers, an input adapter in front of it, or every weight
+        run:
+          type: [string, "null"]
+          description: the project's run that trained the weights, if one did
         version: {type: integer, minimum: 1}
         created: {type: number, description: when the version was published, in seconds since the epoch}
 

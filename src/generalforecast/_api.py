@@ -792,18 +792,20 @@ class DerivedBase(Payload):
     """The DerivedBase schema.
 
     what a derived model runs on: the catalog base and its digest, which its weights
-    are only valid with, and how many bags of weights it averages; each bag counts as
-    one estimator
+    are only valid with, how many bags of weights it averages (each counts as one
+    estimator), and what kind of change its weights make
     """
 
     base: ModelId
     base_digest: Digest
     bags: int
+    kind: Literal["lora", "adapter", "full"]
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("base", "base", True, _decode_ModelId),
         Field("base_digest", "base_digest", True, _decode_Digest),
         Field("bags", "bags", True, _integer),
+        Field("kind", "kind", True, _literal("lora", "adapter", "full")),
     )
 
 
@@ -1018,6 +1020,8 @@ class DerivedModel(Payload):
     base_digest: Digest
     digest: Digest
     bags: int
+    kind: Literal["lora", "adapter", "full"]
+    run: str | None
     version: int
     created: float
 
@@ -1026,6 +1030,8 @@ class DerivedModel(Payload):
         Field("base_digest", "base_digest", True, _decode_Digest),
         Field("digest", "digest", True, _decode_Digest),
         Field("bags", "bags", True, _integer),
+        Field("kind", "kind", True, _literal("lora", "adapter", "full")),
+        Field("run", "run", True, _union(_text, _null)),
         Field("version", "version", True, _integer),
         Field("created", "created", True, _number),
     )
