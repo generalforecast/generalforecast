@@ -29,6 +29,7 @@ RECORDED = (
     "ContextVersion",
     "Derived",
     "DerivedResolver",
+    "DerivedWeights",
     "Environment",
     "Error",
     "ImportOutcome",

@@ -33,6 +33,9 @@ class Plane:
             raise catalog.ModelRefError("UnknownModel", f"no model {model}")
         return derived.Derived(model, MODEL, self.base_digest, WEIGHTS, self.bags)
 
+    def weights(self, made, base):
+        raise AssertionError("pinning and locking never load weights")
+
 
 @pytest.fixture
 def plane():
