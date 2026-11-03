@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+import logging
 import threading
 import time
 from collections.abc import Callable, Hashable, Sequence
@@ -13,6 +14,8 @@ from generalforecast.constants import LOCAL_DEVICE_TIER
 from generalforecast.runtime.device import available_memory, device_memory, host_memory
 from generalforecast.runtime.memory import tree_bytes
 from generalforecast.runtime.shapes import bucket_size
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -125,6 +128,24 @@ def out_of_memory(error: BaseException) -> bool:
         return False
     message = str(error)
     return "RESOURCE_EXHAUSTED" in message or "out of memory" in message.lower()
+
+
+# What a program compiles with where XLA's autotuner ran out of device memory
+# compiling it: no autotuning, so XLA takes its default kernels.
+UNTUNED_OPTIONS = {"xla_gpu_autotune_level": 0}
+
+
+def autotune_ran_out(error: BaseException) -> bool:
+    """Whether a call failed compiling, for want of device memory to autotune its kernels on.
+
+    XLA's GPU autotuner times each candidate kernel on buffers of its own,
+    beside what the device holds, and fails the compile when it cannot
+    allocate them.
+    """
+    message = str(error)
+    return out_of_memory(error) and (
+        "Failed to get configs" in message or "autotun" in message.lower()
+    )
 
 
 @dataclass(frozen=True)
@@ -301,6 +322,9 @@ class Chunks:
         self._measured: set[Hashable] = set()
         # How many times over a kind's bytes calls that ran out of memory showed.
         self._backoff: dict[Hashable, int] = {}
+        # Programs compiled without autotuning, by function and argument
+        # shapes, for calls whose autotuning ran out of device memory.
+        self._untuned: dict[Hashable, Any] = {}
         # Parts of one item a call takes, once a single item ran out of memory.
         self._parts: dict[Hashable, int] = {}
         # Padded counts each kind has run at, and those compiling ahead.
@@ -393,11 +417,19 @@ class Chunks:
                     continue
             started = time.perf_counter()
             traces = _traces(call.function)
+            untuned = self._untuned_of(call)
             try:
-                outputs = call.function(*call.shared, *call.items)
+                if untuned is None:
+                    outputs = call.function(*call.shared, *call.items)
+                else:
+                    outputs = untuned(*call.shared, *call.items)
                 dispatched = time.perf_counter() if self.timed is not None else 0.0
                 jax.block_until_ready(outputs)
             except jax.errors.JaxRuntimeError as error:
+                if untuned is None and autotune_ran_out(error) and self._untune(call):
+                    # Its kernels autotuned on buffers the device could not
+                    # hold: the same call again, compiled without autotuning.
+                    continue
                 if not out_of_memory(error) or stop - first == 1:
                     raise
                 # XLA's measure fell short of what the call needed: halve the
@@ -439,6 +471,35 @@ class Chunks:
             # Freed before the next call, so the device never holds two calls' outputs.
             del outputs
             first = stop
+
+    def _untuned_of(self, call: Call) -> Any:
+        """The program a call runs compiled without autotuning, where its autotuning ran out of memory; else None."""
+        if not self._untuned:
+            return None
+        with self._lock:
+            return self._untuned.get(
+                _signature(call.function, (*call.shared, *call.items))
+            )
+
+    def _untune(self, call: Call) -> bool:
+        """Compiles a call's program without autotuning, for it and later calls of its shapes; False if it cannot be."""
+        arguments = (*call.shared, *call.items)
+        try:
+            lowered = cast(jax.stages.Wrapped, call.function).lower(*arguments)
+            program = lowered.compile(compiler_options=UNTUNED_OPTIONS)
+        except Exception:  # noqa: BLE001
+            return False
+        # A compiled program takes its call's arguments as they are, so only
+        # one called with every argument, none of them static, serves it.
+        if program.in_tree != jax.tree.structure((arguments, {})):
+            return False
+        logger.warning(
+            "compiling a call ran out of device memory to autotune its kernels; "
+            "it runs compiled without autotuning"
+        )
+        with self._lock:
+            self._untuned[_signature(call.function, arguments)] = program
+        return True
 
     def _compiled_count(
         self,
