@@ -9,7 +9,8 @@ import logging
 import math
 import os
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -34,6 +35,29 @@ from generalforecast.models.contract import TabularFunctions
 from generalforecast.runtime.device import to_cache_dtype, with_summary_chunk
 
 logger = logging.getLogger(__name__)
+
+# XLA's options for a program compiled only to read its analyses, on a GPU:
+# no autotuning, which times candidate kernels by running them on the device.
+# Nothing runs a measured program, and what it holds is its buffer
+# assignment's, which the kernels autotuning picks among barely change.
+MEASURE_OPTIONS = {"xla_gpu_autotune_level": 0}
+# Measuring compiles run this many at once; XLA compiles outside the GIL.
+MEASURE_THREADS = 4
+
+
+def measure_compiled(lowered: jax.stages.Lowered) -> jax.stages.Compiled:
+    """A program compiled to read its analyses alone: without autotuning on a GPU (`MEASURE_OPTIONS`)."""
+    if jax.default_backend() != "gpu":
+        return lowered.compile()
+    return lowered.compile(compiler_options=MEASURE_OPTIONS)
+
+
+def concurrently[T](calls: Sequence[Callable[[], T]]) -> list[T]:
+    """Each call's result, in order, `MEASURE_THREADS` of them at once; the first error raised, if any."""
+    if len(calls) < 2:
+        return [call() for call in calls]
+    with ThreadPoolExecutor(min(MEASURE_THREADS, len(calls))) as pool:
+        return list(pool.map(lambda call: call(), calls))
 
 
 def tree_bytes(tree: Any) -> int:
@@ -282,10 +306,19 @@ def _working_profiles(
         Exception: Whatever compiling the call raised, where XLA cannot say.
     """
     small_rows, large_rows = WORKING_ROWS
+    # The four compiles at once; the cache's sizes only trace.
+    sizes = [(width, rows) for width in widths for rows in WORKING_ROWS]
+    found = dict(
+        zip(
+            sizes,
+            concurrently([partial(working, width, rows) for width, rows in sizes]),
+            strict=True,
+        )
+    )
     measured = []
     for width in widths:
         cache = memory_profile(functions, model, width, cache_dtype)
-        small, large = working(width, small_rows), working(width, large_rows)
+        small, large = found[width, small_rows], found[width, large_rows]
         per_row = [
             (b - a) / (large_rows - small_rows)
             for a, b in zip(small, large, strict=True)
@@ -327,7 +360,7 @@ class NoMemoryAnalysis(RuntimeError):
 
 def _analysis(function: Callable[..., Any], *arguments: Any) -> Any:
     """XLA's memory analysis of `function` compiled for these arguments."""
-    analysis = jax.jit(function).lower(*arguments).compile().memory_analysis()
+    analysis = measure_compiled(jax.jit(function).lower(*arguments)).memory_analysis()
     if analysis is None:
         raise NoMemoryAnalysis("XLA gives no memory analysis on this backend")
     return analysis
@@ -615,7 +648,7 @@ def fit_profile(
         return jax.jit(fit).lower(model, *inputs)
 
     def measured(program: jax.stages.Lowered, rows: int) -> float:
-        analysis = program.compile().memory_analysis()
+        analysis = measure_compiled(program).memory_analysis()
         if analysis is None:
             raise RuntimeError("XLA gives no memory analysis on this backend")
         total = analysis.temp_size_in_bytes + analysis.output_size_in_bytes
@@ -636,10 +669,12 @@ def fit_profile(
         if path is not None and path.is_file():
             fused, state = json.loads(path.read_text())
             return FitProfile(width, Cost(*fused), Cost(*state))
-        bytes = [
-            measured(program, rows)
-            for program, rows in zip(programs, (few, many) * 2, strict=True)
-        ]
+        bytes = concurrently(
+            [
+                partial(measured, program, rows)
+                for program, rows in zip(programs, (few, many) * 2, strict=True)
+            ]
+        )
         profile = FitProfile(width, cost(*bytes[:2]), cost(*bytes[2:]))
     except Exception as error:  # noqa: BLE001
         logger.warning(
