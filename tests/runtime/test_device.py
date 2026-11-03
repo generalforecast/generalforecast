@@ -160,19 +160,21 @@ def test_a_worker_starts_without_process_affinity(
     Worker().close()
 
 
-def test_command_buffers_are_on_unless_xla_flags_or_gf_turn_them_off(
+def test_command_buffers_are_off_unless_xla_flags_or_gf_turn_them_on(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("GF_COMMAND_BUFFERS", raising=False)
     monkeypatch.setenv("XLA_FLAGS", "--xla_dump_to=/tmp/x")
     command_buffers()
     assert os.environ["XLA_FLAGS"] == (
-        f"--xla_dump_to=/tmp/x --xla_gpu_enable_command_buffer={COMMAND_BUFFERS}"
+        "--xla_dump_to=/tmp/x --xla_gpu_enable_command_buffer="
     )
     monkeypatch.setenv("XLA_FLAGS", "")
-    monkeypatch.setenv("GF_COMMAND_BUFFERS", "0")
+    monkeypatch.setenv("GF_COMMAND_BUFFERS", "1")
     command_buffers()
-    assert os.environ["XLA_FLAGS"] == "--xla_gpu_enable_command_buffer="
+    assert os.environ["XLA_FLAGS"] == (
+        f"--xla_gpu_enable_command_buffer={COMMAND_BUFFERS}"
+    )
     monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_enable_command_buffer=FUSION")
     command_buffers()
     assert os.environ["XLA_FLAGS"] == "--xla_gpu_enable_command_buffer=FUSION"
