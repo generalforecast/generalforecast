@@ -619,13 +619,18 @@ def training_upload(
 ) -> Operation[JsonObject]:
     """Uploads a training table in chunks, completes it, and waits for verification.
 
-    The chunks go where the service says: straight to object storage when it
-    returns a URL, else to the service. A rejected upload raises with the
-    reason the service gave.
+    The upload opens with the table's size and metadata, so the service
+    refuses a bad one before any bytes move. The chunks go where it says:
+    straight to object storage when it returns a URL, else to the service.
+    A rejected upload raises with the reason the service gave.
     """
     body = yield Work(parquet_bytes, (data,))
     opened = yield Call(
-        "POST", "/uploads", "corpus", "new", {"bytes": len(body), "format": "parquet"}
+        "POST",
+        "/uploads",
+        "corpus",
+        "new",
+        {"bytes": len(body), "format": "parquet", "metadata": metadata},
     )
     upload, url, size = opened["id"], opened.get("url"), opened["chunk_bytes"]
     for start in range(0, len(body), size):
@@ -639,7 +644,7 @@ def training_upload(
         f"/uploads/{name(upload)}/complete",
         "corpus",
         upload,
-        {"metadata": metadata},
+        {},
     )
     while wait and state["state"] not in UPLOAD_DONE:
         yield Pause(poll)
