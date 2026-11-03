@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from generalforecast._core import bucket_size
+from generalforecast.constants import TRANSIENT_ROWS
 from generalforecast.worker.calls import _host_padded
 from generalforecast.worker.pages import Representations
 from generalforecast.worker.records import Page, Unit
@@ -206,13 +207,22 @@ class Encoding:
                     jnp.asarray(_host_padded(targets, padded)),
                 )
         device_values, device_targets = on_device[unit.table]
-        index = np.full(self._size(len(unit.rows)), len(device_values), np.int32)
+        index = np.full(
+            self._transient_size(len(unit.rows)), len(device_values), np.int32
+        )
         index[: len(positions)] = positions
         return (
             self._tables[unit.table].state,
             _Gather(device_values, device_targets, index),
             len(unit.rows),
         )
+
+    def _transient_size(self: "Worker", rows: int) -> int:
+        """Rows a put-off context of `rows` rows pads to: its bucket, or past `TRANSIENT_ROWS`, the next multiple of it."""
+        bucket = self._size(rows)
+        if bucket <= TRANSIENT_ROWS:
+            return bucket
+        return min(bucket, -(-rows // TRANSIENT_ROWS) * TRANSIENT_ROWS)
 
     def _own_arguments(self: "Worker", unit: Unit) -> tuple:
         """A unit's fit arguments, from the rows it came with."""

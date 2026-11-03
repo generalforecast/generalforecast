@@ -151,6 +151,12 @@ ATTENTION_BLOCK_CHUNK = 1 << 18
 # How often the sampler reads every thread's stack.
 SAMPLE_INTERVAL = 0.001
 
+# Rows a context with no room to keep pads to a multiple of, past one
+# padded size: it is encoded only in the call that decodes it, so its
+# shape needs no slots, and a context of 5,120 rows padded to 8,192, as
+# a kept one pads, took twice as long to encode.
+TRANSIENT_ROWS = 512
+
 # The most queries a context with no room to keep may have to encode and
 # decode in one call with many others: one per query under neighbors, or a
 # few. A context more queries read decodes them on its own, in parts if
