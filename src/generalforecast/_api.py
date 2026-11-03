@@ -2311,38 +2311,6 @@ class UploadOpenedReply(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
-class UploadCreate(Payload):
-    """The UploadCreate schema."""
-
-    bytes: int
-    format: Literal["parquet"] = "parquet"
-
-    FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("bytes", "bytes", True, _integer),
-        Field("format", "format", True, _literal("parquet")),
-    )
-
-
-@dataclass(frozen=True, kw_only=True)
-class UploadCreateRequest(Payload):
-    """The UploadCreateRequest schema."""
-
-    api_version: Literal["gf/v1"] = "gf/v1"
-    project: Name
-    request_id: str
-    resource: Resource
-    payload: UploadCreate
-
-    FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("api_version", "api_version", True, _literal("gf/v1")),
-        Field("project", "project", True, _decode_Name),
-        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
-        Field("resource", "resource", True, _record(Resource)),
-        Field("payload", "payload", True, _record(UploadCreate)),
-    )
-
-
-@dataclass(frozen=True, kw_only=True)
 class UploadMetadata(Payload):
     """The UploadMetadata schema."""
 
@@ -2364,32 +2332,36 @@ class UploadMetadata(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
-class UploadComplete(Payload):
-    """The UploadComplete schema."""
+class UploadCreate(Payload):
+    """The UploadCreate schema."""
 
+    bytes: int
+    format: Literal["parquet"] = "parquet"
     metadata: UploadMetadata
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("bytes", "bytes", True, _integer),
+        Field("format", "format", True, _literal("parquet")),
         Field("metadata", "metadata", True, _record(UploadMetadata)),
     )
 
 
 @dataclass(frozen=True, kw_only=True)
-class UploadCompleteRequest(Payload):
-    """The UploadCompleteRequest schema."""
+class UploadCreateRequest(Payload):
+    """The UploadCreateRequest schema."""
 
     api_version: Literal["gf/v1"] = "gf/v1"
     project: Name
     request_id: str
     resource: Resource
-    payload: UploadComplete
+    payload: UploadCreate
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("api_version", "api_version", True, _literal("gf/v1")),
         Field("project", "project", True, _decode_Name),
         Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
         Field("resource", "resource", True, _record(Resource)),
-        Field("payload", "payload", True, _record(UploadComplete)),
+        Field("payload", "payload", True, _record(UploadCreate)),
     )
 
 
@@ -2452,40 +2424,6 @@ class UploadDeletedReply(Payload):
         Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
         Field("resource", "resource", True, _record(Resource)),
         Field("result", "result", True, _record(UploadDeleted)),
-    )
-
-
-@dataclass(frozen=True, kw_only=True)
-class UploadReceived(Payload):
-    """The UploadReceived schema."""
-
-    id: Name
-    received: int
-    bytes: int
-
-    FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("id", "id", True, _decode_Name),
-        Field("received", "received", True, _integer),
-        Field("bytes", "bytes", True, _integer),
-    )
-
-
-@dataclass(frozen=True, kw_only=True)
-class UploadReceivedReply(Payload):
-    """The UploadReceivedReply schema."""
-
-    api_version: Literal["gf/v1"] = "gf/v1"
-    project: Name
-    request_id: str
-    resource: Resource
-    result: UploadReceived
-
-    FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("api_version", "api_version", True, _literal("gf/v1")),
-        Field("project", "project", True, _decode_Name),
-        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
-        Field("resource", "resource", True, _record(Resource)),
-        Field("result", "result", True, _record(UploadReceived)),
     )
 
 
@@ -6384,7 +6322,7 @@ ROUTES: tuple[Route, ...] = (
         "uploads.complete",
         "POST",
         "/v1/projects/{project}/uploads/{upload}/complete",
-        UploadCompleteRequest,
+        UploadRefRequest,
         UploadReply,
         "application/json",
     ),
@@ -6395,14 +6333,6 @@ ROUTES: tuple[Route, ...] = (
         UploadRefRequest,
         UploadDeletedReply,
         "application/json",
-    ),
-    Route(
-        "uploads.bytes",
-        "POST",
-        "/v1/projects/{project}/uploads/{upload}/bytes",
-        None,
-        UploadReceivedReply,
-        "application/octet-stream",
     ),
     Route("auth.status", "GET", "/v1/auth/status", None, AuthStatusReply, None),
     Route(
