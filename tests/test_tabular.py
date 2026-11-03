@@ -19,7 +19,10 @@ from pyarrow import feather, parquet
 from generalforecast.predictors.runtime.schema import TableSchema
 from generalforecast.predictors.validation import PredictorError
 from generalforecast.tabular import (
+    MAX_BYTES,
+    MAX_ROWS,
     PHYSICAL_TYPES,
+    arrow_bytes,
     coerce,
     physical_type,
     read_table,
@@ -389,3 +392,18 @@ def test_formats_limits_and_invalid_bytes_are_explicit():
     with pytest.raises(PredictorError) as error:
         read_table(b"x\n1\n", "xlsx")
     assert error.value.code == "UnsupportedFormat"
+
+
+def test_a_digest_is_the_normalized_streams_hash_held_nowhere_whole():
+    from generalforecast.predictors.validation import bytes_digest
+
+    small = pa.table({"x": [1, 2, None], "y": ["a", "b", "c"]})
+    assert table_digest(small) == bytes_digest(arrow_bytes(small))
+    # Past one IPC batch, and past the default row bound once it is raised.
+    large = pa.table({"x": list(range(MAX_ROWS + 5))})
+    with pytest.raises(PredictorError):
+        table_digest(large)
+    raised = {"max_rows": 2 * MAX_ROWS, "max_bytes": 4 * MAX_BYTES}
+    assert table_digest(large, **raised) == bytes_digest(arrow_bytes(large, **raised))
+    # A larger bound leaves a table within the default one as it was.
+    assert table_digest(small, **raised) == table_digest(small)
