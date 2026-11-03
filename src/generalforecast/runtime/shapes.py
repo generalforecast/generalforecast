@@ -7,9 +7,10 @@ import jax.numpy as jnp
 from jax import Array
 
 # The scheduler in generalforecast._core decides padded sizes; Python pads to them.
-from generalforecast._core import bucket_size
+# How a context's rows pack into blocks of slots, as the scheduler counts them.
+from generalforecast._core import block_shape, bucket_size
 
-__all__ = ["bucket_size", "bucketed", "pad_rows"]
+__all__ = ["block_shape", "bucket_size", "bucketed", "pad_rows"]
 
 
 def pad_rows(values: Array, size: int, fill: float = 0) -> Array:

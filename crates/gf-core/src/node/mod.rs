@@ -34,7 +34,7 @@ use crate::planner::{
 use crate::regions::{Built, Rebuild, RegionSpec, RegionStats, Regions, RegionsError};
 use crate::rows::{RowMemory, RowSnapshot, RowStore, RowsError, Sealer};
 use crate::series::{SeriesIndex, SeriesKey};
-use crate::shapes::bucket_size;
+use crate::shapes::{block_shape, bucket_size};
 use crate::table::{Change, Keys, ROW_IDS, RowId, RowKey, Snapshot, Table, TableError, Version};
 use crate::time_index::TimeIndex;
 

@@ -431,10 +431,11 @@ class Admission:
         kept in the pool, and its encode and the decode of a chunk of queries
         beside the pool. So an adaptive table resolves against it as against
         the model's own cap, reading a core and each query's neighbors rather
-        than a context the device cannot hold. Sizes double from the smallest
-        until one does not fit, by the model's profiles, and a size they
-        refuse is measured at its own size before it ends the search, since
-        the profiles' line through small contexts can overstate a large one.
+        than a context the device cannot hold. Padded sizes grow from the
+        smallest, bucket by bucket, until one does not fit, by the model's
+        profiles, and a size they refuse is measured at its own size before it
+        ends the search, since the profiles' line through small contexts can
+        overstate a large one.
         None on a CPU, whose memory the host's caches share, and where XLA
         gives no measure.
         """
@@ -456,7 +457,7 @@ class Admission:
 
         size, measures = self._size(MEASURED_ROWS), 0
         while size < MEMORY_ROWS_LIMIT:
-            larger = size * 2
+            larger = self._size(size + 1)
             found = fits(larger, exact=False)
             if found is None:
                 return None

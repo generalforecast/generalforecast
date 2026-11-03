@@ -28,7 +28,7 @@ from generalforecast.models.kumo.model import kumo_functions
 from generalforecast.models.tabicl.model import tabicl_functions
 from generalforecast.runtime.device import device_settings
 from generalforecast.runtime.memory import NoMemoryAnalysis, memory_profile
-from generalforecast.runtime.paging import DevicePool, read_context
+from generalforecast.runtime.paging import DevicePool, cache_layout, pack, read_context
 from generalforecast.worker import Worker
 from generalforecast.worker import admission as worker_admission
 from tests.models.conformance.cases import CASES, Case, table
@@ -249,7 +249,8 @@ def test_rows_wider_than_a_slot_span_slots(strategy: str) -> None:
     queries = np.concatenate([NEAR_A, NEAR_B, spread])
     predictions = []
     # Odd slot sizes, so the bytes of a padding block land misaligned.
-    for slot_bytes in (1 << 20, row // 3 + 1, 257):
+    # And slots a little short of two rows, whose rows share blocks of slots.
+    for slot_bytes in (1 << 20, row // 3 + 1, 257, row * 19 // 10):
         client = node_harness.local(slot_bytes=slot_bytes)
         rows = _table(client, strategy=chosen, model=TABICL)
         rows.insert(np.arange(64), features, targets)
@@ -259,6 +260,45 @@ def test_rows_wider_than_a_slot_span_slots(strategy: str) -> None:
 
     for predicted in predictions[1:]:
         np.testing.assert_allclose(predicted, predictions[0], rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("in_order", [True, False], ids=["in order", "by row"])
+def test_rows_packed_across_slots_read_back_bit_for_bit(in_order: bool) -> None:
+    model = tiny_tabicl(regression=False)
+    row = memory_profile(tabicl_functions, model, 5).cache_bytes_per_row
+    # Slots a little short of two rows: a slot of whole rows would hold one
+    # and leave almost half of it empty, so rows share blocks of slots.
+    slot_bytes = row * 19 // 10
+    layout = cache_layout(tabicl_functions, model, 5, slot_bytes)
+    assert layout.rows_per_slot > 1 and layout.slots_per_row > 1
+    rows = 40
+    features, targets = _clusters(rows)
+    state, context_rows = tabicl_functions.fit(
+        model, features, targets, 3, num_rows=rows
+    )
+    cache = tabicl_functions.encode(model, state, context_rows, targets, num_rows=rows)
+    packed = np.asarray(pack(layout, cache))
+    # The entry's slots, scattered through a larger pool.
+    generator = np.random.default_rng(0)
+    places = generator.permutation(3 * len(packed))[: len(packed)]
+    pool = np.zeros((3 * len(packed), slot_bytes), np.uint8)
+    pool[places] = packed
+    blocks = places.reshape(-1, layout.slots_per_row).astype(np.int32)
+    order = np.arange(rows) if in_order else generator.permutation(rows)
+
+    read = jax.jit(lambda *values: read_context(layout, *values, in_order=in_order))(
+        jnp.asarray(pool),
+        jnp.asarray(blocks),
+        jnp.asarray(order, jnp.int32),
+        jnp.int32(rows),
+    )
+
+    expected = layout.treedef.flatten_up_to(cache)
+    got_leaves = layout.treedef.flatten_up_to(read)
+    for leaf in layout.row_leaves:
+        got = np.moveaxis(np.asarray(got_leaves[leaf.index]), leaf.axis, 0)
+        want = np.moveaxis(np.asarray(expected[leaf.index]), leaf.axis, 0)[order]
+        np.testing.assert_array_equal(got.view(np.uint8), want.view(np.uint8))
 
 
 def test_pools_never_pass_the_nodes_slots() -> None:
