@@ -676,6 +676,24 @@ def run_spec(name_: str, **settings: Any) -> JsonObject:
     return {"name": name_, **{k: v for k, v in settings.items() if v is not None}}
 
 
+def run_list(state: str | None) -> Operation[list[JsonObject]]:
+    """`GET /runs`: the project's runs by name, with `state` only those in it."""
+    params = None if state is None else {"state": state}
+    result = yield Call("GET", "/runs", "run", "runs", params=params)
+    value = result.get("runs")
+    if type(value) is not list or any(type(item) is not dict for item in value):
+        raise ServiceError("ProtocolError", "invalid collection response", 502)
+    return value
+
+
+def run_cancel(run: str, *, save: bool) -> Operation[JsonObject]:
+    """`POST /runs/{run}/cancel`; with `save`, a training run publishes what it trained."""
+    require(type(save) is bool, "save must be true or false")
+    return (
+        yield from posted("run", "runs", run, "cancel", {"save": True} if save else {})
+    )
+
+
 def run_lineage(run: str) -> Operation[JsonObject]:
     """`GET /runs/{run}/lineage`: every change to a run, oldest first."""
     return (yield Call("GET", f"/runs/{name(run)}/lineage", "run", run))
