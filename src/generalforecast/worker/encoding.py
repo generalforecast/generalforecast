@@ -50,18 +50,25 @@ Transient = dict[int, _Deferred]
 
 @dataclass(frozen=True)
 class _Gather:
-    """A put-off unit's rows, gathered on the device from its step's rows once it is encoded.
+    """A put-off unit's rows, gathered from its step's rows once it is encoded.
 
     Attributes:
-        values: The step's rows' representations for the unit's table, on the device.
-        targets: Their targets, on the device.
+        values: The step's rows' representations for the unit's table, on
+            the device, or on the host where they would not fit beside the
+            device's pool and a call.
+        targets: Their targets, where `values` are.
         index: Each of the unit's padded rows' place in `values`; padding
             points past them, and reads as zeros.
     """
 
-    values: jax.Array
-    targets: jax.Array
+    values: jax.Array | np.ndarray
+    targets: jax.Array | np.ndarray
     index: np.ndarray
+
+    @property
+    def on_device(self) -> bool:
+        """Whether the step's rows are on the device, for a gather there."""
+        return isinstance(self.values, jax.Array)
 
 
 @jax.jit
@@ -70,11 +77,26 @@ def _taken(values: jax.Array, index: jax.Array) -> jax.Array:
     return jnp.take(values, index, axis=0, mode="fill", fill_value=0)
 
 
+def _host_taken(values: np.ndarray, index: np.ndarray) -> np.ndarray:
+    """`values`' rows at `index`, zeros where it points past them, on the host."""
+    taken = np.zeros((len(index), *values.shape[1:]), values.dtype)
+    inside = index < len(values)
+    taken[inside] = values[index[inside]]
+    return taken
+
+
 def _expanded(arguments: tuple) -> tuple:
-    """A put-off unit's encode arguments, its rows gathered on the device."""
+    """A put-off unit's encode arguments, its rows gathered where the step's rows are."""
     if len(arguments) != 3 or not isinstance(arguments[1], _Gather):
         return arguments
     state, gather, rows = arguments
+    if not gather.on_device:
+        return (
+            state,
+            _host_taken(np.asarray(gather.values), gather.index),
+            _host_taken(np.asarray(gather.targets), gather.index),
+            rows,
+        )
     index = jnp.asarray(gather.index)
     return (state, _taken(gather.values, index), _taken(gather.targets, index), rows)
 
@@ -108,7 +130,9 @@ class Encoding:
         # the device once: such units are many, each a context of its own,
         # and gathering each on the host and copying it over took most of
         # their encode. Padded to a bucket, so few sizes compile a gather.
-        on_device: dict[int, tuple[jax.Array, jax.Array]] = {}
+        # Where they would not fit the device beside its pool and a call,
+        # they stay on the host, and each unit gathers its own there.
+        gathered: dict[int, tuple[Any, Any]] = {}
         work: dict[str, list[tuple[int, tuple]]] = defaultdict(list)
         group: dict[str, list[int]] = defaultdict(list)
         for index in waiting:
@@ -118,7 +142,7 @@ class Encoding:
                 stage, arguments = "fit_encode", self._own_arguments(unit)
             elif unit.action == "transient":
                 stage = "encode"
-                arguments = self._gathered_later(unit, joined, on_device)
+                arguments = self._gathered_later(unit, joined, gathered)
             else:
                 stage, arguments = "encode", self._gathered(unit, joined)
             if unit.action == "transient":
@@ -184,9 +208,9 @@ class Encoding:
         self: "Worker",
         unit: Unit,
         joined: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]],
-        on_device: dict[int, tuple[jax.Array, jax.Array]],
+        gathered: dict[int, tuple[Any, Any]],
     ) -> tuple:
-        """A put-off unit's encode arguments, its rows to gather on the device once encoded.
+        """A put-off unit's encode arguments, its rows to gather once encoded.
 
         Only the places of its rows are kept meanwhile, so a step of many
         put-off units holds one copy of its rows rather than one per unit.
@@ -199,23 +223,44 @@ class Encoding:
                 f"a unit of table {unit.table} reads rows that are in none "
                 "of the step's pages"
             )
-        if unit.table not in on_device:
+        if unit.table not in gathered:
             padded = bucket_size(len(rows), self._minimum)
-            with self.stats.timed("pad"):
-                on_device[unit.table] = (
-                    jnp.asarray(_host_padded(values, padded)),
-                    jnp.asarray(_host_padded(targets, padded)),
-                )
-        device_values, device_targets = on_device[unit.table]
+            if self._joins_on_device(values, targets, padded):
+                with self.stats.timed("pad"):
+                    gathered[unit.table] = (
+                        jnp.asarray(_host_padded(values, padded)),
+                        jnp.asarray(_host_padded(targets, padded)),
+                    )
+            else:
+                # Too many for the device beside its pool and a call, as a
+                # wide model's representations of many rows are: each unit
+                # gathers its own rows on the host as it is encoded.
+                gathered[unit.table] = (values, targets)
+        step_values, step_targets = gathered[unit.table]
         index = np.full(
-            self._transient_size(len(unit.rows)), len(device_values), np.int32
+            self._transient_size(len(unit.rows)), len(step_values), np.int32
         )
         index[: len(positions)] = positions
         return (
             self._tables[unit.table].state,
-            _Gather(device_values, device_targets, index),
+            _Gather(step_values, step_targets, index),
             len(unit.rows),
         )
+
+    def _joins_on_device(
+        self: "Worker", values: np.ndarray, targets: np.ndarray, padded: int
+    ) -> bool:
+        """Whether a step's rows, padded, fit the device beside its pool and one call.
+
+        Put-off units gather from them through the step's calls, which each
+        take up to a call's budget beside them. On a CPU, whose memory is the
+        host's, they always do.
+        """
+        if self.budget.cpu:
+            return True
+        row = (values.nbytes + targets.nbytes) // max(1, len(values))
+        room = self.budget.device - self._pool_bytes - self._call_bytes
+        return padded * row <= room
 
     def _transient_size(self: "Worker", rows: int) -> int:
         """Rows a put-off context of `rows` rows pads to: its bucket, or past `TRANSIENT_ROWS`, the next multiple of it."""

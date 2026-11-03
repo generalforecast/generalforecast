@@ -375,6 +375,7 @@ class Decodes:
             if (
                 deferred.stage == "encode"
                 and isinstance(arguments[1], _Gather)
+                and arguments[1].on_device
                 and len(item.queries) <= FUSED_QUERIES
             ):
                 # Alike calls: one table, one batch's query rows, one padded
