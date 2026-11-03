@@ -196,9 +196,12 @@ class Pages:
                 (page.table, (self._tables[page.table].state, features, targets))
             )
             embedding.append((index, missing))
-        for (index, missing), representations in zip(
-            embedding, self._call("embed", work), strict=True
-        ):
+
+        # Each page comes to the host as its call finishes, so the device holds
+        # one call's pages at a time, not every page the step embeds: a wide
+        # table's representations of all its pages can fill the device.
+        def fetched(position: int, representations: Any) -> None:
+            index, missing = embedding[position]
             page = pages[index]
             with self.stats.timed("fetch"):
                 embedded = np.asarray(representations)[: len(missing)]
@@ -209,6 +212,8 @@ class Pages:
             else:
                 partial[index] = (embedded, np.asarray(page.targets))
             self.stats.rows_embedded += len(missing)
+
+        self._call("embed", work, consume=fetched)
         for index, computed in partial.items():
             self._keep(pages[index], computed)
             found[index] = computed
