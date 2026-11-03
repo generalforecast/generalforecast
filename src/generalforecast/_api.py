@@ -227,6 +227,10 @@ ModelName = str
 _decode_ModelName: Decoder = _pattern("^[a-z0-9][a-z0-9.-]{0,62}$")
 
 
+FineTuneName = str
+_decode_FineTuneName: Decoder = _pattern("^[a-z][a-z0-9-]{0,62}@ft[1-9]\\d*$")
+
+
 ModelId = str
 _decode_ModelId: Decoder = _pattern(
     "^[a-z][a-z0-9-]{0,62}/[a-z0-9][a-z0-9.-]{0,62}(?:@ft[1-9]\\d*)?(?:@sha256:[0-9a-f]{64})?(?:@\\d+)?(?:\\*\\d+)?$",
@@ -1002,6 +1006,32 @@ class PredictorListReply(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class DerivedModel(Payload):
+    """The DerivedModel schema.
+
+    what a fine-tune is made of, as a predictor's lock records it: its base, pinned,
+    and its weights; present on the project's fine-tunes alone, which otherwise
+    describe themselves as their base does
+    """
+
+    base: ModelId
+    base_digest: Digest
+    digest: Digest
+    bags: int
+    version: int
+    created: float
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("base", "base", True, _decode_ModelId),
+        Field("base_digest", "base_digest", True, _decode_Digest),
+        Field("digest", "digest", True, _decode_Digest),
+        Field("bags", "bags", True, _integer),
+        Field("version", "version", True, _integer),
+        Field("created", "created", True, _number),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class Artifact(Payload):
     """The Artifact schema."""
 
@@ -1080,6 +1110,7 @@ class Model(Payload):
     capabilities: tuple[Capability, ...]
     limits: Limits
     warm_shapes: tuple[Shape, ...]
+    derived: DerivedModel | None = None
     artifact_verification: str | None = None
     license_source: str | None = None
     variant: ModelVariant | None = None
@@ -1087,6 +1118,7 @@ class Model(Payload):
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("model", "model", True, _text),
         Field("name", "name", True, _decode_ModelId),
+        Field("derived", "derived", False, _record(DerivedModel)),
         Field("task", "task", True, _decode_Task),
         Field("repository", "repository", True, _text),
         Field("revision", "revision", True, _text),
@@ -2445,112 +2477,6 @@ class UploadDeletedReply(Payload):
         Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
         Field("resource", "resource", True, _record(Resource)),
         Field("result", "result", True, _record(UploadDeleted)),
-    )
-
-
-@dataclass(frozen=True, kw_only=True)
-class FineTune(Payload):
-    """The FineTune schema."""
-
-    model: ModelId
-    name: Name
-    version: int
-    base: ModelId
-    base_digest: Digest
-    digest: Digest
-    bags: int
-    created: float
-
-    FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("model", "model", True, _decode_ModelId),
-        Field("name", "name", True, _decode_Name),
-        Field("version", "version", True, _integer),
-        Field("base", "base", True, _decode_ModelId),
-        Field("base_digest", "base_digest", True, _decode_Digest),
-        Field("digest", "digest", True, _decode_Digest),
-        Field("bags", "bags", True, _integer),
-        Field("created", "created", True, _number),
-    )
-
-
-@dataclass(frozen=True, kw_only=True)
-class FineTuneReply(Payload):
-    """The FineTuneReply schema."""
-
-    api_version: Literal["gf/v1"] = "gf/v1"
-    project: Name
-    request_id: str
-    resource: Resource
-    result: FineTune
-
-    FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("api_version", "api_version", True, _literal("gf/v1")),
-        Field("project", "project", True, _decode_Name),
-        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
-        Field("resource", "resource", True, _record(Resource)),
-        Field("result", "result", True, _record(FineTune)),
-    )
-
-
-@dataclass(frozen=True, kw_only=True)
-class FineTuneList(Payload):
-    """The FineTuneList schema."""
-
-    fine_tunes: tuple[FineTune, ...]
-
-    FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("fine_tunes", "fine_tunes", True, _items(_record(FineTune))),
-    )
-
-
-@dataclass(frozen=True, kw_only=True)
-class FineTuneListReply(Payload):
-    """The FineTuneListReply schema."""
-
-    api_version: Literal["gf/v1"] = "gf/v1"
-    project: Name
-    request_id: str
-    resource: Resource
-    result: FineTuneList
-
-    FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("api_version", "api_version", True, _literal("gf/v1")),
-        Field("project", "project", True, _decode_Name),
-        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
-        Field("resource", "resource", True, _record(Resource)),
-        Field("result", "result", True, _record(FineTuneList)),
-    )
-
-
-@dataclass(frozen=True, kw_only=True)
-class FineTuneVersions(Payload):
-    """The FineTuneVersions schema."""
-
-    name: Name
-    versions: tuple[FineTune, ...]
-
-    FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("name", "name", True, _decode_Name),
-        Field("versions", "versions", True, _items(_record(FineTune))),
-    )
-
-
-@dataclass(frozen=True, kw_only=True)
-class FineTuneVersionsReply(Payload):
-    """The FineTuneVersionsReply schema."""
-
-    api_version: Literal["gf/v1"] = "gf/v1"
-    project: Name
-    request_id: str
-    resource: Resource
-    result: FineTuneVersions
-
-    FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("api_version", "api_version", True, _literal("gf/v1")),
-        Field("project", "project", True, _decode_Name),
-        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
-        Field("resource", "resource", True, _record(Resource)),
-        Field("result", "result", True, _record(FineTuneVersions)),
     )
 
 
@@ -6452,30 +6378,6 @@ ROUTES: tuple[Route, ...] = (
         UploadRefRequest,
         UploadDeletedReply,
         "application/json",
-    ),
-    Route(
-        "fine-tunes.list",
-        "GET",
-        "/v1/projects/{project}/fine-tunes",
-        None,
-        FineTuneListReply,
-        None,
-    ),
-    Route(
-        "fine-tunes.get",
-        "GET",
-        "/v1/projects/{project}/fine-tunes/{fine_tune}",
-        None,
-        FineTuneVersionsReply,
-        None,
-    ),
-    Route(
-        "fine-tunes.version",
-        "GET",
-        "/v1/projects/{project}/fine-tunes/{fine_tune}/versions/{version}",
-        None,
-        FineTuneReply,
-        None,
     ),
     Route("auth.status", "GET", "/v1/auth/status", None, AuthStatusReply, None),
     Route(

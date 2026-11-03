@@ -218,8 +218,27 @@ pub fn owns(method: &Method, path: &str) -> bool {
     if escaped && !tail.is_empty() {
         return true;
     }
+    // A project's fine-tune, `models/<name>@ft<version>`, is the upstream's
+    // to describe: the plane keeps them, and the front's catalog has none.
+    if let ["models", model] = tail
+        && fine_tune(model)
+    {
+        return false;
+    }
     route(method, tail)
         .is_some_and(|action| action != Action::Predictors && action != Action::Predictor)
+}
+
+/// Whether a `models/{model}` segment names one of the project's fine-tunes,
+/// `<name>@ft<version>`, as the public spec's `FineTuneName` has it.
+fn fine_tune(segment: &str) -> bool {
+    let Some((owned, version)) = segment.split_once("@ft") else {
+        return false;
+    };
+    name(owned).is_ok()
+        && !version.is_empty()
+        && !version.starts_with('0')
+        && version.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// The action a route's segments after its project name, if it is one the
