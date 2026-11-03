@@ -15,8 +15,10 @@ import logging
 import os
 import platform
 import re
+import threading
 import time
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -27,6 +29,8 @@ from generalforecast._core import bucket_size
 from generalforecast.constants import (
     STARTED_PROGRAMS,
     TABLE_STAGES,
+    WARM_COMPILES,
+    WARM_RUN_BYTES,
     WARM_RUN_ROWS,
     WARMED_PAGES,
     WARMED_QUERIES,
@@ -74,6 +78,34 @@ def _manifests(bucket_minimum: int, slot_bytes: int) -> Path:
     return cache_root() / "programs" / digest
 
 
+# A directory of measures shipped with the package or image, as `shipped`
+# writes them: one directory per `_manifests` identity.
+SHIPPED_MEASURES_ENV = "GF_MEASURES"
+
+
+def _shipped_measures(bucket_minimum: int, slot_bytes: int) -> Path | None:
+    """Where measures shipped for these programs are, under `GF_MEASURES`; None where none are."""
+    root = os.environ.get(SHIPPED_MEASURES_ENV)
+    if not root:
+        return None
+    directory = Path(root) / _manifests(bucket_minimum, slot_bytes).name
+    return directory if directory.is_dir() else None
+
+
+# Seconds a warm start compiles before it takes steps, at most; what is left
+# compiles ahead while the worker serves, or when a step first calls it.
+WARM_SECONDS_ENV = "GF_WARM_SECONDS"
+
+
+def _zeros_bytes(tree: Any) -> int:
+    """Bytes of zeros the shapes in `tree` take."""
+    return sum(
+        int(np.prod(leaf.shape)) * np.dtype(leaf.dtype).itemsize
+        for leaf in jax.tree.leaves(tree)
+        if hasattr(leaf, "shape") and hasattr(leaf, "dtype")
+    )
+
+
 def _cpu_features() -> str:
     """The instruction sets XLA may compile this machine's CPU programs with, which a program shipped from another must match.
 
@@ -119,6 +151,7 @@ class Ahead:
         self: "Worker",
         progress: Callable[[int, int], None] | None = None,
         models: Sequence[int] | None = None,
+        seconds: float | None = None,
     ) -> None:
         """Compiles the kinds of call earlier processes recorded for the loaded models: the most recently used before any step, the rest ahead.
 
@@ -131,15 +164,22 @@ class Ahead:
         rest compile ahead in quiet gaps between steps, most recently used
         first. A kind that no longer compiles, as after the model's code
         changed, is skipped. Call it after `allocate`: paged decodes read
-        the pool.
+        the pool. Kinds compile `WARM_COMPILES` at once, each kind's counts
+        in turn, so one that fails stops its own counts alone.
 
         Args:
             progress: Called with the programs compiled so far and the
                 programs to compile before any step, after each program and
                 each measure, so the caller can show how far along it is.
             models: The loaded models to compile for; every one by default.
+            seconds: The most seconds to compile before returning, from
+                `GF_WARM_SECONDS` if None, else no limit; the programs left
+                compile ahead, as those past `STARTED_PROGRAMS` do.
         """
+        if seconds is None and os.environ.get(WARM_SECONDS_ENV):
+            seconds = float(os.environ[WARM_SECONDS_ENV])
         started = time.perf_counter()
+        deadline = None if seconds is None else started + seconds
         chosen = self._specs.keys() if models is None else models
         planned: list[tuple[int, Recorded, list[tuple[Kind, int]]]] = []
         for model in chosen:
@@ -152,23 +192,32 @@ class Ahead:
             planned.append((model, recorded, programs))
         total = sum(min(len(programs), STARTED_PROGRAMS) for *_, programs in planned)
         done = 0
+        counting = threading.Lock()
+
+        def counted() -> None:
+            nonlocal done
+            with counting:
+                done += 1
+                if progress is not None:
+                    progress(done, total)
+
         for model, recorded, programs in planned:
             if not self.forecaster(model) and recorded.kinds:
                 # What a step measures by compiling, once per model and width,
                 # before it decides where a context goes.
                 self.decode_profile(model)
                 for measure in recorded.measures:
+                    if deadline is not None and time.perf_counter() > deadline:
+                        # A step measures what it needs when it first does.
+                        break
                     self._measure(model, measure)
                     if progress is not None:
                         progress(done, total)
-            failed: set[Kind] = set()
+            kinds: dict[Kind, list[int]] = {}
             for kind, count in programs[:STARTED_PROGRAMS]:
-                if kind not in failed and not self._warm_program(model, kind, count):
-                    failed.add(kind)
-                done += 1
-                if progress is not None:
-                    progress(done, total)
-            for kind, count in programs[STARTED_PROGRAMS:]:
+                kinds.setdefault(kind, []).append(count)
+            left, failed = self._warm_kinds(model, kinds, deadline, counted)
+            for kind, count in left + programs[STARTED_PROGRAMS:]:
                 if kind not in failed:
                     self.programs.later(
                         lambda model=model, kind=kind, count=count: self._warm_program(
@@ -176,6 +225,41 @@ class Ahead:
                         )
                     )
         self.programs.warm_seconds += time.perf_counter() - started
+
+    def _warm_kinds(
+        self: "Worker",
+        model: int,
+        kinds: dict[Kind, list[int]],
+        deadline: float | None,
+        counted: Callable[[], None],
+    ) -> tuple[list[tuple[Kind, int]], set[Kind]]:
+        """Compiles each kind's counts in turn, `WARM_COMPILES` kinds at once, until `deadline`.
+
+        Returns:
+            The kinds and counts left at the deadline, and the kinds that
+            failed to compile, whose later counts are not tried.
+        """
+        left: list[tuple[Kind, int]] = []
+        failed: set[Kind] = set()
+        lock = threading.Lock()
+
+        def warm(kind: Kind, counts: list[int]) -> None:
+            for at, count in enumerate(counts):
+                if deadline is not None and time.perf_counter() > deadline:
+                    with lock:
+                        left.extend((kind, rest) for rest in counts[at:])
+                    return
+                compiled = self._warm_program(model, kind, count)
+                counted()
+                if not compiled:
+                    with lock:
+                        failed.add(kind)
+                    return
+
+        threads = min(WARM_COMPILES, max(1, len(kinds)))
+        with ThreadPoolExecutor(threads, thread_name_prefix="gf-start") as pool:
+            list(pool.map(lambda item: warm(*item), kinds.items()))
+        return left, failed
 
     def _warm_program(self: "Worker", model: int, kind: Kind, count: int) -> bool:
         """Compiles a recorded kind of a model's call for `count` items, and runs it on zeros where that is quick; whether it compiled.
@@ -192,7 +276,8 @@ class Ahead:
             shared = self._shared(program, kind, items)
             arguments = (parameters, *shared, *items)
             note_compiled(function, arguments, function.lower(*arguments).compile())
-            inputs = zeros((shared, items))
+            small = _zeros_bytes((shared, items)) <= WARM_RUN_BYTES
+            inputs = zeros((shared, items)) if small else None
             if inputs is not None and (
                 kind.program[0] not in TABLE_STAGES
                 or most_rows(kind.item) <= WARM_RUN_ROWS

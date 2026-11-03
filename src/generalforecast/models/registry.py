@@ -421,18 +421,26 @@ BUILT_IN: dict[str, Callable[[], Model]] = {
 
 
 def _trained(entry: ModelEntry, model: Model) -> Model:
-    """A built-in model whose properties say the largest contexts it was trained on."""
+    """A built-in model whose properties say the largest contexts it was trained on, and that it pads widths."""
     functions, parameters = model
     capability = entry.capability
-    if isinstance(functions, SeriesFunctions) or capability.context_rows is None:
+    if isinstance(functions, SeriesFunctions):
         return model
+    trained = (
+        {}
+        if capability.context_rows is None
+        else {
+            "context_rows": capability.context_rows,
+            "context_features": capability.context_features,
+            "context_classes": capability.context_classes,
+        }
+    )
 
     def properties(parameters: Any) -> Any:
+        # Every built-in model sets constant columns aside, as the
+        # conformance check of padded widths shows.
         return dataclasses.replace(
-            functions.properties(parameters),
-            context_rows=capability.context_rows,
-            context_features=capability.context_features,
-            context_classes=capability.context_classes,
+            functions.properties(parameters), padded_width=True, **trained
         )
 
     return functions._replace(properties=properties), parameters

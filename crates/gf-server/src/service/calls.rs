@@ -7,8 +7,8 @@
 use super::frames::{
     Laps, answer, answered, batches, changes, creation_id, descriptor, encoded, exchange_path,
     forecasted, future_column, given_keys, groups_column, horizon_of, invalid, keys, lineage, path,
-    prediction_batch, quantile_batch, quantile_levels, query_rows, results, series_column, times,
-    write_id,
+    picked_batch, prediction_batch, quantile_batch, quantile_levels, query_rows, results,
+    series_column, times, write_id,
 };
 use super::*;
 
@@ -150,6 +150,16 @@ impl Service {
         route += laps.lap();
         laps.observe(&self.metrics.request_route_seconds, route);
         laps.observe(&self.metrics.request_decode_seconds, decode);
+        // A table that knows its columns' levels has the worker take the
+        // levels asked, so only those columns leave it.
+        let pick = levels
+            .as_ref()
+            .zip(placement.levels.as_ref())
+            .map(|(levels, known)| Pick {
+                known: Arc::clone(known),
+                levels: levels.clone(),
+            });
+        let known = pick.as_ref().map(|pick| pick.known.len());
         let predictions = self
             .ask(placement.shard, |reply| Command::Predict {
                 table,
@@ -158,6 +168,7 @@ impl Service {
                 before,
                 given,
                 trace: trace.id().to_string(),
+                pick,
                 reply,
             })
             .await
@@ -166,6 +177,17 @@ impl Service {
         laps.observe(&self.metrics.request_shard_seconds, shard);
         counts.predictions.add(predictions.rows as u64);
         counts.predict_seconds.observe(started.elapsed());
+        // A worker that took the levels answers with their columns alone; one
+        // with every column is interpolated here. The two never coincide,
+        // since a call names at most `MAX_LEVELS`, fewer than a regressor's
+        // columns.
+        if let (Some(known), Some(levels)) = (known, levels.as_deref())
+            && predictions.columns == levels.len()
+            && predictions.columns != known
+        {
+            let batch = picked_batch(&predictions, levels)?;
+            return answered(batch, &predictions, laps, Arc::clone(&self.metrics));
+        }
         self.predicted(&predictions, levels.as_deref(), &placement, laps)
             .await
     }

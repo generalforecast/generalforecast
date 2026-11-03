@@ -323,6 +323,8 @@ def _strategy_of(spec: Mapping[str, Any]) -> Strategy:
             return Strategy.exact()
         case "adaptive":
             return Strategy.adaptive()
+        case "adaptive_whole":
+            return Strategy.adaptive_whole()
         case "subsample":
             return Strategy.subsample(int(spec["rows"]), int(spec.get("seed", 0)))
         case "neighbors":

@@ -122,18 +122,45 @@ impl Strategy {
         Self(planner::Strategy::Adaptive)
     }
 
+    /// As `adaptive`, but past the cap a table may read whole.
+    ///
+    /// It does while it holds at most four times a cap of 10,000 rows or
+    /// more and its worker can hold the whole context on its device, the
+    /// table's `whole_rows`.
+    #[staticmethod]
+    fn adaptive_whole() -> Self {
+        Self(planner::Strategy::AdaptiveWhole)
+    }
+
     /// The strategy a table of `rows` live rows plans with.
     ///
     /// `cap` is the model's context rows, or None for no cap; `timed` whether
-    /// the table's rows have times. An adaptive strategy is resolved by the
-    /// server's rule, any other is itself.
-    #[pyo3(signature = (rows, cap, timed = false))]
-    fn resolve(&self, rows: i64, cap: Option<i64>, timed: bool) -> PyResult<Self> {
+    /// the table's rows have times; `whole` the most rows its worker can
+    /// hold as one context on its device, which `adaptive_whole` reads a
+    /// table past the cap whole within. An adaptive strategy is resolved by
+    /// the server's rule, any other is itself.
+    #[pyo3(signature = (rows, cap, timed = false, whole = None))]
+    fn resolve(
+        &self,
+        rows: i64,
+        cap: Option<i64>,
+        timed: bool,
+        whole: Option<i64>,
+    ) -> PyResult<Self> {
         let cap = cap
             .map(|cap| count::<u64>(cap, "cap"))
             .transpose()?
             .and_then(std::num::NonZeroU64::new);
-        Ok(Self(self.0.resolve(count(rows, "rows")?, cap, timed)))
+        let whole = whole
+            .map(|whole| count::<u64>(whole, "whole"))
+            .transpose()?
+            .and_then(std::num::NonZeroU64::new);
+        Ok(Self(self.0.resolve_within(
+            count(rows, "rows")?,
+            cap,
+            whole,
+            timed,
+        )))
     }
 
     /// The same deterministic sample of rows for every query: a core alone.
@@ -211,6 +238,7 @@ impl Strategy {
         else {
             return match self.0 {
                 planner::Strategy::Adaptive => "Strategy.adaptive()",
+                planner::Strategy::AdaptiveWhole => "Strategy.adaptive_whole()",
                 _ => "Strategy.exact()",
             }
             .to_string();
@@ -270,6 +298,7 @@ impl Strategy {
         else {
             return match self.0 {
                 planner::Strategy::Adaptive => r#"{"kind": "adaptive"}"#,
+                planner::Strategy::AdaptiveWhole => r#"{"kind": "adaptive_whole"}"#,
                 _ => r#"{"kind": "exact"}"#,
             }
             .to_string();
@@ -919,7 +948,7 @@ impl Node {
         refit_cutoffs = "each", scale_rows = None, retrieval = 0,
         summary = "table", state_bytes = 0,
         categorical = Vec::new(), retrieval_categoricals = "codes",
-        unlabeled_context = false, fit_bound = None,
+        unlabeled_context = false, fit_bound = None, whole_rows = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn create_table(
@@ -952,6 +981,7 @@ impl Node {
         retrieval_categoricals: &str,
         unlabeled_context: bool,
         fit_bound: Option<i64>,
+        whole_rows: Option<i64>,
     ) -> PyResult<u32> {
         let cutoffs = refit_cutoffs.parse::<CutoffRefit>().map_err(invalid)?;
         let refit = RefitPolicy::new(refit_after, refit_shift)
@@ -1009,6 +1039,10 @@ impl Node {
                         .ok_or_else(|| invalid("context_rows must be positive"))
                 })
                 .transpose()?,
+            whole_rows: whole_rows
+                .map(|rows| count::<u64>(rows, "whole_rows"))
+                .transpose()?
+                .map(NonZeroU64::new),
             past_cap: past_cap.parse::<PastCap>().map_err(invalid)?,
             regions: region_rows
                 .map(|rows| -> PyResult<RegionSpec> {
@@ -1145,6 +1179,7 @@ impl Node {
             refit: RefitPolicy::default(),
             fit_rows: positive(DEFAULT_FIT_ROWS as i64, "fit_rows")?,
             context_rows: None,
+            whole_rows: None,
             past_cap: PastCap::Warn,
             regions: None,
             scale_rows: None,
@@ -1460,6 +1495,18 @@ impl Node {
                 count(fused_rows, "fused_rows")?,
             )
             .map_err(raised)
+    }
+
+    /// Whether a table waits for `set_whole_rows`; see `take_unmeasured`.
+    fn wants_whole_rows(&self, table: u32) -> PyResult<bool> {
+        self.0.wants_whole_rows(TableId(table)).map_err(raised)
+    }
+
+    /// Sets the most rows a table's worker can hold as one context, None for none.
+    #[pyo3(signature = (table, rows))]
+    fn set_whole_rows(&mut self, table: u32, rows: Option<i64>) -> PyResult<()> {
+        let rows = rows.map(|rows| count::<u64>(rows, "rows")).transpose()?;
+        self.0.set_whole_rows(TableId(table), rows).map_err(raised)
     }
 
     /// The most rows a table's state is fit on, within the worker's call budget.

@@ -42,28 +42,42 @@ impl Shard {
         for &table in &tables {
             // A scratch table fits as its partition's table does; a request
             // context is an ephemeral table, which `tables` does not hold.
+            // Neither has a definition to ask after, so neither reads a
+            // table past the cap whole.
             let Some(name) = self.name_of(table) else {
+                let _ = self.node.set_whole_rows(table, None);
                 continue;
             };
             let Some(definition) = self.definition(table, name) else {
+                let _ = self.node.set_whole_rows(table, None);
                 continue;
             };
             let key = (definition.model.clone(), definition.model_features());
-            let limits = if let Some(&limits) = self.fit_limits.get(&key) {
+            // An adaptive_whole table asks how many rows the worker can hold
+            // as one context, once per model and feature count, beside its fits.
+            let whole = self.node.wants_whole_rows(table).unwrap_or(false);
+            let known = self.fit_limits.get(&key).copied();
+            let told = self.whole_limits.get(&key).copied();
+            let limits = if let Some(limits) = known.filter(|_| !whole || told.is_some()) {
                 limits
             } else {
                 let request = WorkerRequest::FitLimits {
                     model: key.0.clone(),
                     features: key.1,
+                    whole,
                 };
                 let rows = |rows: Option<u64>| rows.map_or(usize::MAX, |rows| rows as usize);
                 match self.ask_worker(&request).await {
                     Ok(WorkerReply::FitLimits {
                         state_rows,
                         fused_rows,
+                        whole_rows,
                     }) => {
                         let limits = (rows(state_rows), rows(fused_rows));
-                        self.fit_limits.insert(key, limits);
+                        self.fit_limits.insert(key.clone(), limits);
+                        if whole {
+                            self.whole_limits.insert(key.clone(), whole_rows);
+                        }
                         limits
                     }
                     reply => {
@@ -80,6 +94,10 @@ impl Shard {
                     }
                 }
             };
+            if whole {
+                let rows = self.whole_limits.get(&key).copied().flatten();
+                let _ = self.node.set_whole_rows(table, rows);
+            }
             let _ = self.node.set_fit_limits(table, limits.0, limits.1);
         }
         !tables.is_empty()
@@ -389,6 +407,7 @@ impl Shard {
             refit: config.refit,
             fit_rows: config.fit_rows,
             context_rows: context_rows.and_then(NonZeroU64::new),
+            whole_rows: None,
             past_cap: config.past_cap,
             regions: if series.is_some() {
                 None

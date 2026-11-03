@@ -119,6 +119,23 @@ impl TableState {
             && self.table.len() > self.spec.sizes.fit_bound as u64
     }
 
+    /// Whether the table's next plan would read it whole past its model's
+    /// cap if its worker could hold it, before the worker says how many rows
+    /// it can: an `AdaptiveWhole` table within `ADAPTIVE_WHOLE_PAST_CAP`
+    /// times a cap of at least `ADAPTIVE_WHOLE_FROM_CAP`.
+    pub(super) fn unmeasured_whole(&self) -> bool {
+        let rows = self.table.len();
+        self.spec.whole_rows.is_none()
+            && self.spec.strategy == Strategy::AdaptiveWhole
+            && self.spec.series.is_none()
+            && self.spec.context_rows.is_some_and(|cap| {
+                let cap = cap.get();
+                cap >= ADAPTIVE_WHOLE_FROM_CAP
+                    && rows > cap
+                    && rows <= cap.saturating_mul(ADAPTIVE_WHOLE_PAST_CAP)
+            })
+    }
+
     /// Rows plans leave out: unlabeled ones, unless the model reads them.
     pub(super) fn hidden(&self) -> &RoaringBitmap {
         static NONE: std::sync::LazyLock<RoaringBitmap> =
@@ -155,9 +172,10 @@ impl TableState {
     /// its live rows, the model's cap and whether its rows have times, any
     /// other as given.
     pub(super) fn resolved(&self) -> Strategy {
-        self.spec.strategy.resolve(
+        self.spec.strategy.resolve_within(
             self.table.len(),
             self.spec.context_rows,
+            self.spec.whole_rows.flatten(),
             self.times.has_timed(),
         )
     }

@@ -273,6 +273,45 @@ def test_a_start_compiles_the_most_recently_used_programs_and_the_rest_ahead(
     later.programs.drop()
 
 
+def test_a_start_past_its_seconds_leaves_the_rest_to_compile_ahead(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from generalforecast.worker import ahead
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    first = Worker(slot_bytes=4096, compile_ahead=False)
+    _, step = _fused(first, 1)
+    first._specs[0] = "tiny-tabicl"
+    first.run(step([0]))
+    manifest = first.programs.manifest("tiny-tabicl")
+    assert manifest is not None
+    recorded = manifest.read()
+    total = sum(recorded.programs(kind) for kind in recorded.kinds)
+    ran: list[Any] = []
+    monkeypatch.setattr(ahead, "zeros", lambda tree: ran.append(tree))
+
+    def started(seconds: float | None) -> Worker:
+        later = Worker(slot_bytes=4096)
+        later.add_model(0, tabicl_functions, tiny_tabicl(regression=False))
+        later._specs[0] = "tiny-tabicl"
+        later.allocate(256, 0, 0)
+        later.programs.quiet = 3600.0
+        later.warm_start(seconds=seconds)
+        return later
+
+    # Out of time at once: nothing compiles before steps, all of it ahead.
+    late = started(0.0)
+    assert late.programs.warmed == 0
+    assert len(late.programs._later) == total
+    late.programs.drop()
+    # Zeros past `WARM_RUN_BYTES` are never made: those programs only compile.
+    monkeypatch.setattr(ahead, "WARM_RUN_BYTES", 0)
+    timely = started(None)
+    assert timely.programs.warmed == min(total, ahead.STARTED_PROGRAMS)
+    assert ran == []
+    timely.programs.drop()
+
+
 def test_a_worker_loads_a_model_beside_its_steps_and_reports_it_by_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -384,3 +423,59 @@ def test_a_worker_whose_server_is_gone_exits_quietly():
         )
     assert finished.returncode == 0, finished.stderr
     assert "Traceback" not in finished.stderr, finished.stderr
+
+
+def test_a_fit_profile_is_kept_for_later_processes_unless_unmeasured(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from generalforecast.runtime.memory import Cost, FitProfile
+    from generalforecast.worker import admission
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    measured: list[int] = []
+    # Widths XLA measures, by their costs; any other it cannot measure.
+    costs = {FEATURES: (Cost(1.0, 2.0), Cost(3.0, 4.0))}
+
+    def measure(functions: Any, model: Any, width: int, cache: Any) -> FitProfile:
+        measured.append(width)
+        return FitProfile(width, *costs.get(width, ()))
+
+    def started() -> Worker:
+        worker = Worker()
+        worker.add_model(
+            0, tabicl_functions, tiny_tabicl(regression=False), spec="tiny"
+        )
+        return worker
+
+    monkeypatch.setattr(admission, "fit_profile", measure)
+    expected = FitProfile(FEATURES, *costs[FEATURES])
+    assert started().fit_profile(0, FEATURES) == expected
+    # A later process reads it without measuring.
+    assert started().fit_profile(0, FEATURES) == expected
+    assert measured == [FEATURES]
+
+    # One XLA could not measure is measured again by the next process.
+    wider = FEATURES + 1
+    assert started().fit_profile(0, wider) == FitProfile(wider)
+    started().fit_profile(0, wider)
+    assert measured == [FEATURES, wider, wider]
+
+
+def test_a_fit_profile_kept_before_steps_were_measured_is_measured_again(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from generalforecast.runtime.memory import Cost, FitProfile
+    from generalforecast.worker import admission
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    worker = Worker()
+    worker.add_model(0, tabicl_functions, tiny_tabicl(regression=False), spec="tiny")
+    # As a process kept it before fit profiles measured a step: two costs.
+    old = FitProfile(FEATURES, Cost(1.0, 2.0), Cost(3.0, 4.0))
+    worker.programs.measured(
+        "tiny", ("fit_profile", FEATURES, repr(worker._settings)), lambda: old
+    )
+    fresh = FitProfile(FEATURES, Cost(1.0, 2.0), Cost(3.0, 4.0), Cost(0.0, 5.0))
+    monkeypatch.setattr(admission, "fit_profile", lambda *_: fresh)
+
+    assert worker.fit_profile(0, FEATURES) == fresh

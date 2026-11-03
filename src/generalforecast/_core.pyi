@@ -204,12 +204,28 @@ class Strategy:
         a quarter of the cap plus the nearest rows that fill the rest, the
         neighbors leaning to the newest rows when the table has times.
         """
-    def resolve(self, rows: int, cap: int | None, timed: bool = False) -> Strategy:
+    @staticmethod
+    def adaptive_whole() -> Strategy:
+        """As `adaptive`, but past the cap a table may read whole.
+
+        It does while it holds at most four times a cap of 10,000 rows or
+        more and its worker can hold the whole context on its device, the
+        table's `whole_rows`.
+        """
+    def resolve(
+        self,
+        rows: int,
+        cap: int | None,
+        timed: bool = False,
+        whole: int | None = None,
+    ) -> Strategy:
         """The strategy a table of `rows` live rows plans with.
 
         `cap` is the model's context rows, or None for no cap; `timed` whether
-        the table's rows have times. An adaptive strategy is resolved by the
-        server's rule, any other is itself.
+        the table's rows have times; `whole` the most rows its worker can
+        hold as one context on its device, which `adaptive_whole` reads a
+        table past the cap whole within. An adaptive strategy is resolved by
+        the server's rule, any other is itself.
         """
     @staticmethod
     def subsample(rows: int, seed: int = 0, kind: CoreKind = "random") -> Strategy:
@@ -459,6 +475,7 @@ class Node:
         retrieval_categoricals: Literal["codes", "one_hot", "target"] = "codes",
         unlabeled_context: bool = False,
         fit_bound: int | None = None,
+        whole_rows: int | None = None,
     ) -> int:
         """Adds an empty table and returns its id. `classes` is 0 for regression.
 
@@ -576,6 +593,10 @@ class Node:
         """Tables that came to wait for their fit's rows to be measured, each once."""
     def set_fit_limits(self, table: int, state_rows: int, fused_rows: int) -> None:
         """Sets the rows a table's state alone and a fit with its rows take, as measured."""
+    def wants_whole_rows(self, table: int) -> bool:
+        """Whether a table waits for `set_whole_rows`; see `take_unmeasured`."""
+    def set_whole_rows(self, table: int, rows: int | None) -> None:
+        """Sets the most rows a table's worker can hold as one context, None for none."""
     def effective_fit_rows(self, table: int) -> int:
         """The most rows a table's state is fit on, within the worker's call budget."""
     def region_stats(self, table: int) -> dict[str, float] | None:

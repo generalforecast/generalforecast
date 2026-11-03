@@ -9,10 +9,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
+use std::sync::Arc;
 
 use gf_core::cache::{CacheKey, Movement, SlotId};
 use gf_core::forecasting::{Forecast, Grid, SeriesUnit};
-use gf_core::node::{QueryBatch, Step, SummaryScope, Targets, Unit};
+use gf_core::node::{QueryBatch, RequestId, Step, SummaryScope, Targets, Unit};
 use gf_core::planner::{Core, CoreKind, Recency, Strategy};
 use gf_core::table::{RowId, TableId};
 use serde::{Deserialize, Serialize};
@@ -449,9 +450,19 @@ pub fn movements_json(movements: &[Movement]) -> Value {
     )
 }
 
-/// A step as a frame for a worker.
+/// The quantile levels a regressor's caller asked for, and the levels of the
+/// model's prediction columns: the worker answers with predictions at
+/// `levels` alone, as `quantile_values` would interpolate them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Pick {
+    pub known: Arc<Vec<f64>>,
+    pub levels: Vec<f64>,
+}
+
+/// A step as a frame for a worker; `picks` gives the levels a request's
+/// predictions keep, if its caller named them.
 #[must_use]
-pub fn step_frame(step: &Step) -> Frame {
+pub fn step_frame(step: &Step, picks: &dyn Fn(RequestId) -> Option<Pick>) -> Frame {
     let mut frame = Frame::header(Value::Null);
     let fits: Vec<Value> = step
         .fits()
@@ -513,7 +524,7 @@ pub fn step_frame(step: &Step) -> Frame {
     let queries: Vec<Value> = step
         .queries()
         .iter()
-        .map(|batch| batch_json(&mut frame, batch))
+        .map(|batch| batch_json(&mut frame, batch, picks(batch.request)))
         .collect();
     let series_units: Vec<Value> = step
         .series_units()
@@ -633,15 +644,20 @@ fn unit_json(frame: &mut Frame, unit: &Unit) -> Value {
     })
 }
 
-fn batch_json(frame: &mut Frame, batch: &QueryBatch) -> Value {
-    json!({
+fn batch_json(frame: &mut Frame, batch: &QueryBatch, pick: Option<Pick>) -> Value {
+    let mut value = json!({
         "request": batch.request.0,
         "table": batch.table.0,
         "epoch": batch.epoch.0,
         "count": batch.units.len(),
         "features": frame.push(f32_bytes(&batch.features)),
         "units": batch.units.iter().map(|unit| unit.0).collect::<Vec<_>>(),
-    })
+    });
+    if let Some(pick) = pick {
+        value["known"] = json!(pick.known.as_slice());
+        value["levels"] = json!(pick.levels);
+    }
+    value
 }
 
 /// What the server asks a worker, beside steps, which `step_frame` builds
@@ -662,10 +678,13 @@ pub enum WorkerRequest {
         features: usize,
     },
     /// How many rows a model's fit takes within the worker's call budget,
-    /// for a table of `features` columns.
+    /// for a table of `features` columns, and with `whole`, how many it can
+    /// hold as one context on its device.
     FitLimits {
         model: String,
         features: usize,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        whole: bool,
     },
     /// Loads a model the worker did not start with, under `name`, from its
     /// spec, beside the worker's steps: the worker answers `Loading` at
@@ -772,6 +791,10 @@ pub enum WorkerReply {
     FitLimits {
         state_rows: Option<u64>,
         fused_rows: Option<u64>,
+        /// The most rows the worker can hold as one context on its device,
+        /// when asked; None where it can hold none or was not asked.
+        #[serde(default)]
+        whole_rows: Option<u64>,
     },
     Ok,
     /// A check the model refuses.
@@ -1119,6 +1142,9 @@ pub enum StrategySpec {
     Exact,
     /// Exact up to the model's cap, retrieved past it; see `Strategy::Adaptive`.
     Adaptive,
+    /// As `Adaptive`, reading a table past the cap whole while the worker can
+    /// hold it; see `Strategy::AdaptiveWhole`.
+    AdaptiveWhole,
     Retrieved {
         #[serde(default)]
         core: Option<CoreSpec>,
@@ -1190,6 +1216,7 @@ impl StrategySpec {
         match *self {
             Self::Exact => Strategy::Exact,
             Self::Adaptive => Strategy::Adaptive,
+            Self::AdaptiveWhole => Strategy::AdaptiveWhole,
             Self::Retrieved {
                 core,
                 neighbors,
@@ -1219,6 +1246,7 @@ impl StrategySpec {
         match strategy {
             Strategy::Exact => Self::Exact,
             Strategy::Adaptive => Self::Adaptive,
+            Strategy::AdaptiveWhole => Self::AdaptiveWhole,
             Strategy::Retrieved {
                 core,
                 neighbors,

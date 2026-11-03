@@ -69,7 +69,13 @@ impl Shard {
         }
         self.metrics.step_tables.add(tables.len() as u64);
         self.report_cache();
-        match self.worker.pipeline.send(&step_frame(&step)).await {
+        let picks = |request| {
+            self.pending
+                .get(&request)
+                .and_then(|pending| pending.pick.clone())
+        };
+        let frame = step_frame(&step, &picks);
+        match self.worker.pipeline.send(&frame).await {
             Ok(reply) => {
                 self.in_flight.push_back(InFlight {
                     step,

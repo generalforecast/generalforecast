@@ -74,8 +74,8 @@ use crate::metrics::{Metrics, TableMetrics, Timing};
 use crate::name::TableName;
 use crate::partition::{self, Given, ModelRows, Offer};
 use crate::protocol::{
-    ModelProfile, Outcome, Predictions, StrategySpec, WorkerReply, WorkerRequest, movements_json,
-    outcome_from, step_frame,
+    ModelProfile, Outcome, Pick, Predictions, StrategySpec, WorkerReply, WorkerRequest,
+    movements_json, outcome_from, step_frame,
 };
 use crate::routes::Routes;
 use crate::wal::{
@@ -200,6 +200,9 @@ struct Pending {
     table: TableId,
     bytes: u64,
     arrived: Instant,
+    /// The levels the worker keeps of a regressor's predictions, if the
+    /// caller named them.
+    pick: Option<Pick>,
 }
 
 /// A query a table took, before its caller waits on it: its id, table and
@@ -554,6 +557,9 @@ pub enum Command {
         given: Option<Vec<Vec<u128>>>,
         /// The request's trace id, for the log line of the step it runs in.
         trace: String,
+        /// The levels a regressor's predictions keep, which the worker
+        /// interpolates; every column if None.
+        pick: Option<Pick>,
         reply: Reply<Predictions>,
     },
     /// Forecasts series of a table of series over `horizon` steps, each from
@@ -680,6 +686,9 @@ pub enum Command {
         context: Box<RequestContext>,
         asked: Asked,
         trace: String,
+        /// Increasing levels a regressor's answer keeps, which the worker
+        /// interpolates and the answer's `levels` then are; every column if None.
+        pick: Option<Vec<f64>>,
         reply: Reply<Inferred>,
     },
     /// The models the worker serves, by name.
@@ -967,6 +976,9 @@ pub struct Shard {
     /// How many rows the worker's fits take, by model and feature count:
     /// the most a state alone is fit on, and the most a fit embeds.
     fit_limits: HashMap<(String, usize), (usize, usize)>,
+    /// The most rows the worker can hold as one context, by model and
+    /// feature count, as `measure_fits` asked it for `adaptive_whole` tables.
+    whole_limits: HashMap<(String, usize), Option<u64>>,
     key: EncryptionKey,
     directory: PathBuf,
     bucket_minimum: NonZeroUsize,
@@ -1056,6 +1068,7 @@ impl Shard {
             names: HashMap::new(),
             profiles: HashMap::new(),
             fit_limits: HashMap::new(),
+            whole_limits: HashMap::new(),
             key,
             directory,
             bucket_minimum: NonZeroUsize::new(memory.bucket_minimum)
@@ -1590,11 +1603,25 @@ impl Shard {
                 context,
                 asked,
                 trace,
+                pick,
                 reply,
             } => match self.infer(*context, asked).await {
                 Ok((submitted, levels)) => {
+                    let request = submitted.request;
                     let (answered, answer) = oneshot::channel();
                     self.queue_pending(submitted, answered, trace);
+                    let levels = match (pick, levels) {
+                        (Some(picked), Some(known)) => {
+                            if let Some(pending) = self.pending.get_mut(&request) {
+                                pending.pick = Some(Pick {
+                                    known: Arc::new(known.clone()),
+                                    levels: picked.clone(),
+                                });
+                            }
+                            Levels::Picked { known, picked }
+                        }
+                        (_, levels) => Levels::Known(levels),
+                    };
                     // A caller that goes away closes the queued reply, so the
                     // abandoned query leaves the queue as a prediction's does.
                     tokio::spawn(relay(answer, reply, levels));
@@ -1637,12 +1664,19 @@ impl Shard {
                 before,
                 given,
                 trace,
+                pick,
                 reply,
             } => {
                 let resolved = self.resolve(&table, &mut features, &strings);
                 let submitted =
                     resolved.and_then(|()| self.submit(&table, features, before, given));
+                let request = submitted.as_ref().ok().map(|submitted| submitted.request);
                 self.admit(submitted, reply, trace);
+                if let (Some(request), Some(pick)) = (request, pick)
+                    && let Some(pending) = self.pending.get_mut(&request)
+                {
+                    pending.pick = Some(pick);
+                }
             }
         }
     }
@@ -1892,17 +1926,37 @@ impl Shard {
 
 /// Passes a request context's predictions on with its table's levels, or
 /// stops waiting once the caller goes away, which closes the queued reply.
+/// The levels of an answer's columns: the table's own, or those the worker
+/// was asked to pick, which it answers with unless it kept every column.
+enum Levels {
+    Known(Option<Vec<f64>>),
+    Picked { known: Vec<f64>, picked: Vec<f64> },
+}
+
+impl Levels {
+    fn of(self, columns: usize) -> Option<Vec<f64>> {
+        match self {
+            Self::Known(levels) => levels,
+            Self::Picked { picked, .. } if picked.len() == columns => Some(picked),
+            Self::Picked { known, .. } => Some(known),
+        }
+    }
+}
+
 async fn relay(
     answer: oneshot::Receiver<Result<Predictions, ServerError>>,
     reply: Reply<Inferred>,
-    levels: Option<Vec<f64>>,
+    levels: Levels,
 ) {
     let mut reply = reply;
     tokio::select! {
         answered = answer => {
             let answered = answered
                 .unwrap_or_else(|_| Err(ServerError::Unavailable("the shard has stopped".to_string())));
-            let _ = reply.send(answered.map(|predictions| Inferred { predictions, levels }));
+            let _ = reply.send(answered.map(|predictions| {
+                let levels = levels.of(predictions.columns);
+                Inferred { predictions, levels }
+            }));
         }
         () = reply.closed() => {}
     }

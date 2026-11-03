@@ -271,8 +271,14 @@ def paged_inputs(
     blocks = np.zeros((count, shape.blocks, per_row), dtype=np.int32)
     positions = np.zeros((count, shape.context_rows), dtype=np.int32)
     counts = np.zeros(count, dtype=np.int32)
-    # The query rows stay on the device, where the embed left them.
-    rows = jnp.stack(padded([_padded(d.rows, shape.queries) for d in chunk], count))
+    # The query rows stay on the device, where the embed left them; features
+    # a decode embeds itself stack on the host and go with the call.
+    if all(isinstance(d.rows, np.ndarray) for d in chunk):
+        rows = np.stack(
+            padded([_host_rows(d.rows, shape.queries) for d in chunk], count)
+        )
+    else:
+        rows = jnp.stack(padded([_padded(d.rows, shape.queries) for d in chunk], count))
     # Which rows each query reads, when any decoding says; padding rows read
     # every row. Queries by rows, so only a masked call builds it.
     masked = (count, shape.queries, shape.context_rows) if shape.masked else (0, 0, 0)
@@ -389,6 +395,8 @@ def query_rows(rows: jax.Array, queries: list[int], size: int) -> jax.Array:
     """
     index = np.full(size, queries[-1], dtype=np.int32)
     index[: len(queries)] = queries
+    if isinstance(rows, np.ndarray):
+        return rows[index]
     return _taken(rows, index)
 
 
@@ -396,6 +404,15 @@ def query_rows(rows: jax.Array, queries: list[int], size: int) -> jax.Array:
 def _taken(rows: jax.Array, index: np.ndarray) -> jax.Array:
     """`rows[index]`, in one dispatch."""
     return rows[index]
+
+
+def _host_rows(rows: np.ndarray, size: int) -> np.ndarray:
+    """Host rows padded with zeros to `size`, as `_padded` pads device rows."""
+    if len(rows) == size:
+        return rows
+    out = np.zeros((size, *rows.shape[1:]), dtype=rows.dtype)
+    out[: len(rows)] = rows
+    return out
 
 
 # Rows padded in one dispatch, compiled once per pair of bucketed sizes.

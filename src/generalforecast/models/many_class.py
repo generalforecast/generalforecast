@@ -234,6 +234,7 @@ def many_class_functions(functions: TabularFunctions) -> TabularFunctions:
             context_features=inner.context_features,
             column_summary=inner.column_summary,
             unlabeled_context=inner.unlabeled_context,
+            padded_width=inner.padded_width,
         )
 
     return TabularFunctions(

@@ -514,3 +514,30 @@ def test_a_fused_unit_predicts_as_its_rows_fit_and_encoded_apart(
         functions, model, jnp.asarray(features), jnp.asarray(targets), data.queries
     )
     _close(predicted, expected)
+
+
+def test_constant_columns_after_a_tables_own_leave_predictions_alone(
+    case: Case, functions: TabularFunctions, model: Any
+) -> None:
+    """Why the built-in models pad widths: each sets constant columns aside, so a table padded with them predicts as it would unpadded.
+
+    An ensemble orders its estimators' columns by the width, so it does not.
+    """
+    data = table(case.regression, rows=40, queries=12)
+
+    def predicted(padding: int) -> jax.Array:
+        features = np.pad(np.asarray(data.features), ((0, 0), (0, padding)))
+        queries = np.pad(np.asarray(data.queries), ((0, 0), (0, padding)))
+        padded = data._replace(
+            features=jnp.asarray(features), queries=jnp.asarray(queries)
+        )
+        return predict(
+            functions, model, padded, categorical=jnp.zeros(features.shape[1], bool)
+        )
+
+    unpadded = predicted(0)
+    if case.name.startswith("ensemble"):
+        assert not functions.properties(model).padded_width
+        return
+    for padding in (1, 3, 11):
+        _close(predicted(padding), unpadded)

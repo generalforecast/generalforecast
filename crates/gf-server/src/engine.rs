@@ -30,6 +30,7 @@ use crate::error::ServerError;
 use crate::http::ApiError;
 use crate::name::TableName;
 use crate::predictors::ServedPredictor;
+use crate::protocol::Pick;
 use crate::routes::{Busy, Routes};
 use crate::shard::{Asked, Command, Fence, Incoming, Inferred, RequestContext, Write};
 use crate::wal::{Rows, Terms};
@@ -138,6 +139,7 @@ impl Engine {
                 context,
                 Asked::Rows(request.queries.clone()),
                 &request.fingerprint,
+                None,
             )
             .await;
         drop(charge);
@@ -250,15 +252,17 @@ impl Engine {
             horizon,
             groups: Some(vec![(0..targets.len() as u64).collect(); count]),
         };
-        self.ask(context, asked, fingerprint).await
+        self.ask(context, asked, fingerprint, None).await
     }
 
-    /// Asks the shard `Routes` gives a context for an answer against it.
+    /// Asks the shard `Routes` gives a context for an answer against it;
+    /// a regressor's answer keeps only the increasing levels `pick` names.
     pub async fn ask(
         &self,
         context: RequestContext,
         asked: Asked,
         fingerprint: &[u8; 32],
+        pick: Option<Vec<f64>>,
     ) -> Result<Inferred, ApiError> {
         let shard = match self.pinned {
             Some(shard) => self.routes.shard(shard),
@@ -269,18 +273,26 @@ impl Engine {
             context: Box::new(context),
             asked,
             trace: String::new(),
+            pick,
             reply,
         };
         self.wait(shard, command, answer).await
     }
 
-    /// Predicts encoded queries from a snapshot predictor's durable table.
-    pub async fn predicted(&self, bound: &Bound, features: Vec<f32>) -> Result<Inferred, ApiError> {
+    /// Predicts encoded queries from a snapshot predictor's durable table; a
+    /// regressor's answer keeps only the increasing levels `pick` names.
+    pub async fn predicted(
+        &self,
+        bound: &Bound,
+        features: Vec<f32>,
+        pick: Option<Vec<f64>>,
+    ) -> Result<Inferred, ApiError> {
         self.predict_bound(
             &bound.table,
             &bound.fingerprint,
             features,
             bound.levels.clone(),
+            pick,
         )
         .await
     }
@@ -293,9 +305,15 @@ impl Engine {
         fingerprint: &[u8; 32],
         features: Vec<f32>,
         levels: Option<Vec<f64>>,
+        pick: Option<Vec<f64>>,
     ) -> Result<Inferred, ApiError> {
         let shard = self.durable(fingerprint);
         let (reply, answer) = oneshot::channel();
+        let pick = pick.zip(levels.clone()).map(|(picked, known)| Pick {
+            known: Arc::new(known),
+            levels: picked,
+        });
+        let picked = pick.as_ref().map(|pick| pick.levels.clone());
         let command = Command::Predict {
             table: table.clone(),
             features,
@@ -303,9 +321,15 @@ impl Engine {
             before: None,
             given: None,
             trace: String::new(),
+            pick,
             reply,
         };
         let predictions = self.wait(self.routes.shard(shard), command, answer).await?;
+        // A worker that took the levels answers with their columns alone.
+        let levels = match picked {
+            Some(picked) if picked.len() == predictions.columns => Some(picked),
+            _ => levels,
+        };
         Ok(Inferred {
             predictions,
             levels,

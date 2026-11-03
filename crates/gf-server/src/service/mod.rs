@@ -86,7 +86,7 @@ pub use crate::error::exists;
 use crate::metrics::{Histogram, Metrics};
 use crate::name::TableName;
 use crate::partition;
-use crate::protocol::{Predictions, StrategySpec};
+use crate::protocol::{Pick, Predictions, StrategySpec};
 use crate::quantiles::{self, quantile_values};
 use crate::shard::{
     Command, Description, Fence, Incoming, KnownFuture, Lease, Lineage, LogLength, Write,

@@ -29,6 +29,15 @@ SCATTER_ROWS = 4096
 # scatter's share of a step barely shrinks and workers sharing a host's cores
 # would contend for them.
 SCATTER_THREADS = 8
+# Queries a decode pads to one bucket whatever it wastes; a batch past it
+# splits where padding would waste more than `SPLIT_WASTE` of its queries.
+# Below it a call leaves the device short of work, so padding costs little.
+SPLIT_QUERIES = 4096
+SPLIT_WASTE = 1 / 8
+# Single-table decode calls whose stacked state a worker keeps for the next
+# step, so a warm step skips stacking the state on the device. Each holds a
+# copy of its table's state.
+HELD_STATES = 4
 # Items a device stack takes in one program. A stack's compile grows faster
 # than its items, about 14 s at 2,048 on a CPU, so a larger stack joins
 # stacks of this many, which compile in a tenth of that and run as fast.
@@ -89,6 +98,13 @@ MAPPINGS_SHORT = 3 / 4
 # only up to `WARM_RUN_ROWS` rows, and past that only compiles them.
 TABLE_STAGES = frozenset({"fit", "state", "encode"})
 WARM_RUN_ROWS = 1024
+# The most bytes of zeros a warm start runs a program on. A paged decode
+# reads the device pool, and zeros the pool's size are a second pool, which
+# the device holding the first cannot take; past this it only compiles.
+WARM_RUN_BYTES = 256 << 20
+# Programs a warm start compiles at once: compiles are mostly host work, and
+# a machine of a few cores takes about this many side by side.
+WARM_COMPILES = 4
 # Page counts a table's embeds compile for once it is fit, this many buckets
 # from one page: a write changes one page or a few.
 WARMED_PAGES = 4

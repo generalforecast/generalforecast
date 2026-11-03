@@ -62,7 +62,7 @@ from generalforecast.runtime.programs import Programs
 from generalforecast.runtime.series import SeriesBytes
 from generalforecast.system import usable_cpus
 from generalforecast.worker.admission import Admission
-from generalforecast.worker.ahead import Ahead, _manifests
+from generalforecast.worker.ahead import Ahead, _manifests, _shipped_measures
 from generalforecast.worker.calls import Calls, _item, _only_item, _stack_columns
 from generalforecast.worker.decodes import Decodes
 from generalforecast.worker.encoding import Encoding
@@ -107,6 +107,19 @@ def _tables(step: protocol.Step) -> list[int]:
     tables += [batch.table for batch in step.queries]
     tables += [unit.table for unit in step.series_units]
     return list(dict.fromkeys(tables))
+
+
+def _replaced(record: Any, **changes: Any) -> Any:
+    """A step record with `changes`: the protocol's own record, as the native node's are rebuilt."""
+    if dataclasses.is_dataclass(record):
+        return dataclasses.replace(record, **changes)
+    kind = getattr(protocol, type(record).__name__)
+    fields = {
+        field.name: getattr(record, field.name)
+        for field in dataclasses.fields(kind)
+        if hasattr(record, field.name)
+    }
+    return kind(**(fields | changes))
 
 
 def _part(step: protocol.Step, table: int) -> protocol.Step:
@@ -228,6 +241,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
             ),
             ahead=compile_ahead,
             manifests=self._manifest_dir,
+            shipped=_shipped_measures(bucket_minimum, slot_bytes),
             dropped=self._chunks.forget_counts,
         )
         self._models: dict[int, _Model] = {}
@@ -437,6 +451,8 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         if any(not 0 <= column < features for column in categorical):
             raise ValueError(f"categorical columns must be in 0 .. {features - 1}")
         check_summary(self.properties(model), summary)
+        # Steps pad the table's rows and queries to this width (`_widened`).
+        features = self.width(model, features)
         self.programs.add_shape((model, num_classes, features))
         self._remember(model, ("width", features))
         self.layout(model, features)
@@ -477,7 +493,42 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         with self.stats.timed("move"):
             for movement in step.movements:
                 self.apply(movement)
-        return self._counted(step)
+        return self._counted(self._widened(step))
+
+    def _widened(self, step: Step) -> Step:
+        """The step with each table's rows and queries padded to the table's width with constant columns, which its model sets aside.
+
+        A step from the native node is rebuilt as the protocol's records.
+        """
+
+        def wide(item: Any) -> Any:
+            features = item.features
+            if features is None:
+                return item
+            width = self._tables[item.table].features
+            if features.shape[-1] >= width:
+                return item
+            padding = [(0, 0)] * (features.ndim - 1) + [(0, width - features.shape[-1])]
+            return _replaced(item, features=np.pad(features, padding))
+
+        def narrow(items: Sequence[Any]) -> bool:
+            return any(
+                item.features is not None
+                and item.features.shape[-1] < self._tables[item.table].features
+                for item in items
+            )
+
+        if not any(
+            narrow(items) for items in (step.fits, step.pages, step.units, step.queries)
+        ):
+            return step
+        return _replaced(
+            step,
+            fits=[wide(item) for item in step.fits],
+            pages=[wide(item) for item in step.pages],
+            units=[wide(item) for item in step.units],
+            queries=[wide(item) for item in step.queries],
+        )
 
     def run_apart(
         self, step: protocol.Step
@@ -499,6 +550,8 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         with self.stats.timed("move"):
             for movement in step.movements:
                 self.apply(movement)
+        # A protocol step widens to a protocol step.
+        step = cast(protocol.Step, self._widened(step))
         try:
             return self._counted(step), {}
         except PoolLost:
@@ -565,4 +618,14 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         predictions = self._decode(reads, step.units, transient)
         predictions.update(self._decode_fused(alone, step.units))
         predictions.update(self._forecast(step.series_units, step.forecasts))
+        for batch in step.queries:
+            # Only the server's batches carry levels; the native node's never do.
+            known = getattr(batch, "known", None)
+            levels = getattr(batch, "levels", None)
+            if known is not None and levels is not None:
+                values = predictions.get(batch.request)
+                if values is not None and values.ndim == 2:
+                    predictions[batch.request] = protocol.at_levels(
+                        values, known, levels
+                    )
         return predictions

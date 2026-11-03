@@ -419,6 +419,12 @@ pub struct TableSpec {
     pub fit_rows: NonZeroUsize,
     /// The most context rows the model was trained on, if it says.
     pub context_rows: Option<NonZeroU64>,
+    /// The most rows the table's worker can hold as one context on its
+    /// device, which `Strategy::AdaptiveWhole` reads a table past the cap
+    /// whole within: None until the worker is asked, which an
+    /// `AdaptiveWhole` table past the cap waits for (see
+    /// `Node::take_unmeasured`), and `Some(None)` where it can hold none.
+    pub whole_rows: Option<Option<NonZeroU64>>,
     /// What a context past `context_rows` does.
     pub past_cap: PastCap,
     /// Regions whose queries share a context, rebuilt on churn; without

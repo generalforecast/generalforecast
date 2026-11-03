@@ -64,6 +64,12 @@ class TabularProperties:
             masks a non-finite target in any row. A masked context row asks
             of them what they were not trained on. Otherwise such rows stay
             out of fits and contexts until they are labeled.
+        padded_width: Whether constant columns after a table's own leave its
+            predictions alone, as for a model that sets constant columns
+            aside. The engine then pads a table's width to one of a few
+            shared widths, so tables of nearby widths share their programs
+            and measures. An ensemble that orders columns by the width does
+            not.
     """
 
     regression: bool
@@ -76,6 +82,7 @@ class TabularProperties:
     context_features: int | None = None
     context_classes: int | None = None
     column_summary: bool = False
+    padded_width: bool = False
 
 
 class Fit(Protocol):

@@ -264,6 +264,7 @@ fn a_steps_series_units_and_forecasts_travel_as_grids() {
             refit: RefitPolicy::default(),
             fit_rows: NonZeroUsize::new(DEFAULT_FIT_ROWS).unwrap(),
             context_rows: None,
+            whole_rows: None,
             past_cap: PastCap::Warn,
             regions: None,
             scale_rows: None,
@@ -313,7 +314,7 @@ fn a_steps_series_units_and_forecasts_travel_as_grids() {
         .unwrap();
     let step = node.schedule().unwrap().expect("a step");
 
-    let frame = step_frame(&step);
+    let frame = step_frame(&step, &|_| None);
 
     let unit = &frame.header["series_units"][0];
     assert_eq!(unit["members"], json!(["7"]));
@@ -337,4 +338,83 @@ fn a_steps_series_units_and_forecasts_travel_as_grids() {
     assert_eq!(forecast["rows"], 0);
     let future = &frame.buffers[forecast["values"].as_u64().unwrap() as usize];
     assert!(future.is_empty());
+}
+
+#[test]
+fn a_query_batch_carries_the_levels_its_caller_asked_and_others_do_not() {
+    use std::num::{NonZeroU64, NonZeroUsize};
+    use std::sync::Arc;
+
+    use gf_core::cache::{ModelId, TierConfig};
+    use gf_core::categories::CategoryEncoding;
+    use gf_core::node::{
+        DEFAULT_FIT_ROWS, EntrySizes, Node, PastCap, RefitPolicy, SummaryScope, TableSpec, Targets,
+        Task,
+    };
+    use gf_server::protocol::{Pick, step_frame};
+
+    let tier = |slots| TierConfig {
+        slot_bytes: NonZeroU64::new(4096).unwrap(),
+        slots,
+    };
+    let mut node = Node::new(tier(64), tier(64)).unwrap();
+    let table = node
+        .create_table(TableSpec {
+            model: ModelId(0),
+            features: 2,
+            unlabeled_context: false,
+            task: Task::Values,
+            page_size: NonZeroUsize::new(128).unwrap(),
+            strategy: Strategy::Exact,
+            sizes: EntrySizes {
+                bytes_per_row: 4,
+                bytes_per_representation: 0,
+                state_bytes: 0,
+                bucket_minimum: NonZeroUsize::new(1).unwrap(),
+                state_rows: usize::MAX,
+                fused_rows: usize::MAX,
+                fit_bound: usize::MAX,
+            },
+            time_bucket: None,
+            refit: RefitPolicy::default(),
+            fit_rows: NonZeroUsize::new(DEFAULT_FIT_ROWS).unwrap(),
+            context_rows: None,
+            whole_rows: None,
+            past_cap: PastCap::Warn,
+            regions: None,
+            scale_rows: None,
+            retrieval: 0,
+            categorical: Vec::new(),
+            categories: CategoryEncoding::Codes,
+            summary: SummaryScope::Table,
+            series: None,
+        })
+        .unwrap();
+    node.insert(
+        table,
+        &[1, 2, 3],
+        &[0.0, 1.0, 2.0, 3.0, 4.0, 5.0],
+        Targets::Values(vec![1.0, 2.0, 3.0]),
+    )
+    .unwrap();
+    let asked = node.submit(table, &[0.5, 0.5]).unwrap();
+    let plain = node.submit(table, &[1.5, 1.5]).unwrap();
+    let step = node.schedule().unwrap().expect("a step");
+    let pick = Pick {
+        known: Arc::new(vec![0.25, 0.5, 0.75]),
+        levels: vec![0.9, 0.1],
+    };
+
+    let frame = step_frame(&step, &|request| (request == asked).then(|| pick.clone()));
+
+    let queries = frame.header["queries"].as_array().unwrap();
+    let batch = |request: gf_core::node::RequestId| {
+        queries
+            .iter()
+            .find(|batch| batch["request"] == json!(request.0))
+            .expect("the request's batch")
+    };
+    assert_eq!(batch(asked)["known"], json!([0.25, 0.5, 0.75]));
+    assert_eq!(batch(asked)["levels"], json!([0.9, 0.1]));
+    assert!(batch(plain).get("levels").is_none() && batch(plain).get("known").is_none());
 }

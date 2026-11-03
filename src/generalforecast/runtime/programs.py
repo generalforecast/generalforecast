@@ -33,10 +33,43 @@ from generalforecast.system import mappings_short
 
 logger = logging.getLogger(__name__)
 
+# How a paged decode compiles on a GPU: without autotuning, which took 40%
+# of its compile and moved no decode's time on an H100 (TabICL v2, 1,024 to
+# 8,192 queries: 3.6 s against 6.1 s to compile; 5.1, 11.1 and 20.7 ms to
+# run either way), so a step that meets a new query count waits less.
+DECODE_OPTIONS = {"xla_gpu_autotune_level": 0}
+
 
 def ladder(first: int, count: int) -> list[int]:
     """`count` padded sizes from `first`, a padded size, each double the last, as buckets are."""
     return [first << step for step in range(count)]
+
+
+# Widths up to this many columns compile as they are; wider tables pad to
+# one of `WIDTH_STEPS` widths an octave, so a table pads by at most a quarter.
+EXACT_WIDTHS = 8
+WIDTH_STEPS = 4
+# Set to `0` to compile every width as it is.
+PADDED_WIDTHS_ENV = "GF_PADDED_WIDTHS"
+
+
+def padded_width(features: int) -> int:
+    """The width a table of `features` columns compiles at, for a model whose properties allow padding it.
+
+    Tables of nearby widths then share their programs and measures: 17 to
+    20 columns compile at 20, 21 to 24 at 24. `GF_PADDED_WIDTHS=0` keeps
+    every width as it is.
+    """
+    if features <= EXACT_WIDTHS or os.environ.get(PADDED_WIDTHS_ENV) == "0":
+        return features
+    octave = 1 << ((features - 1).bit_length() - 1)
+    step = octave // WIDTH_STEPS
+    return -(-features // step) * step
+
+
+def _digest(model: str) -> str:
+    """A model spec's file name among manifests: its digest."""
+    return hashlib.sha256(model.encode()).hexdigest()[:32]
 
 
 def counts_up_to(counts: Iterable[int]) -> list[int]:
@@ -220,6 +253,12 @@ def zeros(tree: Any) -> Any | None:
     return jax.tree.unflatten(structure, [zero(leaf) for leaf in leaves])
 
 
+def _options_for(key: Hashable) -> dict[str, Any] | None:
+    """The compiler options a program under `key` compiles with: `DECODE_OPTIONS` for a paged decode on a GPU, else XLA's own."""
+    paged = isinstance(key, tuple) and bool(key) and key[0] == "paged"
+    return DECODE_OPTIONS if paged and jax.default_backend() == "gpu" else None
+
+
 def _compile(function: Callable[..., Any], arguments: tuple) -> None:
     """Compiles a function for these arguments, or their shapes, keeping its program's FLOPs."""
     jitted = cast(jax.stages.Wrapped, function)
@@ -396,6 +435,7 @@ class Programs:
         manifests: Path | None = None,
         short_of_mappings: Callable[[], bool] = mappings_short,
         dropped: Callable[[], None] | None = None,
+        shipped: Path | None = None,
     ) -> None:
         """Sets up with nothing compiled.
 
@@ -412,6 +452,10 @@ class Programs:
                 mappings it may, asked at each new shape.
             dropped: Called once every program is dropped, to forget what
                 held for them, such as the counts a kind has programs for.
+            shipped: A directory of measures shipped with the package or
+                image for these programs, laid out as `manifests` is, if
+                any: a model's measures it holds are read under those this
+                machine measured, so they compile nothing to take them.
         """
         self._settings = settings
         self._short_of_memory = short_of_memory
@@ -451,6 +495,7 @@ class Programs:
         # programs were not what held them.
         self._mappings_futile = False
         self._manifests = manifests
+        self._shipped = shipped
         # Kinds and counts recorded by this process, which need no rewrite.
         self._recorded: set[tuple[str, Hashable, int]] = set()
         # Each model's measures, by spec and key, as read from its manifest.
@@ -478,7 +523,8 @@ class Programs:
         function = build()
         if self._settings is not None:
             function = with_precision(function, self._settings.matmul_precision)
-        compiled = jax.jit(function)
+        options = _options_for(key)
+        compiled = jax.jit(function, compiler_options=options)
         with self._lock:
             return self._compiled.setdefault(key, compiled)
 
@@ -486,8 +532,7 @@ class Programs:
         """Where a model's kinds of call are recorded, under a name of its spec's digest; None without manifests."""
         if self._manifests is None:
             return None
-        digest = hashlib.sha256(model.encode()).hexdigest()[:32]
-        return Manifest(self._manifests / f"{digest}.json")
+        return Manifest(self._manifests / f"{_digest(model)}.json")
 
     def remember(self, model: str, kind: Kind, count: int) -> None:
         """Records that a model's kind of call ran at `count` items, for later processes to compile at start.
@@ -526,20 +571,24 @@ class Programs:
 
         Measures follow from the model, its shapes and the device alone, so a
         later process reads them rather than compiling programs to take them
-        again. Without manifests, `measure` runs each time.
+        again. Shipped measures are read first, then this machine's over
+        them. Without manifests, a measure shipped for the key is read and
+        any other runs each time.
         """
         manifest = self.manifest(model)
-        if manifest is None:
-            return measure()
         with self._lock:
             kept = self._measures.get(model)
         if kept is None:
-            kept = manifest.measured()
+            kept = self.shipped_measures(model)
+            if manifest is not None:
+                kept |= manifest.measured()
             with self._lock:
                 kept = self._measures.setdefault(model, kept)
         if key in kept:
             return kept[key]
         value = measure()
+        if manifest is None:
+            return value
         with self._lock:
             kept[key] = value
         try:
@@ -547,6 +596,12 @@ class Programs:
         except OSError as error:
             logger.warning("cannot keep a measure: %s", error)
         return value
+
+    def shipped_measures(self, model: str) -> dict[Hashable, Any]:
+        """A model's measures shipped for these programs, by key; empty without any."""
+        if self._shipped is None:
+            return {}
+        return Manifest(self._shipped / f"{_digest(model)}.json").measured()
 
     def recorded(self, model: str) -> Recorded:
         """What a model compiled for and served in earlier processes."""

@@ -37,6 +37,7 @@ from generalforecast.runtime.memory import (
     memory_profile,
 )
 from generalforecast.runtime.paging import CacheLayout, cache_layout
+from generalforecast.runtime.programs import padded_width
 from generalforecast.runtime.series import (
     SeriesBytes,
     abstract_group,
@@ -50,12 +51,29 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The most rows `Admission.whole_rows` searches up to.
+WHOLE_ROWS_LIMIT = 1 << 26
+
+
+class _Unmeasured(Exception):
+    """A fit profile XLA could not measure, which is not kept."""
+
 
 class Admission:
     """How a worker measures its models and refuses work past its memory."""
 
+    def width(self: "Worker", model: int, features: int) -> int:
+        """The width a loaded model runs a table of `features` columns at: padded to a shared width where its properties allow.
+
+        A padded width is its own, so the width of a width is itself.
+        """
+        if not self.properties(model).padded_width:
+            return features
+        return padded_width(features)
+
     def profile(self: "Worker", model: int, features: int) -> MemoryProfile:
         """A loaded model's sizes for tables with `features` columns, as stored."""
+        features = self.width(model, features)
         entry = self._tabular(model)
         cache_dtype = None if self._settings is None else self._settings.cache_dtype
         return self._profiles.get(
@@ -242,14 +260,35 @@ class Admission:
         return self._encode_bytes.get((model, fit, features, rows), measure)
 
     def fit_profile(self: "Worker", model: int, features: int) -> FitProfile:
-        """What a loaded model's fit takes for tables with `features` columns, measured once."""
+        """What a loaded model's fit takes for tables with `features` columns, measured once.
+
+        Kept with the model's other measures, so a later process reads it
+        without tracing the four fits it measures.
+        """
         entry = self._tabular(model)
-        return self._fit_profiles.get(
-            (model, features),
-            lambda: fit_profile(
+        unmeasured = FitProfile(features)
+
+        def measure() -> FitProfile:
+            profile = fit_profile(
                 entry.functions, entry.parameters, features, self._fit_cache
-            ),
-        )
+            )
+            # A fit XLA could not measure is not kept for later processes,
+            # which measure it again.
+            if profile == unmeasured:
+                raise _Unmeasured
+            return profile
+
+        def kept() -> FitProfile:
+            try:
+                # Keyed apart from fit profiles kept before they measured a
+                # step, which would read with none and size steps by the
+                # fused fit; those read as absent, and are measured again.
+                key = ("fit_profile", features, "step")
+                return self._measured(model, key, measure)
+            except _Unmeasured:
+                return unmeasured
+
+        return self._fit_profiles.get((model, features), kept)
 
     def fit_rows(self: "Worker", model: int, features: int) -> tuple[int, int]:
         """The most rows a fit takes within the call budget, for tables with `features` columns.
@@ -264,7 +303,7 @@ class Admission:
             The most rows a state alone is fit on, and the most a fit embeds
             in the call that fits its state; `sys.maxsize` for any.
         """
-        profile = self.fit_profile(model, features)
+        profile = self.fit_profile(model, self.width(model, features))
         return (
             self._padded_floor(profile.state_rows(self._call_bytes)),
             self._padded_floor(profile.fused_rows(self._call_bytes)),
@@ -284,6 +323,7 @@ class Admission:
         Returns:
             The rows, a padded size or none.
         """
+        features = self.width(model, features)
         rows = self.profile(model, features).row_bytes
         per_row = FIT_CELL_BYTES * (features + 4) + FIT_ROW_SCALE * rows
         return self._padded_floor(self._call_bytes // per_row)
@@ -314,6 +354,7 @@ class Admission:
             ValueError: If the model refuses such a table, so it is refused
                 when created rather than at its first fit.
         """
+        features = self.width(model, features)
         size = self._size(1)
 
         def check() -> bool:
@@ -343,6 +384,7 @@ class Admission:
         Raises:
             ValueError: If a slot cannot hold one of the model's context rows.
         """
+        features = self.width(model, features)
         entry = self._tabular(model)
         cache_dtype = None if self._settings is None else self._settings.cache_dtype
         return self._layouts.get(
@@ -441,6 +483,8 @@ class Admission:
         """
         if self.budget.cpu or not self._pool_bytes:
             return None
+        # As the table's steps run: at its padded width.
+        features = self.width(model, features)
         per_row = self.profile(model, features).cache_bytes_per_row
         layout = self.layout(model, features)
         decode = self.decode_profile(model)
@@ -468,6 +512,55 @@ class Admission:
                 return size
             size = larger
         return None
+
+    def whole_rows(self: "Worker", model: int, features: int) -> int | None:
+        """The most rows this worker can hold as one kept context on its device.
+
+        A context of them fits the device pool, so it stays cached for every
+        query that reads it, and its encode, or its decode of the smallest
+        chunk of queries, fits beside the pool, with the autotuner's headroom,
+        as `_fits_device` holds a unit to. An `adaptive_whole` table past its
+        model's cap reads whole within it. None where the model's encode
+        cannot be measured, so such a table reads as an adaptive one does.
+        """
+        features = self.width(model, features)
+        profile = self.encode_profile(model, features)
+        if profile is None:
+            return None
+        per_row = self.profile(model, features).cache_bytes_per_row
+        layout = self.layout(model, features)
+        decode = self.decode_profile(model)
+        room = self.budget.device - self._pool_bytes
+
+        def fits(rows: int) -> bool:
+            size = self._size(rows)
+            # The context's slots as its rows pack into blocks of them.
+            if layout.slots(size) * self._slot_bytes > self._pool_bytes:
+                return False
+            needed = max(
+                profile.working_bytes(per_row, size),
+                decode.working_bytes(per_row, size),
+            )
+            if not self.budget.cpu:
+                needed += needed // AUTOTUNE_SHARE
+            return needed <= room
+
+        if not fits(1):
+            return None
+        low, high = 1, WHOLE_ROWS_LIMIT
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits(middle):
+                low = middle
+            else:
+                high = middle - 1
+        return low
+
+    def _input_bytes(self: "Worker", unit: Unit) -> int:
+        """Bytes of a unit's padded rows as its encode reads them: their representations."""
+        table = self._tables[unit.table]
+        profile = self.profile(table.model, table.features)
+        return self._size(len(unit.rows)) * profile.row_bytes
 
     def _context_bytes(self: "Worker", unit: Unit) -> int:
         """Bytes of a unit's context as the model caches it, padding and own state included."""

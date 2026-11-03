@@ -1885,7 +1885,7 @@ async fn a_shard_whose_queue_stays_full_times_a_request_out() {
     let table = gf_server::name::TableName::new("pkg-full").unwrap();
     let refused = tokio::time::timeout(
         Duration::from_secs(5),
-        engine.predict_bound(&table, &[0; 32], vec![0.0], None),
+        engine.predict_bound(&table, &[0; 32], vec![0.0], None, None),
     )
     .await
     .expect("refused within the request timeout")
@@ -2127,7 +2127,7 @@ async fn an_engine_table_the_shard_does_not_hold_is_retried_not_missing() {
     );
     let table = gf_server::name::TableName::new("pkg-gone").unwrap();
     let refused = engine
-        .predict_bound(&table, &[0; 32], vec![0.0], None)
+        .predict_bound(&table, &[0; 32], vec![0.0], None, None)
         .await
         .unwrap_err();
     assert_eq!(

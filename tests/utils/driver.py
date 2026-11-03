@@ -254,6 +254,10 @@ class Driver:
             waiting = self._node.take_unmeasured()
             for table in waiting:
                 model, features = self.fitting[table]
+                if self._node.wants_whole_rows(table):
+                    self._node.set_whole_rows(
+                        table, self._worker.whole_rows(model, features)
+                    )
                 self._node.set_fit_limits(
                     table, *self._worker.fit_rows(model, features)
                 )

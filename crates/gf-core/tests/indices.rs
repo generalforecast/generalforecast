@@ -352,18 +352,22 @@ fn nearest_rows_match_a_full_scan_as_rows_come_and_go() {
             })
             .collect();
         scanned.sort_by(|left, right| left.0.total_cmp(&right.0).then(left.1.cmp(&right.1)));
-        let expected: Context = scanned
-            .iter()
-            .take(25)
-            .map(|&(_, row)| RowId(row))
-            .collect();
+        // 25 opens pages best first; 100, a large share of the allowed rows,
+        // reads every one and selects.
+        for count in [25, 100] {
+            let expected: Context = scanned
+                .iter()
+                .take(count)
+                .map(|&(_, row)| RowId(row))
+                .collect();
 
-        assert_eq!(
-            index
-                .nearest_rows(&query, 25, &allowed, &Kept, &Kept)
-                .unwrap(),
-            expected
-        );
+            assert_eq!(
+                index
+                    .nearest_rows(&query, count, &allowed, &Kept, &Kept)
+                    .unwrap(),
+                expected
+            );
+        }
     }
 }
 

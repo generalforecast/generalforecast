@@ -31,6 +31,8 @@ from generalforecast.runtime.memory import NoMemoryAnalysis, memory_profile
 from generalforecast.runtime.paging import DevicePool, cache_layout, pack, read_context
 from generalforecast.worker import Worker
 from generalforecast.worker import admission as worker_admission
+from generalforecast.worker import decodes as worker_decodes
+from generalforecast.worker.decodes import query_pieces
 from tests.models.conformance.cases import CASES, Case, table
 from tests.models.kumo.tiny import tiny_kumo
 from tests.models.tabicl.tiny import tiny_tabicl
@@ -352,6 +354,55 @@ def test_contexts_past_the_models_length_warn_once_or_are_clamped() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         tables["warn"].predict(NEAR_B)
+
+
+def test_an_adaptive_whole_table_past_the_cap_reads_whole_where_its_worker_holds_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tiny_tabicl(regression=False)
+    cap = 10_000
+    # The tiny model as if it were trained on contexts of 10,000 rows.
+    functions = tabicl_functions._replace(
+        properties=lambda parameters: dataclasses.replace(
+            tabicl_functions.properties(parameters), context_rows=cap
+        )
+    )
+    rows = cap + 2_000
+    features, targets = _clusters(rows)
+
+    def predicted(name: str, held: int | None) -> tuple[Any, np.ndarray]:
+        client = node_harness.local()
+        monkeypatch.setattr(client._worker, "whole_rows", lambda *_: held)
+        handle = client.create_table(
+            name,
+            model=(functions, model),
+            features=5,
+            classes=3,
+            page_size=PAGE,
+            strategy=generalforecast.Strategy.adaptive_whole(),
+        )
+        handle.insert(np.arange(rows), features, targets)
+        predictions = handle.predict(NEAR_A)
+        return handle.describe().resolved_strategy, predictions
+
+    whole, _ = predicted("held", rows)
+    assert whole == generalforecast.Strategy.exact()
+    # A worker that cannot hold the table reads it as an adaptive table does.
+    for held in (None, rows - 1):
+        resolved, _ = predicted("short", held)
+        assert resolved == generalforecast.Strategy.adaptive().resolve(rows, cap)
+
+
+def test_the_worker_holds_whole_contexts_its_pool_can_keep() -> None:
+    client = node_harness.local()
+    _table(client).insert(np.arange(32), *_clusters())
+    worker = client._worker
+    (loaded,) = worker._models
+    whole = worker.whole_rows(loaded, 5)
+    assert whole is not None
+    per_row = worker.profile(loaded, 5).cache_bytes_per_row
+    assert worker._size(whole) * per_row <= worker._pool_bytes
+    assert worker._size(2 * whole) * per_row > worker._pool_bytes or whole >= (1 << 25)
 
 
 def test_contexts_whose_calls_would_not_fit_the_device_are_refused() -> None:
@@ -1362,8 +1413,9 @@ def test_small_tables_run_together_in_one_compiled_call() -> None:
 
     together = client.predict({name: NEAR_A for name in tables})
 
-    # Every table pads to 32 rows, so each stage runs once for all six.
-    assert client.stats.calls == {"fit": 1, "embed": 1, "encode": 1, "decode": 1}
+    # Every table pads to 32 rows, so each stage runs once for all six; the
+    # queries read cached contexts, so they embed inside the decode.
+    assert client.stats.calls == {"fit": 1, "encode": 1, "decode": 1}
     # Warming compiles larger sizes once the worker is idle; let it finish.
     client._worker.programs.wait()
     traces.clear()
@@ -1448,7 +1500,11 @@ def _as_frame(step: Any) -> protocol.Step:
     """A step from the bindings as a server's worker receives it."""
 
     def copy(kind: Any, item: Any) -> Any:
-        return kind(**{f.name: getattr(item, f.name) for f in dataclasses.fields(kind)})
+        # The native node's batches carry no levels; the protocol's default them.
+        fields = dataclasses.fields(kind)
+        return kind(
+            **{f.name: getattr(item, f.name) for f in fields if hasattr(item, f.name)}
+        )
 
     return protocol.Step(
         movements=[copy(protocol.Movement, item) for item in step.movements],
@@ -1495,7 +1551,7 @@ def test_a_failing_table_fails_only_its_own_part_of_a_step(
     )
     # Only the good table's part counts, once, though the whole step ran first.
     assert worker.stats.encoded == 1
-    assert worker.stats.calls == {"fit": 1, "embed": 1, "encode": 1, "decode": 1}
+    assert worker.stats.calls == {"fit": 1, "encode": 1, "decode": 1}
     # A step with no table to blame raises.
     with pytest.raises(ValueError, match="bad rows"):
         worker.run_apart(protocol.Step([], [], [], [], []))
@@ -2905,14 +2961,13 @@ def test_a_steps_parts_add_up_to_its_seconds(monkeypatch: pytest.MonkeyPatch) ->
     stages = sum(spent["seconds"] for spent in header["stages"].values())
     # A step that fits, encodes and decodes runs every part once at least;
     # a call's handing to the device is `compile` for a shape its program
-    # had not seen and `dispatch` otherwise, and the decode's query arrays
-    # go to the device as `dispatch` either way.
-    assert set(parts) - {"compile"} == {
+    # had not seen and `dispatch` otherwise. Queries that read a cached
+    # context go to the device with their decode's call.
+    assert set(parts) - {"compile", "dispatch"} == {
         "frame",
         "move",
         "pad",
         "stack",
-        "dispatch",
         "wait",
         "unstack",
         "fetch",
@@ -3024,8 +3079,9 @@ def test_timed_parts_wait_for_the_device_work_they_start(
 
     worker.timers = True
     timed, _ = worker_process._answer(worker, {}, lambda: None, {"kind": "step"}, [])()
-    # The context's store and the queries' dispatch each wait for the device.
-    assert len(waited) >= 2
+    # The context's store waits for the device; the queries go with their
+    # decode's call, which waits on its own.
+    assert len(waited) >= 1
     waited.clear()
     worker.timers = False
     untimed, _ = worker_process._answer(
@@ -3266,3 +3322,76 @@ def test_gated_local_clients_keep_their_tables_until_the_last_closes() -> None:
     second.close()
     assert wired not in engine.tables()
     engine.close()
+
+
+def test_a_table_pads_to_a_shared_width_where_its_model_allows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Nine columns run at ten, as a constant tenth, and predict as nine do.
+    data = table(False, rows=40, queries=6, features=9)
+    model = tiny_tabicl(regression=False)
+
+    def padding(parameters: Any) -> Any:
+        return dataclasses.replace(
+            tabicl_functions.properties(parameters), padded_width=True
+        )
+
+    functions = tabicl_functions._replace(properties=padding)
+
+    def predicted(served: bool = False) -> tuple[np.ndarray, int]:
+        client = node_harness.local()
+        rows = client.create_table(
+            "rows", model=(functions, model), features=9, classes=data.num_classes
+        )
+        rows.insert(np.arange(40), np.asarray(data.features), np.asarray(data.targets))
+        if served:
+            # As a server's worker runs a step it receives.
+            node = client._node
+            request = node.submit(rows._id, np.asarray(data.queries), None)
+            answered, failed = client._worker.run_apart(_as_frame(node.schedule()))
+            assert failed == {}
+            predictions = answered[request]
+        else:
+            predictions = rows.predict(np.asarray(data.queries))
+        widths = {spec.features for spec in client._worker._tables.values()}
+        client.close()
+        return predictions, widths.pop()
+
+    padded, width = predicted()
+    assert width == 10
+    served, _ = predicted(served=True)
+    monkeypatch.setenv("GF_PADDED_WIDTHS", "0")
+    unpadded, width = predicted()
+    assert width == 9
+    np.testing.assert_allclose(padded, unpadded, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(served, unpadded, rtol=1e-5, atol=1e-5)
+
+
+def test_query_pieces_pad_little_and_take_only_compiled_sizes() -> None:
+    def size(rows: int) -> int:
+        return 1 << max(3, (rows - 1).bit_length())
+
+    pieces = query_pieces(9769, size)
+    assert pieces == [8192, 1577]
+    assert sum(size(piece) for piece in pieces) == 10240
+    # Small batches and batches that fill their bucket stay whole.
+    assert query_pieces(2162, size) == [2162]
+    assert query_pieces(8000, size) == [8000]
+
+
+def test_queries_split_past_the_threshold_predict_as_one_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = node_harness.local()
+    rows = _table(client)
+    rows.insert(np.arange(32), *_clusters())
+    queries = np.concatenate([NEAR_A, NEAR_B] * 10)
+    whole = rows.predict(queries)
+
+    monkeypatch.setattr(worker_decodes, "SPLIT_QUERIES", 2)
+    assert (
+        len(query_pieces(len(queries), lambda rows: 1 << (rows - 1).bit_length())) > 1
+    )
+    split = rows.predict(queries)
+
+    np.testing.assert_allclose(split, whole, rtol=1e-5, atol=1e-6)
