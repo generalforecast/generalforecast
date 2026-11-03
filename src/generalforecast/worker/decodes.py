@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from generalforecast.constants import SCATTER_ROWS
+from generalforecast.constants import SCATTER_ROWS, SPLIT_QUERIES, SPLIT_WASTE
 from generalforecast.runtime.budget import Call, out_of_memory
 from generalforecast.runtime.decoding import (
     Decoding,
@@ -71,6 +71,57 @@ class _Dense:
         ]
 
 
+def query_pieces(count: int, size: Callable[[int], int]) -> list[int]:
+    """Query counts a batch of `count` queries decodes in, so padding wastes little.
+
+    Each call pads its queries to `size`'s bucket, a power of two, so 9,769
+    queries in one call compute 16,384 rows. Past `SPLIT_QUERIES` a batch
+    instead takes the largest bucket that it fills while padding would waste
+    more than `SPLIT_WASTE` of what is left, then decodes the rest the same
+    way: 9,769 queries decode as 8,192 and 1,577 padded to 2,048, so 10,240
+    rows. Every piece is a size the worker compiles anyway.
+    """
+    pieces = []
+    left = count
+    while left:
+        padded = size(left)
+        if padded <= SPLIT_QUERIES or padded - left <= left * SPLIT_WASTE:
+            pieces.append(left)
+            break
+        pieces.append(padded // 2)
+        left -= padded // 2
+    return pieces
+
+
+def split_queries(
+    batches: Sequence[QueryBatch], size: Callable[[int], int]
+) -> tuple[list[QueryBatch], list[tuple[int, int, int]]]:
+    """Each batch as `query_pieces` splits it, and where each piece's predictions go.
+
+    A piece's request is its position, as `merged` numbers its batches; its
+    placement is its batch's request, its first query there and the batch's
+    queries, so the pieces of a batch fill one array.
+    """
+    pieces: list[QueryBatch] = []
+    placement = []
+    for batch in batches:
+        start = 0
+        for count in query_pieces(len(batch.units), size):
+            stop = start + count
+            whole = start == 0 and stop == len(batch.units)
+            pieces.append(
+                dataclasses.replace(
+                    batch,
+                    request=len(pieces),
+                    features=batch.features if whole else batch.features[start:stop],
+                    units=batch.units if whole else batch.units[start:stop],
+                )
+            )
+            placement.append((batch.request, start, len(batch.units)))
+            start = stop
+    return pieces, placement
+
+
 class Decodes:
     """How a worker decodes a step's queries, and scatters their predictions back."""
 
@@ -89,7 +140,8 @@ class Decodes:
         encoded and decoded as dense arrays.
         """
         joined, parts = merged(batches)
-        predictions = self._decode_batches(joined, units, transient)
+        pieces, placement = split_queries(joined, self._size)
+        predictions = self._decode_batches(pieces, units, transient, placement)
         return {
             request: predictions[index][start:stop]
             for index, owned in enumerate(parts)
@@ -149,11 +201,14 @@ class Decodes:
         batches: Sequence[QueryBatch],
         units: Sequence[Unit],
         transient: Transient,
+        placement: Sequence[tuple[int, int, int]] | None = None,
     ) -> dict[int, np.ndarray]:
         """Decodes batches whose requests are their positions; see `_decode`.
 
         A table that summarizes each context embeds its queries against their
         unit's own state, in the decode, so each decoding reads one unit.
+        With `placement`, each batch's predictions go to the request, at the
+        first query, of an array of the queries `split_queries` gives it.
         """
         features = []
         for batch in batches:
@@ -212,15 +267,18 @@ class Decodes:
             parts: list[tuple[np.ndarray, np.ndarray, np.ndarray]] = []
             for ((batch, queries), _), values in zip(outputs, fetched, strict=True):
                 values = np.asarray(values)
-                if batch.request not in predictions:
-                    shape = (len(batch.units), values.shape[-1])
-                    predictions[batch.request] = np.zeros(shape, dtype=values.dtype)
-                at = np.asarray(queries, dtype=np.intp)
+                request, offset, total = (
+                    (batch.request, 0, len(batch.units))
+                    if placement is None
+                    else placement[batch.request]
+                )
+                if request not in predictions:
+                    shape = (total, values.shape[-1])
+                    predictions[request] = np.zeros(shape, dtype=values.dtype)
+                at = np.asarray(queries, dtype=np.intp) + offset
                 for start in range(0, len(at), SCATTER_ROWS):
                     stop = start + SCATTER_ROWS
-                    parts.append(
-                        (predictions[batch.request], at[start:stop], values[start:stop])
-                    )
+                    parts.append((predictions[request], at[start:stop], values[start:stop]))
             self._scatter(parts)
         return predictions
 
@@ -418,6 +476,9 @@ class Decodes:
             for position, decoding in enumerate(decodings[first:stop]):
                 with self.stats.timed("unstack"):
                     item = _item(values, np.int32(position))
+                # Its copy to the host runs beside the step's later calls.
+                for leaf in jax.tree.leaves(item):
+                    leaf.copy_to_host_async()
                 results.append(((decoding.batch, decoding.queries), item))
 
         # A context and the working copy beside it, and the queries' rows; and

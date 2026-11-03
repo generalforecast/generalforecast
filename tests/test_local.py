@@ -30,6 +30,8 @@ from generalforecast.runtime.memory import NoMemoryAnalysis, memory_profile
 from generalforecast.runtime.paging import DevicePool, read_context
 from generalforecast.worker import Worker
 from generalforecast.worker import admission as worker_admission
+from generalforecast.worker import decodes as worker_decodes
+from generalforecast.worker.decodes import query_pieces
 from tests.models.conformance.cases import CASES, Case, table
 from tests.models.kumo.tiny import tiny_kumo
 from tests.models.tabicl.tiny import tiny_tabicl
@@ -3180,3 +3182,31 @@ def test_gated_local_clients_keep_their_tables_until_the_last_closes() -> None:
     second.close()
     assert wired not in engine.tables()
     engine.close()
+
+
+def test_query_pieces_pad_little_and_take_only_compiled_sizes() -> None:
+    def size(rows: int) -> int:
+        return 1 << max(3, (rows - 1).bit_length())
+
+    pieces = query_pieces(9769, size)
+    assert pieces == [8192, 1577]
+    assert sum(size(piece) for piece in pieces) == 10240
+    # Small batches and batches that fill their bucket stay whole.
+    assert query_pieces(2162, size) == [2162]
+    assert query_pieces(8000, size) == [8000]
+
+
+def test_queries_split_past_the_threshold_predict_as_one_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = node_harness.local()
+    rows = _table(client)
+    rows.insert(np.arange(32), *_clusters())
+    queries = np.concatenate([NEAR_A, NEAR_B] * 10)
+    whole = rows.predict(queries)
+
+    monkeypatch.setattr(worker_decodes, "SPLIT_QUERIES", 2)
+    assert len(query_pieces(len(queries), lambda rows: 1 << (rows - 1).bit_length())) > 1
+    split = rows.predict(queries)
+
+    np.testing.assert_allclose(split, whole, rtol=1e-5, atol=1e-6)
