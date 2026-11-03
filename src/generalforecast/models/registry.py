@@ -285,11 +285,64 @@ def load_ref(
         from generalforecast.models import custom
 
         return custom.load(ref.name)
+    if ref.derived:
+        made = _catalog.resolve_derived(ref)
+        return _derived_variant(
+            made, surface, allow_downloads, ref.codes, ref.estimators
+        )
     entry = ref.entry
     if surface != "local":
         return _variant(entry.id, surface, allow_downloads, ref.codes, ref.estimators)
     functions, parameters = _native(entry, surface, allow_downloads)
     return wrap(functions, parameters, ref)
+
+
+@lru_cache(maxsize=16)
+def _derived_variant(
+    made: Any,
+    surface: Surface,
+    allow_downloads: bool,
+    codes: int | None,
+    estimators: int | None,
+) -> Model:
+    """A derived model as one `Bagged` model over its base's one shared copy.
+
+    Keyed by everything `made` is, its weights' digest included, so a model
+    whose weights changed under its name never runs from this cache.
+    """
+    from generalforecast.models import derived
+    from generalforecast.models.bagged import Bagged, bagged_functions
+
+    entry = _catalog.ENTRIES[made.base]
+    functions, parameters = (
+        _served(entry.id, surface, allow_downloads)
+        if surface != "local"
+        else _native(entry, surface, allow_downloads)
+    )
+    if isinstance(functions, SeriesFunctions):
+        raise ModelRefError(
+            "UnsupportedCapability",
+            f"{made.model} runs on a forecaster, which bags no weights",
+        )
+    resolver = derived.resolver()
+    if resolver is None:
+        raise ModelRefError("UnknownModel", f"no resolver keeps {made.model}")
+    weights = resolver.weights(made, parameters)
+    import jax
+
+    leading = {
+        getattr(leaf, "shape", (None,))[:1] for leaf in jax.tree.leaves(weights.own)
+    }
+    if leading != {(made.bags,)}:
+        raise ModelRefError(
+            "ModelMismatch",
+            f"{made.model} has {made.bags} bags, but its weights stack {sorted(leading)}",
+        )
+    bagged = (
+        bagged_functions(functions),
+        Bagged(parameters, weights.own, made.bags, weights.combine),
+    )
+    return wrap(*bagged, ModelRef(entry.id, codes, estimators))
 
 
 def load_engine_model(spec: str) -> Model:
