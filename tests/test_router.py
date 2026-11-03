@@ -785,13 +785,15 @@ def test_a_partitioned_tables_cutoffs_read_rows_from_before_them(
     with pytest.raises(ValueError, match="has no regions"):
         tables["split"].region_churn(NEAR_A)
     assert np.isnan(tables["whole"].region_churn(NEAR_A)).all()
-    # Each partition would cut its context to the model's length on its own.
+    # Each partition would cut an exact context to the model's length on its
+    # own; the default, adaptive one is resolved for the table as a whole.
     with pytest.raises(ValueError, match="one partition"):
         client.create_table(
             "clamped",
             model="tiny",
             features=5,
             classes=3,
+            strategy=generalforecast.Strategy.exact(),
             partitions=4,
             past_cap="clamp",
         )
