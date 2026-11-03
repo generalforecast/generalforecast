@@ -17,6 +17,12 @@ export type Name = string;
 export type ModelName = string;
 
 /**
+ * a project's fine-tune version by its name and version, as `credit-default@ft3` names
+ * `<project>/credit-default@ft3`
+ */
+export type FineTuneName = string;
+
+/**
  * a catalog model id, `general-forecast/<name>`, or a derived model's,
  * `<owner>/<name>@ft<version>`; then an optional digest pin (`@sha256:<digest>`) and
  * variant suffix (`@4*2`)
@@ -362,6 +368,20 @@ export interface PredictorListReply extends Envelope {
   result: PredictorList;
 }
 
+/**
+ * what a fine-tune is made of, as a predictor's lock records it: its base, pinned, and
+ * its weights; present on the project's fine-tunes alone, which otherwise describe
+ * themselves as their base does
+ */
+export interface DerivedModel {
+  base: ModelId;
+  base_digest: Digest;
+  digest: Digest;
+  bags: number;
+  version: number;
+  created: number;
+}
+
 export interface Artifact {
   repository: string;
   revision: string;
@@ -393,6 +413,7 @@ export interface Capability {
 export interface Model {
   model: string;
   name: ModelId;
+  derived?: DerivedModel;
   task: Task;
   repository: string;
   revision: string;

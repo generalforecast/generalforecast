@@ -27,6 +27,9 @@ WORKER = (
     "generalforecast.worker_process",
     "generalforecast.runtime",
     "generalforecast.models",
+    # A plane's trainer loads the base it fine-tunes, as the worker loads it
+    # to run it.
+    "generalforecast.training",
 )
 # What executes models: loading them for execution, the worker and runtime.
 EXECUTION = (

@@ -227,6 +227,10 @@ ModelName = str
 _decode_ModelName: Decoder = _pattern("^[a-z0-9][a-z0-9.-]{0,62}$")
 
 
+FineTuneName = str
+_decode_FineTuneName: Decoder = _pattern("^[a-z][a-z0-9-]{0,62}@ft[1-9]\\d*$")
+
+
 ModelId = str
 _decode_ModelId: Decoder = _pattern(
     "^[a-z][a-z0-9-]{0,62}/[a-z0-9][a-z0-9.-]{0,62}(?:@ft[1-9]\\d*)?(?:@sha256:[0-9a-f]{64})?(?:@\\d+)?(?:\\*\\d+)?$",
@@ -1002,6 +1006,32 @@ class PredictorListReply(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class DerivedModel(Payload):
+    """The DerivedModel schema.
+
+    what a fine-tune is made of, as a predictor's lock records it: its base, pinned,
+    and its weights; present on the project's fine-tunes alone, which otherwise
+    describe themselves as their base does
+    """
+
+    base: ModelId
+    base_digest: Digest
+    digest: Digest
+    bags: int
+    version: int
+    created: float
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("base", "base", True, _decode_ModelId),
+        Field("base_digest", "base_digest", True, _decode_Digest),
+        Field("digest", "digest", True, _decode_Digest),
+        Field("bags", "bags", True, _integer),
+        Field("version", "version", True, _integer),
+        Field("created", "created", True, _number),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class Artifact(Payload):
     """The Artifact schema."""
 
@@ -1080,6 +1110,7 @@ class Model(Payload):
     capabilities: tuple[Capability, ...]
     limits: Limits
     warm_shapes: tuple[Shape, ...]
+    derived: DerivedModel | None = None
     artifact_verification: str | None = None
     license_source: str | None = None
     variant: ModelVariant | None = None
@@ -1087,6 +1118,7 @@ class Model(Payload):
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("model", "model", True, _text),
         Field("name", "name", True, _decode_ModelId),
+        Field("derived", "derived", False, _record(DerivedModel)),
         Field("task", "task", True, _decode_Task),
         Field("repository", "repository", True, _text),
         Field("revision", "revision", True, _text),

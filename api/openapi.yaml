@@ -4086,10 +4086,15 @@ components:
       name: model
       in: path
       required: true
-      schema: {$ref: "#/components/schemas/ModelName"}
+      schema:
+        oneOf:
+          - {$ref: "#/components/schemas/ModelName"}
+          - {$ref: "#/components/schemas/FineTuneName"}
       description: |
         a catalog model's name without its `general-forecast/` prefix, such
-        as `tabicl-v2-classifier`, since a path segment holds no `/`
+        as `tabicl-v2-classifier`, or one of the project's fine-tunes as
+        `<name>@ft<version>`, such as `credit-default@ft3`; a path segment
+        holds no `/`, so a fine-tune's owner is the path's project
 
     workspace:
       name: workspace
@@ -4145,6 +4150,13 @@ components:
         a catalog model's name, its id without `general-forecast/`, such as
         `tabpfn-3.5-classifier`; unlike a chosen resource name it may start
         with a digit and hold dots
+
+    FineTuneName:
+      type: string
+      pattern: "^[a-z][a-z0-9-]{0,62}@ft[1-9]\\d*$"
+      description: |
+        a project's fine-tune version by its name and version, as
+        `credit-default@ft3` names `<project>/credit-default@ft3`
 
     ModelId:
       type: string
@@ -4682,8 +4694,14 @@ components:
       required: [model, name, task, artifact, bounds, capabilities, runtime, license, repository, revision, limits, warm_shapes]
       additionalProperties: false
       properties:
-        model: {type: string, description: "`general-forecast/<name>@sha256:<digest>`"}
+        model:
+          type: string
+          description: |
+            the id with its content digest: `general-forecast/<name>@sha256:<digest>`
+            for a catalog model, `<project>/<name>@ft<version>@sha256:<digest>`
+            with the weights' digest for a fine-tune
         name: {$ref: "#/components/schemas/ModelId"}
+        derived: {$ref: "#/components/schemas/DerivedModel"}
         task: {$ref: "#/components/schemas/Task"}
         repository: {type: string}
         revision: {type: string}
@@ -4709,6 +4727,22 @@ components:
         warm_shapes:
           type: array
           items: {$ref: "#/components/schemas/Shape"}
+
+    DerivedModel:
+      type: object
+      description: |
+        what a fine-tune is made of, as a predictor's lock records it: its
+        base, pinned, and its weights; present on the project's fine-tunes
+        alone, which otherwise describe themselves as their base does
+      required: [base, base_digest, digest, bags, version, created]
+      additionalProperties: false
+      properties:
+        base: {$ref: "#/components/schemas/ModelId"}
+        base_digest: {$ref: "#/components/schemas/Digest"}
+        digest: {$ref: "#/components/schemas/Digest"}
+        bags: {type: integer, minimum: 1, description: estimators the weights hold, averaged when served}
+        version: {type: integer, minimum: 1}
+        created: {type: number, description: when the version was published, in seconds since the epoch}
 
     ModelVariant:
       type: object
