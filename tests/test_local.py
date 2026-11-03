@@ -455,8 +455,10 @@ def test_adaptive_tables_read_no_more_rows_than_the_device_holds() -> None:
     def needs(rows: int) -> int:
         encode = worker.encode_bytes(loaded, 5, rows, exact=True)
         assert encode is not None
-        needed = max(encode, decode.working_bytes(row, rows))
-        return needed + needed // AUTOTUNE_SHARE
+        working = decode.working_bytes(row, rows)
+        # As a put-off context needs, which holds no less than a kept one.
+        needed = max(encode, 2 * rows * row + working)
+        return needed + max(encode, working) // AUTOTUNE_SHARE
 
     # A device, beside its pool, that holds a context of `small` rows as
     # `_fits_device` checks it, but not one of `large`; as an accelerator is.
@@ -481,6 +483,45 @@ def test_adaptive_tables_read_no_more_rows_than_the_device_holds() -> None:
     # reads a core and each query's neighbors, at most what the device holds.
     with pytest.raises(ValueError, match="encoding it"):
         whole.predict(NEAR_A)
+    assert adaptive.predict(NEAR_A).shape == (2, 3)
+    assert adaptive.describe().context_rows == small
+
+
+@pytest.mark.slow
+def test_a_model_whose_measured_contexts_overfill_the_device_reads_fewer_rows() -> None:
+    client = node_harness.local()
+    worker = client._worker
+    small = MEASURED_ROWS // 4
+    features, targets = _clusters(MEASURED_ROWS)
+    first = _table(client, name="first", model=TABICL)
+    (loaded,) = worker._models
+    row = worker.profile(loaded, 5).cache_bytes_per_row
+    decode = worker.decode_profile(loaded)
+
+    def needs(rows: int) -> int:
+        encode = worker.encode_bytes(loaded, 5, rows, exact=True)
+        assert encode is not None
+        working = decode.working_bytes(row, rows)
+        needed = max(encode, 2 * rows * row + working)
+        return needed + max(encode, working) // AUTOTUNE_SHARE
+
+    # A device too small beside its pool for even the smallest measured
+    # context, as for a wide model whose rows cache many megabytes each: the
+    # cap shrinks from it to the largest that fits, rather than holding at it.
+    room = (needs(small) + needs(2 * small)) // 2
+    worker.budget = dataclasses.replace(
+        worker.budget, device=worker._pool_bytes + room, cpu=False
+    )
+    assert worker.memory_rows(loaded, 5) == small
+    del first
+
+    adaptive = _table(
+        client,
+        name="adaptive",
+        model=TABICL,
+        strategy=generalforecast.Strategy.adaptive(),
+    )
+    adaptive.insert(np.arange(MEASURED_ROWS), features, targets)
     assert adaptive.predict(NEAR_A).shape == (2, 3)
     assert adaptive.describe().context_rows == small
 

@@ -471,12 +471,16 @@ class Admission:
 
         A context past it would not fit as `_fits_device` checks: its cache
         kept in the pool, and its encode and the decode of a chunk of queries
-        beside the pool. So an adaptive table resolves against it as against
-        the model's own cap, reading a core and each query's neighbors rather
-        than a context the device cannot hold. Padded sizes grow from the
-        smallest, bucket by bucket, until one does not fit, by the model's
-        profiles, and a size they refuse is measured at its own size before it
-        ends the search, since the profiles' line through small contexts can
+        beside the pool, or, put off for want of room in the pool, its encode
+        or its cache twice and that decode. So an adaptive table resolves
+        against it as against the model's own cap, reading a core and each
+        query's neighbors rather than a context the device cannot hold.
+        Padded sizes grow from the smallest measured, bucket by bucket, until
+        one does not fit, by the model's profiles; where even that one does
+        not, they shrink from it until one does, so a model whose contexts
+        are large a row reads fewer rows rather than none. A size the
+        profiles refuse is measured at its own size before it ends the
+        search, since the profiles' line through small contexts can
         overstate a large one.
         None on a CPU, whose memory the host's caches share, and where XLA
         gives no measure.
@@ -489,6 +493,7 @@ class Admission:
         layout = self.layout(model, features)
         decode = self.decode_profile(model)
         room = self.budget.device - self._pool_bytes
+        measures = 0
 
         def fits(size: int, exact: bool) -> bool | None:
             if layout.slots(size) * self._slot_bytes > self._pool_bytes:
@@ -496,18 +501,38 @@ class Admission:
             encode = self.encode_bytes(model, features, size, exact=exact)
             if encode is None:
                 return None
-            needed = max(encode, decode.working_bytes(per_row, size))
-            return needed + needed // AUTOTUNE_SHARE <= room
+            working = decode.working_bytes(per_row, size)
+            # As `_fits_device` holds a put-off unit to, which holds no less
+            # than a kept one.
+            needed = max(encode, 2 * size * per_row + working)
+            return needed + max(encode, working) // AUTOTUNE_SHARE <= room
 
-        size, measures = self._size(MEASURED_ROWS), 0
+        def measured_fits(size: int) -> bool | None:
+            nonlocal measures
+            found = fits(size, exact=False)
+            if found is False and measures < MEMORY_ROWS_MEASURES:
+                measures += 1
+                found = fits(size, exact=True)
+            return found
+
+        size = self._size(MEASURED_ROWS)
+        found = measured_fits(size)
+        if found is None:
+            return None
+        if not found:
+            while size > self._minimum:
+                size = self._size(size // 2)
+                found = measured_fits(size)
+                if found is None:
+                    return None
+                if found:
+                    break
+            return size
         while size < MEMORY_ROWS_LIMIT:
             larger = self._size(size + 1)
-            found = fits(larger, exact=False)
+            found = measured_fits(larger)
             if found is None:
                 return None
-            if not found and measures < MEMORY_ROWS_MEASURES:
-                measures += 1
-                found = fits(larger, exact=True)
             if not found:
                 return size
             size = larger
