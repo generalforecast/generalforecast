@@ -145,3 +145,17 @@ def test_shipped_measures_are_what_a_worker_measures_and_spare_it_measuring(
     # What it measures itself, as at another width, it keeps over them.
     worker.profile(0, FEATURES + 1)
     assert measuring == ["memory_profile"]
+
+
+def test_measures_taken_apart_keep_together(tmp_path) -> None:
+    from generalforecast.runtime.programs import Manifest, encoded
+
+    # As containers measuring a width each return them for one writer.
+    spec = "tests.models.conformance.cases:tabicl_classes"
+    shipped.keep_measures(tmp_path, spec, encoded({("fit_profile", 8): 1}))
+    written = shipped.keep_measures(tmp_path, spec, encoded({("fit_profile", 16): 2}))
+    assert Manifest(written.with_suffix(".json")).measured() == {
+        ("fit_profile", 8): 1,
+        ("fit_profile", 16): 2,
+    }
+    assert shipped.padded_widths(24) == [1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16, 20, 24]
