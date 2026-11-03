@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import re
+import sys
 import tarfile
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -366,9 +367,31 @@ def built(models: int = 2) -> bool:
     )
 
 
+def _answer(arguments: list[str]) -> Any:
+    """The JSON answer to one of the hosting API's measure commands."""
+    from generalforecast.runtime.programs import Manifest, encoded
+
+    command, rest = arguments[0], arguments[1:]
+    if command == "identity":
+        return identity()
+    if command == "widths":
+        return padded_widths(int(rest[0]))
+    if command == "measured":
+        return measured(rest[0], [int(width) for width in rest[1].split(",")])
+    if command == "keep":
+        return str(keep_measures(Path(rest[0]), rest[1], json.load(sys.stdin)))
+    if command == "kept":
+        return encoded(Manifest(Path(rest[0]) / f"{_digest(rest[1])}.json").measured())
+    raise SystemExit(f"unknown command {command!r}")
+
+
 if __name__ == "__main__":
     import sys
 
+    if sys.argv[1:2] in (["identity"], ["widths"], ["measured"], ["keep"], ["kept"]):
+        # The hosting API's measures, asked from a process of their own.
+        print(json.dumps(_answer(sys.argv[1:])))
+        sys.exit()
     if sys.argv[1:2] == ["measures"]:
         # python -m generalforecast.runtime.shipped measures OUT SPEC... [--widths N,...]
         arguments = sys.argv[2:]

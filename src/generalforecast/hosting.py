@@ -300,18 +300,40 @@ def prefetch_catalog() -> None:
     preload()
 
 
+def _shipped(*arguments: str, given: Any = None) -> Any:
+    """What `python -m generalforecast.runtime.shipped` answers, as JSON: the worker side measures, this process only asks.
+
+    Raises:
+        ServiceError: `ModelUnavailable` if the command fails.
+    """
+    import json
+    import subprocess
+    import sys
+
+    done = subprocess.run(
+        [sys.executable, "-m", "generalforecast.runtime.shipped", *arguments],
+        input=None if given is None else json.dumps(given),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if done.returncode != 0:
+        raise ServiceError(
+            "ModelUnavailable",
+            f"measuring failed: {done.stderr.strip().splitlines()[-1:]}",
+            500,
+        )
+    return json.loads(done.stdout.strip().splitlines()[-1])
+
+
 def measures_identity() -> str:
     """The identity this machine's measures are kept under, as `GF_MEASURES/<identity>`: gf's traced code, JAX, the device and padding."""
-    from generalforecast.runtime import shipped
-
-    return shipped.identity()
+    return _shipped("identity")
 
 
 def padded_widths(most: int) -> list[int]:
     """The widths gf pads tables of up to `most` columns to, which measures are kept per."""
-    from generalforecast.runtime import shipped
-
-    return shipped.padded_widths(most)
+    return _shipped("widths", str(most))
 
 
 def measured(spec: str, widths: Any) -> dict[str, Any]:
@@ -319,26 +341,20 @@ def measured(spec: str, widths: Any) -> dict[str, Any]:
 
     A pool takes them once per GPU type and keeps them with
     `keep_measures`, so its workers read them in place of compiling the
-    model to take them (`GF_MEASURES`).
+    model to take them (`GF_MEASURES`). They are taken in a process of
+    their own, as a worker's.
     """
-    from generalforecast.runtime import shipped
-
-    return shipped.measured(spec, widths)
+    return _shipped("measured", spec, ",".join(str(width) for width in widths))
 
 
 def keep_measures(directory: Path, spec: str, measures: Any) -> Path:
     """Adds a model's `measured` measures to those `directory`, one identity's, keeps for it; returns its file."""
-    from generalforecast.runtime import shipped
-
-    return shipped.keep_measures(directory, spec, measures)
+    return Path(_shipped("keep", str(directory), spec, given=measures))
 
 
-def kept_measures(directory: Path, spec: str) -> dict[Any, Any]:
-    """The measures `directory` keeps for a model, by key; empty if none."""
-    from generalforecast.runtime.programs import Manifest
-    from generalforecast.runtime.shipped import _digest
-
-    return Manifest(directory / f"{_digest(spec)}.json").measured()
+def kept_measures(directory: Path, spec: str) -> dict[str, Any]:
+    """The measures `directory` keeps for a model, as JSON as `measured` gives them; empty if none."""
+    return _shipped("kept", str(directory), spec)
 
 
 __all__ = [
