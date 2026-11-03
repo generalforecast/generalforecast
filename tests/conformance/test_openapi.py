@@ -400,9 +400,12 @@ def test_model_ids_have_one_grammar() -> None:
 
     schemas = SPEC["components"]["schemas"]
     assert schemas["ModelName"]["pattern"] == f"^{MODEL_NAME_PATTERN}$"
-    assert schemas["ModelId"]["pattern"].startswith(
-        f"^general-forecast/{MODEL_NAME_PATTERN}"
-    )
+    # The spec's model id is the one grammar, derived ids included.
+    assert schemas["ModelId"]["pattern"] == f"^{MODEL_ID.pattern}$"
+    assert MODEL_ID.fullmatch("acme/credit-default@ft3")
+    assert MODEL_ID.fullmatch("acme/credit-default@ft12@4*2")
+    for bad in ("acme/credit-default@ft0", "acme/credit-default@4@ft3"):
+        assert not MODEL_ID.fullmatch(bad)
     parameter = SPEC["components"]["parameters"]["model"]["schema"]
     assert parameter == {"$ref": "#/components/schemas/ModelName"}
     assert MODEL_ID.fullmatch("general-forecast/tabpfn-3.5-classifier")
