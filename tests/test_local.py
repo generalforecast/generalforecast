@@ -1646,6 +1646,23 @@ def test_decoding_from_slots_matches_decoding_dense_caches() -> None:
     np.testing.assert_allclose(predictions[0], predictions[1], rtol=1e-5, atol=1e-5)
 
 
+def _fused_calls(monkeypatch: pytest.MonkeyPatch, worker: Any) -> list[int]:
+    """The contexts each fused encode and decode call of `worker` takes, as they run."""
+    calls: list[int] = []
+    run = worker._chunks.run
+
+    def counting(stage, key, count, budget, estimate, prepare, *rest, **options):
+        def prepared(start: int, stop: int, padded: int) -> Any:
+            if key[0] == "encode_decode":
+                calls.append(stop - start)
+            return prepare(start, stop, padded)
+
+        return run(stage, key, count, budget, estimate, prepared, *rest, **options)
+
+    monkeypatch.setattr(worker._chunks, "run", counting)
+    return calls
+
+
 def test_contexts_with_no_room_are_encoded_only_as_their_decode_needs_them(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1661,34 +1678,19 @@ def test_contexts_with_no_room_are_encoded_only_as_their_decode_needs_them(
     features, targets = _clusters(128)
     rows.insert(np.arange(128), features, targets)
     worker = client._worker
-    # One context a call, so a step's contexts come from many calls: a call
-    # takes at most an eighth of a device with room for a context, its copy
-    # in the decode and the decode's working memory.
+    # Few contexts a call, so a step's contexts come from many calls: a call
+    # takes at most an eighth of a device with room for a context, its
+    # rows and the decode's working memory.
     worker.budget = dataclasses.replace(worker.budget, device=5 * unit)
-    call = worker._call
-    alive: list[int] = []
-
-    def counting(stage: str, work: Any, consume: Any = None) -> Any:
-        if stage == "decode" and work:
-            # Contexts on the device now, counted by this one's largest parts.
-            leaves = jax.tree.leaves(work[0][1][1])
-            part = max(leaves, key=lambda leaf: leaf.nbytes)
-
-            def like(array: Any) -> bool:
-                return array.shape == part.shape and array.dtype == part.dtype
-
-            held = sum(like(array) for array in jax.live_arrays())
-            alive.append(held // sum(like(leaf) for leaf in leaves))
-        return call(stage, work, consume)
-
-    monkeypatch.setattr(worker, "_call", counting)
+    calls = _fused_calls(monkeypatch, worker)
     queries = np.random.default_rng(0).normal(size=(32, 5)).astype(np.float32) * 5
     rows.predict(queries)
 
-    # The step never held every context it had no room for at once.
+    # Each context is encoded and decoded in one call, and no call held
+    # every context the step had no room for.
     assert client.stats.transient >= 8
-    assert len(alive) >= 8
-    assert max(alive) <= 2, alive
+    assert len(calls) >= 8
+    assert max(calls) <= 2, calls
 
 
 def test_dense_contexts_are_encoded_a_call_budget_at_a_time(
@@ -1699,9 +1701,6 @@ def test_dense_contexts_are_encoded_a_call_budget_at_a_time(
     paged = node_harness.local()
     dense = node_harness.local(device_bytes=unit // 2, slot_bytes=unit // 2)
     worker = dense._worker
-    # Less than two contexts, so each is decoded before the next is encoded:
-    # a call takes at most an eighth of a device with room for a context, its
-    # copy in the decode and the decode's working memory.
     worker.budget = dataclasses.replace(worker.budget, device=5 * unit)
     events: list[str] = []
     call = worker._call
@@ -1712,6 +1711,7 @@ def test_dense_contexts_are_encoded_a_call_budget_at_a_time(
         return call(stage, work, consume)
 
     monkeypatch.setattr(worker, "_call", calling)
+    calls = _fused_calls(monkeypatch, worker)
     features, targets = _clusters(64)
     queries = np.concatenate([NEAR_A, NEAR_B, NEAR_A + 0.5])
     predictions = []
@@ -1724,8 +1724,10 @@ def test_dense_contexts_are_encoded_a_call_budget_at_a_time(
         rows.insert(np.arange(64), features, targets)
         predictions.append(rows.predict(queries))
 
-    assert events.count("encode") > 1
-    assert events == ["encode", "decode"] * events.count("encode")
+    # Contexts with no room encode and decode together, a call budget at a
+    # time, never as an encode and then a decode.
+    assert events == []
+    assert len(calls) > 1
     np.testing.assert_allclose(predictions[0], predictions[1], rtol=1e-5, atol=1e-5)
 
 
