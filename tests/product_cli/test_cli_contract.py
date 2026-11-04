@@ -524,6 +524,22 @@ def test_a_write_failure_names_the_file(monkeypatch):
     assert error.message == "cannot open `out.csv`: permission denied"
 
 
+def test_delete_posts_to_the_routes_delete_action(monkeypatch):
+    from generalforecast import commands
+
+    class Recording:
+        calls: ClassVar[list] = []
+
+        def _call(self, method, path, kind, ident, payload=None, **_):
+            self.calls.append((method, path, payload))
+            return {"name": ident, "deleted": True}
+
+    monkeypatch.setattr(commands, "client_for", lambda args, settings=None: Recording())
+    code, _, stderr = gf("admin", "delete", "churn", "--yes", monkeypatch=monkeypatch)
+    assert code == 0, stderr
+    assert Recording.calls == [("POST", "/predictors/churn/delete", {})]
+
+
 def test_push_waits_for_readiness_by_wait_not_timeout():
     from generalforecast.errors import Error
     from generalforecast.predictor_commands import PredictorCommands
