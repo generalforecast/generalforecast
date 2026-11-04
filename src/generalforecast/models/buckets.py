@@ -71,10 +71,18 @@ def bucket_quantiles(
         within = jnp.where(upper, 1 - above / mass, below / mass)
         within = jnp.clip(within, 0, 1)
         inside = borders[index] + widths[index] * within
-        left = borders[1] - _half_normal_quantile(widths[0], 1 - within)
-        right = borders[-2] + _half_normal_quantile(widths[-1], within)
-        values = jnp.where(index == 0, left, inside)
-        return jnp.where(index == buckets - 1, right, values)
+        # A tail is read only in its own bucket: elsewhere its level is 0, not
+        # one at the edge of the bucket the level fell in, whose infinite
+        # quantile would make every gradient through the levels NaN.
+        first, last = index == 0, index == buckets - 1
+        left = borders[1] - _half_normal_quantile(
+            widths[0], jnp.where(first, 1 - within, 0)
+        )
+        right = borders[-2] + _half_normal_quantile(
+            widths[-1], jnp.where(last, within, 0)
+        )
+        values = jnp.where(first, left, inside)
+        return jnp.where(last, right, values)
 
     flat = (
         cumulative.reshape(-1, buckets),
