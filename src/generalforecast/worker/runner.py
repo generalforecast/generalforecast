@@ -46,6 +46,7 @@ from generalforecast.runtime.memory import (
     FitProfile,
     MemoryProfile,
     WorkingProfile,
+    tree_bytes,
 )
 from generalforecast.runtime.paging import (
     CacheLayout,
@@ -382,6 +383,10 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
                 # release compiled on this platform, if it shipped any.
                 assert self._manifest_dir is not None
                 shipped.install(cache_root(), self._manifest_dir.name, spec)
+
+    def parameter_bytes(self) -> int:
+        """Bytes the loaded models' parameters hold."""
+        return sum(tree_bytes(entry.parameters) for entry in self._models.values())
 
     def forecaster(self, model: int) -> bool:
         """Whether a loaded model is a forecaster."""

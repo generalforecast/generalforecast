@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
+import dataclasses
 import logging
 import threading
 import time
@@ -56,6 +57,17 @@ class MemoryBudget:
         """
         cpu = jax.default_backend() == "cpu"
         return cls(device_memory(), host_memory(), cpu, max(1, workers), local)
+
+    def holding(self, held: int) -> "MemoryBudget":
+        """This budget with `held` bytes of an accelerator's memory taken for the worker's life, as loaded models' parameters are.
+
+        The pool, calls and everything sized from `device` then divide only
+        what is left. A CPU's device is a share of host memory, which holds
+        the parameters beside it, so its budget stays as it is.
+        """
+        if self.cpu:
+            return self
+        return dataclasses.replace(self, device=max(0, self.device - held))
 
     @property
     def device_tier(self) -> int:

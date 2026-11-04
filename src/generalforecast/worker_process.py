@@ -96,6 +96,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         name, spec = entry.split("=", 1)
         names[name] = len(names)
         worker.add_model(names[name], *registry.load_engine_model(spec), spec=spec)
+    # The models' parameters stay on the device beside its pool and calls: a
+    # 24 GB GPU serving every catalog model holds 5 GiB of them.
+    budget = budget.holding(worker.parameter_bytes())
+    worker.budget = budget
 
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
