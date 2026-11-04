@@ -52,7 +52,12 @@ A hosted pool takes its workers' measures once per GPU type: on each,
 `measured(spec, padded_widths(columns))` gives a served model's measures,
 `keep_measures(directory / measures_identity(), spec, measures)` keeps them
 for its workers to read through `GF_MEASURES`, and `kept_measures` reads
-them back.
+them back. Its prebuild runs workers with `AUTOTUNE_ENV` naming a directory
+and `AUTOTUNE_RECORD_ENV` set to `1`, and once they end, `keep_autotune` of
+that directory keeps each GPU type's recorded autotune results; serving
+workers given `AUTOTUNE_ENV` alone load them, so every worker of a GPU type
+compiles a program to the same kernels and predicts the same, bitwise
+(`generalforecast.autotune`).
 
 Exports:
 
@@ -102,7 +107,9 @@ Exports:
             each bag changes the features the base reads.
         training: the trainer's surface, `generalforecast.training`: a
             catalog model's contract calls and parameters as gf serves
-            them, and the parameter types fine-tuning adapts. The
+            them, the parameter types LoRA adapts, and full fine-tuning's
+            components and `full/1` weights, which a resolver hands back
+            for a derived model of kind `full`. The
             resolver decides who may use a model; gf never sees how it was
             made. A lock that pins one is `lock_version: 2`, with a
             `predictor.derived` block of `base`, `base_digest`, `bags`
@@ -134,6 +141,8 @@ from typing import Any
 from generalforecast import training
 from generalforecast.as_of import format as format_as_of
 from generalforecast.as_of import parse as parse_as_of
+from generalforecast.autotune import AUTOTUNE_ENV, keep_autotune
+from generalforecast.autotune import RECORD_ENV as AUTOTUNE_RECORD_ENV
 from generalforecast.contracts import (
     ContextImportRef,
     ContextVersion,
@@ -370,6 +379,8 @@ def kept_measures(directory: Path, spec: str) -> dict[str, Any]:
 
 __all__ = [
     "ALIASES",
+    "AUTOTUNE_ENV",
+    "AUTOTUNE_RECORD_ENV",
     "CONTEXT_ROWS_KEY",
     "DERIVED_KINDS",
     "PHYSICAL_TYPES",
@@ -430,6 +441,7 @@ __all__ = [
     "format_as_of",
     "json_object",
     "json_rows",
+    "keep_autotune",
     "keep_measures",
     "kept_measures",
     "limits",

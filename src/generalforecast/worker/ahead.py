@@ -35,7 +35,7 @@ from generalforecast.constants import (
     WARMED_PAGES,
     WARMED_QUERIES,
 )
-from generalforecast.runtime.budget import Call, _shapes, note_compiled
+from generalforecast.runtime.budget import Call, _shapes, note_compiled, out_of_memory
 from generalforecast.runtime.device import cache_root, cpu_flags
 from generalforecast.runtime.programs import (
     Kind,
@@ -94,6 +94,7 @@ def _shipped_measures(bucket_minimum: int, slot_bytes: int) -> Path | None:
 
 # Seconds a warm start compiles before it takes steps, at most; what is left
 # compiles ahead while the worker serves, or when a step first calls it.
+# gf-server bounds its shape buckets by it too, once the workers are warm.
 WARM_SECONDS_ENV = "GF_WARM_SECONDS"
 
 
@@ -104,6 +105,21 @@ def _zeros_bytes(tree: Any) -> int:
         for leaf in jax.tree.leaves(tree)
         if hasattr(leaf, "shape") and hasattr(leaf, "dtype")
     )
+
+
+def _run_bytes(compiled: Any, tree: Any) -> int:
+    """Bytes a run of a compiled program on zeros of `tree` takes: the zeros, and its temporaries and outputs as XLA counts them.
+
+    Where XLA does not count them, the zeros alone.
+    """
+    held = _zeros_bytes(tree)
+    try:
+        analysis = compiled.memory_analysis()
+    except Exception:  # noqa: BLE001
+        analysis = None
+    if analysis is None:
+        return held
+    return held + analysis.temp_size_in_bytes + analysis.output_size_in_bytes
 
 
 def _cpu_features() -> str:
@@ -187,7 +203,9 @@ class Ahead:
             programs = [
                 (kind, count)
                 for kind, counts in recorded.by_use()
-                for count in self._buckets(kind.program[0]) or counts_up_to(counts)
+                for count in recorded.started(
+                    kind, self._buckets(kind.program[0]) or counts_up_to(counts)
+                )
             ]
             planned.append((model, recorded, programs))
         total = sum(min(len(programs), STARTED_PROGRAMS) for *_, programs in planned)
@@ -266,7 +284,11 @@ class Ahead:
 
         A program's first run sets it up on the device, which would otherwise
         slow the first step that calls it. One reading a large table takes as
-        long on zeros as the call it would speed up, so only compiles.
+        long on zeros as the call it would speed up, so only compiles. So does
+        one whose run would take more than `WARM_RUN_BYTES` of the device, its
+        zeros, temporaries and outputs together: these programs also compile
+        ahead beside steps, and a run of one holding gigabytes of temporaries
+        would take them from the step beside it.
         """
         program = (kind.program[0], model, *kind.program[2:])
         parameters = self._models[model].parameters
@@ -275,8 +297,9 @@ class Ahead:
             items = abstract(kind.item, count)
             shared = self._shared(program, kind, items)
             arguments = (parameters, *shared, *items)
-            note_compiled(function, arguments, function.lower(*arguments).compile())
-            small = _zeros_bytes((shared, items)) <= WARM_RUN_BYTES
+            compiled = function.lower(*arguments).compile()
+            note_compiled(function, arguments, compiled)
+            small = _run_bytes(compiled, (shared, items)) <= WARM_RUN_BYTES
             inputs = zeros((shared, items)) if small else None
             if inputs is not None and (
                 kind.program[0] not in TABLE_STAGES
@@ -284,6 +307,18 @@ class Ahead:
             ):
                 jax.block_until_ready(function(parameters, *inputs[0], *inputs[1]))
         except Exception as error:  # noqa: BLE001
+            if out_of_memory(error) and model in self._specs:
+                # It would run out again at every start on this device; a
+                # call that needs it compiles it then.
+                self.programs.short_of_memory(self._specs[model], kind, count)
+                logger.warning(
+                    "not compiling a recorded %s call of %d items, short of device "
+                    "memory; later starts here skip it and larger counts: %s",
+                    kind.program[0],
+                    count,
+                    error,
+                )
+                return False
             logger.warning(
                 "not compiling a recorded %s call: %s", kind.program[0], error
             )

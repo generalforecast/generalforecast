@@ -8,14 +8,15 @@ mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use common::{fresh_directory, shard, shard_in};
 use gf_core::catalog::Surface;
 use gf_server::budget::RequestBudget;
-use gf_server::http::{Front, KeyStore, Principal, ServedModel, Static, router};
+use gf_server::http::{Front, KeyStore, Principal, ServedModel, Static, router, warm_deadline};
+use gf_server::progress::Compiling;
 use gf_server::routes::Routes;
 use gf_server::wal::EncryptionKey;
 use serde_json::{Value, json};
@@ -2286,4 +2287,86 @@ async fn as_of_is_refused_for_a_context_that_is_not_live() {
         assert_eq!(body["error"]["param"], "as_of", "{as_of}");
     }
     std::fs::remove_file(snapshot).unwrap();
+}
+
+#[test]
+fn warm_seconds_bound_the_buckets_as_the_workers_read_them() {
+    let now = Instant::now();
+    assert_eq!(warm_deadline(None, now), None);
+    assert_eq!(warm_deadline(Some(""), now), None);
+    assert_eq!(warm_deadline(Some("soon"), now), None);
+    assert_eq!(warm_deadline(Some("inf"), now), None);
+    assert_eq!(
+        warm_deadline(Some("240"), now),
+        Some(now + Duration::from_secs(240))
+    );
+    assert_eq!(
+        warm_deadline(Some(" 1.5 "), now),
+        Some(now + Duration::from_millis(1500))
+    );
+    assert_eq!(warm_deadline(Some("0"), now), Some(now));
+    assert_eq!(warm_deadline(Some("-3"), now), Some(now));
+}
+
+/// A front serving one catalog model the warm-up compiles buckets for,
+/// over `shards`.
+async fn warming(shards: Vec<tokio::sync::mpsc::Sender<gf_server::shard::Command>>) -> Arc<Front> {
+    let served = ServedModel {
+        reference: "general-forecast/tabicl-v2-classifier".to_string(),
+        ..served()
+    };
+    let front = Arc::new(Front::new(
+        vec![served],
+        Box::new(Static::new(None)),
+        Surface::SelfHosted,
+        true,
+        RequestBudget::new(1 << 30),
+        Duration::from_secs(30),
+        Arc::new(AtomicBool::new(false)),
+    ));
+    front
+        .start(shards, Arc::new(Routes::new(1, 4)))
+        .await
+        .unwrap();
+    front
+}
+
+#[tokio::test]
+async fn warming_stops_at_its_deadline_and_the_server_starts_without_the_rest() {
+    let unbounded = warming(vec![shard().await]).await;
+    let compiling = Compiling::default();
+    let warmed = unbounded.warm(&compiling, None).await;
+    assert_eq!(warmed, 3);
+    assert_eq!(compiling.current().done, 3);
+
+    let late = warming(vec![shard().await]).await;
+    let compiling = Compiling::default();
+    assert_eq!(late.warm(&compiling, Some(Instant::now())).await, 0);
+    assert_eq!(
+        (compiling.current().done, compiling.current().total),
+        (0, 3)
+    );
+    let (status, _, body) = call(&late, "GET", "/v1/projects/team-a/models", None, &[]).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["result"]["models"][0]["warm_shapes"], json!([]));
+
+    let ahead = Some(Instant::now() + Duration::from_secs(600));
+    let bounded = warming(vec![shard().await]).await;
+    assert_eq!(bounded.warm(&Compiling::default(), ahead).await, warmed);
+}
+
+#[tokio::test]
+async fn a_bucket_under_way_at_the_deadline_is_left_to_its_first_request() {
+    // A shard that takes commands and never answers: every bucket hangs.
+    let (shard, _held) = tokio::sync::mpsc::channel(16);
+    let front = warming(vec![shard]).await;
+    let compiling = Compiling::default();
+    let started = Instant::now();
+    let deadline = Some(started + Duration::from_millis(200));
+    let warmed = tokio::time::timeout(Duration::from_secs(30), front.warm(&compiling, deadline))
+        .await
+        .expect("warming ends at its deadline");
+    assert_eq!(warmed, 0);
+    assert_eq!(compiling.current().done, 1);
+    assert!(started.elapsed() < Duration::from_secs(5));
 }

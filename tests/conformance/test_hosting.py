@@ -20,6 +20,8 @@ SOURCE = Path(__file__).resolve().parents[2] / "src" / "generalforecast"
 
 RECORDED = (
     "ALIASES",
+    "AUTOTUNE_ENV",
+    "AUTOTUNE_RECORD_ENV",
     "AcceptedWrite",
     "CONTEXT_ROWS_KEY",
     "Capability",
@@ -80,6 +82,7 @@ RECORDED = (
     "format_as_of",
     "json_object",
     "json_rows",
+    "keep_autotune",
     "keep_measures",
     "kept_measures",
     "limits",
@@ -172,15 +175,23 @@ def test_the_training_surface_loads_a_tabular_model_as_gf_serves_it(monkeypatch)
     from tests.models.tabicl.tiny import tiny_tabicl
 
     training = hosting.training
-    assert training.VERSION == 2
+    assert training.VERSION == 3
     assert sorted(training.__all__) == [
+        "COMPONENTS",
+        "COMPONENT_MAPS",
         "Encoded",
+        "FULL_FORMAT",
         "LinearParameters",
         "TabularFunctions",
         "VERSION",
         "encode",
         "load",
+        "pack_full",
+        "replaced",
+        "trainable",
+        "unpack_full",
     ]
+    assert training.FULL_FORMAT == "full/1"
     asked = []
 
     def load(spec, *, surface, allow_downloads):
