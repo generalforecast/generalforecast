@@ -445,7 +445,8 @@ def _profiled(worker: Worker, model: int, features: int) -> protocol.Profiled:
         class_slots=properties.class_slots,
         outputs=properties.num_outputs,
         context_rows=_fewest(
-            properties.context_rows, worker.memory_rows(model, features)
+            properties.context_rows,
+            worker.memory_rows(model, features, beside=_fits(worker, model, features)),
         ),
         state_bytes=profile.state_bytes,
         categorical_state_bytes=profile.categorical_state_bytes,
@@ -453,6 +454,25 @@ def _profiled(worker: Worker, model: int, features: int) -> protocol.Profiled:
         unlabeled_context=properties.unlabeled_context,
         fit_bound=_limit(worker.fit_bound(model, features)),
     )
+
+
+def _fits(worker: Worker, model: int, features: int) -> Callable[[], None]:
+    """Measures a model's fits for a width, as a table's first step asks of them (`FitLimits`).
+
+    Run beside the device cap's measures where they leave the machine room
+    (`Admission.memory_rows`), the four fits their profile compiles are not
+    left for the table's first step to wait on. The worker measures each key
+    once (`Memo`), so that step reads this measure, or waits for it to
+    finish.
+    """
+
+    def measure() -> None:
+        with contextlib.suppress(Exception):
+            # A fit that cannot be measured raises again in the step that
+            # asks for it, which answers with the error.
+            worker.fit_rows(model, features)
+
+    return measure
 
 
 def _fewest(*limits: int | None) -> int | None:
