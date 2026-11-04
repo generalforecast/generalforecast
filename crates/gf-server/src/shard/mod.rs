@@ -1889,10 +1889,14 @@ impl Shard {
     }
 
     /// Sends the worker a request and reads its reply.
+    ///
+    /// The worker answers frames in order, so a request waits behind the
+    /// steps in flight, which may compile for minutes: it gives up only once
+    /// the worker goes `step_timeout` without progress, as a step does.
     async fn ask_worker(&mut self, request: &WorkerRequest) -> Result<WorkerReply, ServerError> {
         let frame = self
             .worker
-            .request_within(&request.frame(), self.step_timeout)
+            .request_progressing(&request.frame(), self.step_timeout)
             .await
             .map_err(ServerError::Internal)?;
         WorkerReply::of(&frame).map_err(|error| ServerError::Internal(error.0))
