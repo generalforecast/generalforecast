@@ -503,6 +503,7 @@ class Admission:
         decode = self.decode_profile(model)
         room = self.budget.device - self._pool_bytes
         measures = 0
+        ahead_taken = False
 
         def fits(size: int, exact: bool) -> bool | None:
             if layout.slots(size) * self._slot_bytes > self._pool_bytes:
@@ -516,6 +517,21 @@ class Admission:
             needed = max(encode, 2 * size * per_row + working)
             return needed + max(encode, working) // AUTOTUNE_SHARE <= room
 
+        def measurable(size: int) -> bool:
+            """Whether an exact measure of `size`'s encode could make it fit.
+
+            Not where its slots outgrow the pool, or what it holds besides its
+            encode, its cache twice and a decode, outgrows the room: `fits`
+            refuses it whatever its encode takes, so measuring it, a compile
+            of an encode of that many rows, would be for nothing. TabICL v2's
+            contexts past about 600k rows on an H100 are such, and measuring
+            three of them took 5 s of every new width's first table create.
+            """
+            if layout.slots(size) * self._slot_bytes > self._pool_bytes:
+                return False
+            working = decode.working_bytes(per_row, size)
+            return 2 * size * per_row + working + working // AUTOTUNE_SHARE <= room
+
         def ahead(size: int, larger: bool) -> None:
             """Measures `size` and the sizes the search would measure after it, side by side.
 
@@ -526,12 +542,17 @@ class Admission:
             measured for nothing.
             """
             sizes = [size]
+            last = size
             while len(sizes) < MEMORY_ROWS_MEASURES - measures:
-                last = sizes[-1]
                 step = self._size(last + 1) if larger else self._size(last // 2)
                 if step == last or (not larger and step < self._minimum):
                     break
-                sizes.append(step)
+                last = step
+                if measurable(step):
+                    sizes.append(step)
+                elif larger:
+                    # Larger sizes hold more beside their encode still.
+                    break
 
             def measure(rows: int) -> None:
                 # A size that cannot compile raises when the search reads it.
@@ -543,13 +564,17 @@ class Admission:
             concurrently([lambda rows=rows: measure(rows) for rows in sizes])
 
         def measured_fits(size: int, larger: bool = True) -> bool | None:
-            nonlocal measures
+            nonlocal measures, ahead_taken
             found = fits(size, exact=False)
             if found is False and measures < MEMORY_ROWS_MEASURES:
-                if measures == 0:
-                    ahead(size, larger)
+                # A size no encode would bring in counts as measured without
+                # compiling one, so the search reads the same sizes either way.
+                if measurable(size):
+                    if not ahead_taken:
+                        ahead(size, larger)
+                        ahead_taken = True
+                    found = fits(size, exact=True)
                 measures += 1
-                found = fits(size, exact=True)
             return found
 
         size = self._size(MEASURED_ROWS)
