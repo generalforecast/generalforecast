@@ -57,7 +57,7 @@ and `AUTOTUNE_RECORD_ENV` set to `1`, and once they end, `keep_autotune` of
 that directory keeps each GPU type's recorded autotune results; serving
 workers given `AUTOTUNE_ENV` alone load them, so every worker of a GPU type
 compiles a program to the same kernels and predicts the same, bitwise
-(`generalforecast.runtime.autotune`).
+(`generalforecast.autotune`).
 
 Exports:
 
@@ -139,6 +139,8 @@ from typing import Any
 from generalforecast import training
 from generalforecast.as_of import format as format_as_of
 from generalforecast.as_of import parse as parse_as_of
+from generalforecast.autotune import AUTOTUNE_ENV, keep_autotune
+from generalforecast.autotune import RECORD_ENV as AUTOTUNE_RECORD_ENV
 from generalforecast.contracts import (
     ContextImportRef,
     ContextVersion,
@@ -184,8 +186,6 @@ from generalforecast.predictors.runtime.requests import request_table
 from generalforecast.predictors.runtime.tabular import bound_order as bound_rows
 from generalforecast.predictors.spec import PredictorSpec
 from generalforecast.predictors.validation import PredictorError, bytes_digest
-from generalforecast.runtime.autotune import AUTOTUNE_ENV, keep_autotune
-from generalforecast.runtime.autotune import RECORD_ENV as AUTOTUNE_RECORD_ENV
 from generalforecast.serve.listener import binary, configuration
 from generalforecast.serve.models import catalog_model, published_entry
 from generalforecast.service.boundary import (

@@ -28,10 +28,10 @@ from typing import Any
 import jax
 
 from generalforecast import protocol
+from generalforecast.autotune import use_autotune_results
 from generalforecast.constants import SAMPLE_INTERVAL
 from generalforecast.models import registry
 from generalforecast.profiling import memory
-from generalforecast.runtime.autotune import use_autotune_results
 from generalforecast.runtime.budget import MemoryBudget
 from generalforecast.runtime.device import (
     command_buffers,

@@ -27,6 +27,7 @@ import importlib.metadata
 import os
 import re
 import subprocess
+from collections.abc import Mapping
 from pathlib import Path
 
 AUTOTUNE_ENV = "GF_AUTOTUNE"
@@ -76,13 +77,14 @@ def recording(kept: Path, pid: int) -> Path:
 
 
 def autotune_flags(
-    environ: dict[str, str] | None = None, gpu: str | None = None
+    environ: Mapping[str, str] | None = None, gpu: str | None = None
 ) -> list[str]:
     """XLA's flags to load, and with `GF_AUTOTUNE_RECORD=1` record, this GPU's results; none without `GF_AUTOTUNE`.
 
     A run whose `XLA_FLAGS` already name autotune results keeps its own.
     """
-    environ = os.environ if environ is None else environ
+    if environ is None:
+        environ = os.environ
     root = environ.get(AUTOTUNE_ENV)
     if not root or "autotune_results" in environ.get("XLA_FLAGS", ""):
         return []
@@ -139,7 +141,8 @@ def keep_autotune(directory: Path) -> list[Path]:
     for kept, paths in sorted(recordings.items()):
         whole = [path for path in paths if _complete(path)]
         if whole:
-            os.replace(max(whole, key=lambda path: path.stat().st_size), kept)
+            largest = max(whole, key=lambda path: path.stat().st_size)
+            os.replace(largest, kept)
             kept_files.append(kept)
         for path in paths:
             path.unlink(missing_ok=True)

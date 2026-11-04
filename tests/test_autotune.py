@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from generalforecast.runtime import autotune
+from generalforecast import autotune
 
 GPU = "NVIDIA H100 80GB HBM3"
 

@@ -27,11 +27,11 @@ import numpy as np
 
 from generalforecast import protocol
 from generalforecast._core import CacheKey
+from generalforecast.autotune import use_autotune_results
 from generalforecast.constants import SCATTER_THREADS
 from generalforecast.models.contract import TabularFunctions, TabularProperties
 from generalforecast.models.series import SeriesFunctions, SeriesProperties
 from generalforecast.runtime import shipped
-from generalforecast.runtime.autotune import use_autotune_results
 from generalforecast.runtime.budget import Chunks, MemoryBudget, out_of_memory
 from generalforecast.runtime.decoding import PROGRAMS, Context
 from generalforecast.runtime.device import (
