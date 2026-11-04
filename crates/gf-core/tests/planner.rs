@@ -562,6 +562,26 @@ fn adaptive_whole_shares_one_context_past_the_rows_its_device_holds() {
     }
 }
 
+#[test]
+fn cost_rows_hold_a_per_query_context_to_the_cost_of_tabicls_16384_rows() {
+    use gf_core::planner::{ADAPTIVE_WHOLE_CONTEXT, ADAPTIVE_WHOLE_ROW_BYTES, cost_rows};
+
+    // TabICL v2 and narrower rows, such as TabPFN-3.5's 7,232 bytes, keep
+    // the per-query contexts adaptive_whole was measured with.
+    for row_bytes in [1, 7_232, ADAPTIVE_WHOLE_ROW_BYTES] {
+        assert_eq!(cost_rows(row_bytes), ADAPTIVE_WHOLE_CONTEXT);
+    }
+    // Wider rows take fewer, so rows squared times bytes a row stays put:
+    // LimiX-2 on 24 columns caches 393,216 bytes a row, 16 times TabICL's.
+    assert_eq!(cost_rows(16 * ADAPTIVE_WHOLE_ROW_BYTES), 4_096);
+    assert_eq!(cost_rows(393_216), 4_096);
+    assert_eq!(cost_rows(4 * ADAPTIVE_WHOLE_ROW_BYTES), 8_192);
+    // Mitra-2 on 24 columns, 614,400 bytes a row.
+    assert_eq!(cost_rows(614_400), 3_276);
+    // However wide, at least one row.
+    assert_eq!(cost_rows(u64::MAX), 1);
+}
+
 /// Rows below 48 in one stratum and the rest in another.
 struct Halves;
 

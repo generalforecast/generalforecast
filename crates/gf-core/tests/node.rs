@@ -5146,6 +5146,48 @@ fn an_adaptive_whole_table_past_what_its_device_holds_shares_one_context() {
 }
 
 #[test]
+fn an_adaptive_whole_table_whose_per_query_contexts_cost_too_much_shares_one() {
+    use gf_core::planner::{ADAPTIVE_WHOLE_ROW_BYTES, cost_rows};
+
+    let mut node = node(64);
+    // A model cap of 64 rows the device does not cut, with rows that cache
+    // so much that past the cap a per-query context may take only 32 rows.
+    let row_bytes = ADAPTIVE_WHOLE_ROW_BYTES * 512 * 512;
+    assert_eq!(cost_rows(row_bytes), 32);
+    let mut wide = spec(Strategy::AdaptiveWhole);
+    wide.context_rows = NonZeroU64::new(64);
+    wide.sizes.bytes_per_row = row_bytes;
+    let table = node.create_table(wide).unwrap();
+    let (keys, features, targets) = rows(128);
+    let Targets::Classes(labels) = targets else {
+        unreachable!("rows makes classes")
+    };
+    let insert = |node: &mut Node, rows: std::ops::Range<usize>| {
+        let values = &features[rows.start * FEATURES..rows.end * FEATURES];
+        let labels = Targets::Classes(labels[rows.clone()].to_vec());
+        node.insert(table, &keys[rows], values, labels).unwrap();
+    };
+
+    // Within the cap it reads every row, and waits for nothing: the cost
+    // bounds only contexts that would be per query.
+    insert(&mut node, 0..64);
+    assert_eq!(node.strategy(table).unwrap(), Strategy::Exact);
+    node.submit(table, &A).unwrap();
+    assert!(node.schedule().unwrap().is_some());
+    assert!(node.take_unmeasured().is_empty());
+
+    // Past it, it waits for the rows its worker holds as one context, then
+    // every query reads one stratified core of them, encoded once.
+    insert(&mut node, 64..128);
+    node.submit(table, &A).unwrap();
+    assert!(node.schedule().unwrap().is_none());
+    assert_eq!(node.take_unmeasured(), [table]);
+    node.set_whole_rows(table, Some(48)).unwrap();
+    let shared = Strategy::subsample(48, 0, CoreKind::Stratified);
+    assert_eq!(node.strategy(table).unwrap(), shared);
+}
+
+#[test]
 fn a_timed_adaptive_table_leans_its_neighbors_to_the_newest_rows() {
     let mut node = node(64);
     let table = node
