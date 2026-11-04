@@ -240,7 +240,10 @@ def pack(
     }
     arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
     sink = io.BytesIO()
-    with zipfile.ZipFile(sink, "w", zipfile.ZIP_DEFLATED) as archive:
+    # The fastest deflate: trained deltas are mostly noise, which no level
+    # shrinks more than a few percent further, while zero deltas shrink
+    # alike at any level. Higher levels took 4.5 times as long.
+    with zipfile.ZipFile(sink, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as archive:
         for key, array in arrays.items():
             with archive.open(f"{key}.npy", "w") as member:
                 np.lib.format.write_array(member, array, allow_pickle=False)
