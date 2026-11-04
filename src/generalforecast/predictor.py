@@ -257,6 +257,7 @@ class Predictor:
         self._project = project
         self._api_key = api_key
         self._transport: Any = None
+        self._served_keyed = False
         self.future = tuple(future)
         self.target = target
         self.inputs: tuple[str, ...] | None = (
@@ -671,6 +672,7 @@ class Predictor:
                     key_env="GF_API_KEY" if owned and self._api_key is None else None,
                 )
                 self._transport = Transport(base, token=settings.token, timeout=120)
+                self._served_keyed = bool(settings.token)
         return self._transport
 
     def _served_post(self, path: str, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -692,16 +694,34 @@ class Predictor:
             Resource("predictor", self.name),
             dict(payload or {}),
         )
+        from urllib.parse import urlsplit
+
+        from generalforecast.service.contracts import ServiceError
+
         with boundary():
-            value = self._served_transport().send(
-                method,
-                f"/v1/projects/{project}{path}",
-                request.to_dict() if method == "POST" else None,
-                {
-                    "X-GF-Request-ID": request.scope.request_id,
-                    "X-GF-Project": project,
-                },
-            )
+            transport = self._served_transport()
+            try:
+                value = transport.send(
+                    method,
+                    f"/v1/projects/{project}{path}",
+                    request.to_dict() if method == "POST" else None,
+                    {
+                        "X-GF-Request-ID": request.scope.request_id,
+                        "X-GF-Project": project,
+                    },
+                )
+            except ServiceError as error:
+                if error.code != "Unauthorized" or self._served_keyed:
+                    raise
+                # A served URL gets GF_API_KEY only when GF_URL names it.
+                served = urlsplit(self._base)
+                origin = f"{served.scheme}://{served.netloc}"
+                raise ServiceError(
+                    "Unauthorized",
+                    error.message,
+                    401,
+                    hint=f"set GF_URL={origin} and GF_API_KEY to its key",
+                ) from None
             return dict(unwrap(value, request))
 
     # evaluation

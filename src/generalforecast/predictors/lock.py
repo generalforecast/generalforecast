@@ -9,7 +9,8 @@ writes the result here. `gf check --frozen`, `gf.Predictor`, `gf serve`,
 know what a predictor is. It has one format:
 
     lock_version: 1               # 2 when the predictor runs a derived model
-    digest: sha256:...            # of the document without this key
+    digest: sha256:...            # of the document without this key or checked_with
+    checked_with: {gf, rules}     # the gf version that wrote it and its LOCK_RULES
     manifest: sha256:...          # of the normalized gf.yaml it resolves
     predictor:
       name, model, model_digest, task, target, target_type
@@ -37,6 +38,17 @@ know what a predictor is. It has one format:
 `digest` is the one identity of a predictor revision: hosted serving dedupes
 revisions by it, gf-server fingerprints bound tables by it under `gf serve`
 and hosted serving alike, and `contracts.PredictorLock.digest` is it.
+
+`checked_with` says which gf wrote the lock: its package version, and
+`rules`, the revision of what `gf check` writes for a given `gf.yaml`, rows
+and catalog. Two builds of one package version can write different locks
+for the same inputs, so `rules`, not the version, is what tells an
+out-of-date gf from a lock edited by hand: a plane whose gf finds a pushed
+lock other than what it would write, from a lock of other rules, asks for
+the gf that writes its rules rather than for `gf check` again. It only
+describes the writer, so `digest` leaves it out: the same predictor checked
+by two gf versions is one revision. A lock without it was written before
+gf recorded it, under rules 1.
 """
 
 from pathlib import Path
@@ -66,6 +78,20 @@ from generalforecast.predictors.validation import column as column_name
 
 LOCK = "gf.lock"
 LOCK_VERSION = 1
+# The revision of what `gf check` writes for the same gf.yaml, rows and
+# catalog. Bump it with any change that makes `gf check` write a lock other
+# than before for the same inputs (a model's context row cap, the engine's
+# adaptive selection, a default the lock records), so a plane on the new
+# rules tells a customer on an older gf to upgrade instead of to run
+# `gf check`, which would write the same lock again.
+#   1: what gf check wrote through 064a957, and any lock without
+#      `checked_with` (gf between #76 and this record wrote rules 2 without
+#      saying so; where its locks agree they are admitted all the same).
+#   2: TabICL v2's context row cap of 100,000 (gf #76), which resolves a
+#      selection of 60,001 to 100,000 rows as exact where it was retrieved.
+LOCK_RULES = 2
+# The rules of a lock that does not record them.
+UNRECORDED_RULES = 1
 # The version of a lock whose predictor runs a derived model; locks of
 # catalog models stay at LOCK_VERSION, so none of them changes.
 DERIVED_LOCK_VERSION = 2
@@ -112,8 +138,61 @@ RESOURCE_FIELDS = frozenset(
 
 
 def lock_digest(document: dict[str, Any]) -> str:
-    """The lock's one digest: of its canonical JSON without the `digest` key."""
-    return digest({key: value for key, value in document.items() if key != "digest"})
+    """The lock's one digest: of its canonical JSON without `digest` and `checked_with`."""
+    return digest(
+        {
+            key: value
+            for key, value in document.items()
+            if key not in ("digest", "checked_with")
+        }
+    )
+
+
+def checked_with() -> dict[str, Any]:
+    """The `checked_with` this gf writes: its package version and `LOCK_RULES`."""
+    import generalforecast
+
+    return {"gf": generalforecast.__version__, "rules": LOCK_RULES}
+
+
+def rules_of(document: dict[str, Any]) -> int:
+    """The rules a lock was written under; `UNRECORDED_RULES` when it does not say."""
+    recorded = document.get("checked_with")
+    if type(recorded) is dict and type(recorded.get("rules")) is int:
+        return recorded["rules"]
+    return UNRECORDED_RULES
+
+
+def other_rules(document: dict[str, Any]) -> str | None:
+    """Why a lock written under other rules than this gf's differs, or None.
+
+    A lock `gf check` wrote under older rules is out of date however often
+    that gf runs it again, and one written under newer rules is past what
+    this gf writes; either way the fix is the gf that writes this gf's
+    rules, which the sentence names.
+    """
+    rules = rules_of(document)
+    if rules == LOCK_RULES:
+        return None
+    current = checked_with()
+    recorded = document.get("checked_with")
+    writer = (
+        f"gf {recorded['gf']} (lock rules {rules})"
+        if type(recorded) is dict and type(recorded.get("gf")) is str
+        else f"a gf from before locks recorded it (lock rules {rules})"
+    )
+    here = f"gf {current['gf']} (lock rules {LOCK_RULES})"
+    if rules < LOCK_RULES:
+        return (
+            f"this predictor was checked with {writer}; this service runs {here}, "
+            "whose gf check writes it differently; upgrade the gf SDK "
+            "(`pip install -U generalforecast`) and run `gf check` again"
+        )
+    return (
+        f"this predictor was checked with {writer}, newer than {here}, "
+        "which this service runs; check it with the gf this service runs, "
+        f"or push it once the service runs lock rules {rules}"
+    )
 
 
 def manifest_digest(spec: PredictorSpec) -> str:
@@ -186,6 +265,7 @@ def document(resolution: Resolution) -> dict[str, Any]:
     version = LOCK_VERSION if resolution.derived is None else DERIVED_LOCK_VERSION
     value: dict[str, Any] = {
         "lock_version": version,
+        "checked_with": checked_with(),
         "manifest": resolution.manifest,
         "predictor": predictor,
     }
@@ -217,8 +297,15 @@ def validate(value: Any) -> dict[str, Any]:
     fields(
         value,
         {"lock_version", "digest", "manifest", "predictor", "model"},
-        {"resources"},
+        {"resources", "checked_with"},
     )
+    if "checked_with" in value:
+        recorded = fields(value["checked_with"], {"gf", "rules"})
+        text(recorded["gf"])
+        ensure(
+            type(recorded["rules"]) is int and recorded["rules"] >= 1,
+            "checked_with.rules is a whole number from 1",
+        )
     hash_value(value["digest"])
     ensure(
         hash_value(value["manifest"]),
@@ -711,16 +798,20 @@ def resolution_of(value: dict[str, Any], spec: PredictorSpec | None) -> Resoluti
 __all__ = [
     "DERIVED_LOCK_VERSION",
     "LOCK",
+    "LOCK_RULES",
     "LOCK_VERSION",
     "LOCK_VERSIONS",
     "changes",
+    "checked_with",
     "document",
     "load_lock",
     "lock_digest",
     "lock_document",
     "manifest_digest",
+    "other_rules",
     "read_lock",
     "resolution_of",
+    "rules_of",
     "validate",
     "write_lock",
 ]

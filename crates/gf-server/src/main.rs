@@ -25,6 +25,7 @@ use clap::Parser;
 use gf_server::auth::Tokens;
 use gf_server::budget::RequestBudget;
 use gf_server::config::{Config, HttpConfig, KeysConfig};
+use gf_server::deadline::DeadlineLayer;
 use gf_server::http::{Front, Introspect, KeyStore, Principal, ServedModel, Static};
 use gf_server::metrics::Metrics;
 use gf_server::progress::{Compiling, Progress};
@@ -85,6 +86,10 @@ enum Subcommand {
         /// A file holding the log encryption key; `GF_LOG_KEY` otherwise.
         #[arg(long)]
         key_file: Option<PathBuf>,
+        /// A router's replication token, which `GF_REPLICATION_TOKEN` may
+        /// give instead; the server then holds tables only under its leases.
+        #[arg(long)]
+        replication_token: Option<String>,
         /// Overwrite the file if it exists.
         #[arg(long)]
         force: bool,
@@ -134,6 +139,7 @@ async fn command() -> Result<(), Box<dyn Error>> {
             models,
             token,
             key_file,
+            replication_token,
             force,
         } => init(
             &path,
@@ -144,6 +150,9 @@ async fn command() -> Result<(), Box<dyn Error>> {
                 models: Vec::new(),
                 token: String::new(),
                 key_file,
+                replication_token: replication_token
+                    .or_else(|| std::env::var("GF_REPLICATION_TOKEN").ok())
+                    .filter(|token| !token.is_empty()),
             },
             &models,
             token,
@@ -346,7 +355,10 @@ async fn run(
         let tokens = Tokens::new(&config.tokens);
         let replication_tokens = Tokens::new(&config.replication_tokens);
         let mut server = tonic::transport::Server::builder()
-            .timeout(Duration::from_secs_f64(config.request_timeout_seconds))
+            .layer(DeadlineLayer::new(
+                Duration::from_secs_f64(config.request_timeout_seconds),
+                "request_timeout_seconds",
+            ))
             // A cap on streams, not a queue for them: a stream waiting its turn would
             // hold its rows in the connection's flow-control window, which the
             // rows of the calls it waits on may then not get through.

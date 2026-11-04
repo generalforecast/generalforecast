@@ -183,9 +183,11 @@ impl Scan<'_> {
     /// `(dimensions + 2)` of float64's, away from float32's subnormal range,
     /// where its error is at most a few `f32::MIN_POSITIVE` per term. So the
     /// rows whose float32 distance is within those bounds of the `count`th
-    /// nearest by float32 hold every row nearest by `squared`; those alone
-    /// are measured by `squared` and ranked as `nearest_rows` ranks them,
-    /// ties to the lower key.
+    /// nearest by float32 hold every row nearest by `squared`. Of those, the
+    /// rows below the `count`th by the bounds again are nearer than every
+    /// row past it, so they are taken as they are; the rest, a thin band
+    /// around the `count`th, alone are measured by `squared` and ranked as
+    /// `nearest_rows` ranks them, ties to the lower key.
     ///
     /// # Errors
     ///
@@ -216,7 +218,7 @@ impl Scan<'_> {
         let underflow = 4.0 * (self.dimensions as f64 + 3.0) * f64::from(f32::MIN_POSITIVE);
         let mut found = Vec::with_capacity(queries.len());
         let mut measured = vec![0.0f32; SCAN_QUERIES * rows];
-        let mut order: Vec<u32> = Vec::with_capacity(rows);
+        let mut sorted: Vec<f32> = Vec::with_capacity(rows);
         for block in queries.chunks(SCAN_QUERIES) {
             for (index, &slot) in self.slots.iter().enumerate() {
                 let values = self.dense.at(slot as usize);
@@ -226,37 +228,41 @@ impl Scan<'_> {
             }
             for (place, query) in block.iter().enumerate() {
                 let distances = &measured[place * rows..(place + 1) * rows];
-                order.clear();
-                order.extend(0..rows as u32);
-                order.select_nth_unstable_by(count - 1, |&left, &right| {
-                    distances[left as usize].total_cmp(&distances[right as usize])
-                });
-                let farthest = order[..count]
-                    .iter()
-                    .map(|&index| f64::from(distances[index as usize]))
-                    .fold(0.0f64, f64::max);
+                sorted.clear();
+                sorted.extend_from_slice(distances);
+                let (_, nth, _) = sorted.select_nth_unstable_by(count - 1, f32::total_cmp);
+                let farthest = f64::from(*nth);
                 // Twice the widening, once for the count-th row's own bound
                 // and once for the candidate's, and room for float32
                 // underflow, whose error is absolute rather than relative.
                 let within = farthest * widen * widen * (1.0 + 1e-9) + underflow;
-                let mut near: Vec<Near> = distances
-                    .iter()
-                    .enumerate()
-                    .filter(|&(_, &distance)| f64::from(distance) <= within)
-                    .map(|(index, _)| {
+                // A row whose float32 distance is below this by the same
+                // widening is nearer by `squared` than every row from the
+                // count-th on, so it is among the nearest without measuring.
+                let sure_below = (farthest - underflow) / (widen * widen * (1.0 + 1e-9));
+                let (mut sure, mut near): (Vec<RowId>, Vec<Near>) = (Vec::new(), Vec::new());
+                for (index, &distance) in distances.iter().enumerate() {
+                    let distance = f64::from(distance);
+                    if distance < sure_below {
+                        sure.push(self.rows[index]);
+                    } else if distance <= within {
                         let slot = self.slots[index] as usize;
-                        Near(
+                        near.push(Near(
                             squared(self.dense.at(slot), query),
                             self.dense.keys[slot],
                             self.rows[index],
-                        )
-                    })
-                    .collect();
-                if near.len() > count {
-                    near.select_nth_unstable(count - 1);
-                    near.truncate(count);
+                        ));
+                    }
                 }
-                found.push(near.into_iter().map(|Near(_, _, row)| row).collect());
+                let left = count.saturating_sub(sure.len());
+                if left == 0 {
+                    near.clear();
+                } else if near.len() > left {
+                    near.select_nth_unstable(left - 1);
+                    near.truncate(left);
+                }
+                sure.extend(near.into_iter().map(|Near(_, _, row)| row));
+                found.push(sure.into_iter().collect());
             }
         }
         Ok(found)

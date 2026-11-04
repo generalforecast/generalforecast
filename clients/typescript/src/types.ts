@@ -866,13 +866,24 @@ export interface LockResources {
 }
 
 /**
+ * the gf that wrote a lock: its package version, and the revision of what its gf check
+ * writes for the same gf.yaml, rows and catalog. A lock without it was written under
+ * rules 1
+ */
+export interface LockWriter {
+  gf: string;
+  rules: number;
+}
+
+/**
  * gf.lock: what gf check resolved gf.yaml into. `digest` is the canonical JSON digest
- * of the document without `digest`, the one identity of a predictor revision;
- * `manifest` the digest of the normalized gf.yaml it resolves
+ * of the document without `digest` and `checked_with`, the one identity of a predictor
+ * revision; `manifest` the digest of the normalized gf.yaml it resolves
  */
 export interface Lock {
   lock_version: 1 | 2;
   digest: Digest;
+  checked_with?: LockWriter;
   manifest: Digest;
   predictor: Resolution;
   resources?: LockResources;
