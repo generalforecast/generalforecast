@@ -152,18 +152,68 @@ impl Vectors for Scaled<'_> {
             .vector(&features))
     }
 
+    /// Many rows are read from a snapshot of the store and scaled on every
+    /// core, each thread writing its share of the rows' places in `into`.
     fn extend_vectors(&self, rows: &[RowId], into: &mut Vec<f32>) -> Result<(), RowsError> {
         let standardizer = self
             .standardizer
             .expect("rows are scaled before they are placed");
-        let (features, _) = self.rows.gather(rows)?;
-        let width = features.len() / rows.len().max(1);
-        for row in features.chunks_exact(width.max(1)) {
-            standardizer.extend(row, into);
+        let threads = std::thread::available_parallelism()
+            .map_or(1, NonZeroUsize::get)
+            .min(rows.len() / PARALLEL_SCALED_ROWS);
+        if threads <= 1 {
+            let (features, _) = self.rows.gather(rows)?;
+            let width = features.len() / rows.len().max(1);
+            for row in features.chunks_exact(width.max(1)) {
+                standardizer.extend(row, into);
+            }
+            return Ok(());
         }
-        Ok(())
+        let snapshot = self.rows.snapshot();
+        let dimensions = self.vector(rows[0])?.len();
+        let start = into.len();
+        into.resize(start + rows.len() * dimensions, 0.0);
+        let share = rows.len().div_ceil(threads);
+        let read: Vec<Result<(), RowsError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = rows
+                .chunks(share)
+                .zip(into[start..].chunks_mut(share * dimensions))
+                .map(|(rows, place)| {
+                    let snapshot = &snapshot;
+                    scope.spawn(move || {
+                        let (mut features, mut vectors) = (Vec::new(), Vec::new());
+                        let batches = rows.chunks(SCALED_BATCH_ROWS);
+                        for (batch, place) in
+                            batches.zip(place.chunks_mut(SCALED_BATCH_ROWS * dimensions))
+                        {
+                            features.clear();
+                            vectors.clear();
+                            snapshot.extend_features(batch, &mut features)?;
+                            let width = features.len() / batch.len();
+                            for row in features.chunks_exact(width.max(1)) {
+                                standardizer.extend(row, &mut vectors);
+                            }
+                            place.copy_from_slice(&vectors);
+                        }
+                        Ok(())
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("a scaling thread does not panic"))
+                .collect()
+        });
+        read.into_iter().collect()
     }
 }
+
+/// Rows each thread scales at least, below which `Scaled::extend_vectors`
+/// reads on the caller's thread alone.
+const PARALLEL_SCALED_ROWS: usize = 8192;
+
+/// Rows a scaling thread reads and scales at a time.
+const SCALED_BATCH_ROWS: usize = 1024;
 
 /// Rows' strata: a row's class, or the bin among `edges` its value falls in.
 pub(super) struct Labels<'a> {
@@ -240,4 +290,75 @@ pub(super) struct Fitted {
     pub(super) rows: u64,
     pub(super) means: Vec<f64>,
     pub(super) deviations: Vec<f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn many_rows_scale_on_many_threads_as_one_by_one() {
+        let (count, width) = (40_000usize, 6usize);
+        let memory = RowMemory::unbounded();
+        let mut store = RowStore::new(&memory, width);
+        let mut state = 7u64;
+        let mut next = || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            (state >> 40) as f32 / (1u64 << 24) as f32
+        };
+        let features: Vec<f32> = (0..count * width)
+            .map(|at| match at % width {
+                // A categorical column, and a column with missing values.
+                2 => (next() * 5.0).floor(),
+                4 if next() < 0.2 => f32::NAN,
+                _ => next() * 8.0 - 4.0,
+            })
+            .collect();
+        let keys: Vec<u128> = (0..count as u128).collect();
+        store.push(&features, &vec![0; count], &keys).unwrap();
+        let labels = Targets::Classes((0..count as i32).map(|row| row % 3).collect());
+        let categories: Vec<f32> = features.chunks(width).map(|row| row[2]).collect();
+        let standardizer = Standardizer {
+            skip: 0,
+            center: vec![0.5; width],
+            scale: vec![2.0; width],
+            lookups: vec![(
+                2,
+                Lookup::fit(
+                    CategoryEncoding::OneHot,
+                    &categories,
+                    &labels,
+                    Task::Classes(3),
+                ),
+            )],
+        };
+        let scaled = Scaled {
+            rows: &store,
+            standardizer: Some(&standardizer),
+        };
+        let rows: Vec<RowId> = (0..count as u32)
+            .filter(|row| row % 7 != 3)
+            .map(RowId)
+            .collect();
+        let mut many = vec![9.0];
+        scaled.extend_vectors(&rows, &mut many).unwrap();
+        let mut one_by_one = vec![9.0];
+        for &row in &rows {
+            one_by_one.extend(scaled.vector(row).unwrap());
+        }
+        assert!(one_by_one.len() > 1 + rows.len() * width);
+        assert_eq!(
+            many.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            one_by_one
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            scaled.extend_vectors(&[RowId(count as u32)], &mut many),
+            Err(RowsError::Unknown(RowId(count as u32)))
+        );
+    }
 }
