@@ -105,6 +105,22 @@ const WARM_SHAPES: &[(usize, usize)] = &[(100, 1), (1_000, 1), (10_000, 1)];
 const WARM_INPUTS: usize = 2;
 /// How long one warm bucket may take to compile and run.
 const WARM_TIMEOUT: Duration = Duration::from_secs(600);
+/// Seconds the shape buckets may take before the server says it is ready,
+/// read as the workers read it for their own warm start: the buckets left
+/// compile when a request first takes their shape.
+pub const WARM_SECONDS_ENV: &str = "GF_WARM_SECONDS";
+
+/// When `Front::warm` stops warming buckets: `seconds` (as
+/// `GF_WARM_SECONDS` gives it) after `from`, or never without a number.
+/// Zero or less warms none, as a worker's warm start compiles none.
+#[must_use]
+pub fn warm_deadline(seconds: Option<&str>, from: Instant) -> Option<Instant> {
+    let seconds: f64 = seconds?.trim().parse().ok()?;
+    if !seconds.is_finite() {
+        return None;
+    }
+    Some(from + Duration::try_from_secs_f64(seconds.max(0.0)).ok()?)
+}
 
 /// A synthetic ad hoc body of `context_rows` rows over `WARM_INPUTS`
 /// deterministic pseudo-uniform inputs and a 0/1 (or real) target; `seed`
@@ -426,10 +442,11 @@ impl Front {
     /// does not pay for the compile; the buckets go to `GET models` as
     /// `warm_shapes`. Each bucket is scored once per shard at the same time,
     /// pinned to it, so every worker compiles it. A bucket that fails is
-    /// logged and skipped, so a
-    /// slow compile never keeps the server from starting. Returns how many
-    /// buckets compiled.
-    pub async fn warm(&self, compiling: &Compiling) -> usize {
+    /// logged and skipped, so a slow compile never keeps the server from
+    /// starting; so are the buckets past `deadline`, the one under way then
+    /// included, which compile when a request first takes their shape.
+    /// Returns how many buckets compiled.
+    pub async fn warm(&self, compiling: &Compiling, deadline: Option<Instant>) -> usize {
         let mut shapes = Vec::new();
         let Ok(engine) = self.engine() else {
             return 0;
@@ -446,9 +463,14 @@ impl Front {
             models.push((served, model));
         }
         compiling.expect((models.len() * WARM_SHAPES.len()) as u64);
+        let mut late = 0;
         for (served, model) in models {
             let regression = model.entry.task == catalog::Task::Regression;
             for &(context_rows, queries) in WARM_SHAPES {
+                if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                    late += 1;
+                    continue;
+                }
                 let replicas = (0..engine.shards()).map(|shard| {
                     let payload = warm_payload(
                         &model.canonical_id(),
@@ -462,13 +484,22 @@ impl Front {
                         adhoc_predict_with(self, &engine, &payload, self.budget.charge()).await
                     }
                 });
+                let scored = futures::future::join_all(replicas);
+                let outcomes = match deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline.into(), scored).await.ok(),
+                    None => Some(scored.await),
+                };
+                compiling.advance(1);
+                let Some(outcomes) = outcomes else {
+                    late += 1;
+                    continue;
+                };
                 let mut failed = None;
-                for outcome in futures::future::join_all(replicas).await {
+                for outcome in outcomes {
                     if let Err(error) = outcome {
                         failed = Some(error.message);
                     }
                 }
-                compiling.advance(1);
                 if let Some(message) = failed {
                     tracing::warn!(
                         model = served.name.as_str(),
@@ -486,6 +517,12 @@ impl Front {
                     }),
                 ));
             }
+        }
+        if late > 0 {
+            tracing::info!(
+                buckets = late,
+                "not warming shape buckets past {WARM_SECONDS_ENV}; each compiles when a request first takes its shape"
+            );
         }
         let count = shapes.len();
         let _ = self.warm.set(shapes);

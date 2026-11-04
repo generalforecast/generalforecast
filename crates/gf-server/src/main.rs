@@ -26,7 +26,9 @@ use gf_server::auth::Tokens;
 use gf_server::budget::RequestBudget;
 use gf_server::config::{Config, HttpConfig, KeysConfig};
 use gf_server::deadline::DeadlineLayer;
-use gf_server::http::{Front, Introspect, KeyStore, Principal, ServedModel, Static};
+use gf_server::http::{
+    Front, Introspect, KeyStore, Principal, ServedModel, Static, WARM_SECONDS_ENV, warm_deadline,
+};
 use gf_server::metrics::Metrics;
 use gf_server::progress::{Compiling, Progress};
 use gf_server::revisions::{Limits as RevisionLimits, Revisions};
@@ -382,8 +384,12 @@ async fn run(
         if let Some((front, url, _)) = &front {
             front.start(shards.clone(), routes.clone()).await?;
             let started = std::time::Instant::now();
+            // The buckets are bounded as the workers' warm start is, after it,
+            // so a start reaches ready however cold its compile cache is.
+            let deadline =
+                warm_deadline(std::env::var(WARM_SECONDS_ENV).ok().as_deref(), started);
             let buckets = tokio::select! {
-                buckets = front.warm(&metrics.compiling) => buckets,
+                buckets = front.warm(&metrics.compiling, deadline) => buckets,
                 () = live.follow(&metrics.compiling) => unreachable!("the progress line never ends"),
                 _ = interrupted.wait_for(|stop| *stop) => {
                     live.clear();
