@@ -444,21 +444,25 @@ def _stop() -> None:
 
 
 # The public engine surface, `gf.engine.Table` and its settings, lives in
-# `generalforecast.native.tables` and loads on first use so importing this
-# module stays cheap.
+# `generalforecast.native.tables`, and `connect`, a client for a served node
+# or router, in `generalforecast.native.remote`. Each loads on first use so
+# importing this module stays cheap.
 _PUBLIC = {
-    name: "generalforecast.native.tables"
-    for name in (
-        "Grouping",
-        "Retrieved",
-        "Schema",
-        "SeriesSchema",
-        "SeriesTable",
-        "Table",
-        "TableOptions",
-        "TimeOptions",
-        "default_selection",
-    )
+    "connect": "generalforecast.native.remote",
+    **{
+        name: "generalforecast.native.tables"
+        for name in (
+            "Grouping",
+            "Retrieved",
+            "Schema",
+            "SeriesSchema",
+            "SeriesTable",
+            "Table",
+            "TableOptions",
+            "TimeOptions",
+            "default_selection",
+        )
+    },
 }
 
 

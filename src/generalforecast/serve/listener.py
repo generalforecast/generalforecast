@@ -337,14 +337,49 @@ def serve(args: argparse.Namespace) -> NoReturn:
     _become(program, "run", "--config", str(config), environment=environment)
 
 
-def _run(program: Path, *arguments: str) -> list[str]:
+def _replication_token(router: Path) -> str:
+    """The replication token a router's configuration gives its nodes."""
+    import tomllib
+
+    path = router.expanduser()
+    try:
+        document = tomllib.loads(path.read_text())
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        raise InvalidInput(
+            f"cannot read `{path}`: {error}",
+            hint="pass the router's configuration file",
+            param="router",
+        ) from None
+    tokens = {
+        node.get("token")
+        for node in document.get("nodes", [])
+        if isinstance(node, dict)
+    }
+    if len(tokens) != 1 or not all(
+        isinstance(token, str) and token for token in tokens
+    ):
+        raise InvalidInput(
+            f"`{path}` names no single replication token for its nodes",
+            hint="write it with `gf admin router init`",
+            param="router",
+        )
+    return tokens.pop()
+
+
+def _run(
+    program: Path, *arguments: str, env: Mapping[str, str] | None = None
+) -> list[str]:
     """Runs a server's `init` or `check`; returns its report lines.
+
+    `env` adds to this process's environment, for a secret kept off the
+    process list.
 
     Raises:
         Error: With the server's own words when it fails.
     """
     done = subprocess.run(
         [str(program), *arguments],
+        env={**os.environ, **env} if env else None,
         stdin=subprocess.DEVNULL,
         capture_output=True,
         text=True,
@@ -413,16 +448,18 @@ def admin(noun: str, args: argparse.Namespace, out: "Output") -> dict:
         arguments += [part for node in args.node for part in ("--node", node)]
     if args.force:
         arguments.append("--force")
-    _run(program, *arguments)
+    routed = noun == "node" and args.router is not None
+    secret = (
+        {"GF_REPLICATION_TOKEN": _replication_token(args.router)} if routed else None
+    )
+    _run(program, *arguments, env=secret)
     out.status("Wrote", f"{path}, which holds the client token")
     steps = [
         f"gf admin {noun} check --config {path}",
         f"gf admin {noun} serve --config {path}",
     ]
     if noun == "router":
-        steps.insert(
-            0, f"list the replication token in {path} in each node's replication_tokens"
-        )
+        steps.insert(0, f"write each node's configuration with --router {path}")
     elif not os.environ.get("GF_LOG_KEY"):
         steps.insert(0, "export GF_LOG_KEY=$(openssl rand -hex 32)")
     return {"path": str(path), "next": steps}
