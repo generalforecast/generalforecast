@@ -570,6 +570,8 @@ class FakeClient:
         **_: Any,
     ) -> dict:
         if path.endswith("/revisions"):
+            # As the hosted service does, a revision without its gf.yaml is refused.
+            assert method == "GET" or isinstance((payload or {}).get("manifest"), dict)
             return {
                 "predictor": ident,
                 "number": self.next_revision,
