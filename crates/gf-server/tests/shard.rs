@@ -71,6 +71,15 @@ fn fake_worker(
                         .flatten()
                         .filter_map(|unit| unit["action"].as_str().map(str::to_string)),
                 );
+                // The rows of each unit, for tests that read them.
+                actions.lock().unwrap().extend(
+                    frame.header["units"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|unit| unit["count"].as_u64())
+                        .map(|count| format!("rows {count}")),
+                );
                 match behaviour.load(Ordering::Relaxed) {
                     mode @ (DEFER | DEFER_EARLY) => {
                         let tables: Vec<u64> = frame.header["queries"]
@@ -2018,6 +2027,42 @@ impl Harness {
             .unwrap()
             .map_err(|error| status(&error))
     }
+}
+
+#[tokio::test]
+async fn a_request_context_past_its_device_shares_what_the_worker_holds() {
+    let shard = shard(settings()).await;
+    let wide = |fingerprint: &str, rows: u128| {
+        let mut context = context(fingerprint, rows);
+        context.definition.model = "wide".to_string();
+        context
+    };
+    let seen = |shard: &Harness, prefix: &str| {
+        shard
+            .actions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|action| action.starts_with(prefix))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    // One the device holds reads every row, unmeasured, as before.
+    shard.infer(wide("held", 2)).await.unwrap();
+    assert!(seen(&shard, "fit_limits").is_empty());
+    assert_eq!(seen(&shard, "rows"), ["rows 2"]);
+
+    // Past it, the worker is asked once what it holds whole, and both
+    // queries read one stratified core of as many rows, not a context each.
+    shard.actions.lock().unwrap().clear();
+    shard.infer(wide("past", 8)).await.unwrap();
+    assert_eq!(seen(&shard, "fit_limits"), ["fit_limits whole=true"]);
+    assert_eq!(seen(&shard, "rows"), ["rows 4"]);
+    shard.actions.lock().unwrap().clear();
+    shard.infer(wide("again", 9)).await.unwrap();
+    assert!(seen(&shard, "fit_limits").is_empty());
+    assert_eq!(seen(&shard, "rows"), ["rows 4"]);
 }
 
 #[tokio::test]

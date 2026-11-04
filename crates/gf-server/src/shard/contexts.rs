@@ -291,7 +291,21 @@ impl Shard {
         times: Option<&[Option<i64>]>,
         shared: bool,
     ) -> Result<TableId, ServerError> {
-        let (spec, _, levels) = self.spec(&definition, false).await?;
+        let (mut spec, _, levels) = self.spec(&definition, false).await?;
+        // A request context reads every row, unless the worker's device
+        // cannot hold them as one context: then it reads as `AdaptiveWhole`
+        // does, which past a device that holds fewer than
+        // `ADAPTIVE_WHOLE_CONTEXT` rows shares one core of what the worker
+        // holds, rather than being refused. One the device holds reads
+        // exactly as before.
+        if spec.strategy == Strategy::Exact
+            && spec.series.is_none()
+            && spec
+                .device_rows
+                .is_some_and(|device| targets.len() as u64 > device.get())
+        {
+            spec.strategy = Strategy::AdaptiveWhole;
+        }
         let id = self.node.create_table(spec)?;
         if !shared {
             self.node.set_single_use(id)?;

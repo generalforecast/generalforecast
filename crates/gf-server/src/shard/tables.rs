@@ -40,10 +40,9 @@ impl Shard {
     pub(super) async fn measure_fits(&mut self) -> bool {
         let tables = self.node.take_unmeasured();
         for &table in &tables {
-            // A scratch table fits as its partition's table does; a request
-            // context is an ephemeral table, which `tables` does not hold.
-            // Neither has a definition to ask after, so neither reads a
-            // table past the cap whole.
+            // A scratch table fits as its partition's table does, and a
+            // request context as its ephemeral definition says; a table with
+            // neither has nothing to ask after, so it reads no table whole.
             let Some(name) = self.name_of(table) else {
                 let _ = self.node.set_whole_rows(table, None);
                 continue;
