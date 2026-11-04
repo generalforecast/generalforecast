@@ -172,13 +172,21 @@ def test_the_training_surface_loads_a_tabular_model_as_gf_serves_it(monkeypatch)
     from tests.models.tabicl.tiny import tiny_tabicl
 
     training = hosting.training
-    assert training.VERSION == 1
+    assert training.VERSION == 2
     assert sorted(training.__all__) == [
+        "COMPONENTS",
+        "COMPONENT_MAPS",
+        "FULL_FORMAT",
         "LinearParameters",
         "TabularFunctions",
         "VERSION",
         "load",
+        "pack_full",
+        "replaced",
+        "trainable",
+        "unpack_full",
     ]
+    assert training.FULL_FORMAT == "full/1"
     asked = []
 
     def load(spec, *, surface, allow_downloads):

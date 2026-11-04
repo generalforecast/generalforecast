@@ -101,7 +101,9 @@ Exports:
             each bag changes the features the base reads.
         training: the trainer's surface, `generalforecast.training`: a
             catalog model's contract calls and parameters as gf serves
-            them, and the parameter types fine-tuning adapts. The
+            them, the parameter types LoRA adapts, and full fine-tuning's
+            components and `full/1` weights, which a resolver hands back
+            for a derived model of kind `full`. The
             resolver decides who may use a model; gf never sees how it was
             made. A lock that pins one is `lock_version: 2`, with a
             `predictor.derived` block of `base`, `base_digest`, `bags`
