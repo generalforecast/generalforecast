@@ -13,6 +13,11 @@ import importlib
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Any
 
+from generalforecast import _cpu
+
+# Before anything can load native code built for a CPU this one is not.
+_cpu.check()
+
 from generalforecast.errors import (
     AmbiguousReference,
     CapacityExceeded,
