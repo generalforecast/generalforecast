@@ -182,9 +182,10 @@ class Pages:
         A page with sources copies their rows, representations and targets,
         and embeds only its own. Those pad to their own bucket, not the page
         size: a page written a row at a time then embeds a few rows, or none.
-        So does a put-off page, kept in no slots, of which `units` read fewer
-        than `SPARSE_SHARE` of the rows: it embeds only those, and
-        `subsets` gets their rows, which its representations then hold.
+        Of a page whose rows `units` read fewer than `SPARSE_SHARE` of, the
+        step holds only those, and `subsets` gets their rows: a put-off one,
+        kept in no slots, embeds only them; a kept one is embedded and kept
+        whole, and a cached one read, but only those rows join the step's.
 
         Raises:
             HostMemoryError: If the representations the step would hold take
@@ -200,17 +201,20 @@ class Pages:
         for index, page in enumerate(pages):
             if index in filled:
                 continue
+            if index in sparse and subsets is not None:
+                subsets[index] = np.asarray(page.rows)[sparse[index]]
             if page.action == "reuse":
-                found[index] = self._cached(page.key)
+                values, targets = self._cached(page.key)
+                if index in sparse:
+                    values, targets = values[sparse[index]], targets[sparse[index]]
+                found[index] = (values, targets)
                 continue
             if page.features is None or page.targets is None:
                 raise RuntimeError(
                     f"a page of table {page.table} to embed came without its rows"
                 )
-            if index in sparse:
+            if index in sparse and page.action == "transient":
                 read = sparse[index]
-                if subsets is not None:
-                    subsets[index] = np.asarray(page.rows)[read]
                 features, targets, _ = self._padded(
                     np.asarray(page.features)[read], np.asarray(page.targets)[read]
                 )
@@ -241,20 +245,30 @@ class Pages:
             page = pages[index]
             with self.stats.timed("fetch"):
                 embedded = np.asarray(representations)[: len(missing)]
-            if index in sparse:
-                partial[index] = (embedded, np.asarray(page.targets)[sparse[index]])
+            if index in sparse and page.action == "transient":
+                found[index] = (embedded, np.asarray(page.targets)[sparse[index]])
             elif index in partial:
-                values, targets = partial[index]
+                values, targets = partial.pop(index)
                 values[missing] = embedded
                 targets[missing] = np.asarray(page.targets)
+                found[index] = done(index, (values, targets))
             else:
-                partial[index] = (embedded, np.asarray(page.targets))
+                found[index] = done(index, (embedded, np.asarray(page.targets)))
             self.stats.rows_embedded += len(missing)
 
-        self._call("embed", work, consume=fetched)
-        for index, computed in partial.items():
+        # A page is kept as its call finishes, and the step holds only the
+        # rows its units read of a page they read little of.
+        def done(index: int, computed: Representations) -> Representations:
             self._keep(pages[index], computed)
-            found[index] = computed
+            if index not in sparse:
+                return computed
+            values, targets = computed
+            return values[sparse[index]], targets[sparse[index]]
+
+        self._call("embed", work, consume=fetched)
+        # Pages whose every row a source held, which embed nothing.
+        for index in list(partial):
+            found[index] = done(index, partial.pop(index))
         return found
 
     def _sparse_pages(
@@ -263,18 +277,15 @@ class Pages:
         filled: dict[int, Representations],
         units: Sequence[Unit],
     ) -> dict[int, np.ndarray]:
-        """The put-off pages of which `units` read fewer than `SPARSE_SHARE` of the rows, with the positions they read.
+        """The pages of which `units` read fewer than `SPARSE_SHARE` of the rows, with the positions they read.
 
-        Only pages to embed in full count: a kept page is cached whole, and
-        one with sources copies most of its rows.
+        A fit's pages and pages with sources, which copy most of their rows,
+        are left out.
         """
         candidates = [
             index
             for index, page in enumerate(pages)
-            if index not in filled
-            and page.action == "transient"
-            and not page.copies
-            and page.features is not None
+            if index not in filled and not page.copies
         ]
         if not candidates:
             return {}
