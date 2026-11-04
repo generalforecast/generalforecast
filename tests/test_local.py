@@ -1957,6 +1957,51 @@ def test_a_table_past_its_fit_rows_fits_on_a_sample_and_embeds_pages_it_reads() 
     assert table.definition.fit_rows == 8
 
 
+@pytest.mark.parametrize("model", [TABICL, LIMIX])
+def test_a_core_spread_over_put_off_pages_embeds_only_the_rows_it_reads(
+    model: str,
+) -> None:
+    def predictions(host_bytes: int | None) -> tuple[np.ndarray, int]:
+        client = node_harness.local(host_bytes=host_bytes)
+        table = client.create_table(
+            "t",
+            model=model,
+            features=5,
+            classes=3,
+            strategy=generalforecast.Strategy.subsample(8),
+            page_size=8,
+            fit_rows=8,
+        )
+        table.insert(np.arange(64), *_clusters(64))
+        found = np.asarray(table.predict(NEAR_A))
+        return found, client.stats.rows_embedded
+
+    # With room on the host, each page the core reads is embedded and kept whole.
+    kept, whole = predictions(None)
+    # Without, pages are put off, and each the core reads less than half of
+    # embeds only the rows it reads, which give the same predictions.
+    sparse, embedded = predictions(0)
+    assert 8 <= embedded < whole / 2
+    np.testing.assert_allclose(sparse, kept, rtol=1e-6, atol=1e-6)
+
+
+def test_a_step_whose_representations_take_more_host_memory_than_is_free_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast.worker import pages as worker_pages
+
+    client = node_harness.local()
+    table = client.create_table(
+        "t", model=TABICL, features=5, classes=3, page_size=8, fit_rows=8
+    )
+    table.insert(np.arange(32), *_clusters())
+    monkeypatch.setattr(worker_pages, "available_memory", lambda: 1024)
+    with pytest.raises(Exception, match="MiB is free; use a strategy"):
+        table.predict(NEAR_A)
+    monkeypatch.setattr(worker_pages, "available_memory", lambda: None)
+    assert np.asarray(table.predict(NEAR_A)).shape == (len(NEAR_A), 3)
+
+
 def test_a_table_that_summarizes_each_context_fits_units_and_reuses_them() -> None:
 
     client = node_harness.local()

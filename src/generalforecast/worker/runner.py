@@ -663,8 +663,9 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
     def _compute(self, step: Step) -> dict[int, np.ndarray]:
         """Fits, page embeds, encodes, decodes and forecasts a step whose copies are applied."""
         pages = self._fit(step.fits, step.pages)
-        pages.update(self._embed_pages(step.pages, pages))
-        transient = self._encode(step.units, step.pages, pages)
+        subsets: dict[int, np.ndarray] = {}
+        pages.update(self._embed_pages(step.pages, pages, step.units, subsets))
+        transient = self._encode(step.units, step.pages, pages, subsets)
         self.stats.steps += 1
         self.stats.queries += sum(len(batch.units) for batch in step.queries)
         self.stats.queries += len(step.forecasts)
