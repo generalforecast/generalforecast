@@ -31,6 +31,7 @@ from generalforecast import protocol
 from generalforecast.constants import SAMPLE_INTERVAL
 from generalforecast.models import registry
 from generalforecast.profiling import memory
+from generalforecast.runtime.autotune import use_autotune_results
 from generalforecast.runtime.budget import MemoryBudget
 from generalforecast.runtime.device import (
     command_buffers,
@@ -79,6 +80,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     # Before `default_settings` starts JAX's backend, which reads XLA's flags.
     command_buffers()
     portable_cpu_programs()
+    use_autotune_results()
     report_fallback()
     budget = MemoryBudget.measure(workers=options.workers)
     worker = Worker(

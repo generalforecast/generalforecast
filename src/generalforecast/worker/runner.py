@@ -31,6 +31,7 @@ from generalforecast.constants import SCATTER_THREADS
 from generalforecast.models.contract import TabularFunctions, TabularProperties
 from generalforecast.models.series import SeriesFunctions, SeriesProperties
 from generalforecast.runtime import shipped
+from generalforecast.runtime.autotune import use_autotune_results
 from generalforecast.runtime.budget import Chunks, MemoryBudget, out_of_memory
 from generalforecast.runtime.decoding import PROGRAMS, Context
 from generalforecast.runtime.device import (
@@ -204,6 +205,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         """
         command_buffers()
         portable_cpu_programs()
+        use_autotune_results()
         report_fallback()
         self._settings, self._minimum = settings, bucket_minimum
         self._slot_bytes = slot_bytes

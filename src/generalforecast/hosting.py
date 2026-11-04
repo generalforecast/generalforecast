@@ -52,7 +52,12 @@ A hosted pool takes its workers' measures once per GPU type: on each,
 `measured(spec, padded_widths(columns))` gives a served model's measures,
 `keep_measures(directory / measures_identity(), spec, measures)` keeps them
 for its workers to read through `GF_MEASURES`, and `kept_measures` reads
-them back.
+them back. Its prebuild runs workers with `AUTOTUNE_ENV` naming a directory
+and `AUTOTUNE_RECORD_ENV` set to `1`, and once they end, `keep_autotune` of
+that directory keeps each GPU type's recorded autotune results; serving
+workers given `AUTOTUNE_ENV` alone load them, so every worker of a GPU type
+compiles a program to the same kernels and predicts the same, bitwise
+(`generalforecast.runtime.autotune`).
 
 Exports:
 
@@ -179,6 +184,8 @@ from generalforecast.predictors.runtime.requests import request_table
 from generalforecast.predictors.runtime.tabular import bound_order as bound_rows
 from generalforecast.predictors.spec import PredictorSpec
 from generalforecast.predictors.validation import PredictorError, bytes_digest
+from generalforecast.runtime.autotune import AUTOTUNE_ENV, keep_autotune
+from generalforecast.runtime.autotune import RECORD_ENV as AUTOTUNE_RECORD_ENV
 from generalforecast.serve.listener import binary, configuration
 from generalforecast.serve.models import catalog_model, published_entry
 from generalforecast.service.boundary import (
@@ -370,6 +377,8 @@ def kept_measures(directory: Path, spec: str) -> dict[str, Any]:
 
 __all__ = [
     "ALIASES",
+    "AUTOTUNE_ENV",
+    "AUTOTUNE_RECORD_ENV",
     "CONTEXT_ROWS_KEY",
     "DERIVED_KINDS",
     "PHYSICAL_TYPES",
@@ -430,6 +439,7 @@ __all__ = [
     "format_as_of",
     "json_object",
     "json_rows",
+    "keep_autotune",
     "keep_measures",
     "kept_measures",
     "limits",
