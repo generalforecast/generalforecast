@@ -458,3 +458,59 @@ def test_shipped_measures_read_under_this_machines_and_without_manifests(
     assert alone.measured("model", ("fit", 8), taken(0)) == 3
     assert alone.measured("model", ("fit", 64), taken(11)) == 11
     assert measured == [9, 11]
+
+
+def test_settling_waits_for_the_tasks_beside_steps() -> None:
+    import threading
+
+    from generalforecast.runtime.programs import Programs
+
+    programs = Programs(None, lambda: False, ())
+    assert not programs.settle()
+    release = threading.Event()
+    done: list[bool] = []
+
+    def task() -> None:
+        release.wait(5)
+        done.append(True)
+
+    programs.soon(task)
+    threading.Timer(0.1, release.set).start()
+    assert programs.settle()
+    assert done == [True]
+    assert not programs.settle()
+
+
+def test_settling_waits_for_a_compile_ahead_that_started_in_a_quiet_gap() -> None:
+    import threading
+
+    from generalforecast.runtime.programs import Programs
+
+    programs = Programs(None, lambda: False, ())
+    started = threading.Event()
+    release = threading.Event()
+    done: list[bool] = []
+
+    def task() -> None:
+        started.set()
+        release.wait(5)
+        done.append(True)
+
+    programs.later(task)
+    assert started.wait(5)
+    threading.Timer(0.1, release.set).start()
+    assert programs.settle()
+    assert done == [True]
+
+
+def test_settling_in_a_step_leaves_tasks_waiting_for_a_quiet_gap() -> None:
+    from generalforecast.runtime.programs import Programs
+
+    programs = Programs(None, lambda: False, ())
+    ran: list[bool] = []
+    with programs.step():
+        programs.later(lambda: ran.append(True))
+        # The task waits for the step to end; settling does not wait for it.
+        assert not programs.settle()
+    programs.wait()
+    assert ran == [True]
