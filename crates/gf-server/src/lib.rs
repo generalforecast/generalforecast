@@ -8,6 +8,7 @@ pub mod as_of;
 pub mod auth;
 pub mod budget;
 pub mod config;
+pub mod deadline;
 pub mod definition;
 pub mod engine;
 pub mod ephemeral;
