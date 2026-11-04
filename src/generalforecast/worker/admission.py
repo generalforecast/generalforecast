@@ -19,6 +19,7 @@ from generalforecast.constants import (
     AUTOTUNE_SHARE,
     FIT_CELL_BYTES,
     FIT_ROW_SCALE,
+    MEASURE_OVERSTATE,
     MEASURED_ROWS,
     MEMORY_ROWS_LIMIT,
     MEMORY_ROWS_MEASURES,
@@ -444,10 +445,13 @@ class Admission:
 
         measured = self.encode_bytes(table.model, table.features, size, fit)
         needed = needs(measured)
-        if needed > room:
-            # The profile's line through small contexts can overstate a large
-            # one's encode several times, so a context it refuses is measured
-            # at its own size before it is refused.
+        # The profile's line through small contexts can overstate a large
+        # one's encode several times, so a context it refuses is measured at
+        # its own size before it is refused: unless what it needs besides
+        # its encode, its cache and decode, does not fit either, or the line
+        # puts it so far past the device that no overstatement would bring it
+        # in. Those would compile a program larger than the device to refuse.
+        if needed > room and needs(None) <= room and needed <= MEASURE_OVERSTATE * room:
             measured = self.encode_bytes(
                 table.model, table.features, size, fit, exact=True
             )

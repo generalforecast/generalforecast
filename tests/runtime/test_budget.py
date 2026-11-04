@@ -11,6 +11,7 @@ import pytest
 
 from generalforecast.runtime import budget as budget_module
 from generalforecast.runtime.budget import (
+    UNTUNED_OPTIONS,
     Call,
     Chunks,
     MemoryBudget,
@@ -46,6 +47,23 @@ def test_a_call_takes_half_what_the_pool_leaves_within_bounds() -> None:
     ]
     assert cpu.call_bytes(0) == 2 << 30
     assert gpu.window_bytes(0) == 2 << 30
+
+
+def test_memory_held_for_a_workers_life_leaves_the_rest_to_divide() -> None:
+    # A 24 GB GPU's 16.5 GiB, 5 GiB of it the parameters of every catalog
+    # model: the pool and a call take shares of what is left, so together
+    # with the parameters they fit the device.
+    unheld = MemoryBudget(16 << 30, 64 << 30, cpu=False)
+    gpu = unheld.holding(5 << 30)
+    cpu = MemoryBudget(16 << 30, 64 << 30, cpu=True)
+
+    def taken(budget: MemoryBudget) -> int:
+        pool = budget.device_tier
+        return (5 << 30) + pool + 2 * budget.call_bytes(pool)
+
+    assert gpu.device == 11 << 30
+    assert taken(gpu) <= 16 << 30 < taken(unheld)
+    assert cpu.holding(5 << 30) == cpu
 
 
 @pytest.mark.parametrize(
@@ -215,7 +233,7 @@ def test_measuring_a_kind_counts_under_the_call_that_reuses_its_program(
 ) -> None:
     # Measuring a kind compiles its program, which the call that follows
     # runs, so the time is the stage's, as a compile in a call is.
-    def measured_slowly(call: Call) -> int:
+    def measured_slowly(call: Call, untuned: bool = False) -> int:
         time.sleep(0.05)
         return 0
 
@@ -574,3 +592,192 @@ def test_a_kinds_first_call_at_a_count_is_seen_though_compiled_before() -> None:
     _run(chunks, doubled, items, 8 * items[0].nbytes)
 
     assert seen == [2]
+
+
+def test_a_call_that_runs_out_of_memory_beside_a_compile_runs_again_once_it_is_done() -> (
+    None
+):
+    compiling = [True]
+    sizes: list[int] = []
+
+    def crowded(values: np.ndarray) -> np.ndarray:
+        sizes.append(len(values))
+        # A compile beside the call holds the device's memory as it autotunes.
+        if compiling[0]:
+            raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: Out of memory")
+        return values
+
+    def settle() -> bool:
+        was = compiling[0]
+        compiling[0] = False
+        return was
+
+    chunks = Chunks(lambda *_: None)
+    chunks.settle = settle
+    items = np.ones((3, 4), np.float32)
+
+    # Even a lone item runs again rather than raising, at its size.
+    assert _run(chunks, crowded, items[:1], 8 * items[0].nbytes) == [1]
+    assert sizes == [1, 1]
+
+    # With nothing beside it, a call that runs out halves as before.
+    compiling[0] = True
+    sizes.clear()
+    chunks.settle = lambda: False
+    with pytest.raises(jax.errors.JaxRuntimeError, match="RESOURCE_EXHAUSTED"):
+        _run(chunks, crowded, items[:1], 8 * items[0].nbytes)
+    assert sizes == [1]
+
+
+def test_a_call_too_large_to_autotune_beside_the_device_s_holdings_compiles_without_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast.runtime import budget
+
+    jitted = jax.jit(lambda values: values * 2)
+    tuned: list[int] = []
+
+    class Autotuned:
+        """A program that would autotune if called as it is."""
+
+        def __call__(self, values: Any) -> Any:
+            tuned.append(len(values))
+            return jitted(values)
+
+        def lower(self, *arguments: Any) -> Any:
+            return jitted.lower(*arguments)
+
+    compiled: list[dict] = []
+    real = jax.stages.Lowered.compile
+
+    def compile(lowered: Any, compiler_options: Any = None) -> Any:
+        compiled.append(compiler_options or {})
+        return real(lowered, compiler_options=compiler_options)
+
+    monkeypatch.setattr(jax.stages.Lowered, "compile", compile)
+    items = np.arange(8, dtype=np.float32).reshape(2, 4)
+    program = Autotuned()
+
+    def prepare(first: int, stop: int, padded: int) -> Call:
+        return Call(program, (), (items[first:stop],), padded)
+
+    outputs: list[np.ndarray] = []
+
+    def consume(first: int, stop: int, values: Any) -> None:
+        outputs.append(np.asarray(values))
+
+    # Room for the call's items twice over: it runs as compiled, autotuned.
+    monkeypatch.setattr(budget, "free_device_bytes", lambda: 1 << 20)
+    chunks = Chunks(lambda *_: None)
+    chunks.run("decode", "roomy", 2, 1 << 20, lambda: 32, prepare, consume)
+    assert tuned == [2]
+
+    # Less than twice its items free: its program compiles without autotuning.
+    monkeypatch.setattr(budget, "free_device_bytes", lambda: 100)
+    tuned.clear()
+    compiled.clear()
+    chunks.run("decode", "crowded", 2, 1 << 20, lambda: 32, prepare, consume)
+    assert tuned == []
+    assert UNTUNED_OPTIONS in compiled
+    np.testing.assert_array_equal(outputs[-1], items * 2)
+
+    # Where the device does not say, as on a CPU, nothing changes: a program
+    # of its own, as the untuned one serves the last one's shapes.
+    monkeypatch.setattr(budget, "free_device_bytes", lambda: None)
+    program = Autotuned()
+    chunks.run("decode", "cpu", 2, 1 << 20, lambda: 32, prepare, consume)
+    assert tuned == [2]
+
+
+def test_a_program_compiled_without_autotuning_compiles_with_it_once_there_is_room(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast.runtime import budget
+
+    jitted = jax.jit(lambda values: values * 2)
+
+    class Program:
+        def __call__(self, values: Any) -> Any:
+            return jitted(values)
+
+        def lower(self, *arguments: Any) -> Any:
+            return jitted.lower(*arguments)
+
+    compiled: list[dict] = []
+    real = jax.stages.Lowered.compile
+
+    def compile(lowered: Any, compiler_options: Any = None) -> Any:
+        compiled.append(compiler_options or {})
+        return real(lowered, compiler_options=compiler_options)
+
+    monkeypatch.setattr(jax.stages.Lowered, "compile", compile)
+    items = np.arange(8, dtype=np.float32).reshape(2, 4)
+    program = Program()
+
+    def prepare(first: int, stop: int, padded: int) -> Call:
+        return Call(program, (), (items[first:stop],), padded)
+
+    outputs: list[np.ndarray] = []
+    chunks = Chunks(lambda *_: None)
+    gaps: list[Any] = []
+    chunks.later = gaps.append
+    free = [100]
+    monkeypatch.setattr(budget, "free_device_bytes", lambda: free[0])
+
+    def run() -> None:
+        chunks.run(
+            "decode",
+            "key",
+            2,
+            1 << 20,
+            lambda: 32,
+            prepare,
+            lambda first, stop, values: outputs.append(np.asarray(values)),
+        )
+
+    run()
+    # Untuned for want of room, with a tuned compile waiting for a quiet gap.
+    assert compiled[-1] == UNTUNED_OPTIONS and len(gaps) == 1
+    # No room in that gap either: it stays untuned, and the next call asks again.
+    gaps.pop()()
+    assert compiled[-1] == UNTUNED_OPTIONS
+    run()
+    assert len(gaps) == 1
+    free[0] = 1 << 20
+    gaps.pop()()
+    assert compiled[-1] == {}
+    run()
+    # Tuned now, it asks for nothing more, and answers as before.
+    assert not gaps
+    np.testing.assert_array_equal(outputs[-1], items * 2)
+
+
+def test_a_kinds_first_measure_compiles_untuned_past_a_quarter_of_free_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast.runtime import budget
+
+    measures: list[bool] = []
+    real = budget.measured_bytes
+
+    def measured(call: Call, untuned: bool = False) -> int:
+        measures.append(untuned)
+        return real(call, untuned)
+
+    monkeypatch.setattr(budget, "measured_bytes", measured)
+    doubled = jax.jit(lambda rows: rows * 2)
+    # Two items of 16 bytes by the estimate: a call of 32 bytes.
+    items = np.ones((2, 4), np.float32)
+
+    # Room for its call four times over: it measures as it compiles, tuned.
+    monkeypatch.setattr(budget, "free_device_bytes", lambda: 128)
+    assert _run(Chunks(lambda *_: None), doubled, items, 1 << 20) == [2]
+    # Less than that, though twice its call is free: its autotuner would
+    # time kernels the measure cannot yet size beside what the device holds,
+    # so the measure compiles without autotuning.
+    monkeypatch.setattr(budget, "free_device_bytes", lambda: 127)
+    assert _run(Chunks(lambda *_: None), doubled, items, 1 << 20) == [2]
+    # Where the device does not say, as on a CPU, it measures tuned.
+    monkeypatch.setattr(budget, "free_device_bytes", lambda: None)
+    assert _run(Chunks(lambda *_: None), doubled, items, 1 << 20) == [2]
+    assert measures == [False, True, False]
