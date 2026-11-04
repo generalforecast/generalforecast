@@ -526,6 +526,42 @@ def test_a_model_whose_measured_contexts_overfill_the_device_reads_fewer_rows() 
     assert adaptive.describe().context_rows == small
 
 
+@pytest.mark.slow
+def test_the_device_cap_measures_no_encode_that_could_not_bring_a_size_in(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = node_harness.local()
+    worker = client._worker
+    small, large = MEASURED_ROWS, 2 * MEASURED_ROWS
+    first = _table(client, name="first", model=TABICL)
+    (loaded,) = worker._models
+    layout = worker.layout(loaded, 5)
+    # A pool that holds `small` rows of the model's cache and not `large`, on
+    # a device with room for either's encode: `large` is refused by its slots
+    # whatever its encode takes, so compiling that encode to measure it, as
+    # the search once did for each size the profiles refused, is for nothing.
+    pool = layout.slots(small) * worker._slot_bytes
+    assert layout.slots(large) * worker._slot_bytes > pool
+    monkeypatch.setattr(worker, "_pool_bytes", pool)
+    worker.budget = dataclasses.replace(
+        worker.budget, device=pool + (64 << 30), cpu=False
+    )
+    measured: list[int] = []
+    encode_bytes = worker.encode_bytes
+
+    def spied(
+        model: int, features: int, rows: int, fit: bool = False, exact: bool = False
+    ) -> int | None:
+        if exact:
+            measured.append(rows)
+        return encode_bytes(model, features, rows, fit, exact)
+
+    monkeypatch.setattr(worker, "encode_bytes", spied)
+    assert worker.memory_rows(loaded, 5) == small
+    assert large not in measured
+    del first
+
+
 def test_representations_are_reused_until_their_page_changes() -> None:
     client = node_harness.local()
     rows = _table(client, strategy=generalforecast.Strategy.neighbors(16))
@@ -595,6 +631,46 @@ def test_appends_that_change_a_querys_neighbors_need_no_new_decode() -> None:
     # A paged decode's shape follows its rows, not the slots they span, so an
     # accelerator compiles, measures and warms no new one.
     assert before and decodes() == before
+
+
+def test_a_paged_decode_takes_one_state_per_table_however_many_contexts_it_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = node_harness.local()
+    worker = client._worker
+    calls: list[tuple[int, set[int]]] = []
+    paged = worker._compiled_paged
+
+    def recording(compiled: Any) -> Any:
+        def call(
+            parameters: Any, source: Any, states: Any, index: Any, *rest: Any
+        ) -> Any:
+            calls.append(
+                (len(index), {leaf.shape[0] for leaf in jax.tree.leaves(states)})
+            )
+            return compiled(parameters, source, states, index, *rest)
+
+        return call
+
+    monkeypatch.setattr(
+        worker, "_compiled_paged", lambda *settings: recording(paged(*settings))
+    )
+    # Each query's context a decoding of its own, as a table too large for a
+    # decoding to read several of its queries' contexts makes them.
+    monkeypatch.setattr(worker, "_packed", lambda groups, units: [[g] for g in groups])
+    rows = _table(client, strategy=generalforecast.Strategy.neighbors(16))
+    features, targets = _clusters(256)
+    rows.insert(np.arange(256), features, targets)
+    queries = np.random.default_rng(2).normal(size=(24, 5)).astype(np.float32)
+
+    together = rows.predict(queries)
+    alone = np.concatenate([rows.predict(queries[[i]]) for i in range(len(queries))])
+
+    # Each query reads a context of its own, many to a call, and every item
+    # indexes the one state its table has: no copy of it for each.
+    assert max(items for items, _ in calls) > 1
+    assert all(states == {1} for _, states in calls)
+    np.testing.assert_allclose(together, alone, rtol=1e-5, atol=1e-6)
 
 
 def test_steps_of_more_queries_after_a_decode_compile_no_decode() -> None:
