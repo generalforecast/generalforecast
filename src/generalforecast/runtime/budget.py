@@ -301,15 +301,18 @@ def _shapes(tree: Any) -> Any:
     )
 
 
-# Stages each of whose items is a whole context's encode, which fills the
-# device alone: a padded item costs as much as a real one, and a call more
-# costs little, so their calls are never padded.
+# Stages each of whose items is a whole context's encode, and the most of
+# them a call may hold for its items to count as large: a padded item then
+# costs about what a real one does, and a call more costs little, so such
+# calls are not padded. Small contexts, of which a call holds many, still pad
+# to their bucket, in one call and one program.
 WHOLE_CONTEXT_STAGES = frozenset({"encode", "fit_encode"})
+LARGE_ITEMS = 128
 
 
-def _unpadded(stage: str, padded: int, left: int) -> int:
-    """`padded`, or for `stage`'s whole contexts, the most powers of two `left` items fill."""
-    if stage not in WHOLE_CONTEXT_STAGES or left >= padded:
+def _unpadded(stage: str, padded: int, left: int, size: int) -> int:
+    """`padded`, or for `stage`'s large contexts, the most powers of two `left` items fill."""
+    if stage not in WHOLE_CONTEXT_STAGES or size > LARGE_ITEMS or left >= padded:
         return padded
     return 1 << (left.bit_length() - 1)
 
@@ -330,9 +333,9 @@ class Chunks:
     A run of more items than a chunk pads its last call to the chunk, and a
     run of fewer pads its one call to their bucket, so a kind of call
     compiles for the chunk and for the buckets below it that single calls
-    take, not for every remainder. A stage of whole contexts' encodes is not
-    padded: its items go in calls of the powers of two they fill, nineteen
-    as sixteen, two and one.
+    take, not for every remainder. Encodes of contexts so large that a call
+    holds at most `LARGE_ITEMS` are not padded: they go in calls of the
+    powers of two they fill, nineteen as sixteen, two and one.
     """
 
     def __init__(
@@ -465,7 +468,7 @@ class Chunks:
             size = self.size(key, budget, estimate)
             if buckets is None:
                 padded = size if count > size else bucket_size(count, 1)
-                padded = _unpadded(stage, padded, count - first)
+                padded = _unpadded(stage, padded, count - first, size)
             else:
                 padded = _bucket_of(buckets, count - first, size)
             own = padded
