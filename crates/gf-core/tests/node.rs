@@ -2137,6 +2137,52 @@ fn a_regression_core_offered_to_a_router_is_the_one_planned() {
 }
 
 #[test]
+fn retrieved_contexts_past_what_the_device_holds_are_cut_to_it() {
+    let mut node = node(64);
+    // A predictor's lock: a core and neighbors filling the model's trained
+    // length, 24 rows, on a device that holds 16 in one context.
+    let locked = Strategy::Retrieved {
+        core: Some(gf_core::planner::Core {
+            rows: 6,
+            seed: 0,
+            kind: CoreKind::Stratified,
+        }),
+        neighbors: 18,
+        among: None,
+        recency: None,
+    };
+    let on_device = |strategy| TableSpec {
+        device_rows: NonZeroU64::new(16),
+        ..spec(strategy)
+    };
+    let table = node.create_table(on_device(locked)).unwrap();
+    let (keys, features, targets) = rows(64);
+    node.insert(table, &keys, &features, targets.clone())
+        .unwrap();
+
+    // Under the default `past_cap`, whatever the model's own cap.
+    assert_eq!(node.spec(table).unwrap().strategy, locked.capped(16));
+    node.submit(table, &A).unwrap();
+    let step = run(&mut node);
+    assert!(!step.units().is_empty());
+    assert!(step.units().iter().all(|unit| unit.rows.len() <= 16));
+    // A strategy set later is cut too.
+    node.set_strategy(table, Strategy::neighbors(40)).unwrap();
+    assert_eq!(node.strategy(table).unwrap(), Strategy::neighbors(16));
+
+    // Contexts every query shares are kept in the pool, so they stay.
+    let shared = Strategy::subsample(24, 0, CoreKind::Stratified);
+    for strategy in [Strategy::Exact, shared, Strategy::AdaptiveWhole] {
+        let table = node.create_table(on_device(strategy)).unwrap();
+        assert_eq!(node.spec(table).unwrap().strategy, strategy);
+    }
+    // As does a retrieved one within the device.
+    let within = Strategy::neighbors(16);
+    let table = node.create_table(on_device(within)).unwrap();
+    assert_eq!(node.spec(table).unwrap().strategy, within);
+}
+
+#[test]
 fn contexts_past_the_models_length_are_cut_or_reported_once() {
     let mut node = node(64);
     let capped = |past_cap| TableSpec {

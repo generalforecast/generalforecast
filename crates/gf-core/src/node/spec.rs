@@ -460,9 +460,38 @@ impl TableSpec {
         }
     }
 
-    /// `strategy` cut to the contexts `clamp` allows.
+    /// `strategy` cut to the contexts `clamp` allows, and a retrieved one
+    /// whose per-query contexts the worker's device could not hold cut to
+    /// `device_rows`, whatever `past_cap` says.
+    ///
+    /// A retrieved strategy with neighbors gives each query a context of its
+    /// own, encoded and decoded beside the device pool rather than kept in
+    /// it, so one past `device_rows` would be refused on every step; a
+    /// predictor locks such a strategy from the model's trained length,
+    /// which a smaller device cannot hold (Mitra-2's 5,120 rows on a 24 GB
+    /// GPU). Cut to the device, it keeps its core, as `Strategy::capped`
+    /// does, and reads fewer neighbors. A context every query shares, as an
+    /// exact or core-only strategy reads, is kept in the pool and held to
+    /// what that holds instead, and an adaptive one resolves against the
+    /// device already (`Strategy::resolve_on`).
     pub(super) fn clamped(&self, strategy: Strategy) -> Strategy {
-        self.clamp().map_or(strategy, |rows| strategy.capped(rows))
+        let strategy = self.clamp().map_or(strategy, |rows| strategy.capped(rows));
+        match (strategy, self.device_rows) {
+            (
+                Strategy::Retrieved {
+                    core, neighbors, ..
+                },
+                Some(device),
+            ) if neighbors > 0
+                && core
+                    .map_or(0, |core| core.rows)
+                    .saturating_add(neighbors as u64)
+                    > device.get() =>
+            {
+                strategy.capped(device.get())
+            }
+            _ => strategy,
+        }
     }
 
     /// The keys of this table's entries in its state of `epoch`.
