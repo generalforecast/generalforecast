@@ -111,14 +111,20 @@ impl Standardizer {
     /// A row's retrieval vector: standardized, with missing values at 0, and
     /// each encoded categorical feature's block in its place.
     pub(super) fn vector(&self, row: &[f32]) -> Vec<f32> {
-        let mut lookups = self.lookups.iter().peekable();
         let mut vector = Vec::with_capacity(row.len() - self.skip);
+        self.extend(row, &mut vector);
+        vector
+    }
+
+    /// Appends a row's retrieval vector, as `vector` gives it, to `vector`.
+    pub(super) fn extend(&self, row: &[f32], vector: &mut Vec<f32>) {
+        let mut lookups = self.lookups.iter().peekable();
         let values = row[self.skip..]
             .iter()
             .zip(self.center.iter().zip(&self.scale));
         for (feature, (&value, (center, scale))) in values.enumerate() {
             if let Some((_, lookup)) = lookups.next_if(|(at, _)| *at == feature) {
-                lookup.extend(value, &mut vector);
+                lookup.extend(value, vector);
                 continue;
             }
             let standardized = (value - center) / scale;
@@ -128,7 +134,6 @@ impl Standardizer {
                 0.0
             });
         }
-        vector
     }
 }
 
@@ -145,6 +150,18 @@ impl Vectors for Scaled<'_> {
             .standardizer
             .expect("rows are scaled before they are placed")
             .vector(&features))
+    }
+
+    fn extend_vectors(&self, rows: &[RowId], into: &mut Vec<f32>) -> Result<(), RowsError> {
+        let standardizer = self
+            .standardizer
+            .expect("rows are scaled before they are placed");
+        let (features, _) = self.rows.gather(rows)?;
+        let width = features.len() / rows.len().max(1);
+        for row in features.chunks_exact(width.max(1)) {
+            standardizer.extend(row, into);
+        }
+        Ok(())
     }
 }
 

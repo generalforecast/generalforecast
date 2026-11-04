@@ -10,7 +10,7 @@ use std::num::{NonZeroU64, NonZeroUsize};
 mod support;
 
 use gf_core::context::{Context, Fingerprint};
-use gf_core::pages::{Bucket, IndexError, PageId, PageIndex};
+use gf_core::pages::{Bucket, Dense, IndexError, PageId, PageIndex};
 use gf_core::series::{SeriesError, SeriesIndex, SeriesKey, with_window};
 use gf_core::table::{RowId, Version};
 use gf_core::time_index::TimeIndex;
@@ -641,5 +641,79 @@ fn series_windows_match_a_naive_list_through_random_changes() {
                 .collect();
             assert_eq!(after.rows, expected, "after of {series:?} from {cutoff}");
         }
+    }
+}
+
+#[test]
+fn a_scan_finds_exactly_the_rows_nearest_rows_finds() {
+    // The last spread puts float32's squared differences among subnormals.
+    let runs = [(2usize, 1.0f32), (9, 1.0), (40, 1.0), (9, 1e-23)];
+    for (run, (dimensions, spread)) in (1u32..).zip(runs) {
+        let mut noise = Noise(11 + u64::from(run));
+        let mut index = PageIndex::new(
+            NonZeroUsize::new(dimensions).unwrap(),
+            NonZeroUsize::new(PAGE).unwrap(),
+        );
+        // Each run's rows of their own, as the kept vectors are per row id.
+        let first = run * 1_000;
+        let mut placed: Vec<Vec<f32>> = Vec::new();
+        for row in first..first + 900 {
+            // Every fifth row repeats one before it, so equal distances tie.
+            let vector: Vec<f32> = if row % 5 == 4 {
+                placed[(row as usize * 7) % placed.len()].clone()
+            } else {
+                (0..dimensions)
+                    .map(|_| noise.next() * 30.0 * spread)
+                    .collect()
+            };
+            index
+                .put(RowId(row), Bucket(u64::from(row % 2)), &vector)
+                .unwrap();
+            placed.push(vector);
+        }
+        for row in (first..first + 900).step_by(7) {
+            index.take(RowId(row)).unwrap();
+        }
+        let allowed: Context = (first..first + 900)
+            .filter(|row| row % 4 != 1)
+            .map(RowId)
+            .collect();
+        // Rows taken out keep no vector; the scan reads only the rows held.
+        let held: Context = allowed
+            .iter()
+            .filter(|row| (row.0 - first) % 7 != 0)
+            .collect();
+        let dense = Dense::read(&held, dimensions, &Kept, &Kept).unwrap();
+        let scan = index.scan(&allowed, &dense);
+        let queries: Vec<Vec<f32>> = (0..20)
+            .map(|query| {
+                if query % 4 == 0 {
+                    // Exactly on a row, and on its repeats.
+                    placed[query * 13].clone()
+                } else {
+                    (0..dimensions)
+                        .map(|_| noise.next() * 35.0 * spread)
+                        .collect()
+                }
+            })
+            .collect();
+        let points: Vec<&[f32]> = queries.iter().map(Vec::as_slice).collect();
+        for count in [1, 7, 50, 300, 2_000] {
+            let scanned = scan.nearest(&points, count).unwrap();
+            for (query, found) in points.iter().zip(&scanned) {
+                assert_eq!(
+                    *found,
+                    index
+                        .nearest_rows(query, count, &allowed, &Kept, &Kept)
+                        .unwrap(),
+                    "{dimensions} dimensions, spread {spread}, count {count}"
+                );
+            }
+        }
+        assert_eq!(
+            scan.nearest(&points, 0).unwrap(),
+            vec![Context::new(); points.len()]
+        );
+        assert!(scan.nearest(&[&[0.0][..]], 3).is_err());
     }
 }

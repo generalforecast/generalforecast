@@ -1106,8 +1106,8 @@ pub fn plan_with(
 const DENSE_QUERIES: usize = 16;
 
 /// Each of `members`' `count` nearest rows within `outside`, as
-/// `PageIndex::nearest_rows` finds them, with the rows read once and the
-/// queries searched side by side on the host's cores.
+/// `PageIndex::nearest_rows` finds them, from one `Scan` of the rows read
+/// once, with the queries split among the host's cores.
 fn nearest_dense(
     source: &Source<'_>,
     outside: &Context,
@@ -1118,7 +1118,7 @@ fn nearest_dense(
     let dimensions = queries[members[0]].as_ref().len();
     let dense =
         Dense::read(outside, dimensions, source.vectors, source.keys).map_err(IndexError::from)?;
-    let index = source.index;
+    let scan = source.index.scan(outside, &dense);
     let threads = std::thread::available_parallelism()
         .map_or(1, std::num::NonZeroUsize::get)
         .min(members.len());
@@ -1131,13 +1131,8 @@ fn nearest_dense(
         let handles: Vec<_> = points
             .chunks(share)
             .map(|chunk| {
-                let dense = &dense;
-                scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|point| index.nearest_rows(point, count, outside, dense, dense))
-                        .collect::<Result<Vec<_>, _>>()
-                })
+                let scan = &scan;
+                scope.spawn(move || scan.nearest(chunk, count))
             })
             .collect();
         handles

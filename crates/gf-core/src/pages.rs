@@ -83,6 +83,19 @@ pub trait Vectors {
     fn squared_to(&self, row: RowId, point: &[f32]) -> Result<f64, RowsError> {
         Ok(squared(&self.vector(row)?, point))
     }
+
+    /// `rows`' vectors, one after another, appended to `into`: as `vector`
+    /// gives each, read as a store reads many rows at once where it can.
+    ///
+    /// # Errors
+    ///
+    /// If a row's values cannot be read.
+    fn extend_vectors(&self, rows: &[RowId], into: &mut Vec<f32>) -> Result<(), RowsError> {
+        for &row in rows {
+            into.extend(self.vector(row)?);
+        }
+        Ok(())
+    }
 }
 
 /// Rows' vectors and keys read once into flat buffers, so a plan of many
@@ -117,11 +130,17 @@ impl Dense {
             values: Vec::with_capacity(count.saturating_mul(dimensions)),
             keys: Vec::with_capacity(count),
         };
+        let mut chunk = Vec::with_capacity(DENSE_READ_ROWS);
         for row in rows.iter() {
             dense.slots[row.0 as usize] = dense.keys.len() as u32;
-            dense.values.extend(vectors.vector(row)?);
             dense.keys.push(keys.key(row));
+            chunk.push(row);
+            if chunk.len() == DENSE_READ_ROWS {
+                vectors.extend_vectors(&chunk, &mut dense.values)?;
+                chunk.clear();
+            }
         }
+        vectors.extend_vectors(&chunk, &mut dense.values)?;
         Ok(dense)
     }
 
@@ -135,8 +154,118 @@ impl Dense {
     }
 
     fn values(&self, row: RowId) -> &[f32] {
-        let start = self.slot(row) * self.dimensions;
+        self.at(self.slot(row))
+    }
+
+    fn at(&self, slot: usize) -> &[f32] {
+        let start = slot * self.dimensions;
         &self.values[start..start + self.dimensions]
+    }
+}
+
+/// Rows a `Dense` read at a time, so a store reads many rows of a block together.
+const DENSE_READ_ROWS: usize = 4096;
+
+/// The rows of a set that an index holds, in a `Dense`, to search by scanning
+/// them all for many queries at once: `PageIndex::scan` makes one.
+#[derive(Debug)]
+pub struct Scan<'a> {
+    dense: &'a Dense,
+    dimensions: usize,
+    slots: Vec<u32>,
+    rows: Vec<RowId>,
+}
+
+/// Queries a scan measures against each row while the row is in cache.
+const SCAN_QUERIES: usize = 8;
+
+impl Scan<'_> {
+    /// Each query's `count` nearest rows, exactly the rows `nearest_rows` finds.
+    ///
+    /// Every row's distance to a block of queries is first measured in
+    /// float32, eight lanes at a time. The float32 sum of a distance's terms
+    /// is within `(dimensions + 32)` units of float32 rounding of the true
+    /// distance, relatively, and `squared`'s float64 sum within
+    /// `(dimensions + 2)` of float64's, away from float32's subnormal range,
+    /// where its error is at most a few `f32::MIN_POSITIVE` per term. So the
+    /// rows whose float32 distance is within those bounds of the `count`th
+    /// nearest by float32 hold every row nearest by `squared`; those alone
+    /// are measured by `squared` and ranked as `nearest_rows` ranks them,
+    /// ties to the lower key.
+    ///
+    /// # Errors
+    ///
+    /// If a query has the wrong length or a non-finite coordinate.
+    pub fn nearest(&self, queries: &[&[f32]], count: usize) -> Result<Vec<Context>, IndexError> {
+        for query in queries {
+            if query.len() != self.dimensions {
+                return Err(IndexError::Dimensions {
+                    expected: self.dimensions,
+                    got: query.len(),
+                });
+            }
+            if query.iter().any(|value| !value.is_finite()) {
+                return Err(IndexError::NotFinite);
+            }
+        }
+        if count == 0 {
+            return Ok(vec![Context::new(); queries.len()]);
+        }
+        if self.rows.len() <= count {
+            let every: Context = self.rows.iter().copied().collect();
+            return Ok(vec![every; queries.len()]);
+        }
+        let rows = self.rows.len();
+        let float32 = (self.dimensions as f64 + 32.0) * f64::from(f32::EPSILON) / 2.0;
+        let float64 = (self.dimensions as f64 + 2.0) * f64::EPSILON / 2.0;
+        let widen = (1.0 + float32) / (1.0 - float32) * (1.0 + float64) / (1.0 - float64);
+        let underflow = 4.0 * (self.dimensions as f64 + 3.0) * f64::from(f32::MIN_POSITIVE);
+        let mut found = Vec::with_capacity(queries.len());
+        let mut measured = vec![0.0f32; SCAN_QUERIES * rows];
+        let mut order: Vec<u32> = Vec::with_capacity(rows);
+        for block in queries.chunks(SCAN_QUERIES) {
+            for (index, &slot) in self.slots.iter().enumerate() {
+                let values = self.dense.at(slot as usize);
+                for (place, query) in block.iter().enumerate() {
+                    measured[place * rows + index] = squared32(query, values);
+                }
+            }
+            for (place, query) in block.iter().enumerate() {
+                let distances = &measured[place * rows..(place + 1) * rows];
+                order.clear();
+                order.extend(0..rows as u32);
+                order.select_nth_unstable_by(count - 1, |&left, &right| {
+                    distances[left as usize].total_cmp(&distances[right as usize])
+                });
+                let farthest = order[..count]
+                    .iter()
+                    .map(|&index| f64::from(distances[index as usize]))
+                    .fold(0.0f64, f64::max);
+                // Twice the widening, once for the count-th row's own bound
+                // and once for the candidate's, and room for float32
+                // underflow, whose error is absolute rather than relative.
+                let within = farthest * widen * widen * (1.0 + 1e-9) + underflow;
+                let mut near: Vec<Near> = distances
+                    .iter()
+                    .enumerate()
+                    .filter(|&(_, &distance)| f64::from(distance) <= within)
+                    .map(|(index, _)| {
+                        let slot = self.slots[index] as usize;
+                        Near(
+                            squared(self.dense.at(slot), query),
+                            self.dense.keys[slot],
+                            self.rows[index],
+                        )
+                    })
+                    .collect();
+                if near.len() > count {
+                    near.select_nth_unstable(count - 1);
+                    near.truncate(count);
+                }
+                found.push(near.into_iter().map(|Near(_, _, row)| row).collect());
+            }
+        }
+        Ok(found)
     }
 }
 
@@ -1050,6 +1179,23 @@ impl PageIndex {
             .filter(|&page| held[page as usize])
             .map(PageId)
             .collect()
+    }
+
+    /// The rows of `allowed` the index holds, to search by `Scan::nearest`
+    /// from `dense`, which read them.
+    #[must_use]
+    pub fn scan<'a>(&self, allowed: &Context, dense: &'a Dense) -> Scan<'a> {
+        let rows: Vec<RowId> = allowed
+            .iter()
+            .filter(|&row| self.assignment.get(row).is_some())
+            .collect();
+        let slots = rows.iter().map(|&row| dense.slot(row) as u32).collect();
+        Scan {
+            dense,
+            dimensions: self.dimensions,
+            slots,
+            rows,
+        }
     }
 
     /// The `count` rows within `allowed` nearest `query`, by exact distance,
