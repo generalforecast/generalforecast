@@ -6,6 +6,7 @@
 import dataclasses
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 from generalforecast.models import catalog
@@ -27,7 +28,7 @@ UPGRADE = (
 )
 
 
-def _checked(root: Path, *, cap: int | None = None) -> tuple[dict, dict, object]:
+def _checked(root: Path, *, cap: int | None = None) -> tuple[dict, dict, pa.Table]:
     """The lock `gf check` writes for a directory, its manifest and its rows.
 
     `cap` stands in for an older gf whose catalog capped the model's context
