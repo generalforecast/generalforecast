@@ -597,6 +597,46 @@ def test_appends_that_change_a_querys_neighbors_need_no_new_decode() -> None:
     assert before and decodes() == before
 
 
+def test_a_paged_decode_takes_one_state_per_table_however_many_contexts_it_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = node_harness.local()
+    worker = client._worker
+    calls: list[tuple[int, set[int]]] = []
+    paged = worker._compiled_paged
+
+    def recording(compiled: Any) -> Any:
+        def call(
+            parameters: Any, source: Any, states: Any, index: Any, *rest: Any
+        ) -> Any:
+            calls.append(
+                (len(index), {leaf.shape[0] for leaf in jax.tree.leaves(states)})
+            )
+            return compiled(parameters, source, states, index, *rest)
+
+        return call
+
+    monkeypatch.setattr(
+        worker, "_compiled_paged", lambda *settings: recording(paged(*settings))
+    )
+    # Each query's context a decoding of its own, as a table too large for a
+    # decoding to read several of its queries' contexts makes them.
+    monkeypatch.setattr(worker, "_packed", lambda groups, units: [[g] for g in groups])
+    rows = _table(client, strategy=generalforecast.Strategy.neighbors(16))
+    features, targets = _clusters(256)
+    rows.insert(np.arange(256), features, targets)
+    queries = np.random.default_rng(2).normal(size=(24, 5)).astype(np.float32)
+
+    together = rows.predict(queries)
+    alone = np.concatenate([rows.predict(queries[[i]]) for i in range(len(queries))])
+
+    # Each query reads a context of its own, many to a call, and every item
+    # indexes the one state its table has: no copy of it for each.
+    assert max(items for items, _ in calls) > 1
+    assert all(states == {1} for _, states in calls)
+    np.testing.assert_allclose(together, alone, rtol=1e-5, atol=1e-6)
+
+
 def test_steps_of_more_queries_after_a_decode_compile_no_decode() -> None:
     jax.config.update("jax_enable_compilation_cache", False)
     compiled: list[str] = []
