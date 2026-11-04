@@ -141,7 +141,7 @@
         "quantile_step": null
       },
       "gates": {
-        "predictor": false,
+        "predictor": true,
         "remote": true,
         "variants": [
           "remote"
@@ -166,7 +166,7 @@
         "quantile_step": 0.001
       },
       "gates": {
-        "predictor": false,
+        "predictor": true,
         "remote": true,
         "variants": [
           "remote"
@@ -191,7 +191,7 @@
         "quantile_step": null
       },
       "gates": {
-        "predictor": false,
+        "predictor": true,
         "remote": true,
         "variants": [
           "remote"
@@ -216,7 +216,7 @@
         "quantile_step": 0.001
       },
       "gates": {
-        "predictor": false,
+        "predictor": true,
         "remote": true,
         "variants": [
           "remote"
@@ -241,7 +241,7 @@
         "quantile_step": null
       },
       "gates": {
-        "predictor": false,
+        "predictor": true,
         "remote": true,
         "variants": [
           "remote"
@@ -266,7 +266,7 @@
         "quantile_step": 0.001
       },
       "gates": {
-        "predictor": false,
+        "predictor": true,
         "remote": true,
         "variants": [
           "remote"
@@ -452,7 +452,7 @@
         "quantile_step": null
       },
       "gates": {
-        "predictor": false,
+        "predictor": true,
         "remote": true,
         "variants": [
           "remote"
@@ -477,7 +477,7 @@
         "quantile_step": 0.001
       },
       "gates": {
-        "predictor": false,
+        "predictor": true,
         "remote": true,
         "variants": [
           "remote"
