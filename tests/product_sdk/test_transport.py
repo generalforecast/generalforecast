@@ -16,8 +16,15 @@ import pytest
 
 from generalforecast.async_client import AsyncClient
 from generalforecast.client import Client
+from generalforecast.service.boundary import MAX_BYTES, MAX_NODES, RESPONSE_MAX_BYTES
 from generalforecast.service.contracts import ServiceError
-from generalforecast.transport import AsyncTransport, Profile, Transport, endpoint
+from generalforecast.transport import (
+    AsyncTransport,
+    Profile,
+    Transport,
+    endpoint,
+    response_value,
+)
 
 
 @pytest.mark.parametrize("client_type", [Client, AsyncClient])
@@ -376,10 +383,10 @@ def test_async_redirect_revocation_cookie_and_response_bounds(monkeypatch):
         for path, code in (
             ("/redirect", "RedirectRefused"),
             ("/revoked", "Unauthorized"),
-            ("/large", "ProtocolError"),
+            ("/large", "CapacityExceeded"),
         ):
             if path == "/large":
-                monkeypatch.setattr(module, "MAX_BYTES", 20)
+                monkeypatch.setattr(module, "RESPONSE_MAX_BYTES", 20)
             with pytest.raises(ServiceError) as error:
                 await transport.send("GET", path, None, {})
             assert error.value.code == code and "fixture-key" not in str(error.value)
@@ -780,6 +787,88 @@ def test_a_download_past_its_limit_is_capacity_exceeded(asynchronous):
         server.shutdown()
         server.server_close()
         worker.join()
+
+
+# A regressor's answer for 99 levels a row: past 1 MiB and `MAX_NODES` at
+# about 360 and 640 rows, as staging answered 512 query rows.
+LEVELS = [round(level / 100, 2) for level in range(1, 100)]
+WIDE_PREDICTION = {
+    "model": "general-forecast/tabicl-v2-regressor",
+    "task": "regression",
+    "predictions": [
+        {
+            "value": -1234.5678901234567,
+            "quantiles": {str(level): -1234.5678901234567 for level in LEVELS},
+        }
+    ]
+    * 800,
+}
+
+
+def _predict_wide(wire, asynchronous: bool):
+    wire.expect(
+        "POST",
+        "/predictors/risk/predict",
+        WIDE_PREDICTION,
+        payload={"queries": [{"x": 3}]},
+    )
+
+    async def go():
+        profile = Profile(wire.url, "test")
+        client = (AsyncClient if asynchronous else Client)(
+            profile=profile, api_key="fixture-key"
+        )
+        try:
+            value = client.predictors.predict("risk", {"x": [3]})
+            return await value if inspect.isawaitable(value) else value
+        finally:
+            if isinstance(client, AsyncClient):
+                await client.aclose()
+            else:
+                client.close()
+
+    return asyncio.run(go())
+
+
+def test_the_wide_prediction_passes_the_request_bounds():
+    size = len(json.dumps(WIDE_PREDICTION).encode())
+    assert 2 * MAX_BYTES <= size < 3 * MAX_BYTES <= RESPONSE_MAX_BYTES
+    assert len(WIDE_PREDICTION["predictions"]) * (len(LEVELS) + 3) > MAX_NODES
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_prediction_larger_than_a_request_is_read_whole(wire, asynchronous):
+    result = _predict_wide(wire, asynchronous)
+    assert result.table.num_rows == 800 and result.task == "regression"
+    assert result.table["quantiles"][0].as_py()["0.99"] == -1234.5678901234567
+    assert not wire.errors
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_response_past_the_cap_says_so(wire, asynchronous, monkeypatch):
+    import generalforecast as gf
+    import generalforecast.transport as module
+
+    monkeypatch.setattr(module, "RESPONSE_MAX_BYTES", 2 * MAX_BYTES)
+    with pytest.raises(gf.CapacityExceeded) as error:
+        _predict_wide(wire, asynchronous)
+    assert error.value.code == "CapacityExceeded"
+    assert error.value.limit == 2 * MAX_BYTES
+    assert str(error.value) == (
+        "the service's response is larger than 2,097,152 bytes; "
+        "predict fewer rows per call"
+    )
+
+
+def test_a_whole_response_past_the_cap_says_so(monkeypatch):
+    import generalforecast.transport as module
+
+    monkeypatch.setattr(module, "RESPONSE_MAX_BYTES", 8)
+    assert response_value(200, b'{"a": 1}') == {"a": 1}
+    with pytest.raises(ServiceError) as error:
+        response_value(200, b'{"a": 10}')
+    assert error.value.code == "CapacityExceeded"
+    assert "larger than 8 bytes; predict fewer rows per call" in str(error.value)
 
 
 def test_an_environment_key_needs_no_readable_credentials_file(tmp_path):

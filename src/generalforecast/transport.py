@@ -45,7 +45,11 @@ import httpx
 
 from generalforecast._files import private_lock, read_private, write_private
 from generalforecast.errors import wire_fields
-from generalforecast.service.boundary import MAX_BYTES, json_object
+from generalforecast.service.boundary import (
+    RESPONSE_MAX_BYTES,
+    RESPONSE_MAX_NODES,
+    json_object,
+)
 from generalforecast.service.contracts import (
     ServiceError,
     name,
@@ -520,9 +524,14 @@ def response_value(status: int, raw: bytes) -> dict[str, Any]:
     """Decodes bounded JSON, refusing credential forwarding and unsafe errors."""
     if 300 <= status < 400:
         raise ServiceError("RedirectRefused", "credential forwarding is disabled", 502)
+    if len(raw) > RESPONSE_MAX_BYTES:
+        raise _too_large(RESPONSE_MAX_BYTES)
     try:
-        require(len(raw) <= MAX_BYTES, "response too large")
-        value = json_object(json.loads(raw))
+        value = json_object(
+            json.loads(raw),
+            max_bytes=RESPONSE_MAX_BYTES,
+            max_nodes=RESPONSE_MAX_NODES,
+        )
     except (ValueError, UnicodeError, ServiceError):
         # A refusal keeps its status, so a bare 404 is still a missing route; a
         # success that is not JSON is the service's fault.
@@ -649,8 +658,14 @@ class _Oversized(Exception):
     """A response past the limit its caller set; each caller names its error."""
 
 
-def _too_large() -> ServiceError:
-    return ServiceError("ProtocolError", "invalid service response", 502)
+def _too_large(limit: int) -> ServiceError:
+    return ServiceError(
+        "CapacityExceeded",
+        f"the service's response is larger than {limit:,} bytes; "
+        "predict fewer rows per call",
+        413,
+        limit=limit,
+    )
 
 
 def _download_too_large(limit: int) -> ServiceError:
@@ -865,11 +880,11 @@ class _Policy:
         """
         try:
             status, raw = yield from self._exchanging(
-                method, path, body, dict(headers or {}), deadline, MAX_BYTES
+                method, path, body, dict(headers or {}), deadline, RESPONSE_MAX_BYTES
             )
             value = response_value(status, raw)
         except _Oversized:
-            raise _too_large() from None
+            raise _too_large(RESPONSE_MAX_BYTES) from None
         except ServiceError as error:
             if (
                 self.platform is None
@@ -880,7 +895,12 @@ class _Policy:
                     response_value(
                         *(
                             yield from self._exchanging(
-                                "GET", PLATFORM_PROBE, None, {}, deadline, MAX_BYTES
+                                "GET",
+                                PLATFORM_PROBE,
+                                None,
+                                {},
+                                deadline,
+                                RESPONSE_MAX_BYTES,
                             )
                         )
                     )
