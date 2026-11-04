@@ -145,6 +145,22 @@ def out_of_memory(error: BaseException) -> bool:
 # What a program compiles with where XLA's autotuner ran out of device memory
 # compiling it: no autotuning, so XLA takes its default kernels.
 UNTUNED_OPTIONS = {"xla_gpu_autotune_level": 0}
+# A kind's first call measures its memory compiled without autotuning unless
+# the device has this many times its estimated bytes free. The estimate can
+# fall many times short of the program (TabPFN-3.5's per-query decodes on
+# Internet-Ads: 26x), and an autotuner out of memory keeps some of what it took.
+MEASURE_SHARE = 4
+
+
+def free_device_bytes() -> int | None:
+    """Bytes the first local device's allocator has left, or None where it does not say, as on a CPU."""
+    try:
+        stats = jax.local_devices()[0].memory_stats()
+    except Exception:  # noqa: BLE001
+        return None
+    if not stats or "bytes_limit" not in stats:
+        return None
+    return int(stats["bytes_limit"]) - int(stats.get("bytes_in_use", 0))
 
 
 def autotune_ran_out(error: BaseException) -> bool:
@@ -186,16 +202,21 @@ def _traces(function: Callable[..., Any]) -> int:
     return int(cache_size()) if callable(cache_size) else 0
 
 
-def measured_bytes(call: Call) -> int:
+def measured_bytes(call: Call, untuned: bool = False) -> int:
     """Bytes per item a call takes, by XLA's own analysis, or 0 when XLA cannot say.
 
     Its temporaries and outputs, with the items' own inputs, spread over the
     items; arguments every item shares are held anyway. Compiling here is the
-    compile the call would do anyway.
+    compile the call would do anyway, which JAX then finds in its caches;
+    with `untuned`, for a call too large to autotune beside what the device
+    holds, it compiles without autotuning instead, whose kernels time on
+    buffers of their own.
     """
     try:
         jitted = cast(jax.stages.Wrapped, call.function)
-        analysis = jitted.lower(*call.shared, *call.items).compile().memory_analysis()
+        lowered = jitted.lower(*call.shared, *call.items)
+        options = UNTUNED_OPTIONS if untuned else None
+        analysis = lowered.compile(compiler_options=options).memory_analysis()
     except Exception:  # noqa: BLE001
         return 0
     if analysis is None:
@@ -337,6 +358,12 @@ class Chunks:
         # Programs compiled without autotuning, by function and argument
         # shapes, for calls whose autotuning ran out of device memory.
         self._untuned: dict[Hashable, Any] = {}
+        # Signatures in `_untuned` whose program has since compiled with
+        # autotuning, and those waiting for a quiet gap to.
+        self._retuned: set[Hashable] = set()
+        self._retuning: set[Hashable] = set()
+        # Each untuned program's lowering and its call's bytes, until it retunes.
+        self._lowered: dict[Hashable, tuple[Any, int]] = {}
         # Parts of one item a call takes, once a single item ran out of memory.
         self._parts: dict[Hashable, int] = {}
         # Padded counts each kind has run at, and those compiling ahead.
@@ -345,6 +372,13 @@ class Chunks:
         # FLOPs of each kind's program at each padded count, read once.
         self._flops: dict[tuple[Hashable, int], float] = {}
         self._lock = threading.Lock()
+        # Waits for compiles running beside calls, returning whether any were:
+        # a call that runs out of memory beside one runs again once it is done.
+        self.settle: Callable[[], bool] | None = None
+        # Runs a task in a quiet gap between steps, such as `Programs.later`:
+        # a program compiled without autotuning compiles with it there, once
+        # the device has room for it.
+        self.later: Callable[[Callable[[], None]], None] | None = None
 
     def size(self, key: Hashable, budget: int, estimate: Callable[[], int]) -> int:
         """Items of a kind one call of at most `budget` bytes takes.
@@ -410,6 +444,8 @@ class Chunks:
         # Seconds measuring a kind took, counted with the call that reuses
         # the program the measure compiled.
         measuring = 0.0
+        # Whether the call about to run already waited for compiles beside it.
+        settled = False
         while first < count:
             size = self.size(key, budget, estimate)
             if buckets is None:
@@ -426,7 +462,11 @@ class Chunks:
             call = prepare(first, stop, padded)
             if self._first_measure(key):
                 started = time.perf_counter()
-                measured = measured_bytes(call)
+                # Before its measure a kind's bytes are an estimate, which
+                # can fall far short of what its program holds, so its
+                # measure autotunes only with four times the estimate free.
+                cautious = self._crowded(key, padded, MEASURE_SHARE)
+                measured = measured_bytes(call, untuned=cautious)
                 measuring += time.perf_counter() - started
                 with self._lock:
                     larger = measured > self._item_bytes[key]
@@ -437,6 +477,16 @@ class Chunks:
             started = time.perf_counter()
             traces = _traces(call.function)
             untuned = self._untuned_of(call)
+            # Autotuning its kernels would take buffers of their own the size
+            # of its own beside what the device holds now.
+            crowded = untuned is None and self._crowded(key, padded)
+            needed = self._call_bytes(key, padded)
+            if crowded and self._untune(
+                call, needed, "is too large to autotune beside steps"
+            ):
+                untuned = self._untuned_of(call)
+            if untuned is not None:
+                self._retune(call)
             try:
                 if untuned is None:
                     outputs = call.function(*call.shared, *call.items)
@@ -445,9 +495,23 @@ class Chunks:
                 dispatched = time.perf_counter() if self.timed is not None else 0.0
                 jax.block_until_ready(outputs)
             except jax.errors.JaxRuntimeError as error:
-                if untuned is None and autotune_ran_out(error) and self._untune(call):
+                if (
+                    untuned is None
+                    and autotune_ran_out(error)
+                    and self._untune(call, self._call_bytes(key, padded))
+                ):
                     # Its kernels autotuned on buffers the device could not
                     # hold: the same call again, compiled without autotuning.
+                    continue
+                if (
+                    out_of_memory(error)
+                    and not settled
+                    and self.settle is not None
+                    and self.settle()
+                ):
+                    # A compile beside the call held the device's memory as it
+                    # autotuned: the same call again, now that it is done.
+                    settled = True
                     continue
                 if out_of_memory(error) and padded > own:
                     # A larger count's program, reused while the items' own
@@ -471,13 +535,22 @@ class Chunks:
                     self._backoff[key] = 2 * self._backoff.get(key, 1)
                 continue
             finished = time.perf_counter()
+            settled = False
             compiled = _traces(call.function) > traces
             with self._lock:
                 flops = self._flops.get((key, padded))
             if flops is None:
                 # Read once per program: here if this call compiled it, else
                 # where it was compiled ahead or at start.
-                flops = estimated_flops(call) if compiled else _noted_flops(call)
+                if untuned is not None:
+                    # Read from the program the call ran, which compiling the
+                    # call's own would autotune.
+                    try:
+                        flops = flops_of(untuned.cost_analysis())
+                    except Exception:  # noqa: BLE001
+                        flops = 0.0
+                else:
+                    flops = estimated_flops(call) if compiled else _noted_flops(call)
                 with self._lock:
                     self._flops[(key, padded)] = flops
             self._counted(stage, measuring + finished - started, flops)
@@ -506,7 +579,7 @@ class Chunks:
             first = stop
 
     def _untuned_of(self, call: Call) -> Any:
-        """The program a call runs compiled without autotuning, where its autotuning ran out of memory; else None."""
+        """The program a call runs in place of its own: compiled without autotuning for want of room, or since with it; else None."""
         if not self._untuned:
             return None
         with self._lock:
@@ -514,8 +587,37 @@ class Chunks:
                 _signature(call.function, (*call.shared, *call.items))
             )
 
-    def _untune(self, call: Call) -> bool:
-        """Compiles a call's program without autotuning, for it and later calls of its shapes; False if it cannot be."""
+    def _crowded(self, key: Hashable, padded: int, share: int = 2) -> bool:
+        """Whether a count a kind has not run at would take more than one `share`th of the device's free memory, by its items' bytes.
+
+        XLA's autotuner times each fused kernel on buffers of its own, as
+        large as the kernel's, beside what the device holds. Past half the
+        free memory it runs out, and what it took is not all given back.
+        """
+        with self._lock:
+            if padded in self._counts.get(key, ()):
+                return False
+        needed = self._call_bytes(key, padded)
+        free = free_device_bytes()
+        return bool(needed) and free is not None and share * needed > free
+
+    def _call_bytes(self, key: Hashable, padded: int) -> int:
+        """Bytes a kind's call of `padded` items takes, by its items' measure; 0 before any."""
+        with self._lock:
+            return self._item_bytes.get(key, 0) * self._backoff.get(key, 1) * padded
+
+    def _untune(
+        self,
+        call: Call,
+        needed: int,
+        why: str = "ran out of device memory to autotune its kernels",
+    ) -> bool:
+        """Compiles a call's program without autotuning, for it and later calls of its shapes; False if it cannot be.
+
+        `needed` is the call's bytes: the program compiles with autotuning
+        again in a quiet gap once the device has twice that free, and
+        serves its later calls from then on (`_retune`).
+        """
         arguments = (*call.shared, *call.items)
         try:
             lowered = cast(jax.stages.Wrapped, call.function).lower(*arguments)
@@ -526,13 +628,52 @@ class Chunks:
         # one called with every argument, none of them static, serves it.
         if program.in_tree != jax.tree.structure((arguments, {})):
             return False
-        logger.warning(
-            "compiling a call ran out of device memory to autotune its kernels; "
-            "it runs compiled without autotuning"
-        )
+        logger.warning("a call's program %s; it runs compiled without autotuning", why)
+        signature = _signature(call.function, arguments)
         with self._lock:
-            self._untuned[_signature(call.function, arguments)] = program
+            self._untuned[signature] = program
+            self._lowered[signature] = (lowered, needed)
         return True
+
+    def _retune(self, call: Call) -> None:
+        """Compiles an untuned call's program with autotuning in a quiet gap, once the device has room; its later calls run it.
+
+        Untuned kernels run a decode up to about twice as slow, so a program
+        compiled without autotuning for want of room stays so only while
+        the device lacks it. Without a quiet gap to compile in, as with no
+        compiling ahead, it stays untuned.
+        """
+        if self.later is None:
+            return
+        signature = _signature(call.function, (*call.shared, *call.items))
+        with self._lock:
+            if signature in self._retuned or signature in self._retuning:
+                return
+            pending = self._lowered.get(signature)
+            if pending is None:
+                return
+            self._retuning.add(signature)
+        lowered, needed = pending
+
+        def retune() -> None:
+            try:
+                free = free_device_bytes()
+                if free is not None and 2 * needed > free:
+                    # Still no room: the next call of it asks again.
+                    return
+                tuned = lowered.compile()
+            except Exception as error:  # noqa: BLE001
+                logger.warning("autotuning an untuned program failed: %s", error)
+                return
+            finally:
+                with self._lock:
+                    self._retuning.discard(signature)
+            with self._lock:
+                self._untuned[signature] = tuned
+                self._retuned.add(signature)
+                self._lowered.pop(signature, None)
+
+        self.later(retune)
 
     def _compiled_count(
         self,

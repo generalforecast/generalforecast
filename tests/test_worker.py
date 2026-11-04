@@ -542,3 +542,48 @@ def test_a_layout_hashes_once_and_pickles_without_its_hash() -> None:
     copy = pickle.loads(pickle.dumps(layout))
     assert "_hash" not in copy.__dict__ and copy == layout
     assert hash(copy) == hash(layout)
+
+
+def test_a_step_of_several_requests_that_runs_out_of_memory_runs_again_in_halves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    worker = Worker(compile_cache=False, compile_ahead=False)
+    computed: list[list[int]] = []
+
+    def compute(step: protocol.Step) -> dict[int, np.ndarray]:
+        requests = [batch.request for batch in step.queries]
+        computed.append(requests)
+        # The device holds the queries of two requests at once, but not more.
+        if len(requests) > 2:
+            raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: Out of memory")
+        return {request: np.full((1, 1), request, np.float32) for request in requests}
+
+    monkeypatch.setattr(worker, "_compute", compute)
+    batches = [
+        protocol.QueryBatch(request, 0, 0, np.zeros((1, 1), np.float32), [0])
+        for request in range(5)
+    ]
+    step = protocol.Step(movements=[], fits=[], pages=[], units=[], queries=batches)
+
+    predictions = worker._answered(step)
+
+    assert sorted(predictions) == [0, 1, 2, 3, 4]
+    assert computed == [[0, 1, 2, 3, 4], [0, 1], [2, 3, 4], [2], [3, 4]]
+
+    # A lone request that runs out still fails, as does an error of another kind.
+    def refusing(step: protocol.Step) -> dict[int, np.ndarray]:
+        raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: Out of memory")
+
+    monkeypatch.setattr(worker, "_compute", refusing)
+    with pytest.raises(jax.errors.JaxRuntimeError):
+        worker._answered(protocol.Step([], [], [], [], batches[:1]))
+
+    def broken(step: protocol.Step) -> dict[int, np.ndarray]:
+        computed.append([-1])
+        raise jax.errors.JaxRuntimeError("INVALID_ARGUMENT: bad")
+
+    computed.clear()
+    monkeypatch.setattr(worker, "_compute", broken)
+    with pytest.raises(jax.errors.JaxRuntimeError):
+        worker._answered(step)
+    assert computed == [[-1]]

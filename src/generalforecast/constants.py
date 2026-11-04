@@ -14,6 +14,13 @@ MEMORY_ROWS_LIMIT = 1 << 24
 # Context sizes a worker compiles an encode at, at most, to find the largest
 # context that fits the device, where its profiles would refuse one.
 MEMORY_ROWS_MEASURES = 3
+# How many times the room beside the pool a context the encode profile
+# refuses may need, by the profile, and still be measured at its own size
+# before it is refused. The profile's line overstated a large encode by up to
+# about 2.5x (TabPFN-3.5 at 65k rows: 20 GiB against 8 GiB), and measuring a
+# context far past the device compiles a program of hundreds of gigabytes,
+# for minutes, only to refuse it.
+MEASURE_OVERSTATE = 4
 
 # What `Worker.fit_bound` takes a fit to hold per cell, and per byte of its
 # rows' representations: built-in models' fits hold at most about a fifth of
