@@ -9,6 +9,7 @@ except on loopback, no redirects, no proxy settings from the environment and
 no credentials.
 """
 
+import hashlib
 import io
 import json
 import os
@@ -23,7 +24,7 @@ import pyarrow.json as arrow_json
 from pyarrow import csv, parquet
 
 from generalforecast import ipc
-from generalforecast.predictors.validation import PredictorError, bytes_digest, ensure
+from generalforecast.predictors.validation import PredictorError, ensure
 
 PHYSICAL_TYPES = frozenset(
     {"boolean", "int64", "float64", "string", "binary", "date", "timestamp"}
@@ -509,18 +510,58 @@ def file_format(path: str) -> str:
     return PurePosixPath(path).suffix.lstrip(".").lower()
 
 
-def arrow_bytes(data: Any) -> bytes:
-    """Produces deterministic normalized IPC bytes, excluding dataframe metadata."""
-    table = to_arrow(data)
-    output = io.BytesIO()
-    with pa.ipc.new_stream(output, table.schema.remove_metadata()) as writer:
+def _write_normalized(data: Any, sink: Any, *, max_rows: int, max_bytes: int) -> None:
+    """Writes a table's deterministic normalized IPC stream to `sink`."""
+    table = to_arrow(data, max_rows=max_rows, max_bytes=max_bytes)
+    with pa.ipc.new_stream(sink, table.schema.remove_metadata()) as writer:
         writer.write_table(table, max_chunksize=MAX_ROWS)
+
+
+def arrow_bytes(
+    data: Any, *, max_rows: int = MAX_ROWS, max_bytes: int = MAX_BYTES
+) -> bytes:
+    """Produces deterministic normalized IPC bytes, excluding dataframe metadata.
+
+    `max_rows` and `max_bytes` bound the table as `to_arrow` does; they do
+    not change the bytes of a table within them.
+    """
+    output = io.BytesIO()
+    _write_normalized(data, output, max_rows=max_rows, max_bytes=max_bytes)
     return output.getvalue()
 
 
-def table_digest(data: Any) -> str:
-    """Hashes normalized table content separately from source container bytes."""
-    return bytes_digest(arrow_bytes(data))
+class _Sha256Sink:
+    """A write-only file that hashes what is written to it, holding none of it."""
+
+    def __init__(self) -> None:
+        self.hash = hashlib.sha256()
+        self.closed = False
+
+    def write(self, data: Any) -> int:
+        view = memoryview(data)
+        self.hash.update(view)
+        return view.nbytes
+
+    def flush(self) -> None:
+        """Nothing is buffered."""
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def table_digest(
+    data: Any, *, max_rows: int = MAX_ROWS, max_bytes: int = MAX_BYTES
+) -> str:
+    """Hashes normalized table content separately from source container bytes.
+
+    The digest is `bytes_digest(arrow_bytes(data))`, computed as the stream is
+    written, so the IPC bytes are never held whole. `max_rows` and
+    `max_bytes` bound the table, as for `arrow_bytes`; a table within the
+    default bounds has the same digest under any larger ones.
+    """
+    sink = _Sha256Sink()
+    _write_normalized(data, sink, max_rows=max_rows, max_bytes=max_bytes)
+    return "sha256:" + sink.hash.hexdigest()
 
 
 _FRAME_FORMATS = {

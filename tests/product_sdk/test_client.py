@@ -394,3 +394,59 @@ def test_a_dotted_catalog_id_is_read_by_its_name(wire, asynchronous):
     for kind in ("predictor", "context"):
         with pytest.raises(ServiceError):
             Resource(kind, "tabpfn-3.5")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_run_names_the_model_it_trains_from_as_base(wire, asynchronous):
+    spec = {
+        "name": "r1",
+        "base": "general-forecast/tabicl-v2-classifier",
+        "corpus": "credit-v1",
+        "changes": [{"kind": "lora", "rank": 16}],
+        "evaluation": {"bagging": {"k": 8}},
+    }
+    wire.expect("POST", "/runs", {"name": "r1"}, payload=spec)
+    created = run(
+        asynchronous,
+        wire.url,
+        lambda c: c.runs.create(
+            "r1",
+            base="general-forecast/tabicl-v2-classifier",
+            corpus="credit-v1",
+            changes=[{"kind": "lora", "rank": 16}],
+            evaluation={"bagging": {"k": 8}},
+        ),
+    )
+    assert created == {"name": "r1"}
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_runs_are_listed_all_or_by_state(wire, asynchronous):
+    wire.expect("GET", "/runs", {"runs": [{"name": "r1"}, {"name": "r2"}]})
+    wire.expect("GET", "/runs?state=training", {"runs": [{"name": "r2"}]})
+    everything = run(asynchronous, wire.url, lambda c: c.runs.list())
+    training = run(asynchronous, wire.url, lambda c: c.runs.list(state="training"))
+    assert [r["name"] for r in everything] == ["r1", "r2"]
+    assert [r["name"] for r in training] == ["r2"]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_an_unknown_run_state_is_the_services_validation_error(wire, asynchronous):
+    wire.expect("GET", "/runs?state=paused", "ValidationError", status=422)
+    with pytest.raises(ServiceError) as refused:
+        run(asynchronous, wire.url, lambda c: c.runs.list(state="paused"))
+    assert refused.value.code == "ValidationError" and refused.value.status == 422
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_cancel_sends_save_only_when_asked(wire, asynchronous):
+    wire.expect("POST", "/runs/r1/cancel", {"state": "cancelled"}, payload={})
+    wire.expect(
+        "POST", "/runs/r1/cancel", {"state": "cancelling"}, payload={"save": True}
+    )
+    plain = run(asynchronous, wire.url, lambda c: c.runs.cancel("r1"))
+    saved = run(asynchronous, wire.url, lambda c: c.runs.cancel("r1", save=True))
+    assert plain["state"] == "cancelled" and saved["state"] == "cancelling"
+    with pytest.raises(ServiceError) as refused:
+        run(asynchronous, wire.url, lambda c: c.runs.cancel("r1", save="yes"))
+    assert refused.value.code == "ValidationError"

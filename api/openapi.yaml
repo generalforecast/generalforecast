@@ -2139,8 +2139,16 @@ paths:
       tags:
       - hosted
       summary: list the project's runs
+      description: Every run by name; `state` lists only the runs in that state. A state that is not
+        a run state is refused with `ValidationError`.
       parameters:
       - $ref: '#/components/parameters/project'
+      - name: state
+        in: query
+        required: false
+        description: list only the runs in this state; every run when left out
+        schema:
+          $ref: '#/components/schemas/RunState'
       responses:
         '200':
           description: ok
@@ -2163,7 +2171,7 @@ paths:
                         state: queued
                         reason: null
                         attempt: 0
-                        base_model: general-forecast/tabicl-v2-classifier
+                        base: general-forecast/tabicl-v2-classifier
                         corpus:
                           name: credit-v1
                           digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2209,7 +2217,7 @@ paths:
                     name: r1
                   payload:
                     name: r1
-                    base_model: general-forecast/tabicl-v2-classifier
+                    base: general-forecast/tabicl-v2-classifier
                     corpus: credit-v1
                     changes:
                     - kind: lora
@@ -2238,7 +2246,7 @@ paths:
                       state: queued
                       reason: null
                       attempt: 0
-                      base_model: general-forecast/tabicl-v2-classifier
+                      base: general-forecast/tabicl-v2-classifier
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2288,7 +2296,7 @@ paths:
                       state: queued
                       reason: null
                       attempt: 0
-                      base_model: general-forecast/tabicl-v2-classifier
+                      base: general-forecast/tabicl-v2-classifier
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2358,7 +2366,7 @@ paths:
                       state: queued
                       reason: null
                       attempt: 0
-                      base_model: general-forecast/tabicl-v2-classifier
+                      base: general-forecast/tabicl-v2-classifier
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2386,7 +2394,12 @@ paths:
       tags:
       - hosted
       summary: cancel a run
-      description: A run a trainer is working on moves to `cancelling` until it stops.
+      description: A run a trainer is working on moves to `cancelling` until it stops, then ends `cancelled`.
+        With `save`, a run that is training stops at its next report and publishes the weights trained
+        so far as the next version of the fine-tune named after the run, as a run stopped by its budget
+        does; its lineage records the version under `published`. Without `save` nothing is published.
+        A run that is not training (queued, setting up, ready or preempted) has no weights in hand, so
+        `save` publishes nothing. Cancelling an ended or cancelling run returns it unchanged.
       parameters:
       - $ref: '#/components/parameters/project'
       - $ref: '#/components/parameters/run'
@@ -2395,7 +2408,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/RunRefRequest'
+              $ref: '#/components/schemas/RunCancelRequest'
             examples:
               cancel:
                 value:
@@ -2405,8 +2418,17 @@ paths:
                   resource:
                     kind: run
                     name: r1
-                  payload:
+                  payload: {}
+              save:
+                value:
+                  api_version: gf/v1
+                  project: acme
+                  request_id: r-0f7c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                  resource:
+                    kind: run
                     name: r1
+                  payload:
+                    save: true
       responses:
         '200':
           description: ok
@@ -2428,7 +2450,7 @@ paths:
                       state: cancelled
                       reason: null
                       attempt: 0
-                      base_model: general-forecast/tabicl-v2-classifier
+                      base: general-forecast/tabicl-v2-classifier
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2448,6 +2470,41 @@ paths:
                       plan: null
                       created: 1761200000.0
                       updated: 1761200060.0
+                save:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-0f7c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                    resource:
+                      kind: run
+                      name: r1
+                    result:
+                      name: r1
+                      state: cancelling
+                      reason: null
+                      attempt: 1
+                      base: general-forecast/tabicl-v2-classifier
+                      corpus:
+                        name: credit-v1
+                        digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
+                      changes:
+                      - kind: lora
+                        rank: 16
+                      evaluation:
+                        bagging:
+                          k: 8
+                      checkpoint_policy:
+                        every: null
+                        keep: best_and_last
+                        state: last
+                      budget: null
+                      seed: 0
+                      tags: []
+                      plan:
+                        phases:
+                        - steps: 100
+                      created: 1761200000.0
+                      updated: 1761200120.0
   /v1/projects/{project}/runs/{run}/lineage:
     get:
       operationId: runs.lineage
@@ -2479,7 +2536,7 @@ paths:
                       - at: 1761200000.0
                         kind: created
                         body:
-                          base_model: general-forecast/tabicl-v2-classifier
+                          base: general-forecast/tabicl-v2-classifier
                           corpus:
                             name: credit-v1
                             digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -5307,7 +5364,7 @@ components:
       - state
       - reason
       - attempt
-      - base_model
+      - base
       - corpus
       - changes
       - evaluation
@@ -5331,8 +5388,9 @@ components:
         attempt:
           type: integer
           minimum: 0
-        base_model:
+        base:
           $ref: '#/components/schemas/ModelId'
+          description: the catalog model the run trains from
         corpus:
           $ref: '#/components/schemas/RunCorpus'
         changes:
@@ -5393,7 +5451,7 @@ components:
       type: object
       required:
       - name
-      - base_model
+      - base
       - corpus
       - changes
       - evaluation
@@ -5401,8 +5459,9 @@ components:
       properties:
         name:
           $ref: '#/components/schemas/Name'
-        base_model:
+        base:
           $ref: '#/components/schemas/ModelId'
+          description: the catalog model the run trains from; a fine-tune is refused with 422
         corpus:
           $ref: '#/components/schemas/Name'
         changes:
@@ -5451,15 +5510,16 @@ components:
         properties:
           payload:
             $ref: '#/components/schemas/RunTrain'
-    RunRef:
+    RunCancel:
       type: object
-      required:
-      - name
+      description: how a run is cancelled; an empty payload cancels without saving
       additionalProperties: false
       properties:
-        name:
-          $ref: '#/components/schemas/Name'
-    RunRefRequest:
+        save:
+          type: boolean
+          default: false
+          description: publish the weights a training run has trained so far before it ends `cancelled`
+    RunCancelRequest:
       allOf:
       - $ref: '#/components/schemas/Envelope'
       - type: object
@@ -5467,7 +5527,7 @@ components:
         - payload
         properties:
           payload:
-            $ref: '#/components/schemas/RunRef'
+            $ref: '#/components/schemas/RunCancel'
     RunEvent:
       type: object
       required:

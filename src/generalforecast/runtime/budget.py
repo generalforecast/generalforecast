@@ -368,7 +368,9 @@ class Chunks:
 
         With `ahead`, a kind that has run before runs only at padded counts it
         has run at, and a count it has not compiles on the side: see
-        `_compiled_count`.
+        `_compiled_count`. A call that runs out of memory at such a count,
+        larger than its items' own, runs again at their own, compiled in the
+        call.
 
         Args:
             stage: The stage each call counts under.
@@ -389,6 +391,9 @@ class Chunks:
             JaxRuntimeError: If a call fails other than for want of memory, or
                 one item alone runs out of it.
         """
+        # Whether the next call runs at its items' own count, compiled in the
+        # call, rather than at a larger one `_compiled_count` reuses.
+        exact = False
         first = 0
         # Seconds measuring a kind took, counted with the call that reuses
         # the program the measure compiled.
@@ -399,10 +404,12 @@ class Chunks:
                 padded = size if count > size else bucket_size(count, 1)
             else:
                 padded = _bucket_of(buckets, count - first, size)
-            if ahead is not None:
+            own = padded
+            if ahead is not None and not exact:
                 padded = self._compiled_count(
                     key, padded, size, count, first, prepare, ahead
                 )
+            exact = False
             stop = min(count, first + padded)
             call = prepare(first, stop, padded)
             if self._first_measure(key):
@@ -429,6 +436,20 @@ class Chunks:
                 if untuned is None and autotune_ran_out(error) and self._untune(call):
                     # Its kernels autotuned on buffers the device could not
                     # hold: the same call again, compiled without autotuning.
+                    continue
+                if out_of_memory(error) and padded > own:
+                    # A larger count's program, reused while the items' own
+                    # compiles on the side, needs more than the device has
+                    # free: the items' own count, compiled in the call.
+                    logger.warning(
+                        "a %s call of %d items ran out of device memory at a "
+                        "compiled count of %d; it runs at its own count of %d",
+                        stage,
+                        stop - first,
+                        padded,
+                        own,
+                    )
+                    exact = True
                     continue
                 if not out_of_memory(error) or stop - first == 1:
                     raise

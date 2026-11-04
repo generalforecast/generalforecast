@@ -2004,7 +2004,7 @@ class Run(Payload):
     state: RunState
     reason: str | None
     attempt: int
-    base_model: ModelId
+    base: ModelId
     corpus: RunCorpus
     changes: tuple[dict[str, Any], ...]
     evaluation: dict[str, Any]
@@ -2021,7 +2021,7 @@ class Run(Payload):
         Field("state", "state", True, _decode_RunState),
         Field("reason", "reason", True, _union(_text, _null)),
         Field("attempt", "attempt", True, _integer),
-        Field("base_model", "base_model", True, _decode_ModelId),
+        Field("base", "base", True, _decode_ModelId),
         Field("corpus", "corpus", True, _record(RunCorpus)),
         Field("changes", "changes", True, _items(_mapping(_any))),
         Field("evaluation", "evaluation", True, _mapping(_any)),
@@ -2089,7 +2089,7 @@ class RunCreate(Payload):
     """The RunCreate schema."""
 
     name: Name
-    base_model: ModelId
+    base: ModelId
     corpus: Name
     changes: tuple[dict[str, Any], ...]
     evaluation: dict[str, Any]
@@ -2101,7 +2101,7 @@ class RunCreate(Payload):
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("name", "name", True, _decode_Name),
-        Field("base_model", "base_model", True, _decode_ModelId),
+        Field("base", "base", True, _decode_ModelId),
         Field("corpus", "corpus", True, _decode_Name),
         Field("changes", "changes", True, _items(_mapping(_any))),
         Field("evaluation", "evaluation", True, _mapping(_any)),
@@ -2161,30 +2161,31 @@ class RunTrainRequest(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
-class RunRef(Payload):
-    """The RunRef schema."""
+class RunCancel(Payload):
+    """How a run is cancelled; an empty payload cancels without saving."""
 
-    name: Name
+    save: bool | None = None
 
-    FIELDS: ClassVar[tuple[Field, ...]] = (Field("name", "name", True, _decode_Name),)
+    FIELDS: ClassVar[tuple[Field, ...]] = (Field("save", "save", False, _boolean),)
+    DEFAULTS: ClassVar[dict[str, Any]] = {"save": False}
 
 
 @dataclass(frozen=True, kw_only=True)
-class RunRefRequest(Payload):
-    """The RunRefRequest schema."""
+class RunCancelRequest(Payload):
+    """The RunCancelRequest schema."""
 
     api_version: Literal["gf/v1"] = "gf/v1"
     project: Name
     request_id: str
     resource: Resource
-    payload: RunRef
+    payload: RunCancel
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("api_version", "api_version", True, _literal("gf/v1")),
         Field("project", "project", True, _decode_Name),
         Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
         Field("resource", "resource", True, _record(Resource)),
-        Field("payload", "payload", True, _record(RunRef)),
+        Field("payload", "payload", True, _record(RunCancel)),
     )
 
 
@@ -6349,7 +6350,7 @@ ROUTES: tuple[Route, ...] = (
         "runs.cancel",
         "POST",
         "/v1/projects/{project}/runs/{run}/cancel",
-        RunRefRequest,
+        RunCancelRequest,
         RunReply,
         "application/json",
     ),
