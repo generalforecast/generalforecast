@@ -60,7 +60,8 @@ Exports:
         PredictorLock, parse_lock, lock_digest, lock_name: a pushed lock,
             read and identified.
         document_digest: a lock document's own digest, of its canonical
-            JSON without the `digest` key; a valid lock's `digest` is it.
+            JSON without the `digest` and `checked_with` keys; a valid
+            lock's `digest` is it.
         Revision, Environment, PromoteRequest: a predictor's revisions and
             the environments that serve them.
         ContextImportRef, ContextVersion, context_version: a live context's
