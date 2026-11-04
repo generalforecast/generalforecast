@@ -176,6 +176,29 @@ def test_manifests_keep_only_the_latest_used_programs(tmp_path) -> None:
     assert recorded.by_use()[0] == (kinds[1], {1, 2})
 
 
+def test_a_kind_short_of_memory_at_start_starts_below_that_count(tmp_path) -> None:
+    programs = Programs(None, lambda: False, ahead=False, manifests=tmp_path)
+    kind = Kind(("fit_decode", None, 2, 5), signature(()), signature(()))
+    other = Kind(("embed", None, 2, 2), signature(()), signature(()))
+    programs.remember("model", kind, 1)
+    programs.remember("model", other, 1)
+    programs.short_of_memory("model", kind, 16)
+    programs.short_of_memory("model", kind, 4)
+    # A kind not recorded is not marked.
+    stray = Kind(("embed", None, 2, 3), signature(()), signature(()))
+    programs.short_of_memory("model", stray, 1)
+
+    recorded = Programs(None, lambda: False, manifests=tmp_path).recorded("model")
+
+    assert recorded.short == {kind: 4}
+    assert recorded.started(kind, [1, 2, 4, 8, 16]) == [1, 2]
+    assert recorded.started(other, [1, 2, 4]) == [1, 2, 4]
+    # A kind that is forgotten takes its mark with it.
+    recorded.kinds.pop(kind)
+    recorded.prune(0.0)
+    assert recorded.short == {}
+
+
 def test_manifests_forget_kinds_no_worker_used_for_a_while(tmp_path) -> None:
     now = [0.0]
     manifest = Manifest(tmp_path / "model.pickle", clock=lambda: now[0])
