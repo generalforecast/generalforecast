@@ -86,6 +86,10 @@ enum Subcommand {
         /// A file holding the log encryption key; `GF_LOG_KEY` otherwise.
         #[arg(long)]
         key_file: Option<PathBuf>,
+        /// A router's replication token, which `GF_REPLICATION_TOKEN` may
+        /// give instead; the server then holds tables only under its leases.
+        #[arg(long)]
+        replication_token: Option<String>,
         /// Overwrite the file if it exists.
         #[arg(long)]
         force: bool,
@@ -135,6 +139,7 @@ async fn command() -> Result<(), Box<dyn Error>> {
             models,
             token,
             key_file,
+            replication_token,
             force,
         } => init(
             &path,
@@ -145,6 +150,9 @@ async fn command() -> Result<(), Box<dyn Error>> {
                 models: Vec::new(),
                 token: String::new(),
                 key_file,
+                replication_token: replication_token
+                    .or_else(|| std::env::var("GF_REPLICATION_TOKEN").ok())
+                    .filter(|token| !token.is_empty()),
             },
             &models,
             token,

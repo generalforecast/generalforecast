@@ -584,6 +584,13 @@ def parser() -> _Parser:
                         help="A model to serve, as NAME=general-forecast/<name> "
                         "(repeatable; default: the TabICL models)",
                     )
+                    a.add_argument(
+                        "--router",
+                        type=Path,
+                        metavar="<FILE>",
+                        help="A router's configuration; the node takes its "
+                        "replication token and holds tables only under its leases",
+                    )
                 else:
                     a.add_argument(
                         "--node",
