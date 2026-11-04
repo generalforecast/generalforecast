@@ -269,16 +269,27 @@ def test_built_in_models_say_the_contexts_they_were_trained_on() -> None:
     model = (tabicl_functions, tiny_tabicl(regression=False))
     limits = []
     for name in (
+        "general-forecast/tabicl-v2-classifier",
         "general-forecast/mitra-classifier",
         "general-forecast/mitra-2-regressor",
         "general-forecast/tabpfn-3-classifier",
+        "general-forecast/tabpfn-3.5-classifier",
     ):
         functions, parameters = registry._trained(catalog.ENTRIES[name], model)
         assert isinstance(functions, TabularFunctions)
         found = functions.properties(parameters)
-        limits.append((found.context_rows, found.context_features))
+        limits.append(
+            (found.context_rows, found.context_features, found.context_classes)
+        )
 
-    assert limits == [(512, 16), (5_120, 50), (1_000_000, 2_000)]
+    # As each upstream states them; a regressor says no classes.
+    assert limits == [
+        (100_000, 100, 10),
+        (512, 16, 10),
+        (5_120, 50, None),
+        (1_000_000, 2_000, 160),
+        (1_000_000, 20_000, 160),
+    ]
     # A model trained on any context says no limits; like every built-in
     # model, it pads widths, and otherwise keeps its properties and parameters.
     functions, parameters = registry._trained(
