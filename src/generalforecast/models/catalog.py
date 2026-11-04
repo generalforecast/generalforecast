@@ -1001,6 +1001,18 @@ _HOSTED = (
     "classification/regression and @K/*N tests"
 )
 _HOSTED_GATES = Gates(remote=True, variants=frozenset({"remote"}), evidence=_HOSTED)
+# Hosted, and qualified for predictors (and so for fine-tuning) by the
+# real-weight predictor tests; their @K/*N variants stay remote-only.
+_HOSTED_PREDICTOR = (
+    "pinned config, weights and license files; real-weight Models API "
+    "classification/regression and @K/*N tests, and real-weight predictor tests"
+)
+_HOSTED_PREDICTOR_GATES = Gates(
+    predictor=True,
+    remote=True,
+    variants=frozenset({"remote"}),
+    evidence=_HOSTED_PREDICTOR,
+)
 _TABICL_GATES = Gates(
     predictor=True,
     remote=True,
@@ -1099,7 +1111,7 @@ _ALL: tuple[ModelEntry, ...] = (
             revision,
             trained=(60_000, 100, 10),
             license="OpenMDW-1.1",
-            gates=_HOSTED_GATES,
+            gates=_HOSTED_PREDICTOR_GATES,
         )
         for size, revision in _KUMO.items()
     ),
@@ -1178,7 +1190,7 @@ _ALL: tuple[ModelEntry, ...] = (
             revision,
             trained=(5_120, 50, 10),
             license="Apache-2.0",
-            gates=_HOSTED_GATES,
+            gates=_HOSTED_PREDICTOR_GATES,
             aliases=(upstream,),
         )
         for name, (upstream, revision) in _MITRA_2.items()
