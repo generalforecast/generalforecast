@@ -20,6 +20,8 @@ SOURCE = Path(__file__).resolve().parents[2] / "src" / "generalforecast"
 
 RECORDED = (
     "ALIASES",
+    "AUTOTUNE_ENV",
+    "AUTOTUNE_RECORD_ENV",
     "AcceptedWrite",
     "CONTEXT_ROWS_KEY",
     "Capability",
@@ -80,6 +82,7 @@ RECORDED = (
     "format_as_of",
     "json_object",
     "json_rows",
+    "keep_autotune",
     "keep_measures",
     "kept_measures",
     "limits",
