@@ -270,8 +270,10 @@ def _predict(args: argparse.Namespace, result: dict, out: term.Output) -> None:
 
 
 def _logs(args: argparse.Namespace, result: dict, out: term.Output) -> None:
-    for line in result.get("lines", []):
-        out.line(printable(str(line)))
+    # Newest first: each event's time in UTC, then its code.
+    for entry in result.get("logs", []):
+        at = datetime.datetime.fromtimestamp(float(entry["at"]), datetime.UTC)
+        out.line(f"{at:%Y-%m-%d %H:%M:%S}  {printable(str(entry['code']))}")
 
 
 def _serving(args: argparse.Namespace, result: dict, out: term.Output) -> None:

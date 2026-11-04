@@ -57,6 +57,32 @@ def bound_order(lock: CompiledPlan, table: pa.Table) -> pa.Table:
     return table.sort_by([(time, "ascending")])
 
 
+def bind_rows(
+    lock: CompiledPlan, table: pa.Table, schema: TableSchema
+) -> _core.PredictorContext:
+    """The labeled rows encoded through `gf_core::predictor`, as every tabular context binds them.
+
+    The rows bind in `bound_order`; the binder keeps the labeled ones,
+    codes the classes in sorted order and each categorical input's words
+    in the order they first appear. `generalforecast.training.encode`
+    encodes a trainer's rows through here too.
+
+    Raises:
+        PredictorError: For rows the binder refuses.
+    """
+    target = lock.spec.target
+    assert target is not None
+    try:
+        return _core.bind_predictor(
+            json.dumps(schema.to_dict()).encode("utf-8"),
+            "classification" if lock.task == "classification" else "regression",
+            target,
+            arrow_bytes(bound_order(lock, table)),
+        )
+    except _core.RequestError as error:
+        raise _refused(error) from None
+
+
 @dataclass(frozen=True)
 class TabularContext:
     """A context's `gf_core::predictor` binding and the engine context its queries read.
@@ -80,18 +106,7 @@ class TabularContext:
         schema: TableSchema,
     ):
         """Binds the labeled rows through `gf_core::predictor`, then as a table."""
-        target = lock.spec.target
-        assert target is not None
-        table = bound_order(lock, table)
-        try:
-            context = _core.bind_predictor(
-                json.dumps(schema.to_dict()).encode("utf-8"),
-                "classification" if lock.task == "classification" else "regression",
-                target,
-                arrow_bytes(table),
-            )
-        except _core.RequestError as error:
-            raise _refused(error) from None
+        context = bind_rows(lock, table, schema)
         classes = tuple(context.classes)
         labeled = Labeled(
             task="classification" if classes else "regression",

@@ -429,6 +429,12 @@ def pushed_admission(
     manifest says. Whatever the manifest, the rows a snapshot lock counts
     must be the rows given, and its outputs those of its task.
 
+    A lock written under other `lock.LOCK_RULES` than this gf's may differ
+    only because its gf writes it differently, which running that gf's
+    `gf check` again does not change, so its refusal names both gfs and
+    asks for the one that writes this gf's rules. A lock of these rules
+    that differs was not written by `gf check` for these inputs.
+
     Raises:
         PredictorError: `LockMismatch` naming the first field that differs.
     """
@@ -437,11 +443,15 @@ def pushed_admission(
     from generalforecast.predictors.validation import PredictorError, ensure
 
     predictor = document["predictor"]
+    skew = locks.other_rules(document)
 
     def agree(condition: Any, field: str, code: str = "LockMismatch") -> None:
         ensure(
             condition,
-            f"gf.lock's {field} is not what gf check writes for it; run `gf check`",
+            f"gf.lock's {field} is not what gf check writes for it; run `gf check`"
+            if skew is None or code != "LockMismatch"
+            else f"gf.lock's {field} is not what this service's gf check writes "
+            f"for it: {skew}",
             code,
         )
 

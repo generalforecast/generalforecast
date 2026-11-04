@@ -63,7 +63,8 @@ def test_real_tabular_prepare_predict_and_isolated_patch(tmp_path, model):
         if task == "classification"
         else ["value", "quantiles"],
     )
-    executor = PredictorExecutor()
+    # The runtime never downloads; only this test of the model fetches it.
+    executor = PredictorExecutor(allow_downloads=True)
     old = executor.prepare(locked, context)
     q = pa.table({"id": ["query"], "x": [1.5]})
     before = old.predict(q)

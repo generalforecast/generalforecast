@@ -20,7 +20,9 @@ To run a derived model, gf loads its catalog base once and asks the
 resolver for `weights`: each bag's own part, stacked along a leading axis,
 and how one part combines with the base's parameters into a bag's. gf runs
 them as one `Bagged` model, so every derived model on a base shares that
-base's copy. Weights are arguments to compiled programs, never constants
+base's copy. A derived model of kind `adapter` also hands over `Inputs`: how
+each bag's own part changes the features the base reads, from statistics of
+the context's real rows, so its bags run in front of the base unmerged. Weights are arguments to compiled programs, never constants
 in them, so a program compiled for one derived model serves every other of
 the same shapes and leaks no weights through the compile cache.
 
@@ -73,6 +75,31 @@ class Derived:
 
 
 @dataclass(frozen=True)
+class Inputs:
+    """How a bag's own part changes the features its base reads: an input adapter.
+
+    A model of kind `adapter` runs each bag's features through these before
+    the base sees them. Statistics are computed from the context's real rows
+    alone, once when the context is fitted, and the same statistics change
+    the context and every query, so a query's features never depend on the
+    other queries it is scored with.
+
+    The same functions for every derived model of a kind let them share
+    compiled programs.
+
+    Attributes:
+        statistics: `statistics(own, features, num_rows)`: what the change
+            reads of a context, from its first `num_rows` rows (all when
+            None); the rest are padding.
+        transform: `transform(own, statistics, features)`: the features the
+            base reads instead, the same shape as `features`.
+    """
+
+    statistics: Callable[[Any, Any, Any], Any]
+    transform: Callable[[Any, Any, Any], Any]
+
+
+@dataclass(frozen=True)
 class Weights:
     """A derived model's weights, as its resolver hands them over.
 
@@ -82,10 +109,13 @@ class Weights:
         combine: Gives one bag's parameters from the base model's parameters
             and that bag's part. The same function for every derived model
             of a kind lets them share compiled programs.
+        inputs: For kind `adapter`, how a bag's part changes the features
+            the base reads; None for the other kinds.
     """
 
     own: Any
     combine: Callable[[Any, Any], Any]
+    inputs: Inputs | None = None
 
 
 class Resolver(Protocol):
