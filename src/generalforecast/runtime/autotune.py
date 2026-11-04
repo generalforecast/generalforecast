@@ -32,6 +32,7 @@ from pathlib import Path
 AUTOTUNE_ENV = "GF_AUTOTUNE"
 RECORD_ENV = "GF_AUTOTUNE_RECORD"
 SUFFIX = ".textproto"
+RECORDING = ".recording-"
 
 
 def gpu_name() -> str | None:
@@ -66,6 +67,14 @@ def results_file(directory: Path, gpu: str, jaxlib: str | None = None) -> Path:
     return directory / f"{slug}-jaxlib-{release}{SUFFIX}"
 
 
+def recording(kept: Path, pid: int) -> Path:
+    """Where process `pid` records the results it tunes or loads for `kept`.
+
+    It ends in `.textproto`, as XLA writes text only for that suffix.
+    """
+    return kept.with_name(f"{kept.name.removesuffix(SUFFIX)}{RECORDING}{pid}{SUFFIX}")
+
+
 def autotune_flags(
     environ: dict[str, str] | None = None, gpu: str | None = None
 ) -> list[str]:
@@ -86,7 +95,9 @@ def autotune_flags(
         flags.append(f"--xla_gpu_load_autotune_results_from={kept}")
     if environ.get(RECORD_ENV) == "1":
         kept.parent.mkdir(parents=True, exist_ok=True)
-        flags.append(f"--xla_gpu_dump_autotune_results_to={kept}.{os.getpid()}")
+        flags.append(
+            f"--xla_gpu_dump_autotune_results_to={recording(kept, os.getpid())}"
+        )
     return flags
 
 
@@ -120,10 +131,10 @@ def keep_autotune(directory: Path) -> list[Path]:
     recording again after each compile. Returns the files it kept.
     """
     recordings: dict[Path, list[Path]] = {}
-    for path in directory.glob(f"*{SUFFIX}.*"):
-        kept = path.with_name(path.name.rsplit(".", 1)[0])
-        if path.name.rsplit(".", 1)[1].isdigit():
-            recordings.setdefault(kept, []).append(path)
+    for path in directory.glob(f"*{RECORDING}*{SUFFIX}"):
+        base, _, pid = path.name.removesuffix(SUFFIX).rpartition(RECORDING)
+        if base and pid.isdigit():
+            recordings.setdefault(path.with_name(base + SUFFIX), []).append(path)
     kept_files = []
     for kept, paths in sorted(recordings.items()):
         whole = [path for path in paths if _complete(path)]
