@@ -88,15 +88,17 @@ Exports:
         pin, limits, entries, parse_model, resource_name, ALIASES,
             ModelRefError, V1_POLICY, CatalogService, prefetch_catalog: the
             catalog, its pins and bounds, and the serving policy.
-        Derived, DerivedResolver, DerivedWeights, DERIVED_KINDS,
-            use_derived: derived
+        Derived, DerivedResolver, DerivedWeights, DerivedInputs,
+            DERIVED_KINDS, use_derived: derived
             models, `<owner>/<name>@ft<version>`, which a plane keeps over a
             catalog base. The plane installs a `DerivedResolver` with
             `use_derived`, or names it to engine workers by
             `GF_DERIVED_RESOLVER=module:attribute`; `pin`, `parse_lock` and
             admission ask it what a derived id is made of (base, base digest,
             weights digest and bags), and loading asks it for the
-            `DerivedWeights` it runs as bags over one copy of the base.
+            `DerivedWeights` it runs as bags over one copy of the base;
+            a model of kind `adapter` hands `DerivedInputs` with them, how
+            each bag changes the features the base reads.
         training: the trainer's surface, `generalforecast.training`: a
             catalog model's contract calls and parameters as gf serves
             them, and the parameter types fine-tuning adapts. The
@@ -158,6 +160,7 @@ from generalforecast.models.catalog import (
 from generalforecast.models.catalog import parse as parse_model
 from generalforecast.models.derived import KINDS as DERIVED_KINDS
 from generalforecast.models.derived import Derived
+from generalforecast.models.derived import Inputs as DerivedInputs
 from generalforecast.models.derived import Resolver as DerivedResolver
 from generalforecast.models.derived import Weights as DerivedWeights
 from generalforecast.models.derived import use as use_derived
@@ -378,6 +381,7 @@ __all__ = [
     "ContextImportRef",
     "ContextVersion",
     "Derived",
+    "DerivedInputs",
     "DerivedResolver",
     "DerivedWeights",
     "Environment",

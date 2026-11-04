@@ -29,6 +29,7 @@ RECORDED = (
     "ContextVersion",
     "DERIVED_KINDS",
     "Derived",
+    "DerivedInputs",
     "DerivedResolver",
     "DerivedWeights",
     "Environment",
