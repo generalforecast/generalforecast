@@ -301,6 +301,21 @@ def _shapes(tree: Any) -> Any:
     )
 
 
+# Stages each of whose items is a whole context's encode: a call of them
+# padded by more than a quarter wastes more of the device than a smaller call
+# for the rest costs, so they run in halves instead.
+WHOLE_CONTEXT_STAGES = frozenset({"encode", "fit_encode"})
+
+
+def _unpadded(stage: str, padded: int, left: int) -> int:
+    """`padded`, halved while a call of `stage` would pad `left` items by more than a quarter."""
+    if stage not in WHOLE_CONTEXT_STAGES:
+        return padded
+    while left < padded and (padded - left) * 4 > padded:
+        padded //= 2
+    return padded
+
+
 def _bucket_of(buckets: Sequence[int], items: int, size: int) -> int:
     """The least of `buckets` within `size` that takes `items`, or else the most within it."""
     within = [bucket for bucket in buckets if bucket <= size] or [1]
@@ -317,7 +332,9 @@ class Chunks:
     A run of more items than a chunk pads its last call to the chunk, and a
     run of fewer pads its one call to their bucket, so a kind of call
     compiles for the chunk and for the buckets below it that single calls
-    take, not for every remainder.
+    take, not for every remainder. A stage of whole contexts' encodes pads
+    by at most a quarter: past that, a call takes half its bucket and the
+    rest go in calls of their own, still at powers of two.
     """
 
     def __init__(
@@ -450,6 +467,7 @@ class Chunks:
             size = self.size(key, budget, estimate)
             if buckets is None:
                 padded = size if count > size else bucket_size(count, 1)
+                padded = _unpadded(stage, padded, count - first)
             else:
                 padded = _bucket_of(buckets, count - first, size)
             own = padded
