@@ -228,9 +228,9 @@ def test_a_run_past_one_call_pads_its_last_call_to_the_chunk() -> None:
     assert padded_counts[-1] == 1 and compiled == ["fit", "fit"]
 
 
-def test_encodes_pad_a_call_by_at_most_a_quarter() -> None:
+def test_encodes_run_in_calls_their_items_fill() -> None:
     # Each encode item is a whole context, so nineteen items run as calls of
-    # sixteen and four rather than one padded to thirty-two; other stages
+    # sixteen, two and one rather than one padded to thirty-two; other stages
     # still pad to their bucket. Each item's output is what it gets alone.
     doubled = jax.jit(lambda rows: rows * 2)
     items = np.arange(40, dtype=np.float32).reshape(40, 1)
@@ -257,13 +257,13 @@ def test_encodes_pad_a_call_by_at_most_a_quarter() -> None:
         np.testing.assert_array_equal(np.stack(outputs), items[:count] * 2)
         return list(padded_counts)
 
-    assert run("encode", 19) == [16, 4]
-    assert run("fit_encode", 19) == [16, 4]
+    assert run("encode", 19) == [16, 2, 1]
+    assert run("fit_encode", 19) == [16, 2, 1]
     assert run("decode", 19) == [32]
-    # A quarter's padding stays; a run past the chunk splits its last call too.
-    assert run("encode", 24) == [32]
+    # A run past the chunk fills its last calls too.
     assert run("encode", 40) == [32, 8]
-    assert run("encode", 3) == [4]
+    assert run("encode", 32) == [32]
+    assert run("encode", 1) == [1]
 
 
 def test_measuring_a_kind_counts_under_the_call_that_reuses_its_program(
