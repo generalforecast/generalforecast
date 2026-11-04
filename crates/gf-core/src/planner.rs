@@ -146,10 +146,10 @@ const ADAPTIVE_CORE_SHARE: f64 = 0.25;
 /// How many times its model's cap a table `AdaptiveWhole` still reads whole
 /// may hold, for a model whose cap is at least `ADAPTIVE_WHOLE_FROM_CAP`.
 /// One shared context is encoded once and cached for every query, where a
-/// retrieved one encodes a context of the cap per query: on TabICL v2's
-/// 60,000-row cap, 83,000 to 200,000-row tables read whole scored within
-/// 0.003 of per-query contexts or better, at thousands of times the rows a
-/// second.
+/// retrieved one encodes a context of the cap per query: with TabICL v2
+/// capped at 60,000 rows, 83,000 to 200,000-row tables read whole scored
+/// within 0.003 of per-query contexts or better, at thousands of times the
+/// rows a second.
 pub const ADAPTIVE_WHOLE_PAST_CAP: u64 = 4;
 
 /// The least cap past which `AdaptiveWhole` reads a table whole up to
@@ -160,7 +160,7 @@ pub const ADAPTIVE_WHOLE_FROM_CAP: u64 = 10_000;
 /// The most rows of each query's context `AdaptiveWhole` reads past the
 /// rows its worker holds whole: a stratified core of a quarter, the rest
 /// the query's nearest rows. Each query's context is encoded on its own, so
-/// its size sets the speed. On an H100 with TabICL v2 (60,000-row cap),
+/// its size sets the speed. On an H100 with TabICL v2 capped at 60,000 rows,
 /// contexts of 16,384 rows scored as well as contexts of the cap or better
 /// on ieee_fraud_detection (590k rows), covertype (580k) and smoking (990k),
 /// at 6 to 8 times the rows a second.

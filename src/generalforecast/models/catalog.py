@@ -1066,12 +1066,17 @@ def _forecaster(
     )
 
 
+# Each tabular model's `trained` limits are its upstream's stated
+# (context rows, features, classes), unset where upstream states none:
+# TabICL v2 takes 100,000 rows, the 300 to 100,000 training samples its README
+# states it performs well on (it pretrains to 60,000, arXiv 2602.11139), of up
+# to 100 features and up to 10 classes.
 _ALL: tuple[ModelEntry, ...] = (
     _tabular(
         "general-forecast/tabicl-v2-classifier",
         "tabicl",
         "5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b",
-        trained=(60_000, 100, 10),
+        trained=(100_000, 100, 10),
         license="BSD-3-Clause",
         gates=_TABICL_GATES,
         aliases=("tabicl-classifier",),
@@ -1080,11 +1085,13 @@ _ALL: tuple[ModelEntry, ...] = (
         "general-forecast/tabicl-v2-regressor",
         "tabicl",
         "1466a562be5d04a25ab612940d80c2c2f901c797",
-        trained=(60_000, 100, 10),
+        trained=(100_000, 100, 10),
         license="BSD-3-Clause",
         gates=_TABICL_GATES,
         aliases=("tabicl-regressor",),
     ),
+    # Kumo Tabular pretrains up to 60,000 rows and 100 columns, with up to 10
+    # classes a forward pass (huggingface.co/blog/nvidia/kumo-tabular).
     *(
         _tabular(
             f"{ORGANIZATION}/kumo-tabular-{size}",
@@ -1102,7 +1109,9 @@ _ALL: tuple[ModelEntry, ...] = (
             "tabpfn",
             _TABPFN_3[1],
             class_slots=160,
-            trained=(1_000_000, 2_000, None),
+            # 1,000,000 rows, 2,000 features (the Prior-Labs/tabpfn_3 card)
+            # and 160 classes natively (docs.priorlabs.ai/models).
+            trained=(1_000_000, 2_000, 160),
             artifact=_upstream(
                 name,
                 *_TABPFN_3,
@@ -1122,7 +1131,10 @@ _ALL: tuple[ModelEntry, ...] = (
             "tabpfn",
             _TABPFN_3_5[1],
             class_slots=160,
-            trained=(1_000_000, 6_000, 160),
+            # 1,000,000 rows and 20,000 features (the Prior-Labs/tabpfn_3_5
+            # card and the TabPFN README), which recommends at most 6,000
+            # columns; more than 160 classes take the many-class extension.
+            trained=(1_000_000, 20_000, 160),
             artifact=_upstream(
                 name,
                 *_TABPFN_3_5,
@@ -1136,6 +1148,8 @@ _ALL: tuple[ModelEntry, ...] = (
             "general-forecast/tabpfn-3.5-regressor",
         )
     ),
+    # LimiX-2 and TabFM 1.0 state no trained row or feature limits upstream;
+    # TabFM's hard limit of 10 classes is its class slots.
     _tabular(
         "general-forecast/limix-2-classifier",
         "limix",
@@ -1152,7 +1166,9 @@ _ALL: tuple[ModelEntry, ...] = (
         "general-forecast/mitra-classifier",
         "mitra",
         "64bc87614af639ccea79dd71a96f3bbf357fee86",
-        trained=(512, 16, None),
+        # Pretrained on 512 support rows of up to 16 features with at most 10
+        # classes, as are Mitra-2's 5,120 rows and 50 features (arXiv 2609.04540).
+        trained=(512, 16, 10),
         gates=Gates(),
     ),
     *(
@@ -1160,7 +1176,7 @@ _ALL: tuple[ModelEntry, ...] = (
             name,
             "mitra",
             revision,
-            trained=(5_120, 50, None),
+            trained=(5_120, 50, 10),
             license="Apache-2.0",
             gates=_HOSTED_GATES,
             aliases=(upstream,),

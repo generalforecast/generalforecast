@@ -76,7 +76,7 @@
       "name": "tabicl-v2-classifier",
       "task": "classification",
       "limits": {
-        "context_rows": 60000,
+        "context_rows": 100000,
         "queries": 100,
         "inputs": 32
       },
@@ -102,7 +102,7 @@
       "name": "tabicl-v2-regressor",
       "task": "regression",
       "limits": {
-        "context_rows": 60000,
+        "context_rows": 100000,
         "queries": 100,
         "inputs": 32
       },
