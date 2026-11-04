@@ -483,9 +483,22 @@ class Runs(Collection):
         """Sets the plan of a run created without one."""
         return self.client._run(ops.posted("run", "runs", run, "train", {"plan": plan}))
 
-    def cancel(self, run: str) -> JsonObject:
-        """Cancels a run; one that is training stops at its next step."""
-        return self.client._run(ops.posted("run", "runs", run, "cancel", {}))
+    def list(self, *, state: str | None = None) -> builtins.list[JsonObject]:
+        """The project's runs by name; with `state`, only the runs in that state.
+
+        A state that is not a run state is refused with `ValidationError`.
+        """
+        return self.client._run(ops.run_list(state))
+
+    def cancel(self, run: str, *, save: bool = False) -> JsonObject:
+        """Cancels a run; one that is training stops at its next step.
+
+        With `save`, a run that is training publishes the weights it has
+        trained so far as its fine-tune's next version, then ends
+        `cancelled`; its lineage names the version. A run not yet training
+        has nothing to save and is cancelled as it would be without `save`.
+        """
+        return self.client._run(ops.run_cancel(run, save=save))
 
     def lineage(self, run: str) -> JsonObject:
         """Every change to a run, oldest first."""

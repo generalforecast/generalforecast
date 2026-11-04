@@ -110,11 +110,12 @@ def wire():
                     state.requests.append((self.path, request.payload))
                 else:
                     assert not raw
-                    parts = self.path.split("/")
+                    parts = self.path.split("?")[0].split("/")
                     kind = {
                         "predictors": "predictor",
                         "contexts": "context",
                         "models": "model",
+                        "runs": "run",
                     }[parts[4]]
                     resource = parts[5] if len(parts) > 5 else parts[4]
                     request = Request(

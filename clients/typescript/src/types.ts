@@ -723,12 +723,13 @@ export interface RunTrainRequest extends Envelope {
   payload: RunTrain;
 }
 
-export interface RunRef {
-  name: Name;
+/** how a run is cancelled; an empty payload cancels without saving */
+export interface RunCancel {
+  save?: boolean;
 }
 
-export interface RunRefRequest extends Envelope {
-  payload: RunRef;
+export interface RunCancelRequest extends Envelope {
+  payload: RunCancel;
 }
 
 export interface RunEvent {
@@ -1997,7 +1998,7 @@ export const ROUTES = {
   "runs.create": { method: "POST", path: "/v1/projects/{project}/runs", request: "RunCreateRequest", reply: "RunReply", body: "application/json" },
   "runs.get": { method: "GET", path: "/v1/projects/{project}/runs/{run}", request: "null", reply: "RunReply", body: null },
   "runs.train": { method: "POST", path: "/v1/projects/{project}/runs/{run}/train", request: "RunTrainRequest", reply: "RunReply", body: "application/json" },
-  "runs.cancel": { method: "POST", path: "/v1/projects/{project}/runs/{run}/cancel", request: "RunRefRequest", reply: "RunReply", body: "application/json" },
+  "runs.cancel": { method: "POST", path: "/v1/projects/{project}/runs/{run}/cancel", request: "RunCancelRequest", reply: "RunReply", body: "application/json" },
   "runs.lineage": { method: "GET", path: "/v1/projects/{project}/runs/{run}/lineage", request: "null", reply: "RunLineageReply", body: null },
   "uploads.create": { method: "POST", path: "/v1/projects/{project}/uploads", request: "UploadCreateRequest", reply: "UploadOpenedReply", body: "application/json" },
   "uploads.get": { method: "GET", path: "/v1/projects/{project}/uploads/{upload}", request: "null", reply: "UploadReply", body: null },
