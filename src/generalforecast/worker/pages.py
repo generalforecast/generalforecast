@@ -12,7 +12,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 
 from generalforecast._core import CacheKey
-from generalforecast.worker.records import Fit, Page
+from generalforecast.runtime.device import HOST_MEMORY, available_memory
+from generalforecast.worker.records import Fit, Page, Unit
 
 if TYPE_CHECKING:
     from generalforecast.worker.runner import Worker
@@ -22,6 +23,15 @@ logger = logging.getLogger(__name__)
 
 # A page's row representations, on the device or the host, and its targets.
 Representations = tuple[Any, np.ndarray]
+
+# A put-off page whose rows the step's units read fewer than this share of
+# embeds only those: a context drawn across a large table, such as a core
+# every query shares, reads a few rows of each of its pages.
+SPARSE_SHARE = 0.5
+
+
+class HostMemoryError(RuntimeError):
+    """A step's row representations would take more host memory than is free."""
 
 
 @dataclass
@@ -161,14 +171,28 @@ class Pages:
         return data.view(page.dtype).reshape(page.shape), page.targets
 
     def _embed_pages(
-        self: "Worker", pages: Sequence[Page], filled: dict[int, Representations]
+        self: "Worker",
+        pages: Sequence[Page],
+        filled: dict[int, Representations],
+        units: Sequence[Unit] = (),
+        subsets: dict[int, np.ndarray] | None = None,
     ) -> dict[int, Representations]:
         """Reads cached pages and embeds the rest, one vectorized call per signature.
 
         A page with sources copies their rows, representations and targets,
         and embeds only its own. Those pad to their own bucket, not the page
         size: a page written a row at a time then embeds a few rows, or none.
+        So does a put-off page, kept in no slots, of which `units` read fewer
+        than `SPARSE_SHARE` of the rows: it embeds only those, and
+        `subsets` gets their rows, which its representations then hold.
+
+        Raises:
+            HostMemoryError: If the representations the step would hold take
+                more host memory than is free, so the worker fails the step
+                rather than its container running out.
         """
+        sparse = self._sparse_pages(pages, filled, units)
+        self._check_host(pages, filled, sparse)
         found: dict[int, Representations] = {}
         work: list[tuple[int, tuple]] = []
         embedding: list[tuple[int, list[int]]] = []
@@ -183,6 +207,18 @@ class Pages:
                 raise RuntimeError(
                     f"a page of table {page.table} to embed came without its rows"
                 )
+            if index in sparse:
+                read = sparse[index]
+                if subsets is not None:
+                    subsets[index] = np.asarray(page.rows)[read]
+                features, targets, _ = self._padded(
+                    np.asarray(page.features)[read], np.asarray(page.targets)[read]
+                )
+                work.append(
+                    (page.table, (self._tables[page.table].state, features, targets))
+                )
+                embedding.append((index, read.tolist()))
+                continue
             missing = list(range(len(page.rows)))
             if page.copies:
                 partial[index] = self._copied(page)
@@ -205,7 +241,9 @@ class Pages:
             page = pages[index]
             with self.stats.timed("fetch"):
                 embedded = np.asarray(representations)[: len(missing)]
-            if index in partial:
+            if index in sparse:
+                partial[index] = (embedded, np.asarray(page.targets)[sparse[index]])
+            elif index in partial:
                 values, targets = partial[index]
                 values[missing] = embedded
                 targets[missing] = np.asarray(page.targets)
@@ -218,6 +256,79 @@ class Pages:
             self._keep(pages[index], computed)
             found[index] = computed
         return found
+
+    def _sparse_pages(
+        self: "Worker",
+        pages: Sequence[Page],
+        filled: dict[int, Representations],
+        units: Sequence[Unit],
+    ) -> dict[int, np.ndarray]:
+        """The put-off pages of which `units` read fewer than `SPARSE_SHARE` of the rows, with the positions they read.
+
+        Only pages to embed in full count: a kept page is cached whole, and
+        one with sources copies most of its rows.
+        """
+        candidates = [
+            index
+            for index, page in enumerate(pages)
+            if index not in filled
+            and page.action == "transient"
+            and not page.copies
+            and page.features is not None
+        ]
+        if not candidates:
+            return {}
+        parts: dict[int, list[np.ndarray]] = defaultdict(list)
+        for unit in units:
+            if unit.action not in ("reuse", "fuse"):
+                parts[unit.table].append(np.asarray(unit.rows))
+        read = {table: np.unique(np.concatenate(rows)) for table, rows in parts.items()}
+        sparse: dict[int, np.ndarray] = {}
+        for index in candidates:
+            page = pages[index]
+            if page.table not in read:
+                continue
+            rows = np.asarray(page.rows)
+            positions = np.flatnonzero(np.isin(rows, read[page.table]))
+            if len(positions) < SPARSE_SHARE * len(rows):
+                sparse[index] = positions
+        return sparse
+
+    def _check_host(
+        self: "Worker",
+        pages: Sequence[Page],
+        filled: dict[int, Representations],
+        sparse: dict[int, np.ndarray],
+    ) -> None:
+        """Raises `HostMemoryError` if the representations a step would hold take more host memory than is free.
+
+        It holds each page's that it embeds or reads from host slots, once
+        (see `_tables_rows`); a fit's pages are already held. Where free
+        memory cannot be told, nothing is checked.
+        """
+        needed: dict[int, int] = defaultdict(int)
+        for index, page in enumerate(pages):
+            if index in filled:
+                continue
+            rows = len(sparse[index]) if index in sparse else len(page.rows)
+            table = self._tables[page.table]
+            needed[page.table] += (
+                rows * self.profile(table.model, table.features).row_bytes
+            )
+        total = sum(needed.values())
+        if not total:
+            return
+        free = available_memory()
+        if free is None or total <= free:
+            return
+        table = max(needed, key=needed.__getitem__)
+        raise HostMemoryError(
+            f"a step's row representations take {total >> 20} MiB of host "
+            f"memory ({needed[table] >> 20} MiB for table {table}), but "
+            f"{free >> 20} MiB is free; use a strategy whose contexts read "
+            "fewer rows, a host with more memory, or set "
+            f"{HOST_MEMORY} if the container's limit is larger than found"
+        )
 
     def _copied(self: "Worker", page: Page) -> Representations:
         """A page's representations and targets with its sources' rows copied in."""
@@ -238,22 +349,30 @@ class Pages:
 
     @staticmethod
     def _tables_rows(
-        pages: Sequence[Page], computed: dict[int, Representations]
+        pages: Sequence[Page],
+        computed: dict[int, Representations],
+        subsets: dict[int, np.ndarray] | None = None,
     ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
         """Each table's page rows sorted, with their representations and targets.
 
         Built once per step, so units gather from them without joining pages
         again. They join on the host: on the device, every new number of rows
         would compile its own join and gather, and writes change it each time.
+        Each page is taken out of `computed` as it joins, so the step holds
+        one copy of its pages' representations, not theirs and the join's. A
+        page in `subsets` holds only those of its rows.
         """
+        subsets = subsets or {}
+
+        def rows_of(index: int) -> np.ndarray:
+            return subsets[index] if index in subsets else np.asarray(pages[index].rows)
+
         by_table: dict[int, list[int]] = defaultdict(list)
         for index, page in enumerate(pages):
             by_table[page.table].append(index)
         joined = {}
         for table, indices in by_table.items():
-            rows = np.sort(
-                np.concatenate([np.asarray(pages[index].rows) for index in indices])
-            )
+            rows = np.sort(np.concatenate([rows_of(index) for index in indices]))
             # Each page's rows go straight to their place, so the step holds
             # one copy of the representations beside the pages'.
             first_values, first_targets = (
@@ -263,8 +382,9 @@ class Pages:
             targets = np.empty(
                 (len(rows), *first_targets.shape[1:]), first_targets.dtype
             )
+            del first_values, first_targets
             for index in indices:
-                at = np.searchsorted(rows, np.asarray(pages[index].rows))
-                values[at], targets[at] = computed[index]
+                at = np.searchsorted(rows, rows_of(index))
+                values[at], targets[at] = computed.pop(index)
             joined[table] = (rows, values, targets)
         return joined

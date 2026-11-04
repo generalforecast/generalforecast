@@ -262,16 +262,41 @@ def report_fallback(
     return True
 
 
+# Bytes of memory the process may use, where its container has a limit it
+# cannot read: a gVisor sandbox, as Modal runs, shows the machine's memory and
+# no cgroup. The smaller of it and what the machine or cgroup says is used.
+HOST_MEMORY = "GF_HOST_MEMORY"
+
+
+def _host_memory_setting() -> int | None:
+    """`GF_HOST_MEMORY` in bytes, or None where it is unset.
+
+    Raises:
+        ValueError: If it is set to anything but a positive whole number.
+    """
+    text = os.environ.get(HOST_MEMORY, "").strip()
+    if not text:
+        return None
+    if not text.isdigit() or int(text) == 0:
+        raise ValueError(
+            f"{HOST_MEMORY} must be a positive number of bytes, not {text!r}"
+        )
+    return int(text)
+
+
 def host_memory(cgroup: Path = Path("/sys/fs/cgroup")) -> int:
     """Bytes of memory this process may use: the machine's, or its container's limit.
 
     A container sees the whole machine's memory, so the limit comes from its
     cgroup: `memory.max` under cgroup v2, `memory/memory.limit_in_bytes` under v1.
+    Where neither tells it, as in a gVisor sandbox, `GF_HOST_MEMORY` does.
 
     Args:
         cgroup: Where cgroups are mounted.
     """
     memory = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    if (setting := _host_memory_setting()) is not None:
+        memory = min(memory, setting)
     for limit in (cgroup / "memory.max", cgroup / "memory" / "memory.limit_in_bytes"):
         try:
             text = limit.read_text().strip()
@@ -290,7 +315,10 @@ def available_memory(
     In a container, its limit less what the container uses, every process in
     it counted: `memory.current` under cgroup v2, `memory/memory.usage_in_bytes`
     under v1, which counts its page cache too. Outside one, the machine's
-    available memory: `MemAvailable` on Linux, free and inactive pages on macOS.
+    available memory: `MemAvailable` on Linux, free and inactive pages on macOS,
+    and with `GF_HOST_MEMORY` set, at most that less what is in use
+    (`MemTotal` less `MemAvailable`, which in a gVisor sandbox is the
+    sandbox's own use).
 
     Args:
         cgroup: Where cgroups are mounted.
@@ -310,10 +338,16 @@ def available_memory(
         lines = meminfo.read_text().splitlines()
     except OSError:
         return _darwin_available() if sys.platform == "darwin" else None
-    for line in lines:
-        if line.startswith("MemAvailable:"):
-            return int(line.split()[1]) * 1024
-    return None
+    fields = {
+        name: int(rest.split()[0]) * 1024
+        for name, _, rest in (line.partition(":") for line in lines)
+        if name in ("MemTotal", "MemAvailable") and rest.split()
+    }
+    free = fields.get("MemAvailable")
+    setting = _host_memory_setting()
+    if free is None or setting is None or "MemTotal" not in fields:
+        return free
+    return max(0, min(free, setting - (fields["MemTotal"] - free)))
 
 
 # `host_statistics64`'s flavor for `vm_statistics64`, and that struct's size in
