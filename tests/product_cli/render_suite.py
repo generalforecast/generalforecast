@@ -600,11 +600,11 @@ class FakeClient:
                 ]
             }
         if "/environments/" in path and path.endswith("/logs"):
+            # The service's LogsReply: newest first.
             return {
-                "lines": [
-                    "2026-10-24T05:12:01Z loaded general-forecast/tabicl-v2-classifier",
-                    "2026-10-24T05:12:03Z compiled 12 programs in 6.8s",
-                    "2026-10-24T05:14:40Z predicted 1,000 rows in 0.21s",
+                "logs": [
+                    {"at": 1792818880.0, "code": "RolledBack"},
+                    {"at": 1792818721.0, "code": "Promoted"},
                 ]
             }
         if "/environments/" in path:
