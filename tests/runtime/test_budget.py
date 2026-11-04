@@ -349,6 +349,62 @@ def test_calls_with_buckets_pad_to_the_least_that_takes_them_or_split_across_the
     assert run(7, 8 << 20) == [4, 4]
 
 
+def test_a_call_out_of_memory_at_a_larger_compiled_count_runs_at_its_own() -> None:
+    doubled = jax.jit(lambda rows: rows * 2)
+    items = np.arange(64, dtype=np.float32).reshape(64, 1)
+    chunks = Chunks(lambda *_: None)
+    calls: list[int] = []
+    aside: list[int] = []
+    outputs: list[np.ndarray] = []
+    # How many items a call may take before the device runs out of memory.
+    room = [64]
+
+    def crowded(values: Any) -> Any:
+        calls.append(len(values))
+        if len(values) > room[0]:
+            raise jax.errors.JaxRuntimeError(
+                "RESOURCE_EXHAUSTED: Out of memory while trying to allocate "
+                "1008.01MiB with allocator GPU_0_bfc on device 0."
+            )
+        return doubled(values)
+
+    def prepare(first: int, stop: int, padded: int) -> Call:
+        rows = items[first:stop]
+        stacked = np.concatenate([rows, np.repeat(rows[-1:], padded - len(rows), 0)])
+        return Call(crowded, (), (stacked,), padded)
+
+    def consume(first: int, stop: int, found: Any) -> None:
+        outputs.extend(np.asarray(found)[: stop - first])
+
+    def run(count: int) -> None:
+        calls.clear()
+        outputs.clear()
+        chunks.run(
+            "decode",
+            "key",
+            count,
+            64 << 20,
+            lambda: 1 << 20,
+            prepare,
+            consume,
+            lambda call, done: aside.append(call.padded),
+        )
+        np.testing.assert_array_equal(np.stack(outputs), items[:count] * 2)
+
+    # A warm call compiled the kind for 64 items while the device had room.
+    run(64)
+    assert calls == [64]
+    # Then the device fills up. One item would reuse the program for 64
+    # while its own count compiles on the side; that runs out of memory, so
+    # it runs at its own count, compiled in the call, rather than failing.
+    room[0] = 1
+    run(1)
+    assert calls == [64, 1] and aside == [1]
+    # From then on its own count is compiled, and it runs there.
+    run(1)
+    assert calls == [1]
+
+
 def test_a_count_that_fails_to_compile_on_the_side_starts_again_later() -> None:
     doubled = jax.jit(lambda rows: rows * 2)
     items = np.arange(5, dtype=np.float32).reshape(5, 1)
