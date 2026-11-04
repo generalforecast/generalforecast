@@ -61,6 +61,7 @@ fn spec(strategy: Strategy) -> TableSpec {
         refit: RefitPolicy::default(),
         fit_rows: NonZeroUsize::new(DEFAULT_FIT_ROWS).unwrap(),
         context_rows: None,
+        device_rows: None,
         whole_rows: None,
         past_cap: PastCap::Warn,
         regions: None,
@@ -5090,6 +5091,58 @@ fn an_adaptive_whole_table_past_the_cap_waits_for_the_rows_its_worker_holds() {
     // One that holds none, likewise.
     node.set_whole_rows(table, None).unwrap();
     assert_eq!(node.strategy(table).unwrap(), retrieved);
+}
+
+#[test]
+fn an_adaptive_whole_table_past_what_its_device_holds_shares_one_context() {
+    let mut node = node(64);
+    // A cap the device cut to 16 rows, below `ADAPTIVE_WHOLE_CONTEXT`.
+    let device = NonZeroU64::new(16);
+    let table = node
+        .create_table(TableSpec {
+            context_rows: device,
+            device_rows: device,
+            ..spec(Strategy::AdaptiveWhole)
+        })
+        .unwrap();
+    let (keys, features, targets) = rows(64);
+    let Targets::Classes(labels) = targets else {
+        unreachable!("rows makes classes")
+    };
+    let insert = |node: &mut Node, rows: std::ops::Range<usize>| {
+        let values = &features[rows.start * FEATURES..rows.end * FEATURES];
+        let labels = Targets::Classes(labels[rows.clone()].to_vec());
+        node.insert(table, &keys[rows], values, labels).unwrap();
+    };
+
+    // Within what the device holds it reads every row, and waits for nothing.
+    insert(&mut node, 0..16);
+    assert_eq!(unit_rows(&mut node, table, &A), 16);
+    assert!(node.take_unmeasured().is_empty());
+
+    // Past it, it waits for the rows its worker holds as one context.
+    insert(&mut node, 16..64);
+    node.submit(table, &A).unwrap();
+    assert!(node.schedule().unwrap().is_none());
+    assert_eq!(node.take_unmeasured(), [table]);
+    assert!(node.wants_whole_rows(table).unwrap());
+
+    // Then every query reads one stratified core of those rows, encoded once.
+    node.set_whole_rows(table, Some(24)).unwrap();
+    let shared = Strategy::subsample(24, 0, CoreKind::Stratified);
+    assert_eq!(node.strategy(table).unwrap(), shared);
+    let step = run(&mut node);
+    assert_eq!(step.units().len(), 1);
+    assert_eq!(step.units()[0].rows.len(), 24);
+    node.submit(table, &[0.0, 0.0, 100.0, 100.0, 50.0, 50.0])
+        .unwrap();
+    let step = run(&mut node);
+    assert!(step.units().iter().all(|unit| unit.rows.len() == 24));
+    assert_eq!(actions(&step), [Action::Reuse]);
+
+    // A worker that holds every row reads them all.
+    node.set_whole_rows(table, Some(64)).unwrap();
+    assert_eq!(node.strategy(table).unwrap(), Strategy::Exact);
 }
 
 #[test]

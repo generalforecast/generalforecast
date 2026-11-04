@@ -120,20 +120,28 @@ impl TableState {
     }
 
     /// Whether the table's next plan would read it whole past its model's
-    /// cap if its worker could hold it, before the worker says how many rows
-    /// it can: an `AdaptiveWhole` table within `ADAPTIVE_WHOLE_PAST_CAP`
-    /// times a cap of at least `ADAPTIVE_WHOLE_FROM_CAP`.
+    /// cap, or share one context past what its device holds, if its worker
+    /// could hold it, before the worker says how many rows it can: an
+    /// `AdaptiveWhole` table within `ADAPTIVE_WHOLE_PAST_CAP` times a cap of
+    /// at least `ADAPTIVE_WHOLE_FROM_CAP`, or past `device_rows` fewer than
+    /// `ADAPTIVE_WHOLE_CONTEXT` that cut its cap (see `Strategy::resolve_on`).
+    /// A table within its cap waits for nothing.
     pub(super) fn unmeasured_whole(&self) -> bool {
         let rows = self.table.len();
+        let Some(cap) = self.spec.context_rows.map(NonZeroU64::get) else {
+            return false;
+        };
+        let device = self.spec.device_rows.is_some_and(|device| {
+            let device = device.get();
+            device <= cap && device < ADAPTIVE_WHOLE_CONTEXT
+        });
         self.spec.whole_rows.is_none()
             && self.spec.strategy == Strategy::AdaptiveWhole
             && self.spec.series.is_none()
-            && self.spec.context_rows.is_some_and(|cap| {
-                let cap = cap.get();
-                cap >= ADAPTIVE_WHOLE_FROM_CAP
-                    && rows > cap
-                    && rows <= cap.saturating_mul(ADAPTIVE_WHOLE_PAST_CAP)
-            })
+            && rows > cap
+            && (device
+                || (cap >= ADAPTIVE_WHOLE_FROM_CAP
+                    && rows <= cap.saturating_mul(ADAPTIVE_WHOLE_PAST_CAP)))
     }
 
     /// Rows plans leave out: unlabeled ones, unless the model reads them.
@@ -169,13 +177,14 @@ impl TableState {
     }
 
     /// The strategy the table plans with now: an adaptive one resolved from
-    /// its live rows, the model's cap and whether its rows have times, any
-    /// other as given.
+    /// its live rows, the model's cap, what its worker's device and the
+    /// worker hold, and whether its rows have times, any other as given.
     pub(super) fn resolved(&self) -> Strategy {
-        self.spec.strategy.resolve_within(
+        self.spec.strategy.resolve_on(
             self.table.len(),
             self.spec.context_rows,
             self.spec.whole_rows.flatten(),
+            self.spec.device_rows,
             self.times.has_timed(),
         )
     }

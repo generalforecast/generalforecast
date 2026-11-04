@@ -670,7 +670,8 @@ class Profiled:
     `fit_bound` is the most rows a table's fit takes before the server asks
     for its `Limited`, or None where fits are not limited. `context_rows` is
     the most rows a context holds: the model's own cap, or the most a context
-    of the table's width takes on the worker's device, whichever is fewer.
+    of the table's width takes on the worker's device, whichever is fewer;
+    `device_rows` is the second alone, or None where the device sets none.
     """
 
     bytes_per_row: int
@@ -694,6 +695,7 @@ class Profiled:
     extendable: bool = False
     unlabeled_context: bool = False
     fit_bound: int | None = None
+    device_rows: int | None = None
 
 
 @dataclass(frozen=True)

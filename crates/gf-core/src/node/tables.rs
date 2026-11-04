@@ -76,7 +76,8 @@ impl Node {
     ///
     /// A table waits once a fit would read more than its `EntrySizes::fit_bound`
     /// rows, and its requests stay pending until `set_fit_limits`; an
-    /// `AdaptiveWhole` table past its model's cap waits until `set_whole_rows`
+    /// `AdaptiveWhole` table past its model's cap, or past the rows its
+    /// worker's device holds in one context, waits until `set_whole_rows`
     /// too, and both are set for each table named.
     pub fn take_unmeasured(&mut self) -> Vec<TableId> {
         std::mem::take(&mut self.untold)
@@ -106,10 +107,10 @@ impl Node {
         Ok(())
     }
 
-    /// Whether a table reads past its model's cap whole once its worker says
-    /// how many rows it can hold as one context, and has not said yet: an
-    /// `AdaptiveWhole` table, which `take_unmeasured` names, for
-    /// `set_whole_rows` to answer.
+    /// Whether a table reads past its model's cap or its device's whole, or
+    /// shares one context, once its worker says how many rows it can hold as
+    /// one context, and has not said yet: an `AdaptiveWhole` table, which
+    /// `take_unmeasured` names, for `set_whole_rows` to answer.
     ///
     /// # Errors
     ///
@@ -124,7 +125,7 @@ impl Node {
 
     /// Sets the most rows a table's worker can hold as one context on its
     /// device, None where it can hold none, so an `AdaptiveWhole` table past
-    /// its model's cap plans again.
+    /// its model's cap, or its device's, plans again.
     ///
     /// # Errors
     ///

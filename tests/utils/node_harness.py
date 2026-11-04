@@ -801,12 +801,10 @@ class LocalClient:
             bound = self._worker.fit_bound(model_id, features)
             # As a server's worker says: the model's cap, or the most the
             # device holds, whichever is fewer.
+            device_rows = self._worker.memory_rows(model_id, features)
             capped = [
                 rows
-                for rows in (
-                    properties.context_rows,
-                    self._worker.memory_rows(model_id, features),
-                )
+                for rows in (properties.context_rows, device_rows)
                 if rows is not None
             ]
             context_rows = min(capped) if capped else None
@@ -824,6 +822,7 @@ class LocalClient:
                 refit_shift=refit_shift,
                 fit_rows=fit_rows,
                 context_rows=context_rows,
+                device_rows=device_rows,
                 past_cap=past_cap,
                 region_rows=region_rows,
                 **_rebuild_arguments(rebuild),

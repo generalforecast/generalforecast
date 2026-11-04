@@ -290,6 +290,7 @@ impl Shard {
             column_summary,
             unlabeled_context,
             fit_bound,
+            device_rows,
             ..
         } = profile;
         let served = &definition.model;
@@ -417,6 +418,7 @@ impl Shard {
             refit: config.refit,
             fit_rows: config.fit_rows,
             context_rows: context_rows.and_then(NonZeroU64::new),
+            device_rows: device_rows.and_then(NonZeroU64::new),
             whole_rows: None,
             past_cap: config.past_cap,
             regions: if series.is_some() {
