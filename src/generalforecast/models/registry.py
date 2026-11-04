@@ -308,6 +308,9 @@ def _derived_variant(
 ) -> Model:
     """A derived model as one `Bagged` model over its base's one shared copy.
 
+    A model of kind `adapter` runs each bag's input adapter in front of the
+    base, unmerged, through `adapted.adapted_functions`.
+
     Keyed by everything `made` is, its weights' digest included, so a model
     whose weights changed under its name never runs from this cache.
     """
@@ -339,9 +342,25 @@ def _derived_variant(
             "ModelMismatch",
             f"{made.model} has {made.bags} bags, but its weights stack {sorted(leading)}",
         )
+    combine = weights.combine
+    if (weights.inputs is not None) != (made.kind == "adapter"):
+        raise ModelRefError(
+            "ModelMismatch",
+            f"{made.model} is of kind {made.kind}, but its weights "
+            + (
+                "change its inputs"
+                if weights.inputs is not None
+                else "change none of its inputs"
+            ),
+        )
+    if weights.inputs is not None:
+        from generalforecast.models.adapted import WithInputs, adapted_functions
+
+        functions = adapted_functions(functions, weights.inputs)
+        combine = WithInputs(combine)
     bagged = (
         bagged_functions(functions),
-        Bagged(parameters, weights.own, made.bags, weights.combine),
+        Bagged(parameters, weights.own, made.bags, combine),
     )
     return wrap(*bagged, ModelRef(entry.id, codes, estimators))
 

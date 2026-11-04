@@ -2591,12 +2591,30 @@ class LockResources(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class LockWriter(Payload):
+    """The LockWriter schema.
+
+    the gf that wrote a lock: its package version, and the revision of what its gf
+    check writes for the same gf.yaml, rows and catalog. A lock without it was written
+    under rules 1
+    """
+
+    gf: str
+    rules: int
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("gf", "gf", True, _text),
+        Field("rules", "rules", True, _integer),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class Lock(Payload):
     """Gf.lock: what gf check resolved gf.yaml into.
 
-    `digest` is the canonical JSON digest of the document without `digest`, the one
-    identity of a predictor revision; `manifest` the digest of the normalized gf.yaml
-    it resolves
+    `digest` is the canonical JSON digest of the document without `digest` and
+    `checked_with`, the one identity of a predictor revision; `manifest` the digest of
+    the normalized gf.yaml it resolves
     """
 
     lock_version: Literal[1, 2]
@@ -2604,11 +2622,13 @@ class Lock(Payload):
     manifest: Digest
     predictor: Resolution
     model: LockedModel
+    checked_with: LockWriter | None = None
     resources: LockResources | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("lock_version", "lock_version", True, _literal(1, 2)),
         Field("digest", "digest", True, _decode_Digest),
+        Field("checked_with", "checked_with", False, _record(LockWriter)),
         Field("manifest", "manifest", True, _decode_Digest),
         Field("predictor", "predictor", True, _record(Resolution)),
         Field("resources", "resources", False, _record(LockResources)),

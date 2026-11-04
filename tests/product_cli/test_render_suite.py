@@ -287,3 +287,9 @@ def test_init_asks_nothing_it_cannot_offer_and_takes_only_good_values(suite):
     holdout = lines(suite, "init-holdout")
     assert "Holdout      0.03  62 rows" in holdout
     assert holdout[-1] == " Initialized predictor churn in ./gf.yaml"
+
+
+def test_logs_show_each_event_newest_first(suite):
+    assert suite["admin-logs"] == (
+        "2026-10-24 05:14:40  RolledBack\n2026-10-24 05:12:01  Promoted"
+    )

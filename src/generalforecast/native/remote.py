@@ -102,6 +102,24 @@ def _duplicates() -> Iterator[None]:
 _BATCH_BYTES = 16 << 20
 
 
+def _read_whole(reader: Any) -> Any:
+    """A Flight reply's whole stream, as a table.
+
+    On the main thread, `read_all`, which a Ctrl-C there cancels. On any
+    other, batch by batch: `read_all` turns a stream that ends `CANCELLED`
+    into a `KeyboardInterrupt` in the main thread, whichever thread read it,
+    which would end a caller that only made this call, such as an async
+    client's, whose calls run on threads of their own. There the error is
+    raised to this call alone.
+    """
+    import pyarrow as pa
+
+    if threading.current_thread() is threading.main_thread():
+        return reader.read_all()
+    batches = [chunk.data for chunk in reader if chunk.data is not None]
+    return pa.Table.from_batches(batches, schema=reader.schema)
+
+
 def _retry_once(call: Callable[[], Any]) -> Any:
     """Calls once more if the server was unavailable, as writes with ids allow."""
     from pyarrow import flight
@@ -1098,7 +1116,7 @@ class RemoteClient:
                 for part in _split(batch):
                     writer.write_batch(part)
                 writer.done_writing()
-                result = reader.read_all()
+                result = _read_whole(reader)
             except BaseException:
                 # The stream failed already; its first error is the one to raise.
                 with contextlib.suppress(Exception):

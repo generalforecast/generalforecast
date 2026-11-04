@@ -920,7 +920,12 @@ class PredictorCommands:
         if not exists:
             self.client._call("POST", "/predictors", "predictor", name, {"name": name})
         revision = Revision.from_dict(
-            self.call("POST", name, "/revisions", {"lock": lock, "snapshot": snapshot})
+            self.call(
+                "POST",
+                name,
+                "/revisions",
+                {"lock": lock, "snapshot": snapshot, "manifest": checked.manifest},
+            )
         )
         if current is None:
             current = Environment.from_dict(
@@ -1107,7 +1112,7 @@ class PredictorCommands:
         """Deletes a hosted predictor and every environment of it."""
         name, _ = self.reference()
         self.confirm(f"Delete {name} and its environments?")
-        result = self.call("DELETE", name)
+        result = self.call("POST", name, "/delete", {})
         self.out.status("Deleted", f"predictor {name}")
         return result if isinstance(result, dict) else {"name": name, "deleted": True}
 

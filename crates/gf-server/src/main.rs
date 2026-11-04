@@ -25,6 +25,7 @@ use clap::Parser;
 use gf_server::auth::Tokens;
 use gf_server::budget::RequestBudget;
 use gf_server::config::{Config, HttpConfig, KeysConfig};
+use gf_server::deadline::DeadlineLayer;
 use gf_server::http::{Front, Introspect, KeyStore, Principal, ServedModel, Static};
 use gf_server::metrics::Metrics;
 use gf_server::progress::{Compiling, Progress};
@@ -346,7 +347,10 @@ async fn run(
         let tokens = Tokens::new(&config.tokens);
         let replication_tokens = Tokens::new(&config.replication_tokens);
         let mut server = tonic::transport::Server::builder()
-            .timeout(Duration::from_secs_f64(config.request_timeout_seconds))
+            .layer(DeadlineLayer::new(
+                Duration::from_secs_f64(config.request_timeout_seconds),
+                "request_timeout_seconds",
+            ))
             // A cap on streams, not a queue for them: a stream waiting its turn would
             // hold its rows in the connection's flow-control window, which the
             // rows of the calls it waits on may then not get through.

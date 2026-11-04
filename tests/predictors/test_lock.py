@@ -6,10 +6,12 @@ from pathlib import Path
 import pytest
 import yaml
 
+import generalforecast
 from generalforecast.contracts import LOCK_VERSION, parse_lock
 from generalforecast.errors import InvalidInput
 from generalforecast.predictors import load, load_lock, resolve, write_lock
 from generalforecast.predictors.lock import (
+    LOCK_RULES,
     changes,
     document,
     lock_digest,
@@ -24,8 +26,19 @@ def test_lock_shape(churn: Path):
     path = write_lock(resolution, churn)
     value = yaml.safe_load(path.read_text())
     assert value["lock_version"] == LOCK_VERSION == 1
-    assert list(value) == ["lock_version", "digest", "manifest", "predictor", "model"]
+    assert list(value) == [
+        "lock_version",
+        "digest",
+        "checked_with",
+        "manifest",
+        "predictor",
+        "model",
+    ]
     assert value["digest"] == lock_digest(value)
+    assert value["checked_with"] == {
+        "gf": generalforecast.__version__,
+        "rules": LOCK_RULES,
+    }
     predictor = value["predictor"]
     assert list(predictor) == [
         "name",
