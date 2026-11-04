@@ -27,6 +27,7 @@ import numpy as np
 
 from generalforecast import protocol
 from generalforecast._core import CacheKey
+from generalforecast.autotune import use_autotune_results
 from generalforecast.constants import SCATTER_THREADS
 from generalforecast.models.contract import TabularFunctions, TabularProperties
 from generalforecast.models.series import SeriesFunctions, SeriesProperties
@@ -204,6 +205,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         """
         command_buffers()
         portable_cpu_programs()
+        use_autotune_results()
         report_fallback()
         self._settings, self._minimum = settings, bucket_minimum
         self._slot_bytes = slot_bytes

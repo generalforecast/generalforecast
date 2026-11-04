@@ -23,6 +23,9 @@ pub struct Starter {
     pub token: String,
     /// A file holding the log encryption key; `GF_LOG_KEY` if None.
     pub key_file: Option<PathBuf>,
+    /// A router's replication token: the server then holds tables only
+    /// under that router's leases.
+    pub replication_token: Option<String>,
 }
 
 /// Random bytes as hex, for tokens and keys.
@@ -85,6 +88,12 @@ pub fn starter_config(starter: &Starter) -> String {
             "encryption_key_env = \"GF_LOG_KEY\"".to_string(),
         ),
     };
+    let lease = match &starter.replication_token {
+        Some(token) => format!(
+            "replication_tokens = [{token:?}]   # the router's\nrequire_lease = true                # tables only under its leases\n"
+        ),
+        None => String::new(),
+    };
     format!(
         r#"# A generalforecast server on this machine. Check it with `gf admin node check --config`
 # and start it with `gf admin node serve --config`{key_note}
@@ -93,7 +102,7 @@ listen = {listen:?}
 data = {data:?}                     # table logs, replayed on restart
 tokens = [{token:?}]
 {key}
-
+{lease}
 # Beyond this machine, serve over TLS and listen on 0.0.0.0:8815.
 # [tls]
 # certificate = "/etc/generalforecast/server.pem"
@@ -367,6 +376,7 @@ pub fn table_logs(tables: &Path) -> std::io::Result<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::TokenConfig;
 
     fn starter(directory: &Path) -> Starter {
         Starter {
@@ -376,6 +386,7 @@ mod tests {
             models: Vec::new(),
             token: "secret".to_string(),
             key_file: None,
+            replication_token: None,
         }
     }
 
@@ -411,6 +422,26 @@ mod tests {
         assert_eq!(config.key_envs(), ["GF_LOG_KEY", "GF_OLD_KEY"]);
         // A short token, and a file others may read, draw warnings.
         assert!(config.warnings(&path)[0].contains("shorter than"));
+    }
+
+    #[test]
+    fn a_routers_token_makes_the_node_hold_tables_under_its_leases() {
+        let directory = tempdir();
+        let path = directory.join("generalforecast.toml");
+        std::fs::write(&path, starter_config(&starter(&directory))).unwrap();
+        let plain = Config::load(&path).unwrap();
+        assert!(plain.replication_tokens.is_empty() && !plain.require_lease);
+        let mut routed = starter(&directory);
+        routed.replication_token = Some("r".repeat(32));
+        std::fs::write(&path, starter_config(&routed)).unwrap();
+        let config = Config::load(&path).unwrap();
+        let tokens: Vec<&str> = config
+            .replication_tokens
+            .iter()
+            .map(TokenConfig::token)
+            .collect();
+        assert_eq!(tokens, ["r".repeat(32)]);
+        assert!(config.require_lease);
     }
 
     #[test]

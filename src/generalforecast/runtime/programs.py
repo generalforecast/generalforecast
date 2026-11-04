@@ -10,7 +10,7 @@ import logging
 import os
 import threading
 import time
-from collections.abc import Callable, Hashable, Iterable, Iterator
+from collections.abc import Callable, Hashable, Iterable, Iterator, Sequence
 from concurrent import futures
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
@@ -280,12 +280,16 @@ class Recorded:
 
     A measure is a tuple its worker reads, such as a table width whose
     sizes were measured; the latest `RECORDED_KINDS` are kept. `used` holds
-    when a worker last used each kind, in seconds since the epoch.
+    when a worker last used each kind, in seconds since the epoch. `short`
+    holds, for a kind a start ran out of device memory compiling, the least
+    count it did at: later starts on this machine's device skip it and the
+    counts past it, which compile when a call first needs them.
     """
 
     kinds: dict[Kind, set[int]]
     measures: dict[tuple, None]
     used: dict[Kind, float] = dataclasses.field(default_factory=dict)
+    short: dict[Kind, int] = dataclasses.field(default_factory=dict)
 
     def programs(self, kind: Kind) -> int:
         """Programs a kind compiles at a start: each count it took, and each power of two up to the most."""
@@ -307,6 +311,14 @@ class Recorded:
             total -= self.programs(oldest)
             del self.kinds[oldest]
         self.used = {kind: self.used[kind] for kind in self.kinds if kind in self.used}
+        self.short = {
+            kind: self.short[kind] for kind in self.kinds if kind in self.short
+        }
+
+    def started(self, kind: Kind, counts: Sequence[int]) -> list[int]:
+        """Those of a kind's `counts` a start compiles: the ones below where it ran out of device memory here."""
+        least = self.short.get(kind)
+        return [count for count in counts if least is None or count < least]
 
     def by_use(self) -> list[tuple[Kind, set[int]]]:
         """The kinds, most recently used first, with their counts."""
@@ -352,6 +364,15 @@ class Manifest:
             recorded.prune(now)
 
         self._update(added)
+
+    def short_of_memory(self, kind: Kind, count: int) -> None:
+        """Records that compiling a recorded kind at `count` items at start ran out of device memory."""
+
+        def marked(recorded: Recorded) -> None:
+            if kind in recorded.kinds:
+                recorded.short[kind] = min(recorded.short.get(kind, count), count)
+
+        self._update(marked)
 
     def add_measure(self, measure: tuple) -> None:
         """Records a measure as the latest taken."""
@@ -542,6 +563,16 @@ class Programs:
             manifest.add(kind, count)
         except OSError as error:
             logger.warning("cannot record a compiled program: %s", error)
+
+    def short_of_memory(self, model: str, kind: Kind, count: int) -> None:
+        """Records that a model's recorded kind ran out of device memory as a start compiled it at `count` items; see `Recorded.short`."""
+        manifest = self.manifest(model)
+        if manifest is None:
+            return
+        try:
+            manifest.short_of_memory(kind, count)
+        except OSError as error:
+            logger.warning("cannot record a program short of memory: %s", error)
 
     def remember_measure(self, model: str, measure: tuple) -> None:
         """Records that a model measured something by compiling, which later processes measure at start."""

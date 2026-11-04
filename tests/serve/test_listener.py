@@ -179,6 +179,51 @@ def test_node_init_writes_through_gf_server_and_names_the_next_steps(
     )
 
 
+def test_node_init_takes_a_routers_token_through_the_environment(monkeypatch, tmp_path):
+    server = _fake(
+        tmp_path,
+        "gf-server",
+        f'printf "%s" "$GF_REPLICATION_TOKEN" > "{tmp_path}/token"\n',
+    )
+    monkeypatch.setattr(listener, "binary", lambda name: server)
+    monkeypatch.delenv("GF_REPLICATION_TOKEN", raising=False)
+    router = tmp_path / "router.toml"
+    router.write_text(
+        '[[nodes]]\nname = "node-0"\naddress = "http://127.0.0.1:8816"\ntoken = "r1"\n'
+        '[[nodes]]\nname = "node-1"\naddress = "http://127.0.0.1:8817"\ntoken = "r1"\n'
+    )
+    node = tmp_path / "node.toml"
+    argv = ("admin", "node", "init", "--path", str(node), "--router", str(router))
+    code, _, stderr = gf(*argv, monkeypatch=monkeypatch)
+    assert code == 0, stderr
+    # The token stays off the process list.
+    assert "r1" not in (tmp_path / "gf-server.args").read_text()
+    assert (tmp_path / "token").read_text() == "r1"
+    router.write_text('[[nodes]]\ntoken = "r1"\n[[nodes]]\ntoken = "r2"\n')
+    code, _, stderr = gf(*argv, monkeypatch=monkeypatch)
+    assert code == 1 and "names no single replication token" in stderr
+
+
+def test_router_init_says_to_give_each_node_its_configuration(monkeypatch, tmp_path):
+    router = _fake(tmp_path, "gf-router", "exit 0\n")
+    monkeypatch.setattr(listener, "binary", lambda name: router)
+    config = tmp_path / "router.toml"
+    code, stdout, stderr = gf(
+        "admin",
+        "router",
+        "init",
+        "--path",
+        str(config),
+        "--node",
+        "http://127.0.0.1:8816",
+        monkeypatch=monkeypatch,
+    )
+    assert code == 0, stderr
+    assert stdout.splitlines()[0] == (
+        f"next: write each node's configuration with --router {config}"
+    )
+
+
 def test_router_check_reports_and_fails_with_the_routers_words(monkeypatch, tmp_path):
     router = _fake(
         tmp_path,
