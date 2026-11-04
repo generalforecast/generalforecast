@@ -301,6 +301,22 @@ def _shapes(tree: Any) -> Any:
     )
 
 
+# Stages each of whose items is a whole context's encode, and the most of
+# them a call may hold for its items to count as large: a padded item then
+# costs about what a real one does, and a call more costs little, so such
+# calls are not padded. Small contexts, of which a call holds many, still pad
+# to their bucket, in one call and one program.
+WHOLE_CONTEXT_STAGES = frozenset({"encode", "fit_encode"})
+LARGE_ITEMS = 128
+
+
+def _unpadded(stage: str, padded: int, left: int, size: int) -> int:
+    """`padded`, or for `stage`'s large contexts, the most powers of two `left` items fill."""
+    if stage not in WHOLE_CONTEXT_STAGES or size > LARGE_ITEMS or left >= padded:
+        return padded
+    return 1 << (left.bit_length() - 1)
+
+
 def _bucket_of(buckets: Sequence[int], items: int, size: int) -> int:
     """The least of `buckets` within `size` that takes `items`, or else the most within it."""
     within = [bucket for bucket in buckets if bucket <= size] or [1]
@@ -317,7 +333,9 @@ class Chunks:
     A run of more items than a chunk pads its last call to the chunk, and a
     run of fewer pads its one call to their bucket, so a kind of call
     compiles for the chunk and for the buckets below it that single calls
-    take, not for every remainder.
+    take, not for every remainder. Encodes of contexts so large that a call
+    holds at most `LARGE_ITEMS` are not padded: they go in calls of the
+    powers of two they fill, nineteen as sixteen, two and one.
     """
 
     def __init__(
@@ -450,6 +468,7 @@ class Chunks:
             size = self.size(key, budget, estimate)
             if buckets is None:
                 padded = size if count > size else bucket_size(count, 1)
+                padded = _unpadded(stage, padded, count - first, size)
             else:
                 padded = _bucket_of(buckets, count - first, size)
             own = padded
