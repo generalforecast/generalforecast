@@ -698,9 +698,11 @@ class RemoteClient:
                 `Strategy.adaptive_whole()`: every row while the table is
                 within the model's cap and the device holds its context, and
                 past them a core and each query's nearest rows in contexts of
-                at most 16,384 rows, so a table is never refused for its size. Pass `Strategy.exact()` to read
-                every row however large the table, which a context the device
-                cannot hold refuses.
+                at most 16,384 rows, or, where the device holds fewer rows than
+                that in one context, one stratified sample of what it holds,
+                which every query shares, so a table is never refused for its
+                size. Pass `Strategy.exact()` to read every row however large
+                the table, which a context the device cannot hold refuses.
             page_size: Rows per page.
             time_bucket: A window of time that pages never straddle, in the
                 units of row times, or a timedelta for a datetime table; with

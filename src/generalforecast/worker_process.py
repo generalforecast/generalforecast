@@ -438,20 +438,20 @@ def _profiled(worker: Worker, model: int, features: int) -> protocol.Profiled:
     features = max(features, 1)
     profile = worker.profile(model, features)
     properties = worker.properties(model)
+    device_rows = worker.memory_rows(model, features)
     return protocol.Profiled(
         bytes_per_row=profile.cache_bytes_per_row,
         representation_bytes=profile.row_bytes,
         regression=properties.regression,
         class_slots=properties.class_slots,
         outputs=properties.num_outputs,
-        context_rows=_fewest(
-            properties.context_rows, worker.memory_rows(model, features)
-        ),
+        context_rows=_fewest(properties.context_rows, device_rows),
         state_bytes=profile.state_bytes,
         categorical_state_bytes=profile.categorical_state_bytes,
         column_summary=properties.column_summary,
         unlabeled_context=properties.unlabeled_context,
         fit_bound=_limit(worker.fit_bound(model, features)),
+        device_rows=device_rows,
     )
 
 

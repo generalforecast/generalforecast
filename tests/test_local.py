@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import inspect
+import json
 import threading
 import time as clock
 import warnings
@@ -485,6 +486,26 @@ def test_adaptive_tables_read_no_more_rows_than_the_device_holds() -> None:
         whole.predict(NEAR_A)
     assert adaptive.predict(NEAR_A).shape == (2, 3)
     assert adaptive.describe().context_rows == small
+
+    # The default strategy, past what the device holds in one context and
+    # below 16,384 rows, reads every row the worker holds as one, or past
+    # them one stratified core of as many, which every query shares.
+    shared = _table(
+        client,
+        name="shared",
+        model=TABICL,
+        strategy=generalforecast.Strategy.adaptive_whole(),
+    )
+    shared.insert(np.arange(large), features, targets)
+    assert shared.predict(NEAR_A).shape == (2, 3)
+    held = worker.whole_rows(loaded, 5)
+    assert held is not None and held >= small
+    resolved = json.loads(shared.describe().resolved_strategy.spec())
+    if large <= held:
+        assert resolved == {"kind": "exact"}
+    else:
+        assert resolved["core"] == {"rows": held, "seed": 0, "kind": "stratified"}
+        assert resolved["neighbors"] == 0
 
 
 @pytest.mark.slow

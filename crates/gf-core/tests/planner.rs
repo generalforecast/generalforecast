@@ -481,6 +481,87 @@ fn adaptive_whole_reads_a_table_past_the_cap_whole_where_the_worker_can_hold_it(
     assert_eq!(Strategy::AdaptiveWhole.seed(), Some(ADAPTIVE_SEED));
 }
 
+#[test]
+fn adaptive_whole_shares_one_context_past_the_rows_its_device_holds() {
+    use gf_core::planner::{ADAPTIVE_SEED, ADAPTIVE_WHOLE_CONTEXT};
+    use std::num::NonZeroU64;
+
+    let rows = NonZeroU64::new;
+    // Mitra-2 on a 1,558-column table: a cap of 50,000 rows cut to 256 by
+    // the device, which holds 384 rows as one kept context.
+    let (cap, device, whole) = (rows(256), rows(256), rows(384));
+    for timed in [false, true] {
+        // Within what the device holds, it reads every row, as before.
+        for live in [1, 255, 256] {
+            assert_eq!(
+                Strategy::AdaptiveWhole.resolve_on(live, cap, whole, device, timed),
+                Strategy::Exact
+            );
+        }
+        // Past it, every row while the worker holds them as one context.
+        for live in [257, 384] {
+            assert_eq!(
+                Strategy::AdaptiveWhole.resolve_on(live, cap, whole, device, timed),
+                Strategy::Exact
+            );
+        }
+        // Past that, one stratified core of what the worker holds, shared by
+        // every query, rather than a context per query.
+        for live in [385, 2_951, 1_000_000] {
+            assert_eq!(
+                Strategy::AdaptiveWhole.resolve_on(live, cap, whole, device, timed),
+                Strategy::subsample(384, ADAPTIVE_SEED, CoreKind::Stratified)
+            );
+        }
+        // A worker that holds fewer as one kept context than one put off
+        // shares the larger.
+        assert_eq!(
+            Strategy::AdaptiveWhole.resolve_on(2_951, cap, rows(128), device, timed),
+            Strategy::subsample(256, ADAPTIVE_SEED, CoreKind::Stratified)
+        );
+        // Without a whole, it reads as `resolve_within` does.
+        assert_eq!(
+            Strategy::AdaptiveWhole.resolve_on(2_951, cap, None, device, timed),
+            Strategy::AdaptiveWhole.resolve_within(2_951, cap, None, timed)
+        );
+        // `Adaptive` and explicit strategies are left as they were.
+        for strategy in [Strategy::Adaptive, Strategy::Exact, Strategy::neighbors(8)] {
+            assert_eq!(
+                strategy.resolve_on(2_951, cap, whole, device, timed),
+                strategy.resolve_within(2_951, cap, whole, timed)
+            );
+        }
+    }
+    // A device that holds `ADAPTIVE_WHOLE_CONTEXT` rows or more, or more
+    // than the model's own cap, leaves per-query contexts as they were.
+    let large = Some(ADAPTIVE_WHOLE_CONTEXT);
+    for (cap, device) in [
+        (rows(60_000), rows(ADAPTIVE_WHOLE_CONTEXT)),
+        (rows(60_000), rows(100_000)),
+        (rows(512), rows(4_096)),
+    ] {
+        let cap = cap.map(|cap| cap.min(device.unwrap()));
+        for live in [100, 60_000, 300_000] {
+            assert_eq!(
+                Strategy::AdaptiveWhole.resolve_on(
+                    live,
+                    cap,
+                    large.and_then(NonZeroU64::new),
+                    device,
+                    false
+                ),
+                Strategy::AdaptiveWhole.resolve_within(
+                    live,
+                    cap,
+                    large.and_then(NonZeroU64::new),
+                    false
+                ),
+                "cap {cap:?}, device {device:?}, rows {live}"
+            );
+        }
+    }
+}
+
 /// Rows below 48 in one stratum and the rest in another.
 struct Halves;
 

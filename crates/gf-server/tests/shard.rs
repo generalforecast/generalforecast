@@ -184,6 +184,36 @@ fn fake_worker(
                         })
                         .frame()
                     }
+                    // The wide model's device holds two rows in a context
+                    // put off and four kept, as a wide table's would.
+                    WorkerRequest::Profile { model, .. } if model == "wide" => {
+                        WorkerReply::Profile(ModelProfile {
+                            bytes_per_row: 64,
+                            representation_bytes: 16,
+                            regression: false,
+                            class_slots: 10,
+                            outputs: 10,
+                            context_rows: Some(2),
+                            state_bytes: 32,
+                            categorical_state_bytes: 64,
+                            column_summary: true,
+                            device_rows: Some(2),
+                            ..ModelProfile::default()
+                        })
+                        .frame()
+                    }
+                    WorkerRequest::FitLimits { model, whole, .. } if model == "wide" => {
+                        actions
+                            .lock()
+                            .unwrap()
+                            .push(format!("fit_limits whole={whole}"));
+                        WorkerReply::FitLimits {
+                            state_rows: None,
+                            fused_rows: None,
+                            whole_rows: whole.then_some(4),
+                        }
+                        .frame()
+                    }
                     WorkerRequest::Profile { .. } => WorkerReply::Profile(ModelProfile {
                         bytes_per_row: 64,
                         representation_bytes: 16,
@@ -433,6 +463,7 @@ async fn shard_routed(
             "tiny-forecaster".to_string(),
             "bounded".to_string(),
             "capped".to_string(),
+            "wide".to_string(),
         ],
     );
     let metrics = Arc::new(Metrics::default());
@@ -2268,6 +2299,58 @@ async fn a_clamped_tables_compaction_keeps_the_strategy_it_was_given() {
     let described = replica.describe().await;
     assert_eq!(described.definition.strategy, StrategySpec::Exact);
     assert_eq!(described.strategy, clamped);
+}
+
+#[tokio::test]
+async fn an_adaptive_whole_table_past_its_device_shares_what_the_worker_holds() {
+    use gf_core::planner::{CoreKind, Strategy};
+    use gf_server::protocol::StrategySpec;
+
+    let shard = shard(settings()).await;
+    let mut definition = definition("rows", 3);
+    definition.model = "wide".to_string();
+    definition.strategy = StrategySpec::AdaptiveWhole;
+    let (reply, answer) = oneshot::channel();
+    shard
+        .commands
+        .send(Command::Create {
+            definition,
+            terms: Terms::default(),
+            reply,
+        })
+        .await
+        .unwrap();
+    answer.await.unwrap().unwrap();
+
+    // Within what the device holds it reads every row, unmeasured.
+    shard.insert(&[1, 2]).await;
+    assert_eq!(shard.predict().await, Ok(1));
+    assert_eq!(shard.describe().await.strategy, StrategySpec::Exact);
+    let measured = |shard: &Harness| {
+        shard
+            .actions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|action| action.starts_with("fit_limits"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert!(measured(&shard).is_empty());
+
+    // Past it, the worker is asked once what it holds whole: it reads every
+    // row up to that, and past it one stratified core of as many.
+    shard.insert(&[3, 4]).await;
+    assert_eq!(shard.predict().await, Ok(1));
+    assert_eq!(shard.describe().await.strategy, StrategySpec::Exact);
+    assert_eq!(measured(&shard), ["fit_limits whole=true"]);
+    shard.insert(&[5, 6, 7, 8]).await;
+    assert_eq!(shard.predict().await, Ok(1));
+    assert_eq!(
+        shard.describe().await.strategy,
+        StrategySpec::of(Strategy::subsample(4, 0, CoreKind::Stratified))
+    );
+    assert_eq!(measured(&shard).len(), 1);
 }
 
 /// An insert of `keys` into `rows`, and where its answer arrives.

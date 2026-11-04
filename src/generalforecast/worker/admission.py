@@ -586,7 +586,9 @@ class Admission:
         query that reads it, and its encode, or its decode of the smallest
         chunk of queries, fits beside the pool, with the autotuner's headroom,
         as `_fits_device` holds a unit to. An `adaptive_whole` table past its
-        model's cap reads whole within it. None where the model's encode
+        model's cap reads whole within it; so does one past `memory_rows`
+        where that is fewer than 16,384, and past it every query of such a
+        table shares a core of this many rows. None where the model's encode
         cannot be measured, so such a table reads as an adaptive one does.
         """
         features = self.width(model, features)

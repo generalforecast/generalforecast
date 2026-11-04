@@ -210,7 +210,10 @@ class Strategy:
 
         It does while it holds at most four times a cap of 10,000 rows or
         more and its worker can hold the whole context on its device, the
-        table's `whole_rows`.
+        table's `whole_rows`. Where the device holds fewer than 16,384 rows
+        in one context, the table's `device_rows`, a table past them reads
+        whole up to `whole_rows`, and past that a stratified core of as many
+        rows every query shares.
         """
     def resolve(
         self,
@@ -476,12 +479,15 @@ class Node:
         unlabeled_context: bool = False,
         fit_bound: int | None = None,
         whole_rows: int | None = None,
+        device_rows: int | None = None,
     ) -> int:
         """Adds an empty table and returns its id. `classes` is 0 for regression.
 
         `summary` is `table` or `context`; a table that summarizes each context
         keeps `state_bytes` of state beside each unit's rows. A fit on more
         than `fit_bound` rows waits for `set_fit_limits`; None never waits.
+        `device_rows` is the most rows one context takes on the worker's
+        device, which `context_rows` is no more than; see `TableSpec`.
         """
     def insert(
         self,
