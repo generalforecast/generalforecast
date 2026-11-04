@@ -105,9 +105,11 @@ MAPPINGS_SHORT = 3 / 4
 # only up to `WARM_RUN_ROWS` rows, and past that only compiles them.
 TABLE_STAGES = frozenset({"fit", "state", "encode"})
 WARM_RUN_ROWS = 1024
-# The most bytes of zeros a warm start runs a program on. A paged decode
+# The most bytes a warm start's run of a program on zeros may take: the zeros,
+# and the temporaries and outputs XLA counts for the program. A paged decode
 # reads the device pool, and zeros the pool's size are a second pool, which
-# the device holding the first cannot take; past this it only compiles.
+# the device holding the first cannot take; a fused decode's zeros are small
+# but its temporaries reach tens of gigabytes. Past this it only compiles.
 WARM_RUN_BYTES = 256 << 20
 # Programs a warm start compiles at once: compiles are mostly host work, and
 # a machine of a few cores takes about this many side by side.
