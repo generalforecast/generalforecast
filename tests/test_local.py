@@ -33,6 +33,7 @@ from generalforecast.worker import Worker
 from generalforecast.worker import admission as worker_admission
 from generalforecast.worker import decodes as worker_decodes
 from generalforecast.worker.decodes import query_pieces
+from generalforecast.worker.records import Memo
 from tests.models.conformance.cases import CASES, Case, table
 from tests.models.kumo.tiny import tiny_kumo
 from tests.models.tabicl.tiny import tiny_tabicl
@@ -524,6 +525,27 @@ def test_a_model_whose_measured_contexts_overfill_the_device_reads_fewer_rows() 
     adaptive.insert(np.arange(MEASURED_ROWS), features, targets)
     assert adaptive.predict(NEAR_A).shape == (2, 3)
     assert adaptive.describe().context_rows == small
+
+
+@pytest.mark.slow
+def test_the_device_cap_runs_work_beside_a_later_width_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = node_harness.local()
+    worker = client._worker
+    first = _table(client, name="first", model=TABICL)
+    (loaded,) = worker._models
+    worker.budget = dataclasses.replace(worker.budget, cpu=False)
+    # As a fresh worker's first width, whose decode profile is not measured:
+    # its two profiles compile at once, and nothing else beside them.
+    monkeypatch.setattr(worker, "_decodes", Memo())
+    started = threading.Event()
+    assert worker.memory_rows(loaded, 5, beside=started.set) is not None
+    assert not started.is_set()
+    # A later width's encode profile compiles beside the work given.
+    assert worker.memory_rows(loaded, 6, beside=started.set) is not None
+    assert started.wait(60)
+    del first
 
 
 @pytest.mark.slow

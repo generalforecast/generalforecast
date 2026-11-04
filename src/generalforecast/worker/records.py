@@ -86,6 +86,10 @@ class Memo[Key: Hashable, Value]:
             self._measuring.pop(key, None)
         return self._values[key]
 
+    def __contains__(self, key: object) -> bool:
+        """Whether a key is measured already."""
+        return key in self._values
+
     def __getitem__(self, key: Key) -> Value:
         """The value of a key measured already."""
         return self._values[key]
