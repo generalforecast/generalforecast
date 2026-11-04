@@ -573,6 +573,35 @@ impl RowSnapshot {
             .collect()
     }
 
+    /// The features of `rows`, row-major, appended to `into`, as they were
+    /// when the snapshot was taken. It takes no lock, so threads can each
+    /// read a share of a snapshot's rows at once.
+    ///
+    /// # Errors
+    ///
+    /// If a row was not stored, or a block cannot be read.
+    pub fn extend_features(&self, rows: &[RowId], into: &mut Vec<f32>) -> Result<(), RowsError> {
+        let mut held: Option<(u32, Bytes)> = None;
+        for &row in rows {
+            if row.0 >= self.rows {
+                return Err(RowsError::Unknown(row));
+            }
+            let block = u32::try_from(row.0 as usize / self.rows_per_block)
+                .expect("blocks number fewer than rows");
+            if held.as_ref().is_none_or(|(at, _)| *at != block) {
+                held = Some((block, self.block(block)?));
+            }
+            let (_, bytes) = held.as_ref().expect("a block is held");
+            let start = (row.0 as usize % self.rows_per_block) * self.row_bytes;
+            into.extend(
+                bytes[start..start + self.width * 4]
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("four bytes"))),
+            );
+        }
+        Ok(())
+    }
+
     fn block(&self, block: u32) -> Result<Bytes, RowsError> {
         if let Some(bytes) = self.memory.get(&block) {
             return Ok(Arc::clone(bytes));
