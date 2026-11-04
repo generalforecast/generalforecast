@@ -228,6 +228,47 @@ def test_a_run_past_one_call_pads_its_last_call_to_the_chunk() -> None:
     assert padded_counts[-1] == 1 and compiled == ["fit", "fit"]
 
 
+def test_large_encodes_run_in_calls_their_items_fill() -> None:
+    # Each encode item is a whole context, so nineteen large ones run as calls
+    # of sixteen, two and one rather than one padded to thirty-two; small
+    # contexts and other stages still pad to their bucket. Each item's output
+    # is what it gets alone.
+    doubled = jax.jit(lambda rows: rows * 2)
+    items = np.arange(40, dtype=np.float32).reshape(40, 1)
+    chunks = Chunks(lambda *_: None)
+    padded_counts: list[int] = []
+    outputs: list[np.ndarray] = []
+
+    def prepare(first: int, stop: int, padded: int) -> Call:
+        padded_counts.append(padded)
+        rows = items[first:stop]
+        stacked = np.concatenate([rows, np.repeat(rows[-1:], padded - len(rows), 0)])
+        return Call(doubled, (), (stacked,), padded)
+
+    def consume(first: int, stop: int, found: Any) -> None:
+        outputs.extend(np.asarray(found)[: stop - first])
+
+    # An estimate past what XLA measures, so the chunk stays 32 items.
+    per_item, budget = 1 << 20, 32 << 20
+
+    def run(stage: str, count: int, item: int = per_item) -> list[int]:
+        padded_counts.clear()
+        outputs.clear()
+        chunks.run(stage, (stage, item), count, budget, lambda: item, prepare, consume)
+        np.testing.assert_array_equal(np.stack(outputs), items[:count] * 2)
+        return list(padded_counts)
+
+    assert run("encode", 19) == [16, 2, 1]
+    assert run("fit_encode", 19) == [16, 2, 1]
+    assert run("decode", 19) == [32]
+    # A run past the chunk fills its last calls too.
+    assert run("encode", 40) == [32, 8]
+    assert run("encode", 32) == [32]
+    assert run("encode", 1) == [1]
+    # Small contexts, of which a call holds 512.
+    assert run("encode", 19, per_item >> 4) == [32]
+
+
 def test_measuring_a_kind_counts_under_the_call_that_reuses_its_program(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
