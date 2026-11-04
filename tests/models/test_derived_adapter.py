@@ -67,7 +67,7 @@ def _stacked(parts):
 class Plane:
     """Keeps one derived model of `kind`, whose bags are `parts`."""
 
-    def __init__(self, parts, kind="adapter", inputs=INPUTS):
+    def __init__(self, parts, kind: derived.Kind = "adapter", inputs=INPUTS):
         self.parts, self.kind, self.inputs = parts, kind, inputs
 
     def resolve(self, model):
