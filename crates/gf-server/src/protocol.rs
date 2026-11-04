@@ -948,6 +948,11 @@ pub struct ModelProfile {
     /// for its `FitLimits`, or None where fits are not limited.
     #[serde(default)]
     pub fit_bound: Option<u64>,
+    /// The most rows one context of the table's width takes on the worker's
+    /// device, which `context_rows` is no more than; None where the device
+    /// sets no such limit.
+    #[serde(default)]
+    pub device_rows: Option<u64>,
 }
 
 /// One request's predictions in a reply: which buffer holds them, and their shape.

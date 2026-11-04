@@ -126,7 +126,10 @@ impl Strategy {
     ///
     /// It does while it holds at most four times a cap of 10,000 rows or
     /// more and its worker can hold the whole context on its device, the
-    /// table's `whole_rows`.
+    /// table's `whole_rows`. Where the device holds fewer than 16,384 rows
+    /// in one context, the table's `device_rows`, a table past them reads
+    /// whole up to `whole_rows`, and past that a stratified core of as many
+    /// rows every query shares.
     #[staticmethod]
     fn adaptive_whole() -> Self {
         Self(planner::Strategy::AdaptiveWhole)
@@ -939,6 +942,8 @@ impl Node {
     /// `summary` is `table` or `context`; a table that summarizes each context
     /// keeps `state_bytes` of state beside each unit's rows. A fit on more
     /// than `fit_bound` rows waits for `set_fit_limits`; None never waits.
+    /// `device_rows` is the most rows one context takes on the worker's
+    /// device, which `context_rows` is no more than; see `TableSpec`.
     #[pyo3(signature = (
         model, features, classes, strategy, bytes_per_row,
         bytes_per_representation = 0, page_size = 128, bucket_minimum = 8,
@@ -949,6 +954,7 @@ impl Node {
         summary = "table", state_bytes = 0,
         categorical = Vec::new(), retrieval_categoricals = "codes",
         unlabeled_context = false, fit_bound = None, whole_rows = None,
+        device_rows = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn create_table(
@@ -982,6 +988,7 @@ impl Node {
         unlabeled_context: bool,
         fit_bound: Option<i64>,
         whole_rows: Option<i64>,
+        device_rows: Option<i64>,
     ) -> PyResult<u32> {
         let cutoffs = refit_cutoffs.parse::<CutoffRefit>().map_err(invalid)?;
         let refit = RefitPolicy::new(refit_after, refit_shift)
@@ -1043,6 +1050,12 @@ impl Node {
                 .map(|rows| count::<u64>(rows, "whole_rows"))
                 .transpose()?
                 .map(NonZeroU64::new),
+            device_rows: device_rows
+                .map(|rows| {
+                    NonZeroU64::new(count(rows, "device_rows")?)
+                        .ok_or_else(|| invalid("device_rows must be positive"))
+                })
+                .transpose()?,
             past_cap: past_cap.parse::<PastCap>().map_err(invalid)?,
             regions: region_rows
                 .map(|rows| -> PyResult<RegionSpec> {
@@ -1179,6 +1192,7 @@ impl Node {
             refit: RefitPolicy::default(),
             fit_rows: positive(DEFAULT_FIT_ROWS as i64, "fit_rows")?,
             context_rows: None,
+            device_rows: None,
             whole_rows: None,
             past_cap: PastCap::Warn,
             regions: None,

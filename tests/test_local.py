@@ -8,6 +8,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import inspect
+import json
 import threading
 import time as clock
 import warnings
@@ -33,6 +34,7 @@ from generalforecast.worker import Worker
 from generalforecast.worker import admission as worker_admission
 from generalforecast.worker import decodes as worker_decodes
 from generalforecast.worker.decodes import query_pieces
+from generalforecast.worker.records import Memo
 from tests.models.conformance.cases import CASES, Case, table
 from tests.models.kumo.tiny import tiny_kumo
 from tests.models.tabicl.tiny import tiny_tabicl
@@ -486,6 +488,26 @@ def test_adaptive_tables_read_no_more_rows_than_the_device_holds() -> None:
     assert adaptive.predict(NEAR_A).shape == (2, 3)
     assert adaptive.describe().context_rows == small
 
+    # The default strategy, past what the device holds in one context and
+    # below 16,384 rows, reads every row the worker holds as one, or past
+    # them one stratified core of as many, which every query shares.
+    shared = _table(
+        client,
+        name="shared",
+        model=TABICL,
+        strategy=generalforecast.Strategy.adaptive_whole(),
+    )
+    shared.insert(np.arange(large), features, targets)
+    assert shared.predict(NEAR_A).shape == (2, 3)
+    held = worker.whole_rows(loaded, 5)
+    assert held is not None and held >= small
+    resolved = json.loads(shared.describe().resolved_strategy.spec())
+    if large <= held:
+        assert resolved == {"kind": "exact"}
+    else:
+        assert resolved["core"] == {"rows": held, "seed": 0, "kind": "stratified"}
+        assert resolved["neighbors"] == 0
+
 
 @pytest.mark.slow
 def test_a_model_whose_measured_contexts_overfill_the_device_reads_fewer_rows() -> None:
@@ -524,6 +546,27 @@ def test_a_model_whose_measured_contexts_overfill_the_device_reads_fewer_rows() 
     adaptive.insert(np.arange(MEASURED_ROWS), features, targets)
     assert adaptive.predict(NEAR_A).shape == (2, 3)
     assert adaptive.describe().context_rows == small
+
+
+@pytest.mark.slow
+def test_the_device_cap_runs_work_beside_a_later_width_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = node_harness.local()
+    worker = client._worker
+    first = _table(client, name="first", model=TABICL)
+    (loaded,) = worker._models
+    worker.budget = dataclasses.replace(worker.budget, cpu=False)
+    # As a fresh worker's first width, whose decode profile is not measured:
+    # its two profiles compile at once, and nothing else beside them.
+    monkeypatch.setattr(worker, "_decodes", Memo())
+    started = threading.Event()
+    assert worker.memory_rows(loaded, 5, beside=started.set) is not None
+    assert not started.is_set()
+    # A later width's encode profile compiles beside the work given.
+    assert worker.memory_rows(loaded, 6, beside=started.set) is not None
+    assert started.wait(60)
+    del first
 
 
 @pytest.mark.slow
@@ -1955,6 +1998,51 @@ def test_a_table_past_its_fit_rows_fits_on_a_sample_and_embeds_pages_it_reads() 
     # Only the pages the queries read are embedded, not the whole table.
     assert 0 < client.stats.rows_embedded < 32
     assert table.definition.fit_rows == 8
+
+
+@pytest.mark.parametrize("model", [TABICL, LIMIX])
+def test_a_core_spread_over_put_off_pages_embeds_only_the_rows_it_reads(
+    model: str,
+) -> None:
+    def predictions(host_bytes: int | None) -> tuple[np.ndarray, int]:
+        client = node_harness.local(host_bytes=host_bytes)
+        table = client.create_table(
+            "t",
+            model=model,
+            features=5,
+            classes=3,
+            strategy=generalforecast.Strategy.subsample(8),
+            page_size=8,
+            fit_rows=8,
+        )
+        table.insert(np.arange(64), *_clusters(64))
+        found = np.asarray(table.predict(NEAR_A))
+        return found, client.stats.rows_embedded
+
+    # With room on the host, each page the core reads is embedded and kept whole.
+    kept, whole = predictions(None)
+    # Without, pages are put off, and each the core reads less than half of
+    # embeds only the rows it reads, which give the same predictions.
+    sparse, embedded = predictions(0)
+    assert 8 <= embedded < whole / 2
+    np.testing.assert_allclose(sparse, kept, rtol=1e-6, atol=1e-6)
+
+
+def test_a_step_whose_representations_take_more_host_memory_than_is_free_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast.worker import pages as worker_pages
+
+    client = node_harness.local()
+    table = client.create_table(
+        "t", model=TABICL, features=5, classes=3, page_size=8, fit_rows=8
+    )
+    table.insert(np.arange(32), *_clusters())
+    monkeypatch.setattr(worker_pages, "available_memory", lambda: 1024)
+    with pytest.raises(Exception, match="MiB is free; use a strategy"):
+        table.predict(NEAR_A)
+    monkeypatch.setattr(worker_pages, "available_memory", lambda: None)
+    assert np.asarray(table.predict(NEAR_A)).shape == (len(NEAR_A), 3)
 
 
 def test_a_table_that_summarizes_each_context_fits_units_and_reuses_them() -> None:

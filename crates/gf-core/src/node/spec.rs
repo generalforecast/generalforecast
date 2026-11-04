@@ -417,12 +417,20 @@ pub struct TableSpec {
     /// each page only once a plan reads it, so a fit's cost stays bounded
     /// however large the table grows.
     pub fit_rows: NonZeroUsize,
-    /// The most context rows the model was trained on, if it says.
+    /// The most context rows the model was trained on, if it says, or the
+    /// most one context takes on the worker's device where that is fewer.
     pub context_rows: Option<NonZeroU64>,
+    /// The most rows one context of the table's width takes on its worker's
+    /// device, kept or put off, if the device sets a limit: what
+    /// `context_rows` is cut to where it is fewer than the model's own cap.
+    /// An `AdaptiveWhole` table whose per-query contexts the device would
+    /// cut below `ADAPTIVE_WHOLE_CONTEXT` rows reads one context every query
+    /// shares instead; see `Strategy::resolve_on`.
+    pub device_rows: Option<NonZeroU64>,
     /// The most rows the table's worker can hold as one context on its
     /// device, which `Strategy::AdaptiveWhole` reads a table past the cap
-    /// whole within: None until the worker is asked, which an
-    /// `AdaptiveWhole` table past the cap waits for (see
+    /// whole within, or past `device_rows` shares: None until the worker is
+    /// asked, which such an `AdaptiveWhole` table waits for (see
     /// `Node::take_unmeasured`), and `Some(None)` where it can hold none.
     pub whole_rows: Option<Option<NonZeroU64>>,
     /// What a context past `context_rows` does.

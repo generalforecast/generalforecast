@@ -105,7 +105,11 @@ pub enum Strategy {
     /// `ADAPTIVE_WHOLE_FROM_CAP` and the worker can hold its whole context on
     /// the device: the table's `whole` rows, which `resolve_within` takes.
     /// Past that, and without a `whole`, it resolves as `Adaptive` does but
-    /// with contexts of at most `ADAPTIVE_WHOLE_CONTEXT` rows.
+    /// with contexts of at most `ADAPTIVE_WHOLE_CONTEXT` rows. Where the
+    /// worker's device holds fewer rows than that in one context, within the
+    /// cap or past it, a table past them reads whole what the worker holds,
+    /// and past that one stratified core of as many rows every query shares
+    /// (see `resolve_on`).
     AdaptiveWhole,
     /// A core shared by every query of a window, plus each query's
     /// `neighbors` nearest rows outside it, encoded together. Without
@@ -294,6 +298,43 @@ impl Strategy {
         whole: Option<NonZeroU64>,
         timed: bool,
     ) -> Self {
+        self.resolve_on(rows, cap, whole, None, timed)
+    }
+
+    /// As `resolve_within`, where `device` is the most rows one context of
+    /// the table's width takes on its worker's device, if the device sets a
+    /// limit, which `cap` is cut to where it is fewer than the model's own.
+    ///
+    /// Where the device cuts `AdaptiveWhole`'s per-query contexts below
+    /// `ADAPTIVE_WHOLE_CONTEXT` rows, as on a wide table for a model that
+    /// caches a row per column, each query's context would take about the
+    /// device's whole room to encode, for every query, at seconds a query.
+    /// So past `device` rows such a table reads whole up to the `whole` rows
+    /// its worker holds as one context, and past those a stratified core of
+    /// them, seeded `ADAPTIVE_SEED`, which every query shares and the worker
+    /// encodes once. Without a `whole`, it resolves as `resolve_within` does.
+    #[must_use]
+    pub fn resolve_on(
+        self,
+        rows: u64,
+        cap: Option<NonZeroU64>,
+        whole: Option<NonZeroU64>,
+        device: Option<NonZeroU64>,
+        timed: bool,
+    ) -> Self {
+        let device = device
+            .map(NonZeroU64::get)
+            .filter(|&device| cap.is_some_and(|cap| device <= cap.get()))
+            .filter(|&device| device < ADAPTIVE_WHOLE_CONTEXT && rows > device);
+        if self == Self::AdaptiveWhole
+            && let (Some(device), Some(whole)) = (device, whole.map(NonZeroU64::get))
+        {
+            return if rows <= whole {
+                Self::Exact
+            } else {
+                Self::subsample(whole.max(device), ADAPTIVE_SEED, CoreKind::Stratified)
+            };
+        }
         let (whole, most) = match self {
             Self::Adaptive => (None, u64::MAX),
             Self::AdaptiveWhole => (whole.map(NonZeroU64::get), ADAPTIVE_WHOLE_CONTEXT),
