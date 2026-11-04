@@ -10,6 +10,8 @@ fit the device could not hold is refused up front, naming what reads less.
 
 import logging
 import sys
+import threading
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 import jax
@@ -471,7 +473,12 @@ class Admission:
                 "rows, such as neighbors, or a device with more memory"
             )
 
-    def memory_rows(self: "Worker", model: int, features: int) -> int | None:
+    def memory_rows(
+        self: "Worker",
+        model: int,
+        features: int,
+        beside: Callable[[], object] | None = None,
+    ) -> int | None:
         """The most rows a context of a table this wide holds on this device, a padded size; None for any.
 
         A context past it would not fit as `_fits_device` checks: its cache
@@ -489,6 +496,13 @@ class Admission:
         overstate a large one.
         None on a CPU, whose memory the host's caches share, and where XLA
         gives no measure.
+
+        `beside`, if given, runs on a thread of its own beside the encode
+        profile's compiles when the decode profile is measured already, as
+        for a model's second width: compiles the caller needs next then fill
+        a machine the four alone leave half idle. Beside both profiles'
+        eight, as for a model's first width, they would only slow both, and
+        `beside` is left for the caller to run when it needs it.
         """
         if self.budget.cpu or not self._pool_bytes:
             return None
@@ -496,6 +510,10 @@ class Admission:
         features = self.width(model, features)
         per_row = self.profile(model, features).cache_bytes_per_row
         layout = self.layout(model, features)
+        if beside is not None and model in self._decodes:
+            threading.Thread(
+                target=beside, name="beside-memory-rows", daemon=True
+            ).start()
         # The two profiles every size reads compile side by side, then are read
         # as each is kept.
         concurrently(
