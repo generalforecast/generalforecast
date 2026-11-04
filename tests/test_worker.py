@@ -289,6 +289,49 @@ def test_a_start_compiles_the_most_recently_used_programs_and_the_rest_ahead(
     later.programs.drop()
 
 
+def test_a_recorded_program_short_of_memory_at_start_is_skipped_by_later_starts(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from generalforecast.worker import ahead
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    first = Worker(slot_bytes=4096, compile_ahead=False)
+    _, step = _fused(first, 1)
+    first._specs[0] = "tiny-tabicl"
+    expected = first.run(step([0]))
+    manifest = first.programs.manifest("tiny-tabicl")
+    assert manifest is not None and manifest.read().kinds
+
+    def started() -> tuple[Worker, Any]:
+        later = Worker(slot_bytes=4096)
+        _, run = _fused(later, 1)
+        later._specs[0] = "tiny-tabicl"
+        later.programs.quiet = 3600.0
+        later.warm_start()
+        return later, run
+
+    # The device has no room for any recorded program at this start.
+    real = ahead.note_compiled
+
+    def short(*arguments: Any) -> None:
+        raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: Out of memory")
+
+    monkeypatch.setattr(ahead, "note_compiled", short)
+    crowded, _ = started()
+    assert crowded.programs.warmed == 0
+    crowded.programs.drop()
+    recorded = manifest.read()
+    assert set(recorded.short) == set(recorded.kinds)
+
+    # A later start on this device compiles none of them again.
+    monkeypatch.setattr(ahead, "note_compiled", real)
+    later, run = started()
+    assert later.programs.warmed == 0 and not later.programs._later
+    # A step that needs one still compiles it, and answers as before.
+    np.testing.assert_array_equal(later.run(run([0]))[0], expected[0])
+    later.programs.drop()
+
+
 def test_a_start_past_its_seconds_leaves_the_rest_to_compile_ahead(
     tmp_path: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

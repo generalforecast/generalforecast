@@ -35,7 +35,7 @@ from generalforecast.constants import (
     WARMED_PAGES,
     WARMED_QUERIES,
 )
-from generalforecast.runtime.budget import Call, _shapes, note_compiled
+from generalforecast.runtime.budget import Call, _shapes, note_compiled, out_of_memory
 from generalforecast.runtime.device import cache_root, cpu_flags
 from generalforecast.runtime.programs import (
     Kind,
@@ -187,7 +187,9 @@ class Ahead:
             programs = [
                 (kind, count)
                 for kind, counts in recorded.by_use()
-                for count in self._buckets(kind.program[0]) or counts_up_to(counts)
+                for count in recorded.started(
+                    kind, self._buckets(kind.program[0]) or counts_up_to(counts)
+                )
             ]
             planned.append((model, recorded, programs))
         total = sum(min(len(programs), STARTED_PROGRAMS) for *_, programs in planned)
@@ -284,6 +286,18 @@ class Ahead:
             ):
                 jax.block_until_ready(function(parameters, *inputs[0], *inputs[1]))
         except Exception as error:  # noqa: BLE001
+            if out_of_memory(error) and model in self._specs:
+                # It would run out again at every start on this device; a
+                # call that needs it compiles it then.
+                self.programs.short_of_memory(self._specs[model], kind, count)
+                logger.warning(
+                    "not compiling a recorded %s call of %d items, short of device "
+                    "memory; later starts here skip it and larger counts: %s",
+                    kind.program[0],
+                    count,
+                    error,
+                )
+                return False
             logger.warning(
                 "not compiling a recorded %s call: %s", kind.program[0], error
             )
