@@ -170,6 +170,35 @@ pub const ADAPTIVE_WHOLE_FROM_CAP: u64 = 10_000;
 /// at 6 to 8 times the rows a second.
 pub const ADAPTIVE_WHOLE_CONTEXT: u64 = 16_384;
 
+/// The cache bytes a context row takes for the model `ADAPTIVE_WHOLE_CONTEXT`
+/// was measured with: TabICL v2, at any width. A context's encode attends
+/// each of its rows to every other in every layer, whose keys and values
+/// are its cache, so it costs about its rows squared times its cache bytes
+/// a row. `AdaptiveWhole` holds a per-query context to the cost of
+/// `ADAPTIVE_WHOLE_CONTEXT` rows of this many bytes (see `cost_rows`): on an
+/// H100, LimiX-2 on a 24-column table caches 393,216 bytes a row, and its
+/// 16,384-row contexts took 1.03 s a query where 4,096 took 0.23 s, while one
+/// stratified context of 30,000 rows that every query shares scored as well
+/// (AUC 0.8138 against 0.8130 on 1,000 rows of smoking).
+pub const ADAPTIVE_WHOLE_ROW_BYTES: u64 = 24_576;
+
+/// The most rows a per-query context whose rows cache `row_bytes` bytes
+/// each may hold at the encode cost `AdaptiveWhole` allows one:
+/// `ADAPTIVE_WHOLE_CONTEXT` for rows of at most `ADAPTIVE_WHOLE_ROW_BYTES`,
+/// and for wider ones fewer, by the square root of their ratio, so rows
+/// squared times bytes a row stays the same.
+#[must_use]
+pub fn cost_rows(row_bytes: u64) -> u64 {
+    if row_bytes <= ADAPTIVE_WHOLE_ROW_BYTES {
+        return ADAPTIVE_WHOLE_CONTEXT;
+    }
+    #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_sign_loss)]
+    let rows = (ADAPTIVE_WHOLE_CONTEXT as f64
+        * (ADAPTIVE_WHOLE_ROW_BYTES as f64 / row_bytes as f64).sqrt()) as u64;
+    rows.max(1)
+}
+
 /// How many nearest rows an adaptive strategy's neighbors are the latest of,
 /// per neighbor, when the table has times.
 const ADAPTIVE_AMONG_PER_NEIGHBOR: usize = 4;
@@ -301,14 +330,16 @@ impl Strategy {
         self.resolve_on(rows, cap, whole, None, timed)
     }
 
-    /// As `resolve_within`, where `device` is the most rows one context of
-    /// the table's width takes on its worker's device, if the device sets a
-    /// limit, which `cap` is cut to where it is fewer than the model's own.
+    /// As `resolve_within`, where `device` is the most rows a per-query
+    /// context may take, if anything sets a limit: what one context of the
+    /// table's width takes on its worker's device, which `cap` is cut to
+    /// where it is fewer than the model's own, or fewer past the cap where
+    /// the context's encode would cost more (see `cost_rows`).
     ///
-    /// Where the device cuts `AdaptiveWhole`'s per-query contexts below
+    /// Where that cuts `AdaptiveWhole`'s per-query contexts below
     /// `ADAPTIVE_WHOLE_CONTEXT` rows, as on a wide table for a model that
     /// caches a row per column, each query's context would take about the
-    /// device's whole room to encode, for every query, at seconds a query.
+    /// device's whole room to encode, or seconds, for every query.
     /// So past `device` rows such a table reads whole up to the `whole` rows
     /// its worker holds as one context, and past those a stratified core of
     /// them, seeded `ADAPTIVE_SEED`, which every query shares and the worker

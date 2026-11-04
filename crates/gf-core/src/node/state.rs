@@ -123,15 +123,15 @@ impl TableState {
     /// cap, or share one context past what its device holds, if its worker
     /// could hold it, before the worker says how many rows it can: an
     /// `AdaptiveWhole` table within `ADAPTIVE_WHOLE_PAST_CAP` times a cap of
-    /// at least `ADAPTIVE_WHOLE_FROM_CAP`, or past `device_rows` fewer than
-    /// `ADAPTIVE_WHOLE_CONTEXT` that cut its cap (see `Strategy::resolve_on`).
-    /// A table within its cap waits for nothing.
+    /// at least `ADAPTIVE_WHOLE_FROM_CAP`, or past `per_query_rows` fewer than
+    /// `ADAPTIVE_WHOLE_CONTEXT` (see `Strategy::resolve_on`). A table within
+    /// its cap waits for nothing.
     pub(super) fn unmeasured_whole(&self) -> bool {
         let rows = self.table.len();
         let Some(cap) = self.spec.context_rows.map(NonZeroU64::get) else {
             return false;
         };
-        let device = self.spec.device_rows.is_some_and(|device| {
+        let device = self.per_query_rows().is_some_and(|device| {
             let device = device.get();
             device <= cap && device < ADAPTIVE_WHOLE_CONTEXT
         });
@@ -184,9 +184,30 @@ impl TableState {
             self.table.len(),
             self.spec.context_rows,
             self.spec.whole_rows.flatten(),
-            self.spec.device_rows,
+            self.per_query_rows(),
             self.times.has_timed(),
         )
+    }
+
+    /// The most rows a per-query context of the table may take, if fewer
+    /// than any: what one context of its width takes on its worker's device
+    /// (`device_rows`), and past the model's cap, where its contexts would
+    /// be per query, fewer still where its rows cache more than
+    /// `ADAPTIVE_WHOLE_ROW_BYTES` each (`cost_rows`). `AdaptiveWhole` shares
+    /// one context past it rather than encoding one a query.
+    pub(super) fn per_query_rows(&self) -> Option<NonZeroU64> {
+        let past_cap = self
+            .spec
+            .context_rows
+            .is_some_and(|cap| self.table.len() > cap.get());
+        let cost = past_cap
+            .then(|| NonZeroU64::new(cost_rows(self.spec.sizes.bytes_per_row)))
+            .flatten()
+            .filter(|rows| rows.get() < ADAPTIVE_WHOLE_CONTEXT);
+        match (self.spec.device_rows, cost) {
+            (Some(device), Some(cost)) => Some(device.min(cost)),
+            (device, cost) => device.or(cost),
+        }
     }
 
     /// As `resolved`, and makes the state fit it: when the resolution has
