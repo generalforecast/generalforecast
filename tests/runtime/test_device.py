@@ -253,6 +253,32 @@ def test_host_memory_is_a_containers_limit(tmp_path: Path) -> None:
     assert host_memory(tmp_path) == 1 << 20
 
 
+def test_gf_host_memory_bounds_a_sandbox_that_shows_the_machine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A gVisor sandbox has no cgroup files, and its meminfo shows the
+    # machine's memory, less what the sandbox itself uses.
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal: 1000000 kB\nMemAvailable: 900000 kB\n")
+    cgroup = tmp_path / "cgroup"
+    cgroup.mkdir()
+    machine = host_memory(cgroup)
+    assert available_memory(cgroup, meminfo) == 900000 * 1024
+    monkeypatch.setenv("GF_HOST_MEMORY", str(200000 * 1024))
+    assert host_memory(cgroup) == min(machine, 200000 * 1024)
+    assert available_memory(cgroup, meminfo) == 100000 * 1024
+    meminfo.write_text("MemTotal: 1000000 kB\nMemAvailable: 750000 kB\n")
+    assert available_memory(cgroup, meminfo) == 0
+    # A cgroup's limit still counts, the smaller of the two.
+    (cgroup / "memory.max").write_text(f"{100000 * 1024}\n")
+    (cgroup / "memory.current").write_text(f"{40000 * 1024}\n")
+    assert host_memory(cgroup) == min(machine, 100000 * 1024)
+    assert available_memory(cgroup, meminfo) == 60000 * 1024
+    monkeypatch.setenv("GF_HOST_MEMORY", "128G")
+    with pytest.raises(ValueError, match="GF_HOST_MEMORY"):
+        host_memory(cgroup)
+
+
 @pytest.mark.parametrize(
     ("machine", "flags", "xla", "expected"),
     [

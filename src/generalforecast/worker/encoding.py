@@ -109,11 +109,13 @@ class Encoding:
         units: Sequence[Unit],
         pages: Sequence[Page],
         computed: dict[int, Representations],
+        subsets: dict[int, np.ndarray] | None = None,
     ) -> Transient:
         """Encodes the units that are not cached; returns those there was no room to keep.
 
         A unit with no room to keep is encoded only by the decode that reads
-        it, so a step never holds every such context at once.
+        it, so a step never holds every such context at once. A page in
+        `subsets` holds the representations of those rows alone.
         """
         transient: Transient = {}
         waiting = [
@@ -125,7 +127,7 @@ class Encoding:
         self.stats.rows_reused += sum(
             len(unit.rows) for unit in units if unit.action == "reuse"
         )
-        joined = self._tables_rows(pages, computed) if waiting else {}
+        joined = self._tables_rows(pages, computed, subsets) if waiting else {}
         # The step's rows of each table that put-off units gather from, on
         # the device once: such units are many, each a context of its own,
         # and gathering each on the host and copying it over took most of
