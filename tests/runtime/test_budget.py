@@ -48,6 +48,23 @@ def test_a_call_takes_half_what_the_pool_leaves_within_bounds() -> None:
     assert gpu.window_bytes(0) == 2 << 30
 
 
+def test_memory_held_for_a_workers_life_leaves_the_rest_to_divide() -> None:
+    # A 24 GB GPU's 16.5 GiB, 5 GiB of it the parameters of every catalog
+    # model: the pool and a call take shares of what is left, so together
+    # with the parameters they fit the device.
+    unheld = MemoryBudget(16 << 30, 64 << 30, cpu=False)
+    gpu = unheld.holding(5 << 30)
+    cpu = MemoryBudget(16 << 30, 64 << 30, cpu=True)
+
+    def taken(budget: MemoryBudget) -> int:
+        pool = budget.device_tier
+        return (5 << 30) + pool + 2 * budget.call_bytes(pool)
+
+    assert gpu.device == 11 << 30
+    assert taken(gpu) <= 16 << 30 < taken(unheld)
+    assert cpu.holding(5 << 30) == cpu
+
+
 @pytest.mark.parametrize(
     ("free", "short"), [(None, False), (8 << 30, True), (32 << 30, False)]
 )
