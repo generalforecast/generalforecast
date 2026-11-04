@@ -5866,13 +5866,25 @@ components:
         replicas_max: {type: integer, minimum: 1}
         idle_seconds: {type: integer, minimum: 0}
 
+    LockWriter:
+      type: object
+      description: |
+        the gf that wrote a lock: its package version, and the revision of
+        what its gf check writes for the same gf.yaml, rows and catalog. A
+        lock without it was written under rules 1
+      required: [gf, rules]
+      additionalProperties: false
+      properties:
+        gf: {type: string}
+        rules: {type: integer, minimum: 1}
+
     Lock:
       type: object
       description: |
         gf.lock: what gf check resolved gf.yaml into. `digest` is the
-        canonical JSON digest of the document without `digest`, the one
-        identity of a predictor revision; `manifest` the digest of the
-        normalized gf.yaml it resolves
+        canonical JSON digest of the document without `digest` and
+        `checked_with`, the one identity of a predictor revision; `manifest`
+        the digest of the normalized gf.yaml it resolves
       required: [lock_version, digest, manifest, predictor, model]
       additionalProperties: false
       properties:
@@ -5881,6 +5893,7 @@ components:
           enum: [1, 2]
           description: 2 when the predictor runs a derived model, which only that version has
         digest: {$ref: "#/components/schemas/Digest"}
+        checked_with: {$ref: "#/components/schemas/LockWriter"}
         manifest: {$ref: "#/components/schemas/Digest"}
         predictor: {$ref: "#/components/schemas/Resolution"}
         resources: {$ref: "#/components/schemas/LockResources"}
