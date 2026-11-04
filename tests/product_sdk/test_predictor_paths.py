@@ -135,6 +135,38 @@ def test_served_calls_go_through_the_sdk_transport_with_project_and_key(monkeypa
     assert defaults["Authorization"] == "Bearer k-1"
 
 
+def test_a_keyless_call_refused_by_a_served_predictor_says_how_to_send_a_key(
+    monkeypatch,
+):
+    from generalforecast import transport
+    from generalforecast.service.contracts import ServiceError
+
+    def send(self, method, path, body, headers, **options):
+        raise ServiceError("Unauthorized", "application bearer required", 401)
+
+    monkeypatch.setattr(transport.Transport, "send", send)
+    monkeypatch.delenv("GF_URL", raising=False)
+    with pytest.raises(gf.errors.Error) as raised:
+        gf.Predictor("https://gf.example.com/churn").predict([{"id": 7, "spend": 1.0}])
+    assert raised.value.code == "Unauthorized"
+    assert (
+        raised.value.hint
+        == "set GF_URL=https://gf.example.com and GF_API_KEY to its key"
+    )
+    # A key that was sent and refused is the key's fault, and says so alone.
+    with pytest.raises(gf.errors.Error) as raised:
+        gf.Predictor("https://gf.example.com/churn", api_key="k-1").predict(
+            [{"id": 7, "spend": 1.0}]
+        )
+    assert raised.value.hint is None
+
+
+def test_the_engine_exports_a_client_for_served_nodes_and_routers():
+    from generalforecast.native import remote
+
+    assert gf.engine.connect is remote.connect
+
+
 def test_push_names_the_environment_alone(tmp_path):
     root = directory(tmp_path / "churn", rows(), name="churn", id="id")
     client = Recorder()
