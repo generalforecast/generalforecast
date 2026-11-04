@@ -141,7 +141,8 @@ def test_serving_refuses_a_revision_pin_that_moved(tmp_path):
     ("name", "runs"),
     [
         ("tabicl-v2-classifier", "gf.Predictor, gf serve and gf push"),
-        ("mitra-2-regressor", "gf.Predictor and gf serve; not qualified for gf push"),
+        ("mitra-2-regressor", "gf.Predictor, gf serve and gf push"),
+        ("timestral-28m", "gf.Predictor and gf serve; not qualified for gf push"),
         (
             "limix-2-classifier",
             "gf.Predictor only; not qualified for gf serve or gf push",

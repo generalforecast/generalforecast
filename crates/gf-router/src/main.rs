@@ -26,6 +26,7 @@ use gf_router::quota::{Limit, Quotas};
 use gf_router::service::{Cluster, Node, Router, Timeouts};
 use gf_server::action::LeaseAnswer;
 use gf_server::auth::{Scope, digest};
+use gf_server::deadline::DeadlineLayer;
 use serde::Deserialize;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity, ServerTlsConfig};
 
@@ -417,7 +418,10 @@ async fn run(path: PathBuf, parent: Option<std::os::fd::OwnedFd>) -> Result<(), 
         .call_timeout_seconds
         .max(2.0 * config.write_timeout_seconds);
     let mut server = tonic::transport::Server::builder()
-        .timeout(Duration::from_secs_f64(calls + CHECK_SECONDS))
+        .layer(DeadlineLayer::new(
+            Duration::from_secs_f64(calls + CHECK_SECONDS),
+            "call limit",
+        ))
         // A cap on streams, not a queue for them: a stream waiting its turn would
         // hold its rows in the connection's flow-control window, which the
         // rows of the calls it waits on may then not get through.

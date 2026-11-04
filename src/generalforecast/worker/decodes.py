@@ -41,6 +41,7 @@ from generalforecast.runtime.paging import (
     StateLayout,
     unpack_states,
 )
+from generalforecast.runtime.shapes import bucket_size
 from generalforecast.runtime.shapes import padded as padded_items
 from generalforecast.worker.calls import _host_padded, _item, _stacked
 from generalforecast.worker.encoding import Transient, _Gather
@@ -726,7 +727,7 @@ class Decodes:
                 states = self._own_states(decodings[first:stop], own, padded)
                 index = np.arange(len(index), dtype=np.int32)
             else:
-                states = self._stacked_states(tables, padded)
+                states = self._stacked_states(tables, bucket_size(len(tables), 1))
             # Rows come straight from the pool into the decode's cache, so it
             # holds neither the slots' bytes whole nor a copy of the pool.
             source, blocks = self._device.source(blocks)
@@ -779,22 +780,25 @@ class Decodes:
             )
         return results
 
-    def _stacked_states(self: "Worker", tables: list[int], padded: int) -> Any:
-        """The tables' states stacked over a call's `padded` items.
+    def _stacked_states(self: "Worker", tables: list[int], count: int) -> Any:
+        """The tables' states stacked, padded to `count` entries.
 
-        A call of one table reuses the stack it made last, while the table
-        keeps that state, so a warm step makes no stacking dispatch. The
-        worker holds at most `HELD_STATES` such stacks, of tables it still
-        serves: each is a copy of a state.
+        A paged decode reads its items' states through its index into them,
+        so it takes one per table rather than a copy per item: a TabPFN-3.5
+        state on 1,558 columns is 459 MB, and a first call of 512 per-query
+        contexts stacked 235 GB of copies. A call of one table reuses the
+        stack it made last, while the table keeps that state, so a warm step
+        makes no stacking dispatch. The worker holds at most `HELD_STATES`
+        such stacks, of tables it still serves: each is a copy of a state.
         """
         states = [self._tables[table].state for table in tables]
         held = self.__dict__.setdefault("_held_states", OrderedDict())
-        key = (tables[0], padded) if len(tables) == 1 else None
+        key = (tables[0], count) if len(tables) == 1 else None
         if key is not None and key in held and held[key][0] is states[0]:
             held.move_to_end(key)
             return held[key][1]
         with self.stats.timed("stack"):
-            stacked = _stacked(padded_items(states, padded))
+            stacked = _stacked(padded_items(states, count))
         if key is not None:
             held[key] = (states[0], stacked)
             for gone in [k for k in held if k[0] not in self._tables]:

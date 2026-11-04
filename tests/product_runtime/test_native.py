@@ -17,8 +17,34 @@ from tests.product_runtime.test_executor import checked
 pytestmark = pytest.mark.slow
 
 
-@pytest.mark.parametrize("task", ["classification", "regression"])
-def test_real_tabicl_prepare_predict_and_isolated_patch(tmp_path, task):
+# Every tabular model qualified for predictors, and so for fine-tuning.
+PREDICTOR_TABULAR = [
+    f"general-forecast/{family}-{task}"
+    for family in (
+        "tabicl-v2",
+        "kumo-tabular-small",
+        "kumo-tabular-medium",
+        "kumo-tabular-large",
+        "mitra-2",
+    )
+    for task in ("classifier", "regressor")
+]
+
+
+def test_every_predictor_qualified_tabular_model_is_tested_here():
+    from generalforecast.models.catalog import entries
+
+    qualified = {
+        e.id
+        for e in entries()
+        if e.gates.predictor and e.id.endswith(("-classifier", "-regressor"))
+    }
+    assert qualified == set(PREDICTOR_TABULAR)
+
+
+@pytest.mark.parametrize("model", PREDICTOR_TABULAR)
+def test_real_tabular_prepare_predict_and_isolated_patch(tmp_path, model):
+    task = "classification" if model.endswith("-classifier") else "regression"
     context = pa.table(
         {
             "id": [str(i) for i in range(8)],
@@ -32,9 +58,7 @@ def test_real_tabicl_prepare_predict_and_isolated_patch(tmp_path, task):
         tmp_path / "first",
         context,
         id="id",
-        model="general-forecast/tabicl-v2-classifier"
-        if task == "classification"
-        else "general-forecast/tabicl-v2-regressor",
+        model=model,
         outputs=["label", "probabilities"]
         if task == "classification"
         else ["value", "quantiles"],

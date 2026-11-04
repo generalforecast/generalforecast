@@ -85,7 +85,8 @@ pub trait Vectors {
     }
 
     /// `rows`' vectors, one after another, appended to `into`: as `vector`
-    /// gives each, read as a store reads many rows at once where it can.
+    /// gives each, read as a store reads many rows at once where it can, on
+    /// many threads if it can.
     ///
     /// # Errors
     ///
@@ -130,17 +131,13 @@ impl Dense {
             values: Vec::with_capacity(count.saturating_mul(dimensions)),
             keys: Vec::with_capacity(count),
         };
-        let mut chunk = Vec::with_capacity(DENSE_READ_ROWS);
+        let mut read = Vec::with_capacity(count);
         for row in rows.iter() {
             dense.slots[row.0 as usize] = dense.keys.len() as u32;
             dense.keys.push(keys.key(row));
-            chunk.push(row);
-            if chunk.len() == DENSE_READ_ROWS {
-                vectors.extend_vectors(&chunk, &mut dense.values)?;
-                chunk.clear();
-            }
+            read.push(row);
         }
-        vectors.extend_vectors(&chunk, &mut dense.values)?;
+        vectors.extend_vectors(&read, &mut dense.values)?;
         Ok(dense)
     }
 
@@ -162,9 +159,6 @@ impl Dense {
         &self.values[start..start + self.dimensions]
     }
 }
-
-/// Rows a `Dense` read at a time, so a store reads many rows of a block together.
-const DENSE_READ_ROWS: usize = 4096;
 
 /// The rows of a set that an index holds, in a `Dense`, to search by scanning
 /// them all for many queries at once: `PageIndex::scan` makes one.
