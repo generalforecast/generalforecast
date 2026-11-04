@@ -14,6 +14,8 @@ from generalforecast.service.boundary import (
     MAX_DEPTH,
     MAX_INTEGER,
     MAX_NODES,
+    RESPONSE_MAX_BYTES,
+    RESPONSE_MAX_NODES,
     Artifact,
     Capability,
     Request,
@@ -152,6 +154,43 @@ def test_json_depth_and_finite_limits():
         nested = {"x": nested}
     with pytest.raises(ServiceError):
         json_object(nested)
+
+
+def test_response_bounds_hold_the_largest_prediction():
+    from pathlib import Path
+
+    import numpy as np
+
+    from generalforecast.contracts import MAX_QUERIES
+    from generalforecast.models.outputs import REGRESSION_LEVELS
+    from generalforecast.service import boundary
+
+    assert (boundary.RESPONSE_ROWS, boundary.RESPONSE_LEVELS) == (
+        MAX_QUERIES,
+        REGRESSION_LEVELS,
+    )
+    server = Path(__file__).parents[2] / "crates/gf-server/src/http/mod.rs"
+    if server.exists():
+        assert "const MAX_QUERY_ROWS: usize = 10_000;" in server.read_text()
+    # The widest float32 a level holds, keyed by the widest level.
+    widest = float(np.float32(-3.4028235e38))
+    row = {
+        "row_identifier": "",
+        "value": widest,
+        "quantiles": {f"{k / 1000:.3f}": widest for k in range(1, 1000)},
+    }
+    assert len(row["quantiles"]) == REGRESSION_LEVELS
+    one = len(json.dumps(row).encode()) + 2
+    assert MAX_QUERIES * one + MAX_BYTES <= RESPONSE_MAX_BYTES
+    assert MAX_QUERIES * (REGRESSION_LEVELS + 3) + MAX_NODES <= RESPONSE_MAX_NODES
+
+
+def test_a_reply_may_be_larger_than_a_request():
+    request = Request(Scope("local", "request-1"), Resource("predictor", "p"), {})
+    result = {"predictions": [{"value": 1.5}] * MAX_NODES}
+    with pytest.raises(ServiceError):
+        json_object(result)
+    assert success(request, result)["result"] == result
 
 
 def test_capability_is_not_fake_success(fixture):

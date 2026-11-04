@@ -28,6 +28,19 @@ MAX_BYTES = 1_048_576
 MAX_NODES = 65_536
 MAX_DEPTH = 16
 MAX_INTEGER = 2**53 - 1
+# A reply is bounded by the largest one the service sends for a request that
+# passes `MAX_BYTES`, not by `MAX_BYTES` itself. A predictor's `/predict`
+# answers up to `contracts.MAX_QUERIES` rows (gf-server's `MAX_QUERY_ROWS`),
+# and a regressor's row carries up to `outputs.REGRESSION_LEVELS` quantiles,
+# the levels k/1000. One level is at most 35 bytes,
+# `"0.999": -3.4028234663852886e+38, ` as Python writes a float32 (serde_json
+# writes 32). A row's object, `value`, `quantiles` and id keys take under 256
+# more; the ids themselves and the envelope echo a request of at most
+# `MAX_BYTES` and `MAX_NODES`. That is about 337 MiB and 10.1M nodes.
+RESPONSE_ROWS = 10_000
+RESPONSE_LEVELS = 999
+RESPONSE_MAX_BYTES = RESPONSE_ROWS * (RESPONSE_LEVELS * 35 + 256) + MAX_BYTES
+RESPONSE_MAX_NODES = RESPONSE_ROWS * (RESPONSE_LEVELS + 8) + MAX_NODES
 JsonObject = dict[str, Any]
 ResourceKind = Literal[
     "workspace",
@@ -45,23 +58,28 @@ ResourceKind = Literal[
 RESOURCE_KINDS = frozenset(ResourceKind.__args__)
 
 
-def json_object(value: Any) -> JsonObject:
+def json_object(
+    value: Any, *, max_bytes: int = MAX_BYTES, max_nodes: int = MAX_NODES
+) -> JsonObject:
     """Copies bounded portable JSON, rejecting lossy/coercible Python values."""
-    return json.loads(json_bytes(value))
+    return json.loads(json_bytes(value, max_bytes=max_bytes, max_nodes=max_nodes))
 
 
-def json_bytes(value: Any) -> bytes:
+def json_bytes(
+    value: Any, *, max_bytes: int = MAX_BYTES, max_nodes: int = MAX_NODES
+) -> bytes:
     """Encodes bounded portable JSON, rejecting lossy/coercible Python values.
 
     The bytes are what `json_object` measures, so native validation of them
-    holds a payload to the same bounds.
+    holds a payload to the same bounds. A reply passes the larger
+    `RESPONSE_MAX_BYTES` and `RESPONSE_MAX_NODES`.
     """
     count = 0
 
     def visit(item: Any, depth: int) -> None:
         nonlocal count
         count += 1
-        require(depth <= MAX_DEPTH and count <= MAX_NODES, "JSON structure too large")
+        require(depth <= MAX_DEPTH and count <= max_nodes, "JSON structure too large")
         if type(item) is dict:
             for key, child in item.items():
                 require(type(key) is str, "JSON object keys must be strings")
@@ -82,7 +100,7 @@ def json_bytes(value: Any) -> bytes:
         encoded = json.dumps(value, allow_nan=False, ensure_ascii=False).encode("utf-8")
     except (ValueError, UnicodeError) as error:
         raise ServiceError("ValidationError", "invalid JSON encoding", 422) from error
-    require(len(encoded) <= MAX_BYTES, "JSON body too large")
+    require(len(encoded) <= max_bytes, "JSON body too large")
     return encoded
 
 
@@ -191,15 +209,20 @@ class ErrorEnvelope(TypedDict):
 
 
 def success(request: Request, result: JsonObject) -> ResultEnvelope:
-    """Builds a bounded wire response without retaining the request payload."""
+    """Builds a bounded wire response without retaining the request payload.
+
+    It is held to the reply bounds clients read, `RESPONSE_MAX_BYTES` and
+    `RESPONSE_MAX_NODES`, not to a request's.
+    """
+    bounds = {"max_bytes": RESPONSE_MAX_BYTES, "max_nodes": RESPONSE_MAX_NODES}
     response: ResultEnvelope = {
         "api_version": VERSION,
         "project": request.scope.project,
         "request_id": request.scope.request_id,
         "resource": asdict(request.resource),
-        "result": json_object(result),
+        "result": json_object(result, **bounds),
     }
-    json_object(dict(response))
+    json_object(dict(response), **bounds)
     return response
 
 
