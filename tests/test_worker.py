@@ -371,6 +371,41 @@ def test_a_start_past_its_seconds_leaves_the_rest_to_compile_ahead(
     timely.programs.drop()
 
 
+def test_a_warm_start_runs_on_zeros_only_programs_whose_temporaries_fit(
+    tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from generalforecast.worker import ahead
+
+    # Zeros of a few KiB, outputs of 16 MiB: what XLA counts is held too.
+    outer = jax.jit(lambda x: jnp.outer(x, x))
+    shapes = jax.ShapeDtypeStruct((2048,), jnp.float32)
+    compiled = outer.lower(shapes).compile()
+    held = ahead._run_bytes(compiled, shapes)
+    assert held >= 2048 * 2048 * 4 > 64 * ahead._zeros_bytes(shapes)
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    first = Worker(slot_bytes=4096, compile_ahead=False)
+    _, step = _fused(first, 1)
+    first._specs[0] = "tiny-tabicl"
+    first.run(step([0]))
+    ran: list[Any] = []
+    monkeypatch.setattr(ahead, "zeros", lambda tree: ran.append(tree))
+    # Every recorded program's run would take more than a warm may: each
+    # still compiles, and none runs.
+    monkeypatch.setattr(
+        ahead, "_run_bytes", lambda compiled, tree: ahead.WARM_RUN_BYTES + 1
+    )
+    later = Worker(slot_bytes=4096)
+    later.add_model(0, tabicl_functions, tiny_tabicl(regression=False))
+    later._specs[0] = "tiny-tabicl"
+    later.allocate(256, 0, 0)
+    later.programs.quiet = 3600.0
+    later.warm_start()
+    assert later.programs.warmed > 0
+    assert ran == []
+    later.programs.drop()
+
+
 def test_a_worker_loads_a_model_beside_its_steps_and_reports_it_by_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

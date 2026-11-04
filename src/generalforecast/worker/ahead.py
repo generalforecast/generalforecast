@@ -106,6 +106,21 @@ def _zeros_bytes(tree: Any) -> int:
     )
 
 
+def _run_bytes(compiled: Any, tree: Any) -> int:
+    """Bytes a run of a compiled program on zeros of `tree` takes: the zeros, and its temporaries and outputs as XLA counts them.
+
+    Where XLA does not count them, the zeros alone.
+    """
+    held = _zeros_bytes(tree)
+    try:
+        analysis = compiled.memory_analysis()
+    except Exception:  # noqa: BLE001
+        analysis = None
+    if analysis is None:
+        return held
+    return held + analysis.temp_size_in_bytes + analysis.output_size_in_bytes
+
+
 def _cpu_features() -> str:
     """The instruction sets XLA may compile this machine's CPU programs with, which a program shipped from another must match.
 
@@ -268,7 +283,11 @@ class Ahead:
 
         A program's first run sets it up on the device, which would otherwise
         slow the first step that calls it. One reading a large table takes as
-        long on zeros as the call it would speed up, so only compiles.
+        long on zeros as the call it would speed up, so only compiles. So does
+        one whose run would take more than `WARM_RUN_BYTES` of the device, its
+        zeros, temporaries and outputs together: these programs also compile
+        ahead beside steps, and a run of one holding gigabytes of temporaries
+        would take them from the step beside it.
         """
         program = (kind.program[0], model, *kind.program[2:])
         parameters = self._models[model].parameters
@@ -277,8 +296,9 @@ class Ahead:
             items = abstract(kind.item, count)
             shared = self._shared(program, kind, items)
             arguments = (parameters, *shared, *items)
-            note_compiled(function, arguments, function.lower(*arguments).compile())
-            small = _zeros_bytes((shared, items)) <= WARM_RUN_BYTES
+            compiled = function.lower(*arguments).compile()
+            note_compiled(function, arguments, compiled)
+            small = _run_bytes(compiled, (shared, items)) <= WARM_RUN_BYTES
             inputs = zeros((shared, items)) if small else None
             if inputs is not None and (
                 kind.program[0] not in TABLE_STAGES
