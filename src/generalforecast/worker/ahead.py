@@ -94,6 +94,7 @@ def _shipped_measures(bucket_minimum: int, slot_bytes: int) -> Path | None:
 
 # Seconds a warm start compiles before it takes steps, at most; what is left
 # compiles ahead while the worker serves, or when a step first calls it.
+# gf-server bounds its shape buckets by it too, once the workers are warm.
 WARM_SECONDS_ENV = "GF_WARM_SECONDS"
 
 
