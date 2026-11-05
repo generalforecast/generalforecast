@@ -33,16 +33,32 @@ pub(super) fn encoded(step: &Step) -> impl Iterator<Item = CacheKey> + '_ {
 /// Which tables' parts of a step the worker failed to run.
 pub(super) enum Failed<'a> {
     None,
-    Tables(&'a HashSet<TableId>),
+    /// The tables whose parts failed. Those among them in `built` stopped
+    /// only once their requests were past their deadline, after their fits,
+    /// page embeds and kept contexts were done; see `Node::complete_deferring`.
+    Tables {
+        failed: &'a HashSet<TableId>,
+        built: &'a HashSet<TableId>,
+    },
     All,
 }
 
 impl Failed<'_> {
+    /// Whether the table's part failed.
     pub(super) fn includes(&self, table: TableId) -> bool {
         match self {
             Failed::None => false,
-            Failed::Tables(tables) => tables.contains(&table),
+            Failed::Tables { failed, .. } => failed.contains(&table),
             Failed::All => true,
+        }
+    }
+
+    /// Whether the table's part may have left its fits, its kept pages or
+    /// its kept contexts undone: it failed, other than once they were built.
+    pub(super) fn unbuilt(&self, table: TableId) -> bool {
+        match self {
+            Failed::Tables { built, .. } if built.contains(&table) => false,
+            _ => self.includes(table),
         }
     }
 }
@@ -117,11 +133,29 @@ impl Node {
     /// except that their tier moves stand, since the worker made them before
     /// any table's part ran. Returns drops as `fail` does.
     pub fn complete_except(&mut self, step: &Step, failed: &HashSet<TableId>) -> Vec<Movement> {
+        self.complete_building(step, failed, &HashSet::new())
+    }
+
+    /// Completes a step as `complete_except` does, except that the failed
+    /// tables `built` names built their parts' fits, kept pages and kept
+    /// contexts before failing, so those stand; their fused units' fits and
+    /// their series units are undone as a failed part's.
+    fn complete_building(
+        &mut self,
+        step: &Step,
+        failed: &HashSet<TableId>,
+        built: &HashSet<TableId>,
+    ) -> Vec<Movement> {
         if failed.is_empty() {
             return self.complete(step);
         }
-        self.unfit(step, |table| failed.contains(&table));
-        self.release(step, &Failed::Tables(failed))
+        let failed = Failed::Tables { failed, built };
+        self.unfit(
+            step,
+            |table| failed.unbuilt(table),
+            |table| failed.includes(table),
+        );
+        self.release(step, &failed)
     }
 
     /// Completes a step as `complete_except` does, except that the tables
@@ -130,10 +164,18 @@ impl Node {
     /// their query requests queue again, and steps leave them out until
     /// `compiled` names the key, unless it already did. A step answers its
     /// forecasts whatever the worker does with their table's part.
+    ///
+    /// The failed tables `expired` names were stopped once every request
+    /// their part answers was past its deadline. The worker stops such a
+    /// part only after its fits, page embeds and kept contexts are done, so
+    /// those stand and the requests' retries find them; only what the part
+    /// computed for its requests alone, its fused units' fits and its series
+    /// units, is undone.
     pub fn complete_deferring(
         &mut self,
         step: &Step,
         failed: &HashSet<TableId>,
+        expired: &HashSet<TableId>,
         deferred: &[(TableId, String)],
     ) -> Vec<Movement> {
         let mut undone = failed.clone();
@@ -145,7 +187,12 @@ impl Node {
                 requeued.push(state.scheduled.take(|request| requests.contains(&request)));
             }
         }
-        let dropped = self.complete_except(step, &undone);
+        let built: HashSet<TableId> = expired
+            .iter()
+            .filter(|table| failed.contains(table) && !deferred.iter().any(|(t, _)| t == *table))
+            .copied()
+            .collect();
+        let dropped = self.complete_building(step, &undone, &built);
         for ((table, key), requests) in deferred.iter().zip(requeued) {
             let compiled = self.compiled.contains(key);
             if let Some(state) = self.tables.get_mut(table) {
@@ -179,19 +226,30 @@ impl Node {
     /// releases them, and fits it held are planned again. Returns drops for the
     /// forgotten entries and those from ended epochs.
     pub fn fail(&mut self, step: &Step) -> Vec<Movement> {
-        self.unfit(step, |_| true);
+        self.unfit(step, |_| true, |_| true);
         self.release(step, &Failed::All)
     }
 
-    /// Plans again the fits a step held for the tables `failed` names.
-    pub(super) fn unfit(&mut self, step: &Step, failed: impl Fn(TableId) -> bool) {
-        let fits = step.fits.iter().map(|fit| (fit.table, fit.epoch));
+    /// Plans again the fits a step held for the tables `fits` names, and
+    /// its fused units' fits for those `fused` names.
+    pub(super) fn unfit(
+        &mut self,
+        step: &Step,
+        fits: impl Fn(TableId) -> bool,
+        fused: impl Fn(TableId) -> bool,
+    ) {
+        let fitted = step
+            .fits
+            .iter()
+            .map(|fit| (fit.table, fit.epoch))
+            .filter(|(table, _)| fits(*table));
         let fused = step
             .units
             .iter()
             .filter(|unit| unit.placed == Placed::Fuse)
-            .map(|unit| (unit.table, unit.key.epoch));
-        for (table, epoch) in fits.chain(fused).filter(|(table, _)| failed(*table)) {
+            .map(|unit| (unit.table, unit.key.epoch))
+            .filter(|(table, _)| fused(*table));
+        for (table, epoch) in fitted.chain(fused) {
             if let Some(state) = self.tables.get_mut(&table)
                 && state.fitted == Some(epoch)
             {
@@ -205,20 +263,24 @@ impl Node {
     /// step reads it any more.
     pub(super) fn release(&mut self, step: &Step, failed: &Failed) -> Vec<Movement> {
         self.flight.release(step);
+        // Each entry, and whether a failed part left it unwritten: a series
+        // unit whenever its part failed, a context or page unless its part
+        // built what it keeps before failing.
         let kept = step
             .units
             .iter()
-            .map(|unit| (unit.table, unit.key, unit.placed.action()))
-            .chain(
-                step.pages
-                    .iter()
-                    .map(|page| (page.table, page.key, page.placed.action())),
-            )
-            .chain(
-                step.series_units
-                    .iter()
-                    .map(|unit| (unit.table, unit.key, unit.placed.action())),
-            );
+            .map(|unit| {
+                let unwritten = failed.unbuilt(unit.table);
+                (unit.table, unit.key, unit.placed.action(), unwritten)
+            })
+            .chain(step.pages.iter().map(|page| {
+                let unwritten = failed.unbuilt(page.table);
+                (page.table, page.key, page.placed.action(), unwritten)
+            }))
+            .chain(step.series_units.iter().map(|unit| {
+                let unwritten = failed.includes(unit.table);
+                (unit.table, unit.key, unit.placed.action(), unwritten)
+            }));
         let mut dropped = Vec::new();
         // A page's sources were pinned for the step too. One a kept page
         // copied from has served its purpose; one a transient page or a
@@ -227,7 +289,7 @@ impl Node {
             for (source, _) in &page.copies {
                 let _ = self.cache.unpin(source);
                 let current = self.tables.get(&page.table).map(|state| state.epoch);
-                let served = page.placed.action() == Action::Encode && !failed.includes(page.table);
+                let served = page.placed.action() == Action::Encode && !failed.unbuilt(page.table);
                 if served
                     || self.flight.doomed.contains(source)
                     || current.is_none_or(|epoch| source.epoch < epoch)
@@ -281,7 +343,7 @@ impl Node {
                 }
             }
         }
-        for (table, key, action) in kept {
+        for (table, key, action, unwritten) in kept {
             if matches!(action, Action::Transient | Action::Fuse) {
                 continue;
             }
@@ -290,7 +352,7 @@ impl Node {
             // A removed table's entries are stale too, and so is an entry a
             // failed step was to write, whether encoded or extended.
             let written = matches!(action, Action::Encode | Action::Extend);
-            let stale = (failed.includes(table) && written)
+            let stale = (unwritten && written)
                 || self.flight.doomed.contains(&key)
                 || current.is_none_or(|epoch| key.epoch < epoch);
             if stale {
@@ -300,7 +362,7 @@ impl Node {
         let now = Instant::now();
         for unit in &step.units {
             if self.rebuilding.contains_key(&unit.key) {
-                if !failed.includes(unit.table) && self.cache.contains(&unit.key) {
+                if !failed.unbuilt(unit.table) && self.cache.contains(&unit.key) {
                     dropped.extend(self.finish_rebuild(unit.key, now));
                 } else {
                     for rebuilt in self.rebuilding.remove(&unit.key).unwrap_or_default() {

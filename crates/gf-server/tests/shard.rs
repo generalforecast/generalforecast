@@ -887,6 +887,30 @@ async fn a_step_bounds_its_run_by_its_requests_deadline_and_expiring_never_quara
 }
 
 #[tokio::test]
+async fn an_expired_step_keeps_the_context_it_encoded_for_the_retry() {
+    let shard = shard(settings()).await;
+    shard.create(3).await.unwrap();
+    shard.insert(&[1, 2, 3, 4]).await;
+
+    // The worker encodes a kept context before it stops a step past its
+    // requests' deadline, so the retry reads it rather than encoding it again.
+    shard.behaviour.store(EXPIRE, Ordering::Relaxed);
+    assert_eq!(shard.predict().await, Err(Code::Unavailable));
+    shard.behaviour.store(OK, Ordering::Relaxed);
+    assert_eq!(shard.predict().await, Ok(1));
+
+    let units: Vec<String> = shard
+        .actions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|action| !action.starts_with("expires_ms="))
+        .cloned()
+        .collect();
+    assert_eq!(units, ["encode", "reuse"]);
+}
+
+#[tokio::test]
 async fn one_tables_failures_leave_the_tables_that_share_its_steps_alone() {
     let shard = shard(settings()).await;
     shard.create_named("bad", 3).await.unwrap();

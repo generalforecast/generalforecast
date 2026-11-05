@@ -216,13 +216,16 @@ impl Shard {
         let outcome = reply
             .map_err(ServerError::Internal)
             .and_then(|frame| outcome_from(&frame).map_err(|error| ServerError::Internal(error.0)));
-        // A failed part's entries may be missing from the worker, so later steps encode them again.
+        // A failed part's entries may be missing from the worker, so later
+        // steps encode them again; an expired part's kept entries and fits
+        // were built before it stopped, so a retry finds them.
         let dropped = match &outcome {
             Ok(outcome) => {
                 let failed: HashSet<TableId> =
                     outcome.failed.iter().map(|(table, _)| *table).collect();
+                let expired: HashSet<TableId> = outcome.expired.iter().copied().collect();
                 self.node
-                    .complete_deferring(&step, &failed, &outcome.deferred)
+                    .complete_deferring(&step, &failed, &expired, &outcome.deferred)
             }
             Err(_) => self.node.fail(&step),
         };
