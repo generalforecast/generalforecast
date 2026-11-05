@@ -21,6 +21,7 @@ operation, which may handle it, as `push` handles a missing predictor.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 import uuid
@@ -39,6 +40,7 @@ from generalforecast.contracts import (
     parse_lock,
 )
 from generalforecast.predictors.validation import PredictorError, bytes_digest
+from generalforecast.retry import ONCE, PREDICT, READ, WRITE, after_unknown_outcome
 from generalforecast.service.boundary import (
     JsonObject,
     Request,
@@ -98,6 +100,11 @@ class Call:
 
     `path` is under `/v1/projects/{project}`, or under `/v1` for a global
     route. A GET sends no body; `params` become its query.
+
+    `retry` is how the client may send it again after a transient failure
+    (`generalforecast.retry`): `PREDICT`, `READ` or `WRITE`, for a write the
+    service applies once however often it is sent, or `ONCE`. None retries
+    a GET as a `READ` and sends any other request once.
     """
 
     method: str
@@ -108,6 +115,14 @@ class Call:
     global_route: bool = False
     params: Mapping[str, Any] | None = None
     deadline: float | None = None
+    retry: str | None = None
+
+    @property
+    def retry_class(self) -> str | None:
+        """How the call is retried: its `retry`, a GET as a read, else never (None)."""
+        if self.retry is not None:
+            return None if self.retry == ONCE else self.retry
+        return READ if self.method == "GET" else None
 
 
 @dataclass(frozen=True)
@@ -252,7 +267,9 @@ def predict(client: Context, **settings: Any) -> Operation[PredictionResult]:
     from generalforecast.predictor import PredictRequest
 
     request = yield Work(PredictRequest.build, kwargs=settings)
-    result = yield Call("POST", "/predict", "predictor", "ad-hoc", request.payload())
+    result = yield Call(
+        "POST", "/predict", "predictor", "ad-hoc", request.payload(), retry=PREDICT
+    )
     return inference_result(result)
 
 
@@ -312,18 +329,65 @@ def model_got(model: str) -> Operation[JsonObject]:
 
 
 def posted(
-    kind: ResourceKind, collection: str, resource: str, action: str, payload: JsonObject
+    kind: ResourceKind,
+    collection: str,
+    resource: str,
+    action: str,
+    payload: JsonObject,
+    *,
+    retry: str | None = None,
 ) -> Operation[JsonObject]:
-    """`POST /{collection}/{name}/{action}`."""
+    """`POST /{collection}/{name}/{action}`; `retry` as `Call` takes it."""
     suffix = f"/{name(resource)}" + (f"/{action}" if action else "")
-    return (yield Call("POST", f"/{collection}{suffix}", kind, resource, payload))
+    return (
+        yield Call(
+            "POST", f"/{collection}{suffix}", kind, resource, payload, retry=retry
+        )
+    )
 
 
 def created(
-    kind: ResourceKind, collection: str, resource: str, payload: JsonObject
+    kind: ResourceKind,
+    collection: str,
+    resource: str,
+    payload: JsonObject,
+    *,
+    retry: str | None = None,
 ) -> Operation[JsonObject]:
-    """`POST /{collection}`: a new resource."""
-    return (yield Call("POST", f"/{collection}", kind, resource, payload))
+    """`POST /{collection}`: a new resource; `retry` as `Call` takes it."""
+    return (yield Call("POST", f"/{collection}", kind, resource, payload, retry=retry))
+
+
+def run_create(name_: str, payload: JsonObject) -> Operation[JsonObject]:
+    """`POST /runs`, retried: the service returns a run created again with the same spec."""
+    return (yield from created("run", "runs", name_, payload, retry=WRITE))
+
+
+def corpus_create(
+    name_: str, members: JsonObject, parent: str | None
+) -> Operation[JsonObject]:
+    """`POST /corpora`, retried, taking its own earlier try's corpus as made.
+
+    The service never reuses a corpus's name, so a try sent again after one
+    whose answer was lost is refused 409 if that try made it. Only then is
+    the corpus read back, and taken when it lists exactly these members and
+    parent; any other conflict is raised as it is.
+    """
+    payload: JsonObject = {"name": name_, "members": members}
+    if parent is not None:
+        payload["parent"] = parent
+    try:
+        return (yield from created("corpus", "corpora", name_, payload, retry=WRITE))
+    except ServiceError as error:
+        if error.status != 409 or not after_unknown_outcome(error):
+            raise
+        conflict = error
+    found = yield from got("corpus", "corpora", name_)
+    if found.get("members") != json.loads(json.dumps(members)) or (
+        found.get("parent") != parent
+    ):
+        raise conflict
+    return found
 
 
 def context_create(client: Context, config: JsonObject | ContextSpec) -> Operation[Any]:
@@ -738,7 +802,7 @@ def predictor_get(client: Context, resource: str, env: str | None) -> Operation[
 def predictor_create(client: Context, predictor: str) -> Operation[Any]:
     """Creates only the predictor name, not serving readiness."""
     result = yield from created(
-        "predictor", "predictors", predictor, {"name": name(predictor)}
+        "predictor", "predictors", predictor, {"name": name(predictor)}, retry=WRITE
     )
     return client._hosted_predictor.from_response(client, predictor, result)
 
@@ -785,15 +849,20 @@ def predictor_environments(predictor: str) -> Operation[tuple[Environment, ...]]
 
 
 def predictor_environment(
-    client: Context, predictor: str, env: str | None, deadline: float | None = None
+    client: Context,
+    predictor: str,
+    env: str | None,
+    deadline: float | None = None,
+    retry: str | None = None,
 ) -> Operation[Environment]:
-    """One environment with its revision and CAS generation."""
+    """One environment with its revision and CAS generation; `retry` as `Call` takes it."""
     value = yield Call(
         "GET",
         _environment_path(client, predictor, env),
         "predictor",
         predictor,
         deadline=deadline,
+        retry=retry,
     )
     return decoded(Environment.from_dict, value, "environment")
 
@@ -806,6 +875,7 @@ def predictor_create_environment(predictor: str, env: str) -> Operation[Environm
         predictor,
         "environments",
         {"name": name(env)},
+        retry=WRITE,
     )
     return decoded(Environment.from_dict, value, "environment")
 
@@ -826,14 +896,30 @@ def predictor_move(
         if expected_generation is None
         else expected_generation
     )
-    value = yield from posted(
-        "predictor",
-        "predictors",
-        predictor,
-        f"environments/{selected}/{action}",
-        PromoteRequest(revision, generation).to_dict(),
-    )
-    return decoded(Environment.from_dict, value, "environment")
+    try:
+        value = yield from posted(
+            "predictor",
+            "predictors",
+            predictor,
+            f"environments/{selected}/{action}",
+            PromoteRequest(revision, generation).to_dict(),
+            retry=WRITE,
+        )
+    except ServiceError as error:
+        # Every try carries one request id, which the service replays once it
+        # has committed the move; a try that arrives while the first is still
+        # committing loses its CAS instead. Only after a try whose outcome was
+        # unknown is the environment read, and the move taken as made when it
+        # points at this revision one generation on.
+        if error.status != 409 or not after_unknown_outcome(error):
+            raise
+        conflict = error
+    else:
+        return decoded(Environment.from_dict, value, "environment")
+    state = yield from predictor_environment(client, predictor, selected)
+    if state.revision != revision or state.generation != generation + 1:
+        raise conflict
+    return state
 
 
 def predictor_predict(
@@ -867,6 +953,7 @@ def predictor_predict(
         predictor,
         payload,
         params=None if selected == DEFAULT_ENVIRONMENT else {"env": selected},
+        retry=PREDICT,
     )
     return inference_result(result)
 
@@ -900,6 +987,7 @@ def predictor_push(
         resource,
         "revisions",
         {"lock": lock.to_dict(), "snapshot": snapshot, "manifest": checked.manifest},
+        retry=WRITE,
     )
     revision = decoded(Revision.from_dict, value, "revision")
     try:
@@ -957,9 +1045,16 @@ def predictor_wait(
     while True:
         if not first and time.monotonic() >= deadline:
             raise _wait_timeout()
+        # A wait with no time checks once: its poll is bounded by no deadline,
+        # so it is not retried either. Any other poll is retried within it.
+        bounded = bool(timeout) or not first
         try:
             state = yield from predictor_environment(
-                client, predictor, env, deadline if timeout or not first else None
+                client,
+                predictor,
+                env,
+                deadline if bounded else None,
+                None if bounded else ONCE,
             )
         except ServiceError as error:
             if error.code == "Timeout" and time.monotonic() >= deadline:

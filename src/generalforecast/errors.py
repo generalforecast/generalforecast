@@ -194,9 +194,13 @@ class Error(Exception):
         path: The file the error points at, if any.
         line: The 1-based `gf.yaml` line the error points at, if any.
         column: The 1-based column on that line, if any.
+        retry_after: The seconds the service asked a caller to wait before
+            sending the request again (its `Retry-After` header), if it did.
     """
 
     code = "Internal"
+    # Set by the transport from a reply's Retry-After; never on the wire.
+    retry_after: float | None = None
     # The status an error of this category answers with when none is given.
     default_status: ClassVar[int] = 500
     # Set on the category classes; every other class takes one from its code.

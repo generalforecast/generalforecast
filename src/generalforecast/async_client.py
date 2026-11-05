@@ -18,13 +18,22 @@ from pathlib import Path
 from typing import Any, Self
 
 from generalforecast import _operations as ops
-from generalforecast._operations import Call, Operation, PartialWrite, Pause, Work
+from generalforecast._operations import (
+    Call,
+    Operation,
+    PartialWrite,
+    Pause,
+    Upload,
+    Work,
+)
 from generalforecast.contracts import (
     ContextImportRef,
     Environment,
     PredictionResult,
     Revision,
 )
+from generalforecast.errors import Error
+from generalforecast.retry import DEFAULT_RETRY, WRITE, RetryPolicy, Tries
 from generalforecast.service.boundary import JsonObject, ResourceKind
 from generalforecast.service.contracts import require
 from generalforecast.service.interfaces import (
@@ -129,7 +138,10 @@ class AsyncClient:
     """One explicit endpoint/project and independent application/provider keys.
 
     Uses only versioned routes. Request IDs correlate; callers must preserve
-    write_id/submission_id on retries. No automatic retries or cookie login.
+    write_id/submission_id on retries. Transient failures of the requests
+    that are safe to send again (predictions, reads, idempotent creates and
+    pointer moves) are retried under `retry`, a `RetryPolicy`; any other
+    request is sent once. No cookie login.
     """
 
     _hosted_predictor = AsyncHostedPredictor
@@ -146,6 +158,7 @@ class AsyncClient:
         config_path: str | Path | None = None,
         base_url: str | None = None,
         settings: ConnectionSettings | None = None,
+        retry: RetryPolicy | int | bool | None = DEFAULT_RETRY,
         **transport_options: Any,
     ) -> None:
         """Resolves the connection as the CLI does, without persisting credentials.
@@ -156,7 +169,14 @@ class AsyncClient:
         as a local `gf serve`, with no credential unless api_key is given.
         `settings` is a connection resolved already, such as the CLI's, in
         place of the other connection arguments.
+
+        `retry` is the `RetryPolicy` transient failures are retried under,
+        for the requests that are safe to send again (`generalforecast.retry`):
+        by default a prediction for up to ten minutes and any other for up to
+        two. None or 0 sends every request once; a number is the most tries.
         """
+        self._retry = RetryPolicy.of(retry)
+        self._retry_sleep = asyncio.sleep
         if settings is None:
             settings = ConnectionSettings.resolve(
                 url, project, token, api_key, profile, config_path, base_url=base_url
@@ -251,25 +271,57 @@ class AsyncClient:
         global_route: bool = False,
         params: Mapping[str, Any] | None = None,
         deadline: float | None = None,
+        retry: str | None = None,
     ) -> JsonObject:
         """Sends one versioned request and returns its unwrapped result.
 
         Every operation's calls go through here, so this one method sends
-        each versioned request a client makes.
+        each versioned request a client makes. `retry` is the call's retry
+        class (`Call.retry`).
         """
         project = self.project if self.project is not None else await self._scope()
-        prepared = ops.prepare(
-            project,
-            Call(method, path, kind, resource, payload, global_route, params, deadline),
+        call = Call(
+            method, path, kind, resource, payload, global_route, params, deadline, retry
         )
-        value = await self._transport.send(
-            prepared.method,
-            prepared.path,
-            prepared.body,
-            prepared.headers,
-            deadline=prepared.deadline,
+        prepared = ops.prepare(project, call)
+        return await self._send(prepared, call.retry_class)
+
+    async def _send(
+        self, prepared: ops.Prepared, retry_class: str | None
+    ) -> JsonObject:
+        """Sends a prepared request, again after a transient failure when its class allows.
+
+        Every try sends the same request, its request id included, so the
+        service can tell a try again from a new request.
+        """
+        tries = (
+            None
+            if self._retry is None or retry_class is None
+            else Tries(
+                self._retry,
+                retry_class,
+                prepared.method,
+                prepared.path,
+                prepared.headers.get("X-GF-Request-ID"),
+                prepared.deadline,
+            )
         )
-        return ops.answer(prepared, value)
+        while True:
+            try:
+                value = await self._transport.send(
+                    prepared.method,
+                    prepared.path,
+                    prepared.body,
+                    prepared.headers,
+                    deadline=prepared.deadline if tries is None else tries.deadline,
+                )
+            except Error as error:
+                wait = None if tries is None else tries.failed(error)
+                if wait is None:
+                    raise
+                await self._retry_sleep(wait)
+                continue
+            return ops.answer(prepared, value)
 
     async def _run[T](self, operation: Operation[T]) -> T:
         """Awaits an operation's steps, throwing failures back into it."""
@@ -306,21 +358,19 @@ class AsyncClient:
                 global_route=step.global_route,
                 params=step.params,
                 deadline=step.deadline,
+                retry=step.retry,
             )
         project = self.project if self.project is not None else await self._scope()
         prepared = ops.prepare(project, step)
-        value = await self._transport.send(
-            prepared.method, prepared.path, prepared.body, prepared.headers
-        )
-        return ops.answer(prepared, value)
+        # A snapshot is stored by its content, so sending it again is safe; a
+        # training upload's chunk is sent once.
+        return await self._send(prepared, WRITE if isinstance(step, Upload) else None)
 
     async def _scope(self) -> str:
         """The project an unscoped key is for, asked of the service once."""
         prepared = ops.prepare(ops.UNSCOPED, ops.KEY_SCOPE)
-        value = await self._transport.send(
-            prepared.method, prepared.path, prepared.body, prepared.headers
-        )
-        self.project = ops.key_project(ops.answer(prepared, value))
+        value = await self._send(prepared, ops.KEY_SCOPE.retry_class)
+        self.project = ops.key_project(value)
         return self.project
 
 
@@ -447,11 +497,10 @@ class Corpora(Collection):
         """Creates a corpus from named members, each `{"snapshots": [...]}` or `{"prior": {...}}`.
 
         A corpus never changes; a new one may name the corpus it updates as `parent`.
+        A create retried after a try whose answer was lost returns the corpus
+        that try made, when it lists the same members.
         """
-        payload: JsonObject = {"name": name, "members": members}
-        if parent is not None:
-            payload["parent"] = parent
-        return await self.client._run(ops.created("corpus", "corpora", name, payload))
+        return await self.client._run(ops.corpus_create(name, members, parent))
 
     async def delete(self, name: str) -> JsonObject:
         """Deletes a corpus no run reads, releasing its snapshots."""
@@ -517,7 +566,8 @@ class Runs(Collection):
         """Creates a run; with a `plan` it trains as soon as it is set up.
 
         `base` is the catalog model the run trains from. Creating the same
-        run again returns it.
+        run again returns it, so the client retries a create the service
+        could not take for now, such as one past the project's run limit.
         """
         payload = ops.run_spec(
             name,
@@ -531,7 +581,7 @@ class Runs(Collection):
             seed=seed,
             tags=tags,
         )
-        return await self.client._run(ops.created("run", "runs", name, payload))
+        return await self.client._run(ops.run_create(name, payload))
 
     async def train(self, run: str, plan: JsonObject) -> JsonObject:
         """Sets the plan of a run created without one."""

@@ -1147,12 +1147,14 @@ class _Requests(logging.Handler):
 
 
 def _show_requests(out: term.Output) -> None:
-    """Shows every request under `-v`: method, URL, status and request id."""
+    """Shows every request under `-v`: method, URL, status and request id, and each retry."""
+    from generalforecast.retry import RETRIES
     from generalforecast.transport import REQUESTS
 
-    REQUESTS.handlers = [_Requests(out)]
-    REQUESTS.setLevel(logging.DEBUG)
-    REQUESTS.propagate = False
+    for logger in (REQUESTS, RETRIES):
+        logger.handlers = [_Requests(out)]
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
 
 
 def _resolve_fine_tunes() -> None:

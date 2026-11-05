@@ -96,7 +96,8 @@ def client_for(
     """Uses named environment references; never persists credential values."""
     settings = connection_for(args) if settings is None else settings
     token = settings.token
-    provider = {
+    # The transport's provider options, apart from the client's own.
+    provider: dict[str, Any] = {
         "auth_mode": os.environ.get("GF_AUTH_MODE", "bearer"),
         "platform_token": os.environ.get("GF_PLATFORM_TOKEN"),
         "modal_key": os.environ.get("GF_MODAL_KEY"),
