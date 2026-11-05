@@ -12,7 +12,7 @@ import pytest
 
 from generalforecast.predictors.runtime import PredictorExecutor
 from generalforecast.predictors.runtime.forecast import ForecastContext
-from tests.product_runtime.test_executor import checked
+from tests.product_runtime.test_executor import checked, loaded
 
 pytestmark = pytest.mark.slow
 
@@ -65,7 +65,7 @@ def test_real_tabular_prepare_predict_and_isolated_patch(tmp_path, model):
     )
     # The runtime never downloads; only this test of the model fetches it.
     executor = PredictorExecutor(allow_downloads=True)
-    old = executor.prepare(locked, context)
+    old = loaded(executor, locked, context)
     q = pa.table({"id": ["query"], "x": [1.5]})
     before = old.predict(q)
     assert before["id"].to_pylist() == ["query"]
@@ -85,7 +85,7 @@ def test_real_tabular_prepare_predict_and_isolated_patch(tmp_path, model):
         model=locked.spec.model,
         outputs=list(locked.outputs),
     )
-    patched = executor.prepare(second, changed)
+    patched = loaded(executor, second, changed)
     assert patched.predict(q).to_pylist() != before.to_pylist()
     assert old.predict(q).equals(before)
 
@@ -119,7 +119,7 @@ def test_real_grouped_chronos_known_future_and_production_isolation(tmp_path):
         outputs=["value", "quantiles"],
         quantiles=[0.1, 0.5, 0.9],
     )
-    old = PredictorExecutor().prepare(locked, context)
+    old = loaded(PredictorExecutor(), locked, context)
     queries = pa.Table.from_pylist(
         [
             {"id": f"q-{s}-{i}", "series": s, "time": i, "promo": float(i % 2)}
@@ -147,7 +147,7 @@ def test_real_schema_free_request_multiclass_categories_and_datetime(tmp_path):
     )
     lock = checked(tmp_path, context, context="request", id="id")
     assert lock.schema.columns == ()
-    prepared = PredictorExecutor().prepare(lock, None)
+    prepared = loaded(PredictorExecutor(), lock, None)
     queries = pa.table(
         {
             "id": ["known", "unseen"],
@@ -187,7 +187,7 @@ def test_real_grouped_forecast_overlapping_covariates_follow_native_channels(tmp
         horizon=2,
         future_inputs=["driver", "zz"],
     )
-    prepared = PredictorExecutor().prepare(locked, context)
+    prepared = loaded(PredictorExecutor(), locked, context)
     assert isinstance(prepared._context, ForecastContext)
     overlap = replace(
         prepared.lock, spec=replace(prepared.lock.spec, past_inputs=("driver",))
@@ -222,7 +222,7 @@ def test_real_forecast_date_axis_preserves_out_of_order_rows(tmp_path):
         horizon=2,
         frequency="1d",
     )
-    prepared = PredictorExecutor().prepare(locked, context)
+    prepared = loaded(PredictorExecutor(), locked, context)
     queries = pa.table(
         {"time": [datetime.date(2026, 1, 18), datetime.date(2026, 1, 17)]}
     )

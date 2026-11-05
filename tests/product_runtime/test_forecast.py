@@ -13,7 +13,7 @@ from generalforecast.engine import Forecasts
 from generalforecast.models.catalog import CHRONOS2_QUANTILES
 from generalforecast.predictors.runtime import PredictorExecutor
 from generalforecast.service.contracts import ServiceError
-from tests.product_runtime.test_executor import checked
+from tests.product_runtime.test_executor import checked, loaded
 from tests.utils.engine import FakeEngine
 
 
@@ -56,7 +56,7 @@ def engine(request, tmp_path, context, monkeypatch):
         outputs=["value", "quantiles"],
         **({"related": request.param} if request.param else {}),
     )
-    return PredictorExecutor().prepare(locked, context)
+    return loaded(PredictorExecutor(), locked, context)
 
 
 def queries():
@@ -90,7 +90,7 @@ def test_overlapping_past_future_covariates_use_native_unique_channel_order(
         horizon=2,
         future_inputs=["promo", "zz"],
     )
-    prepared = PredictorExecutor().prepare(locked, context)
+    prepared = loaded(PredictorExecutor(), locked, context)
     assert prepared._context is not None
     # Isolate runtime ordering from the separately owned manifest role validator.
     overlap = replace(
@@ -163,9 +163,9 @@ def test_irregular_context_and_covariate_disagreement_fail_before_ready(
     )
     changed = context.set_column(1, "time", pa.array([0, 1, 2, 4, 0, 1, 2, 3]))
     with pytest.raises(ServiceError) as error:
-        PredictorExecutor().prepare(locked, changed)
+        loaded(PredictorExecutor(), locked, changed)
     assert error.value.code == "FrequencyMismatch"
     changed = context.set_column(3, "promo", pa.array([0.0] * 4 + [1.0] * 4))
     with pytest.raises(ServiceError) as error:
-        PredictorExecutor().prepare(locked, changed)
+        loaded(PredictorExecutor(), locked, changed)
     assert error.value.code == "UnsupportedCovariates"
