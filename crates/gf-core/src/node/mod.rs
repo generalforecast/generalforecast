@@ -201,12 +201,22 @@ struct TableState {
     /// The program the worker compiles for the table's part of a step,
     /// which steps leave it out until.
     compiling: Option<String>,
+    /// The worker seconds the executor expects a step of the table to take;
+    /// see `Node::set_cost`.
+    cost: f64,
+    /// Steps planned without the table while it waited as long work behind
+    /// shorter; see `Node::set_long_step`.
+    passed: u32,
 }
 
 /// Dead row ids past which, and past the live rows, a table is renumbered
 /// before its next insert, so ids and the arrays they index stay near the
 /// live rows however many rows come and go.
 const SPARSE_ROWS: u64 = 1 << 12;
+
+/// Steps running that short work may pass over a waiting long table before
+/// it goes first; see `Node::set_long_step`.
+pub const LONG_PASSES: u32 = 4;
 
 /// The order a step takes waiting tables in, while its budget lasts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -273,6 +283,9 @@ pub struct Node {
     compiled: HashSet<String>,
     /// Where the last `schedule` spent its time.
     parts: PlanParts,
+    /// Worker seconds a step of a table is expected to take, past which it
+    /// runs alone and after shorter work; None leaves every table short.
+    long_step: Option<f64>,
 }
 
 /// A given context, by the keys of its rows: a renumbering or a restore

@@ -90,6 +90,9 @@ impl Shard {
                 self.queued_bytes >> 20
             )));
         }
+        self.admit_wait(id)?;
+        let expected = self.expected(id);
+        self.node.set_cost(id, expected);
         let request = match given {
             Some(contexts) => self.node.submit_keys(id, &features, &contexts)?,
             None => self.node.submit_before(id, &features, before.as_deref())?,
@@ -184,6 +187,9 @@ impl Shard {
                 self.queued_bytes >> 20
             )));
         }
+        self.admit_wait(id)?;
+        let expected = self.expected(id);
+        self.node.set_cost(id, expected);
         let request = self.node.submit_forecast(
             id,
             &series,

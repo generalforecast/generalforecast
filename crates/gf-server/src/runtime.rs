@@ -130,6 +130,9 @@ pub async fn start(
                 bucket_minimum: config.bucket_minimum,
                 step_bytes: config.step_bytes,
                 scheduling: config.scheduling,
+                long_step: (config.long_step_seconds > 0.0)
+                    .then(|| Duration::from_secs_f64(config.long_step_seconds)),
+                shed: config.shed_past_deadline,
                 eviction: config.eviction,
                 step_timeout: Duration::from_secs_f64(config.step_timeout_seconds),
                 request_timeout: Duration::from_secs_f64(config.longest_request_seconds()),

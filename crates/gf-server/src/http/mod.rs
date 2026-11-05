@@ -38,7 +38,7 @@ use crate::as_of::{self, AsOf};
 use crate::auth::digest;
 use crate::budget::{Charge, RequestBudget};
 use crate::engine::{self, Bound, Engine};
-use crate::error::{DEVICE_MEMORY_CODE, DEVICE_MEMORY_RETRY_SECONDS, ServerError};
+use crate::error::ServerError;
 use crate::name::TableName;
 use crate::predictors::{self, ContextMode, ForecastPredictor, ServedPredictor};
 use crate::progress::Compiling;
@@ -174,6 +174,8 @@ pub struct ApiError {
     /// The optional fields of the error object (`param`, `hint`, `limit`,
     /// `actual`), boxed so the common error stays small.
     pub detail: Option<Box<ErrorDetail>>,
+    /// Seconds to wait before retrying, answered as `Retry-After`.
+    pub retry_after: Option<u64>,
 }
 
 impl ApiError {
@@ -184,6 +186,7 @@ impl ApiError {
             message: message.into(),
             status,
             detail: None,
+            retry_after: None,
         }
     }
 
@@ -253,6 +256,8 @@ impl From<RequestError> for ApiError {
             message: error.message,
             status: error.status,
             detail: error.detail,
+
+            retry_after: None,
         }
     }
 }
@@ -263,7 +268,12 @@ impl From<ServerError> for ApiError {
         if matches!(error, ServerError::Internal(_)) {
             tracing::error!("inference failed: {error}");
         }
-        Self::new(code, message, status)
+        let mut api = Self::new(code, message, status);
+        api.retry_after = error.retry_after();
+        if matches!(error, ServerError::Backlogged(..)) {
+            api = api.reason("queue_wait_exceeds_deadline");
+        }
+        api
     }
 }
 
@@ -732,11 +742,10 @@ fn failure(scope: Option<&Scope>, error: &ApiError) -> Response {
         None => error.body(),
     };
     let mut response = respond(error.status, &body);
-    if error.code == DEVICE_MEMORY_CODE {
-        response.headers_mut().insert(
-            header::RETRY_AFTER,
-            HeaderValue::from(DEVICE_MEMORY_RETRY_SECONDS),
-        );
+    if let Some(seconds) = error.retry_after {
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
     }
     response
 }
@@ -1175,5 +1184,19 @@ mod tests {
         assert_eq!(refused.status(), 503);
         assert_eq!(refused.headers()[header::RETRY_AFTER], "10");
         assert!(!other.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[test]
+    fn a_request_refused_for_the_queue_ahead_answers_503_with_its_retry_after() {
+        let error = ApiError::from(ServerError::Backlogged("queued".into(), 37));
+        let refused = failure(None, &error);
+
+        assert_eq!(refused.status(), 503);
+        assert_eq!(refused.headers()[header::RETRY_AFTER], "37");
+        assert_eq!(error.code, "CapacityExceeded");
+        assert_eq!(
+            error.body()["error"]["reason"],
+            "queue_wait_exceeds_deadline"
+        );
     }
 }

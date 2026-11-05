@@ -318,6 +318,65 @@ fn without_a_device_tier_every_table_joins_one_step() {
 }
 
 #[test]
+fn long_work_runs_alone_after_shorter_work_in_turn() {
+    // Without a device tier every table would join one step.
+    let mut node = node(0);
+    node.set_long_step(Some(10.0));
+    let tables: Vec<TableId> = (0..3)
+        .map(|_| table(&mut node, Strategy::Exact, 16))
+        .collect();
+    // The first table's steps take a minute; the others' a second.
+    node.set_cost(tables[0], 60.0);
+    node.set_cost(tables[1], 1.0);
+    for &table in &tables {
+        node.submit(table, &A).unwrap();
+    }
+
+    let short = run(&mut node);
+    let long = run(&mut node);
+
+    let served =
+        |step: &Step| -> Vec<TableId> { step.queries().iter().map(|batch| batch.table).collect() };
+    assert_eq!(served(&short), [tables[1], tables[2]]);
+    assert_eq!(served(&long), [tables[0]]);
+    assert!(node.schedule().unwrap().is_none());
+}
+
+#[test]
+fn long_work_passed_over_long_enough_goes_first() {
+    let mut node = node(0);
+    node.set_long_step(Some(10.0));
+    let long = table(&mut node, Strategy::Exact, 16);
+    let short = table(&mut node, Strategy::Exact, 16);
+    node.set_cost(long, 60.0);
+    node.submit(long, &A).unwrap();
+
+    // Short work arriving before every step passes the long table over, but
+    // only LONG_PASSES steps running.
+    let mut served = Vec::new();
+    for _ in 0..=gf_core::node::LONG_PASSES {
+        node.submit(short, &A).unwrap();
+        served.push(run(&mut node).queries()[0].table);
+    }
+
+    let passes = gf_core::node::LONG_PASSES as usize;
+    assert_eq!(served[..passes], vec![short; passes][..]);
+    assert_eq!(served[passes], long);
+}
+
+#[test]
+fn without_a_long_step_bound_costs_change_nothing() {
+    let mut node = node(0);
+    let first = table(&mut node, Strategy::Exact, 16);
+    let second = table(&mut node, Strategy::Exact, 16);
+    node.set_cost(first, 600.0);
+    node.submit(first, &A).unwrap();
+    node.submit(second, &A).unwrap();
+
+    assert_eq!(run(&mut node).queries().len(), 2);
+}
+
+#[test]
 fn arrival_scheduling_serves_the_longest_waiting_table_first() {
     for (scheduling, expected) in [
         (Scheduling::Turns, [0, 1, 2]),

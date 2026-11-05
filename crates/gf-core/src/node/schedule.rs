@@ -328,6 +328,9 @@ impl Node {
         if self.scheduling == Scheduling::Arrival {
             waiting.sort_by_key(|id| self.tables[id].first_request());
         }
+        // Short work goes before long, each in the order above; a long table
+        // passed over often enough counts as short. The sort is stable.
+        waiting.sort_by_key(|id| self.waits_as_long(*id));
         // Region contexts due a rebuild take a step of their own once no
         // request waits, or once one has waited out its table's
         // `RebuildWait`, so requests keep reading the old contexts meanwhile.
@@ -391,6 +394,18 @@ impl Node {
             }
         }
         self.flight.hold(&step);
+        // A long table a step went without is passed over once more; one
+        // that joined starts counting again.
+        for &id in &waiting {
+            let long = self.is_long(id);
+            if let Some(state) = self.tables.get_mut(&id) {
+                if scheduled.contains(&id) {
+                    state.passed = 0;
+                } else if long {
+                    state.passed = state.passed.saturating_add(1);
+                }
+            }
+        }
         self.turn = TableId(first.0 + 1);
         for (id, _) in &due {
             if let Some(state) = self.tables.get_mut(id) {
@@ -659,8 +674,13 @@ impl Node {
             // The table an error below is the planning of.
             *planning = Some(id);
             // Planning costs time, so tables wait without it once the budget is
-            // spent, or while a step in flight fits them.
-            if (!scheduled.is_empty() && budget.spent()) || self.flight.fitting.contains(&id) {
+            // spent, or while a step in flight fits them. Long work runs in a
+            // step of its own: it joins none another table started, and none
+            // joins one it started.
+            if (!scheduled.is_empty()
+                && (budget.spent() || self.is_long(id) || self.is_long(scheduled[0])))
+                || self.flight.fitting.contains(&id)
+            {
                 continue;
             }
             let Some(state) = self.tables.get_mut(&id) else {
@@ -806,6 +826,22 @@ impl Node {
             scheduled.push(id);
         }
         Ok(())
+    }
+
+    /// Whether a step of the table is expected to take at least the long
+    /// step bound; see `set_long_step`.
+    fn is_long(&self, id: TableId) -> bool {
+        self.long_step.is_some_and(|bound| {
+            self.tables
+                .get(&id)
+                .is_some_and(|state| state.cost >= bound)
+        })
+    }
+
+    /// Whether the table waits behind short work: it is long, and short
+    /// work has passed it over fewer than `LONG_PASSES` steps running.
+    fn waits_as_long(&self, id: TableId) -> bool {
+        self.is_long(id) && self.tables[&id].passed < LONG_PASSES
     }
 
     /// Adds a series table's forecast requests to the step while the budget

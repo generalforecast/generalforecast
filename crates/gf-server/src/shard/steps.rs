@@ -346,7 +346,7 @@ impl Shard {
     /// context rows each newly encoded, those shared split evenly among the
     /// requests reading them. A table with no requests in the step, as in a
     /// region rebuild's, keeps its cost as rebuild seconds.
-    fn count_costs(&self, step: &Step, outcome: &Outcome) -> HashMap<RequestId, Share> {
+    fn count_costs(&mut self, step: &Step, outcome: &Outcome) -> HashMap<RequestId, Share> {
         self.metrics.worker_seconds.add(outcome.seconds);
         for (name, time) in &outcome.stages {
             let stage = self.metrics.stage(name);
@@ -493,6 +493,14 @@ impl Shard {
                 }
             }
         }
+        // What the step took each table it answered requests of is what its
+        // next step is expected to take; a rebuild's tables answered none.
+        let answered: HashMap<TableId, f64> = cost
+            .iter()
+            .filter(|(table, _)| weights.contains_key(table))
+            .map(|(&table, &seconds)| (table, seconds))
+            .collect();
+        self.learn_costs(&answered);
         step.queries()
             .iter()
             .zip(context)

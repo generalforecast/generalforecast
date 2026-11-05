@@ -24,6 +24,9 @@ pub enum ServerError {
     Fenced(String),
     /// The shard holds as many queries as it may; retry shortly.
     Busy(String),
+    /// The worker has more work queued ahead of the request than any caller
+    /// waits for; retry after the seconds given, when it will have run it.
+    Backlogged(String, u64),
     /// The worker is starting again; retry shortly.
     Unavailable(String),
     /// The device this request reached cannot hold one step of the table's
@@ -92,6 +95,12 @@ impl ServerError {
                 "CapacityExceeded",
                 None,
             ),
+            Self::Backlogged(..) => meaning(
+                tonic::Code::ResourceExhausted,
+                503,
+                "CapacityExceeded",
+                None,
+            ),
             Self::Unavailable(_) => meaning(
                 tonic::Code::Unavailable,
                 503,
@@ -110,6 +119,17 @@ impl ServerError {
                 "InferenceFailed",
                 Some("native inference failed"),
             ),
+        }
+    }
+
+    /// The seconds a client should wait before retrying, as the Models API
+    /// answers them in `Retry-After`; None for an error that names none.
+    #[must_use]
+    pub fn retry_after(&self) -> Option<u64> {
+        match self {
+            Self::Backlogged(_, seconds) => Some(*seconds),
+            Self::DeviceMemory(_) => Some(u64::from(DEVICE_MEMORY_RETRY_SECONDS)),
+            _ => None,
         }
     }
 
@@ -169,7 +189,8 @@ impl fmt::Display for ServerError {
             | Self::Busy(message)
             | Self::Unavailable(message)
             | Self::DeviceMemory(message)
-            | Self::Internal(message) => formatter.write_str(message),
+            | Self::Internal(message)
+            | Self::Backlogged(message, _) => formatter.write_str(message),
         }
     }
 }

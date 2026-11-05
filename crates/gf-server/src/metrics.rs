@@ -217,6 +217,12 @@ pub struct Metrics {
     pub plan_seconds: Histogram,
     /// Time from a prediction request arriving to its step being sent.
     pub queue_seconds: Histogram,
+    /// Predictions refused at once because the work queued ahead of them
+    /// would outlast their deadline.
+    pub requests_shed: Counter,
+    /// Each shard's estimate of how long a new request would wait for the
+    /// work queued ahead of it, in milliseconds; see `queue_wait`.
+    queue_waits: Mutex<Vec<u64>>,
     /// Time workers spent running steps, as they measure it.
     pub worker_seconds: Seconds,
     /// Programs workers compiled as they started, before taking steps, from
@@ -310,6 +316,47 @@ impl Metrics {
         {
             self.timings_dropped.add(1);
         }
+    }
+
+    /// A place for one shard's queue wait, in `queue_wait`.
+    pub fn queue_wait_slot(&self) -> usize {
+        let mut waits = self
+            .queue_waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        waits.push(0);
+        waits.len() - 1
+    }
+
+    /// Sets a shard's estimate of a new request's wait, in seconds.
+    pub fn set_queue_wait(&self, slot: usize, seconds: f64) {
+        let millis = if seconds.is_finite() && seconds > 0.0 {
+            (seconds * 1e3).round() as u64
+        } else {
+            0
+        };
+        if let Some(wait) = self
+            .queue_waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get_mut(slot)
+        {
+            *wait = millis;
+        }
+    }
+
+    /// The longest any shard estimates a new request would wait for the
+    /// work queued ahead of it, in seconds: worker time, not a count of
+    /// requests, so an autoscaler sees a queue of a few long fits as the
+    /// load it is.
+    #[must_use]
+    pub fn queue_wait(&self) -> f64 {
+        self.queue_waits
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .max()
+            .map_or(0.0, |&millis| millis as f64 / 1e3)
     }
 
     /// A worker stage's metrics, made on first use.
@@ -490,6 +537,17 @@ impl Metrics {
             "# HELP gf_queue_seconds Time from a prediction request arriving to its step being sent.\n# TYPE gf_queue_seconds histogram\n"
         );
         histogram(&mut text, "gf_queue_seconds", "", &self.queue_seconds);
+        let _ = write!(
+            text,
+            "# HELP gf_queue_wait_seconds Worker time a new request would wait for the work queued ahead of it, on the busiest worker.\n# TYPE gf_queue_wait_seconds gauge\ngf_queue_wait_seconds {}\n",
+            self.queue_wait()
+        );
+        counter(
+            &mut text,
+            "gf_requests_shed_total",
+            "Predictions refused at once because the work queued ahead would outlast their deadline.",
+            self.requests_shed.get(),
+        );
         let _ = write!(
             text,
             "# HELP gf_worker_seconds_total Time workers spent running steps, as they measure it.\n# TYPE gf_worker_seconds_total counter\ngf_worker_seconds_total {}\n",

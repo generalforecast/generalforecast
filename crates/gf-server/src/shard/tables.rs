@@ -465,6 +465,7 @@ impl Shard {
     /// Stops serving a table on the node and the worker, as `serve` began.
     pub(super) async fn unserve(&mut self, id: TableId) {
         self.recent.remove(&id);
+        self.costs.forget(id);
         self.lift_quarantine(id);
         if self.broken.remove(&id).is_some() {
             self.metrics.tables_broken.sub(1);

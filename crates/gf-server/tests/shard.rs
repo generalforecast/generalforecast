@@ -52,6 +52,9 @@ const MEMORY: u8 = 7;
 /// Fails the first table's part of every step as one stopped past its
 /// requests' deadline, noting the step's `expires_ms` in the actions.
 const EXPIRE: u8 = 8;
+/// Answers every step at once but reports it took the worker 100 s, as a
+/// long fit or a large model's decode would.
+const SLOW: u8 = 9;
 
 /// Answers every frame the shard sends, in order; steps as `behaviour` says.
 /// Each step's units' actions go to `actions`, in the order sent. Models load
@@ -153,6 +156,11 @@ fn fake_worker(
                             }
                         }
                         predictions(&frame.header, None)
+                    }
+                    SLOW => {
+                        let mut reply = predictions(&frame.header, None);
+                        reply.header["seconds"] = Value::from(100.0);
+                        reply
                     }
                     _ => predictions(&frame.header, None),
                 }
@@ -525,6 +533,8 @@ fn settings() -> ShardSettings {
         bucket_minimum: 8,
         step_bytes: None,
         scheduling: Scheduling::Turns,
+        long_step: None,
+        shed: true,
         eviction: Eviction::Gdsf,
         step_timeout: Duration::from_secs(60),
         request_timeout: Duration::from_secs(600),
@@ -1339,6 +1349,73 @@ async fn a_hung_worker_is_started_again_its_requests_fail_and_writes_go_on() {
     assert_eq!(shard.describe().await.rows, 6);
     assert_eq!(shard.create_named("other", 3).await, Err(Code::Unavailable));
     assert_eq!(shard.metrics.workers_down.get(), 1);
+}
+
+/// A shard whose tables `slow` and `slower` have each had two steps the
+/// worker reports took 100 s, with steps' callers waiting 60 s at most, and
+/// a worker that now holds every step it is sent.
+async fn behind_long_steps(shed: bool) -> Harness {
+    let mut settings = settings();
+    settings.request_timeout = Duration::from_secs(60);
+    settings.long_step = Some(Duration::from_secs(10));
+    settings.shed = shed;
+    let shard = shard(settings).await;
+    for table in ["slow", "slower", "quick"] {
+        shard.create_named(table, 3).await.unwrap();
+        shard.insert_into(table, &[1, 2, 3, 4], None).await;
+    }
+    // With nothing queued ahead, a request is admitted however long its own
+    // table's step takes.
+    shard.behaviour.store(SLOW, Ordering::Relaxed);
+    for table in ["slow", "slower", "slow", "slower"] {
+        assert_eq!(shard.predict_from(table).await, Ok(1));
+    }
+    assert_eq!(shard.metrics.requests_shed.get(), 0);
+
+    shard.behaviour.store(HANG, Ordering::Relaxed);
+    shard
+}
+
+#[tokio::test]
+async fn a_prediction_that_would_outwait_its_deadline_behind_long_steps_is_refused_at_once() {
+    let shard = behind_long_steps(true).await;
+    // A step of each long table is in flight, each alone, and each counts at
+    // most the 60 s its callers wait.
+    let _slow = shard.send_predict("slow").await;
+    let _slower = shard.send_predict("slower").await;
+
+    let refused = tokio::time::timeout(Duration::from_secs(5), shard.predict_from("quick"))
+        .await
+        .expect("refused at once");
+
+    assert_eq!(refused, Err(Code::ResourceExhausted));
+    assert_eq!(shard.metrics.requests_shed.get(), 1);
+    // The shard reports the wait once it has handled what woke it.
+    let reported = tokio::time::timeout(Duration::from_secs(5), async {
+        while shard.metrics.queue_wait() <= 60.0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(reported.is_ok(), "{}", shard.metrics.queue_wait());
+    let text = shard.metrics.render();
+    assert!(text.contains("gf_requests_shed_total 1\n"), "{text}");
+    assert!(text.contains("gf_queue_wait_seconds 1"), "{text}");
+}
+
+#[tokio::test]
+async fn a_shard_told_not_to_shed_queues_behind_long_steps() {
+    let shard = behind_long_steps(false).await;
+    // A step of each long table is in flight, each alone, and each counts at
+    // most the 60 s its callers wait.
+    let _slow = shard.send_predict("slow").await;
+    let _slower = shard.send_predict("slower").await;
+
+    let queued =
+        tokio::time::timeout(Duration::from_millis(300), shard.predict_from("quick")).await;
+
+    assert!(queued.is_err(), "refused: {queued:?}");
+    assert_eq!(shard.metrics.requests_shed.get(), 0);
 }
 
 #[tokio::test]
