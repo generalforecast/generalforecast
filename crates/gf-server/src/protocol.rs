@@ -7,7 +7,7 @@
 //! records are frames too. Arrays travel as bytes the receiver can view in
 //! place, so a step's features are never parsed number by number.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::sync::Arc;
 
@@ -975,7 +975,15 @@ pub struct PredictionsHeader {
 pub struct Failure {
     pub table: u32,
     pub message: String,
+    /// `device_memory` where the device could not hold the table's step:
+    /// admission refused it, or a call ran out of memory with its step down
+    /// to one request. Any other failure has no kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
+
+/// The `Failure` kind of a step the device could not hold.
+pub const DEVICE_MEMORY: &str = "device_memory";
 
 /// A table whose part of a step waits for a program the worker compiles
 /// beside its steps, named by `key` until a `Compiled` reply names it too.
@@ -1036,6 +1044,9 @@ pub struct Predictions {
 pub struct Outcome {
     pub predictions: Vec<(u64, Predictions)>,
     pub failed: Vec<(TableId, String)>,
+    /// The failed tables whose part the device could not hold
+    /// (`DEVICE_MEMORY`), which another device may.
+    pub device_memory: BTreeSet<TableId>,
     /// Tables whose part waits for a program, by its key; see `Deferral`.
     pub deferred: Vec<(TableId, String)>,
     pub seconds: f64,
@@ -1101,12 +1112,18 @@ pub fn outcome_from(frame: &Frame) -> Result<Outcome, FrameError> {
             ))
         })
         .collect::<Result<_, _>>()?;
+    let device_memory = failures
+        .iter()
+        .filter(|failure| failure.kind.as_deref() == Some(DEVICE_MEMORY))
+        .map(|failure| TableId(failure.table))
+        .collect();
     Ok(Outcome {
         predictions,
         failed: failures
             .into_iter()
             .map(|failure| (TableId(failure.table), failure.message))
             .collect(),
+        device_memory,
         deferred: deferred
             .into_iter()
             .map(|deferral| (TableId(deferral.table), deferral.key))

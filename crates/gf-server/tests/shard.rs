@@ -19,8 +19,8 @@ use gf_server::definition::{CreationId, Durability, TableDefinition, TimeKind};
 use gf_server::metrics::Metrics;
 use gf_server::name::TableName;
 use gf_server::protocol::{
-    CompileCache, Failure, Frame, ModelProfile, PredictionsHeader, StageTime, WorkerReply,
-    WorkerRequest, f32_bytes,
+    CompileCache, DEVICE_MEMORY, Failure, Frame, ModelProfile, PredictionsHeader, StageTime,
+    WorkerReply, WorkerRequest, f32_bytes,
 };
 use gf_server::routes::Routes;
 use gf_server::shard::{
@@ -47,6 +47,8 @@ const COMPILE: u8 = 4;
 const DEFER: u8 = 5;
 /// As `DEFER`, but reports the program compiled before the reply.
 const DEFER_EARLY: u8 = 6;
+/// Fails the first table's part of every step as one its device could not hold.
+const MEMORY: u8 = 7;
 
 /// Answers every frame the shard sends, in order; steps as `behaviour` says.
 /// Each step's units' actions go to `actions`, in the order sent. Models load
@@ -111,6 +113,14 @@ fn fake_worker(
                     .frame(),
                     HANG => continue,
                     FAIL_FIRST => predictions(&frame.header, Some(0)),
+                    MEMORY => {
+                        let mut reply = predictions(&frame.header, Some(0));
+                        reply.header["failures"][0]["kind"] = Value::from(DEVICE_MEMORY);
+                        reply.header["failures"][0]["message"] = Value::from(
+                            "DeviceMemoryRefused: a context of 5120 rows needs 10560 MiB",
+                        );
+                        reply
+                    }
                     COMPILE => {
                         for _ in 0..6 {
                             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -366,6 +376,7 @@ fn predictions(header: &Value, failing: Option<u32>) -> Frame {
         .map(|table| Failure {
             table,
             message: "ValueError: bad rows".to_string(),
+            kind: None,
         })
         .into_iter()
         .collect();
@@ -801,6 +812,25 @@ async fn a_table_whose_fit_keeps_failing_is_quarantined_until_it_changes() {
     assert_eq!(quarantined, 1);
     assert_eq!(after, Ok(1));
     assert_eq!(shard.metrics.tables_quarantined.get(), 0);
+}
+
+#[tokio::test]
+async fn a_step_its_device_cannot_hold_is_retryable_and_never_quarantines_its_table() {
+    let shard = shard(settings()).await;
+    shard.create(3).await.unwrap();
+    shard.insert(&[1, 2, 3, 4]).await;
+    shard.behaviour.store(MEMORY, Ordering::Relaxed);
+
+    // Past the failures that quarantine a table for any other reason.
+    for _ in 0..5 {
+        assert_eq!(shard.predict().await, Err(Code::ResourceExhausted));
+    }
+    let quarantined = shard.metrics.tables_quarantined.get();
+    shard.behaviour.store(OK, Ordering::Relaxed);
+    let after = shard.predict().await;
+
+    assert_eq!(quarantined, 0);
+    assert_eq!(after, Ok(1));
 }
 
 #[tokio::test]

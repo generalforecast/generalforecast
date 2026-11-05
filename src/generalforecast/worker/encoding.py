@@ -101,6 +101,13 @@ def _expanded(arguments: tuple) -> tuple:
     return (state, _taken(gather.values, index), _taken(gather.targets, index), rows)
 
 
+def transient_size(rows: int, bucket: int) -> int:
+    """Rows a put-off context of `rows` rows, of padded size `bucket`, pads to: its bucket, or past `TRANSIENT_ROWS`, the next multiple of it."""
+    if bucket <= TRANSIENT_ROWS:
+        return bucket
+    return min(bucket, -(-rows // TRANSIENT_ROWS) * TRANSIENT_ROWS)
+
+
 def _reads(queries: Sequence[QueryBatch], units: int) -> np.ndarray:
     """How many of a step's queries read each of its `units` units."""
     read = [np.asarray(batch.units, dtype=np.int64) for batch in queries]
@@ -310,11 +317,8 @@ class Encoding:
         return padded * row <= self._call_bytes // 2
 
     def _transient_size(self: "Worker", rows: int) -> int:
-        """Rows a put-off context of `rows` rows pads to: its bucket, or past `TRANSIENT_ROWS`, the next multiple of it."""
-        bucket = self._size(rows)
-        if bucket <= TRANSIENT_ROWS:
-            return bucket
-        return min(bucket, -(-rows // TRANSIENT_ROWS) * TRANSIENT_ROWS)
+        """Rows a put-off context of `rows` rows pads to; see `transient_size`."""
+        return transient_size(rows, self._size(rows))
 
     def _own_arguments(self: "Worker", unit: Unit) -> tuple:
         """A unit's fit arguments, from the rows it came with."""

@@ -38,7 +38,7 @@ use crate::as_of::{self, AsOf};
 use crate::auth::digest;
 use crate::budget::{Charge, RequestBudget};
 use crate::engine::{self, Bound, Engine};
-use crate::error::ServerError;
+use crate::error::{DEVICE_MEMORY_CODE, DEVICE_MEMORY_RETRY_SECONDS, ServerError};
 use crate::name::TableName;
 use crate::predictors::{self, ContextMode, ForecastPredictor, ServedPredictor};
 use crate::progress::Compiling;
@@ -731,7 +731,14 @@ fn failure(scope: Option<&Scope>, error: &ApiError) -> Response {
         }
         None => error.body(),
     };
-    respond(error.status, &body)
+    let mut response = respond(error.status, &body);
+    if error.code == DEVICE_MEMORY_CODE {
+        response.headers_mut().insert(
+            header::RETRY_AFTER,
+            HeaderValue::from(DEVICE_MEMORY_RETRY_SECONDS),
+        );
+    }
+    response
 }
 
 async fn handle(State(front): State<Arc<Front>>, request: Request) -> Response {
@@ -1150,5 +1157,23 @@ impl Front {
             limits: Limits::Predictor,
             levels: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ApiError, ServerError, failure, header};
+
+    #[test]
+    fn a_step_the_device_cannot_hold_answers_503_with_retry_after() {
+        let error = ApiError::from(ServerError::DeviceMemory(
+            "the step needs 10560 MiB".to_string(),
+        ));
+        let refused = failure(None, &error);
+        let other = failure(None, &ApiError::from(ServerError::Busy("full".into())));
+
+        assert_eq!(refused.status(), 503);
+        assert_eq!(refused.headers()[header::RETRY_AFTER], "10");
+        assert!(!other.headers().contains_key(header::RETRY_AFTER));
     }
 }

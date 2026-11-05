@@ -866,6 +866,7 @@ def predictions(
     stages: dict[str, tuple[int, float, float]] | None = None,
     parts: dict[str, tuple[int, float]] | None = None,
     deferred: dict[int, str] | None = None,
+    kinds: dict[int, str] | None = None,
 ) -> tuple[dict[str, Any], list[bytes]]:
     """A frame of float32 predictions per request, and the tables that failed.
 
@@ -878,6 +879,9 @@ def predictions(
         results: Each request's predictions.
         failed: Each failed table's error.
         deferred: Each table whose part waits for a program, by its key.
+        kinds: The kind of a failed table's error, where it has one:
+            `device_memory` for a step the device could not hold, which the
+            server answers as retryable and does not count against the table.
         seconds: The time the step took the worker.
         stages: The step's compiled calls, their seconds and their FLOPs,
             by stage.
@@ -900,8 +904,10 @@ def predictions(
             entry["horizon"] = values.shape[1]
         entries.append(entry)
         buffers.append(values.tobytes())
+    kinds = kinds or {}
     failures = [
         {"table": table, "message": message}
+        | ({"kind": kinds[table]} if table in kinds else {})
         for table, message in (failed or {}).items()
     ]
     header = {

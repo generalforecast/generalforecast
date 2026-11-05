@@ -382,13 +382,24 @@ def _answer(arguments: list[str]) -> Any:
         return str(keep_measures(Path(rest[0]), rest[1], json.load(sys.stdin)))
     if command == "kept":
         return encoded(Manifest(Path(rest[0]) / f"{_digest(rest[1])}.json").measured())
+    if command == "fit":
+        from generalforecast.runtime.step_memory import pool_fit
+
+        return pool_fit(Path(rest[0]), rest[1:])
     raise SystemExit(f"unknown command {command!r}")
 
 
 if __name__ == "__main__":
     import sys
 
-    if sys.argv[1:2] in (["identity"], ["widths"], ["measured"], ["keep"], ["kept"]):
+    if sys.argv[1:2] in (
+        ["identity"],
+        ["widths"],
+        ["measured"],
+        ["keep"],
+        ["kept"],
+        ["fit"],
+    ):
         # The hosting API's measures, asked from a process of their own.
         print(json.dumps(_answer(sys.argv[1:])))
         sys.exit()

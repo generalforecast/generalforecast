@@ -59,6 +59,18 @@ workers given `AUTOTUNE_ENV` alone load them, so every worker of a GPU type
 compiles a program to the same kernels and predicts the same, bitwise
 (`generalforecast.autotune`).
 
+A plane holds a pushed lock's strategy to what its pool's GPU types can run
+before it accepts it: a lock is the customer's contract, which workers serve
+as locked or refuse. On each GPU type, with nothing else on the device,
+`pool_fit(directory, specs)` gives its room beside a worker's pool
+(`device_room`) and a sheet of each served model's kept measures; the plane
+keeps them, takes the slice a plan's strategy reads with `plan_step(plan)`,
+and `step_fit(fit, spec, width, rows, kept=...)` gives the `StepMemory` one
+step of it needs there, by the very check a worker admits it with. A
+retrieved slice read by at most `FUSED_QUERIES` queries takes the fused
+path. A worker that still cannot hold a step answers it as a retryable 503,
+`DeviceMemoryExceeded`, and does not quarantine the table for it.
+
 Exports:
 
     Locks and revisions
@@ -143,6 +155,7 @@ from generalforecast.as_of import format as format_as_of
 from generalforecast.as_of import parse as parse_as_of
 from generalforecast.autotune import AUTOTUNE_ENV, keep_autotune
 from generalforecast.autotune import RECORD_ENV as AUTOTUNE_RECORD_ENV
+from generalforecast.constants import FUSED_QUERIES
 from generalforecast.contracts import (
     ContextImportRef,
     ContextVersion,
@@ -188,6 +201,8 @@ from generalforecast.predictors.runtime.requests import request_table
 from generalforecast.predictors.runtime.tabular import bound_order as bound_rows
 from generalforecast.predictors.spec import PredictorSpec
 from generalforecast.predictors.validation import PredictorError, bytes_digest
+from generalforecast.runtime.step_memory import StepMemory, device_room
+from generalforecast.runtime.step_memory import fit_of as _fit_of
 from generalforecast.serve.listener import binary, configuration
 from generalforecast.serve.models import catalog_model, published_entry
 from generalforecast.service.boundary import (
@@ -377,12 +392,97 @@ def kept_measures(directory: Path, spec: str) -> dict[str, Any]:
     return _shipped("kept", str(directory), spec)
 
 
+def pool_fit(directory: Path, specs: Any) -> dict[str, Any]:
+    """This GPU type's room beside a pool worker's pool and a sheet of each served model's measures `directory` keeps, as JSON.
+
+    Taken on the pool's GPU type, with nothing else on the device, in a
+    process of its own: it loads every model in `specs`, as a pool worker
+    does, to count their parameters. A plane keeps one per GPU type and
+    reads it with `step_fit`; see `generalforecast.runtime.step_memory`.
+    """
+    return _shipped("fit", str(directory), *specs)
+
+
+def step_fit(
+    fit: dict[str, Any], spec: str, width: int, rows: int, *, kept: bool = False
+) -> StepMemory | None:
+    """Device memory one step of a slice needs on the GPU type a `pool_fit` describes, as its workers admit it.
+
+    None where the GPU type keeps no measures of the model. A retrieved
+    strategy's slice is put off (`kept=False`): it fits a GPU type on the
+    fused path where at most `FUSED_QUERIES` queries read it, and always
+    where it fits decoded apart (`StepMemory.apart`). An exact strategy's
+    whole context is kept.
+    """
+    return _fit_of(fit, spec, width, rows, kept=kept)
+
+
+def plan_step(plan: CompiledPlan) -> dict[str, Any] | None:
+    """The slice one step of a compiled plan's locked strategy reads, as `step_fit` takes it.
+
+    A retrieved strategy reads a core and each query's neighbors, a put-off
+    slice of at most both; an exact one its whole context, kept, when the
+    plan binds its rows. None for a strategy that follows the device
+    (`adaptive`), a forecaster, or an exact context whose rows come later.
+
+    Returns:
+        The model's spec as pool workers load it (`spec`), the table's width
+        (`width`), the slice's rows (`rows`), whether it is kept (`kept`),
+        and the lock's `strategy`, `core` and `neighbors`.
+    """
+    from generalforecast.columns import DATETIME_PARTS
+
+    if plan.task == "forecast":
+        return None
+    selection = plan.spec.selection
+    strategy = "exact" if selection is None else selection.strategy
+    if strategy == "retrieved":
+        assert selection is not None
+        rows = (selection.core or 0) + selection.neighbors
+        if plan.context_rows is not None:
+            rows = min(rows, plan.context_rows)
+        kept = False
+    elif strategy == "exact" and plan.context_rows is not None:
+        rows, kept = plan.context_rows, True
+    else:
+        return None
+    if rows <= 0:
+        return None
+    width = sum(
+        DATETIME_PARTS
+        if column.type in ("date", "timestamp") and column.semantic != "category"
+        else 1
+        for column in plan.schema.columns
+        if column.role == "input"
+    )
+    # As a pool's workers load a catalog model, without its pin: its id.
+    # A derived or custom model keeps its reference, which a pool keeps no
+    # measures of.
+    spec = plan.model.resolved
+    try:
+        ref = parse_model(spec)
+    except Exception:  # noqa: BLE001
+        ref = None
+    if ref is not None and ref.entry is not None and not (ref.derived or ref.custom):
+        spec = ref.entry.id
+    return {
+        "spec": spec,
+        "width": width,
+        "rows": rows,
+        "kept": kept,
+        "strategy": strategy,
+        "core": None if selection is None else selection.core,
+        "neighbors": 0 if selection is None else selection.neighbors,
+    }
+
+
 __all__ = [
     "ALIASES",
     "AUTOTUNE_ENV",
     "AUTOTUNE_RECORD_ENV",
     "CONTEXT_ROWS_KEY",
     "DERIVED_KINDS",
+    "FUSED_QUERIES",
     "PHYSICAL_TYPES",
     "V1_POLICY",
     "VERSION",
@@ -423,6 +523,7 @@ __all__ = [
     "SnapshotRow",
     "SourcePin",
     "SourceRecord",
+    "StepMemory",
     "ad_hoc_lock",
     "arrow_bytes",
     "binary",
@@ -433,6 +534,7 @@ __all__ = [
     "compile_lock",
     "configuration",
     "context_version",
+    "device_room",
     "diagnostic_lines",
     "document_digest",
     "entries",
@@ -459,6 +561,8 @@ __all__ = [
     "parse_lock",
     "parse_model",
     "pin",
+    "plan_step",
+    "pool_fit",
     "prefetch_catalog",
     "published_entry",
     "read_table",
@@ -467,6 +571,7 @@ __all__ = [
     "require",
     "resource_name",
     "served_context",
+    "step_fit",
     "success",
     "table_digest",
     "text",

@@ -66,6 +66,70 @@ def _gather_bytes(layout: CacheLayout, size: int) -> int:
     return math.ceil(WORKING_MARGIN * size * layout.row_bytes)
 
 
+class DeviceMemoryRefused(ValueError):
+    """A unit `Admission._fits_device` refuses for want of device memory beside the pool.
+
+    Apart from other errors, so a server answers it as a device that cannot
+    hold the step now, which another device may, rather than as a table that
+    keeps failing.
+
+    Attributes:
+        needed: Bytes the unit's step needs beside the pool.
+        room: Bytes the device has beside the pool.
+    """
+
+    def __init__(self, message: str, needed: int, room: int) -> None:
+        """Keeps the sizes beside the message."""
+        super().__init__(message)
+        self.needed = needed
+        self.room = room
+
+
+def step_bytes(
+    *,
+    encode: int | None,
+    context: int,
+    working: int,
+    transient: bool,
+    fused: bool = False,
+    state: int = 0,
+    gather: int = 0,
+    accelerator: bool = True,
+) -> int:
+    """Bytes one unit's step takes beside the pool, as `Admission._fits_device` charges it.
+
+    The one rule admission and the hosted plane's push-time estimate
+    (`generalforecast.runtime.step_memory`) both read, so they never
+    disagree. See `_fits_device` for what each path holds.
+
+    Args:
+        encode: The context's encode, measured or by its profile's line;
+            None where XLA gave no measure.
+        context: The context's cache as charged, own state included.
+        working: Decoding the smallest chunk of queries against it.
+        transient: Whether the context is put off, encoded by the decode
+            that reads it.
+        fused: Whether it decodes in the one program that encodes it.
+        state: A kept unit's own state, unpacked beside it.
+        gather: A kept context's copy its paged decode gathers.
+        accelerator: Whether the device is an accelerator, whose autotuner
+            needs headroom.
+    """
+    measured = 0 if encode is None else encode
+    if fused:
+        # The program's cache is a temporary the decode reads, not an output
+        # beside it; unmeasured, the cache at least.
+        held = context if encode is None else max(0, measured - context)
+        needed = held + 2 * working
+    elif transient:
+        needed = max(measured, 2 * context + working)
+    else:
+        needed = max(measured, gather + working + state)
+    if accelerator:
+        needed += max(measured, working) // AUTOTUNE_SHARE
+    return needed
+
+
 class _Unmeasured(Exception):
     """A fit profile XLA could not measure, which is not kept."""
 
@@ -413,7 +477,7 @@ class Admission:
             ),
         )
 
-    def _fits_device(self: "Worker", unit: Unit, fused: bool = False) -> None:
+    def _fits_device(self: "Worker", unit: Unit, fused: bool = False) -> int:
         """Refuses a unit whose encode, or whose context and decode, would not fit the device.
 
         Beside the pool, the device must hold the context's encode: its inputs,
@@ -446,8 +510,12 @@ class Admission:
                 context whose step's rows are on the device, read by at most
                 `FUSED_QUERIES` queries.
 
+        Returns:
+            The bytes the unit's step needs beside the pool, as `step_bytes`
+            charges them.
+
         Raises:
-            ValueError: Naming the strategies that read fewer rows.
+            DeviceMemoryRefused: Naming the strategies that read fewer rows.
         """
         table = self._tables[unit.table]
         per_row = self.profile(table.model, table.features).cache_bytes_per_row
@@ -471,19 +539,16 @@ class Admission:
         )
 
         def needs(measured: int | None) -> int:
-            encode = 0 if measured is None else measured
-            if fused:
-                # The program's cache is a temporary the decode reads, not
-                # an output beside it; unmeasured, the cache at least.
-                held = context if measured is None else max(0, encode - context)
-                needed = held + 2 * working
-            elif transient:
-                needed = max(encode, 2 * context + working)
-            else:
-                needed = max(encode, gather + working + state)
-            if accelerator:
-                needed += max(encode, working) // AUTOTUNE_SHARE
-            return needed
+            return step_bytes(
+                encode=measured,
+                context=context,
+                working=working,
+                transient=transient,
+                fused=fused,
+                state=state,
+                gather=gather,
+                accelerator=accelerator,
+            )
 
         # A transient context is charged at its own padded size by the
         # encode profile's line, which compiles nothing. Below where that
@@ -520,7 +585,7 @@ class Admission:
                 "" if measured is None else f"encoding it {encode >> 20} MiB and "
             )
             reading = " in one call with its encode" if fused else ""
-            raise ValueError(
+            raise DeviceMemoryRefused(
                 f"a context of {len(unit.rows)} rows ({unit.action}, padded to "
                 f"{size}) takes {context >> 20} MiB as the "
                 f"model caches it, {encoding}decoding "
@@ -528,8 +593,11 @@ class Admission:
                 f"which needs {needed >> 20} MiB, but the device has "
                 f"{room >> 20} MiB beside the contexts it keeps; use a strategy "
                 "that reads fewer rows, such as neighbors, or a device with "
-                "more memory"
+                "more memory",
+                needed,
+                room,
             )
+        return needed
 
     def _admitted_rows(self: "Worker", unit: Unit) -> int:
         """Rows admission charges a unit's context at: as its encode pads it.
