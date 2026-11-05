@@ -400,3 +400,27 @@ def fit_of(
         minimum=fit["minimum"],
         slot_bytes=fit["slot_bytes"],
     )
+
+
+def fits_of(
+    fits: Mapping[str, Mapping[str, Any]],
+    spec: str,
+    width: int,
+    rows: Iterable[int],
+    kept: bool = False,
+) -> dict[str, list[dict[str, Any] | None]]:
+    """`fit_of` of each of `rows` on each GPU type's `pool_fit`, as JSON; what `hosting.step_fits` answers.
+
+    A GPU type whose fit this release cannot read answers None for each.
+    """
+    rows = list(rows)
+    found: dict[str, list[dict[str, Any] | None]] = {}
+    for gpu, fit in fits.items():
+        try:
+            steps = [fit_of(fit, spec, width, size, kept=kept) for size in rows]
+        except (ValueError, KeyError, TypeError):
+            steps = [None] * len(rows)
+        found[gpu] = [
+            None if step is None else dataclasses.asdict(step) for step in steps
+        ]
+    return found

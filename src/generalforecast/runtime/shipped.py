@@ -386,6 +386,17 @@ def _answer(arguments: list[str]) -> Any:
         from generalforecast.runtime.step_memory import pool_fit
 
         return pool_fit(Path(rest[0]), rest[1:])
+    if command == "steps":
+        from generalforecast.runtime.step_memory import fits_of
+
+        asked = json.load(sys.stdin)
+        return fits_of(
+            asked["fits"], asked["spec"], asked["width"], asked["rows"], asked["kept"]
+        )
+    if command == "room":
+        from generalforecast.runtime.step_memory import device_room
+
+        return list(device_room(int(rest[0]), int(rest[1])))
     raise SystemExit(f"unknown command {command!r}")
 
 
@@ -399,6 +410,8 @@ if __name__ == "__main__":
         ["keep"],
         ["kept"],
         ["fit"],
+        ["steps"],
+        ["room"],
     ):
         # The hosting API's measures, asked from a process of their own.
         print(json.dumps(_answer(sys.argv[1:])))

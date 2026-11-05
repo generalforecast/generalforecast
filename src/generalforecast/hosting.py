@@ -65,8 +65,9 @@ as locked or refuse. On each GPU type, with nothing else on the device,
 `pool_fit(directory, specs)` gives its room beside a worker's pool
 (`device_room`) and a sheet of each served model's kept measures; the plane
 keeps them, takes the slice a plan's strategy reads with `plan_step(plan)`,
-and `step_fit(fit, spec, width, rows, kept=...)` gives the `StepMemory` one
-step of it needs there, by the very check a worker admits it with. A
+and `step_fits(fits, spec, width, rows, kept=...)` gives the memory one
+step of it needs on each, by the very check a worker admits it with, in a
+process of its own as every worker-side measure is taken here. A
 retrieved slice read by at most `FUSED_QUERIES` queries takes the fused
 path. A worker that still cannot hold a step answers it as a retryable 503,
 `DeviceMemoryExceeded`, and does not quarantine the table for it.
@@ -201,8 +202,6 @@ from generalforecast.predictors.runtime.requests import request_table
 from generalforecast.predictors.runtime.tabular import bound_order as bound_rows
 from generalforecast.predictors.spec import PredictorSpec
 from generalforecast.predictors.validation import PredictorError, bytes_digest
-from generalforecast.runtime.step_memory import StepMemory, device_room
-from generalforecast.runtime.step_memory import fit_of as _fit_of
 from generalforecast.serve.listener import binary, configuration
 from generalforecast.serve.models import catalog_model, published_entry
 from generalforecast.service.boundary import (
@@ -398,27 +397,58 @@ def pool_fit(directory: Path, specs: Any) -> dict[str, Any]:
     Taken on the pool's GPU type, with nothing else on the device, in a
     process of its own: it loads every model in `specs`, as a pool worker
     does, to count their parameters. A plane keeps one per GPU type and
-    reads it with `step_fit`; see `generalforecast.runtime.step_memory`.
+    reads it with `step_fits`; see `generalforecast.runtime.step_memory`.
     """
     return _shipped("fit", str(directory), *specs)
 
 
-def step_fit(
-    fit: dict[str, Any], spec: str, width: int, rows: int, *, kept: bool = False
-) -> StepMemory | None:
-    """Device memory one step of a slice needs on the GPU type a `pool_fit` describes, as its workers admit it.
+def step_fits(
+    fits: dict[str, Any],
+    spec: str,
+    width: int,
+    rows: Any,
+    *,
+    kept: bool = False,
+) -> dict[str, list[dict[str, Any] | None]]:
+    """Device memory one step of a slice needs on each GPU type a `pool_fit` describes, as its workers admit it.
 
-    None where the GPU type keeps no measures of the model. A retrieved
-    strategy's slice is put off (`kept=False`): it fits a GPU type on the
-    fused path where at most `FUSED_QUERIES` queries read it, and always
-    where it fits decoded apart (`StepMemory.apart`). An exact strategy's
-    whole context is kept.
+    Asked of a process of its own, as the worker side admits: the plane
+    imports no worker code. `fits` are `pool_fit`s by GPU type, and `rows`
+    the slice sizes to check, all in the one process.
+
+    Returns:
+        By GPU type, for each of `rows`, the step's bytes decoded apart from
+        its encode (`apart`) and on the fused path (`fused`, None for a kept
+        context), the `room` beside the pool there, the `padded` rows it is
+        charged at and whether the model's measures cover the width
+        (`measured`); None where the GPU type keeps no measures of the
+        model. A retrieved strategy's slice is put off (`kept=False`) and
+        fits a GPU type on the fused path where at most `FUSED_QUERIES`
+        queries read it; an exact strategy's whole context is kept.
     """
-    return _fit_of(fit, spec, width, rows, kept=kept)
+    return _shipped(
+        "steps",
+        given={
+            "fits": fits,
+            "spec": spec,
+            "width": width,
+            "rows": list(rows),
+            "kept": kept,
+        },
+    )
+
+
+def device_room(device: int, parameters: int) -> tuple[int, int]:
+    """Bytes beside the pool, and the pool's, on an accelerator a gf-server worker counts `device` bytes of with `parameters` bytes of loaded models.
+
+    As a worker sizes them, asked of a process of its own.
+    """
+    room, pool = _shipped("room", str(device), str(parameters))
+    return room, pool
 
 
 def plan_step(plan: CompiledPlan) -> dict[str, Any] | None:
-    """The slice one step of a compiled plan's locked strategy reads, as `step_fit` takes it.
+    """The slice one step of a compiled plan's locked strategy reads, as `step_fits` takes it.
 
     A retrieved strategy reads a core and each query's neighbors, a put-off
     slice of at most both; an exact one its whole context, kept, when the
@@ -523,7 +553,6 @@ __all__ = [
     "SnapshotRow",
     "SourcePin",
     "SourceRecord",
-    "StepMemory",
     "ad_hoc_lock",
     "arrow_bytes",
     "binary",
@@ -571,7 +600,7 @@ __all__ = [
     "require",
     "resource_name",
     "served_context",
-    "step_fit",
+    "step_fits",
     "success",
     "table_digest",
     "text",

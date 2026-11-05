@@ -9,6 +9,7 @@ holding 210 MiB of inputs and 1,890 MiB of temporaries beside its 5,040 MiB
 cache. A 24 GB pool GPU has 7,452 MiB beside its pool, an L40S 17,756 MiB.
 """
 
+import dataclasses
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -295,3 +296,22 @@ class _Null:
 
     def __exit__(self, *exc: object) -> None:
         return None
+
+
+def test_the_plane_asks_a_process_of_its_own_for_the_estimate() -> None:
+    # The hosting surface imports no worker code: it asks `shipped`, as it
+    # takes every worker-side measure, and gets the worker's own numbers.
+    fits = {"A10G": _fit(A10G_LIMIT), "L40S": _fit(L40S_LIMIT)}
+    spec = "general-forecast/mitra-2-regressor"
+
+    found = hosting.step_fits(fits, spec, WIDTH, [5120, 2048])
+    other = hosting.step_fits(fits, "general-forecast/tabicl-v2-regressor", 20, [8])
+
+    direct = fit_of(fits["A10G"], spec, WIDTH, 5120)
+    assert direct is not None
+    assert found["A10G"][0] == dataclasses.asdict(direct)
+    large, smaller = found["L40S"][0], found["A10G"][1]
+    assert large is not None and large["room"] == 17756 * MIB
+    assert smaller is not None and smaller["padded"] == 2048
+    assert other == {"A10G": [None], "L40S": [None]}
+    assert hosting.device_room(A10G_LIMIT, PARAMETERS) == (7452 * MIB, 7452 * MIB)
