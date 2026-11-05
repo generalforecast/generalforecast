@@ -84,11 +84,13 @@ use crate::wal::{
 };
 use crate::worker::{self, WorkerConnection};
 use gf_core::columns::{self, Strings, Vocabulary, Words};
+use load::Costs;
 use serde_json::Value;
 
 mod commit;
 mod compaction;
 mod contexts;
+mod load;
 mod models;
 mod replication;
 mod requests;
@@ -893,6 +895,13 @@ pub struct ShardSettings {
     pub step_bytes: Option<u64>,
     /// The order each step takes waiting tables in.
     pub scheduling: Scheduling,
+    /// The worker seconds a step of a table is expected to take past which
+    /// the table runs alone and after shorter work; see `Node::set_long_step`.
+    pub long_step: Option<Duration>,
+    /// Whether a prediction whose wait for the work queued ahead of it is
+    /// past `request_timeout` is refused at once, with a `Retry-After`,
+    /// rather than queued to time out.
+    pub shed: bool,
     /// Which cached context a full tier gives up first.
     pub eviction: Eviction,
     /// How long the worker may take to answer a step before it is started again.
@@ -1016,6 +1025,12 @@ pub struct Shard {
     /// stops is not started again.
     stopping: bool,
     metrics: Arc<Metrics>,
+    /// What each table's and model's steps recently took the worker.
+    costs: Costs,
+    /// Whether predictions that would outwait their deadline are refused.
+    shed: bool,
+    /// This shard's place in the queue-wait gauge.
+    load_slot: usize,
     /// The bytes of each cache tier this shard last added to the gauges.
     cache_reported: [u64; 3],
     /// The bytes of rows in memory this shard last added to its gauge.
@@ -1065,6 +1080,8 @@ impl Shard {
             node.set_step_bytes(bytes);
         }
         node.set_scheduling(memory.scheduling);
+        node.set_long_step(memory.long_step.map(|bound| bound.as_secs_f64()));
+        let load_slot = metrics.queue_wait_slot();
         node.set_timers(memory.timers);
         Ok(Self {
             node,
@@ -1100,6 +1117,9 @@ impl Shard {
             down: None,
             stopping: false,
             metrics,
+            costs: Costs::default(),
+            shed: memory.shed,
+            load_slot,
             cache_reported: [0; 3],
             rows_reported: 0,
             compacting: HashMap::new(),
@@ -1255,6 +1275,7 @@ impl Shard {
                 }
             }
             self.flush_controls();
+            self.report_wait();
         }
         self.drain().await;
         self.save_heads();
@@ -1612,7 +1633,7 @@ impl Shard {
                 trace,
                 pick,
                 reply,
-            } => match self.infer(*context, asked).await {
+            } => match self.infer(*context, asked, &trace).await {
                 Ok((submitted, levels)) => {
                     let request = submitted.request;
                     let (answered, answer) = oneshot::channel();
@@ -1660,7 +1681,9 @@ impl Shard {
             } => {
                 let submitted = self.usable(&table).and_then(|id| {
                     let future = self.future_rows(&table, future)?;
-                    self.submit_forecast(id, &table, series, before, horizon, groups, future)
+                    self.submit_forecast(
+                        id, &table, series, before, horizon, groups, future, &trace,
+                    )
                 });
                 self.admit(submitted, reply, trace);
             }
@@ -1676,7 +1699,7 @@ impl Shard {
             } => {
                 let resolved = self.resolve(&table, &mut features, &strings);
                 let submitted =
-                    resolved.and_then(|()| self.submit(&table, features, before, given));
+                    resolved.and_then(|()| self.submit(&table, features, before, given, &trace));
                 let request = submitted.as_ref().ok().map(|submitted| submitted.request);
                 self.admit(submitted, reply, trace);
                 if let (Some(request), Some(pick)) = (request, pick)

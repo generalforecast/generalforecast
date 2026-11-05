@@ -32,6 +32,7 @@ impl Node {
             rebuilt_regions: HashSet::new(),
             compiled: HashSet::new(),
             parts: PlanParts::default(),
+            long_step: None,
         })
     }
 
@@ -280,6 +281,34 @@ impl Node {
         self.scheduling = scheduling;
     }
 
+    /// Sets the worker seconds a step is expected to take at which a table
+    /// counts as long work; None, or a bound that is not positive, counts
+    /// every table as short.
+    ///
+    /// A long table runs in a step of its own, and waiting tables expected
+    /// to be shorter go first, in the scheduling's order, so a request whose
+    /// step takes a second does not wait behind, or inside, another's
+    /// minute-long fit. A long table that short work passed over
+    /// `LONG_PASSES` steps running goes first, so it waits a bounded number
+    /// of short steps whatever arrives.
+    pub fn set_long_step(&mut self, seconds: Option<f64>) {
+        self.long_step = seconds.filter(|seconds| seconds.is_finite() && *seconds > 0.0);
+    }
+
+    /// Sets the worker seconds the executor expects the table's next step
+    /// to take, as it learned from the table's or its model's recent steps;
+    /// a table never set costs nothing, so it goes as short work. Ignored
+    /// for a table the node does not hold.
+    pub fn set_cost(&mut self, table: TableId, seconds: f64) {
+        if let Some(state) = self.tables.get_mut(&table) {
+            state.cost = if seconds.is_finite() {
+                seconds.max(0.0)
+            } else {
+                0.0
+            };
+        }
+    }
+
     /// Adds an empty table.
     ///
     /// # Errors
@@ -409,6 +438,8 @@ impl Node {
                 single_use: false,
                 scheduled: Scheduled::default(),
                 compiling: None,
+                cost: 0.0,
+                passed: 0,
             },
         );
         Ok(id)

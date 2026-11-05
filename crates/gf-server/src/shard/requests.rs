@@ -56,12 +56,14 @@ impl Shard {
         features: Vec<f32>,
         before: Option<Vec<i64>>,
         given: Option<Vec<Vec<u128>>>,
+        caller: &str,
     ) -> Result<Submitted, ServerError> {
         let id = self.usable(table)?;
-        self.enqueue(id, table, features, before, given)
+        self.enqueue(id, table, features, before, given, caller)
     }
 
-    /// Queues queries of a table the node holds, within the queue's budget.
+    /// Queues queries of a table the node holds, within the queue's budget
+    /// and the wait `admit_wait` allows the call `caller` traces.
     pub(super) fn enqueue(
         &mut self,
         id: TableId,
@@ -69,6 +71,7 @@ impl Shard {
         features: Vec<f32>,
         before: Option<Vec<i64>>,
         given: Option<Vec<Vec<u128>>>,
+        caller: &str,
     ) -> Result<Submitted, ServerError> {
         if let Some(reason) = self.quarantined.get(&id) {
             return Err(ServerError::Invalid(format!(
@@ -90,6 +93,9 @@ impl Shard {
                 self.queued_bytes >> 20
             )));
         }
+        self.admit_wait(id, caller)?;
+        let expected = self.expected(id);
+        self.node.set_cost(id, expected);
         let request = match given {
             Some(contexts) => self.node.submit_keys(id, &features, &contexts)?,
             None => self.node.submit_before(id, &features, before.as_deref())?,
@@ -145,6 +151,7 @@ impl Shard {
         horizon: NonZeroUsize,
         groups: Option<Vec<Vec<u64>>>,
         future: Vec<FutureRow>,
+        caller: &str,
     ) -> Result<Submitted, ServerError> {
         if let Some(reason) = self.quarantined.get(&id) {
             return Err(ServerError::Invalid(format!(
@@ -184,6 +191,9 @@ impl Shard {
                 self.queued_bytes >> 20
             )));
         }
+        self.admit_wait(id, caller)?;
+        let expected = self.expected(id);
+        self.node.set_cost(id, expected);
         let request = self.node.submit_forecast(
             id,
             &series,

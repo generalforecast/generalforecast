@@ -215,6 +215,7 @@ impl Shard {
         &mut self,
         context: RequestContext,
         asked: Asked,
+        caller: &str,
     ) -> Result<(Submitted, Option<Vec<f64>>), ServerError> {
         let RequestContext {
             fingerprint,
@@ -259,7 +260,7 @@ impl Shard {
             .get(id)
             .and_then(|table| table.levels.clone());
         let submitted = match asked {
-            Asked::Rows(queries) => self.enqueue(id, name.as_str(), queries, None, None)?,
+            Asked::Rows(queries) => self.enqueue(id, name.as_str(), queries, None, None, caller)?,
             Asked::Forecast {
                 series,
                 before,
@@ -273,6 +274,7 @@ impl Shard {
                 horizon,
                 groups,
                 Vec::new(),
+                caller,
             )?,
         };
         Ok((submitted, levels))

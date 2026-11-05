@@ -160,6 +160,8 @@ pub fn settings() -> ShardSettings {
         bucket_minimum: 8,
         step_bytes: None,
         scheduling: Scheduling::Turns,
+        long_step: None,
+        shed: true,
         eviction: Eviction::Gdsf,
         step_timeout: Duration::from_secs(60),
         request_timeout: Duration::from_secs(600),

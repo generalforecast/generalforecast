@@ -111,6 +111,20 @@ pub struct Config {
     /// the table whose oldest request has waited longest goes first.
     #[serde(default, deserialize_with = "scheduling")]
     pub scheduling: Scheduling,
+    /// Worker seconds a table's steps are expected to take, from its recent
+    /// steps or its model's, at which the table counts as long work: it runs
+    /// in a step of its own, after waiting tables expected to be shorter,
+    /// unless shorter work has passed it over a few steps running. 0 counts
+    /// every table as short, so steps take tables in `scheduling`'s order alone.
+    #[serde(default = "long_step_seconds")]
+    pub long_step_seconds: f64,
+    /// Whether a prediction is refused at once, with 503 and a `Retry-After`,
+    /// when the worker time queued ahead of it is past the longest a request
+    /// may wait, rather than queued until it times out. The work of its own
+    /// call, on every table the call takes, never counts against it. The
+    /// in-process engine (`_core`) never refuses, as it serves one caller.
+    #[serde(default = "shed_past_deadline")]
+    pub shed_past_deadline: bool,
     /// Which cached context a full tier gives up first: `gdsf` keeps what is
     /// costly to recompute per byte and often read, `lru` keeps what was read
     /// most recently.
@@ -433,6 +447,14 @@ fn step_timeout_seconds() -> f64 {
     300.0
 }
 
+fn long_step_seconds() -> f64 {
+    10.0
+}
+
+fn shed_past_deadline() -> bool {
+    true
+}
+
 fn request_timeout_seconds() -> f64 {
     600.0
 }
@@ -598,6 +620,9 @@ impl Config {
             .find(|(_, value)| !(value.is_finite() && *value > 0.0))
         {
             return Err(format!("{name} must be positive"));
+        }
+        if !(config.long_step_seconds.is_finite() && config.long_step_seconds >= 0.0) {
+            return Err("long_step_seconds must be 0 or positive".to_string());
         }
         let placement = &config.placement;
         if !(placement.rebalance_seconds.is_finite() && placement.rebalance_seconds >= 0.0) {
