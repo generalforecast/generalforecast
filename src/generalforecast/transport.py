@@ -45,6 +45,7 @@ import httpx
 
 from generalforecast._files import private_lock, read_private, write_private
 from generalforecast.errors import wire_fields
+from generalforecast.retry import retry_after
 from generalforecast.service.boundary import (
     RESPONSE_MAX_BYTES,
     RESPONSE_MAX_NODES,
@@ -836,8 +837,12 @@ class _Policy:
         headers: dict[str, str],
         deadline: float | None,
         limit: int,
-    ) -> Generator[_Attempt | _Wait, Any, tuple[int, bytes]]:
-        """One request's attempts under one deadline; an unguarded write is never retried."""
+    ) -> Generator[_Attempt | _Wait, Any, tuple[int, bytes, float | None]]:
+        """One request's attempts under one deadline; an unguarded write is never retried.
+
+        Returns the reply's status, its body and the seconds its Retry-After
+        asks for, if any.
+        """
         end = self._end(deadline)
         _checked_path(path)
         data = request_data(body)
@@ -848,7 +853,9 @@ class _Policy:
                 min(self.retry_delay * 2**attempt, max(0.0, end - time.monotonic()))
             )
             try:
-                status, raw = yield _Attempt(method, path, data, headers, end, limit)
+                status, raw, wait = yield _Attempt(
+                    method, path, data, headers, end, limit
+                )
             except ServiceError as error:
                 _logged(method, self.url + path, error.code, self._headers | headers)
                 if not self._retry(method, body, attempt, error):
@@ -861,7 +868,7 @@ class _Policy:
             ):
                 yield pause
                 continue
-            return status, raw
+            return status, raw, wait
         raise AssertionError("unreachable")
 
     def _sending(
@@ -879,10 +886,14 @@ class _Policy:
         as `HostedOnlyError`; it never stops a request from being sent.
         """
         try:
-            status, raw = yield from self._exchanging(
+            status, raw, wait = yield from self._exchanging(
                 method, path, body, dict(headers or {}), deadline, RESPONSE_MAX_BYTES
             )
-            value = response_value(status, raw)
+            try:
+                value = response_value(status, raw)
+            except ServiceError as error:
+                error.retry_after = wait
+                raise
         except _Oversized:
             raise _too_large(RESPONSE_MAX_BYTES) from None
         except ServiceError as error:
@@ -892,18 +903,10 @@ class _Policy:
                 and route_missing(error)
             ):
                 try:
-                    response_value(
-                        *(
-                            yield from self._exchanging(
-                                "GET",
-                                PLATFORM_PROBE,
-                                None,
-                                {},
-                                deadline,
-                                RESPONSE_MAX_BYTES,
-                            )
-                        )
+                    probed, answered, _ = yield from self._exchanging(
+                        "GET", PLATFORM_PROBE, None, {}, deadline, RESPONSE_MAX_BYTES
                     )
+                    response_value(probed, answered)
                     probe = None
                 except ServiceError as answer:
                     probe = answer
@@ -924,7 +927,7 @@ class _Policy:
     ) -> Generator[_Attempt | _Wait, Any, bytes]:
         """`download`, written once."""
         try:
-            status, raw = yield from self._exchanging(
+            status, raw, _ = yield from self._exchanging(
                 "GET", path, None, {"Accept": "*/*"}, deadline, limit
             )
         except _Oversized:
@@ -1069,7 +1072,8 @@ class Transport(_Policy):
             raise _Oversized
         if time.monotonic() > end:
             raise _timeout()
-        return status, bytes(raw)
+        asked = None if received is None else received.get("Retry-After")
+        return status, bytes(raw), retry_after(asked)
 
 
 def _error_object(raw: bytes) -> Any:
@@ -1179,7 +1183,11 @@ class AsyncTransport(_Policy):
                     if len(raw) + len(chunk) > limit:
                         raise _Oversized
                     raw.extend(chunk)
-                return response.status_code, bytes(raw)
+                return (
+                    response.status_code,
+                    bytes(raw),
+                    retry_after(response.headers.get("Retry-After")),
+                )
         except httpx.TimeoutException:
             raise _timeout() from None
         except httpx.TransportError:
