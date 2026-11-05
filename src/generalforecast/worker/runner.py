@@ -16,8 +16,9 @@ import gc
 import logging
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -116,7 +117,9 @@ def _message(error: Exception) -> str:
 DEVICE_MEMORY = "device_memory"
 # The kind of a failure for a step stopped once every request it answers was
 # past its deadline (`StepExpired`): nobody waits for it, so a server neither
-# counts it against the table nor answers anyone with it.
+# counts it against the table nor answers anyone with it. A table's part
+# stops only once its fits, page embeds and kept contexts are done (see
+# `Worker._keeping`), so the server keeps those entries for the next request.
 EXPIRED = "expired"
 
 
@@ -301,6 +304,9 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         # When the running step's requests are all past their deadline, by
         # `time.monotonic`; None while no step runs or its requests have none.
         self._deadline: float | None = None
+        # Whether the running step builds what later steps reuse, which it
+        # finishes past its deadline: see `_keeping`.
+        self._building = False
         self._chunks.expired = self._expired
         self._models: dict[int, _Model] = {}
         # The spec each model was loaded from, under which its kinds of call are recorded.
@@ -631,7 +637,8 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
             # Every table reads the pool, so no part can run alone.
             raise
         except StepExpired as error:
-            # Its parts would expire as the whole did.
+            # Its parts would expire as the whole did, and it stopped only
+            # once what it keeps for every table was built.
             return {}, self._expire(_tables(step), error)
         except Exception as error:
             tables = _tables(step)
@@ -646,12 +653,14 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         self.deferred = {}
         predictions: dict[int, np.ndarray] = {}
         failed: dict[int, str] = {}
-        for position, table in enumerate(tables):
+        for table in tables:
             try:
                 predictions.update(self._answered(_part(step, table)))
             except StepExpired as error:
-                failed.update(self._expire(tables[position:], error))
-                break
+                # Each later part still builds what it keeps, which the
+                # server keeps for an expired table, then stops at its first
+                # call that only answers.
+                failed.update(self._expire([table], error))
             except Exception as error:  # noqa: BLE001
                 failed[table] = _message(error)
                 self._note_kind(table, error)
@@ -659,8 +668,33 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         return predictions, failed
 
     def _expired(self) -> bool:
-        """Whether every request the running step answers is past its deadline."""
-        return self._deadline is not None and time.monotonic() >= self._deadline
+        """Whether every request the running step answers is past its deadline.
+
+        Never while the step builds what later steps reuse (`_keeping`).
+        """
+        return (
+            not self._building
+            and self._deadline is not None
+            and time.monotonic() >= self._deadline
+        )
+
+    @contextmanager
+    def _keeping(self) -> Iterator[None]:
+        """Runs a step's work that later steps reuse to its end, past its deadline.
+
+        A table's fits, its page embeds and the contexts it keeps in its
+        slots outlast the step: a retry of its requests, or the next, finds
+        them done. Stopped part way, they would be thrown away, and a first
+        fit whose encode takes longer than a caller waits would start over
+        on every retry and never finish. Contexts encoded for a request
+        alone (put off, retrieved or fused) and every decode are what only
+        the step's requests read, so those still stop.
+        """
+        self._building = True
+        try:
+            yield
+        finally:
+            self._building = False
 
     def _expire(self, tables: list[int], error: StepExpired) -> dict[int, str]:
         """Fails `tables` as parts of a step stopped past its requests' deadline (`EXPIRED`)."""
@@ -731,10 +765,14 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
 
     def _compute(self, step: Step) -> dict[int, np.ndarray]:
         """Fits, page embeds, encodes, decodes and forecasts a step whose copies are applied."""
-        pages = self._fit(step.fits, step.pages)
-        subsets: dict[int, np.ndarray] = {}
-        pages.update(self._embed_pages(step.pages, pages, step.units, subsets))
-        transient = self._encode(step.units, step.pages, pages, subsets, step.queries)
+        with self._keeping():
+            pages = self._fit(step.fits, step.pages)
+            subsets: dict[int, np.ndarray] = {}
+            pages.update(self._embed_pages(step.pages, pages, step.units, subsets))
+            # Only kept units encode here; put-off ones encode in their decode.
+            transient = self._encode(
+                step.units, step.pages, pages, subsets, step.queries
+            )
         self.stats.steps += 1
         self.stats.queries += sum(len(batch.units) for batch in step.queries)
         self.stats.queries += len(step.forecasts)

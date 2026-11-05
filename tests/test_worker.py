@@ -184,6 +184,101 @@ def test_a_step_past_its_deadline_stops_and_fails_its_tables_as_expired() -> Non
     assert worker.failure_kinds == {}
 
 
+def _context_steps(worker: Worker) -> Any:
+    """A step reading a tiny classifier's context of 48 rows, which fits its own state."""
+    data = conformance_table(False, rows=48, queries=6)
+    worker.add_model(0, tabicl_functions, tiny_tabicl(regression=False))
+    worker.allocate(256, 0, 0)
+    worker.add_table(0, 0, data.num_classes, FEATURES, summary="context")
+    rows = np.arange(48, dtype=np.uint32)
+    features, targets = np.asarray(data.features), np.asarray(data.targets)
+    state_slots = -(-worker.profile(0, FEATURES).state_bytes // 4096)
+    slots = list(range(worker.layout(0, FEATURES).slots(64) + state_slots))
+    key = CacheKey(0, 0, 0, "context", 1)
+    queries = np.asarray(data.queries)
+
+    def step(action: protocol.Action, deadline: float | None = None) -> protocol.Step:
+        context = (None, None) if action == "reuse" else (features, targets)
+        unit = protocol.Unit(0, key, rows, action, slots, *context)
+        batch = protocol.QueryBatch(0, 0, 0, queries, [0] * len(queries))
+        return protocol.Step([], [], [], [unit], [batch], deadline=deadline)
+
+    return step
+
+
+def _expiring_as_it_builds(
+    worker: Worker, monkeypatch: pytest.MonkeyPatch
+) -> list[str]:
+    """Each stage the worker's calls run, the step's deadline passing as its first starts."""
+    stages: list[str] = []
+    run = worker._chunks.run
+
+    def running(stage: str, *arguments: Any, **keywords: Any) -> None:
+        if not stages:
+            # Every request is past its deadline from the step's first call on.
+            worker._deadline = time.monotonic() - 1
+        stages.append(stage)
+        run(stage, *arguments, **keywords)
+
+    monkeypatch.setattr(worker._chunks, "run", running)
+    return stages
+
+
+def test_a_kept_context_whose_requests_expire_as_it_encodes_is_kept_for_the_next(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A first fit's encode of the context a table keeps can outlast every
+    # caller's wait. Stopped there, its retry would encode it from the start
+    # again and never finish; so it runs to its end, and only the decode,
+    # which nobody waits for, stops.
+    reference = Worker(slot_bytes=4096, compile_ahead=False, compile_cache=False)
+    reference_step = _context_steps(reference)
+    expected = reference.run(reference_step("encode"))[0]
+    worker = Worker(slot_bytes=4096, compile_ahead=False, compile_cache=False)
+    step = _context_steps(worker)
+    stages = _expiring_as_it_builds(worker, monkeypatch)
+
+    predictions, failed = worker.run_apart(
+        step("encode", deadline=time.monotonic() + 60)
+    )
+
+    assert predictions == {}
+    assert list(failed) == [0]
+    assert failed[0].startswith("StepExpired: stopped a step's decode calls")
+    assert worker.failure_kinds == {0: "expired"}
+    # Its own state and context were fit and encoded; no decode ran.
+    assert stages == ["fit_encode", "decode"]
+    # The next step reads the state and context the expired one kept, and
+    # encodes nothing.
+    monkeypatch.undo()
+    encoded = worker.stats.encoded
+    values = worker.run(step("reuse"))[0]
+    assert worker.stats.encoded == encoded
+    np.testing.assert_allclose(values, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_a_context_encoded_for_its_requests_alone_still_stops_once_they_expire(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Put off for want of room, or retrieved per query, a context is encoded
+    # by the decode that reads it and kept by nothing: past its requests'
+    # deadline, it stops before its encode.
+    worker = Worker(slot_bytes=4096, compile_ahead=False, compile_cache=False)
+    step = _context_steps(worker)
+    stages = _expiring_as_it_builds(worker, monkeypatch)
+
+    predictions, failed = worker.run_apart(
+        step("transient", deadline=time.monotonic() + 60)
+    )
+
+    assert predictions == {}
+    assert list(failed) == [0]
+    assert failed[0].startswith("StepExpired: stopped a step's fit_encode calls")
+    assert worker.failure_kinds == {0: "expired"}
+    # Stopped before its encode's first call.
+    assert stages == ["fit_encode"]
+
+
 def test_a_step_frame_s_expiry_counts_from_when_the_worker_read_it() -> None:
     header = {
         "kind": "step",

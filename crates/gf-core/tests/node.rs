@@ -172,6 +172,39 @@ fn a_failed_step_frees_its_entries_and_fit_for_the_next() {
 }
 
 #[test]
+fn an_expired_part_keeps_the_fit_and_contexts_it_built_for_the_retry() {
+    let mut node = node(64);
+    let table = table(&mut node, Strategy::Exact, 32);
+
+    // The worker fit and encoded the table's context, then stopped before
+    // its decode once every request was past its deadline.
+    node.submit(table, &A).unwrap();
+    let expired = node.schedule().unwrap().unwrap();
+    assert_eq!(actions(&expired), [Action::Encode]);
+    let tables = HashSet::from([table]);
+    let dropped = node.complete_deferring(&expired, &tables, &tables, &[]);
+    assert!(dropped.is_empty());
+
+    // The retry neither fits nor encodes again.
+    node.submit(table, &A).unwrap();
+    let retried = run(&mut node);
+    assert!(retried.fits().is_empty());
+    assert_eq!(actions(&retried), [Action::Reuse]);
+
+    // A part that failed otherwise is undone as before.
+    let other = self::table(&mut node, Strategy::Exact, 32);
+    node.submit(other, &A).unwrap();
+    let failed = node.schedule().unwrap().unwrap();
+    let tables = HashSet::from([other]);
+    let dropped = node.complete_deferring(&failed, &tables, &HashSet::new(), &[]);
+    assert!(!dropped.is_empty());
+    node.submit(other, &A).unwrap();
+    let retried = run(&mut node);
+    assert_eq!(retried.fits().len(), 1);
+    assert_eq!(actions(&retried), [Action::Encode]);
+}
+
+#[test]
 fn a_query_before_every_row_is_refused_alone() {
     let mut node = node(64);
     let table = node.create_table(spec(Strategy::Exact)).unwrap();
@@ -4968,6 +5001,7 @@ fn a_deferred_single_use_table_waits_for_its_program_then_serves_its_requests() 
     node.complete_deferring(
         &step,
         &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
         &[(fresh, "k".to_string())],
     );
 
@@ -4985,6 +5019,7 @@ fn a_deferred_single_use_table_waits_for_its_program_then_serves_its_requests() 
     // A key already reported compiled holds nothing back.
     node.complete_deferring(
         &step,
+        &std::collections::HashSet::new(),
         &std::collections::HashSet::new(),
         &[(fresh, "k".to_string())],
     );
@@ -5525,7 +5560,12 @@ fn a_deferred_table_that_reads_shared_contexts_queues_its_requests_again() {
     let table = table(&mut node, Strategy::Exact, 32);
     let request = node.submit(table, &A).unwrap();
     let step = node.schedule().unwrap().expect("a step");
-    node.complete_deferring(&step, &HashSet::new(), &[(table, "k".to_string())]);
+    node.complete_deferring(
+        &step,
+        &HashSet::new(),
+        &HashSet::new(),
+        &[(table, "k".to_string())],
+    );
     assert!(node.schedule().unwrap().is_none());
 
     node.compiled(vec!["k".to_string()]);
@@ -5628,7 +5668,12 @@ fn deferred_given_requests_go_ahead_of_those_given_since() {
     let first = node.submit_given(table, &A, vec![rows.clone()]).unwrap();
     let step = node.schedule().unwrap().expect("a step");
     let second = node.submit_given(table, &B, vec![rows]).unwrap();
-    node.complete_deferring(&step, &HashSet::new(), &[(table, "k".to_string())]);
+    node.complete_deferring(
+        &step,
+        &HashSet::new(),
+        &HashSet::new(),
+        &[(table, "k".to_string())],
+    );
 
     let step = run(&mut node);
     let requests: Vec<RequestId> = step.queries().iter().map(|batch| batch.request).collect();
