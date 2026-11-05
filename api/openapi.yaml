@@ -4876,6 +4876,35 @@ components:
       additionalProperties: false
       properties:
         status: {type: string, const: ok}
+        build:
+          $ref: "#/components/schemas/Build"
+          description: the code the hosted plane runs; gf serve leaves it out
+
+    Build:
+      type: object
+      required: [commit, version, gf_commit, gf_version]
+      additionalProperties: false
+      properties:
+        commit:
+          description: the hosted plane's commit, null when it was not built from one
+          anyOf:
+          - type: string
+          - type: 'null'
+        version:
+          description: the hosted plane's version
+          anyOf:
+          - type: string
+          - type: 'null'
+        gf_commit:
+          description: the gf commit the plane was built with, null when unknown
+          anyOf:
+          - type: string
+          - type: 'null'
+        gf_version:
+          description: the version of gf the plane runs
+          anyOf:
+          - type: string
+          - type: 'null'
 
     HealthError:
       type: object
@@ -5419,6 +5448,32 @@ components:
           type: number
         updated:
           type: number
+        usage:
+          description: the GPU time the run metered and what it cost; null where nothing meters it
+          anyOf:
+          - $ref: '#/components/schemas/RunUsage'
+          - type: 'null'
+    RunUsage:
+      type: object
+      required:
+      - gpu_seconds
+      - charged_gpu_seconds
+      - voided_gpu_seconds
+      - credits
+      additionalProperties: false
+      properties:
+        gpu_seconds:
+          type: number
+          description: GPU seconds charged or still pending, as the run's budget counts them
+        charged_gpu_seconds:
+          type: number
+          description: GPU seconds of attempts that ended charged
+        voided_gpu_seconds:
+          type: number
+          description: GPU seconds lost on the service's side, never charged
+        credits:
+          type: number
+          description: what gpu_seconds cost under the workspace's price book, before its included credits
     RunReply:
       allOf:
       - $ref: '#/components/schemas/Envelope'
@@ -5542,6 +5597,15 @@ components:
           type: string
         body:
           type: object
+          description: |
+            What happened. A `metrics` event is one chunk of training:
+            `steps`, `loss`, `validation_loss` and `seconds`, and, where the
+            trainer reads them, `compile_seconds`, `train_seconds`,
+            `chunk_steps`, `steps_per_second`, `rows_per_second`,
+            `gpu_utilization` (%), `gpu_memory_used_bytes`,
+            `gpu_memory_total_bytes`, `gpu_power_watts`, `gpu_samples`,
+            `device_peak_bytes`, `device_bytes_limit`, `device_bytes_in_use`,
+            `device_count`, `device_kind`, `gpu_name` and `gpu_type`.
     RunLineage:
       type: object
       required:

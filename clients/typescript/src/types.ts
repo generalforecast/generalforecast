@@ -444,8 +444,16 @@ export interface ModelListReply extends Envelope {
   result: ModelList;
 }
 
+export interface Build {
+  commit: string | null;
+  version: string | null;
+  gf_commit: string | null;
+  gf_version: string | null;
+}
+
 export interface Health {
   status: "ok";
+  build?: Build;
 }
 
 export interface HealthError {
@@ -668,6 +676,13 @@ export interface RunCorpus {
   digest: Digest;
 }
 
+export interface RunUsage {
+  gpu_seconds: number;
+  charged_gpu_seconds: number;
+  voided_gpu_seconds: number;
+  credits: number;
+}
+
 export interface Run {
   name: Name;
   state: RunState;
@@ -684,6 +699,7 @@ export interface Run {
   plan: Record<string, unknown> | null;
   created: number;
   updated: number;
+  usage?: RunUsage | null;
 }
 
 export interface RunReply extends Envelope {
