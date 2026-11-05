@@ -74,7 +74,11 @@ impl Shard {
                 .get(&request)
                 .and_then(|pending| pending.pick.clone())
         };
-        let frame = step_frame(&step, &picks);
+        let mut frame = step_frame(&step, &picks);
+        if let Some(expires) = self.expires(&step) {
+            frame.header["expires_ms"] =
+                Value::from(u64::try_from(expires.as_millis()).unwrap_or(u64::MAX));
+        }
         match self.worker.pipeline.send(&frame).await {
             Ok(reply) => {
                 self.in_flight.push_back(InFlight {
@@ -92,6 +96,34 @@ impl Shard {
                 false
             }
         }
+    }
+
+    /// How long from now a step may run before every request it answers is
+    /// past the longest a caller waits, so the worker stops it between its
+    /// calls; None for a step that answers no request, as a rebuild's.
+    ///
+    /// A request's caller times out and goes, but a step already sent to the
+    /// worker runs on: one of many long calls, such as a retrieved context
+    /// encoded per query, would hold the worker, and every request queued
+    /// behind it, long after anyone waits for its answer.
+    fn expires(&self, step: &Step) -> Option<Duration> {
+        let requests: Vec<RequestId> = step
+            .queries()
+            .iter()
+            .map(|batch| batch.request)
+            .chain(step.forecasts().iter().map(|forecast| forecast.request))
+            .collect();
+        if requests.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+        let latest = requests
+            .iter()
+            .filter_map(|request| self.pending.get(request))
+            .map(|pending| pending.arrived + self.request_timeout)
+            .max()
+            .unwrap_or(now);
+        Some(latest.saturating_duration_since(now))
     }
 
     /// Waits for every step in flight and answers its requests; a worker
@@ -201,12 +233,24 @@ impl Shard {
                     predictions,
                     failed,
                     device_memory,
+                    expired,
                     deferred,
                     ..
                 } = outcome;
                 for (table, reason) in &failed {
                     let error = if device_memory.contains(table) {
                         device_memory_error(reason)
+                    } else if expired.contains(table) {
+                        tracing::warn!(
+                            table = self.names.get(table).map(TableName::as_str),
+                            "the worker stopped a step whose requests were all past \
+                             their deadline: {reason}"
+                        );
+                        ServerError::Unavailable(
+                            "the request outlived its deadline before its step finished; \
+                             retry"
+                                .to_string(),
+                        )
                     } else {
                         ServerError::Internal(reason.clone())
                     };
@@ -226,10 +270,11 @@ impl Shard {
                 }
                 // A step the device could not hold says nothing of the table:
                 // a device with more memory, or this one with fewer requests
-                // in the step, takes it. So it neither counts towards nor
+                // in the step, takes it. Nor does one stopped because nobody
+                // waited for it any more. So neither counts towards nor
                 // clears the table's quarantine; anything else does.
                 for (table, reason) in failed {
-                    if !device_memory.contains(&table) {
+                    if !device_memory.contains(&table) && !expired.contains(&table) {
                         self.count_failure(table, &reason);
                     }
                 }

@@ -488,6 +488,19 @@ impl Config {
         self.profiling.is_some()
     }
 
+    /// The longest any caller waits for a prediction, in seconds: a Flight
+    /// call's `request_timeout_seconds`, or the Models API's, whichever is
+    /// longer. A request older than this has no caller left.
+    #[must_use]
+    pub fn longest_request_seconds(&self) -> f64 {
+        self.http
+            .as_ref()
+            .map_or(self.request_timeout_seconds, |http| {
+                self.request_timeout_seconds
+                    .max(http.request_timeout_seconds)
+            })
+    }
+
     /// The environment variables that hold log keys, current and previous,
     /// which workers must never see.
     #[must_use]

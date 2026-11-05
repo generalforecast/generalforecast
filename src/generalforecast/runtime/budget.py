@@ -163,6 +163,14 @@ def free_device_bytes() -> int | None:
     return int(stats["bytes_limit"]) - int(stats.get("bytes_in_use", 0))
 
 
+class StepExpired(Exception):
+    """A step stopped between its calls because every request it answers is past its deadline.
+
+    Its callers were answered as timed out and have gone, so the calls left
+    would compute what nobody reads while every later step waits behind them.
+    """
+
+
 def autotune_ran_out(error: BaseException) -> bool:
     """Whether a call failed compiling, for want of device memory to autotune its kernels on.
 
@@ -397,6 +405,9 @@ class Chunks:
         # a program compiled without autotuning compiles with it there, once
         # the device has room for it.
         self.later: Callable[[Callable[[], None]], None] | None = None
+        # Whether the running step's requests are all past their deadline,
+        # checked before each call: such a step stops (`StepExpired`).
+        self.expired: Callable[[], bool] | None = None
 
     def size(self, key: Hashable, budget: int, estimate: Callable[[], int]) -> int:
         """Items of a kind one call of at most `budget` bytes takes.
@@ -454,6 +465,8 @@ class Chunks:
         Raises:
             JaxRuntimeError: If a call fails other than for want of memory, or
                 one item alone runs out of it.
+            StepExpired: If `expired` says the step's requests are all past
+                their deadline before a call.
         """
         # Whether the next call runs at its items' own count, compiled in the
         # call, rather than at a larger one `_compiled_count` reuses.
@@ -465,6 +478,12 @@ class Chunks:
         # Whether the call about to run already waited for compiles beside it.
         settled = False
         while first < count:
+            if self.expired is not None and self.expired():
+                raise StepExpired(
+                    f"stopped a step's {stage} calls with {count - first} of "
+                    f"{count} items left: every request it answers is past its "
+                    "deadline"
+                )
             size = self.size(key, budget, estimate)
             if buckets is None:
                 padded = size if count > size else bucket_size(count, 1)

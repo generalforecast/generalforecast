@@ -15,6 +15,7 @@ from generalforecast.runtime.budget import (
     Call,
     Chunks,
     MemoryBudget,
+    StepExpired,
     estimated_flops,
     flops_of,
     note_compiled,
@@ -134,6 +135,26 @@ def test_a_call_that_runs_out_of_memory_runs_again_in_smaller_calls() -> None:
     sizes.clear()
     _run(chunks, refusing, items, budget)
     assert sizes == [8, 4, 2, 2, 2]
+
+
+def test_a_run_stops_between_calls_once_its_step_has_expired() -> None:
+    # Each call of one item: a step of many long calls, such as a retrieved
+    # context encoded per query, whose callers have all gone.
+    ran: list[int] = []
+
+    def one(values: np.ndarray) -> np.ndarray:
+        ran.append(len(values))
+        return values
+
+    chunks = Chunks(lambda *_: None)
+    chunks.expired = lambda: len(ran) >= 2
+    items = np.ones((5, 4), np.float32)
+
+    with pytest.raises(StepExpired, match="3 of 5 items left"):
+        _run(chunks, one, items, items[0].nbytes)
+    assert ran == [1, 1]
+    chunks.expired = lambda: False
+    assert _run(chunks, one, items, items[0].nbytes) == [1] * 5
 
 
 def test_an_item_that_alone_runs_out_of_memory_raises() -> None:

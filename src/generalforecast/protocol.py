@@ -14,6 +14,7 @@ import mmap
 import os
 import socket
 import struct
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal, get_args
@@ -167,6 +168,14 @@ class Step:
     queries: list[QueryBatch]
     series_units: list[SeriesUnit] = field(default_factory=list)
     forecasts: list[Forecast] = field(default_factory=list)
+    # When, by `time.monotonic`, every request the step answers is past its
+    # deadline, so the worker stops it between calls; None for no bound.
+    deadline: float | None = None
+
+
+# Where a worker notes, by `time.monotonic`, when it read a frame, so a
+# step's `expires_ms` counts from then rather than from when it ran.
+RECEIVED = "_received"
 
 
 def _exactly(connection: socket.socket, count: int) -> bytes:
@@ -412,7 +421,18 @@ def step(header: dict[str, Any], buffers: list[memoryview]) -> Step:
             _series_unit(entry, buffers) for entry in header.get("series_units", [])
         ],
         forecasts=[_forecast(entry, buffers) for entry in header.get("forecasts", [])],
+        deadline=_deadline(header),
     )
+
+
+def _deadline(header: dict[str, Any]) -> float | None:
+    """A step's deadline: `expires_ms` after the worker read its frame, or after now."""
+    expires = header.get("expires_ms")
+    if expires is None:
+        return None
+    received = header.get(RECEIVED)
+    start = received if isinstance(received, float) else time.monotonic()
+    return start + max(0.0, float(expires)) / 1000
 
 
 def _grid(
@@ -881,7 +901,9 @@ def predictions(
         deferred: Each table whose part waits for a program, by its key.
         kinds: The kind of a failed table's error, where it has one:
             `device_memory` for a step the device could not hold, which the
-            server answers as retryable and does not count against the table.
+            server answers as retryable and does not count against the table;
+            `expired` for a step stopped once its requests were all past
+            their deadline, which it does not count against the table either.
         seconds: The time the step took the worker.
         stages: The step's compiled calls, their seconds and their FLOPs,
             by stage.

@@ -162,6 +162,7 @@ pub fn settings() -> ShardSettings {
         scheduling: Scheduling::Turns,
         eviction: Eviction::Gdsf,
         step_timeout: Duration::from_secs(60),
+        request_timeout: Duration::from_secs(600),
         queue_bytes: 1 << 20,
         snapshot_bytes: 1 << 30,
         timers: false,

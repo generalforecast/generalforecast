@@ -233,6 +233,10 @@ def configuration(
             f"data = {_toml(str(directory / 'data'))}",
             f"tokens = [{_toml(secrets.token_hex(32))}]",
             'encryption_key_env = "GF_LOG_KEY"',
+            # Flight serves only this machine's front under the token above,
+            # so no Flight call waits longer than the front's own requests;
+            # a step whose requests are all older than this then stops.
+            f"request_timeout_seconds = {timeout!r}",
             *([] if metrics is None else [f"metrics_listen = {_toml(metrics)}"]),
             "",
             "[http]",
