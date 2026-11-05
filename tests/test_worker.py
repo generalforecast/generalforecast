@@ -195,9 +195,9 @@ def test_a_step_frame_s_expiry_counts_from_when_the_worker_read_it() -> None:
         "expires_ms": 1500,
         protocol.RECEIVED: 100.0,
     }
-    assert protocol.request(header, []).deadline == 101.5
+    assert protocol.step(header, []).deadline == 101.5
     del header["expires_ms"]
-    assert protocol.request(header, []).deadline is None
+    assert protocol.step(header, []).deadline is None
 
 
 def test_dropping_every_program_forgets_the_counts_each_kind_compiled_for() -> None:
