@@ -84,6 +84,7 @@ use crate::wal::{
 };
 use crate::worker::{self, WorkerConnection};
 use gf_core::columns::{self, Strings, Vocabulary, Words};
+use serde_json::Value;
 
 mod commit;
 mod compaction;
@@ -896,6 +897,10 @@ pub struct ShardSettings {
     pub eviction: Eviction,
     /// How long the worker may take to answer a step before it is started again.
     pub step_timeout: Duration,
+    /// The longest any caller waits for a prediction: past it after a
+    /// request reached the shard, its caller has gone, and a step answering
+    /// only such requests is stopped by the worker between its calls.
+    pub request_timeout: Duration,
     /// Bytes of queries that may wait for a step; requests past it are refused.
     pub queue_bytes: u64,
     /// The most bytes of rows one record of a compacted log holds: a log
@@ -985,6 +990,7 @@ pub struct Shard {
     /// The node's device, host and disk tiers, which the worker's pools match.
     tiers: [TierConfig; 3],
     step_timeout: Duration,
+    request_timeout: Duration,
     queue_bytes: u64,
     snapshot_bytes: u64,
     pending: HashMap<RequestId, Pending>,
@@ -1074,6 +1080,7 @@ impl Shard {
             bucket_minimum: NonZeroUsize::new(memory.bucket_minimum)
                 .ok_or("bucket_minimum must be positive")?,
             step_timeout: memory.step_timeout,
+            request_timeout: memory.request_timeout,
             queue_bytes: memory.queue_bytes,
             snapshot_bytes: memory.snapshot_bytes,
             pending: HashMap::new(),

@@ -132,6 +132,7 @@ pub async fn start(
                 scheduling: config.scheduling,
                 eviction: config.eviction,
                 step_timeout: Duration::from_secs_f64(config.step_timeout_seconds),
+                request_timeout: Duration::from_secs_f64(config.longest_request_seconds()),
                 queue_bytes: config.predict_queue_bytes,
                 snapshot_bytes: 1 << 30,
                 timers: config.timers(),

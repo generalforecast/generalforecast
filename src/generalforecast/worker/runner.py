@@ -32,7 +32,12 @@ from generalforecast.constants import SCATTER_THREADS
 from generalforecast.models.contract import TabularFunctions, TabularProperties
 from generalforecast.models.series import SeriesFunctions, SeriesProperties
 from generalforecast.runtime import shipped
-from generalforecast.runtime.budget import Chunks, MemoryBudget, out_of_memory
+from generalforecast.runtime.budget import (
+    Chunks,
+    MemoryBudget,
+    StepExpired,
+    out_of_memory,
+)
 from generalforecast.runtime.decoding import PROGRAMS, Context
 from generalforecast.runtime.device import (
     DeviceSettings,
@@ -109,6 +114,10 @@ def _message(error: Exception) -> str:
 # a device that cannot hold the step now rather than counting it against the
 # table: `Failure.kind` in the protocol.
 DEVICE_MEMORY = "device_memory"
+# The kind of a failure for a step stopped once every request it answers was
+# past its deadline (`StepExpired`): nobody waits for it, so a server neither
+# counts it against the table nor answers anyone with it.
+EXPIRED = "expired"
 
 
 def _kind(error: BaseException) -> str | None:
@@ -289,6 +298,10 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         )
         self._chunks.settle = self.programs.settle
         self._chunks.later = self.programs.later
+        # When the running step's requests are all past their deadline, by
+        # `time.monotonic`; None while no step runs or its requests have none.
+        self._deadline: float | None = None
+        self._chunks.expired = self._expired
         self._models: dict[int, _Model] = {}
         # The spec each model was loaded from, under which its kinds of call are recorded.
         self._specs: dict[int, str] = {}
@@ -597,6 +610,16 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         """
         self.deferred = {}
         self.failure_kinds = {}
+        self._deadline = getattr(step, "deadline", None)
+        try:
+            return self._run_apart(step)
+        finally:
+            self._deadline = None
+
+    def _run_apart(
+        self, step: protocol.Step
+    ) -> tuple[dict[int, np.ndarray], dict[int, str]]:
+        """`run_apart` within the step's deadline."""
         with self.stats.timed("move"):
             for movement in step.movements:
                 self.apply(movement)
@@ -607,6 +630,9 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         except PoolLost:
             # Every table reads the pool, so no part can run alone.
             raise
+        except StepExpired as error:
+            # Its parts would expire as the whole did.
+            return {}, self._expire(_tables(step), error)
         except Exception as error:
             tables = _tables(step)
             if not tables:
@@ -620,14 +646,29 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         self.deferred = {}
         predictions: dict[int, np.ndarray] = {}
         failed: dict[int, str] = {}
-        for table in tables:
+        for position, table in enumerate(tables):
             try:
                 predictions.update(self._answered(_part(step, table)))
+            except StepExpired as error:
+                failed.update(self._expire(tables[position:], error))
+                break
             except Exception as error:  # noqa: BLE001
                 failed[table] = _message(error)
                 self._note_kind(table, error)
                 self.deferred.pop(table, None)
         return predictions, failed
+
+    def _expired(self) -> bool:
+        """Whether every request the running step answers is past its deadline."""
+        return self._deadline is not None and time.monotonic() >= self._deadline
+
+    def _expire(self, tables: list[int], error: StepExpired) -> dict[int, str]:
+        """Fails `tables` as parts of a step stopped past its requests' deadline (`EXPIRED`)."""
+        logger.warning("%s", error)
+        for table in tables:
+            self.deferred.pop(table, None)
+            self.failure_kinds[table] = EXPIRED
+        return {table: _message(error) for table in tables}
 
     def _note_kind(self, table: int, error: BaseException) -> None:
         """Notes a failed table's kind in `failure_kinds`, if it has one."""

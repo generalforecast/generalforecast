@@ -19,8 +19,8 @@ use gf_server::definition::{CreationId, Durability, TableDefinition, TimeKind};
 use gf_server::metrics::Metrics;
 use gf_server::name::TableName;
 use gf_server::protocol::{
-    CompileCache, DEVICE_MEMORY, Failure, Frame, ModelProfile, PredictionsHeader, StageTime,
-    WorkerReply, WorkerRequest, f32_bytes,
+    CompileCache, DEVICE_MEMORY, EXPIRED, Failure, Frame, ModelProfile, PredictionsHeader,
+    StageTime, WorkerReply, WorkerRequest, f32_bytes,
 };
 use gf_server::routes::Routes;
 use gf_server::shard::{
@@ -49,6 +49,9 @@ const DEFER: u8 = 5;
 const DEFER_EARLY: u8 = 6;
 /// Fails the first table's part of every step as one its device could not hold.
 const MEMORY: u8 = 7;
+/// Fails the first table's part of every step as one stopped past its
+/// requests' deadline, noting the step's `expires_ms` in the actions.
+const EXPIRE: u8 = 8;
 
 /// Answers every frame the shard sends, in order; steps as `behaviour` says.
 /// Each step's units' actions go to `actions`, in the order sent. Models load
@@ -118,6 +121,18 @@ fn fake_worker(
                         reply.header["failures"][0]["kind"] = Value::from(DEVICE_MEMORY);
                         reply.header["failures"][0]["message"] = Value::from(
                             "DeviceMemoryRefused: a context of 5120 rows needs 10560 MiB",
+                        );
+                        reply
+                    }
+                    EXPIRE => {
+                        actions
+                            .lock()
+                            .unwrap()
+                            .push(format!("expires_ms={}", frame.header["expires_ms"]));
+                        let mut reply = predictions(&frame.header, Some(0));
+                        reply.header["failures"][0]["kind"] = Value::from(EXPIRED);
+                        reply.header["failures"][0]["message"] = Value::from(
+                            "StepExpired: stopped a step's encode calls with 7 of 8 items left",
                         );
                         reply
                     }
@@ -512,6 +527,7 @@ fn settings() -> ShardSettings {
         scheduling: Scheduling::Turns,
         eviction: Eviction::Gdsf,
         step_timeout: Duration::from_secs(60),
+        request_timeout: Duration::from_secs(600),
         queue_bytes: 1 << 20,
         snapshot_bytes: 1 << 30,
         timers: false,
@@ -830,6 +846,43 @@ async fn a_step_its_device_cannot_hold_is_retryable_and_never_quarantines_its_ta
     let after = shard.predict().await;
 
     assert_eq!(quarantined, 0);
+    assert_eq!(after, Ok(1));
+}
+
+#[tokio::test]
+async fn a_step_bounds_its_run_by_its_requests_deadline_and_expiring_never_quarantines() {
+    let mut settings = settings();
+    settings.request_timeout = Duration::from_secs(140);
+    let shard = shard(settings).await;
+    shard.create(3).await.unwrap();
+    shard.insert(&[1, 2, 3, 4]).await;
+    shard.behaviour.store(EXPIRE, Ordering::Relaxed);
+
+    // Past the failures that quarantine a table for any other reason.
+    for _ in 0..5 {
+        assert_eq!(shard.predict().await, Err(Code::Unavailable));
+    }
+    let quarantined = shard.metrics.tables_quarantined.get();
+    let expiries: Vec<u64> = shard
+        .actions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|action| action.strip_prefix("expires_ms="))
+        .map(|millis| millis.parse().unwrap())
+        .collect();
+    shard.behaviour.store(OK, Ordering::Relaxed);
+    let after = shard.predict().await;
+
+    assert_eq!(quarantined, 0);
+    assert_eq!(expiries.len(), 5);
+    // Each step may run until its request is as old as any caller waits.
+    assert!(
+        expiries
+            .iter()
+            .all(|&millis| millis > 130_000 && millis <= 140_000),
+        "{expiries:?}"
+    );
     assert_eq!(after, Ok(1));
 }
 

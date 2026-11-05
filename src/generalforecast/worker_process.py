@@ -129,7 +129,12 @@ def main(arguments: Sequence[str] | None = None) -> int:
     def read() -> None:
         try:
             while True:
-                frames.put(protocol.read_frame(connection))
+                frame = protocol.read_frame(connection)
+                # A step waits here while the one before it runs; its
+                # deadline counts from now, as the server's does from sending it.
+                if frame[0].get("kind") == "step":
+                    frame[0][protocol.RECEIVED] = time.monotonic()
+                frames.put(frame)
         except ConnectionError:
             pass
         except Exception:  # noqa: BLE001

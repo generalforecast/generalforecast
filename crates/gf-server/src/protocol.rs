@@ -977,13 +977,18 @@ pub struct Failure {
     pub message: String,
     /// `device_memory` where the device could not hold the table's step:
     /// admission refused it, or a call ran out of memory with its step down
-    /// to one request. Any other failure has no kind.
+    /// to one request; `expired` where the worker stopped the step once its
+    /// requests were all past their deadline. Any other failure has no kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
 }
 
 /// The `Failure` kind of a step the device could not hold.
 pub const DEVICE_MEMORY: &str = "device_memory";
+
+/// The `Failure` kind of a step the worker stopped between its calls once
+/// every request it answers was past its deadline (the step's `expires_ms`).
+pub const EXPIRED: &str = "expired";
 
 /// A table whose part of a step waits for a program the worker compiles
 /// beside its steps, named by `key` until a `Compiled` reply names it too.
@@ -1047,6 +1052,9 @@ pub struct Outcome {
     /// The failed tables whose part the device could not hold
     /// (`DEVICE_MEMORY`), which another device may.
     pub device_memory: BTreeSet<TableId>,
+    /// The failed tables whose part the worker stopped past its requests'
+    /// deadline (`EXPIRED`), which says nothing of the table.
+    pub expired: BTreeSet<TableId>,
     /// Tables whose part waits for a program, by its key; see `Deferral`.
     pub deferred: Vec<(TableId, String)>,
     pub seconds: f64,
@@ -1112,11 +1120,15 @@ pub fn outcome_from(frame: &Frame) -> Result<Outcome, FrameError> {
             ))
         })
         .collect::<Result<_, _>>()?;
-    let device_memory = failures
-        .iter()
-        .filter(|failure| failure.kind.as_deref() == Some(DEVICE_MEMORY))
-        .map(|failure| TableId(failure.table))
-        .collect();
+    let of_kind = |kind: &str| -> BTreeSet<TableId> {
+        failures
+            .iter()
+            .filter(|failure| failure.kind.as_deref() == Some(kind))
+            .map(|failure| TableId(failure.table))
+            .collect()
+    };
+    let device_memory = of_kind(DEVICE_MEMORY);
+    let expired = of_kind(EXPIRED);
     Ok(Outcome {
         predictions,
         failed: failures
@@ -1124,6 +1136,7 @@ pub fn outcome_from(frame: &Frame) -> Result<Outcome, FrameError> {
             .map(|failure| (TableId(failure.table), failure.message))
             .collect(),
         device_memory,
+        expired,
         deferred: deferred
             .into_iter()
             .map(|deferral| (TableId(deferral.table), deferral.key))

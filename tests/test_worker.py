@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import time
 from typing import Any
 
 import jax
@@ -158,6 +160,44 @@ def test_a_failed_table_is_never_also_deferred(monkeypatch: pytest.MonkeyPatch) 
     assert predictions == {}
     assert failed == {1: "RuntimeError: table 1 failed"}
     assert worker.deferred == {0: "readying"}
+
+
+def test_a_step_past_its_deadline_stops_and_fails_its_tables_as_expired() -> None:
+    worker = Worker(slot_bytes=4096, compile_ahead=False)
+    _, step = _fused(worker, 2)
+    worker.run(step([0, 1]))
+    told: list[None] = []
+    worker.progressed = lambda: told.append(None)
+
+    # Every request of the step past its deadline before it runs.
+    expired = dataclasses.replace(step([0, 1]), deadline=time.monotonic() - 1)
+    predictions, failed = worker.run_apart(expired)
+
+    assert predictions == {}
+    assert set(failed) == {0, 1}
+    assert all(message.startswith("StepExpired: ") for message in failed.values())
+    assert worker.failure_kinds == {0: "expired", 1: "expired"}
+    # Stopped before its first call, and parts were not tried alone.
+    assert told == []
+    # A later step without a deadline runs as before.
+    assert list(worker.run_apart(step([0, 1]))[0]) == [0, 1]
+    assert worker.failure_kinds == {}
+
+
+def test_a_step_frame_s_expiry_counts_from_when_the_worker_read_it() -> None:
+    header = {
+        "kind": "step",
+        "movements": [],
+        "fits": [],
+        "pages": [],
+        "units": [],
+        "queries": [],
+        "expires_ms": 1500,
+        protocol.RECEIVED: 100.0,
+    }
+    assert protocol.step(header, []).deadline == 101.5
+    del header["expires_ms"]
+    assert protocol.step(header, []).deadline is None
 
 
 def test_dropping_every_program_forgets_the_counts_each_kind_compiled_for() -> None:
