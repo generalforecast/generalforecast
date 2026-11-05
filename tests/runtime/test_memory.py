@@ -70,7 +70,10 @@ def test_a_measured_program_skips_autotuning_on_a_gpu_alone(monkeypatch) -> None
         )
         assert memory.measure_compiled(cast(Any, Lowered())) == "compiled"
         assert asked.pop() == options
-    assert MEASURE_OPTIONS == {"xla_gpu_autotune_level": 0}
+    assert MEASURE_OPTIONS == {
+        "xla_gpu_autotune_level": 0,
+        "xla_gpu_enable_triton_gemm": False,
+    }
 
 
 def test_tree_bytes_counts_arrays_and_shapes() -> None:

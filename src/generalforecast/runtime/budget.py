@@ -12,7 +12,12 @@ from typing import Any, cast
 import jax
 
 from generalforecast.constants import LOCAL_DEVICE_TIER
-from generalforecast.runtime.device import available_memory, device_memory, host_memory
+from generalforecast.runtime.device import (
+    UNTUNED_OPTIONS,
+    available_memory,
+    device_memory,
+    host_memory,
+)
 from generalforecast.runtime.memory import tree_bytes
 from generalforecast.runtime.shapes import bucket_size
 
@@ -142,9 +147,6 @@ def out_of_memory(error: BaseException) -> bool:
     return "RESOURCE_EXHAUSTED" in message or "out of memory" in message.lower()
 
 
-# What a program compiles with where XLA's autotuner ran out of device memory
-# compiling it: no autotuning, so XLA takes its default kernels.
-UNTUNED_OPTIONS = {"xla_gpu_autotune_level": 0}
 # A kind's first call measures its memory compiled without autotuning unless
 # the device has this many times its estimated bytes free. The estimate can
 # fall many times short of the program (TabPFN-3.5's per-query decodes on

@@ -48,6 +48,7 @@ from generalforecast.runtime.device import (
     portable_cpu_programs,
     report_fallback,
     store_cache,
+    untuned_matmuls,
     use_compile_cache,
 )
 from generalforecast.runtime.memory import (
@@ -233,6 +234,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
             timers: Time each part of a step; see `WorkerStats.parts`.
         """
         command_buffers()
+        untuned_matmuls()
         portable_cpu_programs()
         use_autotune_results()
         report_fallback()

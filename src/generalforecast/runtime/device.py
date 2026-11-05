@@ -7,6 +7,7 @@ import functools
 import logging
 import os
 import platform
+import re
 import sys
 import threading
 from collections.abc import Callable, Sequence
@@ -403,6 +404,34 @@ def command_buffers() -> None:
         return
     kinds = COMMAND_BUFFERS if os.environ.get(COMMAND_BUFFERS_ENV) == "1" else ""
     os.environ["XLA_FLAGS"] = f"{flags} --xla_gpu_enable_command_buffer={kinds}".strip()
+
+
+# XLA's options for a program compiled without autotuning: its matrix
+# multiplies go to cuBLAS, whose heuristics pick a kernel without timing any.
+# Untuned, XLA's Triton matrix multiplies take one default tiling for every
+# shape. On an A10G in exact mode, Mitra-2's encode and decode of one
+# 5,120-row retrieved context took 18.5 s with them and 2.46 s with cuBLAS,
+# as long as with autotuning on (2.41 s), and compiled in 7.5 s rather than 13.
+UNTUNED_OPTIONS: dict[str, Any] = {
+    "xla_gpu_autotune_level": 0,
+    "xla_gpu_enable_triton_gemm": False,
+}
+
+
+def untuned_matmuls() -> None:
+    """Sends matrix multiplies to cuBLAS where `XLA_FLAGS` turns autotuning off, unless they say where.
+
+    A run that turns autotuning off for the whole process, as a pool whose
+    autotuner ran out of memory does, would otherwise compile every program
+    to untuned Triton kernels; see `UNTUNED_OPTIONS`. It takes effect only
+    before JAX starts its first backend.
+    """
+    flags = os.environ.get("XLA_FLAGS", "")
+    if "xla_gpu_enable_triton_gemm" in flags:
+        return
+    levels = re.findall(r"--xla_gpu_autotune_level=(\d+)", flags)
+    if levels and int(levels[-1]) == 0:
+        os.environ["XLA_FLAGS"] = f"{flags} --xla_gpu_enable_triton_gemm=false".strip()
 
 
 def portable_cpu_programs() -> None:

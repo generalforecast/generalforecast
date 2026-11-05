@@ -33,15 +33,20 @@ from generalforecast.constants import (
     WORKING_WIDTHS,
 )
 from generalforecast.models.contract import TabularFunctions
-from generalforecast.runtime.device import to_cache_dtype, with_summary_chunk
+from generalforecast.runtime.device import (
+    UNTUNED_OPTIONS,
+    to_cache_dtype,
+    with_summary_chunk,
+)
 
 logger = logging.getLogger(__name__)
 
 # XLA's options for a program compiled only to read its analyses, on a GPU:
 # no autotuning, which times candidate kernels by running them on the device.
 # Nothing runs a measured program, and what it holds is its buffer
-# assignment's, which the kernels autotuning picks among barely change.
-MEASURE_OPTIONS = {"xla_gpu_autotune_level": 0}
+# assignment's, which the kernels autotuning picks among barely change. Its
+# options are those of an untuned call's program, as it would run.
+MEASURE_OPTIONS = UNTUNED_OPTIONS
 # Measuring compiles run this many at once; XLA compiles outside the GIL.
 MEASURE_THREADS = 4
 
