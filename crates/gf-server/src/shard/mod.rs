@@ -201,6 +201,10 @@ struct Pending {
     table: TableId,
     bytes: u64,
     arrived: Instant,
+    /// When its caller stops waiting: `request_timeout` after it arrived, or
+    /// later for a caller that waits longer, as a server's own warm-up does.
+    /// A step answering only requests past theirs stops between its calls.
+    expires: Instant,
     /// The levels the worker keeps of a regressor's predictions, if the
     /// caller named them.
     pick: Option<Pick>,
@@ -690,6 +694,10 @@ pub enum Command {
         /// Increasing levels a regressor's answer keeps, which the worker
         /// interpolates and the answer's `levels` then are; every column if None.
         pick: Option<Vec<f64>>,
+        /// How long its caller waits, when that is longer than any request
+        /// waits (`request_timeout`): a server's startup warm-up waits as
+        /// long as a first compile takes, which its steps then run to.
+        patience: Option<Duration>,
         reply: Reply<Inferred>,
     },
     /// The models the worker serves, by name.
@@ -899,7 +907,9 @@ pub struct ShardSettings {
     pub step_timeout: Duration,
     /// The longest any caller waits for a prediction: past it after a
     /// request reached the shard, its caller has gone, and a step answering
-    /// only such requests is stopped by the worker between its calls.
+    /// only such requests is stopped by the worker between its calls. A
+    /// request context whose caller says it waits longer (`Infer`'s
+    /// `patience`), as startup warming does, expires that much later.
     pub request_timeout: Duration,
     /// Bytes of queries that may wait for a step; requests past it are refused.
     pub queue_bytes: u64,
@@ -1611,12 +1621,13 @@ impl Shard {
                 asked,
                 trace,
                 pick,
+                patience,
                 reply,
             } => match self.infer(*context, asked).await {
                 Ok((submitted, levels)) => {
                     let request = submitted.request;
                     let (answered, answer) = oneshot::channel();
-                    self.queue_pending(submitted, answered, trace);
+                    self.queue_pending(submitted, answered, trace, patience);
                     let levels = match (pick, levels) {
                         (Some(picked), Some(known)) => {
                             if let Some(pending) = self.pending.get_mut(&request) {
