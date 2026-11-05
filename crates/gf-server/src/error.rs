@@ -26,8 +26,19 @@ pub enum ServerError {
     Busy(String),
     /// The worker is starting again; retry shortly.
     Unavailable(String),
+    /// The device this request reached cannot hold one step of the table's
+    /// strategy now; a retry may reach a device that can.
+    DeviceMemory(String),
     Internal(String),
 }
+
+/// The Models API's code for `ServerError::DeviceMemory`, which it answers
+/// with a `Retry-After` of `DEVICE_MEMORY_RETRY_SECONDS`.
+pub const DEVICE_MEMORY_CODE: &str = "DeviceMemoryExceeded";
+
+/// Seconds a client waits before retrying a `DeviceMemoryExceeded` answer:
+/// long enough for the pool to start or free a device that holds the step.
+pub const DEVICE_MEMORY_RETRY_SECONDS: u32 = 10;
 
 /// What an error means to a client: its Flight status code, its Models API
 /// status and code, and the message the Models API answers with, None where
@@ -86,6 +97,12 @@ impl ServerError {
                 503,
                 "ModelUnavailable",
                 Some("the model is restarting; retry shortly"),
+            ),
+            Self::DeviceMemory(_) => meaning(
+                tonic::Code::ResourceExhausted,
+                503,
+                DEVICE_MEMORY_CODE,
+                None,
             ),
             Self::Internal(_) => meaning(
                 tonic::Code::Internal,
@@ -151,6 +168,7 @@ impl fmt::Display for ServerError {
             | Self::Fenced(message)
             | Self::Busy(message)
             | Self::Unavailable(message)
+            | Self::DeviceMemory(message)
             | Self::Internal(message) => formatter.write_str(message),
         }
     }
@@ -231,6 +249,11 @@ mod tests {
                 (503, "ModelUnavailable"),
             ),
             (
+                ServerError::DeviceMemory(message()),
+                tonic::Code::ResourceExhausted,
+                (503, "DeviceMemoryExceeded"),
+            ),
+            (
                 ServerError::Internal(message()),
                 tonic::Code::Internal,
                 (503, "InferenceFailed"),
@@ -240,7 +263,12 @@ mod tests {
             let (status, name, shown) = error.http();
             assert_eq!((status, name), http, "{error:?}");
             // Only a refusal of the caller's own request says what it was.
-            let own = matches!(error, ServerError::Invalid(_) | ServerError::Busy(_));
+            // So does a device that cannot hold the request's step, naming
+            // what the step needs.
+            let own = matches!(
+                error,
+                ServerError::Invalid(_) | ServerError::Busy(_) | ServerError::DeviceMemory(_)
+            );
             assert_eq!(shown == message(), own, "{error:?}: {shown}");
             assert_eq!(error.status().code(), code);
         }
