@@ -10,6 +10,7 @@ from dataclasses import FrozenInstanceError, replace
 import pyarrow as pa
 import pytest
 
+from generalforecast import _core
 from generalforecast.engine import ModelOutputError
 from generalforecast.predictors.runtime import PredictorExecutor
 from generalforecast.predictors.selection import SelectionInfo
@@ -152,6 +153,49 @@ def test_forged_capability_rehashed_plan_still_fails_admission(tmp_path, data, k
     with pytest.raises(ServiceError) as error:
         PredictorExecutor().prepare(forged, data)
     assert error.value.code == "ModelMismatch" and kernels == []
+
+
+@pytest.mark.parametrize(
+    ("refusal", "code", "status", "message"),
+    [
+        (
+            ("ModelUnavailable", "the model is restarting; retry shortly", 503),
+            "ModelUnavailable",
+            503,
+            "the model is restarting; retry shortly",
+        ),
+        (
+            ("InferenceFailed", "native inference failed", 503),
+            "InferenceFailed",
+            503,
+            "native inference failed",
+        ),
+        (
+            ("InvalidContext", "the table's rows are invalid", 422),
+            "ValidationError",
+            422,
+            "invalid predictor context",
+        ),
+    ],
+)
+def test_an_engine_refusal_to_bind_keeps_a_retryable_status(
+    tmp_path, data, monkeypatch, refusal, code, status, message
+):
+    """A worker starting again is a 503 to retry, never an invalid context."""
+    fake = FakeEngine().install(monkeypatch)
+
+    def refused(*_args, **_kwargs):
+        raise _core.RequestError(*refusal)
+
+    monkeypatch.setattr(fake, "bind", refused)
+    locked = checked(tmp_path, data, id="id")
+    with pytest.raises(ServiceError) as error:
+        PredictorExecutor().prepare(locked, data)
+    assert (error.value.code, error.value.status, str(error.value)) == (
+        code,
+        status,
+        message,
+    )
 
 
 def test_missing_bound_context_and_unexpected_request_context(tmp_path, data, kernels):

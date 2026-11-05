@@ -14,6 +14,7 @@ from typing import Literal
 
 import pyarrow as pa
 
+from generalforecast import _core
 from generalforecast.engine import LocalEngine
 from generalforecast.models.catalog import ModelRef
 from generalforecast.predictors.runtime.compiled import CompiledPlan
@@ -70,6 +71,20 @@ def _bind(lock: CompiledPlan, model: tuple[LocalEngine, ModelRef], context: pa.T
 
 def _failure(error: PredictorError) -> ServiceError:
     return ServiceError(error.code, str(error), 422)
+
+
+def _refusal(error: _core.RequestError, message: str) -> ServiceError:
+    """An engine refusal as the Models API answers it.
+
+    One the engine answers 5xx, such as a worker starting again
+    (`ModelUnavailable`) or failing (`InferenceFailed`), keeps its code,
+    message and status, so a caller retries it rather than reading it as
+    bad input; any other is the predictor's own invalid `message`.
+    """
+    code, reason, status = error.args
+    if isinstance(status, int) and status >= 500:
+        return ServiceError(code, reason, status)
+    return ServiceError("ValidationError", message, 422)
 
 
 @dataclass(frozen=True)
@@ -130,6 +145,8 @@ class PreparedPredictor(ResourceFree):
             raise
         except PredictorError as error:
             raise _failure(error) from None
+        except _core.RequestError as error:
+            raise _refusal(error, "invalid predictor prediction input") from None
         except (ValueError, TypeError, pa.ArrowException):
             raise ServiceError(
                 "ValidationError", "invalid predictor prediction input", 422
@@ -182,6 +199,8 @@ class PredictorExecutor:
             raise
         except PredictorError as error:
             raise _failure(error) from None
+        except _core.RequestError as error:
+            raise _refusal(error, "invalid predictor context") from None
         except (ValueError, TypeError, pa.ArrowException):
             raise ServiceError(
                 "ValidationError", "invalid predictor context", 422

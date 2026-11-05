@@ -14,6 +14,7 @@ import pytest
 from generalforecast import _core
 from generalforecast.engine import Labeled, LocalEngine, _Models
 from generalforecast.models.catalog import ModelRefError, parse
+from generalforecast.service.contracts import ServiceError
 from tests.utils.engine import tabular_request
 
 REF = parse("general-forecast/tabicl-v2-classifier")
@@ -222,5 +223,24 @@ def test_a_load_the_workers_refuse_is_tried_again():
     models = _Models(add)
     with pytest.raises(ModelRefError, match="no such model"):
         models.ensure("m", "m")
+    models.ensure("m", "m")
+    assert attempts == ["m", "m"]
+
+
+def test_a_load_the_workers_cannot_take_now_is_a_refusal_to_retry():
+    """A worker starting again refuses a load with 503, which stays a 503."""
+    attempts: list[str] = []
+
+    def add(name: str, spec: str) -> None:
+        attempts.append(name)
+        if len(attempts) == 1:
+            raise _core.RequestError(
+                "ModelUnavailable", "the model is restarting; retry shortly", 503
+            )
+
+    models = _Models(add)
+    with pytest.raises(ServiceError) as error:
+        models.ensure("m", "m")
+    assert (error.value.code, error.value.status) == ("ModelUnavailable", 503)
     models.ensure("m", "m")
     assert attempts == ["m", "m"]
