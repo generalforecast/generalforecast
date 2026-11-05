@@ -1196,13 +1196,32 @@ class ModelListReply(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class Build(Payload):
+    """The Build schema."""
+
+    commit: str | None
+    version: str | None
+    gf_commit: str | None
+    gf_version: str | None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("commit", "commit", True, _union(_text, _null)),
+        Field("version", "version", True, _union(_text, _null)),
+        Field("gf_commit", "gf_commit", True, _union(_text, _null)),
+        Field("gf_version", "gf_version", True, _union(_text, _null)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class Health(Payload):
     """The Health schema."""
 
     status: Literal["ok"] = "ok"
+    build: Build | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("status", "status", True, _literal("ok")),
+        Field("build", "build", False, _record(Build)),
     )
 
 
@@ -1997,6 +2016,23 @@ class RunCorpus(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class RunUsage(Payload):
+    """The RunUsage schema."""
+
+    gpu_seconds: float
+    charged_gpu_seconds: float
+    voided_gpu_seconds: float
+    credits: float
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("gpu_seconds", "gpu_seconds", True, _number),
+        Field("charged_gpu_seconds", "charged_gpu_seconds", True, _number),
+        Field("voided_gpu_seconds", "voided_gpu_seconds", True, _number),
+        Field("credits", "credits", True, _number),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class Run(Payload):
     """The Run schema."""
 
@@ -2015,6 +2051,7 @@ class Run(Payload):
     plan: dict[str, Any] | None
     created: float
     updated: float
+    usage: RunUsage | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("name", "name", True, _decode_Name),
@@ -2032,6 +2069,7 @@ class Run(Payload):
         Field("plan", "plan", True, _union(_mapping(_any), _null)),
         Field("created", "created", True, _number),
         Field("updated", "updated", True, _number),
+        Field("usage", "usage", False, _union(_record(RunUsage), _null)),
     )
 
 
