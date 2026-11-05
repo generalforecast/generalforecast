@@ -198,6 +198,25 @@ def test_an_engine_refusal_to_bind_keeps_a_retryable_status(
     )
 
 
+def test_a_checking_executor_admits_and_counts_the_context_without_a_model(
+    tmp_path, data, monkeypatch
+):
+    """A plane whose pool serves its predictions checks a revision, loading nothing."""
+    fake = FakeEngine().install(monkeypatch)
+    locked = checked(tmp_path, data, id="id")
+    prepared = PredictorExecutor(load=False).prepare(locked, data)
+    assert isinstance(prepared, PreparedExecution) and prepared.usable
+    assert prepared.context_rows == 4
+    assert fake.loads == [] and fake.contexts == []
+    with pytest.raises(ServiceError) as error:
+        prepared.predict(pa.table({"id": ["q"], "x": [1.0]}))
+    assert (error.value.code, error.value.status) == ("Unsupported", 501)
+    with pytest.raises(ServiceError) as error:
+        PredictorExecutor(load=False).prepare(locked, data.drop_columns(["x"]))
+    assert error.value.status == 422
+    assert fake.loads == []
+
+
 def test_missing_bound_context_and_unexpected_request_context(tmp_path, data, kernels):
     locked = checked(tmp_path, data, id="id")
     with pytest.raises(ServiceError):
