@@ -665,7 +665,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         pages = self._fit(step.fits, step.pages)
         subsets: dict[int, np.ndarray] = {}
         pages.update(self._embed_pages(step.pages, pages, step.units, subsets))
-        transient = self._encode(step.units, step.pages, pages, subsets)
+        transient = self._encode(step.units, step.pages, pages, subsets, step.queries)
         self.stats.steps += 1
         self.stats.queries += sum(len(batch.units) for batch in step.queries)
         self.stats.queries += len(step.forecasts)

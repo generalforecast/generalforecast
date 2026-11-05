@@ -9,6 +9,7 @@ fit the device could not hold is refused up front, naming what reads less.
 """
 
 import logging
+import math
 import sys
 import threading
 from collections.abc import Callable
@@ -25,6 +26,7 @@ from generalforecast.constants import (
     MEASURED_ROWS,
     MEMORY_ROWS_LIMIT,
     MEMORY_ROWS_MEASURES,
+    WORKING_MARGIN,
 )
 from generalforecast.runtime.memory import (
     EncodeProfile,
@@ -57,6 +59,11 @@ logger = logging.getLogger(__name__)
 
 # The most rows `Admission.whole_rows` searches up to.
 WHOLE_ROWS_LIMIT = 1 << 26
+
+
+def _gather_bytes(layout: CacheLayout, size: int) -> int:
+    """Bytes a paged decode's copy of a kept context of `size` padded rows takes; see `Admission._gather_bytes`."""
+    return math.ceil(WORKING_MARGIN * size * layout.row_bytes)
 
 
 class _Unmeasured(Exception):
@@ -406,46 +413,91 @@ class Admission:
             ),
         )
 
-    def _fits_device(self: "Worker", unit: Unit) -> None:
+    def _fits_device(self: "Worker", unit: Unit, fused: bool = False) -> None:
         """Refuses a unit whose encode, or whose context and decode, would not fit the device.
 
         Beside the pool, the device must hold the context's encode: its inputs,
         temporaries and cache, which the call's lone item is taken from in
         place. It must also hold the working memory of decoding the
-        smallest chunk of queries against the context. A kept context's decode
-        reads it, and any own state, from the pool into that working memory; a
-        transient context's decode takes a copy of it into its call, beside
-        the one held. On an accelerator, XLA's autotuner also needs headroom.
-        Otherwise the request would fail for want of memory, after a long fit,
-        with nothing said about what to do instead.
+        smallest chunk of queries against the context, which depends on how
+        the decode reads the context:
+
+        - A kept context's paged decode gathers its rows, and any own state,
+          from the pool into a copy of their own (`_gather_bytes`), beside
+          that working memory.
+        - A transient context decoded apart from its encode takes a copy of
+          its cache into the decode's call, beside the one held: its cache
+          twice.
+        - With `fused`, a transient context whose few queries decode in the
+          one program that gathers and encodes it (`_encode_decode`), whose
+          cache lives only inside that program: its encode without the cache
+          held as an output, and that decode's working memory twice. Probes
+          of Mitra and TabICL v2 measured the program below this.
+
+        A transient context pads to `_transient_size`, as its encode pads it,
+        on an accelerator; on a CPU, every unit is charged at its bucket. On
+        an accelerator, XLA's autotuner also needs headroom. Otherwise the
+        request would fail for want of memory, after a long fit, with nothing
+        said about what to do instead.
+
+        Args:
+            unit: The unit to admit.
+            fused: Whether its decode will take the fused path: a transient
+                context whose step's rows are on the device, read by at most
+                `FUSED_QUERIES` queries.
 
         Raises:
             ValueError: Naming the strategies that read fewer rows.
         """
         table = self._tables[unit.table]
         per_row = self.profile(table.model, table.features).cache_bytes_per_row
-        size = self._size(len(unit.rows))
-        context = self._context_bytes(unit)
+        bucket = self._size(len(unit.rows))
+        size = self._admitted_rows(unit)
+        transient = unit.action == "transient"
+        accelerator = not self.budget.cpu
+        fused = fused and transient and table.own is None and accelerator
+        own = 0 if table.own is None else table.own.slots * self._slot_bytes
+        context = size * per_row + own
         decode = self.decode_profile(table.model)
         working = decode.working_bytes(per_row, size)
         room = self.budget.device - self._pool_bytes
         fit = table.own is not None
+        # A unit's own state is read from its slots and unpacked beside it.
+        state = 2 * own
+        gather = (
+            self._gather_bytes(table.model, table.features, bucket)
+            if accelerator and unit.action not in ("transient", "fuse")
+            else 0
+        )
 
         def needs(measured: int | None) -> int:
             encode = 0 if measured is None else measured
-            if unit.action == "transient":
+            if fused:
+                # The program's cache is a temporary the decode reads, not
+                # an output beside it; unmeasured, the cache at least.
+                held = context if measured is None else max(0, encode - context)
+                needed = held + 2 * working
+            elif transient:
                 needed = max(encode, 2 * context + working)
             else:
-                # A unit's own state is read from its slots and unpacked beside it.
-                state = (
-                    0 if table.own is None else 2 * table.own.slots * self._slot_bytes
-                )
-                needed = max(encode, working + state)
-            if not self.budget.cpu:
+                needed = max(encode, gather + working + state)
+            if accelerator:
                 needed += max(encode, working) // AUTOTUNE_SHARE
             return needed
 
-        measured = self.encode_bytes(table.model, table.features, size, fit)
+        # A transient context is charged at its own padded size by the
+        # encode profile's line, which compiles nothing. Below where that
+        # line holds, and to measure it exactly, it takes the measure of its
+        # bucket, which a kept context of its rows compiles, and which holds
+        # at least as much: so admission compiles no new shape.
+        line_rows = bucket
+        if (
+            size < bucket
+            and size >= MEASURED_ROWS
+            and self.encode_profile(table.model, table.features, fit) is not None
+        ):
+            line_rows = size
+        measured = self.encode_bytes(table.model, table.features, line_rows, fit)
         needed = needs(measured)
         # The profile's line through small contexts can overstate a large
         # one's encode several times, so a context it refuses is measured at
@@ -454,24 +506,53 @@ class Admission:
         # puts it so far past the device that no overstatement would bring it
         # in. Those would compile a program larger than the device to refuse.
         if needed > room and needs(None) <= room and needed <= MEASURE_OVERSTATE * room:
-            measured = self.encode_bytes(
-                table.model, table.features, size, fit, exact=True
+            exact = self.encode_bytes(
+                table.model, table.features, bucket, fit, exact=True
             )
+            if line_rows == bucket or measured is None:
+                measured = exact
+            elif exact is not None:
+                measured = min(measured, exact)
             needed = needs(measured)
         encode = 0 if measured is None else measured
         if needed > room:
             encoding = (
                 "" if measured is None else f"encoding it {encode >> 20} MiB and "
             )
+            reading = " in one call with its encode" if fused else ""
             raise ValueError(
                 f"a context of {len(unit.rows)} rows ({unit.action}, padded to "
                 f"{size}) takes {context >> 20} MiB as the "
                 f"model caches it, {encoding}decoding "
-                f"{decode.queries} queries against it {working >> 20} MiB, which "
-                f"needs {needed >> 20} MiB, but the device has {room >> 20} MiB "
-                "beside the contexts it keeps; use a strategy that reads fewer "
-                "rows, such as neighbors, or a device with more memory"
+                f"{decode.queries} queries against it{reading} {working >> 20} MiB, "
+                f"which needs {needed >> 20} MiB, but the device has "
+                f"{room >> 20} MiB beside the contexts it keeps; use a strategy "
+                "that reads fewer rows, such as neighbors, or a device with "
+                "more memory"
             )
+
+    def _admitted_rows(self: "Worker", unit: Unit) -> int:
+        """Rows admission charges a unit's context at: as its encode pads it.
+
+        A transient context gathered from pages pads to `_transient_size`
+        on an accelerator; any other, and every one on a CPU, to its bucket.
+        """
+        table = self._tables[unit.table]
+        if unit.action == "transient" and table.own is None and not self.budget.cpu:
+            return self._transient_size(len(unit.rows))
+        return self._size(len(unit.rows))
+
+    def _gather_bytes(self: "Worker", model: int, features: int, size: int) -> int:
+        """Bytes a paged decode's copy of a kept context of `size` padded rows takes, with a margin.
+
+        The decode reads the context's blocks from the pool into a cache of
+        its own (`decodes.py`'s "a context and the working copy beside it"),
+        which the decode profile, measured with the cache as an argument,
+        leaves out. Probes measured the paged decode's temporaries at 1.04
+        times the padded cache for Mitra-2, and at the cache and the decode's
+        working memory for TabICL v2; `WORKING_MARGIN` covers the first.
+        """
+        return _gather_bytes(self.layout(model, features), size)
 
     def memory_rows(
         self: "Worker",
@@ -482,9 +563,12 @@ class Admission:
         """The most rows a context of a table this wide holds on this device, a padded size; None for any.
 
         A context past it would not fit as `_fits_device` checks: its cache
-        kept in the pool, and its encode and the decode of a chunk of queries
-        beside the pool, or, put off for want of room in the pool, its encode
-        or its cache twice and that decode. So an adaptive table resolves
+        kept in the pool, and its encode, or the decode of a chunk of queries
+        and its copy of the context's slots, beside the pool; or, put off for
+        want of room in the pool and decoded apart from its encode, its
+        encode or its cache twice and that decode. The fused path a put-off
+        context's few queries may take holds less, so is not what bounds
+        it. So an adaptive table resolves
         against it as against the model's own cap, reading a core and each
         query's neighbors rather than a context the device cannot hold.
         Padded sizes grow from the smallest measured, bucket by bucket, until
@@ -534,10 +618,15 @@ class Admission:
             if encode is None:
                 return None
             working = decode.working_bytes(per_row, size)
-            # As `_fits_device` holds a put-off unit to, which holds no less
-            # than a kept one.
-            needed = max(encode, 2 * size * per_row + working)
+            # As `_fits_device` holds a kept unit, its decode gathering its
+            # slots, and a put-off one decoded apart from its encode.
+            needed = max(encode, besides(size, working))
             return needed + max(encode, working) // AUTOTUNE_SHARE <= room
+
+        def besides(size: int, working: int) -> int:
+            """What a context of `size` rows holds besides its encode, kept or put off."""
+            gather = _gather_bytes(layout, size)
+            return max(2 * size * per_row, gather) + working
 
         def measurable(size: int) -> bool:
             """Whether an exact measure of `size`'s encode could make it fit.
@@ -552,7 +641,7 @@ class Admission:
             if layout.slots(size) * self._slot_bytes > self._pool_bytes:
                 return False
             working = decode.working_bytes(per_row, size)
-            return 2 * size * per_row + working + working // AUTOTUNE_SHARE <= room
+            return besides(size, working) + working // AUTOTUNE_SHARE <= room
 
         def ahead(size: int, larger: bool) -> None:
             """Measures `size` and the sizes the search would measure after it, side by side.
@@ -648,13 +737,15 @@ class Admission:
             # The context's slots as its rows pack into blocks of them.
             if layout.slots(size) * self._slot_bytes > self._pool_bytes:
                 return False
-            needed = max(
-                profile.working_bytes(per_row, size),
-                decode.working_bytes(per_row, size),
-            )
-            if not self.budget.cpu:
-                needed += needed // AUTOTUNE_SHARE
-            return needed <= room
+            encode = profile.working_bytes(per_row, size)
+            working = decode.working_bytes(per_row, size)
+            if self.budget.cpu:
+                return max(encode, working) <= room
+            # The paged decode's copy of the context's slots, beside its
+            # working memory, as `_fits_device` holds a kept unit to.
+            gather = _gather_bytes(layout, size)
+            needed = max(encode, gather + working)
+            return needed + max(encode, working) // AUTOTUNE_SHARE <= room
 
         if not fits(1):
             return None
