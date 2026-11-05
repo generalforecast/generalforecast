@@ -21,11 +21,13 @@ def _worker(context: int, line: int, exact: int) -> tuple[Any, list[bool]]:
         measured.append(exact_measure)
         return exact if exact_measure else line
 
-    worker = SimpleNamespace(
+    worker: Any = SimpleNamespace(
         _tables={0: SimpleNamespace(model=0, features=8, own=None)},
-        profile=lambda model, features: SimpleNamespace(cache_bytes_per_row=1),
+        # The context's cache over its 1,000 rows, padded to themselves.
+        profile=lambda model, features: SimpleNamespace(
+            cache_bytes_per_row=context // 1000
+        ),
         _size=lambda rows: rows,
-        _context_bytes=lambda unit: context,
         decode_profile=lambda model: SimpleNamespace(
             queries=8, working_bytes=lambda per_row, size: 0
         ),
@@ -33,6 +35,7 @@ def _worker(context: int, line: int, exact: int) -> tuple[Any, list[bool]]:
         _pool_bytes=10 * GIB,
         encode_bytes=encode_bytes,
     )
+    worker._admitted_rows = lambda unit: Admission._admitted_rows(worker, unit)
     return worker, measured
 
 

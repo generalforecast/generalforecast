@@ -313,7 +313,10 @@ def _handled(
                 predictions, failed = worker.run_apart(step)
                 with worker.stats.timed("reply"):
                     frame = protocol.predictions(
-                        predictions, failed, deferred=worker.deferred
+                        predictions,
+                        failed,
+                        deferred=worker.deferred,
+                        kinds=worker.failure_kinds,
                     )
                     held = memory.reading() if worker.timers else None
                 frame[0].update(

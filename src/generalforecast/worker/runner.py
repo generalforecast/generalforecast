@@ -65,7 +65,7 @@ from generalforecast.runtime.paging import (
 from generalforecast.runtime.programs import Programs
 from generalforecast.runtime.series import SeriesBytes
 from generalforecast.system import usable_cpus
-from generalforecast.worker.admission import Admission
+from generalforecast.worker.admission import Admission, DeviceMemoryRefused
 from generalforecast.worker.ahead import Ahead, _manifests, _shipped_measures
 from generalforecast.worker.calls import Calls, _item, _only_item, _stack_columns
 from generalforecast.worker.decodes import Decodes
@@ -103,6 +103,23 @@ def check_summary(properties: TabularProperties, summary: str) -> None:
 
 def _message(error: Exception) -> str:
     return f"{type(error).__name__}: {error}"
+
+
+# The kind of a failure for want of device memory, which a server answers as
+# a device that cannot hold the step now rather than counting it against the
+# table: `Failure.kind` in the protocol.
+DEVICE_MEMORY = "device_memory"
+
+
+def _kind(error: BaseException) -> str | None:
+    """A failure's kind: `DEVICE_MEMORY` where the device could not hold the step, else None.
+
+    Admission refused it up front, or a call still ran out of device memory
+    with its step down to one request. Any other error is the table's own.
+    """
+    if isinstance(error, DeviceMemoryRefused) or out_of_memory(error):
+        return DEVICE_MEMORY
+    return None
 
 
 def _tables(step: protocol.Step) -> list[int]:
@@ -228,6 +245,8 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         self.progressed: Callable[[], None] | None = None
         # The tables the running step defers, by the program they wait for.
         self.deferred: dict[int, str] = {}
+        # The last step's failed tables that have a kind (`_kind`), by table.
+        self.failure_kinds: dict[int, str] = {}
         # Programs being readied beside steps, and those that failed to be,
         # which the steps that need them compile and report; the step thread
         # and the thread readying them share them under the lock.
@@ -577,6 +596,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
             is ready, and a failed table is never deferred.
         """
         self.deferred = {}
+        self.failure_kinds = {}
         with self.stats.timed("move"):
             for movement in step.movements:
                 self.apply(movement)
@@ -593,6 +613,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
                 raise
             if len(tables) == 1:
                 self.deferred.pop(tables[0], None)
+                self._note_kind(tables[0], error)
                 return {}, {tables[0]: _message(error)}
         # Each part defers its table again if its program is still being
         # readied, and not if it was readied meanwhile and the part answered.
@@ -604,8 +625,15 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
                 predictions.update(self._answered(_part(step, table)))
             except Exception as error:  # noqa: BLE001
                 failed[table] = _message(error)
+                self._note_kind(table, error)
                 self.deferred.pop(table, None)
         return predictions, failed
+
+    def _note_kind(self, table: int, error: BaseException) -> None:
+        """Notes a failed table's kind in `failure_kinds`, if it has one."""
+        kind = _kind(error)
+        if kind is not None:
+            self.failure_kinds[table] = kind
 
     def _answered(self, step: Any) -> dict[int, np.ndarray]:
         """Computes a step; one of several requests that runs out of device memory runs again in halves.
@@ -665,7 +693,7 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         pages = self._fit(step.fits, step.pages)
         subsets: dict[int, np.ndarray] = {}
         pages.update(self._embed_pages(step.pages, pages, step.units, subsets))
-        transient = self._encode(step.units, step.pages, pages, subsets)
+        transient = self._encode(step.units, step.pages, pages, subsets, step.queries)
         self.stats.steps += 1
         self.stats.queries += sum(len(batch.units) for batch in step.queries)
         self.stats.queries += len(step.forecasts)

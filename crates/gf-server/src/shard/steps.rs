@@ -200,11 +200,17 @@ impl Shard {
                 let Outcome {
                     predictions,
                     failed,
+                    device_memory,
                     deferred,
                     ..
                 } = outcome;
                 for (table, reason) in &failed {
-                    self.fail_requests(&step, Some(*table), &ServerError::Internal(reason.clone()));
+                    let error = if device_memory.contains(table) {
+                        device_memory_error(reason)
+                    } else {
+                        ServerError::Internal(reason.clone())
+                    };
+                    self.fail_requests(&step, Some(*table), &error);
                 }
                 self.answer(&step, predictions, &shares, times, &deferred);
                 let tables = step
@@ -218,8 +224,14 @@ impl Shard {
                         self.failures.remove(&table);
                     }
                 }
+                // A step the device could not hold says nothing of the table:
+                // a device with more memory, or this one with fewer requests
+                // in the step, takes it. So it neither counts towards nor
+                // clears the table's quarantine; anything else does.
                 for (table, reason) in failed {
-                    self.count_failure(table, &reason);
+                    if !device_memory.contains(&table) {
+                        self.count_failure(table, &reason);
+                    }
                 }
             }
             Err(error) => {
@@ -592,4 +604,18 @@ pub(super) fn charge(
         *cost.entry(*table).or_default() += seconds * rows / total;
     }
     true
+}
+
+/// The answer to a request whose table's step this worker's device could not
+/// hold: a 503 the client retries after `DEVICE_MEMORY_RETRY_SECONDS`, which
+/// may reach a device that holds it, naming what the step needs.
+fn device_memory_error(reason: &str) -> ServerError {
+    // The worker names its error's type first, which the client has no use for.
+    let reason = reason
+        .strip_prefix("DeviceMemoryRefused: ")
+        .unwrap_or(reason);
+    ServerError::DeviceMemory(format!(
+        "the GPU this request reached cannot hold one step of the table's \
+         strategy now ({reason}); retry shortly, as another GPU may hold it"
+    ))
 }

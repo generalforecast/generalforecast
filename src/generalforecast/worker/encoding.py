@@ -14,10 +14,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from generalforecast._core import bucket_size
-from generalforecast.constants import TRANSIENT_ROWS
+from generalforecast.constants import FUSED_QUERIES, TRANSIENT_ROWS
 from generalforecast.worker.calls import _host_padded
 from generalforecast.worker.pages import Representations
-from generalforecast.worker.records import Page, Unit
+from generalforecast.worker.records import Page, QueryBatch, Unit
 
 if TYPE_CHECKING:
     from generalforecast.worker.runner import Worker
@@ -101,6 +101,21 @@ def _expanded(arguments: tuple) -> tuple:
     return (state, _taken(gather.values, index), _taken(gather.targets, index), rows)
 
 
+def transient_size(rows: int, bucket: int) -> int:
+    """Rows a put-off context of `rows` rows, of padded size `bucket`, pads to: its bucket, or past `TRANSIENT_ROWS`, the next multiple of it."""
+    if bucket <= TRANSIENT_ROWS:
+        return bucket
+    return min(bucket, -(-rows // TRANSIENT_ROWS) * TRANSIENT_ROWS)
+
+
+def _reads(queries: Sequence[QueryBatch], units: int) -> np.ndarray:
+    """How many of a step's queries read each of its `units` units."""
+    read = [np.asarray(batch.units, dtype=np.int64) for batch in queries]
+    if not read:
+        return np.zeros(units, dtype=np.int64)
+    return np.bincount(np.concatenate(read), minlength=units)
+
+
 class Encoding:
     """How a worker encodes a step's units."""
 
@@ -110,12 +125,16 @@ class Encoding:
         pages: Sequence[Page],
         computed: dict[int, Representations],
         subsets: dict[int, np.ndarray] | None = None,
+        queries: Sequence[QueryBatch] | None = None,
     ) -> Transient:
         """Encodes the units that are not cached; returns those there was no room to keep.
 
         A unit with no room to keep is encoded only by the decode that reads
         it, so a step never holds every such context at once. A page in
-        `subsets` holds the representations of those rows alone.
+        `subsets` holds the representations of those rows alone. `queries`,
+        the step's batches, say how many queries read each such unit, so it
+        is admitted as its decode will run (`_fused_transient`); without
+        them, each is admitted as decoded apart from its encode.
         """
         transient: Transient = {}
         waiting = [
@@ -137,9 +156,17 @@ class Encoding:
         gathered: dict[int, tuple[Any, Any]] = {}
         work: dict[str, list[tuple[int, tuple]]] = defaultdict(list)
         group: dict[str, list[int]] = defaultdict(list)
+        reads = (
+            _reads(queries, len(units))
+            if queries is not None
+            and any(units[index].action == "transient" for index in waiting)
+            else None
+        )
         for index in waiting:
             unit = units[index]
-            self._fits_device(unit)
+            self._fits_device(
+                unit, fused=self._fused_transient(unit, index, joined, reads)
+            )
             if self._tables[unit.table].own is not None:
                 stage, arguments = "fit_encode", self._own_arguments(unit)
             elif unit.action == "transient":
@@ -182,6 +209,31 @@ class Encoding:
         for stage, items in work.items():
             self._call(stage, items, consume=keeper(stage))
         return transient
+
+    def _fused_transient(
+        self: "Worker",
+        unit: Unit,
+        index: int,
+        joined: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]],
+        reads: np.ndarray | None,
+    ) -> bool:
+        """Whether a put-off unit will encode and decode in one program, as `_decode_window` picks.
+
+        One that gathers its rows from the step's rows on the device, read by
+        at most `FUSED_QUERIES` of the step's queries, as `_gathered_later`
+        and `_decode_window` decide it.
+        """
+        if (
+            reads is None
+            or unit.action != "transient"
+            or self._tables[unit.table].own is not None
+            or reads[index] > FUSED_QUERIES
+        ):
+            return False
+        rows, values, targets = joined[unit.table]
+        return self._joins_on_device(
+            values, targets, bucket_size(len(rows), self._minimum)
+        )
 
     def _gathered(
         self: "Worker",
@@ -265,11 +317,8 @@ class Encoding:
         return padded * row <= self._call_bytes // 2
 
     def _transient_size(self: "Worker", rows: int) -> int:
-        """Rows a put-off context of `rows` rows pads to: its bucket, or past `TRANSIENT_ROWS`, the next multiple of it."""
-        bucket = self._size(rows)
-        if bucket <= TRANSIENT_ROWS:
-            return bucket
-        return min(bucket, -(-rows // TRANSIENT_ROWS) * TRANSIENT_ROWS)
+        """Rows a put-off context of `rows` rows pads to; see `transient_size`."""
+        return transient_size(rows, self._size(rows))
 
     def _own_arguments(self: "Worker", unit: Unit) -> tuple:
         """A unit's fit arguments, from the rows it came with."""

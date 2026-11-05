@@ -92,6 +92,8 @@ def test_every_raised_code_reaches_the_wire_as_an_openapi_code():
         ("SnapshotNotFound", 404, "NotFound"),
         ("InternalError", 500, "Internal"),
         ("InferenceFailed", 503, "ModelNotReady"),
+        # A step the GPU a request reached cannot hold: a client retries it.
+        ("DeviceMemoryExceeded", 503, "ModelNotReady"),
         ("Conflict", 409, "Conflict"),
     ],
 )
