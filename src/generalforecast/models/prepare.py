@@ -5,6 +5,7 @@
 
 from typing import NamedTuple
 
+import jax
 import jax.numpy as jnp
 from jax import Array
 from jaxtyping import Bool, Float, Int
@@ -88,7 +89,7 @@ def masked_stats(values: Array, present: Bool[Array, "..."], ddof: int = 0) -> M
     center = shift + offset
     moved = center - shift
     low = (shift - (center - moved)) + (offset - moved)
-    return Moments(center, low, jnp.sqrt(variance).astype(values.dtype))
+    return Moments(center, low, _root(variance).astype(values.dtype))
 
 
 def precise_mean(values: Array, present: Bool[Array, "..."]) -> Array:
@@ -141,9 +142,23 @@ def masked_moments(
     present = jnp.broadcast_to(present, values.shape)
     mean = masked_mean(values, present)
     count = jnp.sum(present, axis=0)
-    squares = jnp.sum(jnp.where(present, (values - mean) ** 2, 0), axis=0)
+    # A missing value takes the mean before it is squared: squared, a NaN
+    # would turn the mean's gradient, and the column's, to NaN.
+    deviations = jnp.where(present, values, mean) - mean
+    squares = jnp.sum(jnp.where(present, deviations**2, 0), axis=0)
     variance = squares / jnp.maximum(count - ddof, 1)
-    return mean, jnp.sqrt(variance).astype(values.dtype)
+    return mean, _root(variance).astype(values.dtype)
+
+
+def _root(variance: Array) -> Array:
+    """The square root of a variance, 0 for none, with a finite gradient there.
+
+    `jnp.sqrt`'s gradient at 0 is infinite, and a constant column's would
+    turn every gradient of its values to NaN: a trainer differentiating
+    through the preprocessing, as an input adapter's does, reads none.
+    """
+    spread = variance > 0
+    return jnp.where(spread, jnp.sqrt(jnp.where(spread, variance, 1)), 0)
 
 
 # Standardized values are clipped here, then soft-clipped this many deviations
@@ -185,8 +200,20 @@ def standardize(
 
 
 def _standardized(values: Array, center: Array, low: Array, scale: Array) -> Array:
-    """`standardize` from the center, its low part and the scale."""
-    return jnp.clip(((values - center) - low) / scale, -CLIP, CLIP)
+    """`standardize` from the center, its low part and the scale.
+
+    A missing or infinite value standardizes as it always has, but outside
+    the gradient: a NaN numerator would turn the scale's gradient, and so
+    every gradient of the column's values, to NaN for a trainer that
+    differentiates through the preprocessing.
+    """
+    finite = jnp.isfinite(values)
+    safe = jnp.where(finite, values, center)
+    standardized = jnp.clip(((safe - center) - low) / scale, -CLIP, CLIP)
+    other = jax.lax.stop_gradient(
+        jnp.clip(((values - center) - low) / scale, -CLIP, CLIP)
+    )
+    return jnp.where(finite, standardized, other)
 
 
 def soft_clip(
