@@ -187,7 +187,7 @@ class RetryEvent:
 
 
 def _predict_backoff() -> Backoff:
-    return Backoff(attempts=60, deadline=600.0, initial=2.0, maximum=30.0)
+    return Backoff(attempts=20, deadline=120.0, initial=2.0, maximum=30.0)
 
 
 def _control_backoff() -> Backoff:
@@ -198,9 +198,8 @@ def _control_backoff() -> Backoff:
 class RetryPolicy:
     """Which requests a client retries, for how long, and who is told.
 
-    The default retries a prediction for up to ten minutes, enough for a
-    model to start and a first fit to finish, and every other retryable
-    request for up to two. A wait is the service's Retry-After when it sends
+    The default retries a prediction, and every other retryable request,
+    for up to two minutes. A wait is the service's Retry-After when it sends
     one, else the class's backoff; a request whose next try would start past
     its deadline, or the deadline the call itself has, gives up and raises
     the last error.

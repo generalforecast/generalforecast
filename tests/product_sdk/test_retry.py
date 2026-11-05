@@ -634,14 +634,14 @@ def test_a_retry_argument_is_a_policy_a_number_of_tries_or_none():
     three = RetryPolicy.of(3)
     assert three is not None
     assert three.predict.attempts == 3 and three.control.attempts == 3
-    assert three.predict.deadline == 600.0 and three.control.deadline == 120.0
+    assert three.predict.deadline == 120.0 and three.control.deadline == 120.0
     custom = RetryPolicy(on_retry=print)
     assert RetryPolicy.of(custom) is custom
     wrongs: list[Any] = [-1, 2.5, "3"]
     for wrong in wrongs:
         with pytest.raises(ValueError, match="retry is"):
             RetryPolicy.of(wrong)
-    assert DEFAULT_RETRY.backoff(PREDICT).deadline == 600.0
+    assert DEFAULT_RETRY.backoff(PREDICT).deadline == 120.0
     assert DEFAULT_RETRY.backoff(READ) is DEFAULT_RETRY.backoff(WRITE)
 
 

@@ -172,8 +172,7 @@ class AsyncClient:
 
         `retry` is the `RetryPolicy` transient failures are retried under,
         for the requests that are safe to send again (`generalforecast.retry`):
-        by default a prediction for up to ten minutes and any other for up to
-        two. None or 0 sends every request once; a number is the most tries.
+        by default for up to two minutes. None or 0 sends every request once; a number is the most tries.
         """
         self._retry = RetryPolicy.of(retry)
         self._retry_sleep = asyncio.sleep
