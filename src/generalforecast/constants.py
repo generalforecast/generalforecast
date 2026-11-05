@@ -176,6 +176,14 @@ SAMPLE_INTERVAL = 0.001
 # shape needs no slots, and a context of 5,120 rows padded to 8,192, as
 # a kept one pads, took twice as long to encode.
 TRANSIENT_ROWS = 512
+# Past this many rows, such a context pads to one of `TRANSIENT_STEPS` sizes
+# an octave instead, as wide tables pad their widths, so by at most a
+# quarter: steps of `TRANSIENT_ROWS` would be a size to compile, 5 to 12
+# seconds each, every 512 rows, 117 of them up to TabICL v2's 60,000. Below
+# it, where Mitra-2's 5,120 rows are, the steps of 512 keep its padding,
+# and its encode, whose attention grows with the square of its rows, small.
+TRANSIENT_STEPPED_ROWS = 8192
+TRANSIENT_STEPS = 4
 
 # The most queries a context with no room to keep may have to encode and
 # decode in one call with many others: one per query under neighbors, or a

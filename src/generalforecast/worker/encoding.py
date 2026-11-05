@@ -4,6 +4,7 @@
 """Encoding: contexts encoded from pages or fit on their own rows, kept or put off until a decode needs them."""
 
 import logging
+import os
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -14,7 +15,12 @@ import jax.numpy as jnp
 import numpy as np
 
 from generalforecast._core import bucket_size
-from generalforecast.constants import FUSED_QUERIES, TRANSIENT_ROWS
+from generalforecast.constants import (
+    FUSED_QUERIES,
+    TRANSIENT_ROWS,
+    TRANSIENT_STEPPED_ROWS,
+    TRANSIENT_STEPS,
+)
 from generalforecast.worker.calls import _host_padded
 from generalforecast.worker.pages import Representations
 from generalforecast.worker.records import Page, QueryBatch, Unit
@@ -101,11 +107,29 @@ def _expanded(arguments: tuple) -> tuple:
     return (state, _taken(gather.values, index), _taken(gather.targets, index), rows)
 
 
+# Set to `0` to pad every put-off context past `TRANSIENT_ROWS` to a multiple
+# of it, as before `TRANSIENT_STEPPED_ROWS`, to compare the two.
+TRANSIENT_STEPS_ENV = "GF_TRANSIENT_STEPS"
+
+
 def transient_size(rows: int, bucket: int) -> int:
-    """Rows a put-off context of `rows` rows, of padded size `bucket`, pads to: its bucket, or past `TRANSIENT_ROWS`, the next multiple of it."""
+    """Rows a put-off context of `rows` rows, whose bucket is `bucket`, pads to.
+
+    Its bucket up to `TRANSIENT_ROWS`; past that, the next multiple of
+    `TRANSIENT_ROWS` up to `TRANSIENT_STEPPED_ROWS`; past that, the next of
+    `TRANSIENT_STEPS` sizes an octave, as `padded_width` pads widths: 8,193
+    to 10,240 rows pad to 10,240, 57,345 to 65,536 to 65,536. Never past the
+    bucket. Its encode, every decode of it, fused or not, and admission's
+    charge all take this size, so they compile and measure alike.
+    `GF_TRANSIENT_STEPS=0` keeps steps of `TRANSIENT_ROWS` all the way.
+    """
     if bucket <= TRANSIENT_ROWS:
         return bucket
-    return min(bucket, -(-rows // TRANSIENT_ROWS) * TRANSIENT_ROWS)
+    step = TRANSIENT_ROWS
+    if rows > TRANSIENT_STEPPED_ROWS and os.environ.get(TRANSIENT_STEPS_ENV) != "0":
+        octave = 1 << ((rows - 1).bit_length() - 1)
+        step = max(TRANSIENT_ROWS, octave // TRANSIENT_STEPS)
+    return min(bucket, -(-rows // step) * step)
 
 
 def _reads(queries: Sequence[QueryBatch], units: int) -> np.ndarray:
