@@ -145,8 +145,12 @@ impl Engine {
     /// Its `data` directory holds bound tables' logs and the worker caches.
     #[new]
     fn new(py: Python<'_>, config: &str) -> PyResult<Self> {
-        let config =
+        let mut config =
             Config::parse(Path::new("engine.toml"), config).map_err(PyValueError::new_err)?;
+        // An engine in its caller's process serves that caller alone: no
+        // other caller's work could be ahead of a request, and nothing would
+        // retry a refusal, so a long queue is the caller's own and waits.
+        config.shed_past_deadline = false;
         let key =
             EncryptionKey::from_hex(&setup::random_hex(32).map_err(failed)?).map_err(failed)?;
         let tables = config.data.join("tables");

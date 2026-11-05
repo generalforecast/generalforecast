@@ -1633,7 +1633,7 @@ impl Shard {
                 trace,
                 pick,
                 reply,
-            } => match self.infer(*context, asked).await {
+            } => match self.infer(*context, asked, &trace).await {
                 Ok((submitted, levels)) => {
                     let request = submitted.request;
                     let (answered, answer) = oneshot::channel();
@@ -1681,7 +1681,9 @@ impl Shard {
             } => {
                 let submitted = self.usable(&table).and_then(|id| {
                     let future = self.future_rows(&table, future)?;
-                    self.submit_forecast(id, &table, series, before, horizon, groups, future)
+                    self.submit_forecast(
+                        id, &table, series, before, horizon, groups, future, &trace,
+                    )
                 });
                 self.admit(submitted, reply, trace);
             }
@@ -1697,7 +1699,7 @@ impl Shard {
             } => {
                 let resolved = self.resolve(&table, &mut features, &strings);
                 let submitted =
-                    resolved.and_then(|()| self.submit(&table, features, before, given));
+                    resolved.and_then(|()| self.submit(&table, features, before, given, &trace));
                 let request = submitted.as_ref().ok().map(|submitted| submitted.request);
                 self.admit(submitted, reply, trace);
                 if let (Some(request), Some(pick)) = (request, pick)

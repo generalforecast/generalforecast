@@ -19,9 +19,13 @@
 //! A request whose estimated wait for the steps ahead of it is past the
 //! longest any caller waits is refused at once, with how long until the
 //! queue would admit it, rather than answered with a timeout once its
-//! caller has waited that long. Its own table's step is never counted
-//! against it: a first fit that takes longer than the deadline still runs,
-//! and the retry that follows reads what it kept.
+//! caller has waited that long. Its own call's work is never counted
+//! against it, on its table or on the other tables a call split over
+//! several, as a forecast over many aligned groups is, takes: a first fit
+//! that takes longer than the deadline still runs, a call larger than one
+//! step never refuses itself, and the retry that follows reads what it
+//! kept. Only a server answering other callers refuses: an engine in a
+//! caller's own process has no one else to wait for (see `shed`).
 
 use super::*;
 
@@ -170,10 +174,30 @@ impl Shard {
             .collect()
     }
 
-    /// The seconds a new request on `table` (or on a table with nothing
-    /// queued, if None) would wait before the worker starts its step: the
-    /// steps in flight, then every other table with requests waiting.
-    pub(super) fn wait_ahead(&self, table: Option<TableId>) -> f64 {
+    /// The tables holding work of the call a new request on `table` belongs
+    /// to: that table, and every table with a request of the same call
+    /// queued or in flight, as the parts of a forecast over several aligned
+    /// groups are. A call is known by its trace; one without a trace is
+    /// known by its table alone.
+    fn own_tables(&self, table: TableId, caller: &str) -> HashSet<TableId> {
+        let mut own = HashSet::from([table]);
+        if !caller.is_empty() {
+            own.extend(
+                self.pending
+                    .values()
+                    .filter(|pending| pending.trace == caller)
+                    .map(|pending| pending.table),
+            );
+        }
+        own
+    }
+
+    /// The seconds a new request would wait before the worker starts its
+    /// step: the steps in flight, then every table with requests waiting,
+    /// leaving out the tables in `own`, which hold the request's own call's
+    /// work: a call split over several tables or steps never waits for
+    /// itself.
+    pub(super) fn wait_ahead(&self, own: &HashSet<TableId>) -> f64 {
         let mut sent: HashSet<RequestId> = HashSet::new();
         let in_flight: Vec<f64> = self
             .in_flight
@@ -189,6 +213,7 @@ impl Shard {
                 );
                 Self::step_tables(&flight.step)
                     .into_iter()
+                    .filter(|table| !own.contains(table))
                     .map(|table| self.expected(table))
                     .sum()
             })
@@ -204,7 +229,7 @@ impl Shard {
             .iter()
             .filter(|(request, pending)| {
                 !sent.contains(request)
-                    && Some(pending.table) != table
+                    && !own.contains(&pending.table)
                     && !pending.reply.is_closed()
             })
             .map(|(_, pending)| pending.table)
@@ -217,20 +242,21 @@ impl Shard {
         )
     }
 
-    /// Refuses a request on `table` whose wait for the work ahead of it is
-    /// past the longest any caller waits, unless the shard was told never to.
-    pub(super) fn admit_wait(&mut self, table: TableId) -> Result<(), ServerError> {
+    /// Refuses a request on `table`, of the call `caller` traces, whose wait
+    /// for the work of other calls ahead of it is past the longest any
+    /// caller waits, unless the shard was told never to.
+    pub(super) fn admit_wait(&mut self, table: TableId, caller: &str) -> Result<(), ServerError> {
         if !self.shed {
             return Ok(());
         }
         let deadline = self.request_timeout.as_secs_f64();
-        let wait = self.wait_ahead(Some(table));
+        let wait = self.wait_ahead(&self.own_tables(table, caller));
         if wait <= deadline {
             return Ok(());
         }
         // Callers that have gone free the worker, so look again without them.
         self.cancel_abandoned();
-        let wait = self.wait_ahead(Some(table));
+        let wait = self.wait_ahead(&self.own_tables(table, caller));
         if wait <= deadline {
             return Ok(());
         }
@@ -238,8 +264,8 @@ impl Shard {
         let retry = retry_seconds(wait, deadline);
         Err(ServerError::Backlogged(
             format!(
-                "the worker has about {wait:.0} s of work queued ahead of this request, past \
-                 the {deadline:.0} s a request may wait; retry in {retry} s"
+                "the worker has about {wait:.0} s of other calls' work queued ahead of this \
+                 request, past the {deadline:.0} s a request may wait; retry in {retry} s"
             ),
             retry,
         ))
@@ -247,7 +273,7 @@ impl Shard {
 
     /// Reports the wait a new request would have, for the pool's autoscaler.
     pub(super) fn report_wait(&self) {
-        let wait = self.wait_ahead(None);
+        let wait = self.wait_ahead(&HashSet::new());
         self.metrics.set_queue_wait(self.load_slot, wait);
     }
 }

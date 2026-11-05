@@ -780,6 +780,16 @@ impl Harness {
 
     /// Sends a prediction, and returns its answer to await later.
     async fn send_predict(&self, table: &str) -> impl Future<Output = Result<usize, Code>> {
+        self.send_traced(table, "").await
+    }
+
+    /// Sends a prediction as part of the call `trace` names, and returns its
+    /// answer to await later.
+    async fn send_traced(
+        &self,
+        table: &str,
+        trace: &str,
+    ) -> impl Future<Output = Result<usize, Code>> {
         let (reply, answer) = oneshot::channel();
         let command = Command::Predict {
             table: name(table),
@@ -787,7 +797,7 @@ impl Harness {
             strings: Vec::new(),
             before: None,
             given: None,
-            trace: String::new(),
+            trace: trace.to_string(),
             pick: None,
             reply,
         };
@@ -1401,6 +1411,39 @@ async fn a_prediction_that_would_outwait_its_deadline_behind_long_steps_is_refus
     let text = shard.metrics.render();
     assert!(text.contains("gf_requests_shed_total 1\n"), "{text}");
     assert!(text.contains("gf_queue_wait_seconds 1"), "{text}");
+}
+
+#[tokio::test]
+async fn a_call_split_over_many_long_steps_on_an_idle_worker_never_refuses_itself() {
+    let shard = behind_long_steps(true).await;
+    shard.create_named("other", 3).await.unwrap();
+    shard.insert_into("other", &[1, 2, 3, 4], None).await;
+    // One call's parts, as a forecast's aligned groups go, each on a table
+    // whose step is expected to take 100 s: together far past the 60 s
+    // deadline, yet none waits for anything but its own call.
+    let mut parts = Vec::new();
+    for table in ["slow", "slower", "quick", "slow"] {
+        parts.push(Box::pin(shard.send_traced(table, "call-1").await));
+    }
+    let answered = tokio::time::timeout(
+        Duration::from_millis(300),
+        futures::future::select_all(parts.iter_mut()),
+    )
+    .await;
+
+    if let Ok((answer, part, _)) = answered {
+        panic!("part {part} was answered: {answer:?}");
+    }
+    assert_eq!(shard.metrics.requests_shed.get(), 0);
+    // Another call behind them waits for all of it, and is refused.
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        shard.send_traced("other", "call-2").await,
+    )
+    .await
+    .expect("refused at once");
+    assert_eq!(refused, Err(Code::ResourceExhausted));
+    assert_eq!(shard.metrics.requests_shed.get(), 1);
 }
 
 #[tokio::test]

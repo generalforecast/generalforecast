@@ -35,6 +35,23 @@ use crate::routes::{Busy, Routes};
 use crate::shard::{Asked, Command, Fence, Incoming, Inferred, RequestContext, Write};
 use crate::wal::{Rows, Terms};
 
+tokio::task_local! {
+    /// The trace of the call a request belongs to, while a call that fans
+    /// out over several tables, as a forecast of several aligned groups
+    /// does, sends its parts: each shard then knows the parts as one call's
+    /// and never counts one against another's wait.
+    static CALL: String;
+}
+
+/// The trace a part of the current call carries to its shard: the call's,
+/// or none outside one.
+fn call_trace() -> String {
+    CALL.try_with(Clone::clone).unwrap_or_default()
+}
+
+/// Numbers the calls that fan out, for their traces.
+static CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A snapshot predictor's rows, bound once into their durable table.
 pub struct Bound {
     pub table: TableName,
@@ -272,7 +289,7 @@ impl Engine {
         let command = Command::Infer {
             context: Box::new(context),
             asked,
-            trace: String::new(),
+            trace: call_trace(),
             pick,
             reply,
         };
@@ -320,7 +337,7 @@ impl Engine {
             strings: Vec::new(),
             before: None,
             given: None,
-            trace: String::new(),
+            trace: call_trace(),
             pick,
             reply,
         };
@@ -480,7 +497,11 @@ impl Engine {
             });
             groups[at].1.push(index);
         }
-        let answers = futures::future::try_join_all(groups.iter().map(|(fingerprint, indices)| {
+        let call = format!(
+            "call-{}",
+            CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let parts = futures::future::try_join_all(groups.iter().map(|(fingerprint, indices)| {
             let members: Vec<usize> = indices
                 .iter()
                 .map(|&index| request.queries[index].member)
@@ -490,8 +511,10 @@ impl Engine {
                 self.forecast(model, group, fingerprint, &members, request.horizon)
                     .await
             }
-        }))
-        .await?;
+        }));
+        // A call that already carries a trace, as a Flight call does, keeps it.
+        let call = CALL.try_with(Clone::clone).unwrap_or(call);
+        let answers = CALL.scope(call, parts).await?;
         Ok(groups
             .into_iter()
             .map(|(_, indices)| indices)
