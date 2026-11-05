@@ -39,6 +39,7 @@ from generalforecast.runtime.device import (
     default_settings,
     portable_cpu_programs,
     report_fallback,
+    untuned_matmuls,
 )
 from generalforecast.system import pin_cpus
 from generalforecast.worker import Worker
@@ -79,6 +80,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
 
     # Before `default_settings` starts JAX's backend, which reads XLA's flags.
     command_buffers()
+    untuned_matmuls()
     portable_cpu_programs()
     use_autotune_results()
     report_fallback()
