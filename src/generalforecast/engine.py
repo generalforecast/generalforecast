@@ -220,6 +220,8 @@ class _Models:
 
         Raises:
             ModelRefError: If the workers cannot load it.
+            ServiceError: If the workers refused the load for now, as while
+                one starts again, with the engine's 5xx code and status.
         """
         if name in self._loaded:
             return
@@ -233,7 +235,13 @@ class _Models:
             try:
                 self._add(name, spec)
             except _core.RequestError as error:
-                code, message, _ = error.args
+                code, message, status = error.args
+                if isinstance(status, int) and status >= 500:
+                    # The workers could not take the load now, as while one
+                    # starts again: a refusal to retry, not a bad reference.
+                    from generalforecast.service.contracts import ServiceError
+
+                    raise ServiceError(code, message, status) from None
                 raise ModelRefError(code, message) from None
             self._loaded.add(name)
         with self._guard:

@@ -14,13 +14,14 @@ from typing import Literal
 
 import pyarrow as pa
 
+from generalforecast import _core
 from generalforecast.engine import LocalEngine
 from generalforecast.models.catalog import ModelRef
 from generalforecast.predictors.runtime.compiled import CompiledPlan
 from generalforecast.predictors.runtime.context import plan_predictor, served_context
 from generalforecast.predictors.runtime.forecast import ForecastContext
 from generalforecast.predictors.runtime.schema import TableSchema
-from generalforecast.predictors.runtime.tabular import TabularContext
+from generalforecast.predictors.runtime.tabular import TabularContext, bind_rows
 from generalforecast.predictors.runtime.validation import (
     admit,
     context_table,
@@ -70,6 +71,20 @@ def _bind(lock: CompiledPlan, model: tuple[LocalEngine, ModelRef], context: pa.T
 
 def _failure(error: PredictorError) -> ServiceError:
     return ServiceError(error.code, str(error), 422)
+
+
+def _refusal(error: _core.RequestError, message: str) -> ServiceError:
+    """An engine refusal as the Models API answers it.
+
+    One the engine answers 5xx, such as a worker starting again
+    (`ModelUnavailable`) or failing (`InferenceFailed`), keeps its code,
+    message and status, so a caller retries it rather than reading it as
+    bad input; any other is the predictor's own invalid `message`.
+    """
+    code, reason, status = error.args
+    if isinstance(status, int) and status >= 500:
+        return ServiceError(code, reason, status)
+    return ServiceError("ValidationError", message, 422)
 
 
 @dataclass(frozen=True)
@@ -130,6 +145,8 @@ class PreparedPredictor(ResourceFree):
             raise
         except PredictorError as error:
             raise _failure(error) from None
+        except _core.RequestError as error:
+            raise _refusal(error, "invalid predictor prediction input") from None
         except (ValueError, TypeError, pa.ArrowException):
             raise ServiceError(
                 "ValidationError", "invalid predictor prediction input", 422
@@ -140,6 +157,38 @@ class PreparedPredictor(ResourceFree):
             ) from None
 
 
+@dataclass(frozen=True)
+class CheckedPredictor(ResourceFree):
+    """A revision admitted and its context checked, with no model loaded.
+
+    What a control plane whose predictions a pool of its own serves keeps
+    of a binding: the rows the context binds, never weights or a worker.
+    """
+
+    lock: CompiledPlan
+    _schema: TableSchema
+    context_rows: int | None
+
+    def predict(
+        self, queries: pa.Table, *, context: pa.Table | None = None
+    ) -> pa.Table:
+        """Refused: a checked predictor holds no model to score with."""
+        raise ServiceError(
+            "Unsupported", "this executor checks predictors and serves none", 501
+        )
+
+
+def _checked(lock: CompiledPlan, context: pa.Table) -> tuple[TableSchema, int]:
+    """A context's schema and labeled rows, checked as a binding checks them, without a model."""
+    table, schema = context_table(lock, context)
+    rows = table.num_rows
+    if lock.task != "forecast":
+        assert lock.spec.target is not None
+        bind_rows(lock, table, schema)
+        rows -= table[lock.spec.target].null_count
+    return schema, rows
+
+
 class PredictorExecutor:
     """The curated engine adapter; operators may inject a separate admitted executor."""
 
@@ -148,23 +197,32 @@ class PredictorExecutor:
         *,
         allow_downloads: bool = False,
         surface: Literal["predictor", "local"] = "predictor",
+        load: bool = True,
     ) -> None:
         """Keeps online artifact acquisition an explicit host-operator decision.
 
         `surface` is the qualification gate models must pass: `predictor`
         for hosted serving, `local` for `gf.Predictor` on the user's machine
-        (`models.CatalogResolver`).
+        (`models.CatalogResolver`). Without `load`, `prepare` admits the
+        plan and checks its context but loads no model and binds nothing in
+        this process (`CheckedPredictor`): a control plane whose pool serves
+        its predictions holds no weights of its own.
         """
         from generalforecast.predictors.models import CatalogResolver
 
         self.allow_downloads = allow_downloads
         self.surface = surface
+        self.load = load
         self.resolver = CatalogResolver(surface)
 
     def prepare(
         self, lock: CompiledPlan, context: pa.Table | None
-    ) -> PreparedPredictor:
-        """Admits immutable content, loads hash-verified weights and warms bound context."""
+    ) -> PreparedPredictor | CheckedPredictor:
+        """Admits immutable content, loads hash-verified weights and warms bound context.
+
+        Without `load`, the content is admitted and the context checked
+        alone (`CheckedPredictor`).
+        """
         try:
             lock = admit(lock, self.resolver)
             mode = lock.spec.context.mode
@@ -173,6 +231,11 @@ class PredictorExecutor:
                 "bound context is required only for snapshot and live-context predictors",
                 "ContextRequired",
             )
+            if not self.load:
+                schema, rows = lock.schema, None
+                if context is not None:
+                    schema, rows = _checked(lock, context)
+                return CheckedPredictor(lock, schema, rows)
             model = _load(lock, self.allow_downloads, self.surface)
             bound, schema, rows = None, lock.schema, None
             if context is not None:
@@ -182,6 +245,8 @@ class PredictorExecutor:
             raise
         except PredictorError as error:
             raise _failure(error) from None
+        except _core.RequestError as error:
+            raise _refusal(error, "invalid predictor context") from None
         except (ValueError, TypeError, pa.ArrowException):
             raise ServiceError(
                 "ValidationError", "invalid predictor context", 422
@@ -192,4 +257,9 @@ class PredictorExecutor:
             ) from None
 
 
-__all__ = ["CONTEXT_ROWS_KEY", "PredictorExecutor", "PreparedPredictor"]
+__all__ = [
+    "CONTEXT_ROWS_KEY",
+    "CheckedPredictor",
+    "PredictorExecutor",
+    "PreparedPredictor",
+]
