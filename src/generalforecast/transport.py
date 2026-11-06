@@ -887,7 +887,12 @@ class _Policy:
             if status == 503 and self._retry(
                 method, body, attempt, _failure(status, _error_object(raw))
             ):
-                yield pause
+                # The service's Retry-After, when it sends one, is the wait.
+                yield (
+                    pause
+                    if wait is None
+                    else _Wait(min(wait, max(0.0, end - time.monotonic())))
+                )
                 continue
             return status, raw, wait
         raise AssertionError("unreachable")

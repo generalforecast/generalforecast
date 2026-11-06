@@ -761,6 +761,41 @@ def test_the_transport_carries_a_replys_retry_after_on_its_error(asynchronous, b
     assert "retry_after" not in first.to_dict()
 
 
+@both
+def test_a_transports_own_retries_wait_the_retry_after_of_a_503(
+    asynchronous, busy, monkeypatch
+):
+    # A transport built with `retries` tried a 503 again after its own short
+    # backoff, whatever the service asked for.
+    import generalforecast.transport as module
+
+    waits: list[float] = []
+
+    async def pause(seconds):
+        waits.append(seconds)
+
+    monkeypatch.setattr(module.time, "sleep", waits.append)
+    monkeypatch.setattr(module.asyncio, "sleep", pause)
+
+    async def go():
+        transport: Any = (AsyncTransport if asynchronous else Transport)(
+            busy, retries=1, retry_delay=0.1
+        )
+        try:
+            value = transport.send("GET", "/v1/projects/test/runs")
+            await value if inspect.isawaitable(value) else value
+        except ServiceError as error:
+            return error
+        finally:
+            if asynchronous:
+                await transport.aclose()
+        raise AssertionError("the 429 is not retried")
+
+    refused = asyncio.run(go())
+    assert refused.status == 429
+    assert waits == [2.0]
+
+
 @pytest.fixture
 def replies():
     """A server whose every reply is spoiled the way `.mode` names, its requests counted."""
