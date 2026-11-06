@@ -202,6 +202,8 @@ struct Pending {
     trace: String,
     table: TableId,
     bytes: u64,
+    /// The queries it asks: rows of features, or series to forecast.
+    queries: f64,
     arrived: Instant,
     /// When its caller stops waiting: `request_timeout` after it arrived, or
     /// later for a caller that waits longer, as a server's own warm-up does.
@@ -218,6 +220,7 @@ struct Submitted {
     request: RequestId,
     table: TableId,
     bytes: u64,
+    queries: f64,
 }
 
 /// A change to a table's rows, or to its fitted state.
@@ -906,9 +909,9 @@ pub struct ShardSettings {
     /// The worker seconds a step of a table is expected to take past which
     /// the table runs alone and after shorter work; see `Node::set_long_step`.
     pub long_step: Option<Duration>,
-    /// Whether a prediction whose wait for the work queued ahead of it is
-    /// past `request_timeout` is refused at once, with a `Retry-After`,
-    /// rather than queued to time out.
+    /// Whether a prediction whose wait for the work ahead of it and its own
+    /// step would end past `request_timeout` is refused at once, with a
+    /// `Retry-After`, rather than queued to time out; see `load`.
     pub shed: bool,
     /// Which cached context a full tier gives up first.
     pub eviction: Eviction,

@@ -691,6 +691,91 @@ def test_a_call_that_runs_out_of_memory_beside_a_compile_runs_again_once_it_is_d
     assert sizes == [1]
 
 
+def test_a_lone_item_that_runs_out_of_memory_runs_again_once_models_move_off_the_device() -> (
+    None
+):
+    # A Mitra-2 decode of a few queries against a 10,000-row context: one
+    # item, larger than the call budget, beside a model cache full of models
+    # no step uses.
+    cached = [True]
+    sizes: list[int] = []
+
+    def crowded(values: np.ndarray) -> np.ndarray:
+        sizes.append(len(values))
+        if cached[0]:
+            raise jax.errors.JaxRuntimeError(
+                "RESOURCE_EXHAUSTED: Out of memory while trying to allocate 4.14GiB"
+            )
+        return values
+
+    asked: list[int | None] = []
+
+    def room(needed: int | None) -> bool:
+        asked.append(needed)
+        was = cached[0]
+        cached[0] = False
+        return was
+
+    chunks = Chunks(lambda *_: None)
+    chunks.room = room
+    items = np.ones((1, 4), np.float32)
+
+    # The item runs again, rather than failing its step as the device's.
+    assert _run(chunks, crowded, items, items[0].nbytes) == [1]
+    assert sizes == [1, 1]
+    # By how much it ran short is not known, so every such model moves off.
+    assert asked == [None]
+
+    # With no model to move off, it fails as before, having asked once.
+    cached[0] = True
+    sizes.clear()
+    asked.clear()
+
+    def no_room(needed: int | None) -> bool:
+        asked.append(needed)
+        return False
+
+    chunks.room = no_room
+    with pytest.raises(jax.errors.JaxRuntimeError, match="RESOURCE_EXHAUSTED"):
+        _run(chunks, crowded, items, items[0].nbytes)
+    assert sizes == [1] and asked == [None]
+
+
+def test_a_call_that_needs_more_than_the_device_has_free_makes_room_before_it_runs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast.runtime import budget
+
+    items = np.ones((2, 256), np.float32)
+    # Each item's square matrix, held whole to sort: far more than its inputs.
+    held = jax.jit(jax.vmap(lambda row: jnp.sort(jnp.outer(row, row).ravel())[0]))
+    free = [1 << 10]
+    asked: list[int | None] = []
+
+    def room(needed: int | None) -> bool:
+        asked.append(needed)
+        free[0] = 1 << 30
+        return True
+
+    monkeypatch.setattr(budget, "free_device_bytes", lambda: free[0])
+    chunks = Chunks(lambda *_: None)
+    chunks.room = room
+
+    # A budget of one item's inputs: each call holds one item, by its measure.
+    assert _run(chunks, held, items, items[0].nbytes) == [1, 1]
+    # The first call, measured before it ran, asked for room for itself and
+    # the autotuning beside it; once there was room, nothing more was asked.
+    assert len(asked) == 1
+    measured = chunks._call_bytes("key", 1)
+    assert measured > 256 * 256 * 4
+    assert asked == [2 * measured]
+
+    # With the device's memory free, nothing moves.
+    asked.clear()
+    assert _run(chunks, held, items, items[0].nbytes) == [1, 1]
+    assert asked == []
+
+
 def test_a_call_too_large_to_autotune_beside_the_device_s_holdings_compiles_without_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

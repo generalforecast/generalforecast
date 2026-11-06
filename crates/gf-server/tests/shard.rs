@@ -55,6 +55,12 @@ const EXPIRE: u8 = 8;
 /// Answers every step at once but reports it took the worker 100 s, as a
 /// long fit or a large model's decode would.
 const SLOW: u8 = 9;
+/// Answers every step at once but reports it took the worker 40 s.
+const STEADY: u8 = 10;
+/// Answers every step at once but reports it took the worker 10 s of
+/// decodes for each query it answered, as a step of many callers' queries
+/// merged takes more than a step of one's.
+const DECODES: u8 = 11;
 
 /// Answers every frame the shard sends, in order; steps as `behaviour` says.
 /// Each step's units' actions go to `actions`, in the order sent. Models load
@@ -160,6 +166,27 @@ fn fake_worker(
                     SLOW => {
                         let mut reply = predictions(&frame.header, None);
                         reply.header["seconds"] = Value::from(100.0);
+                        reply
+                    }
+                    STEADY => {
+                        let mut reply = predictions(&frame.header, None);
+                        reply.header["seconds"] = Value::from(40.0);
+                        reply
+                    }
+                    DECODES => {
+                        let queries: u64 = frame.header["queries"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|batch| batch["count"].as_u64())
+                            .sum();
+                        let seconds = 10.0 * queries as f64;
+                        let mut reply = predictions(&frame.header, None);
+                        reply.header["seconds"] = Value::from(seconds);
+                        reply.header["stages"]["decode"]["seconds"] = Value::from(seconds);
+                        // Its programs were compiled before, so its decodes
+                        // are what later steps of the kind take.
+                        reply.header["compile_cache"]["misses"] = Value::from(0);
                         reply
                     }
                     _ => predictions(&frame.header, None),
@@ -1496,6 +1523,104 @@ async fn a_call_split_over_many_long_steps_on_an_idle_worker_never_refuses_itsel
     .expect("refused at once");
     assert_eq!(refused, Err(Code::ResourceExhausted));
     assert_eq!(shard.metrics.requests_shed.get(), 1);
+}
+
+/// A shard whose table `busy` has had two steps the worker reports in
+/// `behaviour`, with steps' callers waiting 60 s at most, and a worker that
+/// now holds every step it is sent.
+async fn after_two_steps(behaviour: u8) -> Harness {
+    let mut settings = settings();
+    settings.request_timeout = Duration::from_secs(60);
+    let shard = shard(settings).await;
+    shard.create_named("busy", 3).await.unwrap();
+    shard.insert_into("busy", &[1, 2, 3, 4], None).await;
+    shard.behaviour.store(behaviour, Ordering::Relaxed);
+    for _ in 0..2 {
+        assert_eq!(shard.predict_from("busy").await, Ok(1));
+    }
+    shard.behaviour.store(HANG, Ordering::Relaxed);
+    shard
+}
+
+#[tokio::test]
+async fn a_caller_waits_for_the_step_in_flight_on_its_own_predictor_and_is_refused_past_it() {
+    let shard = after_two_steps(STEADY).await;
+    // Another caller's step of the same predictor is in flight, expected to
+    // take 40 s: a new request waits for it, then takes 40 s of its own.
+    let _first = shard.send_predict("busy").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let refused = tokio::time::timeout(Duration::from_secs(5), shard.predict_from("busy"))
+        .await
+        .expect("refused at once");
+
+    assert_eq!(refused, Err(Code::ResourceExhausted));
+    assert_eq!(shard.metrics.requests_shed.get(), 1);
+}
+
+#[tokio::test]
+async fn callers_queued_on_one_predictor_are_refused_once_their_step_would_end_past_the_deadline() {
+    let shard = after_two_steps(DECODES).await;
+    // Each query takes 10 s of decodes, one caller's step is in flight, and
+    // every later caller's query joins the next step: five more fit in the
+    // 60 s a caller waits, the sixth would not.
+    let _first = shard.send_predict("busy").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut queued = Vec::new();
+    for _ in 0..5 {
+        queued.push(Box::pin(shard.send_predict("busy").await));
+    }
+    let answered = tokio::time::timeout(
+        Duration::from_millis(300),
+        futures::future::select_all(queued.iter_mut()),
+    )
+    .await;
+    if let Ok((answer, caller, _)) = answered {
+        panic!("caller {caller} was answered: {answer:?}");
+    }
+    assert_eq!(shard.metrics.requests_shed.get(), 0);
+
+    let refused = tokio::time::timeout(Duration::from_secs(5), shard.predict_from("busy"))
+        .await
+        .expect("refused at once");
+
+    assert_eq!(refused, Err(Code::ResourceExhausted));
+    assert_eq!(shard.metrics.requests_shed.get(), 1);
+    // The autoscaler's gauge counts the queued callers' step.
+    let reported = tokio::time::timeout(Duration::from_secs(5), async {
+        while shard.metrics.queue_wait() <= 50.0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(reported.is_ok(), "{}", shard.metrics.queue_wait());
+}
+
+#[tokio::test]
+async fn a_step_with_no_estimate_counts_towards_the_wait_as_it_runs() {
+    let mut settings = settings();
+    settings.request_timeout = Duration::from_secs(2);
+    let shard = shard(settings).await;
+    for table in ["first", "next"] {
+        shard.create_named(table, 3).await.unwrap();
+        shard.insert_into(table, &[1, 2, 3, 4], None).await;
+    }
+    // The model's first step on this worker, of which nothing is known.
+    shard.behaviour.store(HANG, Ordering::Relaxed);
+    let _first = shard.send_predict("first").await;
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    // A request that wakes the shard, which reports the wait as it handles it.
+    let _next = shard.send_predict("next").await;
+
+    // 1.2 s into its run, it is expected to run until its caller's
+    // deadline, 0.8 s on, rather than to have ended.
+    let reported = tokio::time::timeout(Duration::from_secs(5), async {
+        while shard.metrics.queue_wait() < 0.4 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(reported.is_ok(), "{}", shard.metrics.queue_wait());
 }
 
 #[tokio::test]

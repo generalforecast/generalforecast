@@ -32,6 +32,7 @@ from generalforecast.autotune import use_autotune_results
 from generalforecast.constants import SCATTER_THREADS
 from generalforecast.models.contract import TabularFunctions, TabularProperties
 from generalforecast.models.series import SeriesFunctions, SeriesProperties
+from generalforecast.runtime import budget as runtime_budget
 from generalforecast.runtime import shipped
 from generalforecast.runtime.budget import (
     Chunks,
@@ -310,8 +311,10 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         # finishes past its deadline: see `_keeping`.
         self._building = False
         self._chunks.expired = self._expired
-        # Which models' parameters the device holds; see `add_model`.
+        # Which models' parameters the device holds; see `add_model`. A call
+        # the device has no room for moves the models no step uses off it.
         self.residency = Residency()
+        self._chunks.room = self._room_for_call
         self._models: dict[int, _Model] = {}
         # The spec each model was loaded from, under which its kinds of call are recorded.
         self._specs: dict[int, str] = {}
@@ -471,6 +474,26 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
     def parameter_bytes(self) -> int:
         """Device bytes the loaded models' parameters hold, each array once."""
         return self.residency.device_bytes()
+
+    def _room_for_call(self, needed: int | None) -> bool:
+        """Moves models no step uses off the device until it has `needed` bytes free, or every such model for None; whether any moved.
+
+        The models not pinned keep their share of the device (`capacity`)
+        whether a step uses them or not, so a call whose activations need
+        more than the call budget, as Mitra-2's decodes against a 10,000-row
+        context do, takes that share's room before it would run out of
+        memory. A model moved off comes back, by a copy, when a step next
+        leases it. On a CPU, whose device is the host's memory, nothing
+        moves.
+        """
+        if self.budget.cpu:
+            return False
+        moved = self.residency.spill(runtime_budget.free_device_bytes, needed)
+        if moved:
+            logger.info(
+                "moved %d models no step uses off the device for a call's room", moved
+            )
+        return moved > 0
 
     def hold_models(self, capacity: int | None) -> None:
         """Takes the pinned models' parameters and `capacity` bytes for the rest from the device budget.

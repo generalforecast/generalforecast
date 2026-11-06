@@ -73,6 +73,59 @@ def test_the_model_used_least_recently_moves_off_the_device_first() -> None:
     assert isinstance(residency.parameters(0)["w"], np.ndarray)
 
 
+def test_a_calls_room_moves_the_models_no_step_uses_off_the_device_least_recent_first() -> (
+    None
+):
+    capacity = 3 * 64 * KIB
+    residency = Residency(capacity=capacity)
+    residency.add(9, _weights(256), pinned=True)
+    for model in range(3):
+        residency.add(model, _weights(64, float(model)))
+
+    # The device has 100 KiB free beside what the models hold.
+    def free() -> int:
+        return 100 * KIB + capacity - residency.cached_bytes()
+
+    with residency.lease([0]):
+        # Room for a call of 150 KiB: model 1, the least recent no step
+        # uses, moves off; model 0's step keeps it.
+        assert residency.spill(free, 150 * KIB) == 1
+        assert [residency.resident(model) for model in range(3)] == [True, False, True]
+        # Room the device has already moves nothing.
+        assert residency.spill(free, 100 * KIB) == 0
+        # For a call that ran out of memory, every model no step uses.
+        assert residency.spill(free) == 1
+        assert [residency.resident(model) for model in range(3)] == [True, False, False]
+        assert residency.spill(free) == 0
+    assert residency.resident(9)
+    assert residency.report().evictions == 2
+    # A model moved off comes back as it was when a step needs it.
+    with residency.lease([1]):
+        np.testing.assert_array_equal(np.asarray(residency.parameters(1)["w"]), 1.0)
+
+
+def test_a_worker_on_an_accelerator_makes_room_for_a_call_from_its_model_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast.runtime import budget as runtime_budget
+
+    worker = Worker.__new__(Worker)
+    worker.residency = Residency(capacity=2 * 64 * KIB)
+    worker.residency.add(0, _weights(64))
+    worker.residency.add(1, _weights(64))
+    monkeypatch.setattr(runtime_budget, "free_device_bytes", lambda: None)
+
+    # On a CPU, whose device is the host's memory, nothing moves.
+    worker.budget = MemoryBudget(GIB, GIB, cpu=True)
+    assert not worker._room_for_call(None)
+    assert worker.residency.resident(0) and worker.residency.resident(1)
+
+    worker.budget = MemoryBudget(GIB, GIB, cpu=False)
+    assert worker._room_for_call(None)
+    assert not worker.residency.resident(0) and not worker.residency.resident(1)
+    assert not worker._room_for_call(None)
+
+
 def test_a_pinned_model_is_never_moved_off_the_device_nor_counted_against_the_rest() -> (
     None
 ):
