@@ -38,7 +38,7 @@ use crate::as_of::{self, AsOf};
 use crate::auth::digest;
 use crate::budget::{Charge, RequestBudget};
 use crate::engine::{self, Bound, Engine};
-use crate::error::ServerError;
+use crate::error::{ServerError, UNAVAILABLE_RETRY_SECONDS};
 use crate::name::TableName;
 use crate::predictors::{self, ContextMode, ForecastPredictor, ServedPredictor};
 use crate::progress::Compiling;
@@ -742,7 +742,11 @@ fn failure(scope: Option<&Scope>, error: &ApiError) -> Response {
         None => error.body(),
     };
     let mut response = respond(error.status, &body);
-    if let Some(seconds) = error.retry_after {
+    // Every 503 may be retried, so each says when.
+    let retry = error
+        .retry_after
+        .or_else(|| (error.status == 503).then_some(u64::from(UNAVAILABLE_RETRY_SECONDS)));
+    if let Some(seconds) = retry {
         response
             .headers_mut()
             .insert(header::RETRY_AFTER, HeaderValue::from(seconds));
@@ -858,7 +862,7 @@ async fn answer(
         return Ok(if ready {
             respond(200, &json!({"status": "ok"}))
         } else {
-            respond(503, &not_ready().body())
+            failure(None, &not_ready())
         });
     }
     if !front.hosts.is_empty() {
@@ -1171,7 +1175,7 @@ impl Front {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApiError, ServerError, failure, header};
+    use super::{ApiError, ServerError, UNAVAILABLE_RETRY_SECONDS, failure, header, not_ready};
 
     #[test]
     fn a_step_the_device_cannot_hold_answers_503_with_retry_after() {
@@ -1179,11 +1183,37 @@ mod tests {
             "the step needs 10560 MiB".to_string(),
         ));
         let refused = failure(None, &error);
-        let other = failure(None, &ApiError::from(ServerError::Busy("full".into())));
 
         assert_eq!(refused.status(), 503);
         assert_eq!(refused.headers()[header::RETRY_AFTER], "10");
-        assert!(!other.headers().contains_key(header::RETRY_AFTER));
+    }
+
+    #[test]
+    fn every_503_answers_with_a_retry_after() {
+        let unavailable = UNAVAILABLE_RETRY_SECONDS.to_string();
+        for error in [
+            ApiError::from(ServerError::Busy("full".into())),
+            ApiError::from(ServerError::Unavailable("restarting".into())),
+            ApiError::from(ServerError::Internal("failed".into())),
+            not_ready(),
+            ApiError::new("ModelNotReady", "control plane is unavailable", 503),
+        ] {
+            let refused = failure(None, &error);
+            assert_eq!(refused.status(), 503, "{}", error.code);
+            assert_eq!(refused.headers()[header::RETRY_AFTER], unavailable.as_str());
+        }
+        for error in [
+            ApiError::validation("context exceeds the predictor's max_rows"),
+            ApiError::new(
+                "CapacityExceeded",
+                "request body exceeds 1048576 bytes",
+                413,
+            ),
+            ApiError::new("RequestTimeout", "timed out", 504),
+        ] {
+            let refused = failure(None, &error);
+            assert!(!refused.headers().contains_key(header::RETRY_AFTER));
+        }
     }
 
     #[test]

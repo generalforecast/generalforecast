@@ -43,6 +43,12 @@ pub const DEVICE_MEMORY_CODE: &str = "DeviceMemoryExceeded";
 /// long enough for the pool to start or free a device that holds the step.
 pub const DEVICE_MEMORY_RETRY_SECONDS: u32 = 10;
 
+/// Seconds a client waits before retrying any other 503: a model loading or
+/// restarting, a full server, a control plane it cannot reach. Every 503 the
+/// Models API answers carries a `Retry-After`, this one unless its error
+/// names its own.
+pub const UNAVAILABLE_RETRY_SECONDS: u32 = 5;
+
 /// What an error means to a client: its Flight status code, its Models API
 /// status and code, and the message the Models API answers with, None where
 /// the error's own message is safe to show.
