@@ -318,3 +318,79 @@ def test_the_plane_asks_a_process_of_its_own_for_the_estimate() -> None:
     assert smaller is not None and smaller["padded"] == 2048
     assert other == {"A10G": [None], "L40S": [None]}
     assert hosting.device_room(A10G_LIMIT, PARAMETERS) == (7452 * MIB, 7452 * MIB)
+
+
+def test_a_pool_fit_leaves_its_steps_what_a_worker_holding_its_models_does(
+    monkeypatch, tmp_path
+) -> None:
+    # A worker keeps its pinned models and its model cache's whole share off
+    # what its steps have; the fit the plane checks pushes against must
+    # leave them the same, not the room every model's parameters leave.
+    import numpy as np
+
+    from generalforecast.models import registry
+    from generalforecast.runtime import budget, shipped, step_memory
+    from generalforecast.worker import residency
+    from generalforecast.worker_process import _model_capacity
+
+    sizes = {"general-forecast/a": 3 * GIB, "general-forecast/b": GIB}
+    monkeypatch.setattr(
+        registry,
+        "load_engine_model",
+        lambda spec: (None, {"w": np.zeros(sizes[spec] // 4, np.float32)}),
+    )
+    monkeypatch.setattr(shipped, "identity", lambda *args: "gpu")
+    gpu = budget.MemoryBudget(device=A10G_LIMIT, host=64 * GIB, cpu=False)
+    monkeypatch.setattr(budget.MemoryBudget, "measure", classmethod(lambda cls: gpu))
+    monkeypatch.setattr(
+        step_memory,
+        "parameter_bytes",
+        lambda parameters, settings: parameters["w"].nbytes,
+    )
+
+    def room(**environment: str) -> int:
+        for name in (residency.PINNED_ENV, residency.CACHE_ENV):
+            monkeypatch.delenv(name, raising=False)
+        for name, value in environment.items():
+            monkeypatch.setenv(name, value)
+        return step_memory.pool_fit(tmp_path, sizes)["room"]
+
+    # Every model pinned, and the default share of what they leave cached.
+    cache = _model_capacity(gpu, 4 * GIB)
+    assert cache is not None
+    held = 4 * GIB + cache
+    assert room() == device_room(A10G_LIMIT, held)[0]
+    # The pool's residency: one pinned, the rest sharing a 2 GiB cache.
+    pinned = {residency.PINNED_ENV: "general-forecast/a"}
+    assert (
+        room(**pinned, **{residency.CACHE_ENV: "2GiB"})
+        == device_room(A10G_LIMIT, 5 * GIB)[0]
+    )
+    assert room(**pinned) < device_room(A10G_LIMIT, 4 * GIB)[0]
+
+
+def test_models_held_are_the_pinned_and_their_caches_bound() -> None:
+    from generalforecast.runtime.step_memory import models_held
+
+    sizes = {"a": 3 * GIB, "b": GIB}
+    assert models_held(20 * GIB, sizes, ["a"], "4GiB") == 7 * GIB
+    # A cache named past half of what the pinned leave is cut to it.
+    assert models_held(10 * GIB, sizes, ["a"], "9GiB") == 3 * GIB + 7 * GIB // 2
+    assert models_held(20 * GIB, sizes, ["a", "b"]) == 4 * GIB + 16 * GIB // 8
+
+
+def test_a_models_parameters_are_counted_in_the_dtype_a_worker_holds_them() -> None:
+    import jax.numpy as jnp
+    import numpy as np
+
+    from generalforecast.runtime.step_memory import parameter_bytes
+
+    parameters = {
+        "w": np.zeros((4, 8), np.float32),
+        "ids": np.zeros(16, np.int32),
+        "scale": 2.0,
+    }
+    half = SimpleNamespace(compute_dtype=jnp.bfloat16)
+    exact = SimpleNamespace(compute_dtype=jnp.float32)
+    assert parameter_bytes(parameters, half) == 32 * 2 + 16 * 4
+    assert parameter_bytes(parameters, exact) == 32 * 4 + 16 * 4

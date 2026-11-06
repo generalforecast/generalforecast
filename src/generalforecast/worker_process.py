@@ -289,11 +289,9 @@ def _model_capacity(budget: MemoryBudget, pinned: int) -> int | None:
     """
     if budget.cpu:
         return None
-    left = max(0, budget.device - pinned)
-    named = os.environ.get(residency.CACHE_ENV)
-    if named is None:
-        return left // residency.DEFAULT_CACHE_SHARE
-    return min(residency.parse_bytes(named), left // 2)
+    return residency.cache_bytes(
+        budget.device, pinned, os.environ.get(residency.CACHE_ENV)
+    )
 
 
 def _host_capacity(budget: MemoryBudget) -> int:
