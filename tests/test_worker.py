@@ -552,7 +552,7 @@ def test_a_worker_loads_a_model_beside_its_steps_and_reports_it_by_name(
 
     release = threading.Event()
 
-    def load(spec: str) -> tuple[Any, Any]:
+    def load(spec: str, bases: Any = None) -> tuple[Any, Any]:
         if spec == "broken":
             raise OSError("no weights")
         assert release.wait(10)
@@ -581,12 +581,16 @@ def test_a_worker_loads_a_model_beside_its_steps_and_reports_it_by_name(
     assert sent.empty() and "slow" not in names
 
     release.set()
-    assert sent.get(timeout=10) == {"kind": "loaded", "name": "slow"}
+    reported = sent.get(timeout=10)
+    assert reported.pop("models")["models"] == 2
+    assert reported == {"kind": "loaded", "name": "slow"}
     assert names["slow"] == 1
     assert answer({"kind": "add_model", "name": "broken", "spec": "broken"}) == {
         "kind": "loading"
     }
-    assert sent.get(timeout=10) == {
+    reported = sent.get(timeout=10)
+    assert reported.pop("models")["models"] == 2
+    assert reported == {
         "kind": "loaded",
         "name": "broken",
         "failure": "OSError: no weights",

@@ -36,7 +36,7 @@ use tokio::time::Instant;
 
 use crate::config::WorkerConfig;
 use crate::progress::Compiling;
-use crate::protocol::{Frame, PROTOCOL_VERSION, WorkerReply, WorkerRequest};
+use crate::protocol::{Frame, ModelResidency, PROTOCOL_VERSION, WorkerReply, WorkerRequest};
 
 /// How long a worker may take to load its models and connect.
 const STARTUP: Duration = Duration::from_secs(600);
@@ -52,6 +52,8 @@ pub struct Loaded {
     pub name: String,
     /// Why the model could not load, if it could not.
     pub failure: Option<String>,
+    /// What the worker's device holds of its models after the load.
+    pub models: Option<ModelResidency>,
 }
 
 /// Frames whose buffers total at least this many bytes travel through shared memory.
@@ -275,12 +277,21 @@ impl Pipeline {
                     wake.notify_one();
                     continue;
                 }
-                if let Ok(WorkerReply::Loaded { name, failure }) = WorkerReply::of(&frame) {
+                if let Ok(WorkerReply::Loaded {
+                    name,
+                    failure,
+                    models,
+                }) = WorkerReply::of(&frame)
+                {
                     let (loads, wake) = &*loading;
                     loads
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
-                        .push(Loaded { name, failure });
+                        .push(Loaded {
+                            name,
+                            failure,
+                            models,
+                        });
                     wake.notify_one();
                     continue;
                 }

@@ -348,6 +348,9 @@ impl Shard {
     /// region rebuild's, keeps its cost as rebuild seconds.
     fn count_costs(&mut self, step: &Step, outcome: &Outcome) -> HashMap<RequestId, Share> {
         self.metrics.worker_seconds.add(outcome.seconds);
+        if let Some(models) = outcome.models {
+            self.metrics.set_models(self.load_slot, models);
+        }
         for (name, time) in &outcome.stages {
             let stage = self.metrics.stage(name);
             stage.calls.add(time.calls);

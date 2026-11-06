@@ -12,6 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::protocol::ModelResidency;
+
 /// A count that only goes up.
 #[derive(Debug, Default)]
 pub struct Counter(AtomicU64);
@@ -251,6 +253,13 @@ pub struct Metrics {
     pub move_seconds: Histogram,
     /// The busiest shard's worker time over the mean at the last round, times 1000.
     pub placement_imbalance: Gauge,
+    /// What each shard's worker device holds of its models, as it last
+    /// reported, by the slot `queue_wait_slot` gave the shard.
+    models: Mutex<Vec<ModelResidency>>,
+    /// Models a worker could not load for want of device room, which a
+    /// caller retries (`DeviceMemoryExceeded`), and for any other reason.
+    pub model_loads_refused: Counter,
+    pub model_loads_failed: Counter,
     stages: Mutex<BTreeMap<String, Arc<Stage>>>,
     /// The parts of workers' steps outside their compiled calls, which split
     /// a step's time; see the worker's `WorkerStats.parts`.
@@ -263,6 +272,14 @@ pub struct Metrics {
     memory_peaks: Mutex<BTreeMap<String, Arc<Gauge>>>,
     by_table: Mutex<BTreeMap<String, Arc<TableMetrics>>>,
     timings: Option<TimingLog>,
+}
+
+/// Writes a gauge's series, one per value of `label`.
+fn gauges(text: &mut String, name: &str, help: &str, label: &str, values: &[(&str, u64)]) {
+    let _ = write!(text, "# HELP {name} {help}\n# TYPE {name} gauge\n");
+    for (value, count) in values {
+        let _ = writeln!(text, "{name}{{{label}=\"{value}\"}} {count}");
+    }
 }
 
 fn counter(text: &mut String, name: &str, help: &str, value: u64) {
@@ -296,6 +313,72 @@ fn histogram(text: &mut String, name: &str, labels: &str, histogram: &Histogram)
 }
 
 impl Metrics {
+    /// The workers' model residency: models and bytes on their devices,
+    /// models moved off and back, and loads that failed.
+    fn render_models(&self, text: &mut String) {
+        let models = self.models();
+        gauges(
+            text,
+            "gf_worker_models",
+            "Models workers serve, by where their parameters are: pinned to the device, on it by recent use, or off it.",
+            "state",
+            &[
+                ("pinned", models.pinned),
+                ("cached", models.resident.saturating_sub(models.pinned)),
+                ("off_device", models.models.saturating_sub(models.resident)),
+            ],
+        );
+        gauges(
+            text,
+            "gf_worker_model_bytes",
+            "Bytes workers' model parameters take: pinned to the device, on it by recent use, and off it in host memory.",
+            "state",
+            &[
+                ("pinned", models.pinned_bytes),
+                ("cached", models.cached_bytes),
+                ("host", models.host_bytes),
+            ],
+        );
+        if let Some(capacity) = models.capacity_bytes {
+            let _ = write!(
+                text,
+                "# HELP gf_worker_model_capacity_bytes Device bytes workers give models not pinned.\n# TYPE gf_worker_model_capacity_bytes gauge\ngf_worker_model_capacity_bytes {capacity}\n"
+            );
+        }
+        counter(
+            text,
+            "gf_worker_model_evictions_total",
+            "Models workers moved off their device to make room for others.",
+            models.evictions,
+        );
+        counter(
+            text,
+            "gf_worker_model_restores_total",
+            "Models workers put back on their device for a step.",
+            models.restores,
+        );
+        counter(
+            text,
+            "gf_worker_model_reloads_total",
+            "Models workers loaded again after dropping their host copy.",
+            models.reloads,
+        );
+        let _ = write!(
+            text,
+            "# HELP gf_model_load_failures_total Models workers could not load beside their steps, by reason.\n# TYPE gf_model_load_failures_total counter\n"
+        );
+        let _ = writeln!(
+            text,
+            "gf_model_load_failures_total{{reason=\"device_memory\"}} {}",
+            self.model_loads_refused.get()
+        );
+        let _ = writeln!(
+            text,
+            "gf_model_load_failures_total{{reason=\"other\"}} {}",
+            self.model_loads_failed.get()
+        );
+    }
+
     /// Metrics that also log each answered request's timings, appended to `path`.
     ///
     /// # Errors
@@ -343,6 +426,38 @@ impl Metrics {
         {
             *wait = millis;
         }
+    }
+
+    /// Keeps what a shard's worker reported its device holds of its models.
+    pub fn set_models(&self, slot: usize, residency: ModelResidency) {
+        let mut models = self.models.lock().unwrap_or_else(PoisonError::into_inner);
+        if models.len() <= slot {
+            models.resize(slot + 1, ModelResidency::default());
+        }
+        models[slot] = residency;
+    }
+
+    /// What every shard's worker device holds of its models, summed.
+    #[must_use]
+    pub fn models(&self) -> ModelResidency {
+        let models = self.models.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut sum = ModelResidency::default();
+        for one in models.iter() {
+            sum.resident += one.resident;
+            sum.pinned += one.pinned;
+            sum.models += one.models;
+            sum.pinned_bytes += one.pinned_bytes;
+            sum.cached_bytes += one.cached_bytes;
+            sum.host_bytes += one.host_bytes;
+            sum.evictions += one.evictions;
+            sum.restores += one.restores;
+            sum.reloads += one.reloads;
+            sum.refusals += one.refusals;
+            if let Some(capacity) = one.capacity_bytes {
+                *sum.capacity_bytes.get_or_insert(0) += capacity;
+            }
+        }
+        sum
     }
 
     /// The longest any shard estimates a new request would wait for the
@@ -624,6 +739,7 @@ impl Metrics {
             "# HELP gf_placement_imbalance The busiest shard's worker time over the mean at the last round.\n# TYPE gf_placement_imbalance gauge\ngf_placement_imbalance {}\n",
             self.placement_imbalance.get() as f64 / 1000.0
         );
+        self.render_models(&mut text);
         let stages = self
             .stages
             .lock()

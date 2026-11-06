@@ -23,7 +23,7 @@ models, wherever it runs.
 
 import dataclasses
 import importlib
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache, partial
 from pathlib import Path
@@ -314,15 +314,31 @@ def _derived_variant(
     Keyed by everything `made` is, its weights' digest included, so a model
     whose weights changed under its name never runs from this cache.
     """
-    from generalforecast.models import derived
-    from generalforecast.models.bagged import Bagged, bagged_functions
-
     entry = _catalog.ENTRIES[made.base]
     functions, parameters = (
         _served(entry.id, surface, allow_downloads)
         if surface != "local"
         else _native(entry, surface, allow_downloads)
     )
+    return _derive(made, functions, parameters, codes, estimators)
+
+
+def _derive(
+    made: Any,
+    functions: Any,
+    parameters: Any,
+    codes: int | None,
+    estimators: int | None,
+) -> Model:
+    """A derived model as one `Bagged` model over its base, whose parameters it holds by reference.
+
+    Raises:
+        ModelRefError: For a forecaster base, no resolver, or weights that
+            do not match what `made` says they are.
+    """
+    from generalforecast.models import derived
+    from generalforecast.models.bagged import Bagged, bagged_functions
+
     if isinstance(functions, SeriesFunctions):
         raise ModelRefError(
             "UnsupportedCapability",
@@ -362,16 +378,22 @@ def _derived_variant(
         bagged_functions(functions),
         Bagged(parameters, weights.own, made.bags, combine),
     )
-    return wrap(*bagged, ModelRef(entry.id, codes, estimators))
+    return wrap(*bagged, ModelRef(made.base, codes, estimators))
 
 
-def load_engine_model(spec: str) -> Model:
+def load_engine_model(spec: str, bases: Mapping[str, Model] | None = None) -> Model:
     """Loads what the engine's workers were started with.
 
     A spec is a catalog id, a custom model's `module:attribute` or a
     registered implementation's id (see `register`). A custom model is
     checked against its contract as it loads, so one the engine would run
     wrongly fails to load instead.
+
+    `bases` are catalog models the worker loaded already, by catalog id, as
+    `load_engine_model` gave them and the worker configured them: a derived
+    model on one of them runs over its parameters by reference rather than
+    over a copy of its own, so a worker holds one base however many
+    fine-tunes of it it serves.
     """
     loader = IMPLEMENTATIONS.get(spec)
     if loader is not None:
@@ -382,7 +404,42 @@ def load_engine_model(spec: str) -> Model:
         from generalforecast.models import custom
 
         return custom.checked(spec)
+    if ref.derived and bases:
+        _catalog.admit(ref, "local")
+        made = _catalog.resolve_derived(ref)
+        if made.base in bases:
+            return _derive(made, *bases[made.base], ref.codes, ref.estimators)
     return load_ref(ref)
+
+
+def catalog_base(spec: str) -> str | None:
+    """The catalog id a spec loads as it is, with no codes or estimators, which derived models run over; else None."""
+    if spec in IMPLEMENTATIONS:
+        return None
+    try:
+        ref = _catalog.parse(spec)
+    except ValueError:
+        return None
+    if ref.custom or ref.derived or ref.variant:
+        return None
+    return ref.entry.id
+
+
+def derived_base(spec: str) -> str | None:
+    """The catalog id of the base a derived model's spec runs over; None for any other spec.
+
+    Raises:
+        ModelRefError: For a derived model no resolver keeps.
+    """
+    if spec in IMPLEMENTATIONS:
+        return None
+    try:
+        ref = _catalog.parse(spec)
+    except ValueError:
+        return None
+    if not ref.derived:
+        return None
+    return str(_catalog.resolve_derived(ref).base)
 
 
 def wrap(functions: Any, parameters: Any, ref: ModelRef) -> Model:

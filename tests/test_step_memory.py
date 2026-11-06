@@ -30,6 +30,7 @@ from generalforecast.worker.admission import (
     DeviceMemoryRefused,
     step_bytes,
 )
+from generalforecast.worker.residency import Residency
 from generalforecast.worker.runner import DEVICE_MEMORY, Worker, _kind
 
 MIB = 1 << 20
@@ -240,6 +241,8 @@ def test_a_step_the_device_cannot_hold_fails_with_its_kind(monkeypatch) -> None:
     worker.stats = SimpleNamespace(timed=lambda name: _Null())
     worker.apply = lambda movement: None
     worker._widened = lambda step: step
+    # Tables of no model: the step leases none.
+    worker._tables, worker.residency = {}, Residency()
     errors = {
         0: DeviceMemoryRefused("the slice needs 10 GiB", 10, 7),
         1: RuntimeError("bad rows"),

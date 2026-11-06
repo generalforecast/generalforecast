@@ -42,7 +42,7 @@ from generalforecast.runtime.device import (
     untuned_matmuls,
 )
 from generalforecast.system import pin_cpus
-from generalforecast.worker import Worker
+from generalforecast.worker import Worker, residency
 
 Frame = tuple[dict[str, Any], list[bytes]]
 # The event JAX records as XLA finishes compiling a program.
@@ -96,14 +96,20 @@ def main(arguments: Sequence[str] | None = None) -> int:
     for module in filter(None, os.environ.get("GF_WORKER_MODULES", "").split(",")):
         importlib.import_module(module)
     names: dict[str, int] = {}
-    for entry in options.model or []:
-        name, spec = entry.split("=", 1)
+    # The catalog models loaded as they are, by catalog id, which derived
+    # models run over by reference.
+    bases: dict[str, int] = {}
+    started = [entry.split("=", 1) for entry in options.model or []]
+    pinned = _pinned([name for name, _ in started])
+    for name, spec in started:
         names[name] = len(names)
-        worker.add_model(names[name], *registry.load_engine_model(spec), spec=spec)
-    # The models' parameters stay on the device beside its pool and calls: a
-    # 24 GB GPU serving every catalog model holds 5 GiB of them.
-    budget = budget.holding(worker.parameter_bytes())
-    worker.budget = budget
+        _load_model(worker, bases, names[name], spec, pinned=name in pinned)
+    # The pinned models' parameters stay on the device beside its pool and
+    # calls, and the rest share a bound of it, both taken from the budget:
+    # a 24 GB GPU serving every catalog model holds 5 GiB of them.
+    worker.residency.host_capacity = _host_capacity(budget)
+    worker.hold_models(_model_capacity(budget, worker.residency.pinned_bytes()))
+    budget = worker.budget
 
     connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -195,7 +201,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     def loaded(frame: dict[str, Any]) -> None:
         replies.put(lambda: (frame, []))
 
-    loads = _Loads(worker, names, loaded, progressed)
+    loads = _Loads(worker, names, loaded, progressed, bases)
     while (frame := frames.get()) is not None:
         replies.put(_answer(worker, names, progressed, *frame, loads=loads))
         # After the answer, so the server hears `Loading` before `Loaded`.
@@ -224,9 +230,15 @@ class _Loads:
         names: dict[str, int],
         send: Callable[[dict[str, Any]], None],
         progressed: Callable[..., None],
+        bases: dict[str, int] | None = None,
     ) -> None:
-        """Loads into `worker` under `names`, reporting through `send`."""
+        """Loads into `worker` under `names`, reporting through `send`.
+
+        `bases` are the catalog models loaded as they are, by catalog id,
+        which a derived model runs over rather than over a copy.
+        """
         self._worker, self._names = worker, names
+        self._bases = {} if bases is None else bases
         self._send, self._progressed = send, progressed
         self._asked: list[tuple[str, str]] = []
         self._loading = ThreadPoolExecutor(1, thread_name_prefix="gf-load")
@@ -248,15 +260,105 @@ class _Loads:
             if name not in self._names:
                 # Loads run one at a time, and only they add names.
                 model = len(self._names)
-                self._worker.add_model(
-                    model, *registry.load_engine_model(spec), spec=spec
-                )
+                # Loaded beside the steps, it shares the device with the
+                # models not pinned, and makes room among them first.
+                _load_model(self._worker, self._bases, model, spec, staged=True)
                 if self._worker.allocated:
-                    self._worker.warm_start(self._progressed, models=[model])
+                    with self._worker.residency.lease([model]):
+                        self._worker.warm_start(self._progressed, models=[model])
                 self._names[name] = model
         except Exception as error:  # noqa: BLE001
             failure = f"{type(error).__name__}: {error}"
-        self._send(protocol.reply(protocol.Loaded(name, failure)))
+        models = self._worker.residency.report().frame()
+        self._send(protocol.reply(protocol.Loaded(name, failure, models)))
+
+
+def _pinned(started: Sequence[str]) -> set[str]:
+    """The models started that stay on the device: those `PINNED_ENV` names, else every one."""
+    named = os.environ.get(residency.PINNED_ENV)
+    if named is None:
+        return set(started)
+    return {name.strip() for name in named.split(",") if name.strip()}
+
+
+def _model_capacity(budget: MemoryBudget, pinned: int) -> int | None:
+    """Device bytes the models not pinned share: `CACHE_ENV`'s, else a share of what the pinned leave.
+
+    At most half of what the pinned models leave, so contexts and calls keep
+    the rest. None on a CPU, whose device is the host's memory.
+    """
+    if budget.cpu:
+        return None
+    left = max(0, budget.device - pinned)
+    named = os.environ.get(residency.CACHE_ENV)
+    if named is None:
+        return left // residency.DEFAULT_CACHE_SHARE
+    return min(residency.parse_bytes(named), left // 2)
+
+
+def _host_capacity(budget: MemoryBudget) -> int:
+    """Host bytes models moved off the device keep: `HOST_ENV`'s, else a share of the worker's."""
+    named = os.environ.get(residency.HOST_ENV)
+    if named is None:
+        return budget.host // budget.workers // residency.DEFAULT_HOST_SHARE
+    return residency.parse_bytes(named)
+
+
+def _load_model(
+    worker: Worker,
+    bases: dict[str, int],
+    model: int,
+    spec: str,
+    *,
+    pinned: bool = False,
+    staged: bool = False,
+) -> None:
+    """Loads a model from its spec into `worker`, over the loaded base it derives from, if any.
+
+    A derived model whose base is loaded holds the base's parameters by
+    reference, the base on the device meanwhile. `staged` loads the
+    parameters in host memory first, so the device takes them only once the
+    residency made room (see `Residency.add`), rather than running out of
+    memory part way through the load.
+    """
+    base = registry.derived_base(spec)
+    over = [bases[base]] if base in bases else []
+
+    def load(staged: bool) -> tuple[Any, Any]:
+        # Only the base it runs over: another's parameters are not read.
+        shared = {}
+        if base is not None and over:
+            entry = worker._models[over[0]]
+            shared[base] = (entry.functions, worker.residency.parameters(over[0]))
+        with _staging(staged):
+            return registry.load_engine_model(spec, bases=shared)
+
+    def reload() -> Any:
+        # Loaded again while steps run, so in host memory first, over its
+        # base as it is then.
+        with worker.residency.lease(over):
+            return worker.configured(load(True)[1])
+
+    with worker.residency.lease(over):
+        functions, parameters = load(staged)
+        worker.add_model(
+            model,
+            functions,
+            parameters,
+            spec=spec,
+            pinned=pinned,
+            reload=None if pinned else reload,
+        )
+    catalog = registry.catalog_base(spec)
+    if catalog is not None and catalog not in bases:
+        bases[catalog] = model
+
+
+def _staging(staged: bool) -> contextlib.AbstractContextManager[Any]:
+    """Arrays made within it are in host memory where `staged` and the device is an accelerator."""
+    if not staged or jax.default_backend() == "cpu":
+        return contextlib.nullcontext()
+    return jax.default_device(jax.devices("cpu")[0])
 
 
 # The compile cache's counts as the last reply that carried them read them.
@@ -325,6 +427,7 @@ def _handled(
                         deferred=worker.deferred,
                         kinds=worker.failure_kinds,
                     )
+                    frame[0]["models"] = worker.residency.report().frame()
                     held = memory.reading() if worker.timers else None
                 frame[0].update(
                     protocol.timing(

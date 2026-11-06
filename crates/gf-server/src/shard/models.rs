@@ -103,6 +103,9 @@ impl Shard {
                 continue;
             };
             let adding = self.adding.remove(at).expect("found above");
+            if let Some(models) = report.models {
+                self.metrics.set_models(self.load_slot, models);
+            }
             let outcome = match report.failure {
                 None => {
                     self.worker.models.push(adding.name.clone());
@@ -113,10 +116,16 @@ impl Shard {
                         .insert(adding.name.clone(), adding.spec);
                     Ok(())
                 }
-                Some(failure) => Err(ServerError::Invalid(format!(
-                    "model {:?} could not load: {failure}",
-                    adding.name
-                ))),
+                Some(failure) => {
+                    let error = load_failure(&adding.name, &failure);
+                    if matches!(error, ServerError::DeviceMemory(_)) {
+                        self.metrics.model_loads_refused.add(1);
+                    } else {
+                        self.metrics.model_loads_failed.add(1);
+                    }
+                    tracing::warn!(model = adding.name, "a model could not load: {failure}");
+                    Err(error)
+                }
             };
             for waiter in adding.waiters {
                 let _ = waiter.send(outcome.clone());
@@ -163,5 +172,54 @@ impl Shard {
                 let _ = waiter.send(Err(error.clone()));
             }
         }
+    }
+}
+
+/// The answer to a call whose model the worker could not load: where its
+/// device could not make room for the model's parameters even with every
+/// model not pinned and not in use moved off it, a 503 the client retries
+/// (`DeviceMemoryExceeded`, with a `Retry-After`), as another GPU, or this
+/// one later, may hold it; otherwise the model's own failure.
+fn load_failure(name: &str, failure: &str) -> ServerError {
+    match failure.strip_prefix("DeviceMemoryRefused: ") {
+        Some(reason) => ServerError::DeviceMemory(format!(
+            "the GPU this request reached cannot hold model {name:?} beside the \
+             models it keeps now ({reason}); retry shortly, as another GPU may hold it"
+        )),
+        None => ServerError::Invalid(format!("model {name:?} could not load: {failure}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::http::ApiError;
+
+    #[test]
+    fn a_model_the_device_cannot_make_room_for_answers_503_with_retry_after() {
+        let error = load_failure(
+            "acme/x@ft1",
+            "DeviceMemoryRefused: its parameters take 900 MiB of the device",
+        );
+
+        assert!(matches!(error, ServerError::DeviceMemory(_)));
+        let api = ApiError::from(error);
+        assert_eq!(api.status, 503);
+        assert_eq!(api.code, crate::error::DEVICE_MEMORY_CODE);
+        assert!(api.retry_after.is_some_and(|seconds| seconds > 0));
+        assert!(api.message.contains("its parameters take 900 MiB"));
+        assert!(!api.message.contains("DeviceMemoryRefused"));
+    }
+
+    #[test]
+    fn a_model_that_fails_otherwise_keeps_its_reason() {
+        let error = load_failure("acme/x@ft1", "OSError: no weights");
+
+        assert_eq!(
+            error,
+            ServerError::Invalid(
+                "model \"acme/x@ft1\" could not load: OSError: no weights".to_string()
+            )
+        );
     }
 }
