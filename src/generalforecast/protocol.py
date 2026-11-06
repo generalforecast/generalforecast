@@ -783,10 +783,15 @@ class Loading:
 
 @dataclass(frozen=True)
 class Loaded:
-    """Sent once a model `AddModel` named has loaded, or with why it could not; answers no request."""
+    """Sent once a model `AddModel` named has loaded, or with why it could not; answers no request.
+
+    `models` is what the worker's device holds of its models after the load,
+    as `Residency.report` frames it.
+    """
 
     name: str
     failure: str | None = None
+    models: dict[str, int] | None = None
 
 
 @dataclass(frozen=True)

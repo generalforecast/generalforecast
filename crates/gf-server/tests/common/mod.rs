@@ -53,6 +53,7 @@ pub fn fake_worker(mut stream: UnixStream) {
                     parts: BTreeMap::new(),
                     memory: BTreeMap::new(),
                     compile_cache: CompileCache::default(),
+                    models: None,
                 }
                 .frame()
                 .header;
@@ -83,6 +84,7 @@ pub fn fake_worker(mut stream: UnixStream) {
                         WorkerReply::Loaded {
                             name,
                             failure: None,
+                            models: None,
                         }
                         .frame()
                     }

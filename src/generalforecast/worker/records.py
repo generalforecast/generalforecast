@@ -26,10 +26,18 @@ SeriesUnit = _core.SeriesUnit | protocol.SeriesUnit
 Forecast = _core.Forecast | protocol.Forecast
 
 
-@dataclass
 class _Model[Functions: (TabularFunctions, SeriesFunctions)]:
-    functions: Functions
-    parameters: Any
+    """A loaded model: its contract calls, and its parameters as the worker's residency holds them."""
+
+    def __init__(self, functions: Functions, residency: Any, model: int) -> None:
+        self.functions = functions
+        self._residency = residency
+        self._model = model
+
+    @property
+    def parameters(self) -> Any:
+        """Its parameters: on the device while it is there (see `Residency.parameters`)."""
+        return self._residency.parameters(self._model)
 
 
 _TabularModel = _Model[TabularFunctions]

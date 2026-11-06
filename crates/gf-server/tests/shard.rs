@@ -19,8 +19,8 @@ use gf_server::definition::{CreationId, Durability, TableDefinition, TimeKind};
 use gf_server::metrics::Metrics;
 use gf_server::name::TableName;
 use gf_server::protocol::{
-    CompileCache, DEVICE_MEMORY, EXPIRED, Failure, Frame, ModelProfile, PredictionsHeader,
-    StageTime, WorkerReply, WorkerRequest, f32_bytes,
+    CompileCache, DEVICE_MEMORY, EXPIRED, Failure, Frame, ModelProfile, ModelResidency,
+    PredictionsHeader, StageTime, WorkerReply, WorkerRequest, f32_bytes,
 };
 use gf_server::routes::Routes;
 use gf_server::shard::{
@@ -273,8 +273,9 @@ fn fake_worker(
                     }
                     .frame(),
                     // The fake worker never answers loading model "stuck",
-                    // loads "slow" once released and refuses "broken", each
-                    // beside its steps once it answered.
+                    // loads "slow" once released, refuses "broken", and has
+                    // no device room for "huge", each beside its steps once
+                    // it answered.
                     WorkerRequest::AddModel { name, .. } if name == "stuck" => continue,
                     WorkerRequest::AddModel { name, .. } => {
                         let (writer, held) = (writer.clone(), held.clone());
@@ -282,9 +283,23 @@ fn fake_worker(
                             if name == "slow" {
                                 held.notified().await;
                             }
-                            let failure =
-                                (name == "broken").then(|| "OSError: no weights".to_string());
-                            let loaded = WorkerReply::Loaded { name, failure }.frame();
+                            let failure = match name.as_str() {
+                                "broken" => Some("OSError: no weights".to_string()),
+                                "huge" => Some(
+                                    "DeviceMemoryRefused: its parameters take 9000 MiB".to_string(),
+                                ),
+                                _ => None,
+                            };
+                            let models = Some(ModelResidency {
+                                refusals: u64::from(name == "huge"),
+                                ..ModelResidency::default()
+                            });
+                            let loaded = WorkerReply::Loaded {
+                                name,
+                                failure,
+                                models,
+                            }
+                            .frame();
                             let _ = loaded.write_to(&mut *writer.lock().await).await;
                         });
                         WorkerReply::Loading.frame()
@@ -440,6 +455,16 @@ fn predictions(header: &Value, failing: Option<u32>) -> Frame {
         )]),
         memory: BTreeMap::new(),
         compile_cache: CompileCache { hits: 0, misses: 1 },
+        models: Some(ModelResidency {
+            resident: 2,
+            pinned: 1,
+            models: 3,
+            pinned_bytes: 1 << 30,
+            cached_bytes: 1 << 29,
+            capacity_bytes: Some(1 << 30),
+            evictions: 4,
+            ..ModelResidency::default()
+        }),
     }
     .frame()
     .header;
@@ -1067,6 +1092,17 @@ async fn a_shard_splits_the_workers_time_among_tables_and_counts_their_refits() 
     // Each step's reply counts the compile it says missed the cache, beside
     // the start's one.
     assert_eq!(metrics.compile_cache_misses.get(), 1 + metrics.steps.get());
+    // Each step's reply says what the device holds of the worker's models.
+    let models = metrics.models();
+    assert_eq!(
+        (models.resident, models.pinned, models.evictions),
+        (2, 1, 4)
+    );
+    let text = metrics.render();
+    assert!(text.contains("gf_worker_models{state=\"cached\"} 1"));
+    assert!(text.contains("gf_worker_models{state=\"off_device\"} 1"));
+    assert!(text.contains("gf_worker_model_bytes{state=\"pinned\"} 1073741824"));
+    assert!(text.contains("gf_worker_model_evictions_total 4"));
     assert_eq!(metrics.part("other").calls.get(), metrics.steps.get());
     assert!(close(
         metrics.part("other").seconds.get(),
@@ -1225,6 +1261,22 @@ async fn a_model_the_worker_cannot_load_fails_with_its_reason() {
 
     assert_eq!(failed.expect("answered"), Err(Code::InvalidArgument));
     assert!(!shard.models().await.contains(&"broken".to_string()));
+    assert_eq!(shard.metrics.model_loads_failed.get(), 1);
+}
+
+#[tokio::test]
+async fn a_model_the_device_has_no_room_for_is_refused_as_retryable() {
+    let shard = shard(settings()).await;
+
+    let failed = tokio::time::timeout(Duration::from_secs(5), shard.add_model("huge")).await;
+
+    // `DeviceMemoryExceeded`, a 503 with a `Retry-After`, not an internal error.
+    assert_eq!(failed.expect("answered"), Err(Code::ResourceExhausted));
+    assert!(!shard.models().await.contains(&"huge".to_string()));
+    assert_eq!(shard.metrics.model_loads_refused.get(), 1);
+    assert_eq!(shard.metrics.models().refusals, 1);
+    let text = shard.metrics.render();
+    assert!(text.contains("gf_model_load_failures_total{reason=\"device_memory\"} 1"));
 }
 
 #[tokio::test]

@@ -840,6 +840,9 @@ pub enum WorkerReply {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         failure: Option<String>,
+        /// What the worker's device holds of its models after the load.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        models: Option<ModelResidency>,
     },
     /// A step's predictions, whose values are the frame's buffers, the
     /// tables whose part of the step failed, the seconds the step took the
@@ -861,6 +864,9 @@ pub enum WorkerReply {
         memory: BTreeMap<String, u64>,
         #[serde(default)]
         compile_cache: CompileCache,
+        /// What the worker's device holds of its models after the step.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        models: Option<ModelResidency>,
     },
 }
 
@@ -1016,6 +1022,44 @@ fn is_zero(value: &f64) -> bool {
 
 /// Programs a worker loaded from its persistent compile cache, and those it
 /// compiled, since its last reply that counted them.
+/// What a worker's device holds of its models' parameters, and what moved
+/// on and off it since the worker started, as its `Residency` reports it:
+/// pinned models stay on the device, the rest share `capacity_bytes` of it,
+/// those used least recently moved off to make room.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModelResidency {
+    /// Models on the device, pinned ones included.
+    #[serde(default)]
+    pub resident: u64,
+    /// Models pinned to it.
+    #[serde(default)]
+    pub pinned: u64,
+    /// Models the worker serves, on the device or off it.
+    #[serde(default)]
+    pub models: u64,
+    #[serde(default)]
+    pub pinned_bytes: u64,
+    /// Device bytes the models not pinned take.
+    #[serde(default)]
+    pub cached_bytes: u64,
+    /// Device bytes those may take; None for no bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_bytes: Option<u64>,
+    /// Host bytes the models off the device take.
+    #[serde(default)]
+    pub host_bytes: u64,
+    #[serde(default)]
+    pub evictions: u64,
+    #[serde(default)]
+    pub restores: u64,
+    #[serde(default)]
+    pub reloads: u64,
+    /// Models refused for want of device room.
+    #[serde(default)]
+    pub refusals: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompileCache {
@@ -1067,6 +1111,8 @@ pub struct Outcome {
     pub memory: BTreeMap<String, u64>,
     /// Compile cache hits and misses since the worker's last reply.
     pub compile_cache: CompileCache,
+    /// What the worker's device holds of its models after the step.
+    pub models: Option<ModelResidency>,
 }
 
 /// A worker's reply to a step.
@@ -1084,6 +1130,7 @@ pub fn outcome_from(frame: &Frame) -> Result<Outcome, FrameError> {
         parts,
         memory,
         compile_cache,
+        models,
     } = WorkerReply::of(frame)?
     else {
         return Err(FrameError(format!(
@@ -1146,6 +1193,7 @@ pub fn outcome_from(frame: &Frame) -> Result<Outcome, FrameError> {
         parts,
         memory,
         compile_cache,
+        models,
     })
 }
 

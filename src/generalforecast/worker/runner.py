@@ -18,7 +18,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -56,7 +56,6 @@ from generalforecast.runtime.memory import (
     FitProfile,
     MemoryProfile,
     WorkingProfile,
-    tree_bytes,
 )
 from generalforecast.runtime.paging import (
     CacheLayout,
@@ -86,6 +85,7 @@ from generalforecast.worker.records import (
     _Table,
     _TabularModel,
 )
+from generalforecast.worker.residency import Residency
 from generalforecast.worker.series import Series
 from generalforecast.worker.slots import Slots
 from generalforecast.worker.stats import WorkerStats
@@ -310,6 +310,8 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         # finishes past its deadline: see `_keeping`.
         self._building = False
         self._chunks.expired = self._expired
+        # Which models' parameters the device holds; see `add_model`.
+        self.residency = Residency()
         self._models: dict[int, _Model] = {}
         # The spec each model was loaded from, under which its kinds of call are recorded.
         self._specs: dict[int, str] = {}
@@ -428,15 +430,29 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         functions: TabularFunctions | SeriesFunctions,
         parameters: Any,
         spec: str | None = None,
+        *,
+        pinned: bool = True,
+        reload: Callable[[], Any] | None = None,
     ) -> None:
         """Loads a model's parameters under the node's model id.
 
         With `spec`, what the model was loaded from, the kinds of call it
         compiles for are recorded under it, and `warm_start` compiles them.
+
+        A pinned model stays on the device for the worker's life; any other
+        shares the room `residency` gives models not pinned, moved off the
+        device while the steps use others (see `Residency`). `reload` loads
+        its parameters again, configured or not, once their host copy is
+        dropped. Leaves another model holds, as a fine-tune holds its
+        base's, are shared, not copied.
+
+        Raises:
+            DeviceMemoryRefused: If a model not pinned would not fit even
+                with every other model moved off the device.
         """
-        if self._settings is not None:
-            parameters = configure(parameters, self._settings)
-        self._models[model] = _Model[Any](functions, parameters)
+        parameters = self.configured(parameters)
+        self.residency.add(model, parameters, pinned=pinned, reload=reload)
+        self._models[model] = _Model[Any](functions, self.residency, model)
         if spec is not None:
             self._specs[model] = spec
             manifest = self.programs.manifest(spec)
@@ -446,9 +462,32 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
                 assert self._manifest_dir is not None
                 shipped.install(cache_root(), self._manifest_dir.name, spec)
 
+    def configured(self, parameters: Any) -> Any:
+        """Parameters as `add_model` configures them for the device."""
+        if self._settings is None:
+            return parameters
+        return configure(parameters, self._settings)
+
     def parameter_bytes(self) -> int:
-        """Bytes the loaded models' parameters hold."""
-        return sum(tree_bytes(entry.parameters) for entry in self._models.values())
+        """Device bytes the loaded models' parameters hold, each array once."""
+        return self.residency.device_bytes()
+
+    def hold_models(self, capacity: int | None) -> None:
+        """Takes the pinned models' parameters and `capacity` bytes for the rest from the device budget.
+
+        Every share sized from `budget` then divides what is left, so
+        contexts, calls and models share the device's one budget and a
+        model placed within `capacity` never takes memory admission gave a
+        step (`Admission._fits_device`). Models past `capacity` move off
+        the device, least recently used first. None leaves the models not
+        pinned no bound, holding what they take now.
+        """
+        self.residency.capacity = capacity
+        self.residency.shrink()
+        held = self.residency.pinned_bytes() + (
+            self.residency.cached_bytes() if capacity is None else capacity
+        )
+        self.budget = self.budget.holding(held)
 
     def forecaster(self, model: int) -> bool:
         """Whether a loaded model is a forecaster."""
@@ -620,9 +659,54 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         self.failure_kinds = {}
         self._deadline = getattr(step, "deadline", None)
         try:
-            return self._run_apart(step)
+            tables = _tables(step)
+            models = [
+                self._tables[table].model for table in tables if table in self._tables
+            ]
+            with ExitStack() as leased:
+                # The step's models stay on the device until it ends, put
+                # back first if they were moved off it.
+                try:
+                    leased.enter_context(self.residency.lease(models))
+                except DeviceMemoryRefused:
+                    return self._apart_by_model(step, tables)
+                return self._run_apart(step)
         finally:
             self._deadline = None
+
+    def _apart_by_model(
+        self, step: protocol.Step, tables: list[int]
+    ) -> tuple[dict[int, np.ndarray], dict[int, str]]:
+        """Runs each table's part of a step whose models do not fit the device at once, each with its own model on it.
+
+        A table whose model does not fit even alone fails as the device's
+        (`DEVICE_MEMORY`), which a server answers as a device that cannot
+        hold it now.
+        """
+        with self.stats.timed("move"):
+            for movement in step.movements:
+                self.apply(movement)
+        predictions: dict[int, np.ndarray] = {}
+        failed: dict[int, str] = {}
+        deferred: dict[int, str] = {}
+        for table in tables:
+            spec = self._tables.get(table)
+            models = [] if spec is None else [spec.model]
+            self.deferred = {}
+            try:
+                with self.residency.lease(models):
+                    answered, lost = self._run_apart(_part(step, table))
+            except DeviceMemoryRefused as error:
+                failed[table] = (
+                    f"DeviceMemoryRefused: the table's model does not fit the device now: {error}"
+                )
+                self.failure_kinds[table] = DEVICE_MEMORY
+                continue
+            predictions.update(answered)
+            failed.update(lost)
+            deferred.update(self.deferred)
+        self.deferred = deferred
+        return predictions, failed
 
     def _run_apart(
         self, step: protocol.Step
