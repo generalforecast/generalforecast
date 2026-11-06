@@ -30,6 +30,7 @@ from generalforecast.retry import (
     Backoff,
     RetryEvent,
     RetryPolicy,
+    Tries,
     outcome_unknown,
     retry_after,
     retryable,
@@ -81,6 +82,13 @@ def lost() -> ServiceError:
     )
 
 
+class Slow:
+    """An outcome a try reaches only after `seconds`, as a fit on a cold GPU does."""
+
+    def __init__(self, seconds: float, outcome: Any) -> None:
+        self.seconds, self.outcome = seconds, outcome
+
+
 class Script:
     """A transport that answers each request with the next outcome, and records it."""
 
@@ -99,6 +107,9 @@ class Script:
         )
         assert self.outcomes, f"unexpected {method} {path}"
         outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Slow):
+            time.sleep(outcome.seconds)
+            outcome = outcome.outcome
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
@@ -278,10 +289,9 @@ def test_a_request_gives_up_when_its_next_try_would_pass_its_deadline(
         )
     # The second answer asks for longer than the deadline leaves.
     assert len(script.sent) == 2 and events[-1].gave_up
-    # Every try is bounded by the request's deadline, not just the transport's.
-    deadlines = [sent[3] for sent in script.sent]
-    assert deadlines[0] is not None and deadlines[0] == deadlines[1]
-    assert deadlines[0] - time.monotonic() <= 10.0
+    # The retry deadline never bounds a try in flight: a call with no
+    # deadline of its own leaves each try to the client's timeout.
+    assert [sent[3] for sent in script.sent] == [None, None]
 
 
 @both
@@ -939,3 +949,118 @@ def test_an_async_failure_before_any_reply_is_retried(failure):
     assert error.code in ("TransportError", "Timeout")
     assert error.reason != RESPONSE_INTERRUPTED
     assert len(calls) == 5 and len(slept) == 4
+
+
+def request_limit() -> ServiceError:
+    """The 504 a server answers when a request outlasts its own limit."""
+    return ServiceError("Timeout", "the request exceeded the server's limit", 504)
+
+
+@both
+def test_a_slow_first_try_past_the_deadline_completes(asynchronous, monkeypatch):
+    events: list[RetryEvent] = []
+    script = Script(Slow(0.3, PREDICTION))
+    result, slept = run(
+        asynchronous,
+        script,
+        lambda c: c.predictors.predict("risk", {"x": [3]}),
+        retry=policy(events, deadline=0.1),
+        monkeypatch=monkeypatch,
+    )
+    assert result.model == PREDICTION["model"]
+    assert len(script.sent) == 1 and slept == [] and events == []
+    assert script.sent[0][3] is None
+
+
+@both
+def test_a_request_limit_after_a_long_first_try_is_retried_once(
+    asynchronous, monkeypatch
+):
+    events: list[RetryEvent] = []
+    # The first call fits past the budget and the server's limit; the fit
+    # it kept answers the second at once.
+    script = Script(Slow(0.3, request_limit()), PREDICTION)
+    result, slept = run(
+        asynchronous,
+        script,
+        lambda c: c.predictors.predict("risk", {"x": [3]}),
+        retry=policy(events, deadline=0.1),
+        monkeypatch=monkeypatch,
+    )
+    assert result.model == PREDICTION["model"]
+    assert len(script.sent) == 2 and slept == [1.0]
+    assert [event.wait for event in events] == [1.0]
+    # The two tries are one request.
+    assert script.sent[0][2] == script.sent[1][2]
+
+
+@both
+def test_no_try_starts_past_the_deadline_after_the_one_grace_retry(
+    asynchronous, monkeypatch
+):
+    events: list[RetryEvent] = []
+    script = Script(Slow(0.3, request_limit()), request_limit())
+    with pytest.raises(ServiceError) as caught:
+        run(
+            asynchronous,
+            script,
+            lambda c: c.predictors.predict("risk", {"x": [3]}),
+            retry=policy(events, deadline=0.1),
+            monkeypatch=monkeypatch,
+        )
+    assert caught.value.status == 504
+    assert len(script.sent) == 2 and events[-1].gave_up and events[-1].attempt == 2
+
+
+@both
+def test_a_later_try_past_the_deadline_is_not_followed_by_another(
+    asynchronous, monkeypatch
+):
+    events: list[RetryEvent] = []
+    script = Script(unavailable(wait=0.0), Slow(0.3, request_limit()))
+    with pytest.raises(ServiceError):
+        run(
+            asynchronous,
+            script,
+            lambda c: c.predictors.predict("risk", {"x": [3]}),
+            retry=policy(events, deadline=0.1),
+            monkeypatch=monkeypatch,
+        )
+    assert len(script.sent) == 2 and events[-1].gave_up
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def tries(clock: Clock, limit: float | None = None, **changes) -> Tries:
+    return Tries(
+        policy(**changes), PREDICT, "POST", "/predict", "r-1", limit, clock=clock
+    )
+
+
+def test_the_grace_retry_waits_at_most_the_maximum_and_never_past_the_calls_own_deadline():
+    clock = Clock()
+    budget = tries(clock, deadline=120.0)
+    clock.now += 146.0
+    # A Retry-After longer than the backoff's maximum is cut to it.
+    assert budget.failed(unavailable("Timeout", 504, wait=60.0)) == 4.0
+    clock.now += 4.0
+    assert budget.failed(request_limit()) is None
+
+    clock = Clock()
+    own = tries(clock, limit=clock.now + 147.0, deadline=120.0)
+    clock.now += 146.0
+    assert own.failed(request_limit()) is None
+
+
+def test_a_wait_never_carries_a_try_past_the_deadline():
+    clock = Clock()
+    budget = tries(clock, deadline=120.0)
+    clock.now += 118.0
+    # The first try ended inside the budget, so no grace: a wait past it gives up.
+    assert budget.failed(unavailable(wait=5.0)) is None
