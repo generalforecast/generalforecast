@@ -13,6 +13,7 @@ from email.utils import format_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
+import httpx
 import pytest
 
 import generalforecast as gf
@@ -24,6 +25,7 @@ from generalforecast.retry import (
     DEFAULT_RETRY,
     PREDICT,
     READ,
+    RESPONSE_INTERRUPTED,
     WRITE,
     Backoff,
     RetryEvent,
@@ -331,7 +333,7 @@ def test_retry_none_or_zero_sends_every_request_once(asynchronous, retry, monkey
 def test_reads_are_retried(asynchronous, monkeypatch):
     script = Script(
         lost(),
-        ServiceError("ProtocolError", "invalid service response", 502),
+        unavailable("ServiceUnavailable", 502),
         {"runs": []},
         ServiceError("Timeout", "request deadline exceeded", 504),
         {"name": "r", "state": "finished"},
@@ -625,6 +627,17 @@ def test_which_errors_are_retryable_and_which_leave_the_outcome_unknown():
         ValueError("not a service error"),
     ):
         assert not retryable(refused)
+    # A reply that arrived is never asked for again: malformed, oversized or
+    # in the wrong envelope whatever its status, or cut off once it began.
+    for status in (429, 502, 503, 504):
+        assert not retryable(
+            ServiceError("ProtocolError", "invalid service response", status)
+        )
+    for code, status in (("TransportError", 503), ("Timeout", 504)):
+        interrupted = ServiceError(
+            code, "response interrupted", status, reason=RESPONSE_INTERRUPTED
+        )
+        assert not retryable(interrupted) and not outcome_unknown(interrupted)
 
 
 def test_a_retry_argument_is_a_policy_a_number_of_tries_or_none():
@@ -736,3 +749,193 @@ def test_the_transport_carries_a_replys_retry_after_on_its_error(asynchronous, b
     assert second.status == 429 and second.retry_after is None
     # The wire error object is unchanged.
     assert "retry_after" not in first.to_dict()
+
+
+@pytest.fixture
+def replies():
+    """A server whose every reply is spoiled the way `.mode` names, its requests counted."""
+
+    class State:
+        mode = "invalid"
+        requests = 0
+        url = ""
+
+    state = State()
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, format, *_args):
+            pass
+
+        def send(self, status: int, data: bytes, length: int | None = None):
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header(
+                "Content-Length", str(len(data) if length is None else length)
+            )
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            state.requests += 1
+            if state.mode == "silent":
+                # The connection closes before any status line.
+                self.close_connection = True
+                return
+            if state.mode == "invalid":
+                return self.send(200, b"not-json")
+            if state.mode == "oversized":
+                return self.send(200, b"x" * (1_048_576 + 1))
+            if state.mode == "bad-error":
+                return self.send(503, b"<html>bad gateway</html>")
+            if state.mode == "interrupted":
+                self.close_connection = True
+                return self.send(200, b'{"ob', length=100)
+            raise AssertionError(state.mode)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    worker = threading.Thread(target=server.serve_forever, daemon=True)
+    worker.start()
+    state.url = f"http://127.0.0.1:{server.server_port}"
+    yield state
+    server.shutdown()
+    server.server_close()
+    worker.join()
+
+
+def listed(asynchronous: bool, url: str, **options):
+    """`models.list()` through a real transport; the error and the waits slept."""
+    slept: list[float] = []
+
+    async def go():
+        cls = AsyncClient if asynchronous else Client
+        client: Any = cls(
+            url, project="test", token="test-only-token", retry=policy(), **options
+        )
+
+        if asynchronous:
+
+            async def sleep(seconds):
+                slept.append(seconds)
+
+        else:
+
+            def sleep(seconds):
+                slept.append(seconds)
+
+        client._retry_sleep = sleep
+        try:
+            value = client.models.list()
+            if inspect.isawaitable(value):
+                await value
+        except ServiceError as error:
+            return error
+        finally:
+            if isinstance(client, AsyncClient):
+                await client.aclose()
+            else:
+                client.close()
+        raise AssertionError("the request succeeded")
+
+    return asyncio.run(go()), slept
+
+
+@both
+@pytest.mark.parametrize("mode", ["invalid", "oversized", "bad-error"])
+def test_a_malformed_reply_is_sent_for_once(asynchronous, mode, replies):
+    replies.mode = mode
+    error, slept = listed(asynchronous, replies.url)
+    assert error.code == "ProtocolError"
+    assert replies.requests == 1 and slept == []
+
+
+@both
+def test_a_reply_cut_off_once_it_began_is_sent_for_once(asynchronous, replies):
+    replies.mode = "interrupted"
+    error, slept = listed(asynchronous, replies.url)
+    assert error.code == "TransportError" and error.reason == RESPONSE_INTERRUPTED
+    assert replies.requests == 1 and slept == []
+
+
+@both
+def test_a_connection_closed_before_any_reply_is_retried(asynchronous, replies):
+    replies.mode = "silent"
+    error, slept = listed(asynchronous, replies.url)
+    assert error.code == "TransportError" and error.reason != RESPONSE_INTERRUPTED
+    assert replies.requests == 5 and len(slept) == 4
+
+
+def test_a_sync_body_read_that_raises_is_typed_and_sent_once(monkeypatch):
+    from http.client import IncompleteRead
+
+    class Interrupted:
+        code = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def read(self, _limit):
+            raise IncompleteRead(b"", 10)
+
+    calls = []
+    client = Client(token="test-only-token")
+
+    def open_once(*_args, **_kwargs):
+        calls.append(True)
+        return Interrupted()
+
+    monkeypatch.setattr(client._transport._opener, "open", open_once)
+    with pytest.raises(ServiceError) as caught:
+        client.models.list()
+    assert caught.value.code == "TransportError"
+    assert len(calls) == 1
+
+
+class _Broken(httpx.AsyncByteStream):
+    """A body that yields one chunk, then fails or stalls."""
+
+    def __init__(self, stall: bool) -> None:
+        self.stall = stall
+
+    async def __aiter__(self):
+        yield b'{"ob'
+        if self.stall:
+            await asyncio.sleep(60)
+        raise httpx.ReadError("connection reset")
+
+
+@pytest.mark.parametrize("stall", [False, True])
+def test_an_async_body_that_fails_or_stalls_is_sent_once(stall):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, stream=_Broken(stall))
+
+    error, slept = listed(
+        True,
+        "https://service.example",
+        http_transport=httpx.MockTransport(handler),
+        timeout=0.2,
+    )
+    assert error.code == ("Timeout" if stall else "TransportError")
+    assert error.reason == RESPONSE_INTERRUPTED
+    assert len(calls) == 1 and slept == []
+
+
+@pytest.mark.parametrize("failure", [httpx.ConnectError, httpx.ReadTimeout])
+def test_an_async_failure_before_any_reply_is_retried(failure):
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        raise failure("no reply", request=request)
+
+    error, slept = listed(
+        True, "https://service.example", http_transport=httpx.MockTransport(handler)
+    )
+    assert error.code in ("TransportError", "Timeout")
+    assert error.reason != RESPONSE_INTERRUPTED
+    assert len(calls) == 5 and len(slept) == 4

@@ -46,6 +46,7 @@ __all__ = [
     "ONCE",
     "PREDICT",
     "READ",
+    "RESPONSE_INTERRUPTED",
     "WRITE",
     "Backoff",
     "RetryEvent",
@@ -64,8 +65,14 @@ ONCE: Final = "once"
 RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
 # Codes the SDK raises for a request whose outcome it could not learn.
 _NO_ANSWER = frozenset({"TransportError", "Timeout"})
-# Codes that carry a retryable status but name a failure no retry mends.
-_PERMANENT = frozenset({"RedirectRefused", "ClientClosed"})
+# Codes that carry a retryable status but name a failure no retry mends: a
+# reply that is malformed, oversized or in the wrong envelope is never sent for
+# again, whatever its status.
+_PERMANENT = frozenset({"RedirectRefused", "ClientClosed", "ProtocolError"})
+# The reason a transport gives a `TransportError` or `Timeout` raised once a
+# reply's status line had arrived: the service answered, so the client fails
+# closed rather than send the request again.
+RESPONSE_INTERRUPTED: Final = "response_interrupted"
 # The longest Retry-After believed, in seconds.
 MAX_RETRY_AFTER = 86400.0
 
@@ -75,13 +82,16 @@ RETRIES = logging.getLogger("generalforecast.retries")
 def retryable(error: BaseException) -> bool:
     """Whether a failed request may succeed if it is sent again unchanged.
 
-    True for a request that got no answer (`TransportError`, `Timeout`) and
-    for a 429, 502, 503 or 504; never for any other refusal.
+    True for a request that got no answer (`TransportError`, `Timeout`
+    before any reply arrived) and for a 429, 502, 503 or 504 with a
+    well-formed error object; never for a reply that was interrupted,
+    malformed or oversized once it began (the client fails closed), and never
+    for any other refusal.
     """
     if not isinstance(error, Error):
         return False
     if error.code in _NO_ANSWER:
-        return True
+        return error.reason != RESPONSE_INTERRUPTED
     return error.code not in _PERMANENT and error.status in RETRYABLE_STATUSES
 
 
