@@ -546,6 +546,33 @@ class Residency:
                     break
                 self._evict(chosen)
 
+    def spill(self, free: Callable[[], int | None], needed: int | None = None) -> int:
+        """Moves models no step uses off the device, least recently used first, until `free` says it has `needed` bytes free.
+
+        For a call that needs more of the device than it has free: the
+        models not pinned hold their share of the device whether a step uses
+        them or not, and one moved off comes back by a copy when a step next
+        needs it. With `needed` None, as for a call that ran out of memory
+        by how much is not known, every such model moves off. Pinned and
+        leased models stay; nothing waits.
+
+        Returns:
+            The models moved off the device.
+        """
+        moved = 0
+        with self._lock:
+            while True:
+                if needed is not None:
+                    left = free()
+                    if left is None or left >= needed:
+                        break
+                chosen = self._evictable(set())
+                if chosen is None:
+                    break
+                self._evict(chosen)
+                moved += 1
+        return moved
+
     def evict(self, model: int) -> None:
         """Moves a model not pinned off the device, waiting for steps using it.
 
