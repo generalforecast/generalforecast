@@ -87,6 +87,19 @@ def parse_bytes(text: str) -> int:
     return int(float(found[1]) * _UNITS[found[2].lower()])
 
 
+def cache_bytes(device: int, pinned: int, named: str | None = None) -> int:
+    """Device bytes the models not pinned share beside `pinned` bytes of pinned ones, on an accelerator a worker counts `device` bytes of.
+
+    `named` is `CACHE_ENV`'s value, at most half of what the pinned models
+    leave, so contexts and calls keep the rest; unset, `DEFAULT_CACHE_SHARE`
+    of it.
+    """
+    left = max(0, device - pinned)
+    if named is None:
+        return left // DEFAULT_CACHE_SHARE
+    return min(parse_bytes(named), left // 2)
+
+
 def _held(leaf: Any) -> bool:
     """Whether a parameter leaf is an array the residency holds; other leaves stay as they are."""
     return isinstance(leaf, jax.Array)

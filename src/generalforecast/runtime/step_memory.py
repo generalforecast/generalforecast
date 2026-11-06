@@ -57,6 +57,54 @@ def device_room(
     return budget.device - pool, pool
 
 
+def models_held(
+    device: int,
+    parameters: Mapping[str, int],
+    pinned: Iterable[str],
+    cache: str | None = None,
+) -> int:
+    """Device bytes a pool worker's models take for its life, as its residency holds them.
+
+    As `worker_process` sizes them on an accelerator: the pinned models'
+    parameters stay, and the rest share their cache's whole bound however
+    little they hold now (`residency.cache_bytes`).
+
+    Args:
+        device: Bytes the worker counts of its accelerator.
+        parameters: Each model's parameter bytes on the device, by spec.
+        pinned: The specs of the models pinned on the device.
+        cache: `residency.CACHE_ENV`'s value, if set.
+    """
+    from generalforecast.worker.residency import cache_bytes
+
+    kept = set(pinned)
+    held = sum(size for spec, size in parameters.items() if spec in kept)
+    return held + cache_bytes(device, held, cache)
+
+
+def parameter_bytes(parameters: Any, settings: Any) -> int:
+    """Device bytes a model's parameters take once configured for `settings`, as a worker loads them.
+
+    Floating-point arrays are held in the settings' compute dtype
+    (`device.configure`); nothing is put on the device to count them.
+    """
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    total = 0
+    for leaf in jax.tree.leaves(parameters):
+        if not hasattr(leaf, "dtype") or not hasattr(leaf, "shape"):
+            continue
+        dtype = (
+            settings.compute_dtype
+            if jnp.issubdtype(leaf.dtype, jnp.floating)
+            else leaf.dtype
+        )
+        total += int(np.prod(leaf.shape)) * jnp.dtype(dtype).itemsize
+    return total
+
+
 def step_sheet(
     measures: Mapping[Hashable, Any], settings: str | None = None
 ) -> dict[str, Any]:
@@ -340,7 +388,10 @@ def pool_fit(
 
     Run on the pool's GPU type, with nothing else on the device, as a pool
     worker would start: the served models' parameters are loaded to count
-    them, and the device's memory read as JAX allows it.
+    them, and the device's memory read as JAX allows it. The room is what
+    a worker leaves its steps once its models are held as its residency
+    holds them (`models_held`), read from the same `residency.PINNED_ENV`
+    and `residency.CACHE_ENV` a pool's workers start with.
 
     Args:
         directory: Where the pool keeps measures (`GF_MEASURES`), one
@@ -349,19 +400,29 @@ def pool_fit(
         slot_bytes: Bytes a pool slot holds.
         minimum: The bucket minimum the pool's workers pad to.
     """
+    import os
+
     from generalforecast.models import registry
     from generalforecast.runtime.budget import MemoryBudget
     from generalforecast.runtime.device import default_settings
-    from generalforecast.runtime.memory import tree_bytes
     from generalforecast.runtime.programs import Manifest
     from generalforecast.runtime.shipped import _digest, identity
+    from generalforecast.worker.residency import CACHE_ENV
+    from generalforecast.worker_process import _pinned
 
     specs = list(specs)
     kept_under = identity(minimum, slot_bytes)
-    settings = repr(default_settings())
+    configured = default_settings()
+    settings = repr(configured)
     device = MemoryBudget.measure().device
-    parameters = sum(tree_bytes(registry.load_engine_model(spec)[1]) for spec in specs)
-    room, pool = device_room(device, parameters, slot_bytes)
+    sizes = {
+        spec: parameter_bytes(registry.load_engine_model(spec)[1], configured)
+        for spec in specs
+    }
+    # As the pool's workers hold them, from the same residency settings: a
+    # worker keeps its model cache's whole share off what its steps have.
+    held = models_held(device, sizes, _pinned(specs), os.environ.get(CACHE_ENV))
+    room, pool = device_room(device, held, slot_bytes)
     models = {}
     for spec in specs:
         manifest = Manifest(directory / kept_under / f"{_digest(spec)}.json")
@@ -372,7 +433,8 @@ def pool_fit(
         "version": SHEET_VERSION,
         "identity": kept_under,
         "device": device,
-        "parameters": parameters,
+        "parameters": sum(sizes.values()),
+        "held": held,
         "room": room,
         "pool": pool,
         "slot_bytes": slot_bytes,
