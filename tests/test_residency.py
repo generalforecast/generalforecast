@@ -8,6 +8,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import weakref
 from types import SimpleNamespace
 from typing import Any
 
@@ -224,15 +225,15 @@ def _combine(shared: Any, own: dict[str, tuple[Any, Any]]) -> Any:
     return jax.tree.unflatten(treedef, leaves)
 
 
-def _own(base: Any) -> dict[str, tuple[Any, Any]]:
-    """One bag's adapters over every adapted matrix of `base`, stacked over the bag."""
+def _own(base: Any, rank: int = RANK, seed: int = 7) -> dict[str, tuple[Any, Any]]:
+    """One bag's adapters of `rank` over every adapted matrix of `base`, stacked over the bag."""
     leaves = jax.tree.leaves(base)
-    keys = jax.random.split(jax.random.key(7), 2 * len(leaves))
+    keys = jax.random.split(jax.random.key(seed), 2 * len(leaves))
     own = {}
     for index in _adapted(base):
         outputs, inputs = leaves[index].shape
-        a = jax.random.normal(keys[2 * index], (1, RANK, inputs)) / inputs
-        b = jax.random.normal(keys[2 * index + 1], (1, outputs, RANK)) / RANK
+        a = jax.random.normal(keys[2 * index], (1, rank, inputs)) / inputs
+        b = jax.random.normal(keys[2 * index + 1], (1, outputs, rank)) / rank
         own[str(index)] = (a, b)
     return own
 
@@ -250,6 +251,24 @@ class _Plane:
 
     def weights(self, made: derived.Derived, base: Any) -> derived.Weights:
         return derived.Weights(self.own, _combine)
+
+
+class _Planes:
+    """A resolver keeping LoRA fine-tunes of the tiny base by spec, each its own rank."""
+
+    def __init__(self, own: dict[str, Any]) -> None:
+        self.own = own
+
+    def resolve(self, model: str) -> derived.Derived:
+        return derived.Derived(
+            model, BASE, catalog.ENTRIES[BASE].artifact.digest, "sha256:" + "0" * 64
+        )
+
+    def weights(self, made: derived.Derived, base: Any) -> derived.Weights:
+        # Fresh arrays each load, as a plane's are read from their files, so
+        # nothing but the residency keeps them once a load is done.
+        own = jax.tree.map(jnp.array, self.own[made.model])
+        return derived.Weights(own, _combine)
 
 
 @pytest.fixture
@@ -434,3 +453,110 @@ def test_a_worker_loads_a_fine_tune_over_the_base_it_serves(plane: Any) -> None:
     # Not pinned, it shares the room models not pinned have, by its adapters.
     assert not worker.residency.pinned(1)
     assert reported["models"]["cached_bytes"] == adapters
+
+
+def _as_on_an_accelerator(
+    residency: Residency, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Holds parameters as a worker on an accelerator does, on a CPU.
+
+    A load there stages its parameters in host memory; the residency keeps
+    its own copy of each, puts that on the device as a copy, and the staged
+    arrays are freed once the load is done. A CPU's `device_put` aliases the
+    host copy instead, which would keep the staged arrays alive.
+    """
+    residency._accelerator = True
+    put = jax.device_put
+    monkeypatch.setattr(
+        jax, "device_put", lambda x, *args, **kwargs: put(np.array(x), *args, **kwargs)
+    )
+
+
+def test_an_array_freed_after_its_load_never_names_another_models_buffer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    residency = Residency()
+    _as_on_an_accelerator(residency, monkeypatch)
+
+    staged: list[tuple[int, weakref.ref[jax.Array]]] = []
+
+    def load(model: int, weight: jax.Array) -> None:
+        # Its staged array is freed as this returns: its id is soon another's.
+        staged.append((id(weight), weakref.ref(weight)))
+        residency.add(model, {"w": weight})
+
+    load(0, jnp.zeros((128, 128)))
+    first, alive = staged[0]
+    assert alive() is None
+    # A new array where the first load's staged one was, as CPython soon
+    # reuses a freed object's memory: another model's, of another shape.
+    # Where this allocator does not reuse it, the loads after still might.
+    made = []
+    for _ in range(2_000):
+        made.append(jnp.ones((3, 5)))
+        if id(made[-1]) == first:
+            break
+    reused = made.pop()
+    del made
+    load(1, reused)
+    del reused
+
+    for model in range(2, 64):
+        width = 8 + model
+        load(model, jnp.full((width, width), float(model)))
+
+    assert residency.parameters(0)["w"].shape == (128, 128)
+    assert residency.parameters(1)["w"].shape == (3, 5)
+    np.testing.assert_array_equal(np.asarray(residency.parameters(1)["w"]), 1.0)
+    for model in range(2, 64):
+        width = 8 + model
+        weight = residency.parameters(model)["w"]
+        assert weight.shape == (width, width), model
+        np.testing.assert_array_equal(np.asarray(weight), float(model))
+    assert residency.device_bytes() == 4 * (128**2 + 3 * 5) + sum(
+        4 * (8 + m) ** 2 for m in range(2, 64)
+    )
+
+
+def test_fine_tunes_of_other_ranks_loaded_in_turn_each_run_their_own_adapters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast import worker_process
+
+    base = tiny_tabicl(regression=False)
+    own = {
+        f"acme/credit@ft{index}": _own(base, rank=1 + index % 4, seed=7 + index)
+        for index in range(1, 9)
+    }
+    derived.use(_Planes(own))
+    try:
+        worker = Worker(slot_bytes=4096, compile_cache=False, compile_ahead=False)
+        worker.add_model(0, tabicl_functions, base)
+        _as_on_an_accelerator(worker.residency, monkeypatch)
+        names, bases = {BASE: 0}, {BASE: 0}
+        sent: queue.Queue[dict[str, Any]] = queue.Queue()
+        loads = worker_process._Loads(worker, names, sent.put, lambda *_: None, bases)
+        for spec in own:
+            loads.ask(spec, spec)
+            loads.start()
+            reported = sent.get(timeout=60)
+            assert "failure" not in reported, reported
+
+        for spec, adapters in own.items():
+            # Each over its own copy of the base, as before residency.
+            alone = Worker(slot_bytes=4096, compile_cache=False, compile_ahead=False)
+            made = catalog.resolve_derived(catalog.parse(spec))
+            copy = jax.tree.map(jnp.array, base)
+            alone.add_model(0, tabicl_functions, base)
+            alone.add_model(
+                1, *registry._derive(made, tabicl_functions, copy, None, None)
+            )
+            model = names[spec]
+            assert worker.residency.own_bytes(model) == sum(
+                a.nbytes + b.nbytes for a, b in adapters.values()
+            ), spec
+            np.testing.assert_allclose(
+                _predict(worker, model), _predict(alone, 1), rtol=1e-6, atol=1e-7
+            )
+    finally:
+        derived.use(None)
