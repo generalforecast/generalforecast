@@ -45,7 +45,7 @@ import httpx
 
 from generalforecast._files import private_lock, read_private, write_private
 from generalforecast.errors import wire_fields
-from generalforecast.retry import retry_after
+from generalforecast.retry import RESPONSE_INTERRUPTED, retry_after
 from generalforecast.service.boundary import (
     RESPONSE_MAX_BYTES,
     RESPONSE_MAX_NODES,
@@ -637,16 +637,35 @@ def _closed() -> ServiceError:
     return ServiceError("ClientClosed", "client is closed", 400)
 
 
-def _timeout() -> ServiceError:
-    return ServiceError("Timeout", "request deadline exceeded", 504)
+def _timeout(*, received: bool = False) -> ServiceError:
+    """A deadline that passed; `received` once the reply's status line had arrived."""
+    return ServiceError(
+        "Timeout",
+        "request deadline exceeded" + ("; response interrupted" if received else ""),
+        504,
+        reason=RESPONSE_INTERRUPTED if received else None,
+    )
 
 
-def _transport_failure(what: str) -> ServiceError:
+def _transport_failure(what: str, *, received: bool = False) -> ServiceError:
+    """A failed exchange; `received` once the reply's status line had arrived.
+
+    A failure before any reply is retryable; one after it is not, since the
+    service answered and the client fails closed.
+    """
     return ServiceError(
         "TransportError",
         f"{what}; outcome unknown; preserve write_id or submission_id",
         503,
+        reason=RESPONSE_INTERRUPTED if received else None,
     )
+
+
+@dataclass
+class _Progress:
+    """How far one attempt got: whether the reply's status line arrived."""
+
+    received: bool = False
 
 
 def _compressed() -> ServiceError:
@@ -826,6 +845,8 @@ class _Policy:
         return (
             retryable(method, body)
             and attempt < self.retries
+            and error.code != "ProtocolError"
+            and error.reason != RESPONSE_INTERRUPTED
             and (error.code == "TransportError" or error.status == 503)
         )
 
@@ -1064,16 +1085,34 @@ class Transport(_Policy):
                     raw.extend(chunk)
                     if not hasattr(response, "read1"):
                         break
+                if len(raw) <= limit and _unread(response):
+                    # The connection closed short of the Content-Length.
+                    raise HTTPException("incomplete read")
             except TimeoutError:
-                raise _timeout() from None
+                raise _timeout(received=True) from None
             except (OSError, HTTPException):
-                raise _transport_failure("response interrupted") from None
+                raise _transport_failure(
+                    "response interrupted", received=True
+                ) from None
         if len(raw) > limit:
             raise _Oversized
         if time.monotonic() > end:
-            raise _timeout()
+            raise _timeout(received=True)
         asked = None if received is None else received.get("Retry-After")
         return status, bytes(raw), retry_after(asked)
+
+
+def _unread(response: Any) -> bool:
+    """Whether urllib's reply still expects bytes its Content-Length promised."""
+    reader = response
+    for _ in range(3):
+        length = getattr(reader, "length", None)
+        if isinstance(length, int) and not isinstance(length, bool):
+            return length > 0
+        reader = getattr(reader, "fp", None)
+        if reader is None:
+            return False
+    return False
 
 
 def _error_object(raw: bytes) -> Any:
@@ -1147,17 +1186,23 @@ class AsyncTransport(_Policy):
                 remaining = step.end - time.monotonic()
                 if remaining <= 0:
                     raise _timeout()
+                progress = _Progress()
                 try:
                     async with asyncio.timeout(remaining):
                         result = await self._send_once(
-                            step.method, step.path, step.data, step.headers, step.limit
+                            step.method,
+                            step.path,
+                            step.data,
+                            step.headers,
+                            step.limit,
+                            progress,
                         )
                 except TimeoutError:
-                    raise _timeout() from None
+                    raise _timeout(received=progress.received) from None
             except (ServiceError, _Oversized) as error:
                 failure = error
 
-    async def _send_once(self, method, path, data, headers, limit):
+    async def _send_once(self, method, path, data, headers, limit, progress):
         if self.closed:
             raise _closed()
         try:
@@ -1169,6 +1214,7 @@ class AsyncTransport(_Policy):
                 content=data,
                 headers=self._headers | headers,
             ) as response:
+                progress.received = True
                 if 300 <= response.status_code < 400:
                     raise ServiceError(
                         "RedirectRefused", "credential forwarding is disabled", 502
@@ -1189,6 +1235,10 @@ class AsyncTransport(_Policy):
                     retry_after(response.headers.get("Retry-After")),
                 )
         except httpx.TimeoutException:
-            raise _timeout() from None
+            raise _timeout(received=progress.received) from None
         except httpx.TransportError:
+            if progress.received:
+                raise _transport_failure(
+                    "response interrupted", received=True
+                ) from None
             raise _transport_failure("request failed") from None
