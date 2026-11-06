@@ -202,6 +202,8 @@ struct Pending {
     trace: String,
     table: TableId,
     bytes: u64,
+    /// The queries it asks: rows of features, or series to forecast.
+    queries: f64,
     arrived: Instant,
     /// When its caller stops waiting: `request_timeout` after it arrived, or
     /// later for a caller that waits longer, as a server's own warm-up does.
@@ -218,6 +220,7 @@ struct Submitted {
     request: RequestId,
     table: TableId,
     bytes: u64,
+    queries: f64,
 }
 
 /// A change to a table's rows, or to its fitted state.
