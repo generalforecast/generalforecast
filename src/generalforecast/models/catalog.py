@@ -539,6 +539,40 @@ class ModelRef:
         )
 
 
+def predictor_refusal(ref: ModelRef, *, bags: int = 1) -> tuple[str, str] | None:
+    """Why a hosted predictor may not lock `ref`, as `(code, message)`; None if it may.
+
+    The one hosted predictor qualification: `gf push`, a hosted plane's pin
+    and fine-tuning refuse with it, `gf check` reports it, and the Models
+    API lists it as each model's `hosted-predictor` capability, so a model
+    the catalog lists is never refused at push for a reason the listing
+    did not give. `bags` is a derived model's, each one more estimator run.
+
+    Raises:
+        ModelRefError: For a custom model, which has no entry.
+    """
+    entry = ref.entry
+    if not entry.gates.allows("predictor"):
+        return (
+            "ModelResolutionRequired",
+            (
+                f"{entry.name} is not qualified for hosted predictors: "
+                f"{entry.gates.evidence}"
+            ),
+        )
+    if not entry.gates.allows("predictor", variant=ref.variant):
+        return (
+            "UnsupportedCapability",
+            f"{ref} variants are not qualified for hosted predictors",
+        )
+    if not entry.gates.allows("predictor", variant=bags > 1):
+        return (
+            "UnsupportedCapability",
+            f"bagged {entry.id} is not qualified for hosted predictors",
+        )
+    return None
+
+
 def admit(ref: ModelRef, surface: Surface) -> None:
     """Refuses a reference `surface` may not run, before any of its code loads.
 

@@ -16,6 +16,7 @@ from generalforecast.models.catalog import (
     ModelRef,
     entries,
     parse,
+    predictor_refusal,
 )
 from generalforecast.service.boundary import (
     Capability,
@@ -90,9 +91,19 @@ def _artifact(entry: ModelEntry) -> JsonObject:
     return found
 
 
-def _capabilities(task: str) -> list[JsonObject]:
+def _hosted_predictor(ref: ModelRef) -> JsonObject:
+    """Whether a hosted predictor may lock the model: `gf push`'s own check."""
+    refused = predictor_refusal(ref)
+    if refused is None:
+        return asdict(Capability("hosted-predictor", "supported"))
+    code, reason = refused
+    return asdict(Capability("hosted-predictor", "unsupported", code, reason))
+
+
+def _capabilities(task: str, ref: ModelRef) -> list[JsonObject]:
     return [
         asdict(Capability(task, "supported")),
+        _hosted_predictor(ref),
         asdict(Capability("request-context", "supported")),
         asdict(
             Capability(
@@ -167,14 +178,17 @@ class CatalogService:
                     "quantiles": list(entry.capability.quantiles),
                 },
                 "capabilities": [
-                    asdict(Capability(capability, "supported"))
-                    for capability in (
-                        "forecast",
-                        "related-series",
-                        "known-future-covariates",
-                        "past-covariates",
-                        "request-context",
-                    )
+                    *(
+                        asdict(Capability(capability, "supported"))
+                        for capability in (
+                            "forecast",
+                            "related-series",
+                            "known-future-covariates",
+                            "past-covariates",
+                            "request-context",
+                        )
+                    ),
+                    _hosted_predictor(ref),
                 ],
             }
         if ref.variant:
@@ -189,7 +203,7 @@ class CatalogService:
                 "estimators": V1_POLICY.max_estimators,
                 "members": V1_POLICY.max_members,
             },
-            "capabilities": _capabilities(entry.capability.task),
+            "capabilities": _capabilities(entry.capability.task, ref),
         }
 
 

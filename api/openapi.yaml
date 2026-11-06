@@ -520,6 +520,7 @@ paths:
                           bounds: {context_rows: 100000, query_rows: 100, features: 32, classes: 10, quantile_step: null, codes: 8, estimators: 8, members: 16}
                           capabilities:
                             - {name: classification, state: supported}
+                            - {name: hosted-predictor, state: supported}
                             - {name: request-context, state: supported}
                           limits: {context_rows: 100000, queries: 100, inputs: 32}
                           warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]
@@ -565,6 +566,7 @@ paths:
                       bounds: {context_rows: 100000, query_rows: 100, features: 32, classes: 10, quantile_step: null, codes: 8, estimators: 8, members: 16}
                       capabilities:
                         - {name: classification, state: supported}
+                        - {name: hosted-predictor, state: supported}
                         - {name: request-context, state: supported}
                       limits: {context_rows: 100000, queries: 100, inputs: 32}
                       warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]
