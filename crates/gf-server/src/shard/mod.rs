@@ -909,9 +909,9 @@ pub struct ShardSettings {
     /// The worker seconds a step of a table is expected to take past which
     /// the table runs alone and after shorter work; see `Node::set_long_step`.
     pub long_step: Option<Duration>,
-    /// Whether a prediction whose wait for the work queued ahead of it is
-    /// past `request_timeout` is refused at once, with a `Retry-After`,
-    /// rather than queued to time out.
+    /// Whether a prediction whose wait for the work ahead of it and its own
+    /// step would end past `request_timeout` is refused at once, with a
+    /// `Retry-After`, rather than queued to time out; see `load`.
     pub shed: bool,
     /// Which cached context a full tier gives up first.
     pub eviction: Eviction,

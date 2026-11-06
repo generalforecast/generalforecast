@@ -119,10 +119,12 @@ pub struct Config {
     #[serde(default = "long_step_seconds")]
     pub long_step_seconds: f64,
     /// Whether a prediction is refused at once, with 503 and a `Retry-After`,
-    /// when the worker time queued ahead of it is past the longest a request
-    /// may wait, rather than queued until it times out. The work of its own
-    /// call, on every table the call takes, never counts against it. The
-    /// in-process engine (`_core`) never refuses, as it serves one caller.
+    /// when the worker time ahead of it, the steps in flight on its own
+    /// table included, and its own step would end past the longest a
+    /// request may wait, rather than queued until it times out. The work of
+    /// its own call, on every table the call takes, never counts against
+    /// it. The in-process engine (`_core`) never refuses, as it serves one
+    /// caller.
     #[serde(default = "shed_past_deadline")]
     pub shed_past_deadline: bool,
     /// Which cached context a full tier gives up first: `gdsf` keeps what is
