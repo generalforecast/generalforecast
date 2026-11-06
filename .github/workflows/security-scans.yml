@@ -1,0 +1,52 @@
+# Scans for leaked secrets and insecure code. Findings are reported in the job
+# log and don't block a merge yet.
+name: security scans
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, reopened, ready_for_review, synchronize]
+  schedule:
+    - cron: "0 14 * * 1"
+  workflow_dispatch:
+
+# Every job names the token scopes it needs.
+permissions: {}
+
+jobs:
+  # Every push to every pull request, drafts included: a leak needs catching first.
+  secrets:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Scan the full history with gitleaks
+        env:
+          VERSION: 8.30.1
+          SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/gitleaks.tgz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v$VERSION/gitleaks_${VERSION}_linux_x64.tar.gz"
+          echo "$SHA256  /tmp/gitleaks.tgz" | sha256sum -c -
+          tar -xzf /tmp/gitleaks.tgz -C /tmp gitleaks
+          /tmp/gitleaks git . --redact --verbose --no-banner --exit-code 0
+
+  code:
+    if: ${{ !github.event.pull_request.draft && github.event.action != 'synchronize' }}
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a # v1.8.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+      - name: Scan the code with Semgrep
+        run: uvx semgrep@1.181.0 scan --config p/default --metrics=off
