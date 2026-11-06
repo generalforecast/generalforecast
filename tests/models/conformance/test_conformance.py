@@ -19,6 +19,7 @@ import pytest
 
 from generalforecast import protocol
 from generalforecast._core import CacheKey, bucket_size
+from generalforecast.models import conformance
 from generalforecast.models.conformance import Table, check, predict, table
 from generalforecast.models.conformance import close as _close
 from generalforecast.models.conformance import padded as _padded
@@ -81,6 +82,23 @@ def test_models_pass_the_conformance_check(
     # Another instance of the same shapes shares the properties, so its tables
     # share programs.
     assert functions.properties(case.build(1)) == functions.properties(model)
+
+
+def test_the_checks_run_at_float32_matrix_multiply_precision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A GPU's default precision rounds float32 matrix multiplies to TF32,
+    # and equivalent calls then differ past any tolerance a check keeps.
+    case = CASES[0]
+    seen: list[str | None] = []
+    monkeypatch.setattr(
+        conformance,
+        "_CHECKS",
+        [("seen", lambda *_: seen.append(jax.config.jax_default_matmul_precision))],
+    )
+    with jax.default_matmul_precision("default"):
+        check(case.functions(), case.build(0))
+    assert seen == ["highest"]
 
 
 def test_the_class_count_comes_from_the_caller_within_the_models_slots(
