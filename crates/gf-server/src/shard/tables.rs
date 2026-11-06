@@ -183,7 +183,7 @@ impl Shard {
     ) -> Result<(), ServerError> {
         if let Err(error) = self
             .worker
-            .request_within(&add_table(id, definition).frame(), self.step_timeout)
+            .request_progressing(&add_table(id, definition).frame(), self.step_timeout)
             .await
         {
             let _ = self.node.remove_table(id);
