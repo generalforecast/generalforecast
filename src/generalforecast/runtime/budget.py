@@ -410,6 +410,14 @@ class Chunks:
         # Whether the running step's requests are all past their deadline,
         # checked before each call: such a step stops (`StepExpired`).
         self.expired: Callable[[], bool] | None = None
+        # Moves models no step uses off the device until it has the bytes
+        # asked free, or every such model for None, returning whether it
+        # moved any: a worker's model cache holds its share of the device
+        # whether a step uses it or not. A call whose measure needs more than
+        # the device has free makes room so before it runs, and one that
+        # runs out of memory all the same runs again once every such model
+        # is off the device, before it is split or fails.
+        self.room: Callable[[int | None], bool] | None = None
 
     def size(self, key: Hashable, budget: int, estimate: Callable[[], int]) -> int:
         """Items of a kind one call of at most `budget` bytes takes.
@@ -477,8 +485,10 @@ class Chunks:
         # Seconds measuring a kind took, counted with the call that reuses
         # the program the measure compiled.
         measuring = 0.0
-        # Whether the call about to run already waited for compiles beside it.
+        # Whether the call about to run already waited for compiles beside it,
+        # and moved models off the device for room.
         settled = False
+        spilled = False
         while first < count:
             if self.expired is not None and self.expired():
                 raise StepExpired(
@@ -517,10 +527,12 @@ class Chunks:
             started = time.perf_counter()
             traces = _traces(call.function)
             untuned = self._untuned_of(call)
+            needed = self._call_bytes(key, padded)
             # Autotuning its kernels would take buffers of their own the size
             # of its own beside what the device holds now.
+            fresh = untuned is None and not self._has_count(key, padded)
+            self._make_room(2 * needed if fresh else needed)
             crowded = untuned is None and self._crowded(key, padded)
-            needed = self._call_bytes(key, padded)
             if crowded and self._untune(
                 call, needed, "is too large to autotune beside steps"
             ):
@@ -553,6 +565,22 @@ class Chunks:
                     # autotuned: the same call again, now that it is done.
                     settled = True
                     continue
+                if (
+                    out_of_memory(error)
+                    and not spilled
+                    and self.room is not None
+                    and self.room(None)
+                ):
+                    # Models no step uses held the memory the call needed:
+                    # the same call again, with them off the device.
+                    logger.warning(
+                        "a %s call of %d items ran out of device memory; it runs "
+                        "again with the models no step uses moved off the device",
+                        stage,
+                        stop - first,
+                    )
+                    spilled = True
+                    continue
                 if out_of_memory(error) and padded > own:
                     # A larger count's program, reused while the items' own
                     # compiles on the side, needs more than the device has
@@ -575,7 +603,7 @@ class Chunks:
                     self._backoff[key] = 2 * self._backoff.get(key, 1)
                 continue
             finished = time.perf_counter()
-            settled = False
+            settled = spilled = False
             compiled = _traces(call.function) > traces
             with self._lock:
                 flops = self._flops.get((key, padded))
@@ -626,6 +654,19 @@ class Chunks:
             return self._untuned.get(
                 _signature(call.function, (*call.shared, *call.items))
             )
+
+    def _has_count(self, key: Hashable, padded: int) -> bool:
+        """Whether a kind has a program for a padded count."""
+        with self._lock:
+            return padded in self._counts.get(key, ())
+
+    def _make_room(self, needed: int) -> None:
+        """Has `room` move models off the device for a call of `needed` bytes it does not have free."""
+        if self.room is None or needed <= 0:
+            return
+        free = free_device_bytes()
+        if free is not None and needed > free:
+            self.room(needed)
 
     def _crowded(self, key: Hashable, padded: int, share: int = 2) -> bool:
         """Whether a count a kind has not run at would take more than one `share`th of the device's free memory, by its items' bytes.
