@@ -5,7 +5,7 @@ name: security scans
 on:
   pull_request:
     branches: [main]
-    types: [opened, reopened, ready_for_review]
+    types: [opened, reopened, ready_for_review, synchronize]
   schedule:
     - cron: "0 14 * * 1"
   workflow_dispatch:
@@ -14,8 +14,8 @@ on:
 permissions: {}
 
 jobs:
+  # Every push to every pull request, drafts included: a leak needs catching first.
   secrets:
-    if: ${{ !github.event.pull_request.draft }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 10
     permissions:
@@ -38,7 +38,7 @@ jobs:
           /tmp/gitleaks git . --redact --verbose --no-banner --exit-code 0
 
   code:
-    if: ${{ !github.event.pull_request.draft }}
+    if: ${{ !github.event.pull_request.draft && github.event.action != 'synchronize' }}
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     permissions:
