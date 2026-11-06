@@ -201,11 +201,13 @@ impl Shard {
                     .collect::<Result<_, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let asked = self.queries_of(id, queries.len());
         let request = self.node.submit_given(id, &queries, contexts)?;
         Ok(Submitted {
             request,
             table: id,
             bytes: queries.len() as u64 * 4,
+            queries: asked,
         })
     }
 

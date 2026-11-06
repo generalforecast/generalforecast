@@ -93,7 +93,8 @@ impl Shard {
                 self.queued_bytes >> 20
             )));
         }
-        self.admit_wait(id, caller)?;
+        let queries = self.queries_of(id, features.len());
+        self.admit_wait(id, caller, queries)?;
         let expected = self.expected(id);
         self.node.set_cost(id, expected);
         let request = match given {
@@ -104,6 +105,7 @@ impl Shard {
             request,
             table: id,
             bytes,
+            queries,
         })
     }
 
@@ -191,7 +193,8 @@ impl Shard {
                 self.queued_bytes >> 20
             )));
         }
-        self.admit_wait(id, caller)?;
+        let queries = series.len().max(1) as f64;
+        self.admit_wait(id, caller, queries)?;
         let expected = self.expected(id);
         self.node.set_cost(id, expected);
         let request = self.node.submit_forecast(
@@ -206,6 +209,7 @@ impl Shard {
             request,
             table: id,
             bytes,
+            queries,
         })
     }
 
@@ -231,6 +235,7 @@ impl Shard {
             request,
             table,
             bytes,
+            queries,
         } = submitted;
         self.queued_bytes += bytes;
         self.ephemeral.pin(table);
@@ -245,6 +250,7 @@ impl Shard {
                 trace,
                 table,
                 bytes,
+                queries,
                 arrived,
                 expires: arrived + waits,
                 pick: None,

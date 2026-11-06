@@ -107,7 +107,7 @@ impl Shard {
     /// worker runs on: one of many long calls, such as a retrieved context
     /// encoded per query, would hold the worker, and every request queued
     /// behind it, long after anyone waits for its answer.
-    fn expires(&self, step: &Step) -> Option<Duration> {
+    pub(super) fn expires(&self, step: &Step) -> Option<Duration> {
         let requests: Vec<RequestId> = step
             .queries()
             .iter()
@@ -409,8 +409,14 @@ impl Shard {
             *all.entry(*table).or_default() += rows;
         }
         let mut cost: HashMap<TableId, f64> = HashMap::new();
+        // Each table's decode seconds, by the queries it answered, which a
+        // step of more queries of the table takes more of.
+        let mut decoded: HashMap<TableId, f64> = HashMap::new();
         let mut rest = outcome.seconds;
         for (name, time) in &outcome.stages {
+            if matches!(name.as_str(), "decode" | "embed_decode" | "series_decode") {
+                charge(&mut decoded, time.seconds, &queried);
+            }
             let rows = match name.as_str() {
                 "fit" => &fitted,
                 // A unit fit on its own rows encodes with its fit, and its
@@ -504,7 +510,17 @@ impl Shard {
             .filter(|(table, _)| weights.contains_key(table))
             .map(|(&table, &seconds)| (table, seconds))
             .collect();
-        self.learn_costs(&answered);
+        // A step that compiled or loaded a program spent part of its decodes
+        // on that, which later steps of the kind do not: it teaches no rate.
+        let compiled = outcome.compile_cache.hits + outcome.compile_cache.misses > 0;
+        if compiled {
+            decoded.clear();
+        }
+        let decodes: HashMap<TableId, (f64, f64)> = decoded
+            .iter()
+            .filter_map(|(table, &seconds)| Some((*table, (seconds, queried.get(table).copied()?))))
+            .collect();
+        self.learn_costs(&answered, &decodes);
         step.queries()
             .iter()
             .zip(context)
