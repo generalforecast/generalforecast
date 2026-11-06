@@ -372,7 +372,7 @@ def qualification(model: str) -> Qualification:
     Raises:
         PredictorError: For a reference that names no catalog model.
     """
-    from generalforecast.models.catalog import ModelRefError, parse
+    from generalforecast.models.catalog import ModelRefError, parse, predictor_refusal
 
     try:
         ref = parse(model)
@@ -384,7 +384,7 @@ def qualification(model: str) -> Qualification:
     return Qualification(
         model,
         entry.allows("self-hosted", variant=ref.variant),
-        entry.gates.allows("predictor", variant=ref.variant),
+        predictor_refusal(ref) is None,
         entry.gates.evidence or "no qualification evidence is recorded",
     )
 
@@ -420,6 +420,7 @@ class CatalogResolver:
             ModelRefError,
             custom_refused,
             parse,
+            predictor_refusal,
         )
 
         text(requested)
@@ -450,22 +451,10 @@ class CatalogResolver:
                 )
                 raise PredictorError(code, str(error)) from None
         entry = ref.entry
-        if not entry.gates.allows(self.surface):
-            raise PredictorError(
-                "ModelResolutionRequired",
-                f"{entry.name} is not qualified for hosted predictors: {entry.gates.evidence}",
-            )
-        ensure(
-            entry.gates.allows(self.surface, variant=ref.variant),
-            f"{ref} variants are not qualified for hosted predictors",
-            "UnsupportedCapability",
-        )
-        if made is not None:
-            ensure(
-                entry.gates.allows(self.surface, variant=made.bags > 1),
-                f"bagged {entry.id} is not qualified for hosted predictors",
-                "UnsupportedCapability",
-            )
+        if self.surface == "predictor" and (
+            refused := predictor_refusal(ref, bags=1 if made is None else made.bags)
+        ):
+            raise PredictorError(*refused)
         # Each bag of a derived model is one more estimator run.
         members = (
             ref

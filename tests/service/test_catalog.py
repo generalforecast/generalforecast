@@ -161,3 +161,55 @@ def test_self_hosted_refusals(model, code, status):
     with pytest.raises(ServiceError) as caught:
         CatalogService(surface="self-hosted").get(SCOPE, model)
     assert (caught.value.code, caught.value.status) == (code, status)
+
+
+def test_each_listed_model_says_whether_a_hosted_predictor_may_lock_it():
+    # The listing named Timestral, which `gf push` then refused: the
+    # capability is the push's own check, refusal message and all.
+    from generalforecast.predictors.models import CatalogResolver, qualification
+    from generalforecast.predictors.validation import PredictorError
+
+    listed = CatalogService().list(SCOPE)
+    pushable = set()
+    for model in listed:
+        [capability] = [
+            c for c in model["capabilities"] if c["name"] == "hosted-predictor"
+        ]
+        assert qualification(model["name"]).push is (capability["state"] == "supported")
+        try:
+            CatalogResolver("predictor").resolve(model["name"])
+        except PredictorError as refused:
+            assert capability == {
+                "name": "hosted-predictor",
+                "state": "unsupported",
+                "code": refused.code,
+                "reason": refused.message,
+            }
+        else:
+            assert capability["state"] == "supported"
+            assert capability["code"] is None and capability["reason"] is None
+            pushable.add(model["name"])
+    assert "general-forecast/chronos-2" in pushable
+    assert "general-forecast/tabicl-v2-classifier" in pushable
+    assert not pushable & {
+        "general-forecast/timestral-209m",
+        "general-forecast/timestral-28m",
+    }
+
+
+def test_a_variant_says_whether_a_hosted_predictor_may_lock_it():
+    service = CatalogService()
+
+    def predictor(model):
+        [capability] = [
+            c
+            for c in service.get(SCOPE, model)["capabilities"]
+            if c["name"] == "hosted-predictor"
+        ]
+        return capability
+
+    # TabICL's variants are qualified for predictors; Kumo's only remotely.
+    assert predictor("general-forecast/tabicl-v2-classifier@4")["state"] == "supported"
+    refused = predictor("general-forecast/kumo-tabular-small-classifier@4")
+    assert refused["state"] == "unsupported"
+    assert refused["code"] == "UnsupportedCapability"
