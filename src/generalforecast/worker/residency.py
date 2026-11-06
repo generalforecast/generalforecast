@@ -218,8 +218,11 @@ class Residency:
         self._entries: dict[int, _Entry] = {}
         # Models by use, least recent first.
         self._order: OrderedDict[int, None] = OrderedDict()
-        # Each buffer by the id of the array it holds, on the device or off it,
-        # so a leaf another model holds is found as the same buffer.
+        # Each buffer by the id of an array it holds, on the device or off it,
+        # so a leaf another model holds is found as the same buffer. Only the
+        # arrays a buffer keeps are named here, and `_find` reads an id only
+        # as the very array its buffer keeps: an id names an object only
+        # while it lives, and a freed array's id is soon another array's.
         self._ids: dict[int, int] = {}
         self._keys = itertools.count()
         # An accelerator's parameters off it are host memory; a CPU's device is the host.
@@ -285,11 +288,16 @@ class Residency:
         """A model's parameters as buffers: those other models hold found by identity, the rest new."""
         leaves, treedef = jax.tree.flatten(parameters)
         refs: list[int | _Static] = []
+        # This tree's leaves by id, which hold while `parameters` keeps them:
+        # a leaf it holds twice is one buffer, whether or not one is kept.
+        seen: dict[int, int] = {}
         for leaf in leaves:
             if not _held(leaf) and not isinstance(leaf, np.ndarray):
                 refs.append(_Static(leaf))
                 continue
-            key = self._ids.get(id(leaf))
+            key = seen.get(id(leaf))
+            if key is None:
+                key = self._find(leaf)
             if key is None:
                 if not _held(leaf):
                     # A NumPy leaf is left where its model put it, as before.
@@ -298,15 +306,34 @@ class Residency:
                 key = next(self._keys)
                 buffer = _Buffer(_bytes(leaf))
                 if self._on_host(leaf):
+                    # The buffer keeps this copy, not `leaf`, which its
+                    # loader frees: `leaf`'s id is not the buffer's to name.
                     buffer.host = np.asarray(leaf)
                     self._ids[id(buffer.host)] = key
                 else:
                     buffer.device = leaf
-                self._ids[id(leaf)] = key
+                    self._ids[id(leaf)] = key
                 self._buffers[key] = buffer
                 created.append(key)
+            seen[id(leaf)] = key
             refs.append(key)
         return _Entry(treedef, refs, pinned, reload)
+
+    def _find(self, leaf: Any) -> int | None:
+        """The buffer that keeps this very array, on the device or off it; None if none does.
+
+        An id is read only as the array its buffer keeps now: an id the
+        index still names after its array was freed or replaced may be a
+        new array's, of another model and shape, which must not run as it.
+        """
+        key = self._ids.get(id(leaf))
+        if key is None:
+            return None
+        buffer = self._buffers.get(key)
+        if buffer is None or (buffer.device is not leaf and buffer.host is not leaf):
+            del self._ids[id(leaf)]
+            return None
+        return key
 
     def _on_host(self, leaf: jax.Array) -> bool:
         """Whether an array is in host memory, off an accelerator."""
