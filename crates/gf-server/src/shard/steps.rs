@@ -510,6 +510,12 @@ impl Shard {
             .filter(|(table, _)| weights.contains_key(table))
             .map(|(&table, &seconds)| (table, seconds))
             .collect();
+        // A step that compiled or loaded a program spent part of its decodes
+        // on that, which later steps of the kind do not: it teaches no rate.
+        let compiled = outcome.compile_cache.hits + outcome.compile_cache.misses > 0;
+        if compiled {
+            decoded.clear();
+        }
         let decodes: HashMap<TableId, (f64, f64)> = decoded
             .iter()
             .filter_map(|(table, &seconds)| Some((*table, (seconds, queried.get(table).copied()?))))

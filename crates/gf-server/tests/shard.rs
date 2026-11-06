@@ -184,6 +184,9 @@ fn fake_worker(
                         let mut reply = predictions(&frame.header, None);
                         reply.header["seconds"] = Value::from(seconds);
                         reply.header["stages"]["decode"]["seconds"] = Value::from(seconds);
+                        // Its programs were compiled before, so its decodes
+                        // are what later steps of the kind take.
+                        reply.header["compile_cache"]["misses"] = Value::from(0);
                         reply
                     }
                     _ => predictions(&frame.header, None),
