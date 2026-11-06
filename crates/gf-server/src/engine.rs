@@ -121,6 +121,8 @@ impl Engine {
 
     /// The same engine with another limit on how long one inference may
     /// take, as startup warming allows a compile that a request would not.
+    /// A request context's steps run as long, past the shard's
+    /// `request_timeout`, rather than stopping as abandoned.
     #[must_use]
     pub fn with_timeout(&self, timeout: Duration) -> Self {
         Self {
@@ -291,6 +293,7 @@ impl Engine {
             asked,
             trace: call_trace(),
             pick,
+            patience: Some(self.timeout),
             reply,
         };
         self.wait(shard, command, answer).await

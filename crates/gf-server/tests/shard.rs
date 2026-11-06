@@ -2282,12 +2282,23 @@ fn context(fingerprint: &str, rows: u128) -> RequestContext {
 
 impl Harness {
     async fn infer(&self, context: RequestContext) -> Result<Inferred, Code> {
+        self.infer_waiting(context, None).await
+    }
+
+    /// As `infer`, from a caller that waits `patience`, as a server's
+    /// warm-up does.
+    async fn infer_waiting(
+        &self,
+        context: RequestContext,
+        patience: Option<Duration>,
+    ) -> Result<Inferred, Code> {
         let (reply, answer) = oneshot::channel();
         let command = Command::Infer {
             context: Box::new(context),
             asked: Asked::Rows(vec![0.5, 0.0, 1.5, 0.0]),
             trace: String::new(),
             pick: None,
+            patience,
             reply,
         };
         self.commands.send(command).await.unwrap();
@@ -2297,6 +2308,45 @@ impl Harness {
             .unwrap()
             .map_err(|error| status(&error))
     }
+}
+
+/// The `expires_ms` of each step the fake worker was sent, in order.
+fn expiries(shard: &Harness) -> Vec<u64> {
+    shard
+        .actions
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|action| action.strip_prefix("expires_ms="))
+        .map(|millis| millis.parse().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_caller_that_waits_longer_than_requests_do_has_its_steps_run_as_long() {
+    let mut settings = settings();
+    settings.request_timeout = Duration::from_secs(140);
+    let shard = shard(settings).await;
+    shard.behaviour.store(EXPIRE, Ordering::Relaxed);
+
+    // A request's step stops once it is as old as any caller waits; a
+    // server warming its shape buckets waits as long as a first compile
+    // takes, so its step runs that long; one that waits less than requests
+    // do still has theirs.
+    // Each is answered, whichever table the fake worker fails.
+    let _ = shard.infer(context("request", 4)).await;
+    let _ = shard
+        .infer_waiting(context("warm", 4), Some(Duration::from_secs(600)))
+        .await;
+    let _ = shard
+        .infer_waiting(context("brief", 4), Some(Duration::from_secs(10)))
+        .await;
+
+    let expiries = expiries(&shard);
+    assert_eq!(expiries.len(), 3, "{expiries:?}");
+    assert!((130_000..=140_000).contains(&expiries[0]), "{expiries:?}");
+    assert!((590_000..=600_000).contains(&expiries[1]), "{expiries:?}");
+    assert!((130_000..=140_000).contains(&expiries[2]), "{expiries:?}");
 }
 
 #[tokio::test]

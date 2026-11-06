@@ -99,8 +99,9 @@ impl Shard {
     }
 
     /// How long from now a step may run before every request it answers is
-    /// past the longest a caller waits, so the worker stops it between its
-    /// calls; None for a step that answers no request, as a rebuild's.
+    /// past the longest its caller waits (`Pending::expires`), so the worker
+    /// stops it between its calls; None for a step that answers no request,
+    /// as a rebuild's.
     ///
     /// A request's caller times out and goes, but a step already sent to the
     /// worker runs on: one of many long calls, such as a retrieved context
@@ -120,7 +121,7 @@ impl Shard {
         let latest = requests
             .iter()
             .filter_map(|request| self.pending.get(request))
-            .map(|pending| pending.arrived + self.request_timeout)
+            .map(|pending| pending.expires)
             .max()
             .unwrap_or(now);
         Some(latest.saturating_duration_since(now))

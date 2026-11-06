@@ -218,11 +218,14 @@ impl Shard {
     }
 
     /// Queues a request for its answer, pinning the ephemeral table it reads.
+    /// It expires `request_timeout` from now, or `patience` if its caller
+    /// waits longer.
     pub(super) fn queue_pending(
         &mut self,
         submitted: Submitted,
         reply: Reply<Predictions>,
         trace: String,
+        patience: Option<Duration>,
     ) {
         let Submitted {
             request,
@@ -231,6 +234,10 @@ impl Shard {
         } = submitted;
         self.queued_bytes += bytes;
         self.ephemeral.pin(table);
+        let arrived = Instant::now();
+        let waits = patience.map_or(self.request_timeout, |patience| {
+            patience.max(self.request_timeout)
+        });
         self.pending.insert(
             request,
             Pending {
@@ -238,7 +245,8 @@ impl Shard {
                 trace,
                 table,
                 bytes,
-                arrived: Instant::now(),
+                arrived,
+                expires: arrived + waits,
                 pick: None,
             },
         );
@@ -252,7 +260,7 @@ impl Shard {
         trace: String,
     ) {
         match submitted {
-            Ok(submitted) => self.queue_pending(submitted, reply, trace),
+            Ok(submitted) => self.queue_pending(submitted, reply, trace, None),
             Err(error) => {
                 let _ = reply.send(Err(error));
             }
