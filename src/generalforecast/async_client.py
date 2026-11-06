@@ -312,7 +312,7 @@ class AsyncClient:
                     prepared.path,
                     prepared.body,
                     prepared.headers,
-                    deadline=prepared.deadline if tries is None else tries.deadline,
+                    deadline=prepared.deadline,
                 )
             except Error as error:
                 wait = None if tries is None else tries.failed(error)

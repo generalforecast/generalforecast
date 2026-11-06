@@ -214,6 +214,13 @@ class RetryPolicy:
     its deadline, or the deadline the call itself has, gives up and raises
     the last error.
 
+    A class's deadline only decides whether another try may start: a try in
+    flight runs for the client's `timeout`, or to the deadline the call
+    itself has, however long that is. A first try that outlasts the deadline
+    is retried once all the same, after at most the class's `maximum` wait,
+    so a request a slow first try warmed (such as a prediction whose first
+    call fits its context) is answered by its second.
+
     Attributes:
         predict: The backoff of predictions.
         control: The backoff of reads and of idempotent writes.
@@ -261,9 +268,10 @@ class RetryPolicy:
 
 @dataclass
 class Tries:
-    """One request's tries under a policy: each try's deadline, and whether to try again.
+    """One request's tries under a policy: whether to try again, and after how long.
 
-    The clients drive it: they send with `deadline`, hand a failure to
+    The clients drive it: they send each try with the call's own deadline
+    (never this budget, which no try in flight is cut by), hand a failure to
     `failed`, and wait the seconds it returns or raise when it returns None.
     """
 
@@ -287,11 +295,6 @@ class Tries:
         if self.limit is not None:
             self.end = min(self.end, self.limit)
 
-    @property
-    def deadline(self) -> float:
-        """The `time.monotonic()` moment every try must finish by."""
-        return self.end
-
     def failed(self, error: BaseException) -> float | None:
         """The seconds to wait before trying again after `error`; None to raise it.
 
@@ -311,8 +314,18 @@ class Tries:
             asked if asked is not None else backoff.wait(self.attempt, self.draw)
         )
         now = self.clock()
-        if self.attempt >= backoff.attempts or now + (wait or 0.0) >= self.end:
+        if self.attempt >= backoff.attempts:
             wait = None
+        elif now + (wait or 0.0) >= self.end:
+            # No try starts past the deadline, except once after a first try
+            # that itself outlasted it, and never past the call's own.
+            wait = (
+                min(wait or 0.0, backoff.maximum)
+                if self.attempt == 1 and now >= self.end
+                else None
+            )
+            if wait is not None and self.limit is not None and now + wait >= self.limit:
+                wait = None
         event = RetryEvent(
             self.retry_class,
             self.method,
