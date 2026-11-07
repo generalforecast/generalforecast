@@ -8,7 +8,8 @@ caller may retry: 503 while a model starts or restarts or a device is full,
 429 for a rate or run limit, 504 when inference outlasts one request (a
 predictor's first fit, which the service keeps, so the next try is answered
 from it), 502 when a proxy in front of it has no answer. A request can also
-fail on the way, a connection reset or a reply cut short, with its outcome
+fail on the way, a connection reset, a reply cut short, or a proxy's own
+page for a 502, 503 or 504 in place of the service's reply, with its outcome
 unknown. `Client` and `AsyncClient` try such a request again, under a
 `RetryPolicy`, when sending it again cannot apply it twice:
 
@@ -43,6 +44,7 @@ from typing import Any, Final
 from generalforecast.errors import Error
 
 __all__ = [
+    "GATEWAY_REPLY",
     "ONCE",
     "PREDICT",
     "READ",
@@ -73,6 +75,11 @@ _PERMANENT = frozenset({"RedirectRefused", "ClientClosed", "ProtocolError"})
 # reply's status line had arrived: the service answered, so the client fails
 # closed rather than send the request again.
 RESPONSE_INTERRUPTED: Final = "response_interrupted"
+# The reason a transport gives a `TransportError` for a whole 502, 503 or 504
+# whose body is not JSON: a proxy or load balancer in front of the service
+# answered with a page of its own, so the request's outcome is unknown and
+# one safe to send again is retried.
+GATEWAY_REPLY: Final = "gateway_reply"
 # The longest Retry-After believed, in seconds.
 MAX_RETRY_AFTER = 86400.0
 
@@ -83,10 +90,12 @@ def retryable(error: BaseException) -> bool:
     """Whether a failed request may succeed if it is sent again unchanged.
 
     True for a request that got no answer (`TransportError`, `Timeout`
-    before any reply arrived) and for a 429, 502, 503 or 504 with a
-    well-formed error object; never for a reply that was interrupted,
-    malformed or oversized once it began (the client fails closed), and never
-    for any other refusal.
+    before any reply arrived), for a whole 502, 503 or 504 that is not JSON,
+    a proxy's own page (`TransportError` of `GATEWAY_REPLY`), and for a 429,
+    502, 503 or 504 with a well-formed error object; never for a reply that
+    was interrupted once it began (the client fails closed), never for one
+    that is oversized, JSON in the wrong envelope, or not JSON with any
+    other status, and never for any other refusal.
     """
     if not isinstance(error, Error):
         return False

@@ -23,6 +23,7 @@ from generalforecast.client import Client
 from generalforecast.contracts import Environment
 from generalforecast.retry import (
     DEFAULT_RETRY,
+    GATEWAY_REPLY,
     PREDICT,
     READ,
     RESPONSE_INTERRUPTED,
@@ -811,9 +812,15 @@ def replies():
         def log_message(self, format, *_args):
             pass
 
-        def send(self, status: int, data: bytes, length: int | None = None):
+        def send(
+            self,
+            status: int,
+            data: bytes,
+            length: int | None = None,
+            kind: str = "application/json",
+        ):
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Type", kind)
             self.send_header(
                 "Content-Length", str(len(data) if length is None else length)
             )
@@ -831,11 +838,26 @@ def replies():
             if state.mode == "oversized":
                 return self.send(200, b"x" * (1_048_576 + 1))
             if state.mode == "bad-error":
-                return self.send(503, b"<html>bad gateway</html>")
+                return self.send(503, b'{"detail":"not the error envelope"}')
+            if state.mode == "gateway-cut":
+                self.close_connection = True
+                return self.send(503, b"<html>", length=100, kind="text/html")
+            if state.mode.startswith("gateway-"):
+                # A load balancer's own page, as for a backend that closed
+                # the connection unanswered.
+                status = int(state.mode.removeprefix("gateway-"))
+                page = b"upstream connect error or disconnect/reset before headers"
+                return self.send(status, page, kind="text/plain")
+            if state.mode == "html-500":
+                return self.send(500, b"<html>internal</html>", kind="text/html")
             if state.mode == "interrupted":
                 self.close_connection = True
                 return self.send(200, b'{"ob', length=100)
             raise AssertionError(state.mode)
+
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            self.do_GET()
 
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     worker = threading.Thread(target=server.serve_forever, daemon=True)
@@ -885,7 +907,7 @@ def listed(asynchronous: bool, url: str, **options):
 
 
 @both
-@pytest.mark.parametrize("mode", ["invalid", "oversized", "bad-error"])
+@pytest.mark.parametrize("mode", ["invalid", "oversized", "bad-error", "html-500"])
 def test_a_malformed_reply_is_sent_for_once(asynchronous, mode, replies):
     replies.mode = mode
     error, slept = listed(asynchronous, replies.url)
@@ -899,6 +921,61 @@ def test_a_reply_cut_off_once_it_began_is_sent_for_once(asynchronous, replies):
     error, slept = listed(asynchronous, replies.url)
     assert error.code == "TransportError" and error.reason == RESPONSE_INTERRUPTED
     assert replies.requests == 1 and slept == []
+
+
+@both
+@pytest.mark.parametrize("status", [502, 503, 504])
+def test_a_proxys_own_page_for_a_retryable_status_is_retried(
+    asynchronous, status, replies
+):
+    # A load balancer's text/plain 503 for a backend that closed the
+    # connection unanswered was a ProtocolError, which no client retries.
+    replies.mode = f"gateway-{status}"
+    error, slept = listed(asynchronous, replies.url)
+    assert (error.code, error.status, error.reason) == (
+        "TransportError",
+        status,
+        GATEWAY_REPLY,
+    )
+    assert retryable(error) and outcome_unknown(error)
+    assert replies.requests == 5 and len(slept) == 4
+
+
+@both
+def test_a_proxys_page_cut_off_once_it_began_is_sent_for_once(asynchronous, replies):
+    # Fail closed: a reply that began is never sent for again, whoever sent it.
+    replies.mode = "gateway-cut"
+    error, slept = listed(asynchronous, replies.url)
+    assert error.code == "TransportError" and error.reason == RESPONSE_INTERRUPTED
+    assert replies.requests == 1 and slept == []
+
+
+@both
+def test_a_transport_retries_a_proxys_page_only_for_a_request_safe_to_resend(
+    asynchronous, replies
+):
+    replies.mode = "gateway-503"
+
+    async def go(method, body):
+        transport: Any = (AsyncTransport if asynchronous else Transport)(
+            replies.url, retries=2, retry_delay=0.0
+        )
+        try:
+            value = transport.send(method, "/v1/projects/test/runs", body)
+            await value if inspect.isawaitable(value) else value
+        except ServiceError as error:
+            return error
+        finally:
+            if asynchronous:
+                await transport.aclose()
+        raise AssertionError("the request succeeded")
+
+    read = asyncio.run(go("GET", None))
+    assert read.reason == GATEWAY_REPLY and replies.requests == 3
+    replies.requests = 0
+    # An append without a write id may have been applied: sent once.
+    write = asyncio.run(go("POST", {"payload": {"rows": []}}))
+    assert write.reason == GATEWAY_REPLY and replies.requests == 1
 
 
 @both
