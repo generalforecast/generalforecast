@@ -45,7 +45,7 @@ import httpx
 
 from generalforecast._files import private_lock, read_private, write_private
 from generalforecast.errors import wire_fields
-from generalforecast.retry import RESPONSE_INTERRUPTED, retry_after
+from generalforecast.retry import GATEWAY_REPLY, RESPONSE_INTERRUPTED, retry_after
 from generalforecast.service.boundary import (
     RESPONSE_MAX_BYTES,
     RESPONSE_MAX_NODES,
@@ -521,25 +521,65 @@ def retryable(method: str, body: Any) -> bool:
     )
 
 
+# Statuses a proxy or load balancer in front of a service answers itself,
+# with a page of its own, when it has no reply from the service to pass on.
+_GATEWAY_STATUSES = frozenset({502, 503, 504})
+
+
+def _invalid_reply(status: int) -> ServiceError:
+    # A refusal keeps its status, so a bare 404 is still a missing route; a
+    # success that is not JSON is the service's fault.
+    failed = 502 if 200 <= status < 300 else status
+    return ServiceError("ProtocolError", "invalid service response", failed)
+
+
+def _gateway_failure(status: int) -> ServiceError:
+    return ServiceError(
+        "TransportError",
+        f"a proxy in front of the service answered HTTP {status} without the "
+        "service's reply; outcome unknown; preserve write_id or submission_id",
+        status,
+        reason=GATEWAY_REPLY,
+    )
+
+
+def _reply_error(status: int, raw: bytes) -> ServiceError | None:
+    """The error a whole reply's status and body raise; None for a success."""
+    try:
+        response_value(status, raw)
+    except ServiceError as error:
+        return error
+    return None
+
+
 def response_value(status: int, raw: bytes) -> dict[str, Any]:
-    """Decodes bounded JSON, refusing credential forwarding and unsafe errors."""
+    """Decodes bounded JSON, refusing credential forwarding and unsafe errors.
+
+    A 502, 503 or 504 whose body is not JSON at all is a proxy's own page,
+    such as a load balancer's when the service closed a connection
+    unanswered: a `TransportError` (reason `GATEWAY_REPLY`) whose outcome is
+    unknown, which a request safe to send again is retried after. Any other
+    reply that is not JSON, or JSON in the wrong envelope, is a
+    `ProtocolError`, never retried. The reply is whole when it is decoded:
+    one cut off once it began is a `TransportError` of
+    `RESPONSE_INTERRUPTED` already, and is never sent for again.
+    """
     if 300 <= status < 400:
         raise ServiceError("RedirectRefused", "credential forwarding is disabled", 502)
     if len(raw) > RESPONSE_MAX_BYTES:
         raise _too_large(RESPONSE_MAX_BYTES)
     try:
+        decoded = json.loads(raw)
+    except (ValueError, UnicodeError):
+        if status in _GATEWAY_STATUSES:
+            raise _gateway_failure(status) from None
+        raise _invalid_reply(status) from None
+    try:
         value = json_object(
-            json.loads(raw),
-            max_bytes=RESPONSE_MAX_BYTES,
-            max_nodes=RESPONSE_MAX_NODES,
+            decoded, max_bytes=RESPONSE_MAX_BYTES, max_nodes=RESPONSE_MAX_NODES
         )
-    except (ValueError, UnicodeError, ServiceError):
-        # A refusal keeps its status, so a bare 404 is still a missing route; a
-        # success that is not JSON is the service's fault.
-        failed = 502 if 200 <= status < 300 else status
-        raise ServiceError(
-            "ProtocolError", "invalid service response", failed
-        ) from None
+    except ServiceError:
+        raise _invalid_reply(status) from None
     if not 200 <= status < 300:
         raise _failure(status, value.get("error"))
     return value
@@ -884,9 +924,8 @@ class _Policy:
                 yield pause
                 continue
             _logged(method, self.url + path, status, self._headers | headers)
-            if status == 503 and self._retry(
-                method, body, attempt, _failure(status, _error_object(raw))
-            ):
+            failure = _reply_error(status, raw) if status in _GATEWAY_STATUSES else None
+            if failure is not None and self._retry(method, body, attempt, failure):
                 # The service's Retry-After, when it sends one, is the wait.
                 yield (
                     pause
@@ -1118,14 +1157,6 @@ def _unread(response: Any) -> bool:
         if reader is None:
             return False
     return False
-
-
-def _error_object(raw: bytes) -> Any:
-    try:
-        value = json.loads(raw)
-    except (ValueError, UnicodeError):
-        return None
-    return value.get("error") if isinstance(value, dict) else None
 
 
 class AsyncTransport(_Policy):
