@@ -533,6 +533,22 @@ def block_kv(
     return project_kv(parameters.attention, normalize(norm, context_rows), length)
 
 
+def in_turn[Rows, Cache](rows: Rows, cache: Cache) -> tuple[Rows, Cache]:
+    """`rows` and one layer's cache, released together once `rows` are computed.
+
+    A decode reads a cache per layer, and XLA may run the work that depends
+    on a layer's cache alone, such as converting its keys to the attention's
+    dtype or laying them out for its kernel, before any layer runs: every
+    layer's copy is then held at once, as large as the whole cache, in the
+    one buffer of the program's temporaries. Mitra-2's decode against
+    10,000 context rows asked a 24 GB GPU for 4.14 GiB in that buffer, and
+    XLA measured it on a CPU as large as the whole cache. Passed through
+    here, a layer's cache is read only once the layers before it are done,
+    so its copies are held one layer at a time.
+    """
+    return jax.lax.optimization_barrier((rows, cache))
+
+
 def attention_block(
     parameters: AttentionBlockParameters,
     query_rows: Float[Array, " batch rows model"],

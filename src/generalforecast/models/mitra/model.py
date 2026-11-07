@@ -35,6 +35,7 @@ from generalforecast.nn.attention import (
     AttentionCache,
     attention_block,
     block_kv,
+    in_turn,
 )
 from generalforecast.nn.linear import LinearParameters, linear
 from generalforecast.nn.norm import LayerNormParameters, layer_norm
@@ -251,6 +252,9 @@ def decode(
     batched = jax.tree.map(lambda values: values[None], cache)
     tokens = as_tokens(rows, _width(model))
     for layer, layer_cache in zip(model.layers, batched, strict=True):
+        # Each layer's cache read once the layers before it are done, so its
+        # copies are held a layer at a time: see `in_turn`.
+        tokens, layer_cache = in_turn(tokens, layer_cache)
         tokens = _layer(layer, tokens, layer_cache, _keys_per_row(state))
     target = layer_norm(model.final_norm, tokens[0, :, 0])
     return linear(model.decoder, target)

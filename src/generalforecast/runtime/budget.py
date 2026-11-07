@@ -165,6 +165,40 @@ def free_device_bytes() -> int | None:
     return int(stats["bytes_limit"]) - int(stats.get("bytes_in_use", 0))
 
 
+def largest_free_block() -> int | None:
+    """Bytes of the largest piece of free memory the first local device's allocator has, or None where it does not say."""
+    try:
+        stats = jax.local_devices()[0].memory_stats()
+    except Exception:  # noqa: BLE001
+        return None
+    if not stats or "largest_free_block_bytes" not in stats:
+        return None
+    return int(stats["largest_free_block_bytes"])
+
+
+def contiguous_device_bytes() -> int | None:
+    """Bytes one allocation can take on the first local device: its free bytes, at most its largest free piece; None where it does not say.
+
+    A compiled program holds its temporaries in one buffer, which takes one
+    piece of free memory: a device whose free memory is in pieces holds
+    none larger than its largest, however much is free in all.
+    """
+    free = free_device_bytes()
+    block = largest_free_block()
+    if free is None or block is None:
+        return free
+    return min(free, block)
+
+
+def device_memory_report() -> str:
+    """The first local device's free memory and its largest free piece, for a log line."""
+    free, block = free_device_bytes(), largest_free_block()
+    if free is None:
+        return "the device does not say what it has free"
+    largest = "" if block is None else f", the largest piece {block / 2**30:.2f} GiB"
+    return f"the device has {free / 2**30:.2f} GiB free{largest}"
+
+
 class StepExpired(Exception):
     """A step stopped between its calls because every request it answers is past its deadline.
 
@@ -595,7 +629,16 @@ class Chunks:
                     )
                     exact = True
                     continue
-                if not out_of_memory(error) or stop - first == 1:
+                if not out_of_memory(error):
+                    raise
+                if stop - first == 1:
+                    logger.warning(
+                        "a %s call of one item needs %.2f GiB by its measure and "
+                        "ran out of device memory; %s",
+                        stage,
+                        self._call_bytes(key, padded) / 2**30,
+                        device_memory_report(),
+                    )
                     raise
                 # XLA's measure fell short of what the call needed: halve the
                 # call, from here on.
@@ -661,10 +704,11 @@ class Chunks:
             return padded in self._counts.get(key, ())
 
     def _make_room(self, needed: int) -> None:
-        """Has `room` move models off the device for a call of `needed` bytes it does not have free."""
+        """Has `room` move models off the device for a call of `needed` bytes it has no free piece of."""
         if self.room is None or needed <= 0:
             return
-        free = free_device_bytes()
+        # Its temporaries take one piece of the device's free memory.
+        free = contiguous_device_bytes()
         if free is not None and needed > free:
             self.room(needed)
 
