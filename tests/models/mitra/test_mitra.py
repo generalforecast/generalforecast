@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -102,3 +103,52 @@ def test_an_unlabeled_context_row_embeds_as_a_query(regression: bool) -> None:
         blank, _ = mitra_functions.fit(model, features, unknown, classes)
         assert np.isfinite(blank.snapshot.target_center)
         assert np.isfinite(blank.snapshot.target_scale)
+
+
+def test_a_workers_decode_holds_one_layers_copy_of_its_cache_at_a_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Mitra-2's twelve layers against a context of thousands of rows of
+    # seven features, as a worker decodes it: its `decode` stage, measured as
+    # `Chunks` sizes its calls. Holding every layer's copy of the cache at
+    # once took 4.14 GiB in one buffer at 10,000 rows on an L4.
+    from generalforecast.runtime.budget import Call, measured_bytes
+    from generalforecast.worker import Worker
+    from tests.models.mitra import tiny
+
+    monkeypatch.setattr(tiny, "LAYERS", 12)
+    monkeypatch.setattr(tiny, "EMBED", 64)
+    monkeypatch.setattr(tiny, "HEADS", 2)
+    model = tiny.tiny_mitra()
+    worker = Worker(slot_bytes=4096, compile_cache=False, compile_ahead=False)
+    worker.add_model(0, mitra_functions, model, pinned=True)
+    rows, features, queries, classes = 4096, 7, 8, 2
+    shape = jax.ShapeDtypeStruct
+    state, embedded = jax.eval_shape(
+        lambda m, x, y: mitra_functions.fit(m, x, y, classes),
+        model,
+        shape((rows, features), jnp.float32),
+        shape((rows,), jnp.int32),
+    )
+    cache = jax.eval_shape(
+        lambda m, s, r, y: mitra_functions.encode(m, s, r, y, num_rows=rows),
+        model,
+        state,
+        embedded,
+        shape((rows,), jnp.int32),
+    )
+    asked = shape((queries, embedded.shape[1]), embedded.dtype)
+    one = jax.tree.map(
+        lambda leaf: shape((1, *leaf.shape), leaf.dtype), (state, cache, asked)
+    )
+    compiled = worker._compiled_stage("decode", 0, classes, 3)
+
+    measured = measured_bytes(Call(compiled, (model,), one, 1))
+
+    # Beyond the call's own inputs, the cache among them, it holds about one
+    # layer's copy of the cache, not all twelve.
+    held = sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(one))
+    layer = sum(
+        leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(cache)
+    ) // len(model.layers)
+    assert 0 < measured - held < 3 * layer, (measured - held, layer)

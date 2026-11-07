@@ -776,6 +776,42 @@ def test_a_call_that_needs_more_than_the_device_has_free_makes_room_before_it_ru
     assert asked == []
 
 
+def test_a_device_whose_free_memory_is_in_pieces_holds_a_call_only_its_largest_fits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from generalforecast.runtime import budget
+
+    # As an L4 had at Mitra-2's decode against 10,000 rows: 45% of its 16.9
+    # GiB free, but in two pieces either side of the context pool, the
+    # larger 24% of it.
+    stats = {
+        "bytes_limit": 16_900 << 20,
+        "bytes_in_use": 9_300 << 20,
+        "largest_free_block_bytes": 4_050 << 20,
+    }
+    device = type("Device", (), {"memory_stats": lambda self: dict(stats)})()
+    monkeypatch.setattr(budget.jax, "local_devices", lambda: [device])
+
+    assert budget.free_device_bytes() == 7_600 << 20
+    assert budget.contiguous_device_bytes() == 4_050 << 20
+    assert "7.42 GiB free, the largest piece 3.96 GiB" in budget.device_memory_report()
+
+    # A call of 4.14 GiB fits what is free in all, but no piece of it: it
+    # asks for room before it runs.
+    asked: list[int | None] = []
+    chunks = Chunks(lambda *_: None)
+    chunks.room = lambda needed: asked.append(needed) or False
+    chunks._make_room(4_240 << 20)
+    assert asked == [4_240 << 20]
+
+    # Where the allocator does not say its largest piece, free bytes count.
+    del stats["largest_free_block_bytes"]
+    assert budget.contiguous_device_bytes() == 7_600 << 20
+    asked.clear()
+    chunks._make_room(4_240 << 20)
+    assert asked == []
+
+
 def test_a_call_too_large_to_autotune_beside_the_device_s_holdings_compiles_without_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

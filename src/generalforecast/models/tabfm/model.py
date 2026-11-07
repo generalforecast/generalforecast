@@ -47,6 +47,7 @@ from generalforecast.nn.attention import (
     attention_block,
     block_kv,
     in_chunks,
+    in_turn,
 )
 from generalforecast.nn.induced import (
     InducedAttentionParameters,
@@ -452,6 +453,8 @@ def _decode_queries(
     """Query rows through the in-context blocks against the cache, then the decoder."""
     hidden = queries
     for block, layer in zip(model.icl_blocks, cache.layers, strict=True):
+        # Each layer's cache read in turn: see `in_turn`.
+        hidden, layer = in_turn(hidden, layer)
         hidden = attention_block(block, hidden, layer)
     hidden = rms_norm(model.icl_norm, hidden)
     hidden = jnn.gelu(linear(model.decoder.input, hidden), approximate=True)

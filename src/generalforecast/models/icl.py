@@ -16,6 +16,7 @@ from generalforecast.nn.attention import (
     attention_block,
     block_kv,
     in_chunks,
+    in_turn,
 )
 from generalforecast.nn.linear import (
     LinearParameters,
@@ -149,6 +150,8 @@ def decode_queries(
     """
     hidden = queries
     for block, layer in zip(parameters.blocks, cache.layers, strict=True):
+        # Each layer's cache read in turn: see `in_turn`.
+        hidden, layer = in_turn(hidden, layer)
         hidden = attention_block(block, hidden, layer)
     hidden = _head(parameters, normalize(parameters.output_norm, hidden))
     if isinstance(parameters.decoder, RetrievalParameters):

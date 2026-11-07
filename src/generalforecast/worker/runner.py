@@ -488,10 +488,13 @@ class Worker(Calls, Admission, Ahead, Slots, Pages, Encoding, Decodes, Series):
         """
         if self.budget.cpu:
             return False
-        moved = self.residency.spill(runtime_budget.free_device_bytes, needed)
+        moved = self.residency.spill(runtime_budget.contiguous_device_bytes, needed)
         if moved:
-            logger.info(
-                "moved %d models no step uses off the device for a call's room", moved
+            # A warning, as a worker's logs show no lower level.
+            logger.warning(
+                "moved %d models no step uses off the device for a call's room; %s",
+                moved,
+                runtime_budget.device_memory_report(),
             )
         return moved > 0
 
