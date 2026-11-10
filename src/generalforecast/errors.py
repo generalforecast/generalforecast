@@ -6,7 +6,8 @@
 One hierarchy for the SDK, the clients, the CLI, the engine boundary and the
 services. Every error is an `Error` of one category: `InvalidInput`,
 `NotFound`, `Unauthorized`, `CapacityExceeded`, `ModelNotReady`, `Conflict`,
-`Internal`, `AmbiguousReference`, `Unavailable` or `Unsupported`. An error made from a code,
+`Internal`, `AmbiguousReference`, `Unavailable`, `Unsupported` or
+`PaymentRequired`. An error made from a code,
 such as `ServiceError("WriteConflict", ..., 409)`, takes the category its
 code and status name, so `except gf.Conflict` catches it whichever layer
 raised it. The HTTP error object (section 5 of the interface contract) maps
@@ -30,6 +31,7 @@ WIRE_ERROR_CODES = frozenset(
         "Internal",
         "Conflict",
         "Unsupported",
+        "PaymentRequired",
     ]
 )
 """The OpenAPI `ErrorCode` enum: the only codes a GF service puts on the wire."""
@@ -63,6 +65,8 @@ _PUBLIC_BY_CODE: dict[str, str] = {
         "Conflict",
     ),
     **dict.fromkeys(("RateLimited", "ContextCapacityExceeded"), "CapacityExceeded"),
+    # What the workspace's plan or credit allows, which a payment changes.
+    **dict.fromkeys(("PlanRequired", "CreditsExhausted"), "PaymentRequired"),
     **dict.fromkeys(
         (
             "NotReady",
@@ -127,6 +131,8 @@ def public_code(code: str, status: int | None) -> str:
         return "Unauthorized"
     if status == 409:
         return "Conflict"
+    if status == 402:
+        return "PaymentRequired"
     if status == 429:
         return "CapacityExceeded"
     if status == 501:
@@ -409,6 +415,19 @@ class Unsupported(Error):
     _category = True
 
 
+class PaymentRequired(Error):
+    """The workspace's plan or credit does not cover the request; `reason` says which.
+
+    `plan_required` for a feature its plan does not include, such as
+    fine-tuning on the free plan; `credits_exhausted` once an enforced
+    workspace has used its credits. A payment, not a retry, changes it.
+    """
+
+    code = "PaymentRequired"
+    default_status = 402
+    _category = True
+
+
 class Internal(Error):
     """Our fault; always carries a request id when it came from a server."""
 
@@ -426,6 +445,7 @@ _BY_WIRE: dict[str, type[Error]] = {
     "Conflict": Conflict,
     "Internal": Internal,
     "Unsupported": Unsupported,
+    "PaymentRequired": PaymentRequired,
 }
 _BY_NAME: dict[str, type[Error]] = {
     "InvalidInput": InvalidInput,
@@ -502,6 +522,7 @@ __all__ = [
     "InvalidInput",
     "ModelNotReady",
     "NotFound",
+    "PaymentRequired",
     "Unauthorized",
     "Unavailable",
     "Unsupported",

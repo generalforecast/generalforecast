@@ -307,7 +307,17 @@ class ErrorCode(StrEnum):
     ValidationError 422, NotFound 404, Unauthorized 401, CapacityExceeded 422,
     ModelNotReady 503, Internal 500, Conflict 409 (a compare-and-swap on a stale
     generation), Unsupported 501 (an operation this server does not offer, such as a
-    hosted route on gf serve)
+    hosted route on gf serve), PaymentRequired 402 (the workspace's plan or credit does
+    not cover the request). Hosted fine-tuning's gates, with their `reason`:
+    `PaymentRequired` 402 `plan_required` (fine-tuning needs a Pro or Enterprise plan)
+    and `credits_exhausted` (an enforced workspace has used its credits, which also
+    refuses predictions); `Unauthorized` 403 `fine_tuning_unavailable` (fine-tuning is
+    not turned on for the project); `CapacityExceeded` 429 `run_limit_reached` (the
+    project has as many runs queued or running as it may), `quota_exceeded` (the
+    project's training data would pass its quota) and `snapshot_quota_exceeded`. Those
+    three 429s carry `limit` and `actual`, and lift only when the caller ends a run or
+    deletes data, so clients do not retry them; a 429 `rate_limited` passes on its own
+    and may be retried.
     """
 
     ValidationError = "ValidationError"
@@ -318,6 +328,7 @@ class ErrorCode(StrEnum):
     Internal = "Internal"
     Conflict = "Conflict"
     Unsupported = "Unsupported"
+    PaymentRequired = "PaymentRequired"
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1421,6 +1432,10 @@ Permission = Literal[
     "sources:read",
     "sources:write",
     "models:read",
+    "corpora:read",
+    "corpora:write",
+    "runs:read",
+    "runs:write",
     "keys:read",
     "keys:write",
     "secrets:read",
@@ -1444,6 +1459,10 @@ _decode_Permission: Decoder = _literal(
     "sources:read",
     "sources:write",
     "models:read",
+    "corpora:read",
+    "corpora:write",
+    "runs:read",
+    "runs:write",
     "keys:read",
     "keys:write",
     "secrets:read",
@@ -2445,6 +2464,7 @@ class Upload(Payload):
     error: str | None
     metadata: dict[str, Any] | None
     expires: float | None
+    created: float
     snapshot: TrainingSnapshot | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
@@ -2455,6 +2475,7 @@ class Upload(Payload):
         Field("error", "error", True, _union(_text, _null)),
         Field("metadata", "metadata", True, _union(_mapping(_any), _null)),
         Field("expires", "expires", True, _union(_number, _null)),
+        Field("created", "created", True, _number),
         Field("snapshot", "snapshot", False, _record(TrainingSnapshot)),
     )
 
@@ -2489,6 +2510,7 @@ class UploadOpened(Payload):
     error: str | None
     metadata: dict[str, Any] | None
     expires: float | None
+    created: float
     url: str | None
     method: Literal["PUT"] = "PUT"
     chunk_bytes: int
@@ -2501,9 +2523,40 @@ class UploadOpened(Payload):
         Field("error", "error", True, _union(_text, _null)),
         Field("metadata", "metadata", True, _union(_mapping(_any), _null)),
         Field("expires", "expires", True, _union(_number, _null)),
+        Field("created", "created", True, _number),
         Field("url", "url", True, _union(_text, _null)),
         Field("method", "method", True, _literal("PUT")),
         Field("chunk_bytes", "chunk_bytes", True, _integer),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadList(Payload):
+    """The UploadList schema."""
+
+    uploads: tuple[Upload, ...]
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("uploads", "uploads", True, _items(_record(Upload))),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class UploadListReply(Payload):
+    """The UploadListReply schema."""
+
+    api_version: Literal["gf/v1"] = "gf/v1"
+    project: Name
+    request_id: str
+    resource: Resource
+    result: UploadList
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("api_version", "api_version", True, _literal("gf/v1")),
+        Field("project", "project", True, _decode_Name),
+        Field("request_id", "request_id", True, _pattern("^[\\x20-\\x7e]+$")),
+        Field("resource", "resource", True, _record(Resource)),
+        Field("result", "result", True, _record(UploadList)),
     )
 
 
@@ -6536,6 +6589,14 @@ ROUTES: tuple[Route, ...] = (
         "/v1/projects/{project}/runs/{run}/lineage",
         None,
         RunLineageReply,
+        None,
+    ),
+    Route(
+        "uploads.list",
+        "GET",
+        "/v1/projects/{project}/uploads",
+        None,
+        UploadListReply,
         None,
     ),
     Route(

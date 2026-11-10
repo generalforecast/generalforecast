@@ -514,6 +514,23 @@ class Uploads(Collection):
         )
         return self.client._run(ops.training_upload(data, metadata, wait=wait))
 
+    def list(self) -> builtins.list[JsonObject]:
+        """The project's uploads that are not deleted, oldest first, without their snapshots."""
+        return self.client._run(ops.listed(self.kind, self.collection))
+
+    def get(self, resource: str) -> Mapping[str, Any]:
+        """One upload by its id, `up-...`, with its training snapshot once verified."""
+        return self.client._run(ops.got(self.kind, self.collection, resource))
+
+    def delete(self, upload: str) -> JsonObject:
+        """Deletes an upload and its training snapshot, with every upload of the same table.
+
+        Refused with `Conflict` (reason `snapshot_held`) while a corpus, or a
+        run that has not ended, holds the snapshot. Deleting again changes
+        nothing.
+        """
+        return self.client._run(ops.posted("corpus", "uploads", upload, "delete", {}))
+
 
 class Runs(Collection):
     """Fine-tuning runs: created once, trained once, followed until they end."""

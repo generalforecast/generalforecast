@@ -95,6 +95,14 @@ def test_every_raised_code_reaches_the_wire_as_an_openapi_code():
         # A step the GPU a request reached cannot hold: a client retries it.
         ("DeviceMemoryExceeded", 503, "ModelNotReady"),
         ("Conflict", 409, "Conflict"),
+        # The workspace's plan or credit, which a payment changes.
+        ("PlanRequired", 402, "PaymentRequired"),
+        ("CreditsExhausted", 402, "PaymentRequired"),
+        ("SomethingUnpaid", 402, "PaymentRequired"),
+        # Fine-tuning's other gates keep their codes.
+        ("FineTuningUnavailable", 403, "Unauthorized"),
+        ("RunLimitReached", 429, "CapacityExceeded"),
+        ("QuotaExceeded", 429, "CapacityExceeded"),
     ],
 )
 def test_internal_codes_fold_into_the_enum(code, status, expected):
