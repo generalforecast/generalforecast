@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: General Forecast, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Derived models of kind `adapter`: bags of input adapters in front of one shared base."""
+"""Derived models of kind `input_adapter`: bags of input adapters in front of one shared base."""
 
 import jax
 import jax.numpy as jnp
@@ -67,7 +67,7 @@ def _stacked(parts):
 class Plane:
     """Keeps one derived model of `kind`, whose bags are `parts`."""
 
-    def __init__(self, parts, kind: derived.Kind = "adapter", inputs=INPUTS):
+    def __init__(self, parts, kind: str = "input_adapter", inputs=INPUTS):
         self.parts, self.kind, self.inputs = parts, kind, inputs
 
     def resolve(self, model):
@@ -75,7 +75,12 @@ class Plane:
             raise catalog.ModelRefError("UnknownModel", model)
         made = catalog.ENTRIES[BASE].artifact.digest
         return derived.Derived(
-            model, BASE, made, "sha256:" + "3" * 64, len(self.parts), self.kind
+            model,
+            BASE,
+            made,
+            "sha256:" + "3" * 64,
+            len(self.parts),
+            self.kind,  # ty: ignore[invalid-argument-type]
         )
 
     def weights(self, made, base):
@@ -150,6 +155,17 @@ def test_a_trained_adapter_changes_predictions_as_its_features_say(base):
     np.testing.assert_allclose(found, np.asarray(expected), atol=1e-5)
 
 
+def test_a_plane_that_stored_the_old_name_serves_the_same_adapter(base):
+    data = table(regression=False)
+    (part,) = _adapters(data.features.shape[1], (0.5,))
+    derived.use(Plane([part]))
+    expected = _run(*registry.load(MODEL), data)
+    registry._derived_variant.cache_clear()
+    # A fine-tune an earlier plane published says `adapter`.
+    derived.use(Plane([part], kind="adapter"))
+    np.testing.assert_array_equal(_run(*registry.load(MODEL), data), expected)
+
+
 def test_statistics_read_only_the_context_s_real_rows(base):
     data = table(regression=False)
     (part,) = _adapters(data.features.shape[1], (0.5,))
@@ -189,7 +205,7 @@ def test_adapter_models_share_their_functions_and_programs(base):
 def test_an_adapter_s_kind_and_weights_must_agree(base):
     data = table(regression=False)
     parts = _adapters(data.features.shape[1], (0.1,))
-    derived.use(Plane(parts, kind="adapter", inputs=None))
+    derived.use(Plane(parts, kind="input_adapter", inputs=None))
     with pytest.raises(catalog.ModelRefError) as refused:
         registry.load(MODEL)
     assert refused.value.code == "ModelMismatch"
