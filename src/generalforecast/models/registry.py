@@ -359,7 +359,7 @@ def _derive(
             f"{made.model} has {made.bags} bags, but its weights stack {sorted(leading)}",
         )
     combine = weights.combine
-    if (weights.inputs is not None) != (made.kind == "adapter"):
+    if (weights.inputs is not None) != (made.kind == "input_adapter"):
         raise ModelRefError(
             "ModelMismatch",
             f"{made.model} is of kind {made.kind}, but its weights "

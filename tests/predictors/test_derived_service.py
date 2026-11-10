@@ -15,19 +15,17 @@ FINE_TUNE = "acme/credit-default@ft3"
 BASE = "tabular-classifier"
 BASE_DIGEST = "sha256:" + "0" * 64
 DIGEST = "sha256:" + "1" * 64
-FOUND = {
-    "name": FINE_TUNE,
-    "derived": {
-        "base": BASE,
-        "base_digest": BASE_DIGEST,
-        "digest": DIGEST,
-        "bags": 4,
-        "kind": "lora",
-        "run": "credit-default",
-        "version": 3,
-        "created": 0.0,
-    },
+MADE_BLOCK = {
+    "base": BASE,
+    "base_digest": BASE_DIGEST,
+    "digest": DIGEST,
+    "bags": 4,
+    "kind": "lora",
+    "run": "credit-default",
+    "version": 3,
+    "created": 0.0,
 }
+FOUND = {"name": FINE_TUNE, "derived": MADE_BLOCK}
 MADE = derived.Derived(FINE_TUNE, BASE, BASE_DIGEST, DIGEST, 4)
 
 
@@ -123,3 +121,10 @@ def test_the_cli_keeps_a_resolver_already_installed(no_resolver):
     derived.use(installed)
     cli._resolve_fine_tunes()
     assert derived.resolver() is installed
+
+
+@pytest.mark.parametrize("kind", ["input_adapter", "adapter"])
+def test_an_input_adapter_resolves_whichever_name_the_plane_answers(kind):
+    answer = {**FOUND, "derived": {**MADE_BLOCK, "kind": kind}}
+    made = ServiceResolver(lambda project: Connection(answer)).resolve(FINE_TUNE)
+    assert made.kind == "input_adapter"

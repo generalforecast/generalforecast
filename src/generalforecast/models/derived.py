@@ -20,7 +20,7 @@ To run a derived model, gf loads its catalog base once and asks the
 resolver for `weights`: each bag's own part, stacked along a leading axis,
 and how one part combines with the base's parameters into a bag's. gf runs
 them as one `Bagged` model, so every derived model on a base shares that
-base's copy. A derived model of kind `adapter` also hands over `Inputs`: how
+base's copy. A derived model of kind `input_adapter` also hands over `Inputs`: how
 each bag's own part changes the features the base reads, from statistics of
 the context's real rows, so its bags run in front of the base unmerged. Weights are arguments to compiled programs, never constants
 in them, so a program compiled for one derived model serves every other of
@@ -40,10 +40,27 @@ RESOLVER = "GF_DERIVED_RESOLVER"
 
 
 # What a derived model changes of its base: low-rank adapters on its layers
-# (`lora`), an input adapter in front of it (`adapter`), or every weight
-# (`full`).
-Kind = Literal["lora", "adapter", "full"]
-KINDS: tuple[Kind, ...] = ("lora", "adapter", "full")
+# (`lora`), an input adapter in front of it (`input_adapter`), or every
+# weight (`full`). These are the names a run's changes use too.
+Kind = Literal["lora", "input_adapter", "full"]
+KINDS: tuple[Kind, ...] = ("lora", "input_adapter", "full")
+# Names an earlier gf wrote for a kind, which locks, pins and planes that
+# stored them still say: each is read as its kind.
+LEGACY_KINDS: dict[str, Kind] = {"adapter": "input_adapter"}
+
+
+def kind_of(value: object) -> Kind:
+    """The kind a stored name says, its legacy name read as its current one.
+
+    Raises:
+        ValueError: For a name that is no kind of derived model.
+    """
+    if isinstance(value, str):
+        if value in KINDS:
+            return value  # type: ignore[return-value]
+        if value in LEGACY_KINDS:
+            return LEGACY_KINDS[value]
+    raise ValueError(f"a derived model's kind is one of {', '.join(KINDS)}")
 
 
 @dataclass(frozen=True)
@@ -58,7 +75,8 @@ class Derived:
         digest: The digest of its own weights, `sha256:...`.
         bags: How many sets of weights it averages; each counts as one
             estimator against the serving policy.
-        kind: What its weights change of the base, one of `KINDS`.
+        kind: What its weights change of the base, one of `KINDS`; a
+            legacy name (`adapter`) is read as its kind.
     """
 
     model: str
@@ -69,16 +87,15 @@ class Derived:
     kind: Kind = "lora"
 
     def __post_init__(self) -> None:
-        """Refuses a kind of change gf does not know."""
-        if self.kind not in KINDS:
-            raise ValueError(f"a derived model's kind is one of {', '.join(KINDS)}")
+        """Reads a legacy kind as its current name; refuses a kind gf does not know."""
+        object.__setattr__(self, "kind", kind_of(self.kind))
 
 
 @dataclass(frozen=True)
 class Inputs:
     """How a bag's own part changes the features its base reads: an input adapter.
 
-    A model of kind `adapter` runs each bag's features through these before
+    A model of kind `input_adapter` runs each bag's features through these before
     the base sees them. Statistics are computed from the context's real rows
     alone, once when the context is fitted, and the same statistics change
     the context and every query, so a query's features never depend on the
@@ -109,7 +126,7 @@ class Weights:
         combine: Gives one bag's parameters from the base model's parameters
             and that bag's part. The same function for every derived model
             of a kind lets them share compiled programs.
-        inputs: For kind `adapter`, how a bag's part changes the features
+        inputs: For kind `input_adapter`, how a bag's part changes the features
             the base reads; None for the other kinds.
     """
 

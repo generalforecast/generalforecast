@@ -799,13 +799,18 @@ class DerivedBase(Payload):
     base: ModelId
     base_digest: Digest
     bags: int
-    kind: Literal["lora", "adapter", "full"]
+    kind: Literal["lora", "input_adapter", "full", "adapter"]
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("base", "base", True, _decode_ModelId),
         Field("base_digest", "base_digest", True, _decode_Digest),
         Field("bags", "bags", True, _integer),
-        Field("kind", "kind", True, _literal("lora", "adapter", "full")),
+        Field(
+            "kind",
+            "kind",
+            True,
+            _literal("lora", "input_adapter", "full", "adapter"),
+        ),
     )
 
 
@@ -1007,6 +1012,18 @@ class PredictorListReply(Payload):
     )
 
 
+FineTuneKind = Literal["lora", "input_adapter", "full"]
+_decode_FineTuneKind: Decoder = _literal("lora", "input_adapter", "full")
+
+
+KeptStep = int | None
+_decode_KeptStep: Decoder = _union(_integer, _null)
+
+
+Unchanged = bool | None
+_decode_Unchanged: Decoder = _union(_boolean, _null)
+
+
 @dataclass(frozen=True, kw_only=True)
 class DerivedModel(Payload):
     """The DerivedModel schema.
@@ -1020,20 +1037,24 @@ class DerivedModel(Payload):
     base_digest: Digest
     digest: Digest
     bags: int
-    kind: Literal["lora", "adapter", "full"]
+    kind: FineTuneKind
     run: str | None
     version: int
     created: float
+    kept_step: KeptStep
+    unchanged: Unchanged
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("base", "base", True, _decode_ModelId),
         Field("base_digest", "base_digest", True, _decode_Digest),
         Field("digest", "digest", True, _decode_Digest),
         Field("bags", "bags", True, _integer),
-        Field("kind", "kind", True, _literal("lora", "adapter", "full")),
+        Field("kind", "kind", True, _decode_FineTuneKind),
         Field("run", "run", True, _union(_text, _null)),
         Field("version", "version", True, _integer),
         Field("created", "created", True, _number),
+        Field("kept_step", "kept_step", True, _decode_KeptStep),
+        Field("unchanged", "unchanged", True, _decode_Unchanged),
     )
 
 
@@ -1041,24 +1062,29 @@ class DerivedModel(Payload):
 class FineTuneVersion(Payload):
     """The FineTuneVersion schema.
 
-    one published version of a fine-tune: its id, its id pinned to its weights' digest,
-    and the run that trained it
+    one published version of a fine-tune: its id, its weights' digest, the run that
+    trained it and what that run kept. A version never changes: its id names the same
+    weights for as long as it exists.
     """
 
     name: ModelId
-    model: str
+    digest: Digest
     version: int
-    kind: Literal["lora", "adapter", "full"]
+    kind: FineTuneKind
     run: str | None
     created: float
+    kept_step: KeptStep
+    unchanged: Unchanged
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("name", "name", True, _decode_ModelId),
-        Field("model", "model", True, _text),
+        Field("digest", "digest", True, _decode_Digest),
         Field("version", "version", True, _integer),
-        Field("kind", "kind", True, _literal("lora", "adapter", "full")),
+        Field("kind", "kind", True, _decode_FineTuneKind),
         Field("run", "run", True, _union(_text, _null)),
         Field("created", "created", True, _number),
+        Field("kept_step", "kept_step", True, _decode_KeptStep),
+        Field("unchanged", "unchanged", True, _decode_Unchanged),
     )
 
 

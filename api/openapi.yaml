@@ -538,7 +538,9 @@ paths:
         as `credit-default@ft3`, reads that version as the list shows it,
         with `derived`. A fine-tune's name alone, such as `credit-default`,
         reads its latest version the same way, plus `versions`: every
-        version the project has published under the name, newest first.
+        version the project has published under the name, newest first,
+        each by its id and its weights' digest, with the run that made it
+        and the step it kept.
 
         A fine-tune is named after the run that trained it, and a run may not
         take a catalog model's name, so a name is one or the other. A catalog
@@ -605,19 +607,25 @@ paths:
                         run: credit-default
                         version: 2
                         created: 1793000000.0
+                        kept_step: 180
+                        unchanged: false
                       versions:
                         - name: acme/credit-default@ft2
-                          model: acme/credit-default@ft2@sha256:9c1e3a5b7d9f1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d
+                          digest: sha256:9c1e3a5b7d9f1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d
                           version: 2
                           kind: lora
                           run: credit-default
                           created: 1793000000.0
+                          kept_step: 180
+                          unchanged: false
                         - name: acme/credit-default@ft1
-                          model: acme/credit-default@ft1@sha256:2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d
+                          digest: sha256:2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d
                           version: 1
                           kind: lora
-                          run: null
+                          run: credit-default-v0
                           created: 1792900000.0
+                          kept_step: 0
+                          unchanged: true
                       task: classification
                       repository: general-forecast/tabicl-v2-classifier
                       revision: 5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b
@@ -4687,7 +4695,12 @@ components:
         base: {$ref: "#/components/schemas/ModelId"}
         base_digest: {$ref: "#/components/schemas/Digest"}
         bags: {type: integer, minimum: 1, maximum: 64}
-        kind: {type: string, enum: [lora, adapter, full]}
+        kind:
+          type: string
+          enum: [lora, input_adapter, full, adapter]
+          description: |
+            as `DerivedModel.kind`; a lock written before gf 0.1.16 says
+            `adapter` for `input_adapter`, and is read as it
 
     Resolution:
       type: object
@@ -4832,8 +4845,14 @@ components:
           description: |
             the id with its content digest: `general-forecast/<name>@sha256:<digest>`
             for a catalog model, `<project>/<name>@ft<version>@sha256:<digest>`
-            with the weights' digest for a fine-tune
-        name: {$ref: "#/components/schemas/ModelId"}
+            with the weights' digest for a fine-tune. It is the resolved id a
+            prediction's `model` reports; name a model by `name`.
+        name:
+          $ref: "#/components/schemas/ModelId"
+          description: |
+            the model's id, which `gf.yaml`, `models.get` and a run's `base`
+            take: `general-forecast/<name>`, or a fine-tune version's
+            `<project>/<name>@ft<version>`
         derived: {$ref: "#/components/schemas/DerivedModel"}
         versions:
           type: array
@@ -4874,51 +4893,74 @@ components:
         what a fine-tune is made of, as a predictor's lock records it: its
         base, pinned, and its weights; present on the project's fine-tunes
         alone, which otherwise describe themselves as their base does
-      required: [base, base_digest, digest, bags, kind, run, version, created]
+      required: [base, base_digest, digest, bags, kind, run, version, created, kept_step, unchanged]
       additionalProperties: false
       properties:
         base: {$ref: "#/components/schemas/ModelId"}
         base_digest: {$ref: "#/components/schemas/Digest"}
         digest: {$ref: "#/components/schemas/Digest"}
         bags: {type: integer, minimum: 1, description: estimators the weights hold, averaged when served}
-        kind:
-          type: string
-          enum: [lora, adapter, full]
-          description: |
-            what the weights change of the base: low-rank adapters on its
-            layers, an input adapter in front of it, or every weight
+        kind: {$ref: "#/components/schemas/FineTuneKind"}
         run:
           type: [string, "null"]
           description: |
-            the project's run that trained the weights, if one did;
-            `GET /runs/{run}` reads it, and its lineage's `published` note
-            names this version
+            the project's run that trained and published the weights;
+            `GET /runs/{run}` reads it, and its `published` names this
+            version. Null only for a version published before the service
+            recorded runs on versions, whose run it could not find.
         version: {type: integer, minimum: 1}
-        created: {type: number, description: when the version was published, in seconds since the epoch}
+        created: {type: number, description: "when the version was published, in seconds since the epoch, as every resource's `created`"}
+        kept_step: {$ref: "#/components/schemas/KeptStep"}
+        unchanged: {$ref: "#/components/schemas/Unchanged"}
+
+    FineTuneKind:
+      type: string
+      enum: [lora, input_adapter, full]
+      description: |
+        what the weights change of the base: low-rank adapters on its layers
+        (`lora`), an input adapter in front of it (`input_adapter`), or the
+        named components' own weights (`full`), the names a run's `changes`
+        use. A version trained with LoRA beside an input adapter is
+        `input_adapter`: the LoRA is stored with it.
+
+    KeptStep:
+      type: [integer, "null"]
+      minimum: 0
+      description: |
+        the training step whose weights the version keeps: the one that
+        scored best on the rows the run held out. Step 0 is the base
+        itself. Null for a version whose run did not say.
+
+    Unchanged:
+      type: [boolean, "null"]
+      description: |
+        true when `kept_step` is 0: no check during training beat the base,
+        so the version predicts exactly as its base does. Null where
+        `kept_step` is.
 
     FineTuneVersion:
       type: object
       description: |
-        one published version of a fine-tune: its id, its id pinned to its
-        weights' digest, and the run that trained it
-      required: [name, model, version, kind, run, created]
+        one published version of a fine-tune: its id, its weights' digest,
+        the run that trained it and what that run kept. A version never
+        changes: its id names the same weights for as long as it exists.
+      required: [name, digest, version, kind, run, created, kept_step, unchanged]
       additionalProperties: false
       properties:
         name:
           $ref: "#/components/schemas/ModelId"
-          description: the version's id, `<project>/<name>@ft<version>`, which a predictor names
-        model:
-          type: string
-          description: the id with its weights' digest, `<project>/<name>@ft<version>@sha256:<digest>`
+          description: the version's id, `<project>/<name>@ft<version>`, which a predictor's `gf.yaml` names
+        digest:
+          $ref: "#/components/schemas/Digest"
+          description: the digest of the version's weights, which `gf.lock` pins
         version: {type: integer, minimum: 1}
-        kind:
-          type: string
-          enum: [lora, adapter, full]
-          description: what the weights change of the base, as `derived.kind`
+        kind: {$ref: "#/components/schemas/FineTuneKind"}
         run:
           type: [string, "null"]
-          description: the project's run that trained the version, if one did; `GET /runs/{run}` reads it
-        created: {type: number, description: when the version was published, in seconds since the epoch}
+          description: the run that trained and published the version, as `derived.run`
+        created: {type: number, description: "when the version was published, in seconds since the epoch, as every resource's `created`"}
+        kept_step: {$ref: "#/components/schemas/KeptStep"}
+        unchanged: {$ref: "#/components/schemas/Unchanged"}
 
     ModelVariant:
       type: object

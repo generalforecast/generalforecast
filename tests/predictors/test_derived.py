@@ -24,14 +24,22 @@ WEIGHTS = "sha256:" + "1" * 64
 class Plane:
     """A resolver that keeps one fine-tune of the catalog classifier."""
 
-    def __init__(self, bags=8, base_digest=None):
+    def __init__(self, bags=8, base_digest=None, kind="lora"):
         self.bags = bags
         self.base_digest = base_digest or catalog.ENTRIES[MODEL].artifact.digest
+        self.kind = kind
 
     def resolve(self, model):
         if model != FINE_TUNE:
             raise catalog.ModelRefError("UnknownModel", f"no model {model}")
-        return derived.Derived(model, MODEL, self.base_digest, WEIGHTS, self.bags)
+        return derived.Derived(
+            model,
+            MODEL,
+            self.base_digest,
+            WEIGHTS,
+            self.bags,
+            self.kind,  # ty: ignore[invalid-argument-type]
+        )
 
     def weights(self, made, base):
         raise AssertionError("pinning and locking never load weights")
@@ -181,3 +189,46 @@ def test_a_derived_model_says_what_kind_of_change_its_weights_make():
     assert derived.Derived(FINE_TUNE, MODEL, WEIGHTS, WEIGHTS).kind == "lora"
     with pytest.raises(ValueError):
         derived.Derived(FINE_TUNE, MODEL, WEIGHTS, WEIGHTS, 1, "merged")  # ty: ignore[invalid-argument-type]
+
+
+def test_an_input_adapter_is_named_as_a_run_names_it_and_its_old_name_still_reads():
+    assert derived.KINDS == ("lora", "input_adapter", "full")
+    # A plane, a pin or a lock that stored the old name is read as the new one.
+    legacy = derived.Derived(FINE_TUNE, MODEL, WEIGHTS, WEIGHTS, 1, "adapter")  # ty: ignore[invalid-argument-type]
+    assert legacy.kind == "input_adapter"
+    assert legacy == derived.Derived(
+        FINE_TUNE, MODEL, WEIGHTS, WEIGHTS, 1, "input_adapter"
+    )
+    assert hosting.derived_kind("adapter") == hosting.derived_kind("input_adapter")
+    with pytest.raises(ValueError):
+        hosting.derived_kind("merged")
+
+
+def test_a_lock_writes_input_adapter_and_reads_the_adapter_an_older_gf_wrote(
+    fine_tuned,
+):
+    installed = Plane(kind="adapter")
+    hosting.use_derived(installed)
+    try:
+        value = document(resolve(load(fine_tuned), fine_tuned))
+    finally:
+        hosting.use_derived(None)
+    assert value["predictor"]["derived"]["kind"] == "input_adapter"
+    assert parse_lock(value).digest == value["digest"]
+    # A lock an earlier gf wrote, digest and all, still parses as it was.
+    older = yaml.safe_load(yaml.safe_dump(value))
+    older["predictor"]["derived"]["kind"] = "adapter"
+    from generalforecast.predictors.lock import lock_digest
+
+    older["digest"] = lock_digest(older)
+    assert parse_lock(older).digest == older["digest"]
+
+
+def test_a_pin_an_earlier_gf_stored_with_adapter_reads_as_an_input_adapter(plane):
+    from generalforecast.predictors.models import describe
+
+    plane.kind = "input_adapter"
+    stored = describe(FINE_TUNE).to_dict()
+    stored["derived"]["kind"] = "adapter"
+    pinned = ModelPin.from_dict(stored).derived
+    assert pinned is not None and pinned.kind == "input_adapter"
