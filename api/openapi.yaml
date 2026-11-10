@@ -25,6 +25,8 @@ info:
     `GF_CONFORMANCE_URL` set, against a running `gf serve`. A request example
     marked `x-gf-invalid: true` is one the schema itself refuses; its reply
     example of the same name shows the error.
+    A reply example marked `x-gf-hosted: true` is one only a hosted plane
+    gives, such as a fine-tune's, so the replay against `gf serve` skips it.
 servers:
   - url: https://app.generalforecast.com
     description: hosted
@@ -585,6 +587,7 @@ paths:
                       warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]
                 fine_tune:
                   summary: a fine-tune by its name, with its versions
+                  x-gf-hosted: true
                   value:
                     api_version: gf/v1
                     project: acme
