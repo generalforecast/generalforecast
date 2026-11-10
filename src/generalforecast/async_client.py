@@ -623,8 +623,15 @@ class Models(Collection):
     collection = "models"
 
     async def get(self, resource: str) -> Mapping[str, Any]:
-        """Gets one catalog model by its canonical id, `general-forecast/<name>`."""
-        return await self.client._run(ops.model_got(resource))
+        """Gets a catalog model, or one of the project's fine-tunes, by its id.
+
+        A catalog model's id is `general-forecast/<name>`. A fine-tune's is
+        `<project>/<name>@ft<version>` for one version, or `<project>/<name>`
+        for its latest version with every version under `versions`, newest
+        first; each version names the run that trained it. The reply is the
+        `Model` schema of the API (`generalforecast._api.Model`).
+        """
+        return await self.client._run(ops.model_got(resource, self.client.project))
 
 
 class Predictors(Collection):
