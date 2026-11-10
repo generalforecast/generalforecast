@@ -5,7 +5,7 @@
 
 The hosted service answers conditions that pass on their own with statuses a
 caller may retry: 503 while a model starts or restarts or a device is full,
-429 for a rate or run limit, 504 when inference outlasts one request (a
+429 for a rate limit, 504 when inference outlasts one request (a
 predictor's first fit, which the service keeps, so the next try is answered
 from it), 502 when a proxy in front of it has no answer. A request can also
 fail on the way, a connection reset, a reply cut short, or a proxy's own
@@ -23,7 +23,10 @@ unknown. `Client` and `AsyncClient` try such a request again, under a
 
 Every other write, such as an append without a stable write id, is sent
 once. A refusal of the request itself, a 4xx other than 429, is never
-retried. Each retry, and each give-up, is told to the policy's `on_retry`
+retried, and nor is a 429 for a limit that only the caller's own action
+lifts: a project's run limit (`run_limit_reached`, until a run ends or is
+cancelled, which takes far longer than a retry waits) or its training data
+quota (`quota_exceeded`, `snapshot_quota_exceeded`, until data is deleted). Each retry, and each give-up, is told to the policy's `on_retry`
 and logged at INFO on `generalforecast.retries`.
 
 Public, and stable across releases: `RetryPolicy`, `Backoff`, `RetryEvent`,
@@ -80,6 +83,12 @@ RESPONSE_INTERRUPTED: Final = "response_interrupted"
 # answered with a page of its own, so the request's outcome is unknown and
 # one safe to send again is retried.
 GATEWAY_REPLY: Final = "gateway_reply"
+# Reasons of 429s for a limit that does not pass while a client waits: it
+# lifts when the caller ends a run or deletes data, so the request fails at
+# once rather than after the retry deadline.
+STANDING_LIMITS = frozenset(
+    {"run_limit_reached", "quota_exceeded", "snapshot_quota_exceeded"}
+)
 # The longest Retry-After believed, in seconds.
 MAX_RETRY_AFTER = 86400.0
 
@@ -92,7 +101,8 @@ def retryable(error: BaseException) -> bool:
     True for a request that got no answer (`TransportError`, `Timeout`
     before any reply arrived), for a whole 502, 503 or 504 that is not JSON,
     a proxy's own page (`TransportError` of `GATEWAY_REPLY`), and for a 429,
-    502, 503 or 504 with a well-formed error object; never for a reply that
+    502, 503 or 504 with a well-formed error object, but not a 429 whose
+    reason is a `STANDING_LIMITS` one; never for a reply that
     was interrupted once it began (the client fails closed), never for one
     that is oversized, JSON in the wrong envelope, or not JSON with any
     other status, and never for any other refusal.
@@ -101,6 +111,8 @@ def retryable(error: BaseException) -> bool:
         return False
     if error.code in _NO_ANSWER:
         return error.reason != RESPONSE_INTERRUPTED
+    if error.status == 429 and error.reason in STANDING_LIMITS:
+        return False
     return error.code not in _PERMANENT and error.status in RETRYABLE_STATUSES
 
 

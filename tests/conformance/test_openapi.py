@@ -92,6 +92,7 @@ def test_error_codes_are_the_contract_set():
         "Internal",
         "Conflict",
         "Unsupported",
+        "PaymentRequired",
     ]
     from generalforecast.errors import WIRE_ERROR_CODES
 

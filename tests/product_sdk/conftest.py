@@ -116,6 +116,8 @@ def wire():
                         "contexts": "context",
                         "models": "model",
                         "runs": "run",
+                        "uploads": "corpus",
+                        "corpora": "corpus",
                     }[parts[4]]
                     resource = parts[5] if len(parts) > 5 else parts[4]
                     # A fine-tune's version names the fine-tune, as the plane's does.

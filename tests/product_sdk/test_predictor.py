@@ -46,6 +46,7 @@ def test_top_level_exports_are_exactly_the_contract() -> None:
         "Error",
         "InvalidInput",
         "NotFound",
+        "PaymentRequired",
         "Unauthorized",
         "CapacityExceeded",
         "ModelNotReady",

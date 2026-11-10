@@ -367,14 +367,37 @@ def test_reads_are_retried(asynchronous, monkeypatch):
 
 
 @both
-def test_runs_are_created_again_past_the_run_limit(asynchronous, monkeypatch):
+def test_a_run_past_the_run_limit_is_refused_at_once(asynchronous, monkeypatch):
+    # The limit lifts when a run ends, hours away: no retry waits for that.
     run_limit = ServiceError(
         "RunLimitReached",
-        "the project already has 4 runs queued or running; wait for one to end",
+        "the project already has 1 runs queued or running, and its limit is 1",
         429,
     )
+    script = Script(run_limit)
+    with pytest.raises(gf.CapacityExceeded) as refused:
+        run(
+            asynchronous,
+            script,
+            lambda c: c.runs.create(
+                "ft",
+                base="general-forecast/tabicl-v2-classifier",
+                corpus="c",
+                changes=[],
+            ),
+            retry=policy(),
+            monkeypatch=monkeypatch,
+        )
+    assert refused.value.reason == "run_limit_reached"
+    assert [sent[:2] for sent in script.sent] == [("POST", "/runs")]
+
+
+@both
+def test_a_run_create_is_retried_through_a_rate_limit_and_a_lost_reply(
+    asynchronous, monkeypatch
+):
     created = {"name": "ft", "state": "queued"}
-    script = Script(run_limit, lost(), created)
+    script = Script(unavailable("RateLimited", 429), lost(), created)
     result, slept = run(
         asynchronous,
         script,
@@ -383,13 +406,36 @@ def test_runs_are_created_again_past_the_run_limit(asynchronous, monkeypatch):
             base="general-forecast/tabicl-v2-classifier",
             corpus="c",
             changes=[],
-            evaluation={},
         ),
         retry=policy(),
         monkeypatch=monkeypatch,
     )
     assert result == created and slept == [1.0, 2.0]
     assert [sent[:2] for sent in script.sent] == [("POST", "/runs")] * 3
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ServiceError("RunLimitReached", "limit", 429), False),
+        (ServiceError("QuotaExceeded", "quota", 429), False),
+        (ServiceError("SnapshotQuotaExceeded", "quota", 429), False),
+        # As the wire carries them: the code folded, the reason kept.
+        (
+            ServiceError("CapacityExceeded", "limit", 429, reason="run_limit_reached"),
+            False,
+        ),
+        (
+            ServiceError("CapacityExceeded", "slow down", 429, reason="rate_limited"),
+            True,
+        ),
+        (ServiceError("RateLimited", "slow down", 429), True),
+        (ServiceError("PlanRequired", "upgrade", 402), False),
+        (ServiceError("CreditsExhausted", "add credits", 402), False),
+    ],
+)
+def test_a_limit_only_the_caller_lifts_is_never_retried(error, expected):
+    assert retryable(error) is expected
 
 
 @both
