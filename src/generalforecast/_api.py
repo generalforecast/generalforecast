@@ -2069,6 +2069,31 @@ class RunCorpus(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class RunEvaluation(Payload):
+    """How the run chooses the weights it publishes.
+
+    The trainer holds out 20% of the corpus's rows, scores them every `evaluate_every`
+    steps of the plan, and keeps the step that scores best: `holdout` is that share,
+    and every run says it. A run created without `evaluation` has `{"holdout": 0.2}`,
+    and a create may send that. `bagging` and `sets`, which earlier clients had to
+    send, are still accepted, checked as before and recorded beside `holdout`, but the
+    trainer applies neither: a run publishes one bag, chosen on the hold-out. The one
+    effect of `sets` is that the run holds their snapshots until it ends, so they
+    cannot be deleted meanwhile.
+    """
+
+    holdout: float
+    bagging: dict[str, Any] | None = None
+    sets: tuple[dict[str, Any], ...] | None = None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("holdout", "holdout", True, _number),
+        Field("bagging", "bagging", False, _mapping(_any)),
+        Field("sets", "sets", False, _items(_mapping(_any))),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class RunUsage(Payload):
     """The RunUsage schema."""
 
@@ -2086,6 +2111,40 @@ class RunUsage(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class RunPublished(Payload):
+    """The RunPublished schema.
+
+    What a run published: the version, its weights' digest, the step the weights were
+    kept at and how they scored on the rows the run held out, against the base on the
+    same rows. The same as the lineage's `published` note. A version with `unchanged:
+    true` predicts exactly as its base does: no check during training beat the base.
+    """
+
+    model: ModelId
+    digest: Digest
+    kept_step: KeptStep
+    unchanged: Unchanged
+    validation_loss: float | None
+    base_validation_loss: float | None
+    diverged_at_step: int | None = None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("model", "model", True, _decode_ModelId),
+        Field("digest", "digest", True, _decode_Digest),
+        Field("kept_step", "kept_step", True, _decode_KeptStep),
+        Field("unchanged", "unchanged", True, _decode_Unchanged),
+        Field("validation_loss", "validation_loss", True, _union(_number, _null)),
+        Field(
+            "base_validation_loss",
+            "base_validation_loss",
+            True,
+            _union(_number, _null),
+        ),
+        Field("diverged_at_step", "diverged_at_step", False, _integer),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class Run(Payload):
     """The Run schema."""
 
@@ -2094,9 +2153,10 @@ class Run(Payload):
     reason: str | None
     attempt: int
     base: ModelId
+    fine_tune: Name
     corpus: RunCorpus
     changes: tuple[dict[str, Any], ...]
-    evaluation: dict[str, Any]
+    evaluation: RunEvaluation
     checkpoint_policy: dict[str, Any]
     budget: dict[str, Any] | None
     seed: int
@@ -2104,6 +2164,7 @@ class Run(Payload):
     plan: dict[str, Any] | None
     created: float
     updated: float
+    published: RunPublished | None
     usage: RunUsage | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
@@ -2112,9 +2173,10 @@ class Run(Payload):
         Field("reason", "reason", True, _union(_text, _null)),
         Field("attempt", "attempt", True, _integer),
         Field("base", "base", True, _decode_ModelId),
+        Field("fine_tune", "fine_tune", True, _decode_Name),
         Field("corpus", "corpus", True, _record(RunCorpus)),
         Field("changes", "changes", True, _items(_mapping(_any))),
-        Field("evaluation", "evaluation", True, _mapping(_any)),
+        Field("evaluation", "evaluation", True, _record(RunEvaluation)),
         Field("checkpoint_policy", "checkpoint_policy", True, _mapping(_any)),
         Field("budget", "budget", True, _union(_mapping(_any), _null)),
         Field("seed", "seed", True, _integer),
@@ -2123,6 +2185,7 @@ class Run(Payload):
         Field("created", "created", True, _number),
         Field("updated", "updated", True, _number),
         Field("usage", "usage", False, _union(_record(RunUsage), _null)),
+        Field("published", "published", True, _union(_record(RunPublished), _null)),
     )
 
 
@@ -2183,7 +2246,8 @@ class RunCreate(Payload):
     base: ModelId
     corpus: Name
     changes: tuple[dict[str, Any], ...]
-    evaluation: dict[str, Any]
+    fine_tune: Name | None = None
+    evaluation: dict[str, Any] | None = None
     plan: dict[str, Any] | None = None
     checkpoint_policy: dict[str, Any] | None = None
     budget: dict[str, Any] | None = None
@@ -2193,9 +2257,10 @@ class RunCreate(Payload):
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("name", "name", True, _decode_Name),
         Field("base", "base", True, _decode_ModelId),
+        Field("fine_tune", "fine_tune", False, _decode_Name),
         Field("corpus", "corpus", True, _decode_Name),
         Field("changes", "changes", True, _items(_mapping(_any))),
-        Field("evaluation", "evaluation", True, _mapping(_any)),
+        Field("evaluation", "evaluation", False, _mapping(_any)),
         Field("plan", "plan", False, _mapping(_any)),
         Field("checkpoint_policy", "checkpoint_policy", False, _mapping(_any)),
         Field("budget", "budget", False, _mapping(_any)),

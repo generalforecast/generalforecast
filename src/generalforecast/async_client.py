@@ -12,7 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import builtins
-from collections.abc import Mapping, Sequence
+import inspect
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Self
@@ -20,6 +21,7 @@ from typing import Any, Self
 from generalforecast import _operations as ops
 from generalforecast._operations import (
     Call,
+    Emit,
     Operation,
     PartialWrite,
     Pause,
@@ -322,8 +324,15 @@ class AsyncClient:
                 continue
             return ops.answer(prepared, value)
 
-    async def _run[T](self, operation: Operation[T]) -> T:
-        """Awaits an operation's steps, throwing failures back into it."""
+    async def _run[T](
+        self, operation: Operation[T], emit: Callable[[Any], Any] | None = None
+    ) -> T:
+        """Awaits an operation's steps, throwing failures back into it.
+
+        What the operation emits goes to `emit`, if given, which may be a
+        plain function or a coroutine function; a failure there is thrown
+        back into the operation as a step's would be.
+        """
         result: Any = None
         failure: Exception | None = None
         while True:
@@ -337,11 +346,41 @@ class AsyncClient:
                 return stop.value
             result, failure = None, None
             try:
+                if isinstance(step, Emit):
+                    if emit is not None:
+                        called = emit(step.value)
+                        if inspect.isawaitable(called):
+                            await called
+                else:
+                    result = await self._step(step)
+            except Exception as error:  # noqa: BLE001 - thrown into the operation
+                failure = error
+
+    async def _watch(self, operation: Operation[Any]) -> AsyncIterator[Any]:
+        """Awaits an operation's steps, yielding what it emits."""
+        result: Any = None
+        failure: Exception | None = None
+        while True:
+            try:
+                step = (
+                    operation.send(result)
+                    if failure is None
+                    else operation.throw(failure)
+                )
+            except StopIteration:
+                return
+            result, failure = None, None
+            if isinstance(step, Emit):
+                yield step.value
+                continue
+            try:
                 result = await self._step(step)
             except Exception as error:  # noqa: BLE001 - thrown into the operation
                 failure = error
 
     async def _step(self, step: ops.Step) -> Any:
+        if isinstance(step, Emit):
+            return None
         if isinstance(step, Work):
             return await asyncio.to_thread(step.function, *step.args, **step.kwargs)
         if isinstance(step, Pause):
@@ -555,7 +594,8 @@ class Runs(Collection):
         base: str,
         corpus: str,
         changes: builtins.list[JsonObject],
-        evaluation: JsonObject,
+        fine_tune: str | None = None,
+        evaluation: JsonObject | None = None,
         plan: JsonObject | None = None,
         checkpoint_policy: JsonObject | None = None,
         budget: JsonObject | None = None,
@@ -564,15 +604,16 @@ class Runs(Collection):
     ) -> JsonObject:
         """Creates a run; with a `plan` it trains as soon as it is set up.
 
-        `base` is the catalog model the run trains from. Creating the same
-        run again returns it, so the client retries a create the service
-        could not take for now, such as one past the project's run limit.
+        As `Client.runs.create`: the run publishes the next version of
+        `fine_tune`, the run's name by default, and `evaluation` may be left
+        out. Creating the same run again returns it.
         """
         payload = ops.run_spec(
             name,
             base=base,
             corpus=corpus,
             changes=changes,
+            fine_tune=fine_tune,
             evaluation=evaluation,
             plan=plan,
             checkpoint_policy=checkpoint_policy,
@@ -610,10 +651,33 @@ class Runs(Collection):
         return await self.client._run(ops.run_lineage(run))
 
     async def wait(
-        self, run: str, *, timeout: float | None = None, poll: float = 5.0
+        self,
+        run: str,
+        *,
+        timeout: float | None = None,
+        poll: float = 5.0,
+        on_event: Callable[[JsonObject], Any] | None = None,
     ) -> JsonObject:
-        """Polls a run until it finishes, is cancelled or fails."""
-        return await self.client._run(ops.run_wait(run, timeout=timeout, poll=poll))
+        """Polls a run until it finishes, is cancelled or fails, and returns it.
+
+        As `Client.runs.wait`: the run's `published` names the version it
+        made, or is None. `on_event`, a function or a coroutine function,
+        is called with each lineage event once.
+        """
+        if on_event is None:
+            return await self.client._run(ops.run_wait(run, timeout=timeout, poll=poll))
+        return await self.client._run(
+            ops.run_watch(run, timeout=timeout, poll=poll), on_event
+        )
+
+    def watch(
+        self, run: str, *, timeout: float | None = None, poll: float = 5.0
+    ) -> AsyncIterator[JsonObject]:
+        """Yields a run's lineage events once each, oldest first, until it ends.
+
+        As `Client.runs.watch`, with `async for`.
+        """
+        return self.client._watch(ops.run_watch(run, timeout=timeout, poll=poll))
 
 
 class Models(Collection):

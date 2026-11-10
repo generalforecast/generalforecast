@@ -542,9 +542,10 @@ paths:
         each by its id and its weights' digest, with the run that made it
         and the step it kept.
 
-        A fine-tune is named after the run that trained it, and a run may not
-        take a catalog model's name, so a name is one or the other. A catalog
-        name always reads the catalog model.
+        A run publishes the next version of its `fine_tune`, the run's name
+        unless it names another, and neither may be a catalog model's name,
+        so a name is one or the other. A catalog name always reads the
+        catalog model.
       parameters:
         - $ref: "#/components/parameters/project"
         - $ref: "#/components/parameters/model"
@@ -2250,6 +2251,7 @@ paths:
                         reason: null
                         attempt: 0
                         base: general-forecast/tabicl-v2-classifier
+                        fine_tune: r1
                         corpus:
                           name: credit-v1
                           digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2257,8 +2259,7 @@ paths:
                         - kind: lora
                           rank: 16
                         evaluation:
-                          bagging:
-                            k: 8
+                          holdout: 0.2
                         checkpoint_policy:
                           every: null
                           keep: best_and_last
@@ -2269,13 +2270,16 @@ paths:
                         plan: null
                         created: 1761200000.0
                         updated: 1761200000.0
+                        published: null
     post:
       operationId: runs.create
       tags:
       - hosted
       summary: create a fine-tuning run
       description: Creating the same run again returns it; the same name with a different specification
-        is refused with 409.
+        is refused with 409. The run publishes the next version of its `fine_tune`, the run's name by
+        default, so retraining under the same `fine_tune` makes that fine-tune's next version.
+        `evaluation` is optional.
       parameters:
       - $ref: '#/components/parameters/project'
       requestBody:
@@ -2300,9 +2304,6 @@ paths:
                     changes:
                     - kind: lora
                       rank: 16
-                    evaluation:
-                      bagging:
-                        k: 8
       responses:
         '200':
           description: ok
@@ -2325,6 +2326,7 @@ paths:
                       reason: null
                       attempt: 0
                       base: general-forecast/tabicl-v2-classifier
+                      fine_tune: r1
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2332,8 +2334,7 @@ paths:
                       - kind: lora
                         rank: 16
                       evaluation:
-                        bagging:
-                          k: 8
+                        holdout: 0.2
                       checkpoint_policy:
                         every: null
                         keep: best_and_last
@@ -2344,6 +2345,7 @@ paths:
                       plan: null
                       created: 1761200000.0
                       updated: 1761200000.0
+                      published: null
   /v1/projects/{project}/runs/{run}:
     get:
       operationId: runs.get
@@ -2375,6 +2377,7 @@ paths:
                       reason: null
                       attempt: 0
                       base: general-forecast/tabicl-v2-classifier
+                      fine_tune: r1
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2382,8 +2385,7 @@ paths:
                       - kind: lora
                         rank: 16
                       evaluation:
-                        bagging:
-                          k: 8
+                        holdout: 0.2
                       checkpoint_policy:
                         every: null
                         keep: best_and_last
@@ -2394,6 +2396,50 @@ paths:
                       plan: null
                       created: 1761200000.0
                       updated: 1761200000.0
+                      published: null
+                finished:
+                  summary: a run that published, its version named on the run
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-0e7c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                    resource:
+                      kind: run
+                      name: credit-default-v2
+                    result:
+                      name: credit-default-v2
+                      state: finished
+                      reason: null
+                      attempt: 1
+                      base: general-forecast/tabicl-v2-classifier
+                      fine_tune: credit-default
+                      corpus:
+                        name: credit-v2
+                        digest: sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2
+                      changes:
+                      - kind: lora
+                        rank: 16
+                      evaluation:
+                        holdout: 0.2
+                      checkpoint_policy:
+                        every: null
+                        keep: best_and_last
+                        state: last
+                      budget: null
+                      seed: 0
+                      tags: []
+                      plan:
+                        phases:
+                        - steps: 200
+                      created: 1793000000.0
+                      updated: 1793003600.0
+                      published:
+                        model: acme/credit-default@ft2
+                        digest: sha256:9c1e3a5b7d9f1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d
+                        kept_step: 180
+                        unchanged: false
+                        validation_loss: 0.412
+                        base_validation_loss: 0.455
   /v1/projects/{project}/runs/{run}/train:
     post:
       operationId: runs.train
@@ -2445,6 +2491,7 @@ paths:
                       reason: null
                       attempt: 0
                       base: general-forecast/tabicl-v2-classifier
+                      fine_tune: r1
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2452,8 +2499,7 @@ paths:
                       - kind: lora
                         rank: 16
                       evaluation:
-                        bagging:
-                          k: 8
+                        holdout: 0.2
                       checkpoint_policy:
                         every: null
                         keep: best_and_last
@@ -2466,6 +2512,7 @@ paths:
                         - steps: 100
                       created: 1761200000.0
                       updated: 1761200060.0
+                      published: null
   /v1/projects/{project}/runs/{run}/cancel:
     post:
       operationId: runs.cancel
@@ -2474,8 +2521,8 @@ paths:
       summary: cancel a run
       description: A run a trainer is working on moves to `cancelling` until it stops, then ends `cancelled`.
         With `save`, a run that is training stops at its next report and publishes the weights trained
-        so far as the next version of the fine-tune named after the run, as a run stopped by its budget
-        does; its lineage records the version under `published`. Without `save` nothing is published.
+        so far as the next version of its `fine_tune`, as a run stopped by its budget does; the run's
+        `published`, and its lineage's `published` note, name the version. Without `save` nothing is published.
         A run that is not training (queued, setting up, ready or preempted) has no weights in hand, so
         `save` publishes nothing. Cancelling an ended or cancelling run returns it unchanged.
       parameters:
@@ -2529,6 +2576,7 @@ paths:
                       reason: null
                       attempt: 0
                       base: general-forecast/tabicl-v2-classifier
+                      fine_tune: r1
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2536,8 +2584,7 @@ paths:
                       - kind: lora
                         rank: 16
                       evaluation:
-                        bagging:
-                          k: 8
+                        holdout: 0.2
                       checkpoint_policy:
                         every: null
                         keep: best_and_last
@@ -2548,6 +2595,7 @@ paths:
                       plan: null
                       created: 1761200000.0
                       updated: 1761200060.0
+                      published: null
                 save:
                   value:
                     api_version: gf/v1
@@ -2562,6 +2610,7 @@ paths:
                       reason: null
                       attempt: 1
                       base: general-forecast/tabicl-v2-classifier
+                      fine_tune: r1
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2569,8 +2618,7 @@ paths:
                       - kind: lora
                         rank: 16
                       evaluation:
-                        bagging:
-                          k: 8
+                        holdout: 0.2
                       checkpoint_policy:
                         every: null
                         keep: best_and_last
@@ -2583,6 +2631,7 @@ paths:
                         - steps: 100
                       created: 1761200000.0
                       updated: 1761200120.0
+                      published: null
   /v1/projects/{project}/runs/{run}/lineage:
     get:
       operationId: runs.lineage
@@ -2615,6 +2664,7 @@ paths:
                         kind: created
                         body:
                           base: general-forecast/tabicl-v2-classifier
+                          fine_tune: r1
                           corpus:
                             name: credit-v1
                             digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2622,8 +2672,7 @@ paths:
                           - kind: lora
                             rank: 16
                           evaluation:
-                            bagging:
-                              k: 8
+                            holdout: 0.2
                           checkpoint_policy:
                             every: null
                             keep: best_and_last
@@ -5554,6 +5603,8 @@ components:
       - plan
       - created
       - updated
+      - fine_tune
+      - published
       additionalProperties: false
       properties:
         name:
@@ -5570,6 +5621,10 @@ components:
         base:
           $ref: '#/components/schemas/ModelId'
           description: the catalog model the run trains from
+        fine_tune:
+          $ref: '#/components/schemas/Name'
+          description: the fine-tune the run publishes the next version of, `<project>/<fine_tune>@ft<N>`;
+            the run's name unless it was created with another
         corpus:
           $ref: '#/components/schemas/RunCorpus'
         changes:
@@ -5577,7 +5632,7 @@ components:
           items:
             type: object
         evaluation:
-          type: object
+          $ref: '#/components/schemas/RunEvaluation'
         checkpoint_policy:
           type: object
         budget:
@@ -5603,6 +5658,87 @@ components:
           anyOf:
           - $ref: '#/components/schemas/RunUsage'
           - type: 'null'
+        published:
+          description: the version the run published, once it has; null until then, and for a run that
+            ends without publishing
+          anyOf:
+          - $ref: '#/components/schemas/RunPublished'
+          - type: 'null'
+    RunPublished:
+      type: object
+      description: |
+        What a run published: the version, its weights' digest, the step the
+        weights were kept at and how they scored on the rows the run held
+        out, against the base on the same rows. The same as the lineage's
+        `published` note. A version with `unchanged: true` predicts exactly
+        as its base does: no check during training beat the base.
+      required:
+      - model
+      - digest
+      - kept_step
+      - unchanged
+      - validation_loss
+      - base_validation_loss
+      additionalProperties: false
+      properties:
+        model:
+          $ref: '#/components/schemas/ModelId'
+          description: the version's id, `<project>/<fine_tune>@ft<N>`, which `models.get` reads and
+            a predictor's `gf.yaml` names
+        digest:
+          $ref: '#/components/schemas/Digest'
+          description: the digest of the version's weights
+        kept_step:
+          $ref: '#/components/schemas/KeptStep'
+        unchanged:
+          $ref: '#/components/schemas/Unchanged'
+        validation_loss:
+          description: the kept weights' loss on the held-out rows; null without a finite one
+          anyOf:
+          - type: number
+          - type: 'null'
+        base_validation_loss:
+          description: the base's loss on the same rows; null without a finite one
+          anyOf:
+          - type: number
+          - type: 'null'
+        diverged_at_step:
+          type: integer
+          description: present when the loss stopped being finite there and training stopped; the
+            version keeps the best step before it
+    RunEvaluation:
+      type: object
+      description: |
+        How the run chooses the weights it publishes. The trainer holds out
+        20% of the corpus's rows, scores them every `evaluate_every` steps
+        of the plan, and keeps the step that scores best: `holdout` is that
+        share, and every run says it. A run created without `evaluation`
+        has `{"holdout": 0.2}`, and a create may send that.
+
+        `bagging` and `sets`, which earlier clients had to send, are still
+        accepted, checked as before and recorded beside `holdout`, but the
+        trainer applies neither: a run publishes one bag, chosen on the
+        hold-out. The one effect of `sets` is that the run holds their
+        snapshots until it ends, so they cannot be deleted meanwhile.
+      required:
+      - holdout
+      additionalProperties: false
+      properties:
+        holdout:
+          type: number
+          description: the share of the corpus's rows held out to choose the kept step, 0.2; a create
+            that sends another share is refused with 422, since the trainer applies no other
+        bagging:
+          type: object
+          deprecated: true
+          description: '`{"k": 2..16}`, LoRA and the input adapter alone; recorded, not applied'
+        sets:
+          type: array
+          deprecated: true
+          description: 1 to 16 `{"queries", "context"}` snapshot digests; held until the run ends,
+            not scored
+          items:
+            type: object
     RunUsage:
       type: object
       required:
@@ -5659,7 +5795,6 @@ components:
       - base
       - corpus
       - changes
-      - evaluation
       additionalProperties: false
       properties:
         name:
@@ -5667,6 +5802,16 @@ components:
         base:
           $ref: '#/components/schemas/ModelId'
           description: the catalog model the run trains from; a fine-tune is refused with 422
+        fine_tune:
+          $ref: '#/components/schemas/Name'
+          description: |
+            the fine-tune the run publishes to, the run's name when left out.
+            A run publishes the name's next version, so a new run with the
+            same `fine_tune` makes `@ft2`, then `@ft3`; a version never
+            changes once published. Every version of a name trains from one
+            base: a run whose base differs from the name's earlier runs is
+            refused with 409. A catalog model's short name is refused with
+            422, `param: fine_tune` (or `name`, when it is the run's).
         corpus:
           $ref: '#/components/schemas/Name'
         changes:
@@ -5676,6 +5821,7 @@ components:
             type: object
         evaluation:
           type: object
+          description: optional; see `RunEvaluation`, which is what the run reports
         plan:
           type: object
         checkpoint_policy:
@@ -5748,7 +5894,8 @@ components:
         body:
           type: object
           description: |
-            What happened. A `metrics` event is one chunk of training:
+            What happened. A `published` event is the run's `published`. A
+            `metrics` event is one chunk of training:
             `steps`, `loss`, `validation_loss` and `seconds`, and, where the
             trainer reads them, `compile_seconds`, `train_seconds`,
             `chunk_steps`, `steps_per_second`, `rows_per_second`,
