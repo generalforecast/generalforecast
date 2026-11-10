@@ -38,6 +38,9 @@ from generalforecast.transport import HostedOnlyError, RelayedError, response_va
         ("UnsupportedOperation", 501, gf.Unsupported),
         ("UnsupportedCapability", 501, gf.Unsupported),
         ("Unsupported", 501, gf.Unsupported),
+        ("PlanRequired", 402, gf.PaymentRequired),
+        ("CreditsExhausted", 402, gf.PaymentRequired),
+        ("PaymentRequired", 402, gf.PaymentRequired),
     ],
 )
 def test_a_service_error_is_the_error_of_the_category_its_code_names(
@@ -217,3 +220,29 @@ def test_timeout_has_one_meaning():
     timeout = ServiceError("Timeout", "request deadline exceeded", 504)
     assert isinstance(timeout, gf.Unavailable) and timeout.public == "ModelNotReady"
     assert "Timeout" not in errors._PUBLIC_BY_CODE
+
+
+@pytest.mark.parametrize("reason", ["plan_required", "credits_exhausted"])
+def test_a_plan_or_credit_refusal_is_payment_required_with_its_reason(reason):
+    raised = ServiceError("".join(w.title() for w in reason.split("_")), "pay", 402)
+    assert raised.public_body() == {
+        "error": {"code": "PaymentRequired", "message": "pay", "reason": reason}
+    }
+    read = errors.from_wire(raised.error(), status=402)
+    assert isinstance(read, gf.PaymentRequired) and read.reason == reason
+    assert not isinstance(read, gf.InvalidInput)
+    # A service from before the code sent ValidationError, which stays as it was.
+    older = errors.from_wire(
+        {"code": "ValidationError", "message": "pay", "reason": reason}, status=402
+    )
+    assert isinstance(older, gf.InvalidInput) and older.reason == reason
+
+
+def test_a_client_call_refused_for_its_plan_raises_payment_required(wire):
+    wire.expect("GET", "/runs/r1", "PaymentRequired", status=402)
+    with (
+        Client(wire.url, project="test", api_key="fixture-key") as client,
+        pytest.raises(gf.PaymentRequired) as error,
+    ):
+        client.runs.get("r1")
+    assert error.value.status == 402

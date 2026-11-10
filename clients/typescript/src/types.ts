@@ -53,9 +53,19 @@ export interface Envelope {
  * ValidationError 422, NotFound 404, Unauthorized 401, CapacityExceeded 422,
  * ModelNotReady 503, Internal 500, Conflict 409 (a compare-and-swap on a stale
  * generation), Unsupported 501 (an operation this server does not offer, such as a
- * hosted route on gf serve)
+ * hosted route on gf serve), PaymentRequired 402 (the workspace's plan or credit does
+ * not cover the request). Hosted fine-tuning's gates, with their `reason`:
+ * `PaymentRequired` 402 `plan_required` (fine-tuning needs a Pro or Enterprise plan)
+ * and `credits_exhausted` (an enforced workspace has used its credits, which also
+ * refuses predictions); `Unauthorized` 403 `fine_tuning_unavailable` (fine-tuning is
+ * not turned on for the project); `CapacityExceeded` 429 `run_limit_reached` (the
+ * project has as many runs queued or running as it may), `quota_exceeded` (the
+ * project's training data would pass its quota) and `snapshot_quota_exceeded`. Those
+ * three 429s carry `limit` and `actual`, and lift only when the caller ends a run or
+ * deletes data, so clients do not retry them; a 429 `rate_limited` passes on its own
+ * and may be retried.
  */
-export const ERROR_CODES = ["ValidationError", "NotFound", "Unauthorized", "CapacityExceeded", "ModelNotReady", "Internal", "Conflict", "Unsupported"] as const;
+export const ERROR_CODES = ["ValidationError", "NotFound", "Unauthorized", "CapacityExceeded", "ModelNotReady", "Internal", "Conflict", "Unsupported", "PaymentRequired"] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
 
 /**
@@ -534,7 +544,15 @@ export interface ProjectCreateRequest extends Envelope {
   payload: ProjectCreate;
 }
 
-export type Permission = "predictors:read" | "predictors:write" | "predictors:predict" | "contexts:read" | "contexts:write" | "contexts:history" | "sources:read" | "sources:write" | "models:read" | "keys:read" | "keys:write" | "secrets:read" | "secrets:write" | "members:read" | "members:write" | "sso:read" | "sso:write" | "audit:read" | "operators:read" | "operators:write" | "projects:read";
+/**
+ * A project permission a key or role holds. Fine-tuning's: `corpora:read` reads uploads
+ * and corpora, `corpora:write` uploads and creates and deletes uploads and corpora,
+ * `runs:read` reads runs and their lineage, and `runs:write` creates, trains and
+ * cancels runs; `models:read` reads the fine-tunes runs publish. The admin and editor
+ * roles hold all four; the viewer role holds `corpora:read` and `runs:read`. `GET
+ * /auth/status` lists every permission with the roles that hold it.
+ */
+export type Permission = "predictors:read" | "predictors:write" | "predictors:predict" | "contexts:read" | "contexts:write" | "contexts:history" | "sources:read" | "sources:write" | "models:read" | "corpora:read" | "corpora:write" | "runs:read" | "runs:write" | "keys:read" | "keys:write" | "secrets:read" | "secrets:write" | "members:read" | "members:write" | "sso:read" | "sso:write" | "audit:read" | "operators:read" | "operators:write" | "projects:read";
 
 /** `token` is present only in the create and rotate replies */
 export interface Key {
@@ -861,6 +879,7 @@ export interface Upload {
   error: string | null;
   metadata: Record<string, unknown> | null;
   expires: number | null;
+  created: number;
   snapshot?: TrainingSnapshot;
 }
 
@@ -876,9 +895,18 @@ export interface UploadOpened {
   error: string | null;
   metadata: Record<string, unknown> | null;
   expires: number | null;
+  created: number;
   url: string | null;
   method: "PUT";
   chunk_bytes: number;
+}
+
+export interface UploadList {
+  uploads: Upload[];
+}
+
+export interface UploadListReply extends Envelope {
+  result: UploadList;
 }
 
 export interface UploadOpenedReply extends Envelope {
@@ -2102,6 +2130,7 @@ export const ROUTES = {
   "runs.train": { method: "POST", path: "/v1/projects/{project}/runs/{run}/train", request: "RunTrainRequest", reply: "RunReply", body: "application/json" },
   "runs.cancel": { method: "POST", path: "/v1/projects/{project}/runs/{run}/cancel", request: "RunCancelRequest", reply: "RunReply", body: "application/json" },
   "runs.lineage": { method: "GET", path: "/v1/projects/{project}/runs/{run}/lineage", request: "null", reply: "RunLineageReply", body: null },
+  "uploads.list": { method: "GET", path: "/v1/projects/{project}/uploads", request: "null", reply: "UploadListReply", body: null },
   "uploads.create": { method: "POST", path: "/v1/projects/{project}/uploads", request: "UploadCreateRequest", reply: "UploadOpenedReply", body: "application/json" },
   "uploads.get": { method: "GET", path: "/v1/projects/{project}/uploads/{upload}", request: "null", reply: "UploadReply", body: null },
   "uploads.delete": { method: "POST", path: "/v1/projects/{project}/uploads/{upload}/delete", request: "UploadRefRequest", reply: "UploadDeletedReply", body: "application/json" },

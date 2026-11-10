@@ -2346,6 +2346,26 @@ paths:
                       created: 1761200000.0
                       updated: 1761200000.0
                       published: null
+        '402':
+          description: the workspace's plan does not include fine-tuning, or its credits are used
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorReply'
+              examples:
+                plan_required:
+                  x-gf-hosted: true
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-067c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                    resource:
+                      kind: run
+                      name: r1
+                    error:
+                      code: PaymentRequired
+                      message: fine-tuning needs a Pro or Enterprise plan
+                      reason: plan_required
   /v1/projects/{project}/runs/{run}:
     get:
       operationId: runs.get
@@ -2682,6 +2702,45 @@ paths:
                           tags: []
                           plan: null
   /v1/projects/{project}/uploads:
+    get:
+      operationId: uploads.list
+      tags:
+      - hosted
+      summary: list the project's uploads
+      description: Every upload that is not deleted, oldest first, without its snapshot; `uploads.get`
+        reads one with it. A deleted upload is still read by its id.
+      parameters:
+      - $ref: '#/components/parameters/project'
+      responses:
+        '200':
+          description: ok
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadListReply'
+              examples:
+                list:
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-1a7c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                    resource:
+                      kind: corpus
+                      name: uploads
+                    result:
+                      uploads:
+                      - id: up-3f1c2a9b8e7d6c5b4a392817
+                        state: verified
+                        bytes: 52428800
+                        digest: sha256:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f
+                        error: null
+                        metadata:
+                          target: defaulted
+                          task: classification
+                          origin:
+                            kind: uploaded
+                        expires: null
+                        created: 1761200000.0
     post:
       operationId: uploads.create
       tags:
@@ -2743,6 +2802,7 @@ paths:
                         origin:
                           kind: uploaded
                       expires: 1761286400.0
+                      created: 1761200000.0
                       url: https://storage.googleapis.com/upload/storage/v1/b/gf-artifacts/o?uploadType=resumable&upload_id=ADPycdu
                       method: PUT
                       chunk_bytes: 8388608
@@ -2783,6 +2843,7 @@ paths:
                         origin:
                           kind: uploaded
                       expires: null
+                      created: 1761200000.0
                       snapshot:
                         digest: sha256:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f
                         bytes: 52428800
@@ -4387,12 +4448,26 @@ components:
 
     ErrorCode:
       type: string
-      enum: [ValidationError, NotFound, Unauthorized, CapacityExceeded, ModelNotReady, Internal, Conflict, Unsupported]
+      enum: [ValidationError, NotFound, Unauthorized, CapacityExceeded, ModelNotReady, Internal, Conflict, Unsupported, PaymentRequired]
       description: |
         ValidationError 422, NotFound 404, Unauthorized 401, CapacityExceeded
         422, ModelNotReady 503, Internal 500, Conflict 409 (a compare-and-swap
         on a stale generation), Unsupported 501 (an operation this server
-        does not offer, such as a hosted route on gf serve)
+        does not offer, such as a hosted route on gf serve), PaymentRequired
+        402 (the workspace's plan or credit does not cover the request).
+
+        Hosted fine-tuning's gates, with their `reason`:
+        `PaymentRequired` 402 `plan_required` (fine-tuning needs a Pro or
+        Enterprise plan) and `credits_exhausted` (an enforced workspace has
+        used its credits, which also refuses predictions);
+        `Unauthorized` 403 `fine_tuning_unavailable` (fine-tuning is not
+        turned on for the project);
+        `CapacityExceeded` 429 `run_limit_reached` (the project has as many
+        runs queued or running as it may), `quota_exceeded` (the project's
+        training data would pass its quota) and `snapshot_quota_exceeded`.
+        Those three 429s carry `limit` and `actual`, and lift only when the
+        caller ends a run or deletes data, so clients do not retry them; a
+        429 `rate_limited` passes on its own and may be retried.
 
     Error:
       type: object
@@ -4412,7 +4487,7 @@ components:
             The finer reason behind `code`, when the service has one. A
             refused browser session says why with `reauthentication_required`,
             `link_confirmation_required`, `session_required` or
-            `waitlist_required`.
+            `waitlist_required`; `ErrorCode` lists fine-tuning's.
         param: {type: string}
         hint: {type: string}
         limit: {type: integer}
@@ -5180,6 +5255,15 @@ components:
 
     Permission:
       type: string
+      description: |
+        A project permission a key or role holds. Fine-tuning's:
+        `corpora:read` reads uploads and corpora, `corpora:write` uploads and
+        creates and deletes uploads and corpora, `runs:read` reads runs and
+        their lineage, and `runs:write` creates, trains and cancels runs;
+        `models:read` reads the fine-tunes runs publish. The admin and
+        editor roles hold all four; the viewer role holds `corpora:read`
+        and `runs:read`. `GET /auth/status` lists every permission with the
+        roles that hold it.
       enum:
         - predictors:read
         - predictors:write
@@ -5190,6 +5274,10 @@ components:
         - sources:read
         - sources:write
         - models:read
+        - corpora:read
+        - corpora:write
+        - runs:read
+        - runs:write
         - keys:read
         - keys:write
         - secrets:read
@@ -5976,6 +6064,7 @@ components:
       - error
       - metadata
       - expires
+      - created
       additionalProperties: false
       properties:
         id:
@@ -6001,8 +6090,12 @@ components:
           anyOf:
           - type: number
           - type: 'null'
+        created:
+          type: number
+          description: when the upload was opened, in seconds since the epoch
         snapshot:
           $ref: '#/components/schemas/TrainingSnapshot'
+          description: the training snapshot a verified upload became; `uploads.get` alone carries it
     UploadReply:
       allOf:
       - $ref: '#/components/schemas/Envelope'
@@ -6022,6 +6115,7 @@ components:
       - error
       - metadata
       - expires
+      - created
       - url
       - method
       - chunk_bytes
@@ -6050,6 +6144,8 @@ components:
           anyOf:
           - type: number
           - type: 'null'
+        created:
+          type: number
         url:
           anyOf:
           - type: string
@@ -6060,6 +6156,25 @@ components:
         chunk_bytes:
           type: integer
           minimum: 1
+    UploadList:
+      type: object
+      required:
+      - uploads
+      additionalProperties: false
+      properties:
+        uploads:
+          type: array
+          items:
+            $ref: '#/components/schemas/Upload'
+    UploadListReply:
+      allOf:
+      - $ref: '#/components/schemas/Envelope'
+      - type: object
+        required:
+        - result
+        properties:
+          result:
+            $ref: '#/components/schemas/UploadList'
     UploadOpenedReply:
       allOf:
       - $ref: '#/components/schemas/Envelope'
