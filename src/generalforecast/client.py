@@ -15,7 +15,7 @@ identity action table a hosted service must serve, `WORKSPACE_ACTIONS`
 
 import builtins
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Self
 
@@ -23,6 +23,7 @@ from generalforecast import _operations as ops
 from generalforecast._operations import (
     WORKSPACE_ACTIONS,
     Call,
+    Emit,
     Operation,
     PartialWrite,
     Pause,
@@ -262,8 +263,14 @@ class Client:
                 continue
             return ops.answer(prepared, value)
 
-    def _run[T](self, operation: Operation[T]) -> T:
-        """Runs an operation's steps in this thread, throwing failures back into it."""
+    def _run[T](
+        self, operation: Operation[T], emit: Callable[[Any], Any] | None = None
+    ) -> T:
+        """Runs an operation's steps in this thread, throwing failures back into it.
+
+        What the operation emits goes to `emit`, if given; a failure there
+        is thrown back into the operation as a step's would be.
+        """
         result: Any = None
         failure: Exception | None = None
         while True:
@@ -277,11 +284,39 @@ class Client:
                 return stop.value
             result, failure = None, None
             try:
+                if isinstance(step, Emit):
+                    if emit is not None:
+                        emit(step.value)
+                else:
+                    result = self._step(step)
+            except Exception as error:  # noqa: BLE001 - thrown into the operation
+                failure = error
+
+    def _watch(self, operation: Operation[Any]) -> Iterator[Any]:
+        """Runs an operation's steps in this thread, yielding what it emits."""
+        result: Any = None
+        failure: Exception | None = None
+        while True:
+            try:
+                step = (
+                    operation.send(result)
+                    if failure is None
+                    else operation.throw(failure)
+                )
+            except StopIteration:
+                return
+            result, failure = None, None
+            if isinstance(step, Emit):
+                yield step.value
+                continue
+            try:
                 result = self._step(step)
             except Exception as error:  # noqa: BLE001 - thrown into the operation
                 failure = error
 
     def _step(self, step: ops.Step) -> Any:
+        if isinstance(step, Emit):
+            return None
         if isinstance(step, Work):
             return step.function(*step.args, **step.kwargs)
         if isinstance(step, Pause):
@@ -493,7 +528,8 @@ class Runs(Collection):
         base: str,
         corpus: str,
         changes: builtins.list[JsonObject],
-        evaluation: JsonObject,
+        fine_tune: str | None = None,
+        evaluation: JsonObject | None = None,
         plan: JsonObject | None = None,
         checkpoint_policy: JsonObject | None = None,
         budget: JsonObject | None = None,
@@ -502,15 +538,20 @@ class Runs(Collection):
     ) -> JsonObject:
         """Creates a run; with a `plan` it trains as soon as it is set up.
 
-        `base` is the catalog model the run trains from. Creating the same
-        run again returns it, so the client retries a create the service
-        could not take for now, such as one past the project's run limit.
+        `base` is the catalog model the run trains from. The run publishes
+        the next version of `fine_tune`, `<project>/<fine_tune>@ft<N>`; it
+        defaults to the run's name, so a new run with the same `fine_tune`
+        publishes that fine-tune's next version. `evaluation` may be left
+        out: the run keeps the step that scores best on a 20% hold-out of
+        the corpus's rows, which is what the run reports as its
+        `evaluation`. Creating the same run again returns it.
         """
         payload = ops.run_spec(
             name,
             base=base,
             corpus=corpus,
             changes=changes,
+            fine_tune=fine_tune,
             evaluation=evaluation,
             plan=plan,
             checkpoint_policy=checkpoint_policy,
@@ -546,10 +587,41 @@ class Runs(Collection):
         return self.client._run(ops.run_lineage(run))
 
     def wait(
-        self, run: str, *, timeout: float | None = None, poll: float = 5.0
+        self,
+        run: str,
+        *,
+        timeout: float | None = None,
+        poll: float = 5.0,
+        on_event: Callable[[JsonObject], Any] | None = None,
     ) -> JsonObject:
-        """Polls a run until it finishes, is cancelled or fails."""
-        return self.client._run(ops.run_wait(run, timeout=timeout, poll=poll))
+        """Polls a run until it finishes, is cancelled or fails, and returns it.
+
+        The run's `published` names the version it made, as `{"model":
+        "<project>/<fine_tune>@ft<N>", "digest", "kept_step", "unchanged",
+        "validation_loss", "base_validation_loss"}`, or is None when it made
+        none. With `on_event`, each lineage event is passed to it once, as
+        `watch` yields them. Past `timeout` seconds it raises `WaitTimeout`
+        (`gf.ModelNotReady`), and the run carries on.
+        """
+        if on_event is None:
+            return self.client._run(ops.run_wait(run, timeout=timeout, poll=poll))
+        return self.client._run(
+            ops.run_watch(run, timeout=timeout, poll=poll), on_event
+        )
+
+    def watch(
+        self, run: str, *, timeout: float | None = None, poll: float = 5.0
+    ) -> Iterator[JsonObject]:
+        """Yields a run's lineage events once each, oldest first, until it ends.
+
+        Each event is `{"at", "kind", "body"}`, as `lineage` lists them:
+        `state` for each change of state, `metrics` for each stretch of
+        training (`steps`, `loss`, `validation_loss`, `seconds`), and
+        `published` when it publishes. Events from before the watch began
+        come first. The iteration ends once the run has ended; `get` or
+        `wait` then reads it. Past `timeout` seconds it raises `WaitTimeout`.
+        """
+        return self.client._watch(ops.run_watch(run, timeout=timeout, poll=poll))
 
 
 class Models(Collection):
