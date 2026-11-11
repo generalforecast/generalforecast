@@ -262,7 +262,7 @@ def test_a_transport_sends_each_request_once_and_takes_no_retries(
 
         kind = AsyncTransport if asynchronous else Transport
         with pytest.raises(TypeError):
-            kind("https://service.example", token="fixture-key", retries=2)  # ty: ignore[unknown-argument]
+            kind("https://service.example", token="fixture-key", retries=2)
         if asynchronous:
             transport = AsyncTransport(
                 "https://service.example",
