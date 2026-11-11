@@ -1,0 +1,196 @@
+# SPDX-FileCopyrightText: General Forecast, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+"""A run is created with what it needs, followed by its events, and ends naming its version."""
+
+import inspect
+
+import pytest
+
+import generalforecast as gf
+from generalforecast.service.contracts import ServiceError
+from tests.product_sdk.test_client import run
+
+BASE = "general-forecast/tabicl-v2-classifier"
+PUBLISHED = {
+    "model": "test/credit@ft2",
+    "digest": "sha256:" + "9" * 64,
+    "kept_step": 180,
+    "unchanged": False,
+    "validation_loss": 0.412,
+    "base_validation_loss": 0.455,
+}
+CREATED = {"at": 1.0, "kind": "created", "body": {}}
+SETTING_UP = {"at": 2.0, "kind": "state", "body": {"state": "setting_up"}}
+TRAINING = {"at": 3.0, "kind": "state", "body": {"state": "training"}}
+METRICS = {"at": 4.0, "kind": "metrics", "body": {"steps": 20, "loss": 0.5}}
+NOTE = {"at": 5.0, "kind": "published", "body": PUBLISHED}
+FINISHED = {"at": 6.0, "kind": "state", "body": {"state": "finished"}}
+
+
+def _run(state, **fields):
+    return {"name": "credit-v2", "state": state, **fields}
+
+
+def _lineage(*events):
+    return {"run": "credit-v2", "events": list(events)}
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_run_needs_no_evaluation_and_may_name_the_fine_tune_it_publishes(
+    wire, asynchronous
+):
+    spec = {
+        "name": "credit-v2",
+        "base": BASE,
+        "corpus": "credit-v2",
+        "changes": [{"kind": "lora", "rank": 16}],
+        "fine_tune": "credit",
+    }
+    wire.expect("POST", "/runs", _run("queued", fine_tune="credit"), payload=spec)
+    created = run(
+        asynchronous,
+        wire.url,
+        lambda c: c.runs.create(
+            "credit-v2",
+            base=BASE,
+            corpus="credit-v2",
+            changes=[{"kind": "lora", "rank": 16}],
+            fine_tune="credit",
+        ),
+    )
+    assert created["fine_tune"] == "credit"
+    # Left out, neither is sent: the service picks the run's name and the hold-out.
+    plain = {key: value for key, value in spec.items() if key != "fine_tune"}
+    wire.expect("POST", "/runs", _run("queued"), payload=plain)
+    run(
+        asynchronous,
+        wire.url,
+        lambda c: c.runs.create(
+            "credit-v2",
+            base=BASE,
+            corpus="credit-v2",
+            changes=[{"kind": "lora", "rank": 16}],
+        ),
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_wait_returns_the_run_with_the_version_it_published(wire, asynchronous):
+    wire.expect("GET", "/runs/credit-v2", _run("training", published=None))
+    wire.expect("GET", "/runs/credit-v2", _run("finished", published=PUBLISHED))
+    ended = run(asynchronous, wire.url, lambda c: c.runs.wait("credit-v2", poll=0.01))
+    assert ended["published"]["model"] == "test/credit@ft2"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_wait_reads_published_from_the_lineage_of_a_service_that_does_not_say_it(
+    wire, asynchronous
+):
+    # An older service's run has no `published`; its lineage's note names it.
+    wire.expect("GET", "/runs/credit-v2", _run("finished"))
+    wire.expect(
+        "GET", "/runs/credit-v2/lineage", _lineage(CREATED, METRICS, NOTE, FINISHED)
+    )
+    ended = run(asynchronous, wire.url, lambda c: c.runs.wait("credit-v2"))
+    assert ended["published"] == PUBLISHED
+    # A run that failed published nothing.
+    wire.expect("GET", "/runs/credit-v2", _run("failed", reason="data"))
+    wire.expect("GET", "/runs/credit-v2/lineage", _lineage(CREATED, SETTING_UP))
+    ended = run(asynchronous, wire.url, lambda c: c.runs.wait("credit-v2"))
+    assert ended["published"] is None
+
+
+def _follow(wire):
+    """A run seen three times: setting up, training, then finished and published."""
+    wire.expect("GET", "/runs/credit-v2", _run("setting_up", published=None))
+    wire.expect("GET", "/runs/credit-v2/lineage", _lineage(CREATED, SETTING_UP))
+    wire.expect("GET", "/runs/credit-v2", _run("training", published=None))
+    wire.expect(
+        "GET",
+        "/runs/credit-v2/lineage",
+        _lineage(CREATED, SETTING_UP, TRAINING, METRICS),
+    )
+    wire.expect("GET", "/runs/credit-v2", _run("finished", published=PUBLISHED))
+    wire.expect(
+        "GET",
+        "/runs/credit-v2/lineage",
+        _lineage(CREATED, SETTING_UP, TRAINING, METRICS, NOTE, FINISHED),
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_watch_yields_each_event_once_until_the_run_ends(wire, asynchronous):
+    _follow(wire)
+
+    async def body(client):
+        watched = client.runs.watch("credit-v2", poll=0.01)
+        if asynchronous:
+            return [event async for event in watched]
+        return list(watched)
+
+    events = run(asynchronous, wire.url, body)
+    assert events == [CREATED, SETTING_UP, TRAINING, METRICS, NOTE, FINISHED]
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_wait_passes_each_event_to_on_event_and_returns_the_run(wire, asynchronous):
+    _follow(wire)
+    seen = []
+    ended = run(
+        asynchronous,
+        wire.url,
+        lambda c: c.runs.wait("credit-v2", poll=0.01, on_event=seen.append),
+    )
+    assert seen == [CREATED, SETTING_UP, TRAINING, METRICS, NOTE, FINISHED]
+    assert ended["state"] == "finished" and ended["published"] == PUBLISHED
+
+
+def test_the_async_client_awaits_a_coroutine_on_event(wire):
+    _follow(wire)
+    seen = []
+
+    async def record(event):
+        seen.append(event["kind"])
+
+    ended = run(
+        True,
+        wire.url,
+        lambda c: c.runs.wait("credit-v2", poll=0.01, on_event=record),
+    )
+    assert seen == ["created", "state", "state", "metrics", "published", "state"]
+    assert ended["published"]["model"] == "test/credit@ft2"
+    assert inspect.iscoroutinefunction(record)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_watch_past_its_timeout_raises_and_leaves_the_run_going(wire, asynchronous):
+    wire.expect("GET", "/runs/credit-v2", _run("training", published=None))
+    wire.expect("GET", "/runs/credit-v2/lineage", _lineage(CREATED, TRAINING))
+
+    async def body(client):
+        watched = client.runs.watch("credit-v2", timeout=0, poll=0.01)
+        if asynchronous:
+            return [event async for event in watched]
+        return list(watched)
+
+    with pytest.raises(ServiceError) as raised:
+        run(asynchronous, wire.url, body)
+    assert raised.value.code == "WaitTimeout"
+    assert isinstance(raised.value, gf.ModelNotReady)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_an_on_event_that_raises_stops_the_wait(wire, asynchronous):
+    wire.expect("GET", "/runs/credit-v2", _run("training", published=None))
+    wire.expect("GET", "/runs/credit-v2/lineage", _lineage(CREATED, TRAINING))
+
+    def stop(event):
+        raise RuntimeError("seen enough")
+
+    with pytest.raises(RuntimeError, match="seen enough"):
+        run(
+            asynchronous,
+            wire.url,
+            lambda c: c.runs.wait("credit-v2", poll=0.01, on_event=stop),
+        )

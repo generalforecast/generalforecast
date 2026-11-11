@@ -716,11 +716,43 @@ export interface RunCorpus {
   digest: Digest;
 }
 
+/**
+ * How the run chooses the weights it publishes. The trainer holds out 20% of the
+ * corpus's rows, scores them every `evaluate_every` steps of the plan, and keeps the
+ * step that scores best: `holdout` is that share, and every run says it. A run created
+ * without `evaluation` has `{"holdout": 0.2}`, and a create may send that. `bagging`
+ * and `sets`, which earlier clients had to send, are still accepted, checked as before
+ * and recorded beside `holdout`, but the trainer applies neither: a run publishes one
+ * bag, chosen on the hold-out. The one effect of `sets` is that the run holds their
+ * snapshots until it ends, so they cannot be deleted meanwhile.
+ */
+export interface RunEvaluation {
+  holdout: number;
+  bagging?: Record<string, unknown>;
+  sets?: Record<string, unknown>[];
+}
+
 export interface RunUsage {
   gpu_seconds: number;
   charged_gpu_seconds: number;
   voided_gpu_seconds: number;
   credits: number;
+}
+
+/**
+ * What a run published: the version, its weights' digest, the step the weights were
+ * kept at and how they scored on the rows the run held out, against the base on the
+ * same rows. The same as the lineage's `published` note. A version with `unchanged:
+ * true` predicts exactly as its base does: no check during training beat the base.
+ */
+export interface RunPublished {
+  model: ModelId;
+  digest: Digest;
+  kept_step: KeptStep;
+  unchanged: Unchanged;
+  validation_loss: number | null;
+  base_validation_loss: number | null;
+  diverged_at_step?: number;
 }
 
 export interface Run {
@@ -729,9 +761,10 @@ export interface Run {
   reason: string | null;
   attempt: number;
   base: ModelId;
+  fine_tune: Name;
   corpus: RunCorpus;
   changes: Record<string, unknown>[];
-  evaluation: Record<string, unknown>;
+  evaluation: RunEvaluation;
   checkpoint_policy: Record<string, unknown>;
   budget: Record<string, unknown> | null;
   seed: number;
@@ -740,6 +773,7 @@ export interface Run {
   created: number;
   updated: number;
   usage?: RunUsage | null;
+  published: RunPublished | null;
 }
 
 export interface RunReply extends Envelope {
@@ -757,9 +791,10 @@ export interface RunListReply extends Envelope {
 export interface RunCreate {
   name: Name;
   base: ModelId;
+  fine_tune?: Name;
   corpus: Name;
   changes: Record<string, unknown>[];
-  evaluation: Record<string, unknown>;
+  evaluation?: Record<string, unknown>;
   plan?: Record<string, unknown>;
   checkpoint_policy?: Record<string, unknown>;
   budget?: Record<string, unknown>;

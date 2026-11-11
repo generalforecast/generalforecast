@@ -158,7 +158,19 @@ class Pause:
     seconds: float
 
 
-Step = Call | Upload | Chunk | Work | Pause
+@dataclass(frozen=True)
+class Emit:
+    """A value an operation hands its caller as it goes, such as a run's next event.
+
+    A client that watches the operation yields it (`runs.watch`), or calls
+    its callback with it (`runs.wait(on_event=...)`); one that only runs the
+    operation passes over it. Emitting asks the client for nothing.
+    """
+
+    value: Any
+
+
+Step = Call | Upload | Chunk | Work | Pause | Emit
 type Operation[T] = Generator[Step, Any, T]
 
 
@@ -795,18 +807,88 @@ def run_lineage(run: str) -> Operation[JsonObject]:
     return (yield Call("GET", f"/runs/{name(run)}/lineage", "run", run))
 
 
+# What a run's `published` holds; a note an older service wrote may leave
+# out the losses it had no finite value for.
+PUBLISHED_FIELDS = (
+    "model",
+    "digest",
+    "kept_step",
+    "unchanged",
+    "validation_loss",
+    "base_validation_loss",
+)
+
+
+def published_of(events: Sequence[Any]) -> JsonObject | None:
+    """A run's `published` from its lineage: its last `published` note, or None."""
+    for event in reversed(events):
+        if isinstance(event, dict) and event.get("kind") == "published":
+            body = event.get("body")
+            if isinstance(body, dict):
+                return {key: body.get(key) for key in PUBLISHED_FIELDS} | {
+                    key: value
+                    for key, value in body.items()
+                    if key not in PUBLISHED_FIELDS
+                }
+    return None
+
+
+def _ended(run: str, state: JsonObject) -> Operation[JsonObject]:
+    """A run that has ended, with `published` read from its lineage if the service left it out.
+
+    A service from before runs carried `published` says it only in the
+    lineage's `published` note.
+    """
+    if "published" in state:
+        return state
+    lineage = yield from run_lineage(run)
+    return {**state, "published": published_of(lineage.get("events", ()))}
+
+
+def _still_running(run: str, state: JsonObject) -> ServiceError:
+    return ServiceError("WaitTimeout", f"run {run} is still {state['state']}", 504)
+
+
 def run_wait(run: str, *, timeout: float | None, poll: float) -> Operation[JsonObject]:
-    """Polls a run until it finishes, is cancelled or fails."""
+    """Polls a run until it finishes, is cancelled or fails, and returns it.
+
+    The run's `published` names the version it made, or is None.
+    """
     deadline = None if timeout is None else time.monotonic() + timeout
     state = yield from got("run", "runs", run)
     while state["state"] not in RUN_DONE:
         if deadline is not None and time.monotonic() >= deadline:
-            raise ServiceError(
-                "WaitTimeout", f"run {run} is still {state['state']}", 504
-            )
+            raise _still_running(run, state)
         yield Pause(poll)
         state = yield from got("run", "runs", run)
-    return state
+    return (yield from _ended(run, state))
+
+
+def run_watch(run: str, *, timeout: float | None, poll: float) -> Operation[JsonObject]:
+    """Emits each of a run's lineage events once, oldest first, until the run ends.
+
+    Each poll reads the run and its lineage, and emits the events not yet
+    emitted: `state` changes, `metrics` as training goes, `published`, and
+    the rest the lineage holds. Once the run has ended and its last event
+    is emitted, returns the run as `run_wait` does. `timeout` bounds the
+    whole watch: past it, `WaitTimeout`, and the run carries on.
+    """
+    number(poll, 0.001, 3600, "poll")
+    deadline = None if timeout is None else time.monotonic() + timeout
+    seen = 0
+    while True:
+        state = yield from got("run", "runs", run)
+        events = (yield from run_lineage(run)).get("events", [])
+        for event in events[seen:]:
+            yield Emit(event)
+        seen = max(seen, len(events))
+        if state["state"] in RUN_DONE:
+            if "published" in state:
+                return state
+            return {**state, "published": published_of(events)}
+        if deadline is not None and time.monotonic() >= deadline:
+            raise _still_running(run, state)
+        yield Pause(poll)
 
 
 def _predictor(predictor: str, suffix: str = "") -> str:
