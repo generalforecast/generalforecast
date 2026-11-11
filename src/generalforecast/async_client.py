@@ -580,6 +580,20 @@ class Uploads(Collection):
         )
         return await self.client._run(ops.training_upload(data, metadata, wait=wait))
 
+    async def list(self) -> builtins.list[JsonObject]:
+        """The project's uploads that are not deleted, oldest first, without their snapshots."""
+        return await self.client._run(ops.listed(self.kind, self.collection))
+
+    async def get(self, resource: str) -> Mapping[str, Any]:
+        """One upload by its id, `up-...`, with its training snapshot once verified."""
+        return await self.client._run(ops.got(self.kind, self.collection, resource))
+
+    async def delete(self, upload: str) -> JsonObject:
+        """Deletes an upload and its training snapshot, as `Client.uploads.delete`."""
+        return await self.client._run(
+            ops.posted("corpus", "uploads", upload, "delete", {})
+        )
+
 
 class Runs(Collection):
     """Fine-tuning runs: created once, trained once, followed until they end."""
