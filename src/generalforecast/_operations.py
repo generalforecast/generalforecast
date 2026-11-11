@@ -56,6 +56,7 @@ from generalforecast.service.contracts import (
     name,
     number,
     require,
+    run_ref,
 )
 from generalforecast.service.interfaces import (
     AcceptedWrite,
@@ -310,9 +311,16 @@ def listed(kind: ResourceKind, collection: str) -> Operation[list[JsonObject]]:
     return value
 
 
+def _segment(kind: ResourceKind, resource: str) -> str:
+    """A resource's path segment: its name, or for a run its id or fine-tune name."""
+    return run_ref(resource) if kind == "run" else name(resource)
+
+
 def got(kind: ResourceKind, collection: str, resource: str) -> Operation[JsonObject]:
     """`GET /{collection}/{name}`: one project-qualified resource."""
-    return (yield Call("GET", f"/{collection}/{name(resource)}", kind, resource))
+    return (
+        yield Call("GET", f"/{collection}/{_segment(kind, resource)}", kind, resource)
+    )
 
 
 # A catalog model id, `general-forecast/<name>`, with an optional variant.
@@ -382,7 +390,7 @@ def posted(
     retry: str | None = None,
 ) -> Operation[JsonObject]:
     """`POST /{collection}/{name}/{action}`; `retry` as `Call` takes it."""
-    suffix = f"/{name(resource)}" + (f"/{action}" if action else "")
+    suffix = f"/{_segment(kind, resource)}" + (f"/{action}" if action else "")
     return (
         yield Call(
             "POST", f"/{collection}{suffix}", kind, resource, payload, retry=retry
@@ -403,7 +411,12 @@ def created(
 
 
 def run_create(name_: str, payload: JsonObject) -> Operation[JsonObject]:
-    """`POST /runs`, retried: the service returns a run created again with the same spec."""
+    """`POST /runs`, retried under its request id.
+
+    Each create starts a new run, the fine-tune's next version, so the
+    create is retried only because every try sends the same request id: the
+    service answers a try it has seen with the run the first one made.
+    """
     return (yield from created("run", "runs", name_, payload, retry=WRITE))
 
 
@@ -785,7 +798,7 @@ def run_spec(name_: str, **settings: Any) -> JsonObject:
 
 
 def run_list(state: str | None) -> Operation[list[JsonObject]]:
-    """`GET /runs`: the project's runs by name, with `state` only those in it."""
+    """`GET /runs`: the project's runs by name and version, with `state` only those in it."""
     params = None if state is None else {"state": state}
     result = yield Call("GET", "/runs", "run", "runs", params=params)
     value = result.get("runs")
@@ -804,16 +817,15 @@ def run_cancel(run: str, *, save: bool) -> Operation[JsonObject]:
 
 def run_lineage(run: str) -> Operation[JsonObject]:
     """`GET /runs/{run}/lineage`: every change to a run, oldest first."""
-    return (yield Call("GET", f"/runs/{name(run)}/lineage", "run", run))
+    return (yield Call("GET", f"/runs/{run_ref(run)}/lineage", "run", run))
 
 
-# What a run's `published` holds; a note an older service wrote may leave
-# out the losses it had no finite value for.
+# What a run's `published` holds; a note may leave out the losses the
+# trainer had no finite value for.
 PUBLISHED_FIELDS = (
     "model",
     "digest",
     "kept_step",
-    "unchanged",
     "validation_loss",
     "base_validation_loss",
 )

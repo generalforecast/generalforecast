@@ -596,7 +596,11 @@ class Uploads(Collection):
 
 
 class Runs(Collection):
-    """Fine-tuning runs: created once, trained once, followed until they end."""
+    """Fine-tuning runs, one per version of a fine-tune, followed until they end.
+
+    A run is addressed by its id, `<name>@ft<version>`, or by its
+    fine-tune's name alone for that name's latest run.
+    """
 
     kind: ResourceKind = "run"
     collection = "runs"
@@ -608,7 +612,6 @@ class Runs(Collection):
         base: str,
         corpus: str,
         changes: builtins.list[JsonObject],
-        fine_tune: str | None = None,
         evaluation: JsonObject | None = None,
         plan: JsonObject | None = None,
         checkpoint_policy: JsonObject | None = None,
@@ -616,18 +619,17 @@ class Runs(Collection):
         seed: int | None = None,
         tags: builtins.list[str] | None = None,
     ) -> JsonObject:
-        """Creates a run; with a `plan` it trains as soon as it is set up.
+        """Starts a run that publishes the fine-tune `name`'s next version.
 
-        As `Client.runs.create`: the run publishes the next version of
-        `fine_tune`, the run's name by default, and `evaluation` may be left
-        out. Creating the same run again returns it.
+        As `Client.runs.create`: `base` is always sent and is the same for
+        every version of a name, `evaluation` may be left out, and a retried
+        try returns the run the first one made.
         """
         payload = ops.run_spec(
             name,
             base=base,
             corpus=corpus,
             changes=changes,
-            fine_tune=fine_tune,
             evaluation=evaluation,
             plan=plan,
             checkpoint_policy=checkpoint_policy,
@@ -644,7 +646,7 @@ class Runs(Collection):
         )
 
     async def list(self, *, state: str | None = None) -> builtins.list[JsonObject]:
-        """The project's runs by name; with `state`, only the runs in that state.
+        """The project's runs by name and version; with `state`, only those in it.
 
         A state that is not a run state is refused with `ValidationError`.
         """
@@ -654,7 +656,7 @@ class Runs(Collection):
         """Cancels a run; one that is training stops at its next step.
 
         With `save`, a run that is training publishes the weights it has
-        trained so far as its fine-tune's next version, then ends
+        trained so far as the version it was created for, then ends
         `cancelled`; its lineage names the version. A run not yet training
         has nothing to save and is cancelled as it would be without `save`.
         """

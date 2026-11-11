@@ -227,6 +227,14 @@ ModelName = str
 _decode_ModelName: Decoder = _pattern("^[a-z0-9][a-z0-9.-]{0,62}$")
 
 
+RunId = str
+_decode_RunId: Decoder = _pattern("^[a-z][a-z0-9-]{0,62}@ft[1-9]\\d*$")
+
+
+RunRef = str
+_decode_RunRef: Decoder = _pattern("^[a-z][a-z0-9-]{0,62}(?:@ft[1-9]\\d*)?$")
+
+
 FineTuneName = str
 _decode_FineTuneName: Decoder = _pattern("^[a-z][a-z0-9-]{0,62}@ft[1-9]\\d*$")
 
@@ -317,7 +325,10 @@ class ErrorCode(StrEnum):
     project's training data would pass its quota) and `snapshot_quota_exceeded`. Those
     three 429s carry `limit` and `actual`, and lift only when the caller ends a run or
     deletes data, so clients do not retry them; a 429 `rate_limited` passes on its own
-    and may be retried.
+    and may be retried. A run's create is refused with `Conflict` 409 `run_active`
+    (another run of the fine-tune is still queued or running) or `base_mismatch` (the
+    fine-tune's versions train from another base), and with `ValidationError` 422
+    `base_is_fine_tune` (a fine-tune sent as the base).
     """
 
     ValidationError = "ValidationError"
@@ -1031,10 +1042,6 @@ KeptStep = int | None
 _decode_KeptStep: Decoder = _union(_integer, _null)
 
 
-Unchanged = bool | None
-_decode_Unchanged: Decoder = _union(_boolean, _null)
-
-
 @dataclass(frozen=True, kw_only=True)
 class DerivedModel(Payload):
     """The DerivedModel schema.
@@ -1053,7 +1060,6 @@ class DerivedModel(Payload):
     version: int
     created: float
     kept_step: KeptStep
-    unchanged: Unchanged
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("base", "base", True, _decode_ModelId),
@@ -1065,7 +1071,6 @@ class DerivedModel(Payload):
         Field("version", "version", True, _integer),
         Field("created", "created", True, _number),
         Field("kept_step", "kept_step", True, _decode_KeptStep),
-        Field("unchanged", "unchanged", True, _decode_Unchanged),
     )
 
 
@@ -1085,7 +1090,6 @@ class FineTuneVersion(Payload):
     run: str | None
     created: float
     kept_step: KeptStep
-    unchanged: Unchanged
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("name", "name", True, _decode_ModelId),
@@ -1095,7 +1099,6 @@ class FineTuneVersion(Payload):
         Field("run", "run", True, _union(_text, _null)),
         Field("created", "created", True, _number),
         Field("kept_step", "kept_step", True, _decode_KeptStep),
-        Field("unchanged", "unchanged", True, _decode_Unchanged),
     )
 
 
@@ -2135,14 +2138,13 @@ class RunPublished(Payload):
 
     What a run published: the version, its weights' digest, the step the weights were
     kept at and how they scored on the rows the run held out, against the base on the
-    same rows. The same as the lineage's `published` note. A version with `unchanged:
-    true` predicts exactly as its base does: no check during training beat the base.
+    same rows. The same as the lineage's `published` note. A version kept at step 0
+    predicts exactly as its base does: no check during training beat the base.
     """
 
     model: ModelId
     digest: Digest
     kept_step: KeptStep
-    unchanged: Unchanged
     validation_loss: float | None
     base_validation_loss: float | None
     diverged_at_step: int | None = None
@@ -2151,7 +2153,6 @@ class RunPublished(Payload):
         Field("model", "model", True, _decode_ModelId),
         Field("digest", "digest", True, _decode_Digest),
         Field("kept_step", "kept_step", True, _decode_KeptStep),
-        Field("unchanged", "unchanged", True, _decode_Unchanged),
         Field("validation_loss", "validation_loss", True, _union(_number, _null)),
         Field(
             "base_validation_loss",
@@ -2167,12 +2168,13 @@ class RunPublished(Payload):
 class Run(Payload):
     """The Run schema."""
 
+    id: RunId
     name: Name
+    version: int
     state: RunState
     reason: str | None
     attempt: int
     base: ModelId
-    fine_tune: Name
     corpus: RunCorpus
     changes: tuple[dict[str, Any], ...]
     evaluation: RunEvaluation
@@ -2187,12 +2189,13 @@ class Run(Payload):
     usage: RunUsage | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("id", "id", True, _decode_RunId),
         Field("name", "name", True, _decode_Name),
+        Field("version", "version", True, _integer),
         Field("state", "state", True, _decode_RunState),
         Field("reason", "reason", True, _union(_text, _null)),
         Field("attempt", "attempt", True, _integer),
         Field("base", "base", True, _decode_ModelId),
-        Field("fine_tune", "fine_tune", True, _decode_Name),
         Field("corpus", "corpus", True, _record(RunCorpus)),
         Field("changes", "changes", True, _items(_mapping(_any))),
         Field("evaluation", "evaluation", True, _record(RunEvaluation)),
@@ -2265,7 +2268,6 @@ class RunCreate(Payload):
     base: ModelId
     corpus: Name
     changes: tuple[dict[str, Any], ...]
-    fine_tune: Name | None = None
     evaluation: dict[str, Any] | None = None
     plan: dict[str, Any] | None = None
     checkpoint_policy: dict[str, Any] | None = None
@@ -2276,7 +2278,6 @@ class RunCreate(Payload):
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("name", "name", True, _decode_Name),
         Field("base", "base", True, _decode_ModelId),
-        Field("fine_tune", "fine_tune", False, _decode_Name),
         Field("corpus", "corpus", True, _decode_Name),
         Field("changes", "changes", True, _items(_mapping(_any))),
         Field("evaluation", "evaluation", False, _mapping(_any)),
@@ -2383,11 +2384,11 @@ class RunEvent(Payload):
 class RunLineage(Payload):
     """The RunLineage schema."""
 
-    run: Name
+    run: RunId
     events: tuple[RunEvent, ...]
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("run", "run", True, _decode_Name),
+        Field("run", "run", True, _decode_RunId),
         Field("events", "events", True, _items(_record(RunEvent))),
     )
 

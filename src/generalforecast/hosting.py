@@ -136,8 +136,8 @@ Exports:
         Error, ServiceError, InputError, PredictorError: errors with codes.
         diagnostic_lines, report_diagnostic: a diagnostic in gf's cargo
             shape, as lines or written to standard error.
-        fields, require, name, text, number, model_id: field checks with
-            the same rules gf applies.
+        fields, require, name, text, number, model_id, run_ref: field
+            checks with the same rules gf applies.
         ModelPort, NativeExecutor, PreparedExecution, AcceptedWrite,
             ImportOutcome, Mutation, ObservationInput, SnapshotRow,
             SourcePin, SourceRecord: the ports and records a plane
@@ -231,6 +231,7 @@ from generalforecast.service.contracts import (
     name,
     number,
     require,
+    run_ref,
     text,
 )
 from generalforecast.service.interfaces import (
@@ -603,6 +604,7 @@ __all__ = [
     "request_table",
     "require",
     "resource_name",
+    "run_ref",
     "served_context",
     "step_fits",
     "success",

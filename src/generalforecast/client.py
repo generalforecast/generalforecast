@@ -533,7 +533,11 @@ class Uploads(Collection):
 
 
 class Runs(Collection):
-    """Fine-tuning runs: created once, trained once, followed until they end."""
+    """Fine-tuning runs, one per version of a fine-tune, followed until they end.
+
+    A run is addressed by its id, `<name>@ft<version>`, or by its
+    fine-tune's name alone for that name's latest run.
+    """
 
     kind: ResourceKind = "run"
     collection = "runs"
@@ -545,7 +549,6 @@ class Runs(Collection):
         base: str,
         corpus: str,
         changes: builtins.list[JsonObject],
-        fine_tune: str | None = None,
         evaluation: JsonObject | None = None,
         plan: JsonObject | None = None,
         checkpoint_policy: JsonObject | None = None,
@@ -553,22 +556,28 @@ class Runs(Collection):
         seed: int | None = None,
         tags: builtins.list[str] | None = None,
     ) -> JsonObject:
-        """Creates a run; with a `plan` it trains as soon as it is set up.
+        """Starts a run that publishes the fine-tune `name`'s next version.
 
-        `base` is the catalog model the run trains from. The run publishes
-        the next version of `fine_tune`, `<project>/<fine_tune>@ft<N>`; it
-        defaults to the run's name, so a new run with the same `fine_tune`
-        publishes that fine-tune's next version. `evaluation` may be left
-        out: the run keeps the step that scores best on a 20% hold-out of
-        the corpus's rows, which is what the run reports as its
-        `evaluation`. Creating the same run again returns it.
+        The first run of a name publishes `<project>/<name>@ft1`, and each
+        create after it the next version, `@ft2` and on; the run's `id` is
+        `<name>@ft<version>` from the start. `base` is the catalog model
+        the run trains from, and every version of a name trains afresh from
+        the same one: another base is refused with `Conflict`, a fine-tune
+        with `ValidationError`, and so is a new run while one of the name
+        is still queued or running. With a `plan` it trains as soon as it
+        is set up. `evaluation` may be left out: the run keeps the step
+        that scores best on a 20% hold-out of the corpus's rows, which is
+        what the run reports as its `evaluation`.
+
+        A try sent again after a transient failure carries the same request
+        id, so the service returns the run the first try made rather than
+        start a second.
         """
         payload = ops.run_spec(
             name,
             base=base,
             corpus=corpus,
             changes=changes,
-            fine_tune=fine_tune,
             evaluation=evaluation,
             plan=plan,
             checkpoint_policy=checkpoint_policy,
@@ -583,7 +592,7 @@ class Runs(Collection):
         return self.client._run(ops.posted("run", "runs", run, "train", {"plan": plan}))
 
     def list(self, *, state: str | None = None) -> builtins.list[JsonObject]:
-        """The project's runs by name; with `state`, only the runs in that state.
+        """The project's runs by name and version; with `state`, only those in it.
 
         A state that is not a run state is refused with `ValidationError`.
         """
@@ -593,7 +602,7 @@ class Runs(Collection):
         """Cancels a run; one that is training stops at its next step.
 
         With `save`, a run that is training publishes the weights it has
-        trained so far as its fine-tune's next version, then ends
+        trained so far as the version it was created for, then ends
         `cancelled`; its lineage names the version. A run not yet training
         has nothing to save and is cancelled as it would be without `save`.
         """
@@ -614,7 +623,7 @@ class Runs(Collection):
         """Polls a run until it finishes, is cancelled or fails, and returns it.
 
         The run's `published` names the version it made, as `{"model":
-        "<project>/<fine_tune>@ft<N>", "digest", "kept_step", "unchanged",
+        "<project>/<name>@ft<version>", "digest", "kept_step",
         "validation_loss", "base_validation_loss"}`, or is None when it made
         none. With `on_event`, each lineage event is passed to it once, as
         `watch` yields them. Past `timeout` seconds it raises `WaitTimeout`
