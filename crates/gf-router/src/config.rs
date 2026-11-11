@@ -15,7 +15,7 @@ use serde_json::Value;
 pub struct Config {
     /// The address to serve Arrow Flight on.
     pub listen: String,
-    /// The address to serve `/metrics` and `/healthz` on, if any. They take
+    /// The address to serve `/metrics` and `/livez` on, if any. They take
     /// no token and the metrics name nodes, so bind it to this machine or a
     /// private network.
     #[serde(default)]

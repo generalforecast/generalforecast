@@ -122,27 +122,23 @@ async fn health_readiness_and_the_hosted_headers() {
     assert_eq!(headers["cache-control"], "no-store");
     assert_eq!(headers["x-content-type-options"], "nosniff");
     assert_eq!(headers["content-type"], "application/json; charset=utf-8");
-    // Health and readiness both say the models are not ready until the
-    // shards are up and their programs compiled.
-    for probe in ["/healthz", "/readyz"] {
-        let (status, _, body) = call(&waiting, "GET", probe, None, &[]).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{probe}");
-        assert_eq!(body["error"]["code"], "ModelNotReady", "{probe}");
-        assert!(body["error"]["message"].is_string(), "{probe}");
-    }
+    // Readiness says the models are not ready until the shards are up and
+    // their programs compiled.
+    let (status, _, body) = call(&waiting, "GET", "/readyz", None, &[]).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "ModelNotReady");
+    assert!(body["error"]["message"].is_string());
     let (status, _, body) = call(&waiting, "GET", "/v1/projects/local/models", None, &[]).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body["error"]["code"], "ModelNotReady");
     assert_eq!(body["project"], "local");
     let ready = front(Box::new(Static::new(None)), true).await;
-    for probe in ["/healthz", "/readyz"] {
-        let (status, _, body) = call(&ready, "GET", probe, None, &[]).await;
-        assert_eq!(
-            (status, body),
-            (StatusCode::OK, json!({"status": "ok"})),
-            "{probe}"
-        );
-    }
+    let (status, _, body) = call(&ready, "GET", "/readyz", None, &[]).await;
+    assert_eq!((status, body), (StatusCode::OK, json!({"status": "ok"})));
+    // `/readyz` is the one readiness probe.
+    let (status, _, body) = call(&ready, "GET", "/healthz", None, &[]).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"]["code"], "NotFound");
     let (status, _, body) = call(&ready, "GET", "/livez", None, &[]).await;
     assert_eq!((status, body), (StatusCode::OK, json!({"status": "ok"})));
 }

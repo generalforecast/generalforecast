@@ -670,7 +670,8 @@ paths:
         Readiness has no project and so no envelope. Before every served
         model is loaded and compiled the reply is 503 with
         `{"error": {"code": "ModelNotReady"}}`; `/predict` answers the same
-        way, so a 200 here means predictions will not wait on a compile.
+        way, so a 200 here means predictions will not wait on a compile. A
+        hosted plane's 200 also names its `build`.
       responses:
         "200":
           description: every served model is loaded and compiled
@@ -5218,9 +5219,8 @@ components:
         build:
           $ref: "#/components/schemas/Build"
           description: |
-            the code a hosted plane runs, on a probe that names it; `/readyz`
-            and `/livez` leave it out, since load balancers and health checks
-            read their body as it is, and so does gf serve
+            the code a hosted plane runs, on its 200 from `/readyz`; `/livez`
+            leaves it out, and so does gf serve
 
     Build:
       type: object

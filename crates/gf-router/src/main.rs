@@ -402,7 +402,7 @@ async fn run(path: PathBuf, parent: Option<std::os::fd::OwnedFd>) -> Result<(), 
                     },
                 ),
             )
-            .route("/healthz", axum::routing::get(|| async { "ok" }))
+            .route("/livez", axum::routing::get(|| async { "ok" }))
             .with_state(router.clone());
         tokio::spawn(async move {
             if let Err(error) = axum::serve(listener, app).await {

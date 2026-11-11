@@ -852,9 +852,8 @@ async fn answer(
     }
     // Readiness: 200 only once every served model is loaded and its
     // recorded programs compiled, so a probe never admits traffic the
-    // inference routes would refuse. `/healthz` answers the same, for
-    // callers that still probe it; the API documents `/readyz`.
-    if target == "/readyz" || target == "/healthz" {
+    // inference routes would refuse.
+    if target == "/readyz" {
         let ready = front.ready()
             && match &front.upstream {
                 Some(upstream) => upstream.ready().await,

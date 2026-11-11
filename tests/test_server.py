@@ -749,7 +749,8 @@ def _check_metrics(server: Server) -> None:
     assert metrics['gf_table_rows_written_total{table="rows"}'] == "32"
     assert metrics['gf_table_predictions_total{table="rows"}'] == "4"
     assert metrics['gf_table_predict_seconds_count{table="rows"}'] == "2"
-    assert server.http("/healthz")[0] == server.http("/readyz")[0] == 200
+    assert server.http("/livez")[0] == server.http("/readyz")[0] == 200
+    assert server.http("/healthz")[0] == 404
     # Each step's worker time goes to its requests, and the one fit to its table.
     worker = float(metrics["gf_worker_seconds_total"])
     assert float(metrics['gf_table_gpu_seconds_total{table="rows"}']) == (

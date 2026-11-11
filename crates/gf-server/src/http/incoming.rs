@@ -196,7 +196,7 @@ pub(super) fn name(value: &str) -> Result<String, ApiError> {
 /// front's own predictors when nothing stands behind it.
 #[must_use]
 pub fn owns(method: &Method, path: &str) -> bool {
-    if matches!(path, "/livez" | "/healthz" | "/readyz") {
+    if matches!(path, "/livez" | "/readyz") {
         return true;
     }
     // Segments are read as an upstream would read them, escapes decoded; a

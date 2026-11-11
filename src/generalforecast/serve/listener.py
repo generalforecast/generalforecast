@@ -209,7 +209,7 @@ def configuration(
         revisions: The control plane origin deployed revisions are predicted
             from, under the token in `GF_INTROSPECTION_TOKEN`.
         metrics: A `host:port` where gf-server also serves `/metrics`,
-            `/healthz` and `/readyz` once its workers start; they take no
+            `/livez` and `/readyz` once its workers start; they take no
             token, so it belongs on loopback or a private network.
     """
     command = [sys.executable, "-m", "generalforecast.worker_process"]

@@ -325,7 +325,7 @@ def test_a_server_configured_with_metrics_serves_them_there():
     metrics = f"127.0.0.1:{free_port()}"
     served = Served(build(), "general-forecast/tabicl-v2-classifier", metrics=metrics)
     try:
-        for path, expected in (("/healthz", "ok"), ("/metrics", "gf_")):
+        for path, expected in (("/livez", "ok"), ("/metrics", "gf_")):
             with urllib.request.urlopen(f"http://{metrics}{path}", timeout=30) as reply:
                 assert reply.status == 200
                 assert expected in reply.read().decode()
