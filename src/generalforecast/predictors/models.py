@@ -228,7 +228,7 @@ class ModelPin:
 def _derived(value: Any, pin: dict) -> Derived:
     """A derived pin's own part, which must run on the base the rest describes."""
     from generalforecast.models.catalog import ORGANIZATION, ModelRefError, parse
-    from generalforecast.models.derived import KINDS, LEGACY_KINDS
+    from generalforecast.models.derived import KINDS
 
     fields(value, {"model", "base", "base_digest", "digest", "bags", "kind"})
     try:
@@ -246,8 +246,7 @@ def _derived(value: Any, pin: dict) -> Derived:
     integer(value["bags"])
     ensure(value["bags"] >= 1, "a derived model has at least one bag")
     ensure(
-        value["kind"] in KINDS or value["kind"] in LEGACY_KINDS,
-        "a derived model's kind is lora, input_adapter or full",
+        value["kind"] in KINDS, "a derived model's kind is lora, input_adapter or full"
     )
     return Derived(
         value["model"],

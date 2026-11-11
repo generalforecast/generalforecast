@@ -155,17 +155,6 @@ def test_a_trained_adapter_changes_predictions_as_its_features_say(base):
     np.testing.assert_allclose(found, np.asarray(expected), atol=1e-5)
 
 
-def test_a_plane_that_stored_the_old_name_serves_the_same_adapter(base):
-    data = table(regression=False)
-    (part,) = _adapters(data.features.shape[1], (0.5,))
-    derived.use(Plane([part]))
-    expected = _run(*registry.load(MODEL), data)
-    registry._derived_variant.cache_clear()
-    # A fine-tune an earlier plane published says `adapter`.
-    derived.use(Plane([part], kind="adapter"))
-    np.testing.assert_array_equal(_run(*registry.load(MODEL), data), expected)
-
-
 def test_statistics_read_only_the_context_s_real_rows(base):
     data = table(regression=False)
     (part,) = _adapters(data.features.shape[1], (0.5,))

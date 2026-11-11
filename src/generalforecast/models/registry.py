@@ -308,7 +308,7 @@ def _derived_variant(
 ) -> Model:
     """A derived model as one `Bagged` model over its base's one shared copy.
 
-    A model of kind `adapter` runs each bag's input adapter in front of the
+    A model of kind `input_adapter` runs each bag's input adapter in front of the
     base, unmerged, through `adapted.adapted_functions`.
 
     Keyed by everything `made` is, its weights' digest included, so a model

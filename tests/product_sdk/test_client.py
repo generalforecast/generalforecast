@@ -439,7 +439,7 @@ def test_a_run_names_the_model_it_trains_from_as_base(wire, asynchronous):
         "base": "general-forecast/tabicl-v2-classifier",
         "corpus": "credit-v1",
         "changes": [{"kind": "lora", "rank": 16}],
-        "evaluation": {"bagging": {"k": 8}},
+        "seed": 3,
     }
     wire.expect("POST", "/runs", {"name": "r1"}, payload=spec)
     created = run(
@@ -450,7 +450,7 @@ def test_a_run_names_the_model_it_trains_from_as_base(wire, asynchronous):
             base="general-forecast/tabicl-v2-classifier",
             corpus="credit-v1",
             changes=[{"kind": "lora", "rank": 16}],
-            evaluation={"bagging": {"k": 8}},
+            seed=3,
         ),
     )
     assert created == {"name": "r1"}

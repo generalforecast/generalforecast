@@ -108,7 +108,7 @@ Exports:
             ModelRefError, V1_POLICY, CatalogService, prefetch_catalog: the
             catalog, its pins and bounds, and the serving policy.
         Derived, DerivedResolver, DerivedWeights, DerivedInputs,
-            DERIVED_KINDS, derived_kind, use_derived: derived
+            DERIVED_KINDS, use_derived: derived
             models, `<owner>/<name>@ft<version>`, which a plane keeps over a
             catalog base. The plane installs a `DerivedResolver` with
             `use_derived`, or names it to engine workers by
@@ -118,8 +118,6 @@ Exports:
             `DerivedWeights` it runs as bags over one copy of the base;
             a model of kind `input_adapter` hands `DerivedInputs` with
             them, how each bag changes the features the base reads.
-            `derived_kind` reads a stored kind, the legacy `adapter`
-            included, as one of `DERIVED_KINDS`.
         training: the trainer's surface, `generalforecast.training`: a
             catalog model's contract calls and parameters as gf serves
             them, the parameter types LoRA adapts, and full fine-tuning's
@@ -189,7 +187,6 @@ from generalforecast.models.derived import Derived
 from generalforecast.models.derived import Inputs as DerivedInputs
 from generalforecast.models.derived import Resolver as DerivedResolver
 from generalforecast.models.derived import Weights as DerivedWeights
-from generalforecast.models.derived import kind_of as derived_kind
 from generalforecast.models.derived import use as use_derived
 from generalforecast.predictors.lock import lock_digest as document_digest
 from generalforecast.predictors.models import CatalogResolver, ModelPin
@@ -567,7 +564,6 @@ __all__ = [
     "compile_lock",
     "configuration",
     "context_version",
-    "derived_kind",
     "device_room",
     "diagnostic_lines",
     "document_digest",

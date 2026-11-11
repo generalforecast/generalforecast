@@ -489,7 +489,7 @@ def validate(value: Any) -> dict[str, Any]:
 def _derived(model: str, value: Any) -> None:
     """Checks a derived model's id and its block: base, base digest, bags, kind."""
     from generalforecast.models.catalog import ModelRefError, parse
-    from generalforecast.models.derived import KINDS, LEGACY_KINDS
+    from generalforecast.models.derived import KINDS
 
     try:
         ref = parse(model)
@@ -513,10 +513,10 @@ def _derived(model: str, value: Any) -> None:
         "a derived model has 1 to 64 bags",
         "ValidationError",
     )
-    # A lock an earlier gf wrote says `adapter` for an input adapter.
     ensure(
-        value["kind"] in KINDS or value["kind"] in LEGACY_KINDS,
-        "a derived model's kind is lora, input_adapter or full",
+        value["kind"] in KINDS,
+        "a derived model's kind is lora, input_adapter or full; "
+        "`gf check` writes the lock again",
         "ValidationError",
     )
 

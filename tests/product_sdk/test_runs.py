@@ -62,14 +62,14 @@ def test_a_run_is_created_by_its_fine_tune_name_and_base(wire, asynchronous):
             changes=[{"kind": "lora", "rank": 16}],
         ),
     )
-    # Left out, the evaluation is not sent: the service holds out 20%.
     assert created["id"] == "credit@ft2" and created["version"] == 2
 
 
-def test_a_run_takes_no_fine_tune_apart_from_its_name():
+def test_a_run_takes_no_fine_tune_apart_from_its_name_and_no_evaluation():
     for runs in (Runs, AsyncRuns):
-        assert "fine_tune" not in inspect.signature(runs.create).parameters
-        assert "base" in inspect.signature(runs.create).parameters
+        parameters = inspect.signature(runs.create).parameters
+        assert "fine_tune" not in parameters and "evaluation" not in parameters
+        assert "base" in parameters
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -92,21 +92,15 @@ def test_wait_returns_the_run_with_the_version_it_published(wire, asynchronous):
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_wait_reads_published_from_the_lineage_of_a_service_that_does_not_say_it(
+def test_wait_returns_the_run_as_the_service_answers_and_reads_no_lineage(
     wire, asynchronous
 ):
-    # An older service's run has no `published`; its lineage's note names it.
-    wire.expect("GET", "/runs/credit@ft2", _run("finished"))
+    # The wire answers only the run: a read of its lineage would fail.
     wire.expect(
-        "GET", "/runs/credit@ft2/lineage", _lineage(CREATED, METRICS, NOTE, FINISHED)
+        "GET", "/runs/credit@ft2", _run("failed", reason="data", published=None)
     )
     ended = run(asynchronous, wire.url, lambda c: c.runs.wait("credit@ft2"))
-    assert ended["published"] == PUBLISHED
-    # A run that failed published nothing.
-    wire.expect("GET", "/runs/credit@ft2", _run("failed", reason="data"))
-    wire.expect("GET", "/runs/credit@ft2/lineage", _lineage(CREATED, SETTING_UP))
-    ended = run(asynchronous, wire.url, lambda c: c.runs.wait("credit@ft2"))
-    assert ended["published"] is None
+    assert ended["published"] is None and ended["reason"] == "data"
 
 
 def _follow(wire):

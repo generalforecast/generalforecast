@@ -549,7 +549,6 @@ class Runs(Collection):
         base: str,
         corpus: str,
         changes: builtins.list[JsonObject],
-        evaluation: JsonObject | None = None,
         plan: JsonObject | None = None,
         checkpoint_policy: JsonObject | None = None,
         budget: JsonObject | None = None,
@@ -565,9 +564,9 @@ class Runs(Collection):
         the same one: another base is refused with `Conflict`, a fine-tune
         with `ValidationError`, and so is a new run while one of the name
         is still queued or running. With a `plan` it trains as soon as it
-        is set up. `evaluation` may be left out: the run keeps the step
-        that scores best on a 20% hold-out of the corpus's rows, which is
-        what the run reports as its `evaluation`.
+        is set up. The run keeps the step that scores best on a 20%
+        hold-out of the corpus's rows, which it reports as its
+        `evaluation`.
 
         A try sent again after a transient failure carries the same request
         id, so the service returns the run the first try made rather than
@@ -578,7 +577,6 @@ class Runs(Collection):
             base=base,
             corpus=corpus,
             changes=changes,
-            evaluation=evaluation,
             plan=plan,
             checkpoint_policy=checkpoint_policy,
             budget=budget,

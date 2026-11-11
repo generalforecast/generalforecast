@@ -68,14 +68,17 @@ class ServiceResolver:
         if not isinstance(found.get("derived"), dict):
             raise ModelRefError("UnknownModel", f"{model} is not a fine-tune")
         parts = found["derived"]
-        made = Derived(
-            model,
-            parts["base"],
-            parts["base_digest"],
-            parts["digest"],
-            parts["bags"],
-            parts["kind"],
-        )
+        try:
+            made = Derived(
+                model,
+                parts["base"],
+                parts["base_digest"],
+                parts["digest"],
+                parts["bags"],
+                parts["kind"],
+            )
+        except ValueError as error:
+            raise ModelRefError("ModelMismatch", f"{model}: {error}") from None
         self._found[model] = made
         return made
 

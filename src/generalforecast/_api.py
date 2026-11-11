@@ -821,18 +821,13 @@ class DerivedBase(Payload):
     base: ModelId
     base_digest: Digest
     bags: int
-    kind: Literal["lora", "input_adapter", "full", "adapter"]
+    kind: Literal["lora", "input_adapter", "full"]
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("base", "base", True, _decode_ModelId),
         Field("base_digest", "base_digest", True, _decode_Digest),
         Field("bags", "bags", True, _integer),
-        Field(
-            "kind",
-            "kind",
-            True,
-            _literal("lora", "input_adapter", "full", "adapter"),
-        ),
+        Field("kind", "kind", True, _literal("lora", "input_adapter", "full")),
     )
 
 
@@ -2096,23 +2091,12 @@ class RunEvaluation(Payload):
 
     The trainer holds out 20% of the corpus's rows, scores them every `evaluate_every`
     steps of the plan, and keeps the step that scores best: `holdout` is that share,
-    and every run says it. A run created without `evaluation` has `{"holdout": 0.2}`,
-    and a create may send that. `bagging` and `sets`, which earlier clients had to
-    send, are still accepted, checked as before and recorded beside `holdout`, but the
-    trainer applies neither: a run publishes one bag, chosen on the hold-out. The one
-    effect of `sets` is that the run holds their snapshots until it ends, so they
-    cannot be deleted meanwhile.
+    and every run says it. A create sends no `evaluation`.
     """
 
     holdout: float
-    bagging: dict[str, Any] | None = None
-    sets: tuple[dict[str, Any], ...] | None = None
 
-    FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("holdout", "holdout", True, _number),
-        Field("bagging", "bagging", False, _mapping(_any)),
-        Field("sets", "sets", False, _items(_mapping(_any))),
-    )
+    FIELDS: ClassVar[tuple[Field, ...]] = (Field("holdout", "holdout", True, _number),)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -2268,7 +2252,6 @@ class RunCreate(Payload):
     base: ModelId
     corpus: Name
     changes: tuple[dict[str, Any], ...]
-    evaluation: dict[str, Any] | None = None
     plan: dict[str, Any] | None = None
     checkpoint_policy: dict[str, Any] | None = None
     budget: dict[str, Any] | None = None
@@ -2280,7 +2263,6 @@ class RunCreate(Payload):
         Field("base", "base", True, _decode_ModelId),
         Field("corpus", "corpus", True, _decode_Name),
         Field("changes", "changes", True, _items(_mapping(_any))),
-        Field("evaluation", "evaluation", False, _mapping(_any)),
         Field("plan", "plan", False, _mapping(_any)),
         Field("checkpoint_policy", "checkpoint_policy", False, _mapping(_any)),
         Field("budget", "budget", False, _mapping(_any)),
