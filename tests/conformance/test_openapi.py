@@ -149,8 +149,8 @@ def test_routes_table_matches_the_spec():
         ("GET", "/v1/projects/{project}/predictors"),
         ("GET", "/v1/projects/{project}/predictors/{name}"),
         ("GET", "/v1/projects/{project}/models"),
-        ("GET", "/healthz"),
         ("GET", "/readyz"),
+        ("GET", "/livez"),
     }
     assert public <= expected
     for route in _api.ROUTES:
@@ -291,10 +291,12 @@ def test_an_ad_hoc_payload_takes_the_manifests_input_and_frequency_forms():
     assert listed.inputs == ("price",) and listed.frequency == 86400
 
 
-def test_health_and_readiness_answer_the_same_unenveloped_reply():
-    assert ROUTES["health"].path == "/healthz"
+def test_readiness_and_liveness_are_the_documented_unenveloped_probes():
     assert ROUTES["ready"].path == "/readyz"
-    assert ROUTES["health"].reply is ROUTES["ready"].reply is _api.Health
+    assert ROUTES["live"].path == "/livez"
+    assert ROUTES["ready"].reply is ROUTES["live"].reply is _api.Health
+    # `/healthz` is served as readiness's alias, and documented nowhere.
+    assert "/healthz" not in SPEC["paths"] and "health" not in ROUTES
 
 
 def test_regenerating_changes_nothing(tmp_path):

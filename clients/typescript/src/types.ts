@@ -2089,7 +2089,6 @@ export const ROUTES = {
   "predictors.get": { method: "GET", path: "/v1/projects/{project}/predictors/{name}", request: "null", reply: "PredictorReply", body: null },
   "models.list": { method: "GET", path: "/v1/projects/{project}/models", request: "null", reply: "ModelListReply", body: null },
   "models.get": { method: "GET", path: "/v1/projects/{project}/models/{model}", request: "null", reply: "ModelReply", body: null },
-  "health": { method: "GET", path: "/healthz", request: "null", reply: "Health", body: null },
   "ready": { method: "GET", path: "/readyz", request: "null", reply: "Health", body: null },
   "live": { method: "GET", path: "/livez", request: "null", reply: "Health", body: null },
   "projects.list": { method: "GET", path: "/v1/projects", request: "null", reply: "ProjectListReply", body: null },

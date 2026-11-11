@@ -118,10 +118,11 @@ def test_ad_hoc_capacity_errors_name_the_limit_the_model_lists(server):
     assert model in body["error"]["message"]
 
 
-def test_health_answers_200_only_once_predictions_answer(server):
-    status, body = server.request("GET", "/healthz")
-    ready, _ = server.request("GET", "/readyz")
-    assert ready == status
+def test_readiness_answers_200_only_once_predictions_answer(server):
+    status, body = server.request("GET", "/readyz")
+    # The undocumented `/healthz` answers as `/readyz` does.
+    alias, _ = server.request("GET", "/healthz")
+    assert alias == status
     if status == 200:
         VALIDATOR.validate(VALIDATOR.schema("Health"), body)
         queries = [{"customer_id": 9001, "spend": 82.5, "plan": "pro"}]
