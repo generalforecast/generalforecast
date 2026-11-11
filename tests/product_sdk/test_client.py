@@ -377,6 +377,42 @@ def test_a_model_is_read_by_its_canonical_id(wire, asynchronous):
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_fine_tune_is_read_by_its_id_with_or_without_a_version(wire, asynchronous):
+    versions = [
+        {"name": "test/credit@ft2", "version": 2, "run": "credit"},
+        {"name": "test/credit@ft1", "version": 1, "run": None},
+    ]
+    wire.expect(
+        "GET", "/models/credit", {"name": "test/credit@ft2", "versions": versions}
+    )
+    model = run(asynchronous, wire.url, lambda c: c.models.get("test/credit"))
+    assert model == {"name": "test/credit@ft2", "versions": versions}
+    # One version, as a predictor names it, reads as it always has.
+    wire.expect("GET", "/models/credit@ft1", {"name": "test/credit@ft1"})
+    model = run(asynchronous, wire.url, lambda c: c.models.get("test/credit@ft1"))
+    assert model == {"name": "test/credit@ft1"}
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_another_projects_fine_tune_is_refused_before_it_is_asked_for(
+    wire, asynchronous
+):
+    with pytest.raises(ServiceError) as refused:
+        run(asynchronous, wire.url, lambda c: c.models.get("acme/credit@ft1"))
+    assert refused.value.param == "model"
+    assert refused.value.message == (
+        "acme/credit@ft1 is project acme's; this client reads project test"
+    )
+    assert refused.value.hint == "read it with a client for project acme"
+    with pytest.raises(ServiceError) as refused:
+        run(asynchronous, wire.url, lambda c: c.models.get("acme/Credit"))
+    assert refused.value.hint == (
+        "model ids are general-forecast/<name>, or a fine-tune's "
+        "<project>/<name>[@ft<version>]"
+    )
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
 def test_a_dotted_catalog_id_is_read_by_its_name(wire, asynchronous):
     from generalforecast.service.boundary import Resource
 

@@ -25,6 +25,8 @@ info:
     `GF_CONFORMANCE_URL` set, against a running `gf serve`. A request example
     marked `x-gf-invalid: true` is one the schema itself refuses; its reply
     example of the same name shows the error.
+    A reply example marked `x-gf-hosted: true` is one only a hosted plane
+    gives, such as a fine-tune's, so the replay against `gf serve` skips it.
 servers:
   - url: https://app.generalforecast.com
     description: hosted
@@ -529,13 +531,26 @@ paths:
     get:
       operationId: models.get
       tags: [models]
-      summary: show one model of the catalog with its limits
+      summary: show a catalog model, or one of the project's fine-tunes with its versions
+      description: |
+        `{model}` is one of three things. A catalog model's name, such as
+        `tabicl-v2-classifier`, reads that model. A fine-tune's version, such
+        as `credit-default@ft3`, reads that version as the list shows it,
+        with `derived`. A fine-tune's name alone, such as `credit-default`,
+        reads its latest version the same way, plus `versions`: every
+        version the project has published under the name, newest first.
+
+        A fine-tune is named after the run that trained it, and a run may not
+        take a catalog model's name, so a name is one or the other. A catalog
+        name always reads the catalog model.
       parameters:
         - $ref: "#/components/parameters/project"
         - $ref: "#/components/parameters/model"
       responses:
         "200":
-          description: the model, as the catalog lists it
+          description: |
+            the model, as the list shows it; for a fine-tune named without a
+            version, its latest version and `versions`
           content:
             application/json:
               schema:
@@ -555,6 +570,59 @@ paths:
                       revision: 5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b
                       license: BSD-3-Clause
                       runtime: cpu
+                      artifact:
+                        repository: general-forecast/tabicl-v2-classifier
+                        revision: 5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b
+                        digest: sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                        license: BSD-3-Clause
+                        digest_format: sha256-of-sorted-compact-json-file-sha256-map
+                        files: {LICENSE: 4f90c5fa25a2b7883d6235c7f0b11f942a37859b9f89ac36157cc485329913b4, config.json: 7ec2941cc537535e1bd8f37d33fc97cea97953343d69d765a261ee6a1605d937, model.safetensors: 58f5fc1f276744f721974079c19d2f67efacc39083c54483fe3feba52297d253}
+                      artifact_verification: required-before-load
+                      bounds: {context_rows: 100000, query_rows: 100, features: 32, classes: 10, quantile_step: null, codes: 8, estimators: 8, members: 16}
+                      capabilities:
+                        - {name: classification, state: supported}
+                        - {name: hosted-predictor, state: supported}
+                        - {name: request-context, state: supported}
+                      limits: {context_rows: 100000, queries: 100, inputs: 32}
+                      warm_shapes: [{context_rows: 4096, queries: 128, inputs: 3, classes: 2}]
+                fine_tune:
+                  summary: a fine-tune by its name, with its versions
+                  x-gf-hosted: true
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-d5e6f708192a3b4c5d6e7f8091a2b3c4
+                    resource: {kind: model, name: credit-default}
+                    result:
+                      model: acme/credit-default@ft2@sha256:9c1e3a5b7d9f1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d
+                      name: acme/credit-default@ft2
+                      derived:
+                        base: general-forecast/tabicl-v2-classifier
+                        base_digest: sha256:7a01c2e4b6d8f0a2c4e6f8a0b2d4f6a8c0e2f4a6b8d0f2a4c6e8f0a2b4d6f8a0
+                        digest: sha256:9c1e3a5b7d9f1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d
+                        bags: 1
+                        kind: lora
+                        run: credit-default
+                        version: 2
+                        created: 1793000000.0
+                      versions:
+                        - name: acme/credit-default@ft2
+                          model: acme/credit-default@ft2@sha256:9c1e3a5b7d9f1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d
+                          version: 2
+                          kind: lora
+                          run: credit-default
+                          created: 1793000000.0
+                        - name: acme/credit-default@ft1
+                          model: acme/credit-default@ft1@sha256:2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d
+                          version: 1
+                          kind: lora
+                          run: null
+                          created: 1792900000.0
+                      task: classification
+                      repository: general-forecast/tabicl-v2-classifier
+                      revision: 5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b
+                      license: BSD-3-Clause
+                      runtime: gpu
                       artifact:
                         repository: general-forecast/tabicl-v2-classifier
                         revision: 5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b
@@ -4151,9 +4219,13 @@ components:
           - {$ref: "#/components/schemas/FineTuneName"}
       description: |
         a catalog model's name without its `general-forecast/` prefix, such
-        as `tabicl-v2-classifier`, or one of the project's fine-tunes as
-        `<name>@ft<version>`, such as `credit-default@ft3`; a path segment
-        holds no `/`, so a fine-tune's owner is the path's project
+        as `tabicl-v2-classifier`; one of the project's fine-tunes by its
+        name, such as `credit-default`, for its latest version and every
+        version; or one version as `<name>@ft<version>`, such as
+        `credit-default@ft3`. A path segment holds no `/`, so a fine-tune's
+        owner is the path's project. A fine-tune's name matches `ModelName`
+        too: no fine-tune takes a catalog model's name, and a catalog name
+        reads the catalog model
 
     workspace:
       name: workspace
@@ -4763,6 +4835,13 @@ components:
             with the weights' digest for a fine-tune
         name: {$ref: "#/components/schemas/ModelId"}
         derived: {$ref: "#/components/schemas/DerivedModel"}
+        versions:
+          type: array
+          items: {$ref: "#/components/schemas/FineTuneVersion"}
+          description: |
+            every version of a fine-tune, newest first: present when
+            `models.get` names a fine-tune without a version, and the rest of
+            the model is then its latest version
         task: {$ref: "#/components/schemas/Task"}
         repository: {type: string}
         revision: {type: string}
@@ -4810,8 +4889,35 @@ components:
             layers, an input adapter in front of it, or every weight
         run:
           type: [string, "null"]
-          description: the project's run that trained the weights, if one did
+          description: |
+            the project's run that trained the weights, if one did;
+            `GET /runs/{run}` reads it, and its lineage's `published` note
+            names this version
         version: {type: integer, minimum: 1}
+        created: {type: number, description: when the version was published, in seconds since the epoch}
+
+    FineTuneVersion:
+      type: object
+      description: |
+        one published version of a fine-tune: its id, its id pinned to its
+        weights' digest, and the run that trained it
+      required: [name, model, version, kind, run, created]
+      additionalProperties: false
+      properties:
+        name:
+          $ref: "#/components/schemas/ModelId"
+          description: the version's id, `<project>/<name>@ft<version>`, which a predictor names
+        model:
+          type: string
+          description: the id with its weights' digest, `<project>/<name>@ft<version>@sha256:<digest>`
+        version: {type: integer, minimum: 1}
+        kind:
+          type: string
+          enum: [lora, adapter, full]
+          description: what the weights change of the base, as `derived.kind`
+        run:
+          type: [string, "null"]
+          description: the project's run that trained the version, if one did; `GET /runs/{run}` reads it
         created: {type: number, description: when the version was published, in seconds since the epoch}
 
     ModelVariant:

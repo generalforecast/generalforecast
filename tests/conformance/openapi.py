@@ -213,6 +213,9 @@ class Example:
     invalid: bool = False
     # False for the routes outside the envelope: health and the CLI login.
     envelope: bool = True
+    # True for a reply only a hosted plane gives, as a fine-tune's: a running
+    # `gf serve` keeps none, so the replay against one skips it.
+    hosted: bool = False
 
     @property
     def id(self) -> str:
@@ -264,6 +267,7 @@ def examples(spec: dict[str, Any]) -> list[Example]:
                             media["schema"],
                             example["value"],
                             envelope=envelope,
+                            hosted=bool(example.get("x-gf-hosted", False)),
                         )
                     )
     return found

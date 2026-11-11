@@ -305,16 +305,29 @@ def got(kind: ResourceKind, collection: str, resource: str) -> Operation[JsonObj
 
 # A catalog model id, `general-forecast/<name>`, with an optional variant.
 _MODEL_ID = re.compile(rf"general-forecast/({MODEL_NAME_PATTERN})(?:@\S+)?")
+# A project's fine-tune, `<project>/<name>`, or one version, `<project>/<name>@ft3`.
+_FINE_TUNE_ID = re.compile(
+    r"([a-z][a-z0-9-]{0,62})/([a-z][a-z0-9-]{0,62})(@ft[1-9][0-9]*)?"
+)
 
 
-def model_got(model: str) -> Operation[JsonObject]:
-    """`GET /models/{name}`: one catalog model, named by its canonical id.
+def model_got(model: str, project: str | None = None) -> Operation[JsonObject]:
+    """`GET /models/{name}`: a catalog model, or one of the project's fine-tunes.
 
-    The path takes the id's name, since a path segment holds no `/`; a bare
-    name is refused with the canonical id, as every surface refuses it.
+    A catalog model is named by its canonical id, `general-forecast/<name>`;
+    a fine-tune by its id, `<project>/<name>@ft<version>` for one version,
+    or `<project>/<name>` for its latest version with every version under
+    `versions`, newest first. The path takes the name alone, since a path
+    segment holds no `/`, so a fine-tune is read from the client's own
+    project, `project` when the client knows it. A bare name is refused with
+    the canonical id, as every surface refuses it.
     """
     found = _MODEL_ID.fullmatch(model) if isinstance(model, str) else None
-    if found is None:
+    if found is not None:
+        model_name = found.group(1)
+        return (yield Call("GET", f"/models/{model_name}", "model", model_name))
+    tuned = _FINE_TUNE_ID.fullmatch(model) if isinstance(model, str) else None
+    if tuned is None:
         bare = isinstance(model, str) and "/" not in model and bool(model)
         raise InputError(
             "ValidationError",
@@ -322,10 +335,29 @@ def model_got(model: str) -> Operation[JsonObject]:
             param="model",
             hint=f"use general-forecast/{model}"
             if bare
-            else "model ids are general-forecast/<name>",
+            else "model ids are general-forecast/<name>, or a fine-tune's "
+            "<project>/<name>[@ft<version>]",
         )
-    model_name = found.group(1)
-    return (yield Call("GET", f"/models/{model_name}", "model", model_name))
+    owner, fine_tune, version = tuned.groups()
+
+    def other(project: str) -> InputError:
+        return InputError(
+            "ValidationError",
+            f"{model} is project {owner}'s; this client reads project {project}",
+            param="model",
+            hint=f"read it with a client for project {owner}",
+        )
+
+    if project is not None and project != owner:
+        raise other(project)
+    result = yield Call(
+        "GET", f"/models/{fine_tune}{version or ''}", "model", fine_tune
+    )
+    # An unscoped key's project is the reply's, which names the fine-tune.
+    named = result.get("name") if isinstance(result, dict) else None
+    if isinstance(named, str) and "/" in named and named.split("/", 1)[0] != owner:
+        raise other(named.split("/", 1)[0])
+    return result
 
 
 def posted(

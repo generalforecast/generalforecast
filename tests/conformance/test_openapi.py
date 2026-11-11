@@ -340,6 +340,7 @@ def served():
         and reply.method == "GET"
         and set(reply.tags) & SERVED_TAGS
         and not ("health" in reply.tags and reply.status != 200)
+        and not reply.hosted
     ]
 
 

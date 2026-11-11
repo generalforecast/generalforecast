@@ -1038,6 +1038,31 @@ class DerivedModel(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class FineTuneVersion(Payload):
+    """The FineTuneVersion schema.
+
+    one published version of a fine-tune: its id, its id pinned to its weights' digest,
+    and the run that trained it
+    """
+
+    name: ModelId
+    model: str
+    version: int
+    kind: Literal["lora", "adapter", "full"]
+    run: str | None
+    created: float
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("name", "name", True, _decode_ModelId),
+        Field("model", "model", True, _text),
+        Field("version", "version", True, _integer),
+        Field("kind", "kind", True, _literal("lora", "adapter", "full")),
+        Field("run", "run", True, _union(_text, _null)),
+        Field("created", "created", True, _number),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class Artifact(Payload):
     """The Artifact schema."""
 
@@ -1117,6 +1142,7 @@ class Model(Payload):
     limits: Limits
     warm_shapes: tuple[Shape, ...]
     derived: DerivedModel | None = None
+    versions: tuple[FineTuneVersion, ...] | None = None
     artifact_verification: str | None = None
     license_source: str | None = None
     variant: ModelVariant | None = None
@@ -1125,6 +1151,7 @@ class Model(Payload):
         Field("model", "model", True, _text),
         Field("name", "name", True, _decode_ModelId),
         Field("derived", "derived", False, _record(DerivedModel)),
+        Field("versions", "versions", False, _items(_record(FineTuneVersion))),
         Field("task", "task", True, _decode_Task),
         Field("repository", "repository", True, _text),
         Field("revision", "revision", True, _text),

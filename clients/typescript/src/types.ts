@@ -385,6 +385,19 @@ export interface DerivedModel {
   created: number;
 }
 
+/**
+ * one published version of a fine-tune: its id, its id pinned to its weights' digest,
+ * and the run that trained it
+ */
+export interface FineTuneVersion {
+  name: ModelId;
+  model: string;
+  version: number;
+  kind: "lora" | "adapter" | "full";
+  run: string | null;
+  created: number;
+}
+
 export interface Artifact {
   repository: string;
   revision: string;
@@ -417,6 +430,7 @@ export interface Model {
   model: string;
   name: ModelId;
   derived?: DerivedModel;
+  versions?: FineTuneVersion[];
   task: Task;
   repository: string;
   revision: string;
