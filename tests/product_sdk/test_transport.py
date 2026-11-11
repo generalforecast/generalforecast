@@ -7,7 +7,6 @@ import json
 import os
 import ssl
 import stat
-import time
 from dataclasses import FrozenInstanceError
 from typing import Any, cast
 
@@ -236,111 +235,56 @@ def test_async_cancellation_and_deadlines_close_streams_without_blocking_event_l
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-@pytest.mark.parametrize("identity", [None, "write_id", "submission_id"])
-def test_retries_preserve_guarded_write_identity_and_never_retry_unguarded_posts(
+@pytest.mark.parametrize("identity", [None, "write_id"])
+def test_a_transport_sends_each_request_once_and_takes_no_retries(
     monkeypatch, asynchronous, identity
 ):
+    """Retrying is the clients' `RetryPolicy`; a transport sends once."""
     body = {"payload": {identity: "stable-id"} if identity else {}}
     sent = []
 
     async def run():
         async def handler(request):
-            sent.append((request.content, request.headers["X-Request-ID"]))
-            if len(sent) == 1:
-                return httpx.Response(
-                    503,
-                    json={
-                        "error": {
-                            "code": "ServiceUnavailable",
-                            "message": "service unavailable",
-                        }
-                    },
-                )
-            return httpx.Response(200, json={})
-
-        class Reply:
-            code = 200
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_args):
-                pass
-
-            def read(self, _size):
-                return b"{}"
+            sent.append(request.content)
+            return httpx.Response(
+                503,
+                json={
+                    "error": {
+                        "code": "ServiceUnavailable",
+                        "message": "service unavailable",
+                    }
+                },
+            )
 
         def open_request(request, **_kwargs):
-            sent.append((request.data, request.get_header("X-request-id")))
-            if len(sent) == 1:
-                raise ServiceError("ServiceUnavailable", "fixture failure", 503)
-            return Reply()
+            sent.append(request.data)
+            raise ServiceError("ServiceUnavailable", "fixture failure", 503)
 
+        kind = AsyncTransport if asynchronous else Transport
+        with pytest.raises(TypeError):
+            kind("https://service.example", token="fixture-key", retries=2)
         if asynchronous:
             transport = AsyncTransport(
                 "https://service.example",
                 token="fixture-key",
-                retries=2,
-                retry_delay=0,
                 http_transport=httpx.MockTransport(handler),
             )
         else:
-            transport = Transport(
-                "https://service.example", token="fixture-key", retries=2, retry_delay=0
-            )
+            transport = Transport("https://service.example", token="fixture-key")
             monkeypatch.setattr(transport._opener, "open", open_request)
         try:
-            if identity:
-                value = transport.send(
-                    "POST", "/test", body, {"X-Request-ID": "same-request"}
-                )
-                assert (await value if inspect.isawaitable(value) else value) == {}
-                assert len(sent) == 2 and sent[0] == sent[1]
-                assert json.loads(sent[0][0])["payload"][identity] == "stable-id"
-            else:
-                with pytest.raises(ServiceError):
-                    value = transport.send(
-                        "POST", "/test", body, {"X-Request-ID": "same-request"}
-                    )
+            for method in ("GET", "POST"):
+                with pytest.raises(ServiceError) as error:
+                    value = transport.send(method, "/test", body, {})
                     if inspect.isawaitable(value):
                         await value
-                assert len(sent) == 1
+                assert error.value.status == 503
+            assert len(sent) == 2
         finally:
             if isinstance(transport, AsyncTransport):
                 await transport.aclose()
             else:
                 transport.close()
-
-    asyncio.run(run())
-
-
-def test_async_total_deadline_includes_retry_backoff():
-    async def run():
-        calls = []
-
-        async def handler(request):
-            calls.append(request)
-            return httpx.Response(
-                503,
-                json={
-                    "error": {"code": "ServiceUnavailable", "message": "unavailable"}
-                },
-            )
-
-        transport = AsyncTransport(
-            "https://service.example",
-            token="fixture-key",
-            timeout=0.5,
-            retries=5,
-            retry_delay=1,
-            http_transport=httpx.MockTransport(handler),
-        )
-        start = time.monotonic()
-        with pytest.raises(ServiceError) as error:
-            await transport.send("GET", "/test", None, {}, deadline=start + 0.03)
-        assert error.value.code == "Timeout" and len(calls) == 1
-        assert time.monotonic() - start < 0.3
-        await transport.aclose()
 
     asyncio.run(run())
 
@@ -377,7 +321,6 @@ def test_async_redirect_revocation_cookie_and_response_bounds(monkeypatch):
         transport = AsyncTransport(
             "https://service.example",
             token="fixture-key",
-            retries=5,
             http_transport=httpx.MockTransport(handler),
         )
         for path, code in (

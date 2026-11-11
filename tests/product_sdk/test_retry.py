@@ -821,41 +821,6 @@ def test_the_transport_carries_a_replys_retry_after_on_its_error(asynchronous, b
     assert "retry_after" not in first.to_dict()
 
 
-@both
-def test_a_transports_own_retries_wait_the_retry_after_of_a_503(
-    asynchronous, busy, monkeypatch
-):
-    # A transport built with `retries` tried a 503 again after its own short
-    # backoff, whatever the service asked for.
-    import generalforecast.transport as module
-
-    waits: list[float] = []
-
-    async def pause(seconds):
-        waits.append(seconds)
-
-    monkeypatch.setattr(module.time, "sleep", waits.append)
-    monkeypatch.setattr(module.asyncio, "sleep", pause)
-
-    async def go():
-        transport: Any = (AsyncTransport if asynchronous else Transport)(
-            busy, retries=1, retry_delay=0.1
-        )
-        try:
-            value = transport.send("GET", "/v1/projects/test/runs")
-            await value if inspect.isawaitable(value) else value
-        except ServiceError as error:
-            return error
-        finally:
-            if asynchronous:
-                await transport.aclose()
-        raise AssertionError("the 429 is not retried")
-
-    refused = asyncio.run(go())
-    assert refused.status == 429
-    assert waits == [2.0]
-
-
 @pytest.fixture
 def replies():
     """A server whose every reply is spoiled the way `.mode` names, its requests counted."""
@@ -1007,34 +972,6 @@ def test_a_proxys_page_cut_off_once_it_began_is_sent_for_once(asynchronous, repl
     error, slept = listed(asynchronous, replies.url)
     assert error.code == "TransportError" and error.reason == RESPONSE_INTERRUPTED
     assert replies.requests == 1 and slept == []
-
-
-@both
-def test_a_transport_retries_a_proxys_page_only_for_a_request_safe_to_resend(
-    asynchronous, replies
-):
-    replies.mode = "gateway-503"
-
-    async def go(method, body):
-        transport: Any = (AsyncTransport if asynchronous else Transport)(
-            replies.url, retries=2, retry_delay=0.0
-        )
-        try:
-            value = transport.send(method, "/v1/projects/test/runs", body)
-            await value if inspect.isawaitable(value) else value
-        except ServiceError as error:
-            return error
-        finally:
-            if asynchronous:
-                await transport.aclose()
-        raise AssertionError("the request succeeded")
-
-    read = asyncio.run(go("GET", None))
-    assert read.reason == GATEWAY_REPLY and replies.requests == 3
-    replies.requests = 0
-    # An append without a write id may have been applied: sent once.
-    write = asyncio.run(go("POST", {"payload": {"rows": []}}))
-    assert write.reason == GATEWAY_REPLY and replies.requests == 1
 
 
 @both

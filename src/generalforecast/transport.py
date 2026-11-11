@@ -513,14 +513,6 @@ _NO_ANSWER = frozenset(
 )
 
 
-def retryable(method: str, body: Any) -> bool:
-    """Only retries reads and writes with server-enforced stable identities."""
-    payload = body.get("payload", {}) if isinstance(body, dict) else {}
-    return method == "GET" or bool(
-        payload.get("write_id") or payload.get("submission_id")
-    )
-
-
 # Statuses a proxy or load balancer in front of a service answers itself,
 # with a page of its own, when it has no reply from the service to pass on.
 _GATEWAY_STATUSES = frozenset({502, 503, 504})
@@ -541,15 +533,6 @@ def _gateway_failure(status: int) -> ServiceError:
         status,
         reason=GATEWAY_REPLY,
     )
-
-
-def _reply_error(status: int, raw: bytes) -> ServiceError | None:
-    """The error a whole reply's status and body raise; None for a success."""
-    try:
-        response_value(status, raw)
-    except ServiceError as error:
-        return error
-    return None
 
 
 def response_value(status: int, raw: bytes) -> dict[str, Any]:
@@ -787,15 +770,11 @@ class _Attempt:
     limit: int
 
 
-@dataclass(frozen=True)
-class _Wait:
-    """A pause between attempts."""
-
-    seconds: float
-
-
 class _Policy:
-    """What both transports share: settings, headers, retries and platform detection.
+    """What both transports share: settings, headers and platform detection.
+
+    A transport sends each request once; `RetryPolicy`, in the clients,
+    decides whether to send it again.
 
     The platform is learned once, from one probe of `PLATFORM_PROBE` after the
     first missing hosted-only route. It only explains a later missing route
@@ -814,8 +793,6 @@ class _Policy:
         modal_secret: str | None = None,
         tls_context: ssl.SSLContext | None = None,
         timeout: float = 40,
-        retries: int = 0,
-        retry_delay: float = 0.1,
     ) -> None:
         """Binds GF keys separately from Azure Entra or Modal proxy credentials.
 
@@ -826,9 +803,7 @@ class _Policy:
         self.url = endpoint(url)
         number(timeout, MIN_TIMEOUT, MAX_TIMEOUT, "timeout")
         self.timeout = timeout
-        require(type(retries) is int and 0 <= retries <= 5, "invalid retries")
-        number(retry_delay, 0, 5, "retry_delay")
-        self.retries, self.retry_delay, self.closed = retries, retry_delay, False
+        self.closed = False
         require(
             auth_mode in ("bearer", "azure-easyauth-and-api-key"),
             "unsupported auth_mode",
@@ -881,15 +856,6 @@ class _Policy:
         end = time.monotonic() + self.timeout
         return end if deadline is None else min(deadline, end)
 
-    def _retry(self, method: str, body: Any, attempt: int, error: ServiceError) -> bool:
-        return (
-            retryable(method, body)
-            and attempt < self.retries
-            and error.code != "ProtocolError"
-            and error.reason != RESPONSE_INTERRUPTED
-            and (error.code == "TransportError" or error.status == 503)
-        )
-
     def _exchanging(
         self,
         method: str,
@@ -898,8 +864,8 @@ class _Policy:
         headers: dict[str, str],
         deadline: float | None,
         limit: int,
-    ) -> Generator[_Attempt | _Wait, Any, tuple[int, bytes, float | None]]:
-        """One request's attempts under one deadline; an unguarded write is never retried.
+    ) -> Generator[_Attempt, Any, tuple[int, bytes, float | None]]:
+        """One request, sent once under one deadline.
 
         Returns the reply's status, its body and the seconds its Retry-After
         asks for, if any.
@@ -907,34 +873,15 @@ class _Policy:
         end = self._end(deadline)
         _checked_path(path)
         data = request_data(body)
-        for attempt in range(self.retries + 1):
-            if end - time.monotonic() <= 0:
-                raise _timeout()
-            pause = _Wait(
-                min(self.retry_delay * 2**attempt, max(0.0, end - time.monotonic()))
-            )
-            try:
-                status, raw, wait = yield _Attempt(
-                    method, path, data, headers, end, limit
-                )
-            except ServiceError as error:
-                _logged(method, self.url + path, error.code, self._headers | headers)
-                if not self._retry(method, body, attempt, error):
-                    raise
-                yield pause
-                continue
-            _logged(method, self.url + path, status, self._headers | headers)
-            failure = _reply_error(status, raw) if status in _GATEWAY_STATUSES else None
-            if failure is not None and self._retry(method, body, attempt, failure):
-                # The service's Retry-After, when it sends one, is the wait.
-                yield (
-                    pause
-                    if wait is None
-                    else _Wait(min(wait, max(0.0, end - time.monotonic())))
-                )
-                continue
-            return status, raw, wait
-        raise AssertionError("unreachable")
+        if end - time.monotonic() <= 0:
+            raise _timeout()
+        try:
+            status, raw, wait = yield _Attempt(method, path, data, headers, end, limit)
+        except ServiceError as error:
+            _logged(method, self.url + path, error.code, self._headers | headers)
+            raise
+        _logged(method, self.url + path, status, self._headers | headers)
+        return status, raw, wait
 
     def _sending(
         self,
@@ -943,7 +890,7 @@ class _Policy:
         body: Any,
         headers: Mapping[str, str] | None,
         deadline: float | None,
-    ) -> Generator[_Attempt | _Wait, Any, dict[str, Any]]:
+    ) -> Generator[_Attempt, Any, dict[str, Any]]:
         """`send`, written once: the request, its reply, and the platform it reveals.
 
         The platform is learned once, from one probe of `PLATFORM_PROBE` after
@@ -989,7 +936,7 @@ class _Policy:
 
     def _downloading(
         self, path: str, limit: int, deadline: float | None
-    ) -> Generator[_Attempt | _Wait, Any, bytes]:
+    ) -> Generator[_Attempt, Any, bytes]:
         """`download`, written once."""
         try:
             status, raw, _ = yield from self._exchanging(
@@ -1052,8 +999,8 @@ class Transport(_Policy):
         """Prevents further requests; urllib closes each response after reading."""
         self.closed = True
 
-    def _drive[T](self, steps: Generator[_Attempt | _Wait, Any, T]) -> T:
-        """Runs attempts and waits in this thread, throwing failures back in."""
+    def _drive[T](self, steps: Generator[_Attempt, Any, T]) -> T:
+        """Runs attempts in this thread, throwing failures back in."""
         result: Any = None
         failure: BaseException | None = None
         while True:
@@ -1063,17 +1010,14 @@ class Transport(_Policy):
                 return stop.value
             result, failure = None, None
             try:
-                if isinstance(step, _Wait):
-                    time.sleep(step.seconds)
-                else:
-                    result = self._send_once(
-                        step.method,
-                        step.path,
-                        step.data,
-                        step.headers,
-                        step.end,
-                        step.limit,
-                    )
+                result = self._send_once(
+                    step.method,
+                    step.path,
+                    step.data,
+                    step.headers,
+                    step.end,
+                    step.limit,
+                )
             except (ServiceError, _Oversized) as error:
                 failure = error
 
@@ -1205,8 +1149,8 @@ class AsyncTransport(_Policy):
         """GETs a resource's bytes; more than `limit` of them is `CapacityExceeded`."""
         return await self._drive(self._downloading(path, limit, deadline))
 
-    async def _drive[T](self, steps: Generator[_Attempt | _Wait, Any, T]) -> T:
-        """Awaits attempts and waits, each bounded by the request's deadline."""
+    async def _drive[T](self, steps: Generator[_Attempt, Any, T]) -> T:
+        """Awaits attempts, each bounded by the request's deadline."""
         result: Any = None
         failure: BaseException | None = None
         while True:
@@ -1216,9 +1160,6 @@ class AsyncTransport(_Policy):
                 return stop.value
             result, failure = None, None
             try:
-                if isinstance(step, _Wait):
-                    await asyncio.sleep(step.seconds)
-                    continue
                 remaining = step.end - time.monotonic()
                 if remaining <= 0:
                     raise _timeout()
