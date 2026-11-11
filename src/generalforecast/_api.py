@@ -6257,7 +6257,6 @@ ROUTES: tuple[Route, ...] = (
         ModelReply,
         None,
     ),
-    Route("health", "GET", "/healthz", None, Health, None),
     Route("ready", "GET", "/readyz", None, Health, None),
     Route("live", "GET", "/livez", None, Health, None),
     Route("projects.list", "GET", "/v1/projects", None, ProjectListReply, None),

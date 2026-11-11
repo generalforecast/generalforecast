@@ -156,9 +156,9 @@ export class GeneralForecast {
     );
   }
 
-  /** `GET /healthz`: resolves when every served model is loaded and compiled, else throws GFError(ModelNotReady). */
+  /** `GET /readyz`: resolves when every served model is loaded and compiled, else throws GFError(ModelNotReady). */
   async health(): Promise<void> {
-    return this.probe(ROUTES.health.path);
+    return this.probe(ROUTES.ready.path);
   }
 
   /** `GET /livez`: resolves while the server answers, whether or not its models are ready yet. */

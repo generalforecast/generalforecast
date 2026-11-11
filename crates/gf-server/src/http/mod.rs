@@ -698,7 +698,7 @@ fn catalog_entry(spelling: &str) -> Option<&'static catalog::Entry> {
 fn not_ready() -> ApiError {
     ApiError::new(
         "ModelNotReady",
-        "models are still loading; retry once /healthz answers 200",
+        "models are still loading; retry once /readyz answers 200",
         503,
     )
 }
@@ -850,10 +850,11 @@ async fn answer(
     if target == "/livez" {
         return Ok(respond(200, &json!({"status": "ok"})));
     }
-    // Health is readiness: 200 only once every served model is loaded and
-    // its recorded programs compiled, so a probe never admits traffic the
-    // inference routes would refuse.
-    if target == "/healthz" || target == "/readyz" {
+    // Readiness: 200 only once every served model is loaded and its
+    // recorded programs compiled, so a probe never admits traffic the
+    // inference routes would refuse. `/healthz` answers the same, for
+    // callers that still probe it; the API documents `/readyz`.
+    if target == "/readyz" || target == "/healthz" {
         let ready = front.ready()
             && match &front.upstream {
                 Some(upstream) => upstream.ready().await,

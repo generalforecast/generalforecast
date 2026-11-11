@@ -660,47 +660,17 @@ paths:
                       code: NotFound
                       message: model is not served here
 
-  /healthz:
-    get:
-      operationId: health
-      tags: [health]
-      security: []
-      summary: 200 once every served model is loaded and compiled
-      description: |
-        Health has no project and so no envelope. Before every served model
-        is loaded and compiled the reply is 503 with
-        `{"error": {"code": "ModelNotReady"}}`; `/predict` answers the same
-        way, so a 200 here means predictions will not wait on a compile.
-      responses:
-        "200":
-          description: every served model is loaded and compiled
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Health"
-              examples:
-                ready:
-                  value: {status: ok}
-        "503":
-          description: a served model is still loading or compiling
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/HealthError"
-              examples:
-                loading:
-                  value:
-                    error:
-                      code: ModelNotReady
-                      message: general-forecast/tabicl-v2-classifier is compiling 12 programs
-                      hint: poll /healthz until it answers 200
-
   /readyz:
     get:
       operationId: ready
       tags: [health]
       security: []
-      summary: alias of /healthz
+      summary: 200 once every served model is loaded and compiled
+      description: |
+        Readiness has no project and so no envelope. Before every served
+        model is loaded and compiled the reply is 503 with
+        `{"error": {"code": "ModelNotReady"}}`; `/predict` answers the same
+        way, so a 200 here means predictions will not wait on a compile.
       responses:
         "200":
           description: every served model is loaded and compiled
@@ -735,7 +705,7 @@ paths:
         Liveness has no project and so no envelope. It answers 200 from the
         moment the server listens, while models still load or compile, so a
         supervisor restarts a process that stops answering without waiting
-        on one that is only warming up; `/healthz` says when it is ready.
+        on one that is only warming up; `/readyz` says when it is ready.
       responses:
         "200":
           description: the process answers
@@ -4467,7 +4437,7 @@ components:
                 error:
                   code: ModelNotReady
                   message: general-forecast/tabicl-v2-classifier is compiling 12 programs
-                  hint: poll /healthz until it answers 200
+                  hint: poll /readyz until it answers 200
 
   schemas:
     Name:
@@ -5248,7 +5218,10 @@ components:
         status: {type: string, const: ok}
         build:
           $ref: "#/components/schemas/Build"
-          description: the code the hosted plane runs; gf serve leaves it out
+          description: |
+            the code a hosted plane runs, on a probe that names it; `/readyz`
+            and `/livez` leave it out, since load balancers and health checks
+            read their body as it is, and so does gf serve
 
     Build:
       type: object

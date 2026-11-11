@@ -203,7 +203,7 @@ function mockFetch(log = []) {
       const responses = candidates.filter((e) => e.section === "response");
       chosen = responses.find((r) => r.status === 200);
       if (pathname.endsWith("/nothing")) chosen = responses.find((r) => r.status === 404) ?? chosen;
-      if (["/healthz", "/readyz", "/livez"].includes(template.path)) {
+      if (["/readyz", "/livez"].includes(template.path)) {
         return new Response(JSON.stringify(chosen.value), { status: chosen.status });
       }
       envelope = {
@@ -372,7 +372,7 @@ test("live resolves while the server answers, and the default server is the spec
   });
   await hosted.health();
   const hostedServer = specText.match(/servers:\n\s+- url: (\S+)/)[1];
-  assert.deepEqual(asked, [`${hostedServer}/healthz`]);
+  assert.deepEqual(asked, [`${hostedServer}/readyz`]);
   assert.equal(hosted.baseUrl, "https://app.generalforecast.com");
 });
 
@@ -381,7 +381,7 @@ test("health resolves on 200 and throws ModelNotReady on 503", async () => {
   const loading = new GeneralForecast({
     project: "acme",
     baseUrl: "http://mock.local",
-    fetch: async () => new Response(JSON.stringify(EXAMPLES.find((e) => e.path === "/healthz" && e.status === 503).value), { status: 503 }),
+    fetch: async () => new Response(JSON.stringify(EXAMPLES.find((e) => e.path === "/readyz" && e.status === 503).value), { status: 503 }),
   });
   await assert.rejects(loading.health(), (error) => error instanceof GFError && error.code === "ModelNotReady");
 });
