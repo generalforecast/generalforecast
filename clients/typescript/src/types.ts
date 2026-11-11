@@ -281,7 +281,7 @@ export interface DerivedBase {
   base: ModelId;
   base_digest: Digest;
   bags: number;
-  kind: "lora" | "adapter" | "full";
+  kind: "lora" | "input_adapter" | "full" | "adapter";
 }
 
 /** the resolved predictor gf.lock pins */
@@ -370,6 +370,27 @@ export interface PredictorListReply extends Envelope {
 }
 
 /**
+ * what the weights change of the base: low-rank adapters on its layers (`lora`), an
+ * input adapter in front of it (`input_adapter`), or the named components' own weights
+ * (`full`), the names a run's `changes` use. A version trained with LoRA beside an
+ * input adapter is `input_adapter`: the LoRA is stored with it.
+ */
+export type FineTuneKind = "lora" | "input_adapter" | "full";
+
+/**
+ * the training step whose weights the version keeps: the one that scored best on the
+ * rows the run held out. Step 0 is the base itself. Null for a version whose run did
+ * not say.
+ */
+export type KeptStep = number | null;
+
+/**
+ * true when `kept_step` is 0: no check during training beat the base, so the version
+ * predicts exactly as its base does. Null where `kept_step` is.
+ */
+export type Unchanged = boolean | null;
+
+/**
  * what a fine-tune is made of, as a predictor's lock records it: its base, pinned, and
  * its weights; present on the project's fine-tunes alone, which otherwise describe
  * themselves as their base does
@@ -379,23 +400,28 @@ export interface DerivedModel {
   base_digest: Digest;
   digest: Digest;
   bags: number;
-  kind: "lora" | "adapter" | "full";
+  kind: FineTuneKind;
   run: string | null;
   version: number;
   created: number;
+  kept_step: KeptStep;
+  unchanged: Unchanged;
 }
 
 /**
- * one published version of a fine-tune: its id, its id pinned to its weights' digest,
- * and the run that trained it
+ * one published version of a fine-tune: its id, its weights' digest, the run that
+ * trained it and what that run kept. A version never changes: its id names the same
+ * weights for as long as it exists.
  */
 export interface FineTuneVersion {
   name: ModelId;
-  model: string;
+  digest: Digest;
   version: number;
-  kind: "lora" | "adapter" | "full";
+  kind: FineTuneKind;
   run: string | null;
   created: number;
+  kept_step: KeptStep;
+  unchanged: Unchanged;
 }
 
 export interface Artifact {

@@ -75,6 +75,7 @@ RECORDED = (
     "compile_lock",
     "configuration",
     "context_version",
+    "derived_kind",
     "device_room",
     "diagnostic_lines",
     "document_digest",
