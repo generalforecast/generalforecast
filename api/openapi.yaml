@@ -2261,7 +2261,8 @@ paths:
         A create sent again with the same request id, as the SDK sends a
         retry, returns the run the first one made rather than start
         another; the same request id with another payload is refused with
-        409. `evaluation` is optional.
+        409. The run holds out 20% of the corpus's rows and keeps the step
+        that scores best on them, which its `evaluation` reports.
       parameters:
       - $ref: '#/components/parameters/project'
       requestBody:
@@ -4894,10 +4895,8 @@ components:
         bags: {type: integer, minimum: 1, maximum: 64}
         kind:
           type: string
-          enum: [lora, input_adapter, full, adapter]
-          description: |
-            as `DerivedModel.kind`; a lock written before gf 0.1.16 says
-            `adapter` for `input_adapter`, and is read as it
+          enum: [lora, input_adapter, full]
+          description: as `DerivedModel.kind`
 
     Resolution:
       type: object
@@ -5873,33 +5872,14 @@ components:
         How the run chooses the weights it publishes. The trainer holds out
         20% of the corpus's rows, scores them every `evaluate_every` steps
         of the plan, and keeps the step that scores best: `holdout` is that
-        share, and every run says it. A run created without `evaluation`
-        has `{"holdout": 0.2}`, and a create may send that.
-
-        `bagging` and `sets`, which earlier clients had to send, are still
-        accepted, checked as before and recorded beside `holdout`, but the
-        trainer applies neither: a run publishes one bag, chosen on the
-        hold-out. The one effect of `sets` is that the run holds their
-        snapshots until it ends, so they cannot be deleted meanwhile.
+        share, and every run says it. A create sends no `evaluation`.
       required:
       - holdout
       additionalProperties: false
       properties:
         holdout:
           type: number
-          description: the share of the corpus's rows held out to choose the kept step, 0.2; a create
-            that sends another share is refused with 422, since the trainer applies no other
-        bagging:
-          type: object
-          deprecated: true
-          description: '`{"k": 2..16}`, LoRA and the input adapter alone; recorded, not applied'
-        sets:
-          type: array
-          deprecated: true
-          description: 1 to 16 `{"queries", "context"}` snapshot digests; held until the run ends,
-            not scored
-          items:
-            type: object
+          description: the share of the corpus's rows held out to choose the kept step, 0.2
     RunUsage:
       type: object
       required:
@@ -5979,9 +5959,6 @@ components:
           minItems: 1
           items:
             type: object
-        evaluation:
-          type: object
-          description: optional; see `RunEvaluation`, which is what the run reports
         plan:
           type: object
         checkpoint_policy:

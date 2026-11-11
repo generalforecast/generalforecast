@@ -306,7 +306,7 @@ export interface DerivedBase {
   base: ModelId;
   base_digest: Digest;
   bags: number;
-  kind: "lora" | "input_adapter" | "full" | "adapter";
+  kind: "lora" | "input_adapter" | "full";
 }
 
 /** the resolved predictor gf.lock pins */
@@ -745,17 +745,11 @@ export interface RunCorpus {
 /**
  * How the run chooses the weights it publishes. The trainer holds out 20% of the
  * corpus's rows, scores them every `evaluate_every` steps of the plan, and keeps the
- * step that scores best: `holdout` is that share, and every run says it. A run created
- * without `evaluation` has `{"holdout": 0.2}`, and a create may send that. `bagging`
- * and `sets`, which earlier clients had to send, are still accepted, checked as before
- * and recorded beside `holdout`, but the trainer applies neither: a run publishes one
- * bag, chosen on the hold-out. The one effect of `sets` is that the run holds their
- * snapshots until it ends, so they cannot be deleted meanwhile.
+ * step that scores best: `holdout` is that share, and every run says it. A create sends
+ * no `evaluation`.
  */
 export interface RunEvaluation {
   holdout: number;
-  bagging?: Record<string, unknown>;
-  sets?: Record<string, unknown>[];
 }
 
 export interface RunUsage {
@@ -819,7 +813,6 @@ export interface RunCreate {
   base: ModelId;
   corpus: Name;
   changes: Record<string, unknown>[];
-  evaluation?: Record<string, unknown>;
   plan?: Record<string, unknown>;
   checkpoint_policy?: Record<string, unknown>;
   budget?: Record<string, unknown>;

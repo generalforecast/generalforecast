@@ -3,7 +3,7 @@
 
 """Input-adapted models: a change to the features in front of a model's own calls.
 
-A derived model of kind `adapter` changes what its base reads, not its
+A derived model of kind `input_adapter` changes what its base reads, not its
 weights. `Adapted` holds a model's parameters and the adapter's own part;
 `adapted_functions` runs the model's contract calls on features the
 adapter changed. `fit` computes the adapter's statistics from the

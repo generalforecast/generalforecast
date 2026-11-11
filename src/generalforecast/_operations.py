@@ -820,43 +820,6 @@ def run_lineage(run: str) -> Operation[JsonObject]:
     return (yield Call("GET", f"/runs/{run_ref(run)}/lineage", "run", run))
 
 
-# What a run's `published` holds; a note may leave out the losses the
-# trainer had no finite value for.
-PUBLISHED_FIELDS = (
-    "model",
-    "digest",
-    "kept_step",
-    "validation_loss",
-    "base_validation_loss",
-)
-
-
-def published_of(events: Sequence[Any]) -> JsonObject | None:
-    """A run's `published` from its lineage: its last `published` note, or None."""
-    for event in reversed(events):
-        if isinstance(event, dict) and event.get("kind") == "published":
-            body = event.get("body")
-            if isinstance(body, dict):
-                return {key: body.get(key) for key in PUBLISHED_FIELDS} | {
-                    key: value
-                    for key, value in body.items()
-                    if key not in PUBLISHED_FIELDS
-                }
-    return None
-
-
-def _ended(run: str, state: JsonObject) -> Operation[JsonObject]:
-    """A run that has ended, with `published` read from its lineage if the service left it out.
-
-    A service from before runs carried `published` says it only in the
-    lineage's `published` note.
-    """
-    if "published" in state:
-        return state
-    lineage = yield from run_lineage(run)
-    return {**state, "published": published_of(lineage.get("events", ()))}
-
-
 def _still_running(run: str, state: JsonObject) -> ServiceError:
     return ServiceError("WaitTimeout", f"run {run} is still {state['state']}", 504)
 
@@ -873,7 +836,7 @@ def run_wait(run: str, *, timeout: float | None, poll: float) -> Operation[JsonO
             raise _still_running(run, state)
         yield Pause(poll)
         state = yield from got("run", "runs", run)
-    return (yield from _ended(run, state))
+    return state
 
 
 def run_watch(run: str, *, timeout: float | None, poll: float) -> Operation[JsonObject]:
@@ -895,9 +858,7 @@ def run_watch(run: str, *, timeout: float | None, poll: float) -> Operation[Json
             yield Emit(event)
         seen = max(seen, len(events))
         if state["state"] in RUN_DONE:
-            if "published" in state:
-                return state
-            return {**state, "published": published_of(events)}
+            return state
         if deadline is not None and time.monotonic() >= deadline:
             raise _still_running(run, state)
         yield Pause(poll)

@@ -123,8 +123,14 @@ def test_the_cli_keeps_a_resolver_already_installed(no_resolver):
     assert derived.resolver() is installed
 
 
-@pytest.mark.parametrize("kind", ["input_adapter", "adapter"])
-def test_an_input_adapter_resolves_whichever_name_the_plane_answers(kind):
-    answer = {**FOUND, "derived": {**MADE_BLOCK, "kind": kind}}
+def test_an_input_adapter_resolves_as_the_plane_names_it():
+    answer = {**FOUND, "derived": {**MADE_BLOCK, "kind": "input_adapter"}}
     made = ServiceResolver(lambda project: Connection(answer)).resolve(FINE_TUNE)
     assert made.kind == "input_adapter"
+
+
+def test_a_kind_gf_does_not_know_is_refused_as_a_mismatch():
+    answer = {**FOUND, "derived": {**MADE_BLOCK, "kind": "adapter"}}
+    with pytest.raises(ModelRefError) as refused:
+        ServiceResolver(lambda project: Connection(answer)).resolve(FINE_TUNE)
+    assert refused.value.code == "ModelMismatch"

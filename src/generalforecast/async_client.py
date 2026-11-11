@@ -612,7 +612,6 @@ class Runs(Collection):
         base: str,
         corpus: str,
         changes: builtins.list[JsonObject],
-        evaluation: JsonObject | None = None,
         plan: JsonObject | None = None,
         checkpoint_policy: JsonObject | None = None,
         budget: JsonObject | None = None,
@@ -622,15 +621,14 @@ class Runs(Collection):
         """Starts a run that publishes the fine-tune `name`'s next version.
 
         As `Client.runs.create`: `base` is always sent and is the same for
-        every version of a name, `evaluation` may be left out, and a retried
-        try returns the run the first one made.
+        every version of a name, and a retried try returns the run the
+        first one made.
         """
         payload = ops.run_spec(
             name,
             base=base,
             corpus=corpus,
             changes=changes,
-            evaluation=evaluation,
             plan=plan,
             checkpoint_policy=checkpoint_policy,
             budget=budget,

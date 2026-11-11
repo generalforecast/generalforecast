@@ -44,23 +44,6 @@ RESOLVER = "GF_DERIVED_RESOLVER"
 # weight (`full`). These are the names a run's changes use too.
 Kind = Literal["lora", "input_adapter", "full"]
 KINDS: tuple[Kind, ...] = ("lora", "input_adapter", "full")
-# Names an earlier gf wrote for a kind, which locks, pins and planes that
-# stored them still say: each is read as its kind.
-LEGACY_KINDS: dict[str, Kind] = {"adapter": "input_adapter"}
-
-
-def kind_of(value: object) -> Kind:
-    """The kind a stored name says, its legacy name read as its current one.
-
-    Raises:
-        ValueError: For a name that is no kind of derived model.
-    """
-    if isinstance(value, str):
-        if value in KINDS:
-            return value  # type: ignore[return-value]
-        if value in LEGACY_KINDS:
-            return LEGACY_KINDS[value]
-    raise ValueError(f"a derived model's kind is one of {', '.join(KINDS)}")
 
 
 @dataclass(frozen=True)
@@ -75,8 +58,7 @@ class Derived:
         digest: The digest of its own weights, `sha256:...`.
         bags: How many sets of weights it averages; each counts as one
             estimator against the serving policy.
-        kind: What its weights change of the base, one of `KINDS`; a
-            legacy name (`adapter`) is read as its kind.
+        kind: What its weights change of the base, one of `KINDS`.
     """
 
     model: str
@@ -87,8 +69,9 @@ class Derived:
     kind: Kind = "lora"
 
     def __post_init__(self) -> None:
-        """Reads a legacy kind as its current name; refuses a kind gf does not know."""
-        object.__setattr__(self, "kind", kind_of(self.kind))
+        """Refuses a kind of change gf does not know."""
+        if self.kind not in KINDS:
+            raise ValueError(f"a derived model's kind is one of {', '.join(KINDS)}")
 
 
 @dataclass(frozen=True)

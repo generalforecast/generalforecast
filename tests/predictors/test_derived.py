@@ -191,23 +191,16 @@ def test_a_derived_model_says_what_kind_of_change_its_weights_make():
         derived.Derived(FINE_TUNE, MODEL, WEIGHTS, WEIGHTS, 1, "merged")  # ty: ignore[invalid-argument-type]
 
 
-def test_an_input_adapter_is_named_as_a_run_names_it_and_its_old_name_still_reads():
+def test_an_input_adapter_is_named_as_a_run_names_it_and_no_other_name_reads():
     assert derived.KINDS == ("lora", "input_adapter", "full")
-    # A plane, a pin or a lock that stored the old name is read as the new one.
-    legacy = derived.Derived(FINE_TUNE, MODEL, WEIGHTS, WEIGHTS, 1, "adapter")  # ty: ignore[invalid-argument-type]
-    assert legacy.kind == "input_adapter"
-    assert legacy == derived.Derived(
-        FINE_TUNE, MODEL, WEIGHTS, WEIGHTS, 1, "input_adapter"
-    )
-    assert hosting.derived_kind("adapter") == hosting.derived_kind("input_adapter")
+    assert derived.Derived(FINE_TUNE, MODEL, WEIGHTS, WEIGHTS, 1, "input_adapter")
     with pytest.raises(ValueError):
-        hosting.derived_kind("merged")
+        derived.Derived(FINE_TUNE, MODEL, WEIGHTS, WEIGHTS, 1, "adapter")  # ty: ignore[invalid-argument-type]
+    assert not hasattr(hosting, "derived_kind")
 
 
-def test_a_lock_writes_input_adapter_and_reads_the_adapter_an_older_gf_wrote(
-    fine_tuned,
-):
-    installed = Plane(kind="adapter")
+def test_a_lock_writes_input_adapter_and_refuses_a_lock_that_says_adapter(fine_tuned):
+    installed = Plane(kind="input_adapter")
     hosting.use_derived(installed)
     try:
         value = document(resolve(load(fine_tuned), fine_tuned))
@@ -215,20 +208,27 @@ def test_a_lock_writes_input_adapter_and_reads_the_adapter_an_older_gf_wrote(
         hosting.use_derived(None)
     assert value["predictor"]["derived"]["kind"] == "input_adapter"
     assert parse_lock(value).digest == value["digest"]
-    # A lock an earlier gf wrote, digest and all, still parses as it was.
+    # A lock that says `adapter`, digest and all, is refused, with how to
+    # write it again.
     older = yaml.safe_load(yaml.safe_dump(value))
     older["predictor"]["derived"]["kind"] = "adapter"
     from generalforecast.predictors.lock import lock_digest
 
     older["digest"] = lock_digest(older)
-    assert parse_lock(older).digest == older["digest"]
+    with pytest.raises(PredictorError) as refused:
+        parse_lock(older)
+    assert refused.value.code == "ValidationError"
+    assert "lora, input_adapter or full" in str(refused.value)
+    assert "gf check" in str(refused.value)
 
 
-def test_a_pin_an_earlier_gf_stored_with_adapter_reads_as_an_input_adapter(plane):
+def test_a_pin_that_says_adapter_is_refused(plane):
     from generalforecast.predictors.models import describe
 
     plane.kind = "input_adapter"
     stored = describe(FINE_TUNE).to_dict()
-    stored["derived"]["kind"] = "adapter"
     pinned = ModelPin.from_dict(stored).derived
     assert pinned is not None and pinned.kind == "input_adapter"
+    stored["derived"]["kind"] = "adapter"
+    with pytest.raises(PredictorError):
+        ModelPin.from_dict(stored)
