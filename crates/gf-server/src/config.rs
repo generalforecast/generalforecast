@@ -22,7 +22,7 @@ use crate::shard::EphemeralLimits;
 pub struct Config {
     /// The address to serve Arrow Flight on, such as `0.0.0.0:8815`.
     pub listen: String,
-    /// The address to serve `/metrics`, `/healthz` and `/readyz` on, if any.
+    /// The address to serve `/metrics`, `/livez` and `/readyz` on, if any.
     /// They take no token and the metrics name tables, so bind it to this
     /// machine or a private network.
     #[serde(default)]

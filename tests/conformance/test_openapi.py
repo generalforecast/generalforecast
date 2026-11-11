@@ -295,7 +295,6 @@ def test_readiness_and_liveness_are_the_documented_unenveloped_probes():
     assert ROUTES["ready"].path == "/readyz"
     assert ROUTES["live"].path == "/livez"
     assert ROUTES["ready"].reply is ROUTES["live"].reply is _api.Health
-    # `/healthz` is served as readiness's alias, and documented nowhere.
     assert "/healthz" not in SPEC["paths"] and "health" not in ROUTES
 
 

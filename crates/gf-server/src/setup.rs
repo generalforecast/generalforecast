@@ -108,7 +108,7 @@ tokens = [{token:?}]
 # certificate = "/etc/generalforecast/server.pem"
 # key = "/etc/generalforecast/server.key"
 
-# metrics_listen = "127.0.0.1:9090"   # /metrics, /healthz, /readyz
+# metrics_listen = "127.0.0.1:9090"   # /metrics, /livez, /readyz
 # timing_log = "/var/log/generalforecast/timings.jsonl"   # a JSON line per prediction request
 
 # For generalforecast's developers: turns on timers and allows profile_workers captures.

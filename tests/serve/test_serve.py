@@ -163,7 +163,7 @@ def test_serve_answers_the_models_api_behind_its_key(server):
     scope = Scope("local", "r-test")
     assert call(url, "/livez") == (200, {"status": "ok"})
     assert call(url, "/readyz") == (200, {"status": "ok"})
-    assert call(url, "/healthz") == (200, {"status": "ok"})
+    assert call(url, "/healthz")[0] == 404
     status, body = call(url, "/v1/projects/local/models", key=KEY)
     assert status == 200
     [described] = body["result"]["models"]

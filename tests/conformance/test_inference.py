@@ -120,9 +120,9 @@ def test_ad_hoc_capacity_errors_name_the_limit_the_model_lists(server):
 
 def test_readiness_answers_200_only_once_predictions_answer(server):
     status, body = server.request("GET", "/readyz")
-    # The undocumented `/healthz` answers as `/readyz` does.
-    alias, _ = server.request("GET", "/healthz")
-    assert alias == status
+    # `/readyz` is the one readiness probe.
+    gone, _ = server.request("GET", "/healthz")
+    assert gone == 404
     if status == 200:
         VALIDATOR.validate(VALIDATOR.schema("Health"), body)
         queries = [{"customer_id": 9001, "spend": 82.5, "plan": "pro"}]

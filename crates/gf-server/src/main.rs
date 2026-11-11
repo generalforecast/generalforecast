@@ -325,7 +325,7 @@ async fn run(
                     "/metrics",
                     get(|State(status): State<Status>| async move { status.metrics.render() }),
                 )
-                .route("/healthz", get(|| async { "ok" }))
+                .route("/livez", get(|| async { "ok" }))
                 .route(
                     "/readyz",
                     get(|State(status): State<Status>| async move {
