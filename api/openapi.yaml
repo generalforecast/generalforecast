@@ -542,10 +542,9 @@ paths:
         each by its id and its weights' digest, with the run that made it
         and the step it kept.
 
-        A run publishes the next version of its `fine_tune`, the run's name
-        unless it names another, and neither may be a catalog model's name,
-        so a name is one or the other. A catalog name always reads the
-        catalog model.
+        A run publishes the next version of the fine-tune it names, and no
+        fine-tune may take a catalog model's name, so a name is one or the
+        other.
       parameters:
         - $ref: "#/components/parameters/project"
         - $ref: "#/components/parameters/model"
@@ -605,28 +604,25 @@ paths:
                         digest: sha256:9c1e3a5b7d9f1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d
                         bags: 1
                         kind: lora
-                        run: credit-default
+                        run: credit-default@ft2
                         version: 2
                         created: 1793000000.0
                         kept_step: 180
-                        unchanged: false
                       versions:
                         - name: acme/credit-default@ft2
                           digest: sha256:9c1e3a5b7d9f1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d
                           version: 2
                           kind: lora
-                          run: credit-default
+                          run: credit-default@ft2
                           created: 1793000000.0
                           kept_step: 180
-                          unchanged: false
                         - name: acme/credit-default@ft1
                           digest: sha256:2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d
                           version: 1
                           kind: lora
-                          run: credit-default-v0
+                          run: credit-default@ft1
                           created: 1792900000.0
                           kept_step: 0
-                          unchanged: true
                       task: classification
                       repository: general-forecast/tabicl-v2-classifier
                       revision: 5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b
@@ -2218,8 +2214,8 @@ paths:
       tags:
       - hosted
       summary: list the project's runs
-      description: Every run by name; `state` lists only the runs in that state. A state that is not
-        a run state is refused with `ValidationError`.
+      description: Every run, by fine-tune name and then version; `state` lists only the runs in that
+        state. A state that is not a run state is refused with `ValidationError`.
       parameters:
       - $ref: '#/components/parameters/project'
       - name: state
@@ -2246,12 +2242,13 @@ paths:
                       name: runs
                     result:
                       runs:
-                      - name: r1
+                      - id: credit-default@ft1
+                        name: credit-default
+                        version: 1
                         state: queued
                         reason: null
                         attempt: 0
                         base: general-forecast/tabicl-v2-classifier
-                        fine_tune: r1
                         corpus:
                           name: credit-v1
                           digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2276,10 +2273,25 @@ paths:
       tags:
       - hosted
       summary: create a fine-tuning run
-      description: Creating the same run again returns it; the same name with a different specification
-        is refused with 409. The run publishes the next version of its `fine_tune`, the run's name by
-        default, so retraining under the same `fine_tune` makes that fine-tune's next version.
-        `evaluation` is optional.
+      description: |
+        Starts a run that publishes the next version of the fine-tune
+        `name`: the first run of a name publishes `<project>/<name>@ft1`,
+        the next `@ft2`. The run is `<name>@ft<version>` from the start,
+        and every `/runs/{run}` route takes that id, or the name alone for
+        the name's latest run.
+
+        `base` is always sent. Every version of a fine-tune trains afresh
+        from one catalog model, so a base other than the one the name's
+        versions were trained from is refused with 409 `base_mismatch`, and
+        a fine-tune as `base` with 422 `base_is_fine_tune`. A new run while
+        another run of the name is still queued or running is refused with
+        409 `run_active`. A name that is a catalog model's is refused with
+        422.
+
+        A create sent again with the same request id, as the SDK sends a
+        retry, returns the run the first one made rather than start
+        another; the same request id with another payload is refused with
+        409. `evaluation` is optional.
       parameters:
       - $ref: '#/components/parameters/project'
       requestBody:
@@ -2296,9 +2308,9 @@ paths:
                   request_id: r-067c1e9a2b4d6f8031a5c7e9b2d4f6a8
                   resource:
                     kind: run
-                    name: r1
+                    name: credit-default
                   payload:
-                    name: r1
+                    name: credit-default
                     base: general-forecast/tabicl-v2-classifier
                     corpus: credit-v1
                     changes:
@@ -2319,14 +2331,15 @@ paths:
                     request_id: r-067c1e9a2b4d6f8031a5c7e9b2d4f6a8
                     resource:
                       kind: run
-                      name: r1
+                      name: credit-default
                     result:
-                      name: r1
+                      id: credit-default@ft1
+                      name: credit-default
+                      version: 1
                       state: queued
                       reason: null
                       attempt: 0
                       base: general-forecast/tabicl-v2-classifier
-                      fine_tune: r1
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2361,17 +2374,84 @@ paths:
                     request_id: r-067c1e9a2b4d6f8031a5c7e9b2d4f6a8
                     resource:
                       kind: run
-                      name: r1
+                      name: credit-default
                     error:
                       code: PaymentRequired
                       message: fine-tuning needs a Pro or Enterprise plan
                       reason: plan_required
+        '409':
+          description: another run of the name is still queued or running, the base is not the one
+            the fine-tune's versions were trained from, or the request id was sent with another payload
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorReply'
+              examples:
+                run_active:
+                  x-gf-hosted: true
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-167c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                    resource:
+                      kind: run
+                      name: credit-default
+                    error:
+                      code: Conflict
+                      message: credit-default@ft2 is still training; a fine-tune trains one version
+                        at a time
+                      reason: run_active
+                      param: name
+                      hint: wait for credit-default@ft2 to end, or cancel it
+                base_mismatch:
+                  x-gf-hosted: true
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-177c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                    resource:
+                      kind: run
+                      name: credit-default
+                    error:
+                      code: Conflict
+                      message: credit-default is trained from general-forecast/tabicl-v2-classifier,
+                        not general-forecast/tabicl-v2-regressor; every version of a fine-tune trains
+                        from one base
+                      reason: base_mismatch
+                      param: base
+                      hint: send base general-forecast/tabicl-v2-classifier, or name a new fine-tune
+        '422':
+          description: the request is malformed, `base` is not a catalog model that can be fine-tuned,
+            or `name` is a catalog model's
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorReply'
+              examples:
+                base_is_fine_tune:
+                  x-gf-hosted: true
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-187c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                    resource:
+                      kind: run
+                      name: credit-default
+                    error:
+                      code: ValidationError
+                      message: acme/credit-default@ft1 is a fine-tune; a run trains from a catalog
+                        model, and each version of a fine-tune trains afresh from its base
+                      reason: base_is_fine_tune
+                      param: base
+                      hint: send the fine-tune's base, general-forecast/tabicl-v2-classifier
   /v1/projects/{project}/runs/{run}:
     get:
       operationId: runs.get
       tags:
       - hosted
       summary: show a run
+      description: '`{run}` is a run''s id, `<name>@ft<version>`, for that run, or a fine-tune''s
+        name alone for its latest run. Every run is listed by `runs.list`.'
       parameters:
       - $ref: '#/components/parameters/project'
       - $ref: '#/components/parameters/run'
@@ -2390,14 +2470,15 @@ paths:
                     request_id: r-077c1e9a2b4d6f8031a5c7e9b2d4f6a8
                     resource:
                       kind: run
-                      name: r1
+                      name: credit-default@ft1
                     result:
-                      name: r1
+                      id: credit-default@ft1
+                      name: credit-default
+                      version: 1
                       state: queued
                       reason: null
                       attempt: 0
                       base: general-forecast/tabicl-v2-classifier
-                      fine_tune: r1
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2425,14 +2506,15 @@ paths:
                     request_id: r-0e7c1e9a2b4d6f8031a5c7e9b2d4f6a8
                     resource:
                       kind: run
-                      name: credit-default-v2
+                      name: credit-default
                     result:
-                      name: credit-default-v2
+                      id: credit-default@ft2
+                      name: credit-default
+                      version: 2
                       state: finished
                       reason: null
                       attempt: 1
                       base: general-forecast/tabicl-v2-classifier
-                      fine_tune: credit-default
                       corpus:
                         name: credit-v2
                         digest: sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2
@@ -2457,7 +2539,6 @@ paths:
                         model: acme/credit-default@ft2
                         digest: sha256:9c1e3a5b7d9f1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d
                         kept_step: 180
-                        unchanged: false
                         validation_loss: 0.412
                         base_validation_loss: 0.455
   /v1/projects/{project}/runs/{run}/train:
@@ -2484,7 +2565,7 @@ paths:
                   request_id: r-087c1e9a2b4d6f8031a5c7e9b2d4f6a8
                   resource:
                     kind: run
-                    name: r1
+                    name: credit-default@ft1
                   payload:
                     plan:
                       phases:
@@ -2504,14 +2585,15 @@ paths:
                     request_id: r-087c1e9a2b4d6f8031a5c7e9b2d4f6a8
                     resource:
                       kind: run
-                      name: r1
+                      name: credit-default@ft1
                     result:
-                      name: r1
+                      id: credit-default@ft1
+                      name: credit-default
+                      version: 1
                       state: queued
                       reason: null
                       attempt: 0
                       base: general-forecast/tabicl-v2-classifier
-                      fine_tune: r1
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2541,7 +2623,7 @@ paths:
       summary: cancel a run
       description: A run a trainer is working on moves to `cancelling` until it stops, then ends `cancelled`.
         With `save`, a run that is training stops at its next report and publishes the weights trained
-        so far as the next version of its `fine_tune`, as a run stopped by its budget does; the run's
+        so far as the version the run was created for, as a run stopped by its budget does; the run's
         `published`, and its lineage's `published` note, name the version. Without `save` nothing is published.
         A run that is not training (queued, setting up, ready or preempted) has no weights in hand, so
         `save` publishes nothing. Cancelling an ended or cancelling run returns it unchanged.
@@ -2562,7 +2644,7 @@ paths:
                   request_id: r-097c1e9a2b4d6f8031a5c7e9b2d4f6a8
                   resource:
                     kind: run
-                    name: r1
+                    name: credit-default@ft1
                   payload: {}
               save:
                 value:
@@ -2571,7 +2653,7 @@ paths:
                   request_id: r-0f7c1e9a2b4d6f8031a5c7e9b2d4f6a8
                   resource:
                     kind: run
-                    name: r1
+                    name: credit-default@ft1
                   payload:
                     save: true
       responses:
@@ -2589,14 +2671,15 @@ paths:
                     request_id: r-097c1e9a2b4d6f8031a5c7e9b2d4f6a8
                     resource:
                       kind: run
-                      name: r1
+                      name: credit-default@ft1
                     result:
-                      name: r1
+                      id: credit-default@ft1
+                      name: credit-default
+                      version: 1
                       state: cancelled
                       reason: null
                       attempt: 0
                       base: general-forecast/tabicl-v2-classifier
-                      fine_tune: r1
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2623,14 +2706,15 @@ paths:
                     request_id: r-0f7c1e9a2b4d6f8031a5c7e9b2d4f6a8
                     resource:
                       kind: run
-                      name: r1
+                      name: credit-default@ft1
                     result:
-                      name: r1
+                      id: credit-default@ft1
+                      name: credit-default
+                      version: 1
                       state: cancelling
                       reason: null
                       attempt: 1
                       base: general-forecast/tabicl-v2-classifier
-                      fine_tune: r1
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -2676,15 +2760,14 @@ paths:
                     request_id: r-0a7c1e9a2b4d6f8031a5c7e9b2d4f6a8
                     resource:
                       kind: run
-                      name: r1
+                      name: credit-default@ft1
                     result:
-                      run: r1
+                      run: credit-default@ft1
                       events:
                       - at: 1761200000.0
                         kind: created
                         body:
                           base: general-forecast/tabicl-v2-classifier
-                          fine_tune: r1
                           corpus:
                             name: credit-v1
                             digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
@@ -4303,7 +4386,7 @@ components:
       in: path
       required: true
       schema:
-        $ref: '#/components/schemas/Name'
+        $ref: '#/components/schemas/RunRef'
     upload:
       name: upload
       in: path
@@ -4400,6 +4483,21 @@ components:
         `tabpfn-3.5-classifier`; unlike a chosen resource name it may start
         with a digit and hold dots
 
+    RunId:
+      type: string
+      pattern: "^[a-z][a-z0-9-]{0,62}@ft[1-9]\\d*$"
+      description: |
+        a run's id, `<name>@ft<version>`: the fine-tune it trains and the
+        version it publishes, as `credit-default@ft2` publishes
+        `<project>/credit-default@ft2`
+
+    RunRef:
+      type: string
+      pattern: "^[a-z][a-z0-9-]{0,62}(?:@ft[1-9]\\d*)?$"
+      description: |
+        a run by its id, `credit-default@ft2`, or a fine-tune's name alone,
+        `credit-default`, for the name's latest run
+
     FineTuneName:
       type: string
       pattern: "^[a-z][a-z0-9-]{0,62}@ft[1-9]\\d*$"
@@ -4468,6 +4566,11 @@ components:
         Those three 429s carry `limit` and `actual`, and lift only when the
         caller ends a run or deletes data, so clients do not retry them; a
         429 `rate_limited` passes on its own and may be retried.
+        A run's create is refused with `Conflict` 409 `run_active` (another
+        run of the fine-tune is still queued or running) or `base_mismatch`
+        (the fine-tune's versions train from another base), and with
+        `ValidationError` 422 `base_is_fine_tune` (a fine-tune sent as the
+        base).
 
     Error:
       type: object
@@ -5017,7 +5120,7 @@ components:
         what a fine-tune is made of, as a predictor's lock records it: its
         base, pinned, and its weights; present on the project's fine-tunes
         alone, which otherwise describe themselves as their base does
-      required: [base, base_digest, digest, bags, kind, run, version, created, kept_step, unchanged]
+      required: [base, base_digest, digest, bags, kind, run, version, created, kept_step]
       additionalProperties: false
       properties:
         base: {$ref: "#/components/schemas/ModelId"}
@@ -5028,14 +5131,13 @@ components:
         run:
           type: [string, "null"]
           description: |
-            the project's run that trained and published the weights;
-            `GET /runs/{run}` reads it, and its `published` names this
-            version. Null only for a version published before the service
-            recorded runs on versions, whose run it could not find.
+            the id of the run that trained and published the weights,
+            `<name>@ft<version>`; `GET /runs/{run}` reads it, and its
+            `published` names this version. Null for a version no run
+            published.
         version: {type: integer, minimum: 1}
         created: {type: number, description: "when the version was published, in seconds since the epoch, as every resource's `created`"}
         kept_step: {$ref: "#/components/schemas/KeptStep"}
-        unchanged: {$ref: "#/components/schemas/Unchanged"}
 
     FineTuneKind:
       type: string
@@ -5053,14 +5155,9 @@ components:
       description: |
         the training step whose weights the version keeps: the one that
         scored best on the rows the run held out. Step 0 is the base
-        itself. Null for a version whose run did not say.
-
-    Unchanged:
-      type: [boolean, "null"]
-      description: |
-        true when `kept_step` is 0: no check during training beat the base,
-        so the version predicts exactly as its base does. Null where
-        `kept_step` is.
+        itself: no check during training beat the base, so the version
+        predicts exactly as its base does. Null for a version whose run
+        did not say.
 
     FineTuneVersion:
       type: object
@@ -5068,7 +5165,7 @@ components:
         one published version of a fine-tune: its id, its weights' digest,
         the run that trained it and what that run kept. A version never
         changes: its id names the same weights for as long as it exists.
-      required: [name, digest, version, kind, run, created, kept_step, unchanged]
+      required: [name, digest, version, kind, run, created, kept_step]
       additionalProperties: false
       properties:
         name:
@@ -5084,7 +5181,6 @@ components:
           description: the run that trained and published the version, as `derived.run`
         created: {type: number, description: "when the version was published, in seconds since the epoch, as every resource's `created`"}
         kept_step: {$ref: "#/components/schemas/KeptStep"}
-        unchanged: {$ref: "#/components/schemas/Unchanged"}
 
     ModelVariant:
       type: object
@@ -5691,12 +5787,23 @@ components:
       - plan
       - created
       - updated
-      - fine_tune
       - published
+      - id
+      - version
       additionalProperties: false
       properties:
+        id:
+          $ref: '#/components/schemas/RunId'
+          description: the run's id, `<name>@ft<version>`, which every `/runs/{run}` route takes
         name:
           $ref: '#/components/schemas/Name'
+          description: the fine-tune the run trains, `<project>/<name>`
+        version:
+          type: integer
+          minimum: 1
+          description: the version the run publishes, `<project>/<name>@ft<version>`, fixed when
+            it is created; a run that ends without publishing leaves that version unpublished,
+            and the name's next run takes the next one
         state:
           $ref: '#/components/schemas/RunState'
         reason:
@@ -5709,10 +5816,6 @@ components:
         base:
           $ref: '#/components/schemas/ModelId'
           description: the catalog model the run trains from
-        fine_tune:
-          $ref: '#/components/schemas/Name'
-          description: the fine-tune the run publishes the next version of, `<project>/<fine_tune>@ft<N>`;
-            the run's name unless it was created with another
         corpus:
           $ref: '#/components/schemas/RunCorpus'
         changes:
@@ -5758,28 +5861,25 @@ components:
         What a run published: the version, its weights' digest, the step the
         weights were kept at and how they scored on the rows the run held
         out, against the base on the same rows. The same as the lineage's
-        `published` note. A version with `unchanged: true` predicts exactly
-        as its base does: no check during training beat the base.
+        `published` note. A version kept at step 0 predicts exactly as its
+        base does: no check during training beat the base.
       required:
       - model
       - digest
       - kept_step
-      - unchanged
       - validation_loss
       - base_validation_loss
       additionalProperties: false
       properties:
         model:
           $ref: '#/components/schemas/ModelId'
-          description: the version's id, `<project>/<fine_tune>@ft<N>`, which `models.get` reads and
+          description: the version's id, `<project>/<name>@ft<version>`, which `models.get` reads and
             a predictor's `gf.yaml` names
         digest:
           $ref: '#/components/schemas/Digest'
           description: the digest of the version's weights
         kept_step:
           $ref: '#/components/schemas/KeptStep'
-        unchanged:
-          $ref: '#/components/schemas/Unchanged'
         validation_loss:
           description: the kept weights' loss on the held-out rows; null without a finite one
           anyOf:
@@ -5887,19 +5987,18 @@ components:
       properties:
         name:
           $ref: '#/components/schemas/Name'
+          description: |
+            the fine-tune the run trains: its first run publishes
+            `<project>/<name>@ft1`, and each run after the next version; a
+            version never changes once published. A catalog model's name is
+            refused with 422.
         base:
           $ref: '#/components/schemas/ModelId'
-          description: the catalog model the run trains from; a fine-tune is refused with 422
-        fine_tune:
-          $ref: '#/components/schemas/Name'
           description: |
-            the fine-tune the run publishes to, the run's name when left out.
-            A run publishes the name's next version, so a new run with the
-            same `fine_tune` makes `@ft2`, then `@ft3`; a version never
-            changes once published. Every version of a name trains from one
-            base: a run whose base differs from the name's earlier runs is
-            refused with 409. A catalog model's short name is refused with
-            422, `param: fine_tune` (or `name`, when it is the run's).
+            the catalog model the run trains from, always sent. Every version
+            of a fine-tune trains afresh from the same base: another base is
+            refused with 409 `base_mismatch`, and a fine-tune with 422
+            `base_is_fine_tune`.
         corpus:
           $ref: '#/components/schemas/Name'
         changes:
@@ -5999,7 +6098,7 @@ components:
       additionalProperties: false
       properties:
         run:
-          $ref: '#/components/schemas/Name'
+          $ref: '#/components/schemas/RunId'
         events:
           type: array
           items:

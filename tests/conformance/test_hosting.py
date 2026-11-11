@@ -112,6 +112,7 @@ RECORDED = (
     "request_table",
     "require",
     "resource_name",
+    "run_ref",
     "served_context",
     "step_fits",
     "success",

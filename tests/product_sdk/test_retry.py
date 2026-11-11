@@ -453,8 +453,19 @@ def test_a_limit_only_the_caller_lifts_is_never_retried(error, expected):
             ),
             "/predictors/risk/environments/staging/promote",
         ),
+        (
+            # Each create starts a new version's run: the service tells a
+            # try again from a second run by its request id alone.
+            lambda c: c.runs.create(
+                "credit",
+                base="general-forecast/tabicl-v2-classifier",
+                corpus="c",
+                changes=[{"kind": "lora", "rank": 8}],
+            ),
+            "/runs",
+        ),
     ],
-    ids=["predictor", "environment", "promote"],
+    ids=["predictor", "environment", "promote", "run"],
 )
 def test_idempotent_writes_are_retried_under_one_request_id(
     asynchronous, call, route, monkeypatch
@@ -462,6 +473,8 @@ def test_idempotent_writes_are_retried_under_one_request_id(
     answer = (
         {"name": "risk"}
         if route == "/predictors"
+        else {"id": "credit@ft1", "name": "credit", "version": 1}
+        if route == "/runs"
         else Environment("risk", "staging", 2, 2, "ready").to_dict()
     )
     script = Script(lost(), unavailable("SingleWriterUnavailable"), answer)

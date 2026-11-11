@@ -120,8 +120,10 @@ def wire():
                         "corpora": "corpus",
                     }[parts[4]]
                     resource = parts[5] if len(parts) > 5 else parts[4]
-                    # A fine-tune's version names the fine-tune, as the plane's does.
-                    resource = resource.split("@ft")[0]
+                    # A fine-tune's version names the fine-tune, as the plane's
+                    # does; a run's id names the run.
+                    if kind == "model":
+                        resource = resource.split("@ft")[0]
                     request = Request(
                         Scope("test", self.headers["X-GF-Request-ID"]),
                         Resource(cast(ResourceKind, kind), resource),

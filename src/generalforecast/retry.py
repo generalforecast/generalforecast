@@ -16,10 +16,10 @@ unknown. `Client` and `AsyncClient` try such a request again, under a
 - `PREDICT`: predictions, which read and keep nothing but a fit;
 - `READ`: every GET;
 - `WRITE`: the writes the service applies once whatever the number of
-  times they are sent: creating a predictor, a run or an environment by
-  name, registering a revision by its lock, uploading a snapshot by its
-  content, and promoting or rolling back under the same request id, which
-  the service replays.
+  times they are sent: creating a predictor or an environment by name,
+  registering a revision by its lock, uploading a snapshot by its content,
+  and creating a run, promoting or rolling back under the same request id,
+  which the service replays: every try of a request sends the same id.
 
 Every other write, such as an append without a stable write id, is sent
 once. A refusal of the request itself, a 4xx other than 429, is never

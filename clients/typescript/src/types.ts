@@ -17,6 +17,18 @@ export type Name = string;
 export type ModelName = string;
 
 /**
+ * a run's id, `<name>@ft<version>`: the fine-tune it trains and the version it
+ * publishes, as `credit-default@ft2` publishes `<project>/credit-default@ft2`
+ */
+export type RunId = string;
+
+/**
+ * a run by its id, `credit-default@ft2`, or a fine-tune's name alone, `credit-default`,
+ * for the name's latest run
+ */
+export type RunRef = string;
+
+/**
  * a project's fine-tune version by its name and version, as `credit-default@ft3` names
  * `<project>/credit-default@ft3`
  */
@@ -63,7 +75,10 @@ export interface Envelope {
  * project's training data would pass its quota) and `snapshot_quota_exceeded`. Those
  * three 429s carry `limit` and `actual`, and lift only when the caller ends a run or
  * deletes data, so clients do not retry them; a 429 `rate_limited` passes on its own
- * and may be retried.
+ * and may be retried. A run's create is refused with `Conflict` 409 `run_active`
+ * (another run of the fine-tune is still queued or running) or `base_mismatch` (the
+ * fine-tune's versions train from another base), and with `ValidationError` 422
+ * `base_is_fine_tune` (a fine-tune sent as the base).
  */
 export const ERROR_CODES = ["ValidationError", "NotFound", "Unauthorized", "CapacityExceeded", "ModelNotReady", "Internal", "Conflict", "Unsupported", "PaymentRequired"] as const;
 export type ErrorCode = (typeof ERROR_CODES)[number];
@@ -389,16 +404,11 @@ export type FineTuneKind = "lora" | "input_adapter" | "full";
 
 /**
  * the training step whose weights the version keeps: the one that scored best on the
- * rows the run held out. Step 0 is the base itself. Null for a version whose run did
- * not say.
+ * rows the run held out. Step 0 is the base itself: no check during training beat the
+ * base, so the version predicts exactly as its base does. Null for a version whose run
+ * did not say.
  */
 export type KeptStep = number | null;
-
-/**
- * true when `kept_step` is 0: no check during training beat the base, so the version
- * predicts exactly as its base does. Null where `kept_step` is.
- */
-export type Unchanged = boolean | null;
 
 /**
  * what a fine-tune is made of, as a predictor's lock records it: its base, pinned, and
@@ -415,7 +425,6 @@ export interface DerivedModel {
   version: number;
   created: number;
   kept_step: KeptStep;
-  unchanged: Unchanged;
 }
 
 /**
@@ -431,7 +440,6 @@ export interface FineTuneVersion {
   run: string | null;
   created: number;
   kept_step: KeptStep;
-  unchanged: Unchanged;
 }
 
 export interface Artifact {
@@ -760,26 +768,26 @@ export interface RunUsage {
 /**
  * What a run published: the version, its weights' digest, the step the weights were
  * kept at and how they scored on the rows the run held out, against the base on the
- * same rows. The same as the lineage's `published` note. A version with `unchanged:
- * true` predicts exactly as its base does: no check during training beat the base.
+ * same rows. The same as the lineage's `published` note. A version kept at step 0
+ * predicts exactly as its base does: no check during training beat the base.
  */
 export interface RunPublished {
   model: ModelId;
   digest: Digest;
   kept_step: KeptStep;
-  unchanged: Unchanged;
   validation_loss: number | null;
   base_validation_loss: number | null;
   diverged_at_step?: number;
 }
 
 export interface Run {
+  id: RunId;
   name: Name;
+  version: number;
   state: RunState;
   reason: string | null;
   attempt: number;
   base: ModelId;
-  fine_tune: Name;
   corpus: RunCorpus;
   changes: Record<string, unknown>[];
   evaluation: RunEvaluation;
@@ -809,7 +817,6 @@ export interface RunListReply extends Envelope {
 export interface RunCreate {
   name: Name;
   base: ModelId;
-  fine_tune?: Name;
   corpus: Name;
   changes: Record<string, unknown>[];
   evaluation?: Record<string, unknown>;
@@ -848,7 +855,7 @@ export interface RunEvent {
 }
 
 export interface RunLineage {
-  run: Name;
+  run: RunId;
   events: RunEvent[];
 }
 

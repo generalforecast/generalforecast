@@ -21,6 +21,7 @@ from generalforecast.service.contracts import (
     model_name,
     name,
     require,
+    run_ref,
     text,
 )
 
@@ -150,9 +151,11 @@ class Resource:
             isinstance(self.kind, str) and self.kind in RESOURCE_KINDS,
             "invalid resource kind",
         )
-        # A model is named by its catalog name, which may hold dots; every
+        # A model is named by its catalog name, which may hold dots, and a
+        # run by its id, `<name>@ft<version>`, or its fine-tune's name; every
         # chosen resource name keeps the strict rule.
-        (model_name if self.kind == "model" else name)(self.name)
+        check = {"model": model_name, "run": run_ref}.get(self.kind, name)
+        check(self.name)
 
 
 @dataclass(frozen=True)
