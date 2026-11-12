@@ -2384,7 +2384,9 @@ def test_clients_take_generators_predict_nothing_and_close() -> None:
             client.predict({"missing": NEAR_A})
         table.predict(NEAR_A)
         device = client._worker._device
-        assert device._host is not None
+        # The pool's memory is the host's on a CPU and the device's on an
+        # accelerator.
+        assert device._host is not None or device._data is not None
     assert temporary is not None and not temporary.exists()
     assert client.tables() == []
     # The device pool's memory goes with the client, not with the collector.
@@ -2434,8 +2436,14 @@ def test_built_in_models_load_from_a_local_directory(
         pytest.skip("local checkpoints are not downloaded")
     monkeypatch.setenv("GF_CHECKPOINTS", str(checkpoints))
     functions, model = registry.load("general-forecast/tabicl-v2-classifier")
-    assert functions is tabicl_functions
-    assert not functions.properties(model).regression
+    # TabICL's calls, with properties that add what the catalog says it was
+    # trained on.
+    assert (
+        functions._replace(properties=tabicl_functions.properties) == tabicl_functions
+    )
+    properties = functions.properties(model)
+    assert not properties.regression
+    assert properties.context_rows == 100_000
 
 
 def test_a_client_sizes_its_tiers_from_its_device(

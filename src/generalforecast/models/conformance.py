@@ -163,6 +163,14 @@ def coded(data: Table, column: int) -> tuple[Table, jax.Array]:
     return changed, mask
 
 
+# The precision of float32 matrix multiplies the checks run at. They compare
+# calls that agree in exact arithmetic, padded against unpadded, apart
+# against together; a GPU's default rounds float32 inputs to TF32, ten bits
+# of mantissa, whose last places differ between such calls by more than any
+# tolerance a check could keep, and a valid custom model failed to load.
+CHECK_PRECISION = "highest"
+
+
 def close(actual: Any, expected: Any, tolerance: float = 1e-5) -> None:
     """Raises unless two trees of arrays match within `tolerance`."""
     jax.tree.map(
@@ -251,7 +259,8 @@ def check(
     limits = Limits(features, tolerance, stored_tolerance)
     for name, run in _CHECKS:
         try:
-            run(functions, parameters, properties, regression, limits)
+            with jax.default_matmul_precision(CHECK_PRECISION):
+                run(functions, parameters, properties, regression, limits)
         except AssertionError as error:
             raise AssertionError(f"{name}: {error}") from None
         except Exception as error:
@@ -756,7 +765,8 @@ def check_series(
     )
     for name, run in _SERIES_CHECKS:
         try:
-            run(functions, parameters, properties, tolerance)
+            with jax.default_matmul_precision(CHECK_PRECISION):
+                run(functions, parameters, properties, tolerance)
         except AssertionError as error:
             raise AssertionError(f"{name}: {error}") from None
         except Exception as error:
