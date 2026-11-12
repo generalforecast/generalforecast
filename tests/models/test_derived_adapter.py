@@ -228,3 +228,33 @@ def test_context_pages_embed_as_the_fit_does(base):
         ]
     )
     np.testing.assert_allclose(pages, rows, rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("variant", ["*4", "@2*4"])
+def test_an_ensemble_s_estimators_read_the_columns_the_adapter_changed(base, variant):
+    data = table(regression=False)
+    width = data.features.shape[1]
+    parts = _adapters(width, (0.0, 0.0), seed=2)
+    # Each bag changes one column, a different one, of the table's order.
+    parts[0]["gate"] = parts[0]["gate"].at[0].set(0.5)
+    parts[1]["gate"] = parts[1]["gate"].at[width - 1].set(0.5)
+    derived.use(Plane(parts))
+    functions, parameters = registry.load(MODEL + variant)
+    found = _run(functions, parameters, data)
+    # Every estimator reads the columns its bag's adapter changed, whatever
+    # order it sees them in: the adapter changes the table, then the
+    # ensemble reorders it.
+    ensemble, model = registry.load_tabular(BASE + variant)
+    expected = []
+    for part in parts:
+        mean = statistics(part, data.features, None)
+        expected.append(
+            predict(
+                ensemble,
+                model,
+                transform(part, mean, data.features),
+                data.targets,
+                transform(part, mean, data.queries),
+            )
+        )
+    np.testing.assert_allclose(found, np.mean(expected, axis=0), atol=1e-5)

@@ -309,7 +309,9 @@ def _derived_variant(
     """A derived model as one `Bagged` model over its base's one shared copy.
 
     A model of kind `input_adapter` runs each bag's input adapter in front of the
-    base, unmerged, through `adapted.adapted_functions`.
+    base, unmerged, through `adapted.adapted_functions`, and in front of its
+    `@K` codes and `*N` ensemble, so the adapter reads the table's columns in
+    the order it was trained on.
 
     Keyed by everything `made` is, its weights' digest included, so a model
     whose weights changed under its name never runs from this cache.
@@ -369,16 +371,45 @@ def _derive(
                 else "change none of its inputs"
             ),
         )
-    if weights.inputs is not None:
-        from generalforecast.models.adapted import WithInputs, adapted_functions
+    variant = ModelRef(made.base, codes, estimators)
+    if weights.inputs is None:
+        bagged = (
+            bagged_functions(functions),
+            Bagged(parameters, weights.own, made.bags, combine),
+        )
+        return wrap(*bagged, variant)
+    from generalforecast.models.adapted import WithInputs, adapted_functions
 
-        functions = adapted_functions(functions, weights.inputs)
-        combine = WithInputs(combine)
-    bagged = (
-        bagged_functions(functions),
-        Bagged(parameters, weights.own, made.bags, combine),
+    # An adapter's parameters are per column, in the order of the table it
+    # was trained on, and an ensemble's estimators each see the columns in
+    # another order: each bag's adapter changes the table in front of its
+    # codes and ensemble, never one estimator's view of it.
+    functions, parameters = wrap(functions, parameters, variant)
+    return (
+        bagged_functions(adapted_functions(functions, weights.inputs)),
+        Bagged(parameters, weights.own, made.bags, WithInputs(_Within(combine))),
     )
-    return wrap(*bagged, ModelRef(made.base, codes, estimators))
+
+
+@dataclass(frozen=True)
+class _Within:
+    """A bag's `combine` for a base in the codes and ensemble `wrap` gave it.
+
+    Attributes:
+        combine: Gives the base's parameters for a bag, from the base's own
+            and the bag's part.
+    """
+
+    combine: Callable[[Any, Any], Any]
+
+    def __call__(self, shared: Any, own: Any) -> Any:
+        """The wrapped parameters, with the bag's base parameters inside."""
+        from generalforecast.models.ensemble import Ensemble
+        from generalforecast.models.many_class import ManyClass
+
+        if isinstance(shared, Ensemble | ManyClass):
+            return dataclasses.replace(shared, model=self(shared.model, own))
+        return self.combine(shared, own)
 
 
 def load_engine_model(spec: str, bases: Mapping[str, Model] | None = None) -> Model:
