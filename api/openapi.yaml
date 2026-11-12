@@ -5837,13 +5837,17 @@ components:
           - type: 'null'
     RunPlan:
       description: |
-        How a run trains. A plan of one phase gives its `steps`, and its
-        `episode_sampling` beside them:
+        How a run trains. A plan of one phase gives its `steps`, and pools
+        the corpus: every episode draws from all of its members' rows,
         `{"steps": 200, "learning_rate": 5e-5, "episode_sampling": {"rows": 1024}}`.
-        A plan of two to 16 phases gives `phases`, which run one after
-        another, so their steps add up. A plan gives exactly one of `steps`
-        and `phases`; a plan with both, neither, or `phases` of one phase is
-        refused with 422. The rest of a plan's settings apply to every phase.
+        A curriculum gives two to 16 `phases`, which run one after another,
+        so their steps add up; each phase's `mix` weighs the corpus's
+        members by name, `{"phases": [{"steps": 300, "mix": {"general": 1}},
+        {"steps": 100, "mix": {"general": 1, "credit": 3}}]}`. A plan gives
+        exactly one of `steps` and `phases`; a plan with both, neither, or
+        `phases` of one phase is refused with 422. The rest of a plan's
+        settings, `episode_sampling` among them, apply to every phase, and
+        the learning rate's schedule spans every phase's steps.
       oneOf:
       - $ref: '#/components/schemas/RunPlanSteps'
       - $ref: '#/components/schemas/RunPlanPhases'
@@ -5905,7 +5909,7 @@ components:
           description: checks without improvement before training stops; 0, never, when left out
     RunPlanPhases:
       type: object
-      description: a plan of two or more phases, run one after another
+      description: a curriculum, two or more phases run one after another
       required:
       - phases
       additionalProperties: false
@@ -5916,6 +5920,8 @@ components:
           maxItems: 16
           items:
             $ref: '#/components/schemas/RunPhase'
+        episode_sampling:
+          $ref: '#/components/schemas/EpisodeSampling'
         learning_rate:
           type: number
           minimum: 1.0e-08
@@ -5961,9 +5967,13 @@ components:
     RunPhase:
       type: object
       description: |
-        one phase of a plan of several. Every phase samples episodes alike,
-        and the trainer reads the whole corpus in each, so a phase's `mix`
-        is taken only when it weighs the corpus's one member.
+        one phase of a curriculum: its steps, and the corpus's members it
+        draws from. Each step's episodes come from one member, picked at
+        random by the mix's weights; a phase without a mix pools the
+        corpus, each member picked by its share of the corpus's rows. Every
+        phase samples episodes as the plan's `episode_sampling` says, and a
+        phase's own `learning_rate`, `early_stopping` or `episode_sampling`
+        is refused with 422.
       required:
       - steps
       additionalProperties: false
@@ -5974,12 +5984,15 @@ components:
           maximum: 10000000
         mix:
           type: object
-          description: the corpus's members by name, each with its weight
+          minProperties: 1
+          description: |
+            the corpus's members by name, each with its weight above 0; a
+            name that is not a member of the run's corpus, or a member that
+            is a prior, is refused with 422
           additionalProperties:
             type: number
-            minimum: 0
-        episode_sampling:
-          $ref: '#/components/schemas/EpisodeSampling'
+            exclusiveMinimum: 0
+            maximum: 1000000
     EpisodeSampling:
       type: object
       description: how the trainer draws an episode from the corpus's rows
@@ -6043,7 +6056,10 @@ components:
         How the run chooses the weights it publishes. The trainer holds out
         20% of the corpus's rows, scores them every `evaluate_every` steps
         of the plan, and keeps the step that scores best: `holdout` is that
-        share, and every run says it. A create sends no `evaluation`.
+        share, and every run says it. A curriculum holds out 20% of each
+        member's rows it draws from, and each check scores every member's,
+        1,024 rows in all at most, spread across the members. A create
+        sends no `evaluation`.
       required:
       - holdout
       additionalProperties: false
@@ -6204,7 +6220,10 @@ components:
           description: |
             What happened. A `published` event is the run's `published`. A
             `metrics` event is one chunk of training:
-            `steps`, `loss`, `validation_loss` and `seconds`, and, where the
+            `steps`, `loss`, `validation_loss` and `seconds`; `phase`, the
+            index in the plan's `phases` of the phase it trained in (0 for a
+            plan of `steps`); for a curriculum, `members`, the share of the
+            chunk's steps each member it draws from gave, by name; and, where the
             trainer reads them, `compile_seconds`, `train_seconds`,
             `chunk_steps`, `steps_per_second`, `rows_per_second`,
             `gpu_utilization` (%), `gpu_memory_used_bytes`,

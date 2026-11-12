@@ -577,12 +577,16 @@ class Runs(Collection):
         hold-out of the corpus's rows, which it reports as its
         `evaluation`.
 
-        A `plan` of one phase gives its `steps`, and its `episode_sampling`
-        beside them: `{"steps": 200, "learning_rate": 5e-5,
-        "episode_sampling": {"rows": 1024}}`. A plan of two to 16 phases
-        gives `phases` instead, each with its own `steps`. A plan gives
-        exactly one of the two; anything else is refused with
-        `ValidationError` (`generalforecast._api.RunPlan`).
+        A `plan` of one phase gives its `steps`, and pools the corpus:
+        `{"steps": 200, "learning_rate": 5e-5, "episode_sampling": {"rows":
+        1024}}`. A curriculum gives two to 16 `phases` instead, run in
+        order, each with its `steps` and a `mix` weighing the corpus's
+        members by name: `{"phases": [{"steps": 300, "mix": {"general": 1}},
+        {"steps": 100, "mix": {"general": 1, "credit": 3}}]}`; a phase
+        without a mix pools the corpus. Episode sampling is the plan's in
+        either form. A plan gives exactly one of `steps` and `phases`;
+        anything else is refused with `ValidationError`
+        (`generalforecast._api.RunPlan`).
 
         A try sent again after a transient failure carries the same request
         id, so the service returns the run the first try made rather than

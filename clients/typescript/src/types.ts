@@ -744,8 +744,10 @@ export interface RunCorpus {
 /**
  * How the run chooses the weights it publishes. The trainer holds out 20% of the
  * corpus's rows, scores them every `evaluate_every` steps of the plan, and keeps the
- * step that scores best: `holdout` is that share, and every run says it. A create sends
- * no `evaluation`.
+ * step that scores best: `holdout` is that share, and every run says it. A curriculum
+ * holds out 20% of each member's rows it draws from, and each check scores every
+ * member's, 1,024 rows in all at most, spread across the members. A create sends no
+ * `evaluation`.
  */
 export interface RunEvaluation {
   holdout: number;
@@ -774,19 +776,21 @@ export interface RunPlanSteps {
 }
 
 /**
- * one phase of a plan of several. Every phase samples episodes alike, and the trainer
- * reads the whole corpus in each, so a phase's `mix` is taken only when it weighs the
- * corpus's one member.
+ * one phase of a curriculum: its steps, and the corpus's members it draws from. Each
+ * step's episodes come from one member, picked at random by the mix's weights; a phase
+ * without a mix pools the corpus, each member picked by its share of the corpus's rows.
+ * Every phase samples episodes as the plan's `episode_sampling` says, and a phase's own
+ * `learning_rate`, `early_stopping` or `episode_sampling` is refused with 422.
  */
 export interface RunPhase {
   steps: number;
   mix?: Record<string, number>;
-  episode_sampling?: EpisodeSampling;
 }
 
-/** a plan of two or more phases, run one after another */
+/** a curriculum, two or more phases run one after another */
 export interface RunPlanPhases {
   phases: RunPhase[];
+  episode_sampling?: EpisodeSampling;
   learning_rate?: number;
   optimizer?: "adamw";
   schedule?: "cosine";
@@ -800,12 +804,15 @@ export interface RunPlanPhases {
 }
 
 /**
- * How a run trains. A plan of one phase gives its `steps`, and its `episode_sampling`
- * beside them: `{"steps": 200, "learning_rate": 5e-5, "episode_sampling": {"rows":
- * 1024}}`. A plan of two to 16 phases gives `phases`, which run one after another, so
- * their steps add up. A plan gives exactly one of `steps` and `phases`; a plan with
- * both, neither, or `phases` of one phase is refused with 422. The rest of a plan's
- * settings apply to every phase.
+ * How a run trains. A plan of one phase gives its `steps`, and pools the corpus: every
+ * episode draws from all of its members' rows, `{"steps": 200, "learning_rate": 5e-5,
+ * "episode_sampling": {"rows": 1024}}`. A curriculum gives two to 16 `phases`, which
+ * run one after another, so their steps add up; each phase's `mix` weighs the corpus's
+ * members by name, `{"phases": [{"steps": 300, "mix": {"general": 1}}, {"steps": 100,
+ * "mix": {"general": 1, "credit": 3}}]}`. A plan gives exactly one of `steps` and
+ * `phases`; a plan with both, neither, or `phases` of one phase is refused with 422.
+ * The rest of a plan's settings, `episode_sampling` among them, apply to every phase,
+ * and the learning rate's schedule spans every phase's steps.
  */
 export type RunPlan = RunPlanSteps | RunPlanPhases;
 

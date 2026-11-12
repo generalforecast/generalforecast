@@ -626,8 +626,8 @@ class Runs(Collection):
         """Starts a run that publishes the fine-tune `name`'s next version.
 
         As `Client.runs.create`: `base` is always sent and is the same for
-        every version of a name, a `plan` gives `steps` for one phase or
-        `phases` for several, and a retried try returns the run the first
+        every version of a name, a `plan` gives `steps`, or a curriculum's
+        `phases` mixing the corpus's members, and a retried try returns the run the first
         one made. The run's `model` names it from the start.
         """
         payload = ops.run_spec(

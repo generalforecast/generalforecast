@@ -2089,7 +2089,9 @@ class RunEvaluation(Payload):
 
     The trainer holds out 20% of the corpus's rows, scores them every `evaluate_every`
     steps of the plan, and keeps the step that scores best: `holdout` is that share,
-    and every run says it. A create sends no `evaluation`.
+    and every run says it. A curriculum holds out 20% of each member's rows it draws
+    from, and each check scores every member's, 1,024 rows in all at most, spread
+    across the members. A create sends no `evaluation`.
     """
 
     holdout: float
@@ -2145,28 +2147,30 @@ class RunPlanSteps(Payload):
 
 @dataclass(frozen=True, kw_only=True)
 class RunPhase(Payload):
-    """One phase of a plan of several.
+    """One phase of a curriculum: its steps, and the corpus's members it draws from.
 
-    Every phase samples episodes alike, and the trainer reads the whole corpus in each,
-    so a phase's `mix` is taken only when it weighs the corpus's one member.
+    Each step's episodes come from one member, picked at random by the mix's weights; a
+    phase without a mix pools the corpus, each member picked by its share of the
+    corpus's rows. Every phase samples episodes as the plan's `episode_sampling` says,
+    and a phase's own `learning_rate`, `early_stopping` or `episode_sampling` is
+    refused with 422.
     """
 
     steps: int
     mix: dict[str, float] | None = None
-    episode_sampling: EpisodeSampling | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("steps", "steps", True, _integer),
         Field("mix", "mix", False, _mapping(_number)),
-        Field("episode_sampling", "episode_sampling", False, _record(EpisodeSampling)),
     )
 
 
 @dataclass(frozen=True, kw_only=True)
 class RunPlanPhases(Payload):
-    """A plan of two or more phases, run one after another."""
+    """A curriculum, two or more phases run one after another."""
 
     phases: tuple[RunPhase, ...]
+    episode_sampling: EpisodeSampling | None = None
     learning_rate: float | None = None
     optimizer: Literal["adamw"] | None = None
     schedule: Literal["cosine"] | None = None
@@ -2180,6 +2184,7 @@ class RunPlanPhases(Payload):
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("phases", "phases", True, _items(_record(RunPhase))),
+        Field("episode_sampling", "episode_sampling", False, _record(EpisodeSampling)),
         Field("learning_rate", "learning_rate", False, _number),
         Field("optimizer", "optimizer", False, _literal("adamw")),
         Field("schedule", "schedule", False, _literal("cosine")),
