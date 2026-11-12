@@ -535,12 +535,20 @@ class Uploads(Collection):
 class Runs(Collection):
     """Fine-tuning runs, one per version of a fine-tune, followed until they end.
 
-    A run is addressed by its id, `<name>@ft<version>`, or by its
-    fine-tune's name alone for that name's latest run.
+    A run is named by the model it publishes, its `model`,
+    `<project>/<name>@ft<version>`, as `acme/credit-default@ft1`; every
+    method takes that, or `<project>/<name>` for the name's latest run.
+    The project may be left out, `credit-default@ft1` or `credit-default`,
+    for a run of the client's own project; a model of another project is
+    refused with `ValidationError`.
     """
 
     kind: ResourceKind = "run"
     collection = "runs"
+
+    def get(self, resource: str) -> Mapping[str, Any]:
+        """A run by its model, `<project>/<name>@ft<version>`, or a name's latest run."""
+        return self.client._run(ops.run_got(resource, self.client.project))
 
     def create(
         self,
@@ -558,8 +566,9 @@ class Runs(Collection):
         """Starts a run that publishes the fine-tune `name`'s next version.
 
         The first run of a name publishes `<project>/<name>@ft1`, and each
-        create after it the next version, `@ft2` and on; the run's `id` is
-        `<name>@ft<version>` from the start. `base` is the catalog model
+        create after it the next version, `@ft2` and on; the run's `model`
+        is that version's id from the start, and names the run for `get`,
+        `wait`, `watch`, `train`, `cancel` and `lineage`. `base` is the catalog model
         the run trains from, and every version of a name trains afresh from
         the same one: another base is refused with `Conflict`, a fine-tune
         with `ValidationError`, and so is a new run while one of the name
@@ -567,6 +576,13 @@ class Runs(Collection):
         is set up. The run keeps the step that scores best on a 20%
         hold-out of the corpus's rows, which it reports as its
         `evaluation`.
+
+        A `plan` of one phase gives its `steps`, and its `episode_sampling`
+        beside them: `{"steps": 200, "learning_rate": 5e-5,
+        "episode_sampling": {"rows": 1024}}`. A plan of two to 16 phases
+        gives `phases` instead, each with its own `steps`. A plan gives
+        exactly one of the two; anything else is refused with
+        `ValidationError` (`generalforecast._api.RunPlan`).
 
         A try sent again after a transient failure carries the same request
         id, so the service returns the run the first try made rather than
@@ -586,8 +602,8 @@ class Runs(Collection):
         return self.client._run(ops.run_create(name, payload))
 
     def train(self, run: str, plan: JsonObject) -> JsonObject:
-        """Sets the plan of a run created without one."""
-        return self.client._run(ops.posted("run", "runs", run, "train", {"plan": plan}))
+        """Sets the plan of a run created without one, as `create` takes it."""
+        return self.client._run(ops.run_train(run, plan, self.client.project))
 
     def list(self, *, state: str | None = None) -> builtins.list[JsonObject]:
         """The project's runs by name and version; with `state`, only those in it.
@@ -604,11 +620,13 @@ class Runs(Collection):
         `cancelled`; its lineage names the version. A run not yet training
         has nothing to save and is cancelled as it would be without `save`.
         """
-        return self.client._run(ops.run_cancel(run, save=save))
+        return self.client._run(
+            ops.run_cancel(run, save=save, project=self.client.project)
+        )
 
     def lineage(self, run: str) -> JsonObject:
-        """Every change to a run, oldest first."""
-        return self.client._run(ops.run_lineage(run))
+        """Every change to a run, oldest first, as `{"model", "events"}`."""
+        return self.client._run(ops.run_lineage(run, self.client.project))
 
     def wait(
         self,
@@ -624,13 +642,17 @@ class Runs(Collection):
         "<project>/<name>@ft<version>", "digest", "kept_step",
         "validation_loss", "base_validation_loss"}`, or is None when it made
         none. With `on_event`, each lineage event is passed to it once, as
-        `watch` yields them. Past `timeout` seconds it raises `WaitTimeout`
-        (`gf.ModelNotReady`), and the run carries on.
+        `watch` yields them. A name alone waits for the run that was its
+        latest when the wait began. Past `timeout` seconds it raises
+        `WaitTimeout` (`gf.ModelNotReady`), and the run carries on.
         """
+        project = self.client.project
         if on_event is None:
-            return self.client._run(ops.run_wait(run, timeout=timeout, poll=poll))
+            return self.client._run(
+                ops.run_wait(run, timeout=timeout, poll=poll, project=project)
+            )
         return self.client._run(
-            ops.run_watch(run, timeout=timeout, poll=poll), on_event
+            ops.run_watch(run, timeout=timeout, poll=poll, project=project), on_event
         )
 
     def watch(
@@ -645,7 +667,9 @@ class Runs(Collection):
         come first. The iteration ends once the run has ended; `get` or
         `wait` then reads it. Past `timeout` seconds it raises `WaitTimeout`.
         """
-        return self.client._watch(ops.run_watch(run, timeout=timeout, poll=poll))
+        return self.client._watch(
+            ops.run_watch(run, timeout=timeout, poll=poll, project=self.client.project)
+        )
 
 
 class Models(Collection):
@@ -660,7 +684,7 @@ class Models(Collection):
         A catalog model's id is `general-forecast/<name>`. A fine-tune's is
         `<project>/<name>@ft<version>` for one version, or `<project>/<name>`
         for its latest version with every version under `versions`, newest
-        first; each version names the run that trained it. The reply is the
+        first; the run that trained a version is `runs.get` of its id. The reply is the
         `Model` schema of the API (`generalforecast._api.Model`).
         """
         return self.client._run(ops.model_got(resource, self.client.project))

@@ -116,7 +116,26 @@ def test_payloads_leave_out_what_was_not_given():
         "target": "y",
         "task": "regression",
     }
-    assert ops.run_spec("r1", seed=None, plan={"phases": 5}) == {
+    assert ops.run_spec("r1", seed=None, plan={"steps": 5}) == {
         "name": "r1",
-        "plan": {"phases": 5},
+        "plan": {"steps": 5},
     }
+
+
+def test_a_plan_is_its_steps_or_two_or_more_phases():
+    from generalforecast import _api
+
+    one = _api.Run.FIELDS[[f.key for f in _api.Run.FIELDS].index("plan")]
+    plan = {"steps": 200, "learning_rate": 5e-5, "episode_sampling": {"rows": 1024}}
+    decoded = one.decode(plan, "plan")
+    assert isinstance(decoded, _api.RunPlanSteps) and decoded.steps == 200
+    assert decoded.episode_sampling == _api.EpisodeSampling(rows=1024)
+    phased = one.decode({"phases": [{"steps": 100}, {"steps": 50}]}, "plan")
+    assert isinstance(phased, _api.RunPlanPhases) and len(phased.phases) == 2
+    for refused in (
+        {"steps": 10, "phases": [{"steps": 1}, {"steps": 1}]},
+        {"phases": 200},
+        {"learning_rate": 1e-4},
+    ):
+        with pytest.raises(_api.PayloadError):
+            one.decode(refused, "plan")

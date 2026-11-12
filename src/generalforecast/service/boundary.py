@@ -152,8 +152,8 @@ class Resource:
             "invalid resource kind",
         )
         # A model is named by its catalog name, which may hold dots, and a
-        # run by its id, `<name>@ft<version>`, or its fine-tune's name; every
-        # chosen resource name keeps the strict rule.
+        # run by its model without the project, `<name>@ft<version>`, or its
+        # fine-tune's name; every chosen resource name keeps the strict rule.
         check = {"model": model_name, "run": run_ref}.get(self.kind, name)
         check(self.name)
 

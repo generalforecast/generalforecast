@@ -598,12 +598,17 @@ class Uploads(Collection):
 class Runs(Collection):
     """Fine-tuning runs, one per version of a fine-tune, followed until they end.
 
-    A run is addressed by its id, `<name>@ft<version>`, or by its
-    fine-tune's name alone for that name's latest run.
+    As `Client.runs`: a run is named by the model it publishes, its
+    `model`, `<project>/<name>@ft<version>`, or `<project>/<name>` for the
+    name's latest run, with the project left out for the client's own.
     """
 
     kind: ResourceKind = "run"
     collection = "runs"
+
+    async def get(self, resource: str) -> Mapping[str, Any]:
+        """A run by its model, `<project>/<name>@ft<version>`, or a name's latest run."""
+        return await self.client._run(ops.run_got(resource, self.client.project))
 
     async def create(
         self,
@@ -621,8 +626,9 @@ class Runs(Collection):
         """Starts a run that publishes the fine-tune `name`'s next version.
 
         As `Client.runs.create`: `base` is always sent and is the same for
-        every version of a name, and a retried try returns the run the
-        first one made.
+        every version of a name, a `plan` gives `steps` for one phase or
+        `phases` for several, and a retried try returns the run the first
+        one made. The run's `model` names it from the start.
         """
         payload = ops.run_spec(
             name,
@@ -638,10 +644,8 @@ class Runs(Collection):
         return await self.client._run(ops.run_create(name, payload))
 
     async def train(self, run: str, plan: JsonObject) -> JsonObject:
-        """Sets the plan of a run created without one."""
-        return await self.client._run(
-            ops.posted("run", "runs", run, "train", {"plan": plan})
-        )
+        """Sets the plan of a run created without one, as `create` takes it."""
+        return await self.client._run(ops.run_train(run, plan, self.client.project))
 
     async def list(self, *, state: str | None = None) -> builtins.list[JsonObject]:
         """The project's runs by name and version; with `state`, only those in it.
@@ -658,11 +662,13 @@ class Runs(Collection):
         `cancelled`; its lineage names the version. A run not yet training
         has nothing to save and is cancelled as it would be without `save`.
         """
-        return await self.client._run(ops.run_cancel(run, save=save))
+        return await self.client._run(
+            ops.run_cancel(run, save=save, project=self.client.project)
+        )
 
     async def lineage(self, run: str) -> JsonObject:
-        """Every change to a run, oldest first."""
-        return await self.client._run(ops.run_lineage(run))
+        """Every change to a run, oldest first, as `{"model", "events"}`."""
+        return await self.client._run(ops.run_lineage(run, self.client.project))
 
     async def wait(
         self,
@@ -678,10 +684,13 @@ class Runs(Collection):
         made, or is None. `on_event`, a function or a coroutine function,
         is called with each lineage event once.
         """
+        project = self.client.project
         if on_event is None:
-            return await self.client._run(ops.run_wait(run, timeout=timeout, poll=poll))
+            return await self.client._run(
+                ops.run_wait(run, timeout=timeout, poll=poll, project=project)
+            )
         return await self.client._run(
-            ops.run_watch(run, timeout=timeout, poll=poll), on_event
+            ops.run_watch(run, timeout=timeout, poll=poll, project=project), on_event
         )
 
     def watch(
@@ -691,7 +700,9 @@ class Runs(Collection):
 
         As `Client.runs.watch`, with `async for`.
         """
-        return self.client._watch(ops.run_watch(run, timeout=timeout, poll=poll))
+        return self.client._watch(
+            ops.run_watch(run, timeout=timeout, poll=poll, project=self.client.project)
+        )
 
 
 class Models(Collection):
@@ -706,7 +717,7 @@ class Models(Collection):
         A catalog model's id is `general-forecast/<name>`. A fine-tune's is
         `<project>/<name>@ft<version>` for one version, or `<project>/<name>`
         for its latest version with every version under `versions`, newest
-        first; each version names the run that trained it. The reply is the
+        first; the run that trained a version is `runs.get` of its id. The reply is the
         `Model` schema of the API (`generalforecast._api.Model`).
         """
         return await self.client._run(ops.model_got(resource, self.client.project))
