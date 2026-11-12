@@ -398,7 +398,7 @@ export interface PredictorListReply extends Envelope {
 /**
  * what the weights change of the base: low-rank adapters on its layers (`lora`), an
  * input adapter in front of it (`input_adapter`), or the named components' own weights
- * (`full`), the names a run's `changes` use. A version trained with LoRA beside an
+ * (`full`), the names a run's `techniques` use. A version trained with LoRA beside an
  * input adapter is `input_adapter`: the LoRA is stored with it.
  */
 export type FineTuneKind = "lora" | "input_adapter" | "full";
@@ -847,7 +847,7 @@ export interface Run {
   attempt: number;
   base: ModelId;
   corpus: RunCorpus;
-  changes: Record<string, unknown>[];
+  techniques: Record<string, unknown>[];
   evaluation: RunEvaluation;
   checkpoint_policy: Record<string, unknown>;
   budget: Record<string, unknown> | null;
@@ -876,7 +876,7 @@ export interface RunCreate {
   name: Name;
   base: ModelId;
   corpus: Name;
-  changes: Record<string, unknown>[];
+  techniques: Record<string, unknown>[];
   plan?: RunPlan;
   checkpoint_policy?: Record<string, unknown>;
   budget?: Record<string, unknown>;

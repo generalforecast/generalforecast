@@ -2263,7 +2263,7 @@ class Run(Payload):
     attempt: int
     base: ModelId
     corpus: RunCorpus
-    changes: tuple[dict[str, Any], ...]
+    techniques: tuple[dict[str, Any], ...]
     evaluation: RunEvaluation
     checkpoint_policy: dict[str, Any]
     budget: dict[str, Any] | None
@@ -2284,7 +2284,7 @@ class Run(Payload):
         Field("attempt", "attempt", True, _integer),
         Field("base", "base", True, _decode_ModelId),
         Field("corpus", "corpus", True, _record(RunCorpus)),
-        Field("changes", "changes", True, _items(_mapping(_any))),
+        Field("techniques", "techniques", True, _items(_mapping(_any))),
         Field("evaluation", "evaluation", True, _record(RunEvaluation)),
         Field("checkpoint_policy", "checkpoint_policy", True, _mapping(_any)),
         Field("budget", "budget", True, _union(_mapping(_any), _null)),
@@ -2354,7 +2354,7 @@ class RunCreate(Payload):
     name: Name
     base: ModelId
     corpus: Name
-    changes: tuple[dict[str, Any], ...]
+    techniques: tuple[dict[str, Any], ...]
     plan: RunPlan | None = None
     checkpoint_policy: dict[str, Any] | None = None
     budget: dict[str, Any] | None = None
@@ -2365,7 +2365,7 @@ class RunCreate(Payload):
         Field("name", "name", True, _decode_Name),
         Field("base", "base", True, _decode_ModelId),
         Field("corpus", "corpus", True, _decode_Name),
-        Field("changes", "changes", True, _items(_mapping(_any))),
+        Field("techniques", "techniques", True, _items(_mapping(_any))),
         Field("plan", "plan", False, _decode_RunPlan),
         Field("checkpoint_policy", "checkpoint_policy", False, _mapping(_any)),
         Field("budget", "budget", False, _mapping(_any)),

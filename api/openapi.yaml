@@ -2221,7 +2221,7 @@ paths:
                         corpus:
                           name: credit-v1
                           digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                        changes:
+                        techniques:
                         - kind: lora
                           rank: 16
                         evaluation:
@@ -2289,7 +2289,7 @@ paths:
                     name: credit-default
                     base: general-forecast/tabicl-v2-classifier
                     corpus: credit-v1
-                    changes:
+                    techniques:
                     - kind: lora
                       rank: 16
                     plan:
@@ -2324,7 +2324,7 @@ paths:
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                      changes:
+                      techniques:
                       - kind: lora
                         rank: 16
                       evaluation:
@@ -2467,7 +2467,7 @@ paths:
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                      changes:
+                      techniques:
                       - kind: lora
                         rank: 16
                       evaluation:
@@ -2503,7 +2503,7 @@ paths:
                       corpus:
                         name: credit-v2
                         digest: sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2
-                      changes:
+                      techniques:
                       - kind: lora
                         rank: 16
                       evaluation:
@@ -2581,7 +2581,7 @@ paths:
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                      changes:
+                      techniques:
                       - kind: lora
                         rank: 16
                       evaluation:
@@ -2666,7 +2666,7 @@ paths:
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                      changes:
+                      techniques:
                       - kind: lora
                         rank: 16
                       evaluation:
@@ -2701,7 +2701,7 @@ paths:
                       corpus:
                         name: credit-v1
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                      changes:
+                      techniques:
                       - kind: lora
                         rank: 16
                       evaluation:
@@ -2753,7 +2753,7 @@ paths:
                           corpus:
                             name: credit-v1
                             digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                          changes:
+                          techniques:
                           - kind: lora
                             rank: 16
                           evaluation:
@@ -5119,9 +5119,9 @@ components:
       description: |
         what the weights change of the base: low-rank adapters on its layers
         (`lora`), an input adapter in front of it (`input_adapter`), or the
-        named components' own weights (`full`), the names a run's `changes`
-        use. A version trained with LoRA beside an input adapter is
-        `input_adapter`: the LoRA is stored with it.
+        named components' own weights (`full`), the names a run's
+        `techniques` use. A version trained with LoRA beside an input
+        adapter is `input_adapter`: the LoRA is stored with it.
 
     KeptStep:
       type: [integer, "null"]
@@ -5752,7 +5752,7 @@ components:
       - attempt
       - base
       - corpus
-      - changes
+      - techniques
       - evaluation
       - checkpoint_policy
       - budget
@@ -5797,7 +5797,7 @@ components:
           description: the catalog model the run trains from
         corpus:
           $ref: '#/components/schemas/RunCorpus'
-        changes:
+        techniques:
           type: array
           items:
             type: object
@@ -6122,7 +6122,7 @@ components:
       - name
       - base
       - corpus
-      - changes
+      - techniques
       additionalProperties: false
       properties:
         name:
@@ -6141,7 +6141,7 @@ components:
             `base_is_fine_tune`.
         corpus:
           $ref: '#/components/schemas/Name'
-        changes:
+        techniques:
           type: array
           minItems: 1
           items:

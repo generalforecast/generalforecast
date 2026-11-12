@@ -41,7 +41,7 @@ RESOLVER = "GF_DERIVED_RESOLVER"
 
 # What a derived model changes of its base: low-rank adapters on its layers
 # (`lora`), an input adapter in front of it (`input_adapter`), or every
-# weight (`full`). These are the names a run's changes use too.
+# weight (`full`). These are the names a run's techniques use too.
 Kind = Literal["lora", "input_adapter", "full"]
 KINDS: tuple[Kind, ...] = ("lora", "input_adapter", "full")
 

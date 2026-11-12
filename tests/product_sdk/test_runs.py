@@ -49,7 +49,7 @@ def test_a_run_is_created_by_its_fine_tune_name_and_base(wire, asynchronous):
         "name": "credit",
         "base": BASE,
         "corpus": "credit-v2",
-        "changes": [{"kind": "lora", "rank": 16}],
+        "techniques": [{"kind": "lora", "rank": 16}],
     }
     wire.expect("POST", "/runs", _run("queued"), payload=spec)
     created = run(
@@ -59,7 +59,7 @@ def test_a_run_is_created_by_its_fine_tune_name_and_base(wire, asynchronous):
             "credit",
             base=BASE,
             corpus="credit-v2",
-            changes=[{"kind": "lora", "rank": 16}],
+            techniques=[{"kind": "lora", "rank": 16}],
         ),
     )
     assert created["model"] == "test/credit@ft2" and created["version"] == 2
