@@ -890,31 +890,11 @@ impl WorkerConnection {
         self.directory.as_ref().map(Private::path)
     }
 
-    /// Sends a frame and waits at most `timeout` for its reply. A worker that
-    /// takes longer is killed, which stops its pipeline, so the shard starts
-    /// it again.
-    ///
-    /// # Errors
-    ///
-    /// If the connection fails, the worker replies with an error, or it
-    /// takes too long.
-    pub async fn request_within(&mut self, frame: &Frame, timeout: Duration) -> Reply {
-        if let Ok(reply) = tokio::time::timeout(timeout, self.pipeline.request(frame)).await {
-            return reply;
-        }
-        self.kill().await;
-        Err(format!(
-            "the worker took over {} seconds to answer a {:?} message",
-            timeout.as_secs_f64(),
-            frame.kind()
-        ))
-    }
-
     /// Sends a frame and waits for its reply while the worker reports
     /// progress at least every `timeout`, as it does for each program it
     /// compiles and, at most once a second, for the calls it finishes. A
-    /// worker silent for longer is killed, as `request_within`
-    /// kills it.
+    /// worker silent for longer is killed, which stops its pipeline, so the
+    /// shard starts it again.
     ///
     /// # Errors
     ///

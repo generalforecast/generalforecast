@@ -110,7 +110,7 @@ impl Shard {
         self.allocate().await?;
         for entry in self.tables.values() {
             self.worker
-                .request_within(
+                .request_progressing(
                     &add_table(entry.id, &entry.definition).frame(),
                     self.step_timeout,
                 )
