@@ -227,8 +227,10 @@ ModelName = str
 _decode_ModelName: Decoder = _pattern("^[a-z0-9][a-z0-9.-]{0,62}$")
 
 
-RunId = str
-_decode_RunId: Decoder = _pattern("^[a-z][a-z0-9-]{0,62}@ft[1-9]\\d*$")
+RunModel = str
+_decode_RunModel: Decoder = _pattern(
+    "^[a-z][a-z0-9-]{0,62}/[a-z][a-z0-9-]{0,62}@ft[1-9]\\d*$",
+)
 
 
 RunRef = str
@@ -1051,7 +1053,6 @@ class DerivedModel(Payload):
     digest: Digest
     bags: int
     kind: FineTuneKind
-    run: str | None
     version: int
     created: float
     kept_step: KeptStep
@@ -1062,7 +1063,6 @@ class DerivedModel(Payload):
         Field("digest", "digest", True, _decode_Digest),
         Field("bags", "bags", True, _integer),
         Field("kind", "kind", True, _decode_FineTuneKind),
-        Field("run", "run", True, _union(_text, _null)),
         Field("version", "version", True, _integer),
         Field("created", "created", True, _number),
         Field("kept_step", "kept_step", True, _decode_KeptStep),
@@ -1073,16 +1073,15 @@ class DerivedModel(Payload):
 class FineTuneVersion(Payload):
     """The FineTuneVersion schema.
 
-    one published version of a fine-tune: its id, its weights' digest, the run that
-    trained it and what that run kept. A version never changes: its id names the same
-    weights for as long as it exists.
+    one published version of a fine-tune: its id, its weights' digest and the step its
+    run kept. The run that trained it has the same id as its `model`. A version never
+    changes: its id names the same weights for as long as it exists.
     """
 
     name: ModelId
     digest: Digest
     version: int
     kind: FineTuneKind
-    run: str | None
     created: float
     kept_step: KeptStep
 
@@ -1091,7 +1090,6 @@ class FineTuneVersion(Payload):
         Field("digest", "digest", True, _decode_Digest),
         Field("version", "version", True, _integer),
         Field("kind", "kind", True, _decode_FineTuneKind),
-        Field("run", "run", True, _union(_text, _null)),
         Field("created", "created", True, _number),
         Field("kept_step", "kept_step", True, _decode_KeptStep),
     )
@@ -2091,12 +2089,117 @@ class RunEvaluation(Payload):
 
     The trainer holds out 20% of the corpus's rows, scores them every `evaluate_every`
     steps of the plan, and keeps the step that scores best: `holdout` is that share,
-    and every run says it. A create sends no `evaluation`.
+    and every run says it. A curriculum holds out 20% of each member's rows it draws
+    from, and each check scores every member's, 1,024 rows in all at most, spread
+    across the members. A create sends no `evaluation`.
     """
 
     holdout: float
 
     FIELDS: ClassVar[tuple[Field, ...]] = (Field("holdout", "holdout", True, _number),)
+
+
+@dataclass(frozen=True, kw_only=True)
+class EpisodeSampling(Payload):
+    """How the trainer draws an episode from the corpus's rows."""
+
+    rows: int | Literal["auto"] | None = None
+    context_fraction: float | None = None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("rows", "rows", False, _union(_integer, _literal("auto"))),
+        Field("context_fraction", "context_fraction", False, _number),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunPlanSteps(Payload):
+    """A plan of one phase."""
+
+    steps: int
+    episode_sampling: EpisodeSampling | None = None
+    learning_rate: float | None = None
+    optimizer: Literal["adamw"] | None = None
+    schedule: Literal["cosine"] | None = None
+    warmup_steps: int | None = None
+    weight_decay: float | None = None
+    beta2: float | None = None
+    grad_clip: float | None = None
+    episodes_per_step: int | None = None
+    evaluate_every: int | None = None
+    early_stopping_patience: int | None = None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("steps", "steps", True, _integer),
+        Field("episode_sampling", "episode_sampling", False, _record(EpisodeSampling)),
+        Field("learning_rate", "learning_rate", False, _number),
+        Field("optimizer", "optimizer", False, _literal("adamw")),
+        Field("schedule", "schedule", False, _literal("cosine")),
+        Field("warmup_steps", "warmup_steps", False, _integer),
+        Field("weight_decay", "weight_decay", False, _number),
+        Field("beta2", "beta2", False, _number),
+        Field("grad_clip", "grad_clip", False, _number),
+        Field("episodes_per_step", "episodes_per_step", False, _integer),
+        Field("evaluate_every", "evaluate_every", False, _integer),
+        Field("early_stopping_patience", "early_stopping_patience", False, _integer),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunPhase(Payload):
+    """One phase of a curriculum: its steps, and the corpus's members it draws from.
+
+    Each step's episodes come from one member, picked at random by the mix's weights; a
+    phase without a mix pools the corpus, each member picked by its share of the
+    corpus's rows. Every phase samples episodes as the plan's `episode_sampling` says,
+    and a phase's own `learning_rate`, `early_stopping` or `episode_sampling` is
+    refused with 422.
+    """
+
+    steps: int
+    mix: dict[str, float] | None = None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("steps", "steps", True, _integer),
+        Field("mix", "mix", False, _mapping(_number)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunPlanPhases(Payload):
+    """A curriculum, two or more phases run one after another."""
+
+    phases: tuple[RunPhase, ...]
+    episode_sampling: EpisodeSampling | None = None
+    learning_rate: float | None = None
+    optimizer: Literal["adamw"] | None = None
+    schedule: Literal["cosine"] | None = None
+    warmup_steps: int | None = None
+    weight_decay: float | None = None
+    beta2: float | None = None
+    grad_clip: float | None = None
+    episodes_per_step: int | None = None
+    evaluate_every: int | None = None
+    early_stopping_patience: int | None = None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("phases", "phases", True, _items(_record(RunPhase))),
+        Field("episode_sampling", "episode_sampling", False, _record(EpisodeSampling)),
+        Field("learning_rate", "learning_rate", False, _number),
+        Field("optimizer", "optimizer", False, _literal("adamw")),
+        Field("schedule", "schedule", False, _literal("cosine")),
+        Field("warmup_steps", "warmup_steps", False, _integer),
+        Field("weight_decay", "weight_decay", False, _number),
+        Field("beta2", "beta2", False, _number),
+        Field("grad_clip", "grad_clip", False, _number),
+        Field("episodes_per_step", "episodes_per_step", False, _integer),
+        Field("evaluate_every", "evaluate_every", False, _integer),
+        Field("early_stopping_patience", "early_stopping_patience", False, _integer),
+    )
+
+
+RunPlan = RunPlanSteps | RunPlanPhases
+_decode_RunPlan: Decoder = _union(_record(RunPlanSteps), _record(RunPlanPhases))
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -2152,7 +2255,7 @@ class RunPublished(Payload):
 class Run(Payload):
     """The Run schema."""
 
-    id: RunId
+    model: RunModel
     name: Name
     version: int
     state: RunState
@@ -2166,14 +2269,14 @@ class Run(Payload):
     budget: dict[str, Any] | None
     seed: int
     tags: tuple[Name, ...]
-    plan: dict[str, Any] | None
+    plan: RunPlan | None
     created: float
     updated: float
     published: RunPublished | None
     usage: RunUsage | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("id", "id", True, _decode_RunId),
+        Field("model", "model", True, _decode_RunModel),
         Field("name", "name", True, _decode_Name),
         Field("version", "version", True, _integer),
         Field("state", "state", True, _decode_RunState),
@@ -2187,7 +2290,7 @@ class Run(Payload):
         Field("budget", "budget", True, _union(_mapping(_any), _null)),
         Field("seed", "seed", True, _integer),
         Field("tags", "tags", True, _items(_decode_Name)),
-        Field("plan", "plan", True, _union(_mapping(_any), _null)),
+        Field("plan", "plan", True, _union(_decode_RunPlan, _null)),
         Field("created", "created", True, _number),
         Field("updated", "updated", True, _number),
         Field("usage", "usage", False, _union(_record(RunUsage), _null)),
@@ -2252,7 +2355,7 @@ class RunCreate(Payload):
     base: ModelId
     corpus: Name
     changes: tuple[dict[str, Any], ...]
-    plan: dict[str, Any] | None = None
+    plan: RunPlan | None = None
     checkpoint_policy: dict[str, Any] | None = None
     budget: dict[str, Any] | None = None
     seed: int | None = None
@@ -2263,7 +2366,7 @@ class RunCreate(Payload):
         Field("base", "base", True, _decode_ModelId),
         Field("corpus", "corpus", True, _decode_Name),
         Field("changes", "changes", True, _items(_mapping(_any))),
-        Field("plan", "plan", False, _mapping(_any)),
+        Field("plan", "plan", False, _decode_RunPlan),
         Field("checkpoint_policy", "checkpoint_policy", False, _mapping(_any)),
         Field("budget", "budget", False, _mapping(_any)),
         Field("seed", "seed", False, _integer),
@@ -2294,9 +2397,11 @@ class RunCreateRequest(Payload):
 class RunTrain(Payload):
     """The RunTrain schema."""
 
-    plan: dict[str, Any]
+    plan: RunPlan
 
-    FIELDS: ClassVar[tuple[Field, ...]] = (Field("plan", "plan", True, _mapping(_any)),)
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("plan", "plan", True, _decode_RunPlan),
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -2366,11 +2471,11 @@ class RunEvent(Payload):
 class RunLineage(Payload):
     """The RunLineage schema."""
 
-    run: RunId
+    model: RunModel
     events: tuple[RunEvent, ...]
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
-        Field("run", "run", True, _decode_RunId),
+        Field("model", "model", True, _decode_RunModel),
         Field("events", "events", True, _items(_record(RunEvent))),
     )
 

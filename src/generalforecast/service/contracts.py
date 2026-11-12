@@ -123,17 +123,18 @@ def model_name(value: Any) -> str:
     return value
 
 
-# A run by its id, `<name>@ft<version>`, the fine-tune it trains and the
-# version it publishes, or by the fine-tune's name alone for the name's
-# latest run. The spec's RunRef.
+# A run in a path, its model without the project the path names,
+# `<name>@ft<version>`: the fine-tune it trains and the version it publishes;
+# or the fine-tune's name alone for the name's latest run. The spec's RunRef.
 RUN_REF = re.compile(r"[a-z][a-z0-9-]{0,62}(?:@ft[1-9]\d*)?")
 
 
 def run_ref(value: Any) -> str:
-    """Validates a run's id, `credit-default@ft2`, or a fine-tune's name alone."""
+    """Validates a run's path segment, `credit-default@ft2`, or a fine-tune's name alone."""
     require(
         isinstance(value, str) and RUN_REF.fullmatch(value) is not None,
-        "a run is its fine-tune's name, or its id, as credit-default@ft2",
+        "a run is its model without the project, as credit-default@ft2, "
+        "or its fine-tune's name alone",
     )
     return value
 

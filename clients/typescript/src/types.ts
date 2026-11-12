@@ -17,14 +17,15 @@ export type Name = string;
 export type ModelName = string;
 
 /**
- * a run's id, `<name>@ft<version>`: the fine-tune it trains and the version it
- * publishes, as `credit-default@ft2` publishes `<project>/credit-default@ft2`
+ * the model a run publishes, `<project>/<name>@ft<version>`, which names the run too:
+ * the fine-tune it trains and the version it publishes, as the catalog and `gf.yaml`
+ * name that version
  */
-export type RunId = string;
+export type RunModel = string;
 
 /**
- * a run by its id, `credit-default@ft2`, or a fine-tune's name alone, `credit-default`,
- * for the name's latest run
+ * a run by its `model` without the project, which the path names, `credit-default@ft2`,
+ * or a fine-tune's name alone, `credit-default`, for the name's latest run
  */
 export type RunRef = string;
 
@@ -421,23 +422,21 @@ export interface DerivedModel {
   digest: Digest;
   bags: number;
   kind: FineTuneKind;
-  run: string | null;
   version: number;
   created: number;
   kept_step: KeptStep;
 }
 
 /**
- * one published version of a fine-tune: its id, its weights' digest, the run that
- * trained it and what that run kept. A version never changes: its id names the same
- * weights for as long as it exists.
+ * one published version of a fine-tune: its id, its weights' digest and the step its
+ * run kept. The run that trained it has the same id as its `model`. A version never
+ * changes: its id names the same weights for as long as it exists.
  */
 export interface FineTuneVersion {
   name: ModelId;
   digest: Digest;
   version: number;
   kind: FineTuneKind;
-  run: string | null;
   created: number;
   kept_step: KeptStep;
 }
@@ -745,12 +744,77 @@ export interface RunCorpus {
 /**
  * How the run chooses the weights it publishes. The trainer holds out 20% of the
  * corpus's rows, scores them every `evaluate_every` steps of the plan, and keeps the
- * step that scores best: `holdout` is that share, and every run says it. A create sends
- * no `evaluation`.
+ * step that scores best: `holdout` is that share, and every run says it. A curriculum
+ * holds out 20% of each member's rows it draws from, and each check scores every
+ * member's, 1,024 rows in all at most, spread across the members. A create sends no
+ * `evaluation`.
  */
 export interface RunEvaluation {
   holdout: number;
 }
+
+/** how the trainer draws an episode from the corpus's rows */
+export interface EpisodeSampling {
+  rows?: number | "auto";
+  context_fraction?: number;
+}
+
+/** a plan of one phase */
+export interface RunPlanSteps {
+  steps: number;
+  episode_sampling?: EpisodeSampling;
+  learning_rate?: number;
+  optimizer?: "adamw";
+  schedule?: "cosine";
+  warmup_steps?: number;
+  weight_decay?: number;
+  beta2?: number;
+  grad_clip?: number;
+  episodes_per_step?: number;
+  evaluate_every?: number;
+  early_stopping_patience?: number;
+}
+
+/**
+ * one phase of a curriculum: its steps, and the corpus's members it draws from. Each
+ * step's episodes come from one member, picked at random by the mix's weights; a phase
+ * without a mix pools the corpus, each member picked by its share of the corpus's rows.
+ * Every phase samples episodes as the plan's `episode_sampling` says, and a phase's own
+ * `learning_rate`, `early_stopping` or `episode_sampling` is refused with 422.
+ */
+export interface RunPhase {
+  steps: number;
+  mix?: Record<string, number>;
+}
+
+/** a curriculum, two or more phases run one after another */
+export interface RunPlanPhases {
+  phases: RunPhase[];
+  episode_sampling?: EpisodeSampling;
+  learning_rate?: number;
+  optimizer?: "adamw";
+  schedule?: "cosine";
+  warmup_steps?: number;
+  weight_decay?: number;
+  beta2?: number;
+  grad_clip?: number;
+  episodes_per_step?: number;
+  evaluate_every?: number;
+  early_stopping_patience?: number;
+}
+
+/**
+ * How a run trains. A plan of one phase gives its `steps`, and pools the corpus: every
+ * episode draws from all of its members' rows, `{"steps": 200, "learning_rate": 5e-5,
+ * "episode_sampling": {"rows": 1024}}`. A curriculum gives two to 16 `phases`, which
+ * run one after another, so their steps add up; each phase's `mix` weighs the corpus's
+ * members by name, `{"phases": [{"steps": 300, "mix": {"general": 1}}, {"steps": 100,
+ * "mix": {"general": 1, "credit": 3}}]}`. A plan gives exactly one of `steps` and
+ * `phases`; a plan with both, neither, or `phases` of one phase is refused with 422.
+ * The rest of a plan's settings, `episode_sampling` among them, apply to every phase,
+ * and the learning rate's schedule spans every phase's steps.
+ */
+export type RunPlan = RunPlanSteps | RunPlanPhases;
 
 export interface RunUsage {
   gpu_seconds: number;
@@ -775,7 +839,7 @@ export interface RunPublished {
 }
 
 export interface Run {
-  id: RunId;
+  model: RunModel;
   name: Name;
   version: number;
   state: RunState;
@@ -789,7 +853,7 @@ export interface Run {
   budget: Record<string, unknown> | null;
   seed: number;
   tags: Name[];
-  plan: Record<string, unknown> | null;
+  plan: RunPlan | null;
   created: number;
   updated: number;
   usage?: RunUsage | null;
@@ -813,7 +877,7 @@ export interface RunCreate {
   base: ModelId;
   corpus: Name;
   changes: Record<string, unknown>[];
-  plan?: Record<string, unknown>;
+  plan?: RunPlan;
   checkpoint_policy?: Record<string, unknown>;
   budget?: Record<string, unknown>;
   seed?: number;
@@ -825,7 +889,7 @@ export interface RunCreateRequest extends Envelope {
 }
 
 export interface RunTrain {
-  plan: Record<string, unknown>;
+  plan: RunPlan;
 }
 
 export interface RunTrainRequest extends Envelope {
@@ -848,7 +912,7 @@ export interface RunEvent {
 }
 
 export interface RunLineage {
-  run: RunId;
+  model: RunModel;
   events: RunEvent[];
 }
 

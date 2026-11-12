@@ -116,7 +116,36 @@ def test_payloads_leave_out_what_was_not_given():
         "target": "y",
         "task": "regression",
     }
-    assert ops.run_spec("r1", seed=None, plan={"phases": 5}) == {
+    assert ops.run_spec("r1", seed=None, plan={"steps": 5}) == {
         "name": "r1",
-        "plan": {"phases": 5},
+        "plan": {"steps": 5},
     }
+
+
+def test_a_plan_is_its_steps_or_two_or_more_phases():
+    from generalforecast import _api
+
+    one = _api.Run.FIELDS[[f.key for f in _api.Run.FIELDS].index("plan")]
+    plan = {"steps": 200, "learning_rate": 5e-5, "episode_sampling": {"rows": 1024}}
+    decoded = one.decode(plan, "plan")
+    assert isinstance(decoded, _api.RunPlanSteps) and decoded.steps == 200
+    assert decoded.episode_sampling == _api.EpisodeSampling(rows=1024)
+    curriculum = {
+        "phases": [
+            {"steps": 300, "mix": {"general": 1}},
+            {"steps": 100, "mix": {"general": 1, "credit": 3}},
+        ],
+        "episode_sampling": {"rows": 1024},
+    }
+    phased = one.decode(curriculum, "plan")
+    assert isinstance(phased, _api.RunPlanPhases) and len(phased.phases) == 2
+    assert phased.phases[1].mix == {"general": 1, "credit": 3}
+    for refused in (
+        {"steps": 10, "phases": [{"steps": 1}, {"steps": 1}]},
+        {"phases": 200},
+        {"learning_rate": 1e-4},
+        # A phase samples as its plan does.
+        {"phases": [{"steps": 1, "episode_sampling": {}}, {"steps": 1}]},
+    ):
+        with pytest.raises(_api.PayloadError):
+            one.decode(refused, "plan")

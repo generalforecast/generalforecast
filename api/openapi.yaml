@@ -539,8 +539,9 @@ paths:
         with `derived`. A fine-tune's name alone, such as `credit-default`,
         reads its latest version the same way, plus `versions`: every
         version the project has published under the name, newest first,
-        each by its id and its weights' digest, with the run that made it
-        and the step it kept.
+        each by its id and its weights' digest, with the step it kept. The
+        run that made a version has the version's id as its `model`, so
+        `runs.get` reads it by that id.
 
         A run publishes the next version of the fine-tune it names, and no
         fine-tune may take a catalog model's name, so a name is one or the
@@ -604,7 +605,6 @@ paths:
                         digest: sha256:9c1e3a5b7d9f1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d
                         bags: 1
                         kind: lora
-                        run: credit-default@ft2
                         version: 2
                         created: 1793000000.0
                         kept_step: 180
@@ -613,14 +613,12 @@ paths:
                           digest: sha256:9c1e3a5b7d9f1b3d5f7a9c1e3b5d7f9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d
                           version: 2
                           kind: lora
-                          run: credit-default@ft2
                           created: 1793000000.0
                           kept_step: 180
                         - name: acme/credit-default@ft1
                           digest: sha256:2b4d6f8a0c2e4b6d8f0a2c4e6b8d0f2a4c6e8b0d2f4a6c8e0b2d4f6a8c0e2b4d
                           version: 1
                           kind: lora
-                          run: credit-default@ft1
                           created: 1792900000.0
                           kept_step: 0
                       task: classification
@@ -2213,7 +2211,7 @@ paths:
                       name: runs
                     result:
                       runs:
-                      - id: credit-default@ft1
+                      - model: acme/credit-default@ft1
                         name: credit-default
                         version: 1
                         state: queued
@@ -2247,9 +2245,15 @@ paths:
       description: |
         Starts a run that publishes the next version of the fine-tune
         `name`: the first run of a name publishes `<project>/<name>@ft1`,
-        the next `@ft2`. The run is `<name>@ft<version>` from the start,
-        and every `/runs/{run}` route takes that id, or the name alone for
-        the name's latest run.
+        the next `@ft2`. The run's `model` is that version's id,
+        `<project>/<name>@ft<version>`, from the start. Every
+        `/runs/{run}` route takes it without the project, which the path
+        already names: `credit-default@ft2` for that run, or the name alone
+        for the name's latest run.
+
+        A plan gives `steps` for a plan of one phase, with its
+        `episode_sampling` beside it, or `phases` for a plan of two or more
+        (`RunPlan`); anything else is refused with 422.
 
         `base` is always sent. Every version of a fine-tune trains afresh
         from one catalog model, so a base other than the one the name's
@@ -2288,6 +2292,11 @@ paths:
                     changes:
                     - kind: lora
                       rank: 16
+                    plan:
+                      steps: 200
+                      learning_rate: 5.0e-05
+                      episode_sampling:
+                        rows: 1024
       responses:
         '200':
           description: ok
@@ -2305,7 +2314,7 @@ paths:
                       kind: run
                       name: credit-default
                     result:
-                      id: credit-default@ft1
+                      model: acme/credit-default@ft1
                       name: credit-default
                       version: 1
                       state: queued
@@ -2327,7 +2336,11 @@ paths:
                       budget: null
                       seed: 0
                       tags: []
-                      plan: null
+                      plan:
+                        steps: 200
+                        learning_rate: 5.0e-05
+                        episode_sampling:
+                          rows: 1024
                       created: 1761200000.0
                       updated: 1761200000.0
                       published: null
@@ -2370,11 +2383,11 @@ paths:
                       name: credit-default
                     error:
                       code: Conflict
-                      message: credit-default@ft2 is still training; a fine-tune trains one version
-                        at a time
+                      message: acme/credit-default@ft2 is still training; a fine-tune trains one
+                        version at a time
                       reason: run_active
                       param: name
-                      hint: wait for credit-default@ft2 to end, or cancel it
+                      hint: wait for acme/credit-default@ft2 to end, or cancel it
                 base_mismatch:
                   x-gf-hosted: true
                   value:
@@ -2422,8 +2435,8 @@ paths:
       tags:
       - hosted
       summary: show a run
-      description: '`{run}` is a run''s id, `<name>@ft<version>`, for that run, or a fine-tune''s
-        name alone for its latest run. Every run is listed by `runs.list`.'
+      description: '`{run}` is a run''s `model` without its project, `<name>@ft<version>`, for
+        that run, or a fine-tune''s name alone for its latest run. Every run is listed by `runs.list`.'
       parameters:
       - $ref: '#/components/parameters/project'
       - $ref: '#/components/parameters/run'
@@ -2444,7 +2457,7 @@ paths:
                       kind: run
                       name: credit-default@ft1
                     result:
-                      id: credit-default@ft1
+                      model: acme/credit-default@ft1
                       name: credit-default
                       version: 1
                       state: queued
@@ -2480,7 +2493,7 @@ paths:
                       kind: run
                       name: credit-default
                     result:
-                      id: credit-default@ft2
+                      model: acme/credit-default@ft2
                       name: credit-default
                       version: 2
                       state: finished
@@ -2503,8 +2516,7 @@ paths:
                       seed: 0
                       tags: []
                       plan:
-                        phases:
-                        - steps: 200
+                        steps: 200
                       created: 1793000000.0
                       updated: 1793003600.0
                       published:
@@ -2519,7 +2531,8 @@ paths:
       tags:
       - hosted
       summary: set a run's plan and start it
-      description: A plan is set once; the same plan again returns the run.
+      description: A plan is set once; the same plan again returns the run. A plan gives `steps`
+        for one phase or `phases` for two or more (`RunPlan`); anything else is refused with 422.
       parameters:
       - $ref: '#/components/parameters/project'
       - $ref: '#/components/parameters/run'
@@ -2540,8 +2553,7 @@ paths:
                     name: credit-default@ft1
                   payload:
                     plan:
-                      phases:
-                      - steps: 100
+                      steps: 100
       responses:
         '200':
           description: ok
@@ -2559,7 +2571,7 @@ paths:
                       kind: run
                       name: credit-default@ft1
                     result:
-                      id: credit-default@ft1
+                      model: acme/credit-default@ft1
                       name: credit-default
                       version: 1
                       state: queued
@@ -2582,8 +2594,7 @@ paths:
                       seed: 0
                       tags: []
                       plan:
-                        phases:
-                        - steps: 100
+                        steps: 100
                       created: 1761200000.0
                       updated: 1761200060.0
                       published: null
@@ -2645,7 +2656,7 @@ paths:
                       kind: run
                       name: credit-default@ft1
                     result:
-                      id: credit-default@ft1
+                      model: acme/credit-default@ft1
                       name: credit-default
                       version: 1
                       state: cancelled
@@ -2680,7 +2691,7 @@ paths:
                       kind: run
                       name: credit-default@ft1
                     result:
-                      id: credit-default@ft1
+                      model: acme/credit-default@ft1
                       name: credit-default
                       version: 1
                       state: cancelling
@@ -2703,8 +2714,7 @@ paths:
                       seed: 0
                       tags: []
                       plan:
-                        phases:
-                        - steps: 100
+                        steps: 100
                       created: 1761200000.0
                       updated: 1761200120.0
                       published: null
@@ -2734,7 +2744,7 @@ paths:
                       kind: run
                       name: credit-default@ft1
                     result:
-                      run: credit-default@ft1
+                      model: acme/credit-default@ft1
                       events:
                       - at: 1761200000.0
                         kind: created
@@ -4455,20 +4465,21 @@ components:
         `tabpfn-3.5-classifier`; unlike a chosen resource name it may start
         with a digit and hold dots
 
-    RunId:
+    RunModel:
       type: string
-      pattern: "^[a-z][a-z0-9-]{0,62}@ft[1-9]\\d*$"
+      pattern: "^[a-z][a-z0-9-]{0,62}/[a-z][a-z0-9-]{0,62}@ft[1-9]\\d*$"
       description: |
-        a run's id, `<name>@ft<version>`: the fine-tune it trains and the
-        version it publishes, as `credit-default@ft2` publishes
-        `<project>/credit-default@ft2`
+        the model a run publishes, `<project>/<name>@ft<version>`, which
+        names the run too: the fine-tune it trains and the version it
+        publishes, as the catalog and `gf.yaml` name that version
 
     RunRef:
       type: string
       pattern: "^[a-z][a-z0-9-]{0,62}(?:@ft[1-9]\\d*)?$"
       description: |
-        a run by its id, `credit-default@ft2`, or a fine-tune's name alone,
-        `credit-default`, for the name's latest run
+        a run by its `model` without the project, which the path names,
+        `credit-default@ft2`, or a fine-tune's name alone, `credit-default`,
+        for the name's latest run
 
     FineTuneName:
       type: string
@@ -5090,7 +5101,7 @@ components:
         what a fine-tune is made of, as a predictor's lock records it: its
         base, pinned, and its weights; present on the project's fine-tunes
         alone, which otherwise describe themselves as their base does
-      required: [base, base_digest, digest, bags, kind, run, version, created, kept_step]
+      required: [base, base_digest, digest, bags, kind, version, created, kept_step]
       additionalProperties: false
       properties:
         base: {$ref: "#/components/schemas/ModelId"}
@@ -5098,13 +5109,6 @@ components:
         digest: {$ref: "#/components/schemas/Digest"}
         bags: {type: integer, minimum: 1, description: estimators the weights hold, averaged when served}
         kind: {$ref: "#/components/schemas/FineTuneKind"}
-        run:
-          type: [string, "null"]
-          description: |
-            the id of the run that trained and published the weights,
-            `<name>@ft<version>`; `GET /runs/{run}` reads it, and its
-            `published` names this version. Null for a version no run
-            published.
         version: {type: integer, minimum: 1}
         created: {type: number, description: "when the version was published, in seconds since the epoch, as every resource's `created`"}
         kept_step: {$ref: "#/components/schemas/KeptStep"}
@@ -5132,10 +5136,11 @@ components:
     FineTuneVersion:
       type: object
       description: |
-        one published version of a fine-tune: its id, its weights' digest,
-        the run that trained it and what that run kept. A version never
-        changes: its id names the same weights for as long as it exists.
-      required: [name, digest, version, kind, run, created, kept_step]
+        one published version of a fine-tune: its id, its weights' digest
+        and the step its run kept. The run that trained it has the same id
+        as its `model`. A version never changes: its id names the same
+        weights for as long as it exists.
+      required: [name, digest, version, kind, created, kept_step]
       additionalProperties: false
       properties:
         name:
@@ -5146,9 +5151,6 @@ components:
           description: the digest of the version's weights, which `gf.lock` pins
         version: {type: integer, minimum: 1}
         kind: {$ref: "#/components/schemas/FineTuneKind"}
-        run:
-          type: [string, "null"]
-          description: the run that trained and published the version, as `derived.run`
         created: {type: number, description: "when the version was published, in seconds since the epoch, as every resource's `created`"}
         kept_step: {$ref: "#/components/schemas/KeptStep"}
 
@@ -5760,16 +5762,21 @@ components:
       - created
       - updated
       - published
-      - id
+      - model
       - version
       additionalProperties: false
       properties:
-        id:
-          $ref: '#/components/schemas/RunId'
-          description: the run's id, `<name>@ft<version>`, which every `/runs/{run}` route takes
+        model:
+          $ref: '#/components/schemas/RunModel'
+          description: |
+            the run's name: the model it publishes, `<project>/<name>@ft<version>`,
+            fixed when it is created. The SDK's `runs` methods take it, and
+            every `/runs/{run}` route takes it without its project,
+            `<name>@ft<version>`. Once the run publishes, `published.model` is
+            the same id.
         name:
           $ref: '#/components/schemas/Name'
-          description: the fine-tune the run trains, `<project>/<name>`
+          description: the fine-tune the run trains, the `name` its create sent
         version:
           type: integer
           minimum: 1
@@ -5809,8 +5816,9 @@ components:
           items:
             $ref: '#/components/schemas/Name'
         plan:
+          description: the run's training plan, null until it is set
           anyOf:
-          - type: object
+          - $ref: '#/components/schemas/RunPlan'
           - type: 'null'
         created:
           type: number
@@ -5827,6 +5835,182 @@ components:
           anyOf:
           - $ref: '#/components/schemas/RunPublished'
           - type: 'null'
+    RunPlan:
+      description: |
+        How a run trains. A plan of one phase gives its `steps`, and pools
+        the corpus: every episode draws from all of its members' rows,
+        `{"steps": 200, "learning_rate": 5e-5, "episode_sampling": {"rows": 1024}}`.
+        A curriculum gives two to 16 `phases`, which run one after another,
+        so their steps add up; each phase's `mix` weighs the corpus's
+        members by name, `{"phases": [{"steps": 300, "mix": {"general": 1}},
+        {"steps": 100, "mix": {"general": 1, "credit": 3}}]}`. A plan gives
+        exactly one of `steps` and `phases`; a plan with both, neither, or
+        `phases` of one phase is refused with 422. The rest of a plan's
+        settings, `episode_sampling` among them, apply to every phase, and
+        the learning rate's schedule spans every phase's steps.
+      oneOf:
+      - $ref: '#/components/schemas/RunPlanSteps'
+      - $ref: '#/components/schemas/RunPlanPhases'
+    RunPlanSteps:
+      type: object
+      description: a plan of one phase
+      required:
+      - steps
+      additionalProperties: false
+      properties:
+        steps:
+          type: integer
+          minimum: 1
+          maximum: 10000000
+          description: how many steps the run trains
+        episode_sampling:
+          $ref: '#/components/schemas/EpisodeSampling'
+        learning_rate:
+          type: number
+          minimum: 1.0e-08
+          maximum: 1
+          description: the peak learning rate; 1e-4, or 1e-5 for full fine-tuning, when left out
+        optimizer:
+          type: string
+          enum: [adamw]
+        schedule:
+          type: string
+          enum: [cosine]
+          description: a linear warmup, then a cosine to a tenth of the peak rate
+        warmup_steps:
+          type: integer
+          minimum: 0
+          description: the steps of the linear warmup, 20 when left out
+        weight_decay:
+          type: number
+          minimum: 0
+          maximum: 1
+        beta2:
+          type: number
+          minimum: 0.5
+          maximum: 0.99999
+        grad_clip:
+          type: number
+          minimum: 1.0e-06
+          maximum: 1000000
+        episodes_per_step:
+          type: integer
+          minimum: 1
+          maximum: 64
+        evaluate_every:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          description: the steps between checks on the held-out rows, 20 when left out
+        early_stopping_patience:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: checks without improvement before training stops; 0, never, when left out
+    RunPlanPhases:
+      type: object
+      description: a curriculum, two or more phases run one after another
+      required:
+      - phases
+      additionalProperties: false
+      properties:
+        phases:
+          type: array
+          minItems: 2
+          maxItems: 16
+          items:
+            $ref: '#/components/schemas/RunPhase'
+        episode_sampling:
+          $ref: '#/components/schemas/EpisodeSampling'
+        learning_rate:
+          type: number
+          minimum: 1.0e-08
+          maximum: 1
+          description: the peak learning rate; 1e-4, or 1e-5 for full fine-tuning, when left out
+        optimizer:
+          type: string
+          enum: [adamw]
+        schedule:
+          type: string
+          enum: [cosine]
+          description: a linear warmup, then a cosine to a tenth of the peak rate
+        warmup_steps:
+          type: integer
+          minimum: 0
+          description: the steps of the linear warmup, 20 when left out
+        weight_decay:
+          type: number
+          minimum: 0
+          maximum: 1
+        beta2:
+          type: number
+          minimum: 0.5
+          maximum: 0.99999
+        grad_clip:
+          type: number
+          minimum: 1.0e-06
+          maximum: 1000000
+        episodes_per_step:
+          type: integer
+          minimum: 1
+          maximum: 64
+        evaluate_every:
+          type: integer
+          minimum: 1
+          maximum: 10000
+          description: the steps between checks on the held-out rows, 20 when left out
+        early_stopping_patience:
+          type: integer
+          minimum: 0
+          maximum: 1000
+          description: checks without improvement before training stops; 0, never, when left out
+    RunPhase:
+      type: object
+      description: |
+        one phase of a curriculum: its steps, and the corpus's members it
+        draws from. Each step's episodes come from one member, picked at
+        random by the mix's weights; a phase without a mix pools the
+        corpus, each member picked by its share of the corpus's rows. Every
+        phase samples episodes as the plan's `episode_sampling` says, and a
+        phase's own `learning_rate`, `early_stopping` or `episode_sampling`
+        is refused with 422.
+      required:
+      - steps
+      additionalProperties: false
+      properties:
+        steps:
+          type: integer
+          minimum: 1
+          maximum: 10000000
+        mix:
+          type: object
+          minProperties: 1
+          description: |
+            the corpus's members by name, each with its weight above 0; a
+            name that is not a member of the run's corpus, or a member that
+            is a prior, is refused with 422
+          additionalProperties:
+            type: number
+            exclusiveMinimum: 0
+            maximum: 1000000
+    EpisodeSampling:
+      type: object
+      description: how the trainer draws an episode from the corpus's rows
+      additionalProperties: false
+      properties:
+        rows:
+          description: an episode's rows, or `auto` for 640 (fewer when the corpus has fewer)
+          oneOf:
+          - type: integer
+            minimum: 16
+            maximum: 16384
+          - type: string
+            enum: [auto]
+        context_fraction:
+          type: number
+          minimum: 0.5
+          maximum: 0.95
+          description: the share of an episode's rows that are its context, 0.8 when left out
     RunPublished:
       type: object
       description: |
@@ -5872,7 +6056,10 @@ components:
         How the run chooses the weights it publishes. The trainer holds out
         20% of the corpus's rows, scores them every `evaluate_every` steps
         of the plan, and keeps the step that scores best: `holdout` is that
-        share, and every run says it. A create sends no `evaluation`.
+        share, and every run says it. A curriculum holds out 20% of each
+        member's rows it draws from, and each check scores every member's,
+        1,024 rows in all at most, spread across the members. A create
+        sends no `evaluation`.
       required:
       - holdout
       additionalProperties: false
@@ -5960,7 +6147,7 @@ components:
           items:
             type: object
         plan:
-          type: object
+          $ref: '#/components/schemas/RunPlan'
         checkpoint_policy:
           type: object
         budget:
@@ -5988,7 +6175,7 @@ components:
       additionalProperties: false
       properties:
         plan:
-          type: object
+          $ref: '#/components/schemas/RunPlan'
     RunTrainRequest:
       allOf:
       - $ref: '#/components/schemas/Envelope'
@@ -6033,7 +6220,10 @@ components:
           description: |
             What happened. A `published` event is the run's `published`. A
             `metrics` event is one chunk of training:
-            `steps`, `loss`, `validation_loss` and `seconds`, and, where the
+            `steps`, `loss`, `validation_loss` and `seconds`; `phase`, the
+            index in the plan's `phases` of the phase it trained in (0 for a
+            plan of `steps`); for a curriculum, `members`, the share of the
+            chunk's steps each member it draws from gave, by name; and, where the
             trainer reads them, `compile_seconds`, `train_seconds`,
             `chunk_steps`, `steps_per_second`, `rows_per_second`,
             `gpu_utilization` (%), `gpu_memory_used_bytes`,
@@ -6043,12 +6233,13 @@ components:
     RunLineage:
       type: object
       required:
-      - run
+      - model
       - events
       additionalProperties: false
       properties:
-        run:
-          $ref: '#/components/schemas/RunId'
+        model:
+          $ref: '#/components/schemas/RunModel'
+          description: the run's `model`
         events:
           type: array
           items:

@@ -121,7 +121,7 @@ def wire():
                     }[parts[4]]
                     resource = parts[5] if len(parts) > 5 else parts[4]
                     # A fine-tune's version names the fine-tune, as the plane's
-                    # does; a run's id names the run.
+                    # does; a run is named by its model without the project.
                     if kind == "model":
                         resource = resource.split("@ft")[0]
                     request = Request(

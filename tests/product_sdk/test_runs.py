@@ -31,7 +31,7 @@ FINISHED = {"at": 6.0, "kind": "state", "body": {"state": "finished"}}
 
 def _run(state, **fields):
     return {
-        "id": "credit@ft2",
+        "model": "test/credit@ft2",
         "name": "credit",
         "version": 2,
         "state": state,
@@ -40,7 +40,7 @@ def _run(state, **fields):
 
 
 def _lineage(*events):
-    return {"run": "credit@ft2", "events": list(events)}
+    return {"model": "test/credit@ft2", "events": list(events)}
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
@@ -62,7 +62,7 @@ def test_a_run_is_created_by_its_fine_tune_name_and_base(wire, asynchronous):
             changes=[{"kind": "lora", "rank": 16}],
         ),
     )
-    assert created["id"] == "credit@ft2" and created["version"] == 2
+    assert created["model"] == "test/credit@ft2" and created["version"] == 2
 
 
 def test_a_run_takes_no_fine_tune_apart_from_its_name_and_no_evaluation():
@@ -73,14 +73,66 @@ def test_a_run_takes_no_fine_tune_apart_from_its_name_and_no_evaluation():
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_a_run_is_read_by_its_id_or_its_fine_tune_name(wire, asynchronous):
+def test_a_run_is_read_by_its_model_or_its_fine_tune_name(wire, asynchronous):
+    # The path names the project, so the run's segment leaves it out.
     wire.expect("GET", "/runs/credit", _run("training"))
     wire.expect("GET", "/runs/credit@ft2", _run("training"))
-    latest = run(asynchronous, wire.url, lambda c: c.runs.get("credit"))
-    one = run(asynchronous, wire.url, lambda c: c.runs.get("credit@ft2"))
-    assert latest == one
-    with pytest.raises(ServiceError, match="credit-default@ft2"):
+    wire.expect("GET", "/runs/credit", _run("training"))
+    wire.expect("GET", "/runs/credit@ft2", _run("training"))
+    read = [
+        run(asynchronous, wire.url, lambda c, ref=ref: c.runs.get(ref))
+        for ref in ("test/credit", "test/credit@ft2", "credit", "credit@ft2")
+    ]
+    assert all(one == read[0] for one in read)
+    assert read[0]["model"] == "test/credit@ft2"
+    with pytest.raises(ServiceError, match="is not a run") as refused:
         run(asynchronous, wire.url, lambda c: c.runs.get("credit@ft0"))
+    assert "<project>/<name>@ft<version>" in (refused.value.hint or "")
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_run_of_another_project_or_no_run_is_refused_before_any_request(
+    wire, asynchronous
+):
+    # The wire answers nothing: any request would fail the test.
+    for ref in ("acme/credit@ft2", "general-forecast/tabicl-v2-classifier", "a/b/c"):
+        with pytest.raises(ServiceError) as refused:
+            run(asynchronous, wire.url, lambda c, ref=ref: c.runs.get(ref))
+        assert refused.value.code == "ValidationError" and refused.value.param == "run"
+    with pytest.raises(ServiceError, match="project acme's; this client reads"):
+        run(asynchronous, wire.url, lambda c: c.runs.cancel("acme/credit@ft2"))
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_every_run_method_takes_the_run_by_its_model(wire, asynchronous):
+    wire.expect(
+        "POST",
+        "/runs/credit@ft2/train",
+        _run("queued"),
+        payload={"plan": {"steps": 200}},
+    )
+    wire.expect("POST", "/runs/credit@ft2/cancel", _run("cancelled"), payload={})
+    wire.expect("GET", "/runs/credit@ft2/lineage", _lineage(CREATED))
+    trained = run(
+        asynchronous,
+        wire.url,
+        lambda c: c.runs.train("test/credit@ft2", {"steps": 200}),
+    )
+    cancelled = run(asynchronous, wire.url, lambda c: c.runs.cancel("test/credit@ft2"))
+    lineage = run(asynchronous, wire.url, lambda c: c.runs.lineage("test/credit@ft2"))
+    assert (trained["state"], cancelled["state"]) == ("queued", "cancelled")
+    assert lineage == _lineage(CREATED)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_wait_by_name_follows_the_run_that_was_latest_when_it_began(
+    wire, asynchronous
+):
+    # The name is read once; then its run, by its model, until it ends.
+    wire.expect("GET", "/runs/credit", _run("training", published=None))
+    wire.expect("GET", "/runs/credit@ft2", _run("finished", published=PUBLISHED))
+    ended = run(asynchronous, wire.url, lambda c: c.runs.wait("test/credit", poll=0.01))
+    assert ended["model"] == "test/credit@ft2" and ended["state"] == "finished"
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])

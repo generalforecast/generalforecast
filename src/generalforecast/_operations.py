@@ -51,6 +51,7 @@ from generalforecast.service.boundary import (
 )
 from generalforecast.service.contracts import (
     MODEL_NAME_PATTERN,
+    RUN_REF,
     InputError,
     ServiceError,
     name,
@@ -312,7 +313,7 @@ def listed(kind: ResourceKind, collection: str) -> Operation[list[JsonObject]]:
 
 
 def _segment(kind: ResourceKind, resource: str) -> str:
-    """A resource's path segment: its name, or for a run its id or fine-tune name."""
+    """A resource's path segment: its name, or for a run its own segment (`run_path`)."""
     return run_ref(resource) if kind == "run" else name(resource)
 
 
@@ -807,53 +808,157 @@ def run_list(state: str | None) -> Operation[list[JsonObject]]:
     return value
 
 
-def run_cancel(run: str, *, save: bool) -> Operation[JsonObject]:
-    """`POST /runs/{run}/cancel`; with `save`, a training run publishes what it trained."""
-    require(type(save) is bool, "save must be true or false")
-    return (
-        yield from posted("run", "runs", run, "cancel", {"save": True} if save else {})
+# A run by its model, `<project>/<name>@ft<version>`, or `<project>/<name>`
+# for the name's latest run.
+_RUN_MODEL = re.compile(
+    r"([a-z][a-z0-9-]{0,62})/([a-z][a-z0-9-]{0,62}(?:@ft[1-9]\d*)?)"
+)
+
+
+@dataclass(frozen=True)
+class RunPath:
+    """A run as a path names it, and the project its model named, if it named one."""
+
+    segment: str
+    owner: str | None = None
+
+    def owned(self, result: Any, project: str | None) -> Any:
+        """`result` once its `model` is the named project's, as an unscoped key's reply says."""
+        model = result.get("model") if isinstance(result, dict) else None
+        if self.owner is not None and isinstance(model, str) and "/" in model:
+            found = model.split("/", 1)[0]
+            if found != self.owner:
+                raise _other_project(self.owner, self.segment, found)
+        return result
+
+    def pinned(self, result: Any) -> RunPath:
+        """The run `result` is, by its model: a name's latest run stays that run."""
+        model = result.get("model") if isinstance(result, dict) else None
+        found = _RUN_MODEL.fullmatch(model) if isinstance(model, str) else None
+        if found is None or "@ft" not in found.group(2):
+            return self
+        return RunPath(found.group(2), self.owner)
+
+
+def _other_project(owner: str, segment: str, project: str) -> InputError:
+    return InputError(
+        "ValidationError",
+        f"{owner}/{segment} is project {owner}'s; this client reads project {project}",
+        param="run",
+        hint=f"read it with a client for project {owner}",
     )
 
 
-def run_lineage(run: str) -> Operation[JsonObject]:
+def run_path(run: str, project: str | None = None) -> RunPath:
+    """The path segment of a run named by its model, or by its name alone.
+
+    A run is named by the model it publishes, `<project>/<name>@ft<version>`,
+    or by `<project>/<name>` for the name's latest run. The path names the
+    project, so its segment leaves the project out, and the project-less
+    `<name>@ft<version>` and `<name>` name the client's own project's run
+    as a path does. A model of another project than the client's is
+    refused, as `model_got` refuses one.
+    """
+    found = _RUN_MODEL.fullmatch(run) if isinstance(run, str) else None
+    if found is not None:
+        owner, segment = found.groups()
+        if project is not None and project != owner:
+            raise _other_project(owner, segment, project)
+        return RunPath(segment, owner)
+    if isinstance(run, str) and RUN_REF.fullmatch(run) is not None:
+        return RunPath(run)
+    raise InputError(
+        "ValidationError",
+        f"`{run}` is not a run",
+        param="run",
+        hint="a run is its model, <project>/<name>@ft<version>, or "
+        "<project>/<name> for the name's latest run",
+    )
+
+
+def run_got(run: str, project: str | None = None) -> Operation[JsonObject]:
+    """`GET /runs/{run}`: a run by its model, or a name's latest run."""
+    path = run_path(run, project)
+    result = yield from got("run", "runs", path.segment)
+    return path.owned(result, project)
+
+
+def run_train(
+    run: str, plan: JsonObject, project: str | None = None
+) -> Operation[JsonObject]:
+    """`POST /runs/{run}/train`: sets the plan of a run created without one."""
+    path = run_path(run, project)
+    result = yield from posted("run", "runs", path.segment, "train", {"plan": plan})
+    return path.owned(result, project)
+
+
+def run_cancel(
+    run: str, *, save: bool, project: str | None = None
+) -> Operation[JsonObject]:
+    """`POST /runs/{run}/cancel`; with `save`, a training run publishes what it trained."""
+    require(type(save) is bool, "save must be true or false")
+    path = run_path(run, project)
+    result = yield from posted(
+        "run", "runs", path.segment, "cancel", {"save": True} if save else {}
+    )
+    return path.owned(result, project)
+
+
+def run_lineage(run: str, project: str | None = None) -> Operation[JsonObject]:
     """`GET /runs/{run}/lineage`: every change to a run, oldest first."""
-    return (yield Call("GET", f"/runs/{run_ref(run)}/lineage", "run", run))
+    path = run_path(run, project)
+    return path.owned((yield from _lineage(path)), project)
+
+
+def _lineage(path: RunPath) -> Operation[JsonObject]:
+    return (yield Call("GET", f"/runs/{path.segment}/lineage", "run", path.segment))
 
 
 def _still_running(run: str, state: JsonObject) -> ServiceError:
-    return ServiceError("WaitTimeout", f"run {run} is still {state['state']}", 504)
+    model = state.get("model") if isinstance(state.get("model"), str) else run
+    return ServiceError("WaitTimeout", f"run {model} is still {state['state']}", 504)
 
 
-def run_wait(run: str, *, timeout: float | None, poll: float) -> Operation[JsonObject]:
+def run_wait(
+    run: str, *, timeout: float | None, poll: float, project: str | None = None
+) -> Operation[JsonObject]:
     """Polls a run until it finishes, is cancelled or fails, and returns it.
 
+    A name alone waits for the run that was its latest when the wait began.
     The run's `published` names the version it made, or is None.
     """
     deadline = None if timeout is None else time.monotonic() + timeout
-    state = yield from got("run", "runs", run)
+    path = run_path(run, project)
+    state = path.owned((yield from got("run", "runs", path.segment)), project)
+    path = path.pinned(state)
     while state["state"] not in RUN_DONE:
         if deadline is not None and time.monotonic() >= deadline:
             raise _still_running(run, state)
         yield Pause(poll)
-        state = yield from got("run", "runs", run)
+        state = yield from got("run", "runs", path.segment)
     return state
 
 
-def run_watch(run: str, *, timeout: float | None, poll: float) -> Operation[JsonObject]:
+def run_watch(
+    run: str, *, timeout: float | None, poll: float, project: str | None = None
+) -> Operation[JsonObject]:
     """Emits each of a run's lineage events once, oldest first, until the run ends.
 
     Each poll reads the run and its lineage, and emits the events not yet
     emitted: `state` changes, `metrics` as training goes, `published`, and
     the rest the lineage holds. Once the run has ended and its last event
-    is emitted, returns the run as `run_wait` does. `timeout` bounds the
+    is emitted, returns the run as `run_wait` does. A name alone follows
+    the run that was its latest when the watch began. `timeout` bounds the
     whole watch: past it, `WaitTimeout`, and the run carries on.
     """
     number(poll, 0.001, 3600, "poll")
     deadline = None if timeout is None else time.monotonic() + timeout
+    path = run_path(run, project)
     seen = 0
     while True:
-        state = yield from got("run", "runs", run)
-        events = (yield from run_lineage(run)).get("events", [])
+        state = path.owned((yield from got("run", "runs", path.segment)), project)
+        path = path.pinned(state)
+        events = (yield from _lineage(path)).get("events", [])
         for event in events[seen:]:
             yield Emit(event)
         seen = max(seen, len(events))
