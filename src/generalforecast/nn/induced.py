@@ -12,9 +12,9 @@ from jaxtyping import Float, Int
 from generalforecast.nn.attention import (
     AttentionBlockParameters,
     AttentionCache,
-    attention_block,
     attention_block_streamed,
     block_kv,
+    checkpointed_block,
     in_chunks,
 )
 
@@ -48,7 +48,7 @@ def compress(
             parameters.inducing, (context.shape[0], *parameters.inducing.shape)
         )
         cache = block_kv(parameters.compress, context, length)
-        return attention_block(parameters.compress, inducing, cache)
+        return checkpointed_block(parameters.compress, inducing, cache)
 
     # Each batch row reads all of its context rows, so batch rows go a few at a time.
     chunk = parameters.compress.attention.kernel.block_chunk
@@ -157,7 +157,7 @@ def expand(
     chunk = parameters.expand.attention.kernel.block_chunk
     per_step = None if chunk is None else max(1, chunk // rows.shape[0])
     return in_chunks(
-        lambda rows: attention_block(parameters.expand, rows, cache),
+        lambda rows: checkpointed_block(parameters.expand, rows, cache),
         (rows,),
         per_step,
         axis=1,

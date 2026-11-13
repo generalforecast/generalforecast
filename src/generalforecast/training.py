@@ -16,6 +16,9 @@ plane's, and what it publishes comes back as a derived model's weights
 Exports:
     VERSION: this surface's version.
     load: a catalog model's contract calls and parameters.
+    for_training: a model's parameters as a trainer differentiates them:
+        each layer rematerialized for the backward pass, and attention's
+        row chunking off.
     encode: a table's rows as the model's calls read them when gf serves
         a predictor of that table: features, targets, classes and the
         categorical mask `fit` takes.
@@ -51,7 +54,7 @@ if TYPE_CHECKING:
     from generalforecast.models.full import unpack as unpack_full
     from generalforecast.nn.linear import LinearParameters
 
-VERSION = 3
+VERSION = 4
 
 # Full fine-tuning's names here, and theirs in `generalforecast.models.full`.
 _FULL = {
@@ -101,6 +104,37 @@ def load(model: str, *, allow_downloads: bool = True) -> "tuple[TabularFunctions
     if not isinstance(functions, TabularFunctions):
         raise ValueError(f"{model} is not a tabular model")  # noqa: TRY004
     return functions, parameters
+
+
+def for_training(parameters: Any, *, remat: bool = True, chunked: bool = False) -> Any:
+    """A model's parameters as a trainer runs them under `jax.grad`: the same arrays, other kernels.
+
+    With `remat`, each layer keeps only its inputs for the backward pass and
+    computes the rest again (`AttentionKernel.remat`): a step's memory is
+    then about one layer's activations rather than every layer's. Without
+    `chunked`, attention takes every position at once (`block_chunk`
+    None): row chunking bounds a forward pass's memory, but under
+    `jax.grad` its chunks become a scan that keeps every chunk's
+    residuals. Neither changes what the model computes, so the parameters
+    are served as loaded and only a trainer's step runs these.
+    """
+    import dataclasses
+
+    import jax
+
+    from generalforecast.nn.attention import AttentionParameters
+
+    def kernel(node: Any) -> Any:
+        if not isinstance(node, AttentionParameters):
+            return node
+        changed = dataclasses.replace(node.kernel, remat=remat)
+        if not chunked:
+            changed = dataclasses.replace(changed, block_chunk=None)
+        return dataclasses.replace(node, kernel=changed)
+
+    return jax.tree.map(
+        kernel, parameters, is_leaf=lambda node: isinstance(node, AttentionParameters)
+    )
 
 
 @dataclass(frozen=True)
@@ -186,6 +220,7 @@ __all__ = [
     "LinearParameters",
     "TabularFunctions",
     "encode",
+    "for_training",
     "load",
     "pack_full",
     "replaced",

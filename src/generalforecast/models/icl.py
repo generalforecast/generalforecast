@@ -13,8 +13,8 @@ from generalforecast.models.prepare import batch_length
 from generalforecast.nn.attention import (
     AttentionBlockParameters,
     AttentionCache,
-    attention_block,
     block_kv,
+    checkpointed_block,
     in_chunks,
     in_turn,
 )
@@ -113,7 +113,7 @@ def encode_context(
         # at the last keys; a retrieval decoder reads theirs too.
         if retrieval or index < len(parameters.blocks) - 1:
             hidden = in_chunks(
-                lambda rows, block=block, cache=cache: attention_block(
+                lambda rows, block=block, cache=cache: checkpointed_block(
                     block, rows, cache
                 ),
                 (hidden,),
@@ -152,7 +152,7 @@ def decode_queries(
     for block, layer in zip(parameters.blocks, cache.layers, strict=True):
         # Each layer's cache read in turn: see `in_turn`.
         hidden, layer = in_turn(hidden, layer)
-        hidden = attention_block(block, hidden, layer)
+        hidden = checkpointed_block(block, hidden, layer)
     hidden = _head(parameters, normalize(parameters.output_norm, hidden))
     if isinstance(parameters.decoder, RetrievalParameters):
         assert cache.labels is not None

@@ -9,8 +9,8 @@ from jaxtyping import Float, Int
 
 from generalforecast.nn.attention import (
     AttentionBlockParameters,
-    attention_block,
     block_kv,
+    checkpointed_block,
     in_chunks,
 )
 from generalforecast.nn.norm import Norm, normalize
@@ -51,9 +51,9 @@ def interact_rows(
     def interact(hidden: Array, length: Array | None) -> Array:
         *early, last = parameters.blocks
         for block in early:
-            hidden = attention_block(block, hidden, block_kv(block, hidden, length))
+            hidden = checkpointed_block(block, hidden, block_kv(block, hidden, length))
         cache = block_kv(last, hidden, length)
-        output = attention_block(last, hidden[:, :num_cls, :], cache)
+        output = checkpointed_block(last, hidden[:, :num_cls, :], cache)
         return normalize(parameters.output_norm, output)
 
     # Rows attend only within themselves, so they can go a chunk at a time.

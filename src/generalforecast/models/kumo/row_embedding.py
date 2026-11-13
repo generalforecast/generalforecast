@@ -13,6 +13,7 @@ from generalforecast.models.kumo.cell_embedding import (
     embed_cells,
 )
 from generalforecast.nn.attention import (
+    REMAT_POLICY,
     AttentionBlockParameters,
     attention_block,
     block_kv,
@@ -140,7 +141,7 @@ def embed_rows(
             row: AttentionBlockParameters = row,
             last: bool = last,
         ) -> Array:
-            return _layer(column, state, row, tokens, cells, keys, last)
+            return _checkpointed_layer(column, state, row, tokens, cells, keys, last)
 
         # Given the column states, rows update independently, so they go a
         # chunk at a time and only a layer's input and output cells are whole.
@@ -179,6 +180,29 @@ def _layer(
     return attention_block(row, sequence, cache)
 
 
+_rematerialized_layer = jax.checkpoint(_layer, policy=REMAT_POLICY, static_argnums=(6,))
+
+
+def _checkpointed_layer(
+    column: InducedAttentionParameters,
+    state: Float[Array, " features inducing model"],
+    row: AttentionBlockParameters,
+    tokens: Float[Array, " rows readout model"],
+    cells: Float[Array, " rows features model"],
+    keys: Int[Array, " rows"] | None,
+    last: bool,
+) -> Float[Array, " rows tokens model"]:
+    """`_layer`, keeping only its inputs for the backward pass when its row block's kernel's `remat` is set.
+
+    Its column block's own blocks are rematerialized within it too
+    (`checkpointed_block`), so a backward pass holds one block's
+    activations at a time.
+    """
+    if row.attention.kernel.remat:
+        return _rematerialized_layer(column, state, row, tokens, cells, keys, last)
+    return _layer(column, state, row, tokens, cells, keys, last)
+
+
 def _fit_streamed(
     parameters: RowEmbeddingParameters,
     features: Float[Array, " rows features"],
@@ -209,7 +233,9 @@ def _fit_streamed(
         for column, state, row in zip(
             parameters.columns, earlier, parameters.rows, strict=False
         ):
-            sequence = _layer(column, state, row, tokens, hidden, keys, False)
+            sequence = _checkpointed_layer(
+                column, state, row, tokens, hidden, keys, False
+            )
             tokens, hidden = sequence[:, :readout], sequence[:, readout:]
         return jnp.swapaxes(hidden, 0, 1)
 

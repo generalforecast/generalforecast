@@ -47,6 +47,13 @@ class AttentionKernel:
             of more cells is summarized a chunk of rows at a time, by a running
             softmax, so the fit's memory does not grow with its rows; the
             worker sets it from its call budget. None reads every cell at once.
+        remat: Whether a model's layers recompute their activations for the
+            backward pass rather than keep them (`checkpointed_block`): each
+            in-context, induced and row-interaction block, and each Kumo row
+            embedding layer, keeps only its inputs under `jax.grad`. It
+            changes a gradient's memory and time, not its value; a forward
+            pass runs as without it. Serving leaves it off; a trainer sets
+            it (`generalforecast.training.for_training`).
     """
 
     implementation: Literal["xla", "cudnn"] = "xla"
@@ -54,6 +61,7 @@ class AttentionKernel:
     dtype: jnp.dtype | None = None
     block_chunk: int | None = None
     summary_chunk: int | None = None
+    remat: bool = False
 
 
 @jax.tree_util.register_dataclass
@@ -573,6 +581,24 @@ def attention_block(
     return _feed_forward(parameters, query_rows + attended)
 
 
+# What a rematerialized layer keeps for the backward pass: nothing but its
+# inputs. On an A100, a Kumo-large LoRA step on an 8,192-row episode needed
+# 12.8 GiB with every layer so, against 32.8 GiB keeping only its matrix
+# multiplies' outputs per episode, for about 10% more time.
+REMAT_POLICY = jax.checkpoint_policies.nothing_saveable
+
+
+def checkpointed_block(
+    parameters: AttentionBlockParameters,
+    query_rows: Float[Array, " batch rows model"],
+    cache: AttentionCache,
+) -> Float[Array, " batch rows model"]:
+    """`attention_block`, keeping only its inputs for the backward pass when its kernel's `remat` is set."""
+    if parameters.attention.kernel.remat:
+        return _rematerialized_block(parameters, query_rows, cache)
+    return attention_block(parameters, query_rows, cache)
+
+
 def attention_block_streamed(
     parameters: AttentionBlockParameters,
     query_rows: Float[Array, " batch rows model"],
@@ -597,6 +623,9 @@ def attention_block_streamed(
     attended = attend_streamed(parameters.attention, normed, keys, steps, n_keys)
     attended = _output_norm(parameters.attention_output_norm, attended)
     return _feed_forward(parameters, query_rows + attended)
+
+
+_rematerialized_block = jax.checkpoint(attention_block, policy=REMAT_POLICY)
 
 
 def _output_norm(norm: Norm | None, values: Array) -> Array:
