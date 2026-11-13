@@ -1923,17 +1923,48 @@ _decode_RunTag: Decoder = _pattern("^[a-z0-9][a-z0-9._:/-]{0,63}$")
 
 
 @dataclass(frozen=True, kw_only=True)
-class RunEvaluation(Payload):
-    """How the run chooses the weights it publishes.
+class EarlyStoppingThreshold(Payload):
+    """How far above 0 a step's paired gain over the base must be to keep it."""
 
-    The trainer holds out 20% of the table's rows, scores them every `evaluate_every`
-    steps of the plan, and keeps the step that scores best: `holdout` is that share,
-    and every run says it. A create sends no `evaluation`.
+    standard_errors: float
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("standard_errors", "standard_errors", True, _number),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunEvaluation(Payload):
+    """How the run holds out rows and keeps a step.
+
+    `holdout` of the table's rows, clamped to 2,000..50,000 rows, are held out by its
+    time column, its group column, or stratified by class or target; `report_share` of
+    them are report rows, the rest select rows. Every `eval_steps`, a check scores
+    every select row against `contexts` fixed contexts of `context_rows` training rows,
+    the base's trained row cap when null, and a step becomes the new best only if its
+    gain over the base, row by row, is more than
+    `early_stopping_threshold.standard_errors` standard errors above 0 and beats the
+    best so far. A create may leave any setting out; the run says each.
     """
 
     holdout: float
+    context_rows: int | None
+    contexts: int
+    early_stopping_threshold: EarlyStoppingThreshold
+    report_share: float
 
-    FIELDS: ClassVar[tuple[Field, ...]] = (Field("holdout", "holdout", True, _number),)
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("holdout", "holdout", True, _number),
+        Field("context_rows", "context_rows", True, _union(_integer, _null)),
+        Field("contexts", "contexts", True, _integer),
+        Field(
+            "early_stopping_threshold",
+            "early_stopping_threshold",
+            True,
+            _record(EarlyStoppingThreshold),
+        ),
+        Field("report_share", "report_share", True, _number),
+    )
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -1969,7 +2000,7 @@ class RunPlan(Payload):
     beta2: float | None = None
     grad_clip: float | None = None
     episodes_per_step: int | None = None
-    evaluate_every: int | None = None
+    eval_steps: int | None = None
     early_stopping_patience: int | None = None
     save_steps: int | None = None
     save_total_limit: int | None = None
@@ -1986,7 +2017,7 @@ class RunPlan(Payload):
         Field("beta2", "beta2", False, _number),
         Field("grad_clip", "grad_clip", False, _number),
         Field("episodes_per_step", "episodes_per_step", False, _integer),
-        Field("evaluate_every", "evaluate_every", False, _integer),
+        Field("eval_steps", "eval_steps", False, _integer),
         Field("early_stopping_patience", "early_stopping_patience", False, _integer),
         Field("save_steps", "save_steps", False, _integer),
         Field("save_total_limit", "save_total_limit", False, _integer),
@@ -2012,6 +2043,61 @@ class RunUsage(Payload):
 
 
 @dataclass(frozen=True, kw_only=True)
+class RunReportMetrics(Payload):
+    """The RunReportMetrics schema.
+
+    the task metrics of the base's and the kept step's predictions on the report rows
+    """
+
+    base: dict[str, float]
+    kept: dict[str, float]
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("base", "base", True, _mapping(_number)),
+        Field("kept", "kept", True, _mapping(_number)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunTableReport(Payload):
+    """The RunTableReport schema.
+
+    One table's report rows, scored once for the base and once for the kept step
+    against the check contexts: their mean losses, the gain (the base's loss less the
+    kept step's, above 0 when the kept step is better) with its 95% interval from the
+    per-row gains, and task metrics for each: log loss, accuracy and, for two classes,
+    ROC AUC; or CRPS, RMSE, MAE and R².
+    """
+
+    rows: int
+    base: float
+    kept: float
+    gain: float
+    ci95: tuple[float, ...]
+    metrics: RunReportMetrics
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("rows", "rows", True, _integer),
+        Field("base", "base", True, _number),
+        Field("kept", "kept", True, _number),
+        Field("gain", "gain", True, _number),
+        Field("ci95", "ci95", True, _items(_number)),
+        Field("metrics", "metrics", True, _record(RunReportMetrics)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunReport(Payload):
+    """The report rows' scores, keyed by table, `data` while a run has one table."""
+
+    data: RunTableReport
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("data", "data", True, _record(RunTableReport)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
 class RunPublished(Payload):
     """The RunPublished schema.
 
@@ -2027,6 +2113,10 @@ class RunPublished(Payload):
     validation_loss: float | None
     base_validation_loss: float | None
     diverged_at_step: int | None = None
+    split: Literal["time", "group", "stratified"] | None = None
+    check_context_rows: int | None = None
+    check_contexts: int | None = None
+    report: RunReport | None = None
 
     FIELDS: ClassVar[tuple[Field, ...]] = (
         Field("model", "model", True, _decode_ModelId),
@@ -2040,6 +2130,10 @@ class RunPublished(Payload):
             _union(_number, _null),
         ),
         Field("diverged_at_step", "diverged_at_step", False, _integer),
+        Field("split", "split", False, _literal("time", "group", "stratified")),
+        Field("check_context_rows", "check_context_rows", False, _integer),
+        Field("check_contexts", "check_contexts", False, _integer),
+        Field("report", "report", False, _union(_record(RunReport), _null)),
     )
 
 
@@ -2087,6 +2181,33 @@ class Run(Payload):
         Field("updated", "updated", True, _number),
         Field("usage", "usage", False, _union(_record(RunUsage), _null)),
         Field("published", "published", True, _union(_record(RunPublished), _null)),
+    )
+
+
+@dataclass(frozen=True, kw_only=True)
+class RunEvaluationRequest(Payload):
+    """The RunEvaluationRequest schema.
+
+    a create's evaluation settings; each left out takes its default (`RunEvaluation`)
+    """
+
+    holdout: float | None = None
+    context_rows: int | None = None
+    contexts: int | None = None
+    early_stopping_threshold: EarlyStoppingThreshold | None = None
+    report_share: float | None = None
+
+    FIELDS: ClassVar[tuple[Field, ...]] = (
+        Field("holdout", "holdout", False, _number),
+        Field("context_rows", "context_rows", False, _integer),
+        Field("contexts", "contexts", False, _integer),
+        Field(
+            "early_stopping_threshold",
+            "early_stopping_threshold",
+            False,
+            _record(EarlyStoppingThreshold),
+        ),
+        Field("report_share", "report_share", False, _number),
     )
 
 
@@ -2148,6 +2269,7 @@ class RunCreate(Payload):
     data: tuple[Name, ...]
     method: RunMethod
     plan: RunPlan
+    evaluation: RunEvaluationRequest | None = None
     budget: dict[str, Any] | None = None
     seed: int | None = None
     tags: tuple[RunTag, ...] | None = None
@@ -2158,6 +2280,7 @@ class RunCreate(Payload):
         Field("data", "data", True, _items(_decode_Name)),
         Field("method", "method", True, _record(RunMethod)),
         Field("plan", "plan", True, _record(RunPlan)),
+        Field("evaluation", "evaluation", False, _record(RunEvaluationRequest)),
         Field("budget", "budget", False, _mapping(_any)),
         Field("seed", "seed", False, _integer),
         Field("tags", "tags", False, _items(_decode_RunTag)),
