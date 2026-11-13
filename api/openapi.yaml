@@ -5666,7 +5666,8 @@ components:
           type: integer
           minimum: 0
           maximum: 1000
-          description: checks without a new best before training stops; 0, never, when left out
+          description: checks in a row that do not lower the run's lowest select loss, kept or not,
+            before training stops; 0, never, when left out
         save_steps:
           type: integer
           minimum: 1
@@ -5823,7 +5824,10 @@ components:
         trained row cap when null, and a step becomes the new best only if
         its gain over the base, row by row, is more than
         `early_stopping_threshold.standard_errors` standard errors above 0
-        and beats the best so far. A create may leave any setting out; the
+        and beats the best so far. Training stops early once the plan's
+        `early_stopping_patience` checks in a row have not lowered the
+        run's lowest select loss, significant or not, so a run whose gain
+        is still rising goes on. A create may leave any setting out; the
         run says each.
       required:
       - holdout
