@@ -90,7 +90,7 @@ const RESOURCE_KINDS: [&str; 11] = [
     "operator",
     "api-key",
     "secret",
-    "corpus",
+    "snapshot",
     "run",
 ];
 /// The most query and context rows a predictor's `/predictions` takes.

@@ -437,8 +437,9 @@ def test_a_run_names_the_model_it_trains_from_as_base(wire, asynchronous):
     spec = {
         "name": "r1",
         "base": "general-forecast/tabicl-v2-classifier",
-        "corpus": "credit-v1",
-        "changes": [{"kind": "lora", "rank": 16}],
+        "data": ["credit-2026-01"],
+        "method": {"type": "lora", "rank": 16},
+        "plan": {"steps": 10},
         "seed": 3,
     }
     wire.expect("POST", "/runs", {"name": "r1"}, payload=spec)
@@ -448,8 +449,9 @@ def test_a_run_names_the_model_it_trains_from_as_base(wire, asynchronous):
         lambda c: c.runs.create(
             "r1",
             base="general-forecast/tabicl-v2-classifier",
-            corpus="credit-v1",
-            changes=[{"kind": "lora", "rank": 16}],
+            data=["credit-2026-01"],
+            method={"type": "lora", "rank": 16},
+            plan={"steps": 10},
             seed=3,
         ),
     )
@@ -460,10 +462,22 @@ def test_a_run_names_the_model_it_trains_from_as_base(wire, asynchronous):
 def test_runs_are_listed_all_or_by_state(wire, asynchronous):
     wire.expect("GET", "/runs", {"runs": [{"name": "r1"}, {"name": "r2"}]})
     wire.expect("GET", "/runs?state=training", {"runs": [{"name": "r2"}]})
+    digest = "sha256:" + "c" * 64
+    wire.expect(
+        "GET",
+        f"/runs?data_digest=sha256%3A{'c' * 64}&tag=recipe%3Av1",
+        {"runs": [{"name": "r1"}]},
+    )
     everything = run(asynchronous, wire.url, lambda c: c.runs.list())
     training = run(asynchronous, wire.url, lambda c: c.runs.list(state="training"))
+    tagged = run(
+        asynchronous,
+        wire.url,
+        lambda c: c.runs.list(data_digest=digest, tag="recipe:v1"),
+    )
     assert [r["name"] for r in everything] == ["r1", "r2"]
     assert [r["name"] for r in training] == ["r2"]
+    assert [r["name"] for r in tagged] == ["r1"]
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])

@@ -133,9 +133,12 @@ def client_for(
     )
 
 
-def upload_snapshot(client: Client, table) -> dict:
-    """Uploads the full canonical table through the SDK's authenticated transport."""
-    result = client.upload_snapshot(table)
+def upload_snapshot(client: Client, table, *, prefix: str = "table") -> dict:
+    """Uploads the full canonical table through the SDK's authenticated transport.
+
+    The snapshot is named `<prefix>-<first 12 hex digits of its digest>`.
+    """
+    result = client.upload_snapshot(table, prefix=prefix)
     require(
         type(result) is dict
         and result.get("digest") == table_digest(table)

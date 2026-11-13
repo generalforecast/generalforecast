@@ -46,7 +46,7 @@ export type Digest = string;
 
 export type Task = "classification" | "regression" | "forecast";
 
-export type ResourceKind = "predictor" | "model" | "project" | "api-key" | "secret" | "context" | "source" | "workspace" | "corpus" | "run";
+export type ResourceKind = "predictor" | "model" | "project" | "api-key" | "secret" | "context" | "source" | "workspace" | "snapshot" | "run";
 
 /** what the envelope is about; GET lists use the collection name */
 export interface Resource {
@@ -552,14 +552,14 @@ export interface ProjectCreateRequest extends Envelope {
 }
 
 /**
- * A project permission a key or role holds. Fine-tuning's: `corpora:read` reads uploads
- * and corpora, `corpora:write` uploads and creates and deletes uploads and corpora,
- * `runs:read` reads runs and their lineage, and `runs:write` creates, trains and
- * cancels runs; `models:read` reads the fine-tunes runs publish. The admin and editor
- * roles hold all four; the viewer role holds `corpora:read` and `runs:read`. `GET
- * /auth/status` lists every permission with the roles that hold it.
+ * A project permission a key or role holds. Fine-tuning's: `snapshots:read` reads
+ * snapshots, `snapshots:write` uploads and deletes them, `runs:read` reads runs and
+ * their lineage, and `runs:write` creates and cancels runs; `models:read` reads the
+ * fine-tunes runs publish. The admin and editor roles hold all four; the viewer role
+ * holds `snapshots:read` and `runs:read`. `GET /auth/status` lists every permission
+ * with the roles that hold it.
  */
-export type Permission = "predictors:read" | "predictors:write" | "predictors:predict" | "contexts:read" | "contexts:write" | "contexts:history" | "sources:read" | "sources:write" | "models:read" | "corpora:read" | "corpora:write" | "runs:read" | "runs:write" | "keys:read" | "keys:write" | "secrets:read" | "secrets:write" | "members:read" | "members:write" | "sso:read" | "sso:write" | "audit:read" | "operators:read" | "operators:write" | "projects:read";
+export type Permission = "predictors:read" | "predictors:write" | "predictors:predict" | "contexts:read" | "contexts:write" | "contexts:history" | "sources:read" | "sources:write" | "models:read" | "snapshots:read" | "snapshots:write" | "runs:read" | "runs:write" | "keys:read" | "keys:write" | "secrets:read" | "secrets:write" | "members:read" | "members:write" | "sso:read" | "sso:write" | "audit:read" | "operators:read" | "operators:write" | "projects:read";
 
 /** `token` is present only in the create and rotate replies */
 export interface Key {
@@ -670,97 +670,59 @@ export interface SecretDeletedReply extends Envelope {
   result: SecretDeleted;
 }
 
-export interface Prior {
-  name: string;
-  version: string;
-  params?: Record<string, unknown>;
-}
+export type RunState = "queued" | "setting_up" | "training" | "preempted" | "finished" | "cancelling" | "cancelled" | "failed";
 
-export interface SnapshotsMember {
-  snapshots: Digest[];
-}
-
-export interface PriorMember {
-  prior: Prior;
-}
-
-export type CorpusMember = SnapshotsMember | PriorMember;
-
-export interface Corpus {
-  name: Name;
-  digest: Digest;
-  members: Record<string, CorpusMember>;
-  parent: Name | null;
-  created: number;
-}
-
-export interface CorpusReply extends Envelope {
-  result: Corpus;
-}
-
-export interface CorpusList {
-  corpora: Corpus[];
-}
-
-export interface CorpusListReply extends Envelope {
-  result: CorpusList;
-}
-
-export interface CorpusCreate {
-  name: Name;
-  members: Record<string, CorpusMember>;
-  parent?: Name;
-}
-
-export interface CorpusCreateRequest extends Envelope {
-  payload: CorpusCreate;
-}
-
-export interface CorpusRef {
-  name: Name;
-}
-
-export interface CorpusRefRequest extends Envelope {
-  payload: CorpusRef;
-}
-
-export interface CorpusDeleted {
-  name: Name;
-  deleted: true;
-  released_snapshots: number;
-}
-
-export interface CorpusDeletedReply extends Envelope {
-  result: CorpusDeleted;
-}
-
-export type RunState = "queued" | "setting_up" | "ready" | "training" | "preempted" | "finished" | "cancelling" | "cancelled" | "failed";
-
-export interface RunCorpus {
+/**
+ * a snapshot a run reads, by its name and the digest the name had when the run was
+ * created
+ */
+export interface RunData {
   name: Name;
   digest: Digest;
 }
+
+/** a component full fine-tuning may train */
+export type RunComponent = "column_encoder" | "row_encoder" | "in_context_transformer" | "prediction_head";
+
+/**
+ * How a run changes the network: `{"type": "lora", "rank": 16}`, with `"input_adapter":
+ * true` to train an input adapter in front of it; `{"type": "input_adapter"}`; or
+ * `{"type": "full", "components": [...]}`, some of `column_encoder`, `row_encoder`,
+ * `in_context_transformer` and `prediction_head`. A method the base does not take is
+ * refused with 422.
+ */
+export interface RunMethod {
+  type: "lora" | "input_adapter" | "full";
+  rank?: number;
+  input_adapter?: boolean;
+  components?: RunComponent[];
+}
+
+/** a label to find runs by, as `recipe:fraud-v1` */
+export type RunTag = string;
 
 /**
  * How the run chooses the weights it publishes. The trainer holds out 20% of the
- * corpus's rows, scores them every `evaluate_every` steps of the plan, and keeps the
- * step that scores best: `holdout` is that share, and every run says it. A curriculum
- * holds out 20% of each member's rows it draws from, and each check scores every
- * member's, 1,024 rows in all at most, spread across the members. A create sends no
- * `evaluation`.
+ * table's rows, scores them every `evaluate_every` steps of the plan, and keeps the
+ * step that scores best: `holdout` is that share, and every run says it. A create sends
+ * no `evaluation`.
  */
 export interface RunEvaluation {
   holdout: number;
 }
 
-/** how the trainer draws an episode from the corpus's rows */
+/** how the trainer draws an episode from the table's training rows */
 export interface EpisodeSampling {
   rows?: number | "auto";
   context_fraction?: number;
 }
 
-/** a plan of one phase */
-export interface RunPlanSteps {
+/**
+ * How a run trains: its `steps`, how it samples episodes, the optimizer's settings and
+ * its checkpoint settings, `{"steps": 200, "learning_rate": 5e-5, "episode_sampling":
+ * {"rows": 1024}}`. A setting the trainer does not read is refused with 422.
+ */
+export interface RunPlan {
   steps: number;
   episode_sampling?: EpisodeSampling;
   learning_rate?: number;
@@ -773,48 +735,10 @@ export interface RunPlanSteps {
   episodes_per_step?: number;
   evaluate_every?: number;
   early_stopping_patience?: number;
+  save_steps?: number;
+  save_total_limit?: number;
+  save_only_model?: boolean;
 }
-
-/**
- * one phase of a curriculum: its steps, and the corpus's members it draws from. Each
- * step's episodes come from one member, picked at random by the mix's weights; a phase
- * without a mix pools the corpus, each member picked by its share of the corpus's rows.
- * Every phase samples episodes as the plan's `episode_sampling` says, and a phase's own
- * `learning_rate`, `early_stopping` or `episode_sampling` is refused with 422.
- */
-export interface RunPhase {
-  steps: number;
-  mix?: Record<string, number>;
-}
-
-/** a curriculum, two or more phases run one after another */
-export interface RunPlanPhases {
-  phases: RunPhase[];
-  episode_sampling?: EpisodeSampling;
-  learning_rate?: number;
-  optimizer?: "adamw";
-  schedule?: "cosine";
-  warmup_steps?: number;
-  weight_decay?: number;
-  beta2?: number;
-  grad_clip?: number;
-  episodes_per_step?: number;
-  evaluate_every?: number;
-  early_stopping_patience?: number;
-}
-
-/**
- * How a run trains. A plan of one phase gives its `steps`, and pools the corpus: every
- * episode draws from all of its members' rows, `{"steps": 200, "learning_rate": 5e-5,
- * "episode_sampling": {"rows": 1024}}`. A curriculum gives two to 16 `phases`, which
- * run one after another, so their steps add up; each phase's `mix` weighs the corpus's
- * members by name, `{"phases": [{"steps": 300, "mix": {"general": 1}}, {"steps": 100,
- * "mix": {"general": 1, "credit": 3}}]}`. A plan gives exactly one of `steps` and
- * `phases`; a plan with both, neither, or `phases` of one phase is refused with 422.
- * The rest of a plan's settings, `episode_sampling` among them, apply to every phase,
- * and the learning rate's schedule spans every phase's steps.
- */
-export type RunPlan = RunPlanSteps | RunPlanPhases;
 
 export interface RunUsage {
   gpu_seconds: number;
@@ -846,14 +770,14 @@ export interface Run {
   reason: string | null;
   attempt: number;
   base: ModelId;
-  corpus: RunCorpus;
-  changes: Record<string, unknown>[];
+  data: RunData[];
+  data_digest: Digest;
+  method: RunMethod;
   evaluation: RunEvaluation;
-  checkpoint_policy: Record<string, unknown>;
   budget: Record<string, unknown> | null;
   seed: number;
-  tags: Name[];
-  plan: RunPlan | null;
+  tags: RunTag[];
+  plan: RunPlan;
   created: number;
   updated: number;
   usage?: RunUsage | null;
@@ -875,25 +799,16 @@ export interface RunListReply extends Envelope {
 export interface RunCreate {
   name: Name;
   base: ModelId;
-  corpus: Name;
-  changes: Record<string, unknown>[];
-  plan?: RunPlan;
-  checkpoint_policy?: Record<string, unknown>;
+  data: Name[];
+  method: RunMethod;
+  plan: RunPlan;
   budget?: Record<string, unknown>;
   seed?: number;
-  tags?: Name[];
+  tags?: RunTag[];
 }
 
 export interface RunCreateRequest extends Envelope {
   payload: RunCreate;
-}
-
-export interface RunTrain {
-  plan: RunPlan;
-}
-
-export interface RunTrainRequest extends Envelope {
-  payload: RunTrain;
 }
 
 /** how a run is cancelled; an empty payload cancels without saving */
@@ -920,98 +835,69 @@ export interface RunLineageReply extends Envelope {
   result: RunLineage;
 }
 
-export type UploadState = "open" | "verified" | "rejected" | "expired" | "deleted";
+export type SnapshotState = "open" | "ready" | "rejected" | "expired" | "deleted";
 
 export interface SnapshotColumn {
   name: string;
   type: string;
 }
 
-export interface TrainingSnapshot {
-  digest: Digest;
-  bytes: number;
-  rows: number;
-  columns: SnapshotColumn[];
-  metadata: Record<string, unknown>;
-}
-
-export interface Upload {
-  id: Name;
-  state: UploadState;
-  bytes: number;
-  digest: Digest | null;
-  error: string | null;
-  metadata: Record<string, unknown> | null;
-  expires: number | null;
-  created: number;
-  snapshot?: TrainingSnapshot;
-}
-
-export interface UploadReply extends Envelope {
-  result: Upload;
-}
-
-export interface UploadOpened {
-  id: Name;
-  state: UploadState;
-  bytes: number;
-  digest: Digest | null;
-  error: string | null;
-  metadata: Record<string, unknown> | null;
-  expires: number | null;
-  created: number;
-  url: string | null;
-  method: "PUT";
-  chunk_bytes: number;
-}
-
-export interface UploadList {
-  uploads: Upload[];
-}
-
-export interface UploadListReply extends Envelope {
-  result: UploadList;
-}
-
-export interface UploadOpenedReply extends Envelope {
-  result: UploadOpened;
-}
-
-export interface UploadMetadata {
+/**
+ * A table's training metadata: its `target` and `task`, and optionally its `time` and
+ * `group` columns, its column types and its origin. A run refuses a snapshot without a
+ * target and task.
+ */
+export interface SnapshotMetadata {
   target: string;
   task: "classification" | "regression";
-  column_types?: Record<string, string>;
+  column_types?: Record<string, "numerical" | "categorical">;
   time?: string;
   group?: string;
   origin?: Record<string, unknown>;
 }
 
-export interface UploadCreate {
+/**
+ * A named, immutable table. `digest`, `rows` and `columns` are set once it is `ready`.
+ * A create that opens an upload also carries where its bytes go: `url`, `method` and
+ * `chunk_bytes`.
+ */
+export interface Snapshot {
+  name: Name;
+  state: SnapshotState;
+  digest: Digest | null;
+  bytes: number;
+  rows: number | null;
+  columns: SnapshotColumn[] | null;
+  metadata: SnapshotMetadata | null;
+  error: string | null;
+  expires: number | null;
+  created: number;
+  url?: string | null;
+  method?: "PUT";
+  chunk_bytes?: number;
+}
+
+export interface SnapshotReply extends Envelope {
+  result: Snapshot;
+}
+
+export interface SnapshotList {
+  snapshots: Snapshot[];
+}
+
+export interface SnapshotListReply extends Envelope {
+  result: SnapshotList;
+}
+
+export interface SnapshotCreate {
+  name: Name;
   bytes: number;
   format: "parquet";
-  metadata: UploadMetadata;
+  metadata: SnapshotMetadata;
 }
 
-export interface UploadCreateRequest extends Envelope {
-  payload: UploadCreate;
-}
-
-export interface UploadRef {
-}
-
-export interface UploadRefRequest extends Envelope {
-  payload: UploadRef;
-}
-
-export interface UploadDeleted {
-  id: Name;
-  state: "deleted";
-  digest: Digest | null;
-  uploads: Name[];
-}
-
-export interface UploadDeletedReply extends Envelope {
-  result: UploadDeleted;
+export interface SnapshotCreateRequest extends Envelope {
+  payload: SnapshotCreate;
 }
 
 /** an immutable pushed predictor */
@@ -1430,15 +1316,6 @@ export interface SourceList {
 
 export interface SourceListReply extends Envelope {
   result: SourceList;
-}
-
-export interface UploadReceipt {
-  digest: Digest;
-  rows: number;
-}
-
-export interface UploadReceiptReply extends Envelope {
-  result: UploadReceipt;
 }
 
 /** a permission keys may hold; one that is not enforced authorizes nothing yet */
@@ -2182,21 +2059,15 @@ export const ROUTES = {
   "sources.list": { method: "GET", path: "/v1/projects/{project}/sources", request: "null", reply: "SourceListReply", body: null },
   "sources.pin": { method: "POST", path: "/v1/projects/{project}/sources", request: "SourcePinRequest", reply: "SourcePinReply", body: "application/json" },
   "sources.get": { method: "GET", path: "/v1/projects/{project}/sources/{source}", request: "null", reply: "SourcePinReply", body: null },
-  "snapshots.upload": { method: "POST", path: "/v1/projects/{project}/snapshots", request: "null", reply: "UploadReceiptReply", body: "application/vnd.apache.arrow.stream" },
-  "corpora.list": { method: "GET", path: "/v1/projects/{project}/corpora", request: "null", reply: "CorpusListReply", body: null },
-  "corpora.create": { method: "POST", path: "/v1/projects/{project}/corpora", request: "CorpusCreateRequest", reply: "CorpusReply", body: "application/json" },
-  "corpora.get": { method: "GET", path: "/v1/projects/{project}/corpora/{corpus}", request: "null", reply: "CorpusReply", body: null },
-  "corpora.delete": { method: "POST", path: "/v1/projects/{project}/corpora/{corpus}/delete", request: "CorpusRefRequest", reply: "CorpusDeletedReply", body: "application/json" },
+  "snapshots.list": { method: "GET", path: "/v1/projects/{project}/snapshots", request: "null", reply: "SnapshotListReply", body: null },
+  "snapshots.create": { method: "POST", path: "/v1/projects/{project}/snapshots", request: "SnapshotCreateRequest", reply: "SnapshotReply", body: "application/json" },
+  "snapshots.get": { method: "GET", path: "/v1/projects/{project}/snapshots/{snapshot}", request: "null", reply: "SnapshotReply", body: null },
+  "snapshots.delete": { method: "POST", path: "/v1/projects/{project}/snapshots/{snapshot}/delete", request: "EmptyRequest", reply: "SnapshotReply", body: "application/json" },
   "runs.list": { method: "GET", path: "/v1/projects/{project}/runs", request: "null", reply: "RunListReply", body: null },
   "runs.create": { method: "POST", path: "/v1/projects/{project}/runs", request: "RunCreateRequest", reply: "RunReply", body: "application/json" },
   "runs.get": { method: "GET", path: "/v1/projects/{project}/runs/{run}", request: "null", reply: "RunReply", body: null },
-  "runs.train": { method: "POST", path: "/v1/projects/{project}/runs/{run}/train", request: "RunTrainRequest", reply: "RunReply", body: "application/json" },
   "runs.cancel": { method: "POST", path: "/v1/projects/{project}/runs/{run}/cancel", request: "RunCancelRequest", reply: "RunReply", body: "application/json" },
   "runs.lineage": { method: "GET", path: "/v1/projects/{project}/runs/{run}/lineage", request: "null", reply: "RunLineageReply", body: null },
-  "uploads.list": { method: "GET", path: "/v1/projects/{project}/uploads", request: "null", reply: "UploadListReply", body: null },
-  "uploads.create": { method: "POST", path: "/v1/projects/{project}/uploads", request: "UploadCreateRequest", reply: "UploadOpenedReply", body: "application/json" },
-  "uploads.get": { method: "GET", path: "/v1/projects/{project}/uploads/{upload}", request: "null", reply: "UploadReply", body: null },
-  "uploads.delete": { method: "POST", path: "/v1/projects/{project}/uploads/{upload}/delete", request: "UploadRefRequest", reply: "UploadDeletedReply", body: "application/json" },
   "auth.status": { method: "GET", path: "/v1/auth/status", request: "null", reply: "AuthStatusReply", body: null },
   "auth.logout": { method: "POST", path: "/v1/auth/logout", request: "EmptyRequest", reply: "LoggedOutReply", body: "application/json" },
   "workspace.get": { method: "GET", path: "/v1/workspace", request: "null", reply: "ProjectListReply", body: null },

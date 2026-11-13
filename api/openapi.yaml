@@ -1967,52 +1967,13 @@ paths:
                     result: {source_id: source-8f1b2c3d4e5f60718293a4b5c6d7e8f9, digest: sha256:9a7f6b4c2d1e0f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c7d6e5f4a, size_bytes: 482113, format: csv, mapping: {key: customer_id, features: {spend: spend, plan: plan}, labels: {churned: churned}, label_types: {churned: boolean}}}
 
   /v1/projects/{project}/snapshots:
-    post:
-      operationId: snapshots.upload
-      tags: [hosted]
-      summary: upload a table as an Arrow stream, for a context or a revision to name by digest
-      description: |
-        The body is an Arrow IPC stream, not an envelope, so the request id
-        and project ride in headers; the reply is enveloped as any other.
-        At most 100,000 rows and 32 MiB. The digest is of the normalized
-        table, so a client can check it against its own.
-      parameters:
-        - $ref: "#/components/parameters/project"
-        - name: X-GF-Request-ID
-          in: header
-          required: true
-          schema: {type: string, minLength: 1, maxLength: 128}
-        - name: X-GF-Project
-          in: header
-          required: true
-          schema: {$ref: "#/components/schemas/Name"}
-      requestBody:
-        required: true
-        content:
-          application/vnd.apache.arrow.stream:
-            schema: {type: string, format: binary}
-      responses:
-        "200":
-          description: the stored table's digest and row count
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/UploadReceiptReply"
-              examples:
-                uploaded:
-                  value:
-                    api_version: gf/v1
-                    project: acme
-                    request_id: r-1c4524901f88a3b4730006b3bf14c7fc
-                    resource: {kind: context, name: snapshots}
-                    result: {digest: 'sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e', rows: 1840}
-
-  /v1/projects/{project}/corpora:
     get:
-      operationId: corpora.list
+      operationId: snapshots.list
       tags:
       - hosted
-      summary: list the project's corpora
+      summary: list the project's snapshots
+      description: Every snapshot that is not deleted, oldest first. A deleted snapshot is still read
+        by its name, and its name stays taken.
       parameters:
       - $ref: '#/components/parameters/project'
       responses:
@@ -2021,170 +1982,322 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CorpusListReply'
+                $ref: '#/components/schemas/SnapshotListReply'
               examples:
                 list:
                   value:
                     api_version: gf/v1
                     project: acme
-                    request_id: r-017c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                    request_id: r-1a7c1e9a2b4d6f8031a5c7e9b2d4f6a8
                     resource:
-                      kind: corpus
-                      name: corpora
+                      kind: snapshot
+                      name: snapshots
                     result:
-                      corpora:
-                      - name: credit-v1
+                      snapshots:
+                      - name: credit-2026-01
+                        state: ready
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                        members:
-                          credit:
-                            snapshots:
-                            - sha256:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f
-                        parent: null
+                        bytes: 52428800
+                        rows: 500000
+                        columns:
+                        - name: income
+                          type: double
+                        - name: defaulted
+                          type: int64
+                        metadata:
+                          target: defaulted
+                          task: classification
+                          origin:
+                            kind: uploaded
+                        error: null
+                        expires: null
                         created: 1761200000.0
     post:
-      operationId: corpora.create
+      operationId: snapshots.create
       tags:
       - hosted
-      summary: create an immutable list of training data
-      description: Holds every snapshot it lists until it is deleted. A name, once used, always means the
-        same members.
+      summary: create a named snapshot, by a resumable Parquet upload or an Arrow stream
+      description: |
+        A snapshot is an immutable table, named in its project: training
+        runs read it by name, and predictor revisions and context imports
+        by digest. A name is never reused, even once its snapshot is
+        deleted; the same name with the same content returns the snapshot,
+        and with other content is refused with 409.
+
+        A JSON payload opens a resumable upload of a Parquet table of up to
+        8 GiB, with its size and training metadata. `url` is a resumable
+        session to `PUT` the bytes to, in `chunk_bytes` chunks with
+        `Content-Range`. Once every declared byte is stored, the plane
+        verifies the upload on its own: it reads the Parquet footer, checks
+        the named columns exist and hashes the rows, and the snapshot
+        becomes `ready`, or `rejected` with an `error`. An upload left open
+        for a day expires.
+
+        An Arrow IPC stream body is a table of at most 100,000 rows and
+        32 MiB, `ready` at once. It is not an envelope, so the request id
+        and project ride in headers, and the query names the snapshot and,
+        optionally, its training metadata. The digest is of the normalized
+        table, so a client can check it against its own. `gf push` names
+        its snapshot `<predictor>-<first 12 hex digits of the digest>`.
       parameters:
       - $ref: '#/components/parameters/project'
+      - name: name
+        in: query
+        required: false
+        description: an Arrow stream's snapshot name, which an Arrow stream must send
+        schema:
+          $ref: '#/components/schemas/Name'
+      - name: target
+        in: query
+        required: false
+        description: an Arrow stream's target column, sent with `task`
+        schema:
+          type: string
+      - name: task
+        in: query
+        required: false
+        description: an Arrow stream's task, sent with `target`
+        schema:
+          type: string
+          enum:
+          - classification
+          - regression
+      - name: time
+        in: query
+        required: false
+        description: an Arrow stream's time column
+        schema:
+          type: string
+      - name: group
+        in: query
+        required: false
+        description: an Arrow stream's group column
+        schema:
+          type: string
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/CorpusCreateRequest'
+              $ref: '#/components/schemas/SnapshotCreateRequest'
             examples:
               create:
                 value:
                   api_version: gf/v1
                   project: acme
-                  request_id: r-027c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                  request_id: r-0b7c1e9a2b4d6f8031a5c7e9b2d4f6a8
                   resource:
-                    kind: corpus
-                    name: credit-v1
+                    kind: snapshot
+                    name: credit-2026-01
                   payload:
-                    name: credit-v1
-                    members:
-                      credit:
-                        snapshots:
-                        - sha256:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f
+                    name: credit-2026-01
+                    bytes: 52428800
+                    format: parquet
+                    metadata:
+                      target: defaulted
+                      task: classification
+                      time: applied_at
+          application/vnd.apache.arrow.stream:
+            schema:
+              type: string
+              format: binary
       responses:
         '200':
-          description: ok
+          description: the snapshot, and for an upload where to send its bytes
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CorpusReply'
+                $ref: '#/components/schemas/SnapshotReply'
               examples:
                 create:
                   value:
                     api_version: gf/v1
                     project: acme
-                    request_id: r-027c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                    request_id: r-0b7c1e9a2b4d6f8031a5c7e9b2d4f6a8
                     resource:
-                      kind: corpus
-                      name: credit-v1
+                      kind: snapshot
+                      name: credit-2026-01
                     result:
-                      name: credit-v1
-                      digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                      members:
-                        credit:
-                          snapshots:
-                          - sha256:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f
-                      parent: null
+                      name: credit-2026-01
+                      state: open
+                      digest: null
+                      bytes: 52428800
+                      rows: null
+                      columns: null
+                      metadata:
+                        target: defaulted
+                        task: classification
+                        time: applied_at
+                        origin:
+                          kind: uploaded
+                      error: null
+                      expires: 1761286400.0
                       created: 1761200000.0
-  /v1/projects/{project}/corpora/{corpus}:
+                      url: https://storage.googleapis.com/upload/storage/v1/b/gf-artifacts/o?uploadType=resumable&upload_id=ADPycdu
+                      method: PUT
+                      chunk_bytes: 8388608
+                streamed:
+                  summary: an Arrow stream, ready at once
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-1c4524901f88a3b4730006b3bf14c7fc
+                    resource:
+                      kind: snapshot
+                      name: fraud-5fb6a4c6f24b
+                    result:
+                      name: fraud-5fb6a4c6f24b
+                      state: ready
+                      digest: sha256:5fb6a4c6f24bd5fb3623f97e3c62186e12e28e5b5fb6a4c6f24bd5fb3623f97e
+                      bytes: 73416
+                      rows: 1840
+                      columns:
+                      - name: amount
+                        type: double
+                      - name: is_fraud
+                        type: bool
+                      metadata: null
+                      error: null
+                      expires: null
+                      created: 1761200000.0
+        '409':
+          description: the name is another table's; a name is never reused
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorReply'
+              examples:
+                taken:
+                  x-gf-hosted: true
+                  value:
+                    api_version: gf/v1
+                    project: acme
+                    request_id: r-0b7c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                    resource:
+                      kind: snapshot
+                      name: credit-2026-01
+                    error:
+                      code: Conflict
+                      message: snapshot credit-2026-01 exists; a snapshot never changes and its
+                        name is never reused
+                      param: name
+                      hint: name the new table something else
+  /v1/projects/{project}/snapshots/{snapshot}:
     get:
-      operationId: corpora.get
+      operationId: snapshots.get
       tags:
       - hosted
-      summary: show a corpus
+      summary: show a snapshot
       parameters:
       - $ref: '#/components/parameters/project'
-      - $ref: '#/components/parameters/corpus'
+      - $ref: '#/components/parameters/snapshot'
       responses:
         '200':
           description: ok
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CorpusReply'
+                $ref: '#/components/schemas/SnapshotReply'
               examples:
                 get:
                   value:
                     api_version: gf/v1
                     project: acme
-                    request_id: r-037c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                    request_id: r-0c7c1e9a2b4d6f8031a5c7e9b2d4f6a8
                     resource:
-                      kind: corpus
-                      name: credit-v1
+                      kind: snapshot
+                      name: credit-2026-01
                     result:
-                      name: credit-v1
+                      name: credit-2026-01
+                      state: ready
                       digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                      members:
-                        credit:
-                          snapshots:
-                          - sha256:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f
-                      parent: null
+                      bytes: 52428800
+                      rows: 500000
+                      columns:
+                      - name: income
+                        type: double
+                      - name: defaulted
+                        type: int64
+                      metadata:
+                        target: defaulted
+                        task: classification
+                        origin:
+                          kind: uploaded
+                      error: null
+                      expires: null
                       created: 1761200000.0
-  /v1/projects/{project}/corpora/{corpus}/delete:
+  /v1/projects/{project}/snapshots/{snapshot}/delete:
     post:
-      operationId: corpora.delete
+      operationId: snapshots.delete
       tags:
       - hosted
-      summary: delete a corpus and release its snapshots
-      description: Refused with 409 while a run that has not ended reads it.
+      summary: delete a snapshot
+      description: Deletes an uploaded snapshot's bytes, or releases a streamed one's table; its name
+        stays taken. Refused with 409 `snapshot_held` while a run that has not ended reads it.
+        Deleting again changes nothing.
       parameters:
       - $ref: '#/components/parameters/project'
-      - $ref: '#/components/parameters/corpus'
+      - $ref: '#/components/parameters/snapshot'
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/CorpusRefRequest'
+              $ref: '#/components/schemas/EmptyRequest'
             examples:
               delete:
                 value:
                   api_version: gf/v1
                   project: acme
-                  request_id: r-047c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                  request_id: r-0e7c1e9a2b4d6f8031a5c7e9b2d4f6a8
                   resource:
-                    kind: corpus
-                    name: credit-v1
-                  payload:
-                    name: credit-v1
+                    kind: snapshot
+                    name: credit-2026-01
+                  payload: {}
       responses:
         '200':
           description: ok
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CorpusDeletedReply'
+                $ref: '#/components/schemas/SnapshotReply'
               examples:
                 delete:
                   value:
                     api_version: gf/v1
                     project: acme
-                    request_id: r-047c1e9a2b4d6f8031a5c7e9b2d4f6a8
+                    request_id: r-0e7c1e9a2b4d6f8031a5c7e9b2d4f6a8
                     resource:
-                      kind: corpus
-                      name: credit-v1
+                      kind: snapshot
+                      name: credit-2026-01
                     result:
-                      name: credit-v1
-                      deleted: true
-                      released_snapshots: 1
+                      name: credit-2026-01
+                      state: deleted
+                      digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
+                      bytes: 52428800
+                      rows: 500000
+                      columns:
+                      - name: income
+                        type: double
+                      - name: defaulted
+                        type: int64
+                      metadata:
+                        target: defaulted
+                        task: classification
+                        origin:
+                          kind: uploaded
+                      error: null
+                      expires: null
+                      created: 1761200000.0
   /v1/projects/{project}/runs:
     get:
       operationId: runs.list
       tags:
       - hosted
       summary: list the project's runs
-      description: Every run, by fine-tune name and then version; `state` lists only the runs in that
-        state. A state that is not a run state is refused with `ValidationError`.
+      description: Every run, by fine-tune name and then version; `state`, `data_digest` and `tag`
+        each list only the runs that match. A state that is not a run state is refused with
+        `ValidationError`.
       parameters:
       - $ref: '#/components/parameters/project'
       - name: state
@@ -2193,6 +2306,18 @@ paths:
         description: list only the runs in this state; every run when left out
         schema:
           $ref: '#/components/schemas/RunState'
+      - name: data_digest
+        in: query
+        required: false
+        description: list only the runs over the data with this digest, the runs' `data_digest`
+        schema:
+          $ref: '#/components/schemas/Digest'
+      - name: tag
+        in: query
+        required: false
+        description: list only the runs carrying this tag
+        schema:
+          $ref: '#/components/schemas/RunTag'
       responses:
         '200':
           description: ok
@@ -2218,22 +2343,21 @@ paths:
                         reason: null
                         attempt: 0
                         base: general-forecast/tabicl-v2-classifier
-                        corpus:
-                          name: credit-v1
+                        data:
+                        - name: credit-2026-01
                           digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                        changes:
-                        - kind: lora
+                        data_digest: sha256:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3
+                        method:
+                          type: lora
                           rank: 16
+                          input_adapter: false
                         evaluation:
                           holdout: 0.2
-                        checkpoint_policy:
-                          every: null
-                          keep: best_and_last
-                          state: last
                         budget: null
                         seed: 0
                         tags: []
-                        plan: null
+                        plan:
+                          steps: 200
                         created: 1761200000.0
                         updated: 1761200000.0
                         published: null
@@ -2251,9 +2375,11 @@ paths:
         already names: `credit-default@ft2` for that run, or the name alone
         for the name's latest run.
 
-        A plan gives `steps` for a plan of one phase, with its
-        `episode_sampling` beside it, or `phases` for a plan of two or more
-        (`RunPlan`); anything else is refused with 422.
+        `data` names ready snapshots that together are one table, the
+        base's task; the run pins each to its digest, and holds them until
+        it ends. `method` says how the network changes, and `plan` how it
+        trains (`RunPlan`): a run is created with its plan and starts
+        training once it is set up.
 
         `base` is always sent. Every version of a fine-tune trains afresh
         from one catalog model, so a base other than the one the name's
@@ -2266,7 +2392,7 @@ paths:
         A create sent again with the same request id, as the SDK sends a
         retry, returns the run the first one made rather than start
         another; the same request id with another payload is refused with
-        409. The run holds out 20% of the corpus's rows and keeps the step
+        409. The run holds out 20% of the table's rows and keeps the step
         that scores best on them, which its `evaluation` reports.
       parameters:
       - $ref: '#/components/parameters/project'
@@ -2288,9 +2414,10 @@ paths:
                   payload:
                     name: credit-default
                     base: general-forecast/tabicl-v2-classifier
-                    corpus: credit-v1
-                    changes:
-                    - kind: lora
+                    data:
+                    - credit-2026-01
+                    method:
+                      type: lora
                       rank: 16
                     plan:
                       steps: 200
@@ -2321,18 +2448,16 @@ paths:
                       reason: null
                       attempt: 0
                       base: general-forecast/tabicl-v2-classifier
-                      corpus:
-                        name: credit-v1
+                      data:
+                      - name: credit-2026-01
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                      changes:
-                      - kind: lora
+                      data_digest: sha256:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3
+                      method:
+                        type: lora
                         rank: 16
+                        input_adapter: false
                       evaluation:
                         holdout: 0.2
-                      checkpoint_policy:
-                        every: null
-                        keep: best_and_last
-                        state: last
                       budget: null
                       seed: 0
                       tags: []
@@ -2464,22 +2589,21 @@ paths:
                       reason: null
                       attempt: 0
                       base: general-forecast/tabicl-v2-classifier
-                      corpus:
-                        name: credit-v1
+                      data:
+                      - name: credit-2026-01
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                      changes:
-                      - kind: lora
+                      data_digest: sha256:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3
+                      method:
+                        type: lora
                         rank: 16
+                        input_adapter: false
                       evaluation:
                         holdout: 0.2
-                      checkpoint_policy:
-                        every: null
-                        keep: best_and_last
-                        state: last
                       budget: null
                       seed: 0
                       tags: []
-                      plan: null
+                      plan:
+                        steps: 200
                       created: 1761200000.0
                       updated: 1761200000.0
                       published: null
@@ -2500,18 +2624,16 @@ paths:
                       reason: null
                       attempt: 1
                       base: general-forecast/tabicl-v2-classifier
-                      corpus:
-                        name: credit-v2
+                      data:
+                      - name: credit-2026-02
                         digest: sha256:b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2
-                      changes:
-                      - kind: lora
+                      data_digest: sha256:d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4
+                      method:
+                        type: lora
                         rank: 16
+                        input_adapter: false
                       evaluation:
                         holdout: 0.2
-                      checkpoint_policy:
-                        every: null
-                        keep: best_and_last
-                        state: last
                       budget: null
                       seed: 0
                       tags: []
@@ -2525,79 +2647,6 @@ paths:
                         kept_step: 180
                         validation_loss: 0.412
                         base_validation_loss: 0.455
-  /v1/projects/{project}/runs/{run}/train:
-    post:
-      operationId: runs.train
-      tags:
-      - hosted
-      summary: set a run's plan and start it
-      description: A plan is set once; the same plan again returns the run. A plan gives `steps`
-        for one phase or `phases` for two or more (`RunPlan`); anything else is refused with 422.
-      parameters:
-      - $ref: '#/components/parameters/project'
-      - $ref: '#/components/parameters/run'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/RunTrainRequest'
-            examples:
-              train:
-                value:
-                  api_version: gf/v1
-                  project: acme
-                  request_id: r-087c1e9a2b4d6f8031a5c7e9b2d4f6a8
-                  resource:
-                    kind: run
-                    name: credit-default@ft1
-                  payload:
-                    plan:
-                      steps: 100
-      responses:
-        '200':
-          description: ok
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/RunReply'
-              examples:
-                train:
-                  value:
-                    api_version: gf/v1
-                    project: acme
-                    request_id: r-087c1e9a2b4d6f8031a5c7e9b2d4f6a8
-                    resource:
-                      kind: run
-                      name: credit-default@ft1
-                    result:
-                      model: acme/credit-default@ft1
-                      name: credit-default
-                      version: 1
-                      state: queued
-                      reason: null
-                      attempt: 0
-                      base: general-forecast/tabicl-v2-classifier
-                      corpus:
-                        name: credit-v1
-                        digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                      changes:
-                      - kind: lora
-                        rank: 16
-                      evaluation:
-                        holdout: 0.2
-                      checkpoint_policy:
-                        every: null
-                        keep: best_and_last
-                        state: last
-                      budget: null
-                      seed: 0
-                      tags: []
-                      plan:
-                        steps: 100
-                      created: 1761200000.0
-                      updated: 1761200060.0
-                      published: null
   /v1/projects/{project}/runs/{run}/cancel:
     post:
       operationId: runs.cancel
@@ -2608,7 +2657,7 @@ paths:
         With `save`, a run that is training stops at its next report and publishes the weights trained
         so far as the version the run was created for, as a run stopped by its budget does; the run's
         `published`, and its lineage's `published` note, name the version. Without `save` nothing is published.
-        A run that is not training (queued, setting up, ready or preempted) has no weights in hand, so
+        A run that is not training (queued, setting up or preempted) has no weights in hand, so
         `save` publishes nothing. Cancelling an ended or cancelling run returns it unchanged.
       parameters:
       - $ref: '#/components/parameters/project'
@@ -2663,22 +2712,21 @@ paths:
                       reason: null
                       attempt: 0
                       base: general-forecast/tabicl-v2-classifier
-                      corpus:
-                        name: credit-v1
+                      data:
+                      - name: credit-2026-01
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                      changes:
-                      - kind: lora
+                      data_digest: sha256:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3
+                      method:
+                        type: lora
                         rank: 16
+                        input_adapter: false
                       evaluation:
                         holdout: 0.2
-                      checkpoint_policy:
-                        every: null
-                        keep: best_and_last
-                        state: last
                       budget: null
                       seed: 0
                       tags: []
-                      plan: null
+                      plan:
+                        steps: 200
                       created: 1761200000.0
                       updated: 1761200060.0
                       published: null
@@ -2698,18 +2746,16 @@ paths:
                       reason: null
                       attempt: 1
                       base: general-forecast/tabicl-v2-classifier
-                      corpus:
-                        name: credit-v1
+                      data:
+                      - name: credit-2026-01
                         digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                      changes:
-                      - kind: lora
+                      data_digest: sha256:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3
+                      method:
+                        type: lora
                         rank: 16
+                        input_adapter: false
                       evaluation:
                         holdout: 0.2
-                      checkpoint_policy:
-                        every: null
-                        keep: best_and_last
-                        state: last
                       budget: null
                       seed: 0
                       tags: []
@@ -2750,228 +2796,21 @@ paths:
                         kind: created
                         body:
                           base: general-forecast/tabicl-v2-classifier
-                          corpus:
-                            name: credit-v1
+                          data:
+                          - name: credit-2026-01
                             digest: sha256:a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1
-                          changes:
-                          - kind: lora
+                          data_digest: sha256:c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3
+                          method:
+                            type: lora
                             rank: 16
+                            input_adapter: false
                           evaluation:
                             holdout: 0.2
-                          checkpoint_policy:
-                            every: null
-                            keep: best_and_last
-                            state: last
                           budget: null
                           seed: 0
                           tags: []
-                          plan: null
-  /v1/projects/{project}/uploads:
-    get:
-      operationId: uploads.list
-      tags:
-      - hosted
-      summary: list the project's uploads
-      description: Every upload that is not deleted, oldest first, without its snapshot; `uploads.get`
-        reads one with it. A deleted upload is still read by its id.
-      parameters:
-      - $ref: '#/components/parameters/project'
-      responses:
-        '200':
-          description: ok
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/UploadListReply'
-              examples:
-                list:
-                  value:
-                    api_version: gf/v1
-                    project: acme
-                    request_id: r-1a7c1e9a2b4d6f8031a5c7e9b2d4f6a8
-                    resource:
-                      kind: corpus
-                      name: uploads
-                    result:
-                      uploads:
-                      - id: up-3f1c2a9b8e7d6c5b4a392817
-                        state: verified
-                        bytes: 52428800
-                        digest: sha256:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f
-                        error: null
-                        metadata:
-                          target: defaulted
-                          task: classification
-                          origin:
-                            kind: uploaded
-                        expires: null
-                        created: 1761200000.0
-    post:
-      operationId: uploads.create
-      tags:
-      - hosted
-      summary: open an upload of a Parquet training table, with its size and metadata
-      description: '`url` is a resumable session to `PUT` the bytes to, in `chunk_bytes` chunks with `Content-Range`.
-        The metadata names the target and task, and the columns verification checks. Once every declared
-        byte is stored, the plane verifies the upload on its own: it reads the Parquet footer, checks the
-        named columns exist and hashes the bytes, and the upload becomes `verified` or `rejected` with an
-        `error`. An upload left open for a day expires.'
-      parameters:
-      - $ref: '#/components/parameters/project'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/UploadCreateRequest'
-            examples:
-              create:
-                value:
-                  api_version: gf/v1
-                  project: acme
-                  request_id: r-0b7c1e9a2b4d6f8031a5c7e9b2d4f6a8
-                  resource:
-                    kind: corpus
-                    name: new
-                  payload:
-                    bytes: 52428800
-                    format: parquet
-                    metadata:
-                      target: defaulted
-                      task: classification
-      responses:
-        '200':
-          description: ok
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/UploadOpenedReply'
-              examples:
-                create:
-                  value:
-                    api_version: gf/v1
-                    project: acme
-                    request_id: r-0b7c1e9a2b4d6f8031a5c7e9b2d4f6a8
-                    resource:
-                      kind: corpus
-                      name: new
-                    result:
-                      id: up-3f1c2a9b8e7d6c5b4a392817
-                      state: open
-                      bytes: 52428800
-                      digest: null
-                      error: null
-                      metadata:
-                        target: defaulted
-                        task: classification
-                        origin:
-                          kind: uploaded
-                      expires: 1761286400.0
-                      created: 1761200000.0
-                      url: https://storage.googleapis.com/upload/storage/v1/b/gf-artifacts/o?uploadType=resumable&upload_id=ADPycdu
-                      method: PUT
-                      chunk_bytes: 8388608
-  /v1/projects/{project}/uploads/{upload}:
-    get:
-      operationId: uploads.get
-      tags:
-      - hosted
-      summary: show an upload and, once verified, its training snapshot
-      parameters:
-      - $ref: '#/components/parameters/project'
-      - $ref: '#/components/parameters/upload'
-      responses:
-        '200':
-          description: ok
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/UploadReply'
-              examples:
-                get:
-                  value:
-                    api_version: gf/v1
-                    project: acme
-                    request_id: r-0c7c1e9a2b4d6f8031a5c7e9b2d4f6a8
-                    resource:
-                      kind: corpus
-                      name: up-3f1c2a9b8e7d6c5b4a392817
-                    result:
-                      id: up-3f1c2a9b8e7d6c5b4a392817
-                      state: verified
-                      bytes: 52428800
-                      digest: sha256:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f
-                      error: null
-                      metadata:
-                        target: defaulted
-                        task: classification
-                        origin:
-                          kind: uploaded
-                      expires: null
-                      created: 1761200000.0
-                      snapshot:
-                        digest: sha256:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f
-                        bytes: 52428800
-                        rows: 500000
-                        columns:
-                        - name: income
-                          type: double
-                        - name: defaulted
-                          type: int64
-                        metadata:
-                          target: defaulted
-                          task: classification
-                          origin:
-                            kind: uploaded
-  /v1/projects/{project}/uploads/{upload}/delete:
-    post:
-      operationId: uploads.delete
-      tags:
-      - hosted
-      summary: delete an upload and its training snapshot
-      description: Every upload of the same table shares its snapshot and is deleted with it. Refused with
-        409 while a corpus or a run that has not ended holds the snapshot.
-      parameters:
-      - $ref: '#/components/parameters/project'
-      - $ref: '#/components/parameters/upload'
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/UploadRefRequest'
-            examples:
-              delete:
-                value:
-                  api_version: gf/v1
-                  project: acme
-                  request_id: r-0e7c1e9a2b4d6f8031a5c7e9b2d4f6a8
-                  resource:
-                    kind: corpus
-                    name: up-3f1c2a9b8e7d6c5b4a392817
-                  payload: {}
-      responses:
-        '200':
-          description: ok
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/UploadDeletedReply'
-              examples:
-                delete:
-                  value:
-                    api_version: gf/v1
-                    project: acme
-                    request_id: r-0e7c1e9a2b4d6f8031a5c7e9b2d4f6a8
-                    resource:
-                      kind: corpus
-                      name: up-3f1c2a9b8e7d6c5b4a392817
-                    result:
-                      id: up-3f1c2a9b8e7d6c5b4a392817
-                      state: deleted
-                      digest: sha256:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f
-                      uploads:
-                      - up-3f1c2a9b8e7d6c5b4a392817
+                          plan:
+                            steps: 200
   /v1/auth/status:
     get:
       operationId: auth.status
@@ -4357,20 +4196,14 @@ components:
       in: path
       required: true
       schema: {type: string, pattern: "^key-[0-9a-f]{20,24}$"}
-    corpus:
-      name: corpus
-      in: path
-      required: true
-      schema:
-        $ref: '#/components/schemas/Name'
     run:
       name: run
       in: path
       required: true
       schema:
         $ref: '#/components/schemas/RunRef'
-    upload:
-      name: upload
+    snapshot:
+      name: snapshot
       in: path
       required: true
       schema:
@@ -4506,7 +4339,7 @@ components:
 
     ResourceKind:
       type: string
-      enum: [predictor, model, project, api-key, secret, context, source, workspace, corpus, run]
+      enum: [predictor, model, project, api-key, secret, context, source, workspace, snapshot, run]
 
     Resource:
       type: object
@@ -5327,12 +5160,11 @@ components:
       type: string
       description: |
         A project permission a key or role holds. Fine-tuning's:
-        `corpora:read` reads uploads and corpora, `corpora:write` uploads and
-        creates and deletes uploads and corpora, `runs:read` reads runs and
-        their lineage, and `runs:write` creates, trains and cancels runs;
-        `models:read` reads the fine-tunes runs publish. The admin and
-        editor roles hold all four; the viewer role holds `corpora:read`
-        and `runs:read`. `GET /auth/status` lists every permission with the
+        `snapshots:read` reads snapshots, `snapshots:write` uploads and
+        deletes them, `runs:read` reads runs and their lineage, and
+        `runs:write` creates and cancels runs; `models:read` reads the
+        fine-tunes runs publish. The admin and editor roles hold all four;
+        the viewer role holds `snapshots:read` and `runs:read`. `GET /auth/status` lists every permission with the
         roles that hold it.
       enum:
         - predictors:read
@@ -5344,8 +5176,8 @@ components:
         - sources:read
         - sources:write
         - models:read
-        - corpora:read
-        - corpora:write
+        - snapshots:read
+        - snapshots:write
         - runs:read
         - runs:write
         - keys:read
@@ -5561,179 +5393,20 @@ components:
           properties:
             result: {$ref: "#/components/schemas/SecretDeleted"}
 
-    Prior:
-      type: object
-      required:
-      - name
-      - version
-      additionalProperties: false
-      properties:
-        name:
-          type: string
-        version:
-          type: string
-        params:
-          type: object
-    SnapshotsMember:
-      type: object
-      required:
-      - snapshots
-      additionalProperties: false
-      properties:
-        snapshots:
-          type: array
-          minItems: 1
-          maxItems: 1024
-          items:
-            $ref: '#/components/schemas/Digest'
-    PriorMember:
-      type: object
-      required:
-      - prior
-      additionalProperties: false
-      properties:
-        prior:
-          $ref: '#/components/schemas/Prior'
-    CorpusMember:
-      oneOf:
-      - $ref: '#/components/schemas/SnapshotsMember'
-      - $ref: '#/components/schemas/PriorMember'
-    Corpus:
-      type: object
-      required:
-      - name
-      - digest
-      - members
-      - parent
-      - created
-      additionalProperties: false
-      properties:
-        name:
-          $ref: '#/components/schemas/Name'
-        digest:
-          $ref: '#/components/schemas/Digest'
-        members:
-          type: object
-          minProperties: 1
-          maxProperties: 32
-          additionalProperties:
-            $ref: '#/components/schemas/CorpusMember'
-        parent:
-          anyOf:
-          - $ref: '#/components/schemas/Name'
-          - type: 'null'
-        created:
-          type: number
-    CorpusReply:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - result
-        properties:
-          result:
-            $ref: '#/components/schemas/Corpus'
-    CorpusList:
-      type: object
-      required:
-      - corpora
-      additionalProperties: false
-      properties:
-        corpora:
-          type: array
-          items:
-            $ref: '#/components/schemas/Corpus'
-    CorpusListReply:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - result
-        properties:
-          result:
-            $ref: '#/components/schemas/CorpusList'
-    CorpusCreate:
-      type: object
-      required:
-      - name
-      - members
-      additionalProperties: false
-      properties:
-        name:
-          $ref: '#/components/schemas/Name'
-        members:
-          type: object
-          minProperties: 1
-          maxProperties: 32
-          additionalProperties:
-            $ref: '#/components/schemas/CorpusMember'
-        parent:
-          $ref: '#/components/schemas/Name'
-    CorpusCreateRequest:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - payload
-        properties:
-          payload:
-            $ref: '#/components/schemas/CorpusCreate'
-    CorpusRef:
-      type: object
-      required:
-      - name
-      additionalProperties: false
-      properties:
-        name:
-          $ref: '#/components/schemas/Name'
-    CorpusRefRequest:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - payload
-        properties:
-          payload:
-            $ref: '#/components/schemas/CorpusRef'
-    CorpusDeleted:
-      type: object
-      required:
-      - name
-      - deleted
-      - released_snapshots
-      additionalProperties: false
-      properties:
-        name:
-          $ref: '#/components/schemas/Name'
-        deleted:
-          type: boolean
-          const: true
-        released_snapshots:
-          type: integer
-          minimum: 0
-    CorpusDeletedReply:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - result
-        properties:
-          result:
-            $ref: '#/components/schemas/CorpusDeleted'
     RunState:
       type: string
       enum:
       - queued
       - setting_up
-      - ready
       - training
       - preempted
       - finished
       - cancelling
       - cancelled
       - failed
-    RunCorpus:
+    RunData:
       type: object
+      description: a snapshot a run reads, by its name and the digest the name had when the run was created
       required:
       - name
       - digest
@@ -5743,6 +5416,51 @@ components:
           $ref: '#/components/schemas/Name'
         digest:
           $ref: '#/components/schemas/Digest'
+    RunMethod:
+      type: object
+      description: |
+        How a run changes the network: `{"type": "lora", "rank": 16}`, with
+        `"input_adapter": true` to train an input adapter in front of it;
+        `{"type": "input_adapter"}`; or `{"type": "full", "components":
+        [...]}`, some of `column_encoder`, `row_encoder`,
+        `in_context_transformer` and `prediction_head`. A method the base
+        does not take is refused with 422.
+      required:
+      - type
+      additionalProperties: false
+      properties:
+        type:
+          type: string
+          enum:
+          - lora
+          - input_adapter
+          - full
+        rank:
+          type: integer
+          minimum: 1
+          maximum: 256
+          description: LoRA's rank, which `lora` needs
+        input_adapter:
+          type: boolean
+          description: whether an input adapter trains beside LoRA; false when left out
+        components:
+          type: array
+          minItems: 1
+          description: the components full fine-tuning trains, which `full` needs
+          items:
+            $ref: '#/components/schemas/RunComponent'
+    RunComponent:
+      type: string
+      description: a component full fine-tuning may train
+      enum:
+      - column_encoder
+      - row_encoder
+      - in_context_transformer
+      - prediction_head
+    RunTag:
+      type: string
+      pattern: '^[a-z0-9][a-z0-9._:/-]{0,63}$'
+      description: a label to find runs by, as `recipe:fraud-v1`
     Run:
       type: object
       required:
@@ -5751,10 +5469,10 @@ components:
       - reason
       - attempt
       - base
-      - corpus
-      - changes
+      - data
+      - data_digest
+      - method
       - evaluation
-      - checkpoint_policy
       - budget
       - seed
       - tags
@@ -5795,16 +5513,18 @@ components:
         base:
           $ref: '#/components/schemas/ModelId'
           description: the catalog model the run trains from
-        corpus:
-          $ref: '#/components/schemas/RunCorpus'
-        changes:
+        data:
           type: array
+          description: the snapshots the run reads, one table, each pinned to its digest
           items:
-            type: object
+            $ref: '#/components/schemas/RunData'
+        data_digest:
+          $ref: '#/components/schemas/Digest'
+          description: the digest of the data's digests, in order; runs of the same data share it
+        method:
+          $ref: '#/components/schemas/RunMethod'
         evaluation:
           $ref: '#/components/schemas/RunEvaluation'
-        checkpoint_policy:
-          type: object
         budget:
           anyOf:
           - type: object
@@ -5814,12 +5534,9 @@ components:
         tags:
           type: array
           items:
-            $ref: '#/components/schemas/Name'
+            $ref: '#/components/schemas/RunTag'
         plan:
-          description: the run's training plan, null until it is set
-          anyOf:
-          - $ref: '#/components/schemas/RunPlan'
-          - type: 'null'
+          $ref: '#/components/schemas/RunPlan'
         created:
           type: number
         updated:
@@ -5836,24 +5553,12 @@ components:
           - $ref: '#/components/schemas/RunPublished'
           - type: 'null'
     RunPlan:
-      description: |
-        How a run trains. A plan of one phase gives its `steps`, and pools
-        the corpus: every episode draws from all of its members' rows,
-        `{"steps": 200, "learning_rate": 5e-5, "episode_sampling": {"rows": 1024}}`.
-        A curriculum gives two to 16 `phases`, which run one after another,
-        so their steps add up; each phase's `mix` weighs the corpus's
-        members by name, `{"phases": [{"steps": 300, "mix": {"general": 1}},
-        {"steps": 100, "mix": {"general": 1, "credit": 3}}]}`. A plan gives
-        exactly one of `steps` and `phases`; a plan with both, neither, or
-        `phases` of one phase is refused with 422. The rest of a plan's
-        settings, `episode_sampling` among them, apply to every phase, and
-        the learning rate's schedule spans every phase's steps.
-      oneOf:
-      - $ref: '#/components/schemas/RunPlanSteps'
-      - $ref: '#/components/schemas/RunPlanPhases'
-    RunPlanSteps:
       type: object
-      description: a plan of one phase
+      description: |
+        How a run trains: its `steps`, how it samples episodes, the
+        optimizer's settings and its checkpoint settings,
+        `{"steps": 200, "learning_rate": 5e-5, "episode_sampling": {"rows": 1024}}`.
+        A setting the trainer does not read is refused with 422.
       required:
       - steps
       additionalProperties: false
@@ -5907,99 +5612,26 @@ components:
           minimum: 0
           maximum: 1000
           description: checks without improvement before training stops; 0, never, when left out
-    RunPlanPhases:
-      type: object
-      description: a curriculum, two or more phases run one after another
-      required:
-      - phases
-      additionalProperties: false
-      properties:
-        phases:
-          type: array
-          minItems: 2
-          maxItems: 16
-          items:
-            $ref: '#/components/schemas/RunPhase'
-        episode_sampling:
-          $ref: '#/components/schemas/EpisodeSampling'
-        learning_rate:
-          type: number
-          minimum: 1.0e-08
-          maximum: 1
-          description: the peak learning rate; 1e-4, or 1e-5 for full fine-tuning, when left out
-        optimizer:
-          type: string
-          enum: [adamw]
-        schedule:
-          type: string
-          enum: [cosine]
-          description: a linear warmup, then a cosine to a tenth of the peak rate
-        warmup_steps:
-          type: integer
-          minimum: 0
-          description: the steps of the linear warmup, 20 when left out
-        weight_decay:
-          type: number
-          minimum: 0
-          maximum: 1
-        beta2:
-          type: number
-          minimum: 0.5
-          maximum: 0.99999
-        grad_clip:
-          type: number
-          minimum: 1.0e-06
-          maximum: 1000000
-        episodes_per_step:
-          type: integer
-          minimum: 1
-          maximum: 64
-        evaluate_every:
-          type: integer
-          minimum: 1
-          maximum: 10000
-          description: the steps between checks on the held-out rows, 20 when left out
-        early_stopping_patience:
-          type: integer
-          minimum: 0
-          maximum: 1000
-          description: checks without improvement before training stops; 0, never, when left out
-    RunPhase:
-      type: object
-      description: |
-        one phase of a curriculum: its steps, and the corpus's members it
-        draws from. Each step's episodes come from one member, picked at
-        random by the mix's weights; a phase without a mix pools the
-        corpus, each member picked by its share of the corpus's rows. Every
-        phase samples episodes as the plan's `episode_sampling` says, and a
-        phase's own `learning_rate`, `early_stopping` or `episode_sampling`
-        is refused with 422.
-      required:
-      - steps
-      additionalProperties: false
-      properties:
-        steps:
+        save_steps:
           type: integer
           minimum: 1
           maximum: 10000000
-        mix:
-          type: object
-          minProperties: 1
-          description: |
-            the corpus's members by name, each with its weight above 0; a
-            name that is not a member of the run's corpus, or a member that
-            is a prior, is refused with 422
-          additionalProperties:
-            type: number
-            exclusiveMinimum: 0
-            maximum: 1000000
+          description: the steps between checkpoints
+        save_total_limit:
+          type: integer
+          minimum: 0
+          maximum: 100
+          description: the checkpoints kept besides the best
+        save_only_model:
+          type: boolean
+          description: whether a checkpoint keeps the trained weights alone, without the optimizer's state
     EpisodeSampling:
       type: object
-      description: how the trainer draws an episode from the corpus's rows
+      description: how the trainer draws an episode from the table's training rows
       additionalProperties: false
       properties:
         rows:
-          description: an episode's rows, or `auto` for 640 (fewer when the corpus has fewer)
+          description: an episode's rows, or `auto` for 640 (fewer when the table has fewer)
           oneOf:
           - type: integer
             minimum: 16
@@ -6054,19 +5686,16 @@ components:
       type: object
       description: |
         How the run chooses the weights it publishes. The trainer holds out
-        20% of the corpus's rows, scores them every `evaluate_every` steps
+        20% of the table's rows, scores them every `evaluate_every` steps
         of the plan, and keeps the step that scores best: `holdout` is that
-        share, and every run says it. A curriculum holds out 20% of each
-        member's rows it draws from, and each check scores every member's,
-        1,024 rows in all at most, spread across the members. A create
-        sends no `evaluation`.
+        share, and every run says it. A create sends no `evaluation`.
       required:
       - holdout
       additionalProperties: false
       properties:
         holdout:
           type: number
-          description: the share of the corpus's rows held out to choose the kept step, 0.2
+          description: the share of the table's rows held out to choose the kept step, 0.2
     RunUsage:
       type: object
       required:
@@ -6121,8 +5750,9 @@ components:
       required:
       - name
       - base
-      - corpus
-      - changes
+      - data
+      - method
+      - plan
       additionalProperties: false
       properties:
         name:
@@ -6139,17 +5769,20 @@ components:
             of a fine-tune trains afresh from the same base: another base is
             refused with 409 `base_mismatch`, and a fine-tune with 422
             `base_is_fine_tune`.
-        corpus:
-          $ref: '#/components/schemas/Name'
-        changes:
+        data:
           type: array
           minItems: 1
+          maxItems: 64
+          description: |
+            the names of ready snapshots that together are one table: the
+            same columns, target and task, the task the base's. The run
+            pins each name to its digest.
           items:
-            type: object
+            $ref: '#/components/schemas/Name'
+        method:
+          $ref: '#/components/schemas/RunMethod'
         plan:
           $ref: '#/components/schemas/RunPlan'
-        checkpoint_policy:
-          type: object
         budget:
           type: object
         seed:
@@ -6157,8 +5790,9 @@ components:
           minimum: 0
         tags:
           type: array
+          maxItems: 16
           items:
-            $ref: '#/components/schemas/Name'
+            $ref: '#/components/schemas/RunTag'
     RunCreateRequest:
       allOf:
       - $ref: '#/components/schemas/Envelope'
@@ -6168,23 +5802,6 @@ components:
         properties:
           payload:
             $ref: '#/components/schemas/RunCreate'
-    RunTrain:
-      type: object
-      required:
-      - plan
-      additionalProperties: false
-      properties:
-        plan:
-          $ref: '#/components/schemas/RunPlan'
-    RunTrainRequest:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - payload
-        properties:
-          payload:
-            $ref: '#/components/schemas/RunTrain'
     RunCancel:
       type: object
       description: how a run is cancelled; an empty payload cancels without saving
@@ -6220,10 +5837,7 @@ components:
           description: |
             What happened. A `published` event is the run's `published`. A
             `metrics` event is one chunk of training:
-            `steps`, `loss`, `validation_loss` and `seconds`; `phase`, the
-            index in the plan's `phases` of the phase it trained in (0 for a
-            plan of `steps`); for a curriculum, `members`, the share of the
-            chunk's steps each member it draws from gave, by name; and, where the
+            `steps`, `loss`, `validation_loss` and `seconds`; and, where the
             trainer reads them, `compile_seconds`, `train_seconds`,
             `chunk_steps`, `steps_per_second`, `rows_per_second`,
             `gpu_utilization` (%), `gpu_memory_used_bytes`,
@@ -6253,11 +5867,11 @@ components:
         properties:
           result:
             $ref: '#/components/schemas/RunLineage'
-    UploadState:
+    SnapshotState:
       type: string
       enum:
       - open
-      - verified
+      - ready
       - rejected
       - expired
       - deleted
@@ -6272,186 +5886,12 @@ components:
           type: string
         type:
           type: string
-    TrainingSnapshot:
+    SnapshotMetadata:
       type: object
-      required:
-      - digest
-      - bytes
-      - rows
-      - columns
-      - metadata
-      additionalProperties: false
-      properties:
-        digest:
-          $ref: '#/components/schemas/Digest'
-        bytes:
-          type: integer
-        rows:
-          type: integer
-        columns:
-          type: array
-          items:
-            $ref: '#/components/schemas/SnapshotColumn'
-        metadata:
-          type: object
-    Upload:
-      type: object
-      required:
-      - id
-      - state
-      - bytes
-      - digest
-      - error
-      - metadata
-      - expires
-      - created
-      additionalProperties: false
-      properties:
-        id:
-          $ref: '#/components/schemas/Name'
-        state:
-          $ref: '#/components/schemas/UploadState'
-        bytes:
-          type: integer
-          minimum: 1
-        digest:
-          anyOf:
-          - $ref: '#/components/schemas/Digest'
-          - type: 'null'
-        error:
-          anyOf:
-          - type: string
-          - type: 'null'
-        metadata:
-          anyOf:
-          - type: object
-          - type: 'null'
-        expires:
-          anyOf:
-          - type: number
-          - type: 'null'
-        created:
-          type: number
-          description: when the upload was opened, in seconds since the epoch
-        snapshot:
-          $ref: '#/components/schemas/TrainingSnapshot'
-          description: the training snapshot a verified upload became; `uploads.get` alone carries it
-    UploadReply:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - result
-        properties:
-          result:
-            $ref: '#/components/schemas/Upload'
-    UploadOpened:
-      type: object
-      required:
-      - id
-      - state
-      - bytes
-      - digest
-      - error
-      - metadata
-      - expires
-      - created
-      - url
-      - method
-      - chunk_bytes
-      additionalProperties: false
-      properties:
-        id:
-          $ref: '#/components/schemas/Name'
-        state:
-          $ref: '#/components/schemas/UploadState'
-        bytes:
-          type: integer
-          minimum: 1
-        digest:
-          anyOf:
-          - $ref: '#/components/schemas/Digest'
-          - type: 'null'
-        error:
-          anyOf:
-          - type: string
-          - type: 'null'
-        metadata:
-          anyOf:
-          - type: object
-          - type: 'null'
-        expires:
-          anyOf:
-          - type: number
-          - type: 'null'
-        created:
-          type: number
-        url:
-          anyOf:
-          - type: string
-          - type: 'null'
-        method:
-          type: string
-          const: PUT
-        chunk_bytes:
-          type: integer
-          minimum: 1
-    UploadList:
-      type: object
-      required:
-      - uploads
-      additionalProperties: false
-      properties:
-        uploads:
-          type: array
-          items:
-            $ref: '#/components/schemas/Upload'
-    UploadListReply:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - result
-        properties:
-          result:
-            $ref: '#/components/schemas/UploadList'
-    UploadOpenedReply:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - result
-        properties:
-          result:
-            $ref: '#/components/schemas/UploadOpened'
-    UploadCreate:
-      type: object
-      required:
-      - bytes
-      - format
-      - metadata
-      additionalProperties: false
-      properties:
-        bytes:
-          type: integer
-          minimum: 1
-          maximum: 8589934592
-        format:
-          type: string
-          const: parquet
-        metadata:
-          $ref: '#/components/schemas/UploadMetadata'
-    UploadCreateRequest:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - payload
-        properties:
-          payload:
-            $ref: '#/components/schemas/UploadCreate'
-    UploadMetadata:
-      type: object
+      description: |
+        A table's training metadata: its `target` and `task`, and
+        optionally its `time` and `group` columns, its column types and its
+        origin. A run refuses a snapshot without a target and task.
       required:
       - target
       - task
@@ -6469,49 +5909,86 @@ components:
           type: object
           additionalProperties:
             type: string
+            enum:
+            - numerical
+            - categorical
         time:
           type: string
+          minLength: 1
         group:
           type: string
+          minLength: 1
         origin:
           type: object
-    UploadRef:
+    Snapshot:
       type: object
-      required: []
-      additionalProperties: false
-      properties: {}
-    UploadRefRequest:
-      allOf:
-      - $ref: '#/components/schemas/Envelope'
-      - type: object
-        required:
-        - payload
-        properties:
-          payload:
-            $ref: '#/components/schemas/UploadRef'
-    UploadDeleted:
-      type: object
+      description: |
+        A named, immutable table. `digest`, `rows` and `columns` are set
+        once it is `ready`. A create that opens an upload also carries
+        where its bytes go: `url`, `method` and `chunk_bytes`.
       required:
-      - id
+      - name
       - state
       - digest
-      - uploads
+      - bytes
+      - rows
+      - columns
+      - metadata
+      - error
+      - expires
+      - created
       additionalProperties: false
       properties:
-        id:
+        name:
           $ref: '#/components/schemas/Name'
         state:
-          type: string
-          const: deleted
+          $ref: '#/components/schemas/SnapshotState'
         digest:
           anyOf:
           - $ref: '#/components/schemas/Digest'
           - type: 'null'
-        uploads:
-          type: array
-          items:
-            $ref: '#/components/schemas/Name'
-    UploadDeletedReply:
+        bytes:
+          type: integer
+          minimum: 1
+        rows:
+          anyOf:
+          - type: integer
+          - type: 'null'
+        columns:
+          anyOf:
+          - type: array
+            items:
+              $ref: '#/components/schemas/SnapshotColumn'
+          - type: 'null'
+        metadata:
+          anyOf:
+          - $ref: '#/components/schemas/SnapshotMetadata'
+          - type: 'null'
+        error:
+          anyOf:
+          - type: string
+          - type: 'null'
+        expires:
+          description: when an open upload expires, in seconds since the epoch; null otherwise
+          anyOf:
+          - type: number
+          - type: 'null'
+        created:
+          type: number
+          description: when the snapshot was created, in seconds since the epoch
+        url:
+          description: a resumable session to `PUT` the bytes to, or null to send them to the plane
+          anyOf:
+          - type: string
+          - type: 'null'
+        method:
+          type: string
+          enum:
+          - PUT
+        chunk_bytes:
+          type: integer
+          minimum: 1
+    SnapshotReply:
       allOf:
       - $ref: '#/components/schemas/Envelope'
       - type: object
@@ -6519,7 +5996,56 @@ components:
         - result
         properties:
           result:
-            $ref: '#/components/schemas/UploadDeleted'
+            $ref: '#/components/schemas/Snapshot'
+    SnapshotList:
+      type: object
+      required:
+      - snapshots
+      additionalProperties: false
+      properties:
+        snapshots:
+          type: array
+          items:
+            $ref: '#/components/schemas/Snapshot'
+    SnapshotListReply:
+      allOf:
+      - $ref: '#/components/schemas/Envelope'
+      - type: object
+        required:
+        - result
+        properties:
+          result:
+            $ref: '#/components/schemas/SnapshotList'
+    SnapshotCreate:
+      type: object
+      required:
+      - name
+      - bytes
+      - format
+      - metadata
+      additionalProperties: false
+      properties:
+        name:
+          $ref: '#/components/schemas/Name'
+          description: the snapshot's name, unique in the project and never reused
+        bytes:
+          type: integer
+          minimum: 1
+          maximum: 8589934592
+        format:
+          type: string
+          const: parquet
+        metadata:
+          $ref: '#/components/schemas/SnapshotMetadata'
+    SnapshotCreateRequest:
+      allOf:
+      - $ref: '#/components/schemas/Envelope'
+      - type: object
+        required:
+        - payload
+        properties:
+          payload:
+            $ref: '#/components/schemas/SnapshotCreate'
     State:
       type: string
       enum: [pending, building, ready, failed, stopped]
@@ -7240,22 +6766,6 @@ components:
           required: [result]
           properties:
             result: {$ref: "#/components/schemas/SourceList"}
-
-    UploadReceipt:
-      type: object
-      required: [digest, rows]
-      additionalProperties: false
-      properties:
-        digest: {$ref: "#/components/schemas/Digest"}
-        rows: {type: integer, minimum: 0, maximum: 100000}
-
-    UploadReceiptReply:
-      allOf:
-        - $ref: "#/components/schemas/Envelope"
-        - type: object
-          required: [result]
-          properties:
-            result: {$ref: "#/components/schemas/UploadReceipt"}
 
     PermissionGrant:
       type: object

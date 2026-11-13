@@ -124,8 +124,7 @@ class Client:
         self._transport = Transport(self.profile.url, token=key, **transport_options)
         self.contexts = Contexts(self)
         self.sources = Sources(self)
-        self.corpora = Corpora(self)
-        self.uploads = Uploads(self)
+        self.snapshots = Snapshots(self)
         self.runs = Runs(self)
         self.models = Models(self)
         self.predictors = Predictors(self)
@@ -198,9 +197,13 @@ class Client:
             )
         )
 
-    def upload_snapshot(self, data: Any) -> JsonObject:
-        """Uploads the full normalized Arrow snapshot and verifies the returned digest."""
-        return self._run(ops.upload_snapshot(self, data))
+    def upload_snapshot(self, data: Any, *, prefix: str = "table") -> JsonObject:
+        """Sends a table as the snapshot named after `prefix` and its digest, verified.
+
+        The name is `<prefix>-<first 12 hex digits of the digest>`, so the
+        same table sent again returns the same snapshot.
+        """
+        return self._run(ops.upload_snapshot(self, data, prefix=prefix))
 
     def _call(
         self,
@@ -457,38 +460,21 @@ class Sources(Collection):
         return self.client._run(ops.source_pin(spec))
 
 
-class Corpora(Collection):
-    """Named, immutable lists of training data: snapshots, and priors drawn while training."""
+class Snapshots(Collection):
+    """Named, immutable tables: uploaded in chunks for training, or streamed as Arrow.
 
-    kind: ResourceKind = "corpus"
-    collection = "corpora"
+    A name is unique in the project and never reused, even once its
+    snapshot is deleted. Runs read snapshots by name; the same name with
+    the same table again returns the snapshot, and with another table is
+    refused with `Conflict`.
+    """
 
-    def create(
-        self, name: str, members: JsonObject, *, parent: str | None = None
-    ) -> JsonObject:
-        """Creates a corpus from named members, each `{"snapshots": [...]}` or `{"prior": {...}}`.
-
-        A corpus never changes; a new one may name the corpus it updates as `parent`.
-        A create retried after a try whose answer was lost returns the corpus
-        that try made, when it lists the same members.
-        """
-        return self.client._run(ops.corpus_create(name, members, parent))
-
-    def delete(self, name: str) -> JsonObject:
-        """Deletes a corpus no run reads, releasing its snapshots."""
-        return self.client._run(
-            ops.posted("corpus", "corpora", name, "delete", {"name": name})
-        )
-
-
-class Uploads(Collection):
-    """Training tables uploaded in chunks and verified into training snapshots."""
-
-    kind: ResourceKind = "corpus"
-    collection = "uploads"
+    kind: ResourceKind = "snapshot"
+    collection = "snapshots"
 
     def create(
         self,
+        name: str,
         data: Any,
         *,
         target: str,
@@ -499,10 +485,11 @@ class Uploads(Collection):
         origin: JsonObject | None = None,
         wait: bool = True,
     ) -> JsonObject:
-        """Uploads a table (a frame, an Arrow table, or a Parquet path or bytes).
+        """Uploads a training table (a frame, an Arrow table, or a Parquet path or bytes) as `name`.
 
-        With `wait`, returns once the service has verified it; its `digest`
-        then names the training snapshot that corpora list.
+        It goes in chunks, straight to object storage where the service
+        says. With `wait`, returns once the service has verified it and the
+        snapshot is `ready`; a rejected upload raises `ValidationError`.
         """
         metadata = ops.upload_metadata(
             target,
@@ -512,24 +499,48 @@ class Uploads(Collection):
             group=group,
             origin=origin,
         )
-        return self.client._run(ops.training_upload(data, metadata, wait=wait))
+        return self.client._run(ops.training_upload(name, data, metadata, wait=wait))
+
+    def stream(
+        self,
+        name: str,
+        data: Any,
+        *,
+        target: str | None = None,
+        task: str | None = None,
+        time: str | None = None,
+        group: str | None = None,
+    ) -> JsonObject:
+        """Sends a small table (100,000 rows, 32 MiB) as one Arrow stream, `ready` at once.
+
+        Its training metadata is optional: a run reads it once it names a
+        `target` and `task`.
+        """
+        metadata = {
+            key: value
+            for key, value in (
+                ("target", target),
+                ("task", task),
+                ("time", time),
+                ("group", group),
+            )
+            if value is not None
+        }
+        return self.client._run(
+            ops.upload_snapshot(self.client, data, snapshot=name, metadata=metadata)
+        )
 
     def list(self) -> builtins.list[JsonObject]:
-        """The project's uploads that are not deleted, oldest first, without their snapshots."""
+        """The project's snapshots that are not deleted, oldest first."""
         return self.client._run(ops.listed(self.kind, self.collection))
 
-    def get(self, resource: str) -> Mapping[str, Any]:
-        """One upload by its id, `up-...`, with its training snapshot once verified."""
-        return self.client._run(ops.got(self.kind, self.collection, resource))
+    def delete(self, name: str) -> JsonObject:
+        """Deletes a snapshot; its name stays taken.
 
-    def delete(self, upload: str) -> JsonObject:
-        """Deletes an upload and its training snapshot, with every upload of the same table.
-
-        Refused with `Conflict` (reason `snapshot_held`) while a corpus, or a
-        run that has not ended, holds the snapshot. Deleting again changes
-        nothing.
+        Refused with `Conflict` (reason `snapshot_held`) while a run that
+        has not ended reads it. Deleting again changes nothing.
         """
-        return self.client._run(ops.posted("corpus", "uploads", upload, "delete", {}))
+        return self.client._run(ops.posted("snapshot", "snapshots", name, "delete", {}))
 
 
 class Runs(Collection):
@@ -555,10 +566,9 @@ class Runs(Collection):
         name: str,
         *,
         base: str,
-        corpus: str,
-        changes: builtins.list[JsonObject],
-        plan: JsonObject | None = None,
-        checkpoint_policy: JsonObject | None = None,
+        data: builtins.list[str],
+        method: JsonObject,
+        plan: JsonObject,
         budget: JsonObject | None = None,
         seed: int | None = None,
         tags: builtins.list[str] | None = None,
@@ -568,25 +578,24 @@ class Runs(Collection):
         The first run of a name publishes `<project>/<name>@ft1`, and each
         create after it the next version, `@ft2` and on; the run's `model`
         is that version's id from the start, and names the run for `get`,
-        `wait`, `watch`, `train`, `cancel` and `lineage`. `base` is the catalog model
+        `wait`, `watch`, `cancel` and `lineage`. `base` is the catalog model
         the run trains from, and every version of a name trains afresh from
         the same one: another base is refused with `Conflict`, a fine-tune
         with `ValidationError`, and so is a new run while one of the name
-        is still queued or running. With a `plan` it trains as soon as it
-        is set up. The run keeps the step that scores best on a 20%
-        hold-out of the corpus's rows, which it reports as its
-        `evaluation`.
+        is still queued or running.
 
-        A `plan` of one phase gives its `steps`, and pools the corpus:
+        `data` names ready snapshots that together are one table (the same
+        columns, target and task); the run pins each to its digest, and
+        runs of the same data share its `data_digest`. `method` is how the
+        network changes, `{"type": "lora", "rank": 16}` (with
+        `"input_adapter": true` for an adapter beside it),
+        `{"type": "input_adapter"}` or `{"type": "full", "components":
+        [...]}`. `plan` gives its `steps` and the trainer's settings,
         `{"steps": 200, "learning_rate": 5e-5, "episode_sampling": {"rows":
-        1024}}`. A curriculum gives two to 16 `phases` instead, run in
-        order, each with its `steps` and a `mix` weighing the corpus's
-        members by name: `{"phases": [{"steps": 300, "mix": {"general": 1}},
-        {"steps": 100, "mix": {"general": 1, "credit": 3}}]}`; a phase
-        without a mix pools the corpus. Episode sampling is the plan's in
-        either form. A plan gives exactly one of `steps` and `phases`;
-        anything else is refused with `ValidationError`
-        (`generalforecast._api.RunPlan`).
+        1024}}`; anything the trainer does not read is refused with
+        `ValidationError` (`generalforecast._api.RunPlan`). The run keeps
+        the step that scores best on a 20% hold-out of the table's rows,
+        which it reports as its `evaluation`.
 
         A try sent again after a transient failure carries the same request
         id, so the service returns the run the first try made rather than
@@ -595,26 +604,29 @@ class Runs(Collection):
         payload = ops.run_spec(
             name,
             base=base,
-            corpus=corpus,
-            changes=changes,
+            data=data,
+            method=method,
             plan=plan,
-            checkpoint_policy=checkpoint_policy,
             budget=budget,
             seed=seed,
             tags=tags,
         )
         return self.client._run(ops.run_create(name, payload))
 
-    def train(self, run: str, plan: JsonObject) -> JsonObject:
-        """Sets the plan of a run created without one, as `create` takes it."""
-        return self.client._run(ops.run_train(run, plan, self.client.project))
+    def list(
+        self,
+        *,
+        state: str | None = None,
+        data_digest: str | None = None,
+        tag: str | None = None,
+    ) -> builtins.list[JsonObject]:
+        """The project's runs by name and version, only those matching what is given.
 
-    def list(self, *, state: str | None = None) -> builtins.list[JsonObject]:
-        """The project's runs by name and version; with `state`, only those in it.
-
-        A state that is not a run state is refused with `ValidationError`.
+        `state` lists the runs in it, `data_digest` those over the data
+        with that digest, and `tag` those carrying it. A state that is not
+        a run state is refused with `ValidationError`.
         """
-        return self.client._run(ops.run_list(state))
+        return self.client._run(ops.run_list(state, data_digest, tag))
 
     def cancel(self, run: str, *, save: bool = False) -> JsonObject:
         """Cancels a run; one that is training stops at its next step.

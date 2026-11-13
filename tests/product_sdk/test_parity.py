@@ -10,6 +10,7 @@ import inspect
 import re
 import time
 from typing import Any
+from urllib.parse import parse_qs
 
 import pytest
 
@@ -244,7 +245,12 @@ class Recorder:
                     import pyarrow as pa
 
                     table = pa.ipc.open_stream(body).read_all()
-                    return {"digest": table_digest(table), "rows": table.num_rows}
+                    named = parse_qs(route.partition("?")[2])["name"][0]
+                    return {
+                        "name": named,
+                        "digest": table_digest(table),
+                        "rows": table.num_rows,
+                    }
                 if result == "listing":
                     return {route.strip("/"): []}
                 return result

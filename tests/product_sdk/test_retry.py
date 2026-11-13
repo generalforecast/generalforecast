@@ -45,7 +45,6 @@ PREDICTION = {
     "predictions": [{"label": True, "probabilities": {"false": 0.1, "true": 0.9}}],
 }
 SNAPSHOT = "sha256:" + "a" * 64
-MEMBERS = {"table": {"snapshots": [SNAPSHOT]}}
 
 
 def fast(**changes) -> Backoff:
@@ -382,8 +381,9 @@ def test_a_run_past_the_run_limit_is_refused_at_once(asynchronous, monkeypatch):
             lambda c: c.runs.create(
                 "ft",
                 base="general-forecast/tabicl-v2-classifier",
-                corpus="c",
-                changes=[],
+                data=["t"],
+                method={"type": "lora", "rank": 8},
+                plan={"steps": 1},
             ),
             retry=policy(),
             monkeypatch=monkeypatch,
@@ -404,8 +404,9 @@ def test_a_run_create_is_retried_through_a_rate_limit_and_a_lost_reply(
         lambda c: c.runs.create(
             "ft",
             base="general-forecast/tabicl-v2-classifier",
-            corpus="c",
-            changes=[],
+            data=["t"],
+            method={"type": "lora", "rank": 8},
+            plan={"steps": 1},
         ),
         retry=policy(),
         monkeypatch=monkeypatch,
@@ -459,8 +460,9 @@ def test_a_limit_only_the_caller_lifts_is_never_retried(error, expected):
             lambda c: c.runs.create(
                 "credit",
                 base="general-forecast/tabicl-v2-classifier",
-                corpus="c",
-                changes=[{"kind": "lora", "rank": 8}],
+                data=["t"],
+                method={"type": "lora", "rank": 8},
+                plan={"steps": 1},
             ),
             "/runs",
         ),
@@ -498,8 +500,7 @@ def test_idempotent_writes_are_retried_under_one_request_id(
             "/contexts/history/append",
         ),
         (lambda c: c.runs.cancel("ft"), "/runs/ft/cancel"),
-        (lambda c: c.runs.train("ft", {"steps": 1}), "/runs/ft/train"),
-        (lambda c: c.corpora.delete("c"), "/corpora/c/delete"),
+        (lambda c: c.snapshots.delete("t"), "/snapshots/t/delete"),
         (lambda c: c.predictors.delete("risk"), "/predictors/risk/delete"),
         (lambda c: c.keys.create(name="k", permissions=[]), "/keys"),
         (lambda c: c.secrets.create(name="s", value="v"), "/secrets"),
@@ -508,8 +509,7 @@ def test_idempotent_writes_are_retried_under_one_request_id(
         "mutate",
         "append",
         "cancel",
-        "train",
-        "corpus-delete",
+        "snapshot-delete",
         "delete",
         "key",
         "secret",
@@ -521,80 +521,6 @@ def test_other_writes_are_sent_once(asynchronous, call, route, monkeypatch):
     with pytest.raises(gf.Unavailable):
         run(asynchronous, script, call, retry=policy(events), monkeypatch=monkeypatch)
     assert [sent[1] for sent in script.sent] == [route] and not events
-
-
-@both
-def test_a_corpus_its_own_lost_try_made_is_returned(asynchronous, monkeypatch):
-    made = {
-        "name": "c",
-        "digest": "sha256:" + "b" * 64,
-        "members": MEMBERS,
-        "parent": None,
-    }
-    conflict = ServiceError("Conflict", "a corpus never changes", 409)
-    script = Script(lost(), conflict, made)
-    result, _ = run(
-        asynchronous,
-        script,
-        lambda c: c.corpora.create("c", MEMBERS),
-        retry=policy(),
-        monkeypatch=monkeypatch,
-    )
-    assert result == made
-    assert [sent[:2] for sent in script.sent] == [
-        ("POST", "/corpora"),
-        ("POST", "/corpora"),
-        ("GET", "/corpora/c"),
-    ]
-
-
-@both
-def test_a_corpus_of_other_members_is_still_a_conflict(asynchronous, monkeypatch):
-    other = {"table": {"snapshots": ["sha256:" + "c" * 64]}}
-    conflict = ServiceError("Conflict", "a corpus never changes", 409)
-    script = Script(lost(), conflict, {"name": "c", "members": other, "parent": None})
-    with pytest.raises(gf.Conflict) as raised:
-        run(
-            asynchronous,
-            script,
-            lambda c: c.corpora.create("c", MEMBERS),
-            retry=policy(),
-            monkeypatch=monkeypatch,
-        )
-    assert raised.value is conflict
-
-
-@both
-def test_a_corpus_conflict_on_the_first_try_is_raised_unread(asynchronous, monkeypatch):
-    conflict = ServiceError("Conflict", "a corpus never changes", 409)
-    script = Script(conflict)
-    with pytest.raises(gf.Conflict):
-        run(
-            asynchronous,
-            script,
-            lambda c: c.corpora.create("c", MEMBERS),
-            retry=policy(),
-            monkeypatch=monkeypatch,
-        )
-    assert [sent[1] for sent in script.sent] == ["/corpora"]
-
-
-@both
-def test_a_corpus_conflict_after_a_rate_limit_is_raised_unread(
-    asynchronous, monkeypatch
-):
-    # A 429 refuses before anything is kept, so the conflict is someone else's.
-    conflict = ServiceError("Conflict", "a corpus never changes", 409)
-    script = Script(unavailable("RateLimited", 429), conflict)
-    with pytest.raises(gf.Conflict):
-        run(
-            asynchronous,
-            script,
-            lambda c: c.corpora.create("c", MEMBERS),
-            retry=policy(),
-            monkeypatch=monkeypatch,
-        )
-    assert [sent[1] for sent in script.sent] == ["/corpora", "/corpora"]
 
 
 @both
