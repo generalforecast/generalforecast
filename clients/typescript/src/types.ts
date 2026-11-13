@@ -714,7 +714,10 @@ export interface EarlyStoppingThreshold {
  * fixed contexts of `context_rows` training rows, the base's trained row cap when null,
  * and a step becomes the new best only if its gain over the base, row by row, is more
  * than `early_stopping_threshold.standard_errors` standard errors above 0 and beats the
- * best so far. A create may leave any setting out; the run says each.
+ * best so far. Training stops early once the plan's `early_stopping_patience` checks in
+ * a row have not lowered the run's lowest select loss, significant or not, so a run
+ * whose gain is still rising goes on. A create may leave any setting out; the run says
+ * each.
  */
 export interface RunEvaluation {
   holdout: number;
