@@ -67,10 +67,10 @@ def test_a_run_is_created_by_its_fine_tune_name_and_base(wire, asynchronous):
     assert created["model"] == "test/credit@ft2" and created["version"] == 2
 
 
-def test_a_run_takes_no_fine_tune_apart_from_its_name_and_no_evaluation():
+def test_a_run_takes_no_fine_tune_apart_from_its_name_and_its_evaluation():
     for runs in (Runs, AsyncRuns):
         parameters = inspect.signature(runs.create).parameters
-        assert "fine_tune" not in parameters and "evaluation" not in parameters
+        assert "fine_tune" not in parameters and "evaluation" in parameters
         assert "base" in parameters
 
 
