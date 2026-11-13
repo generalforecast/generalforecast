@@ -625,10 +625,15 @@ class FakeClient:
             return {"lock": self.served_lock()}
         return {"name": ident, "environments": ["production", "staging"]}
 
-    def upload_snapshot(self, table: Any) -> dict:
+    def upload_snapshot(self, table: Any, *, prefix: str = "table") -> dict:
         from generalforecast.tabular import table_digest
 
-        return {"digest": table_digest(table), "rows": table.num_rows}
+        digest = table_digest(table)
+        return {
+            "name": f"{prefix}-{digest.removeprefix('sha256:')[:12]}",
+            "digest": digest,
+            "rows": table.num_rows,
+        }
 
     # live contexts
     def get(self, name: str) -> Any:

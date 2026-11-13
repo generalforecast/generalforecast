@@ -53,7 +53,7 @@ ResourceKind = Literal[
     "operator",
     "api-key",
     "secret",
-    "corpus",
+    "snapshot",
     "run",
 ]
 RESOURCE_KINDS = frozenset(ResourceKind.__args__)

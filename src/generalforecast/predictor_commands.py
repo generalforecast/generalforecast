@@ -907,7 +907,9 @@ class PredictorCommands:
                 "Uploading",
                 f"{name} revision {number}  snapshot, {term.count(checked.snapshot.num_rows)} rows, {_bytes(checked.snapshot.nbytes)}",
             )
-            snapshot = upload_snapshot(self.client, checked.snapshot)["digest"]
+            snapshot = upload_snapshot(self.client, checked.snapshot, prefix=name)[
+                "digest"
+            ]
             if snapshot != checked.lock.data_digest:
                 raise Error(
                     "InvalidInput",

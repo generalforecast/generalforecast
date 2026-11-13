@@ -34,23 +34,23 @@ def _drive(operation, replies):
 
 
 def test_a_chunk_is_a_raw_post_with_its_content_range():
-    prepared = ops.prepare("acme", ops.Chunk("up-1", 8, b"abcd", 20))
+    prepared = ops.prepare("acme", ops.Chunk("credit-2026-01", 8, b"abcd", 20))
     assert prepared.method == "POST"
-    assert prepared.path == "/v1/projects/acme/uploads/up-1/bytes"
+    assert prepared.path == "/v1/projects/acme/snapshots/credit-2026-01/bytes"
     assert prepared.body == b"abcd"
     assert prepared.headers["Content-Range"] == "bytes 8-11/20"
     assert prepared.headers["Content-Type"] == "application/octet-stream"
-    assert prepared.request.resource.kind == "corpus"
+    assert prepared.request.resource.kind == "snapshot"
 
 
 def test_an_upload_the_service_takes_is_sent_in_chunks_then_awaited():
     body = ops.parquet_bytes(TABLE)
-    opened = {"id": "up-1", "url": None, "chunk_bytes": 1024, "state": "open"}
+    opened = {"name": "t", "url": None, "chunk_bytes": 1024, "state": "open"}
     chunks = -(-len(body) // 1024)
-    replies = ["run", opened, *[{}] * chunks, {"state": "verified", "digest": "d"}]
+    replies = ["run", opened, *[{}] * chunks, {"state": "ready", "digest": "d"}]
     steps, result = _drive(
         ops.training_upload(
-            TABLE, {"target": "y", "task": "classification"}, wait=True
+            "t", TABLE, {"target": "y", "task": "classification"}, wait=True
         ),
         replies,
     )
@@ -60,43 +60,62 @@ def test_an_upload_the_service_takes_is_sent_in_chunks_then_awaited():
     # The metadata opens the upload, and nothing completes it: the service
     # verifies it once every byte is stored, and the client reads it back.
     opening = steps[1]
-    assert opening.path == "/uploads"
+    assert opening.path == "/snapshots"
+    assert opening.resource == "t"
     assert opening.payload == {
+        "name": "t",
         "bytes": len(body),
         "format": "parquet",
         "metadata": {"target": "y", "task": "classification"},
     }
     assert not [s for s in steps if "complete" in getattr(s, "path", "")]
-    assert steps[-1].method == "GET" and steps[-1].path == "/uploads/up-1"
-    assert result["state"] == "verified"
+    assert steps[-1].method == "GET" and steps[-1].path == "/snapshots/t"
+    assert result["state"] == "ready"
+
+
+def test_an_arrow_snapshot_is_named_in_its_query():
+    prepared = ops.prepare(
+        "acme",
+        ops.Upload(
+            "fraud-5fb6a4c6f24b", b"arrow", {"target": "y", "task": "regression"}
+        ),
+    )
+    assert prepared.path == (
+        "/v1/projects/acme/snapshots?name=fraud-5fb6a4c6f24b&target=y&task=regression"
+    )
+    assert prepared.request.resource.kind == "snapshot"
+    assert prepared.request.resource.name == "fraud-5fb6a4c6f24b"
+    assert ops.snapshot_name("fraud", "sha256:" + "ab" * 32) == "fraud-abababababab"
 
 
 def test_an_upload_to_storage_puts_its_chunks_at_the_url():
     opened = {
-        "id": "up-1",
+        "name": "t",
         "url": "https://storage/session",
         "chunk_bytes": 1 << 20,
         "state": "open",
     }
-    replies = ["run", opened, 200, {"state": "open"}, {"state": "verified"}]
+    replies = ["run", opened, 200, {"state": "open"}, {"state": "ready"}]
     steps, result = _drive(
-        ops.training_upload(TABLE, {"target": "y", "task": "regression"}, wait=True),
+        ops.training_upload(
+            "t", TABLE, {"target": "y", "task": "regression"}, wait=True
+        ),
         replies,
     )
     puts = [s for s in steps if isinstance(s, ops.Work) and s.function is ops.put_chunk]
     assert len(puts) == 1 and puts[0].args[0] == "https://storage/session"
     # It waited for verification.
     assert sum(isinstance(s, ops.Pause) for s in steps) == 2
-    assert result["state"] == "verified"
+    assert result["state"] == "ready"
 
 
 def test_a_rejected_upload_raises_its_reason():
-    opened = {"id": "up-1", "url": None, "chunk_bytes": 1 << 20, "state": "open"}
+    opened = {"name": "t", "url": None, "chunk_bytes": 1 << 20, "state": "open"}
     rejected = {"state": "rejected", "error": "the table has no column y"}
     with pytest.raises(ServiceError, match="no column y"):
         _drive(
             ops.training_upload(
-                TABLE, {"target": "y", "task": "regression"}, wait=True
+                "t", TABLE, {"target": "y", "task": "regression"}, wait=True
             ),
             ["run", opened, {}, rejected],
         )
@@ -122,30 +141,118 @@ def test_payloads_leave_out_what_was_not_given():
     }
 
 
-def test_a_plan_is_its_steps_or_two_or_more_phases():
+def test_a_plan_is_its_steps_and_the_trainers_settings():
     from generalforecast import _api
 
     one = _api.Run.FIELDS[[f.key for f in _api.Run.FIELDS].index("plan")]
     plan = {"steps": 200, "learning_rate": 5e-5, "episode_sampling": {"rows": 1024}}
     decoded = one.decode(plan, "plan")
-    assert isinstance(decoded, _api.RunPlanSteps) and decoded.steps == 200
+    assert isinstance(decoded, _api.RunPlan) and decoded.steps == 200
     assert decoded.episode_sampling == _api.EpisodeSampling(rows=1024)
-    curriculum = {
-        "phases": [
-            {"steps": 300, "mix": {"general": 1}},
-            {"steps": 100, "mix": {"general": 1, "credit": 3}},
-        ],
-        "episode_sampling": {"rows": 1024},
-    }
-    phased = one.decode(curriculum, "plan")
-    assert isinstance(phased, _api.RunPlanPhases) and len(phased.phases) == 2
-    assert phased.phases[1].mix == {"general": 1, "credit": 3}
+    saved = one.decode({"steps": 10, "save_steps": 5, "save_total_limit": 2}, "plan")
+    assert (saved.save_steps, saved.save_total_limit) == (5, 2)
     for refused in (
         {"steps": 10, "phases": [{"steps": 1}, {"steps": 1}]},
-        {"phases": 200},
+        {"phases": [{"steps": 1}, {"steps": 1}]},
         {"learning_rate": 1e-4},
-        # A phase samples as its plan does.
-        {"phases": [{"steps": 1, "episode_sampling": {}}, {"steps": 1}]},
+        {"steps": 10, "checkpoint_policy": {"every": 5}},
     ):
         with pytest.raises(_api.PayloadError):
             one.decode(refused, "plan")
+
+
+def _parquet(table):
+    import io
+
+    import pyarrow.parquet as pq
+
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+    return sink.getvalue()
+
+
+def _read(body):
+    import pyarrow.parquet as pq
+
+    return pq.read_table(pa.BufferReader(body))
+
+
+def test_parquet_bytes_and_files_go_as_they_are(tmp_path):
+    body = _parquet(TABLE)
+    assert ops.parquet_bytes(body) == body
+    path = tmp_path / "train"
+    path.write_bytes(body)
+    assert ops.parquet_bytes(path) == body
+
+
+# Fractional values, so a CSV round trip keeps the column a float.
+FILE_TABLE = pa.table({"x": [1.5, 2.25, 3.75], "y": [0, 1, 0]})
+
+
+@pytest.mark.parametrize("suffix", [".csv", ".tsv", ".arrow", ".feather", ".jsonl"])
+def test_other_table_files_are_written_as_parquet(tmp_path, suffix):
+    import pyarrow.csv as pa_csv
+    from pyarrow import feather
+
+    path = tmp_path / f"train{suffix}"
+    if suffix in (".csv", ".tsv"):
+        pa_csv.write_csv(
+            FILE_TABLE,
+            path,
+            pa_csv.WriteOptions(delimiter="\t" if suffix == ".tsv" else ","),
+        )
+    elif suffix == ".jsonl":
+        path.write_text(
+            "".join(
+                f'{{"x": {x}, "y": {y}}}\n'
+                for x, y in zip(
+                    FILE_TABLE["x"].to_pylist(),
+                    FILE_TABLE["y"].to_pylist(),
+                    strict=True,
+                )
+            )
+        )
+    else:
+        feather.write_feather(FILE_TABLE, path)
+    assert _read(ops.parquet_bytes(path)).equals(FILE_TABLE)
+
+
+def test_an_arrow_stream_file_is_read_too(tmp_path):
+    path = tmp_path / "train.arrow"
+    with (
+        pa.OSFile(str(path), "wb") as sink,
+        pa.ipc.new_stream(sink, TABLE.schema) as writer,
+    ):
+        writer.write_table(TABLE)
+    assert _read(ops.parquet_bytes(path)).equals(TABLE)
+
+
+def test_bytes_that_are_not_parquet_are_refused_before_an_upload():
+    upload = ops.training_upload(
+        "train", b"x,y\n1,0\n", {"target": "y", "task": "classification"}, wait=True
+    )
+    step = next(upload)
+    assert isinstance(step, ops.Work)
+    with pytest.raises(ServiceError, match="not Parquet") as raised:
+        step.function(*step.args, **step.kwargs)
+    assert raised.value.status == 422
+
+
+@pytest.mark.parametrize("name", ["train.xlsx", "train"])
+def test_a_file_of_another_kind_is_refused(tmp_path, name):
+    path = tmp_path / name
+    path.write_bytes(b"not a table")
+    with pytest.raises(ServiceError, match="not Parquet"):
+        ops.parquet_bytes(path)
+
+
+def test_a_file_that_does_not_parse_says_so(tmp_path):
+    path = tmp_path / "train.arrow"
+    path.write_bytes(b"not arrow at all")
+    with pytest.raises(ServiceError, match="could not be read as arrow"):
+        ops.parquet_bytes(path)
+
+
+def test_a_missing_path_is_refused(tmp_path):
+    with pytest.raises(ServiceError, match="is not a file"):
+        ops.parquet_bytes(tmp_path / "missing.parquet")

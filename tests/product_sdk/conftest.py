@@ -9,6 +9,7 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from types import SimpleNamespace
 from typing import cast
+from urllib.parse import parse_qsl
 
 import pyarrow as pa
 import pytest
@@ -61,7 +62,11 @@ def wire():
                 return
             try:
                 method, path, payload, result, status = expected.popleft()
-                assert self.command == method and self.path == path
+                # An Arrow snapshot names itself in its query.
+                sent, _, query = self.path.partition("?")
+                assert self.command == method and (
+                    self.path == path or (sent == path and sent.endswith("/snapshots"))
+                )
                 assert self.headers["Authorization"] == "Bearer fixture-key"
                 assert self.headers["X-GF-Project"] == "test"
                 raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
@@ -69,18 +74,24 @@ def wire():
                     self.headers.get("Content-Type")
                     == "application/vnd.apache.arrow.stream"
                 ):
+                    named = dict(parse_qsl(query))["name"]
                     request = Request(
                         Scope("test", self.headers["X-GF-Request-ID"]),
-                        Resource("context", "snapshots"),
+                        Resource("snapshot", named),
                         {},
                     )
                     table = pa.ipc.open_stream(raw).read_all()
-                    result = {"digest": table_digest(table), "rows": table.num_rows}
+                    result = {
+                        "name": named,
+                        "state": "ready",
+                        "digest": table_digest(table),
+                        "rows": table.num_rows,
+                    }
                     if state.corrupt:
                         result["rows"] = (
                             True if state.corrupt == "boolean" else result["rows"] + 1
                         )
-                    state.requests.append((self.path, table))
+                    state.requests.append((sent, table))
                 elif (
                     self.headers.get("Content-Type")
                     == "application/vnd.generalforecast.python-source+tar"
@@ -116,8 +127,7 @@ def wire():
                         "contexts": "context",
                         "models": "model",
                         "runs": "run",
-                        "uploads": "corpus",
-                        "corpora": "corpus",
+                        "snapshots": "snapshot",
                     }[parts[4]]
                     resource = parts[5] if len(parts) > 5 else parts[4]
                     # A fine-tune's version names the fine-tune, as the plane's

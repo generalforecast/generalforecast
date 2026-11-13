@@ -7,7 +7,7 @@ Each operation is a generator. It yields the steps it needs and receives each
 step's result:
 
 - a `Call` to a versioned route, answered with the reply's unwrapped result;
-- an `Upload` of an Arrow snapshot, answered with its receipt;
+- an `Upload` of an Arrow snapshot, answered with the snapshot it made;
 - a `Work` item, CPU-bound conversion run off the event loop, answered with
   its return value;
 - a `Pause` between polls.
@@ -21,7 +21,6 @@ operation, which may handle it, as `push` handles a missing predictor.
 from __future__ import annotations
 
 import hashlib
-import json
 import re
 import time
 import uuid
@@ -129,16 +128,18 @@ class Call:
 
 @dataclass(frozen=True)
 class Upload:
-    """An Arrow snapshot, `POST /snapshots`."""
+    """An Arrow snapshot, `POST /snapshots?name=...`, with its optional training metadata."""
 
+    name: str
     data: bytes
+    metadata: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class Chunk:
-    """A chunk of a training upload the service takes, `POST /uploads/{id}/bytes`."""
+    """A chunk of a training upload the service takes, `POST /snapshots/{name}/bytes`."""
 
-    upload: str
+    snapshot: str
     start: int
     data: bytes
     total: int
@@ -195,7 +196,7 @@ def prepare(project: str, step: Call | Upload | Chunk) -> Prepared:
         end = step.start + len(step.data) - 1
         return Prepared(
             "POST",
-            f"/v1/projects/{project}/uploads/{name(step.upload)}/bytes",
+            f"/v1/projects/{project}/snapshots/{name(step.snapshot)}/bytes",
             step.data,
             {
                 "Content-Type": "application/octet-stream",
@@ -203,19 +204,22 @@ def prepare(project: str, step: Call | Upload | Chunk) -> Prepared:
                 "X-GF-Project": project,
                 "X-GF-Request-ID": request_id,
             },
-            Request(Scope(project, request_id), Resource("corpus", step.upload), {}),
+            Request(
+                Scope(project, request_id), Resource("snapshot", step.snapshot), {}
+            ),
         )
     if isinstance(step, Upload):
+        query = urlencode({"name": name(step.name), **step.metadata})
         return Prepared(
             "POST",
-            f"/v1/projects/{project}/snapshots",
+            f"/v1/projects/{project}/snapshots?{query}",
             step.data,
             {
                 "Content-Type": ARROW_STREAM,
                 "X-GF-Project": project,
                 "X-GF-Request-ID": request_id,
             },
-            Request(Scope(project, request_id), Resource("context", "snapshots"), {}),
+            Request(Scope(project, request_id), Resource("snapshot", step.name), {}),
         )
     request = envelope(project, request_id, step.kind, step.resource, step.payload)
     prefix = "/v1" if step.global_route else f"/v1/projects/{project}"
@@ -287,20 +291,44 @@ def predict(client: Context, **settings: Any) -> Operation[PredictionResult]:
     return inference_result(result)
 
 
-def upload_snapshot(client: Context, data: Any) -> Operation[JsonObject]:
-    """`POST /snapshots`: the full normalized Arrow snapshot, its digest verified."""
+def snapshot_name(prefix: str, digest: str) -> str:
+    """The name a table's snapshot takes after what it is for: `<prefix>-<12 hex of its digest>`.
+
+    The same table is the same name, so sending it again returns the
+    snapshot it made.
+    """
+    return f"{prefix}-{digest.removeprefix('sha256:')[:12]}"
+
+
+def upload_snapshot(
+    client: Context,
+    data: Any,
+    *,
+    snapshot: str | None = None,
+    prefix: str = "table",
+    metadata: Mapping[str, str] | None = None,
+) -> Operation[JsonObject]:
+    """`POST /snapshots?name=...`: the full normalized Arrow table, its digest verified.
+
+    The snapshot is named `snapshot`, or after `prefix` and its digest
+    (`snapshot_name`). `metadata` is its optional training metadata:
+    `target` and `task`, and `time` and `group`.
+    """
     normalized = yield Work(table, (data,))
     encoded = yield Work(arrow_bytes, (normalized,))
     digest = yield Work(bytes_digest, (encoded,))
-    receipt = yield Upload(encoded)
-    if type(receipt.get("rows")) is not int or receipt != {
-        "digest": digest,
-        "rows": normalized.num_rows,
-    }:
+    named = snapshot or snapshot_name(prefix, digest)
+    made = yield Upload(named, encoded, dict(metadata or {}))
+    if (
+        made.get("name") != named
+        or made.get("digest") != digest
+        or type(made.get("rows")) is not int
+        or made["rows"] != normalized.num_rows
+    ):
         raise ServiceError(
-            "ProtocolError", "snapshot receipt does not match uploaded content", 502
+            "ProtocolError", "snapshot reply does not match uploaded content", 502
         )
-    return receipt
+    return made
 
 
 def listed(kind: ResourceKind, collection: str) -> Operation[list[JsonObject]]:
@@ -419,33 +447,6 @@ def run_create(name_: str, payload: JsonObject) -> Operation[JsonObject]:
     service answers a try it has seen with the run the first one made.
     """
     return (yield from created("run", "runs", name_, payload, retry=WRITE))
-
-
-def corpus_create(
-    name_: str, members: JsonObject, parent: str | None
-) -> Operation[JsonObject]:
-    """`POST /corpora`, retried, taking its own earlier try's corpus as made.
-
-    The service never reuses a corpus's name, so a try sent again after one
-    whose answer was lost is refused 409 if that try made it. Only then is
-    the corpus read back, and taken when it lists exactly these members and
-    parent; any other conflict is raised as it is.
-    """
-    payload: JsonObject = {"name": name_, "members": members}
-    if parent is not None:
-        payload["parent"] = parent
-    try:
-        return (yield from created("corpus", "corpora", name_, payload, retry=WRITE))
-    except ServiceError as error:
-        if error.status != 409 or not after_unknown_outcome(error):
-            raise
-        conflict = error
-    found = yield from got("corpus", "corpora", name_)
-    if found.get("members") != json.loads(json.dumps(members)) or (
-        found.get("parent") != parent
-    ):
-        raise conflict
-    return found
 
 
 def context_create(client: Context, config: JsonObject | ContextSpec) -> Operation[Any]:
@@ -635,7 +636,7 @@ def context_import_file(
     client: Context, context: str, data: Any
 ) -> Operation[ImportReceipt]:
     """Uploads a local bounded table, then binds it to a live context."""
-    receipt = yield from upload_snapshot(client, data)
+    receipt = yield from upload_snapshot(client, data, prefix=context)
     return (
         yield from context_import(
             ContextImportRef(
@@ -687,20 +688,110 @@ def source_pin(spec: JsonObject) -> Operation[SourcePin]:
 
 
 # Training uploads and runs that are done waiting.
-UPLOAD_DONE = ("verified", "rejected", "expired")
+UPLOAD_DONE = ("ready", "rejected", "expired")
 RUN_DONE = ("finished", "cancelled", "failed")
 
 
+# Files a training upload writes as Parquet on the way; a Parquet file goes as it is.
+UPLOAD_FILES = {
+    ".csv": "csv",
+    ".tsv": "tsv",
+    ".arrow": "arrow",
+    ".feather": "arrow",
+    ".ipc": "arrow",
+    ".jsonl": "jsonl",
+    ".ndjson": "jsonl",
+}
+PARQUET_MAGIC = b"PAR1"
+
+
+def _not_parquet(what: str) -> ServiceError:
+    return ServiceError(
+        "ValidationError",
+        f"{what} is not Parquet; send a .parquet, .csv, .tsv, .arrow, .feather or .jsonl file, "
+        "a dataframe or an Arrow table",
+        422,
+    )
+
+
+def _is_parquet(head: bytes, tail: bytes) -> bool:
+    return head[:4] == PARQUET_MAGIC and tail[-4:] == PARQUET_MAGIC
+
+
+def _file_parquet(path: Path, kind: str) -> bytes:
+    """A CSV, TSV, Arrow IPC (file or stream, so Feather v2) or JSON Lines file written as Parquet.
+
+    CSV and TSV convert batch by batch, so their decoded table is never
+    held whole.
+    """
+    import io
+
+    import pyarrow as pa
+    import pyarrow.csv as pa_csv
+    import pyarrow.json as pa_json
+    import pyarrow.parquet as pq
+
+    sink = io.BytesIO()
+    try:
+        if kind in ("csv", "tsv"):
+            reader = pa_csv.open_csv(
+                path,
+                parse_options=pa_csv.ParseOptions(
+                    delimiter="\t" if kind == "tsv" else ","
+                ),
+            )
+            with pq.ParquetWriter(sink, reader.schema) as writer:
+                for batch in reader:
+                    writer.write_batch(batch)
+        elif kind == "arrow":
+            with pa.memory_map(str(path)) as source:
+                try:
+                    table = pa.ipc.open_file(source).read_all()
+                except pa.ArrowInvalid:
+                    source.seek(0)
+                    table = pa.ipc.open_stream(source).read_all()
+            pq.write_table(table, sink)
+        else:
+            pq.write_table(pa_json.read_json(path), sink)
+    except (pa.ArrowInvalid, pa.ArrowTypeError, UnicodeDecodeError) as error:
+        raise ServiceError(
+            "ValidationError",
+            f"`{path.name}` could not be read as {kind}: {error}",
+            422,
+        ) from None
+    return sink.getvalue()
+
+
 def parquet_bytes(data: Any) -> bytes:
-    """A training table as Parquet bytes: a path or bytes as given, else a table written."""
+    """A training table as Parquet bytes.
+
+    Parquet bytes, or a Parquet file at a path, go as they are. A path to a
+    .csv, .tsv, .arrow, .feather or .jsonl file, or a dataframe or Arrow
+    table, is written as Parquet. Anything else is refused here, before an
+    upload opens.
+    """
     import io
 
     import pyarrow.parquet as pq
 
     if isinstance(data, bytes | bytearray):
+        if not _is_parquet(data[:4], data[-4:]):
+            raise _not_parquet("the bytes")
         return bytes(data)
     if isinstance(data, str | Path):
-        return Path(data).read_bytes()
+        path = Path(data)
+        if not path.is_file():
+            raise ServiceError("ValidationError", f"`{path}` is not a file", 422)
+        with path.open("rb") as file:
+            head = file.read(4)
+            file.seek(max(path.stat().st_size - 4, 0))
+            tail = file.read(4)
+        if _is_parquet(head, tail):
+            return path.read_bytes()
+        kind = UPLOAD_FILES.get(path.suffix.lower())
+        if kind is None:
+            raise _not_parquet(f"`{path.name}`")
+        return _file_parquet(path, kind)
     sink = io.BytesIO()
     pq.write_table(table(data), sink)
     return sink.getvalue()
@@ -737,7 +828,7 @@ def put_chunk(url: str, start: int, data: bytes, total: int) -> int:
 
 
 def training_upload(
-    data: Any, metadata: JsonObject, *, wait: bool, poll: float = 1.0
+    snapshot: str, data: Any, metadata: JsonObject, *, wait: bool, poll: float = 1.0
 ) -> Operation[JsonObject]:
     """Uploads a training table in chunks and waits for the service to verify it.
 
@@ -745,17 +836,24 @@ def training_upload(
     refuses a bad one before any bytes move. The chunks go where it says:
     straight to object storage when it returns a URL, else to the service.
     Once every declared byte is stored, the service verifies the upload on
-    its own. A rejected upload raises with the reason the service gave.
+    its own and the snapshot `snapshot` is ready. A rejected upload raises
+    with the reason the service gave.
     """
     body = yield Work(parquet_bytes, (data,))
     state = yield Call(
         "POST",
-        "/uploads",
-        "corpus",
-        "new",
-        {"bytes": len(body), "format": "parquet", "metadata": metadata},
+        "/snapshots",
+        "snapshot",
+        snapshot,
+        {
+            "name": snapshot,
+            "bytes": len(body),
+            "format": "parquet",
+            "metadata": metadata,
+        },
+        retry=WRITE,
     )
-    upload, url, size = state["id"], state.get("url"), state["chunk_bytes"]
+    upload, url, size = state["name"], state.get("url"), state["chunk_bytes"]
     for start in range(0, len(body), size):
         part = body[start : start + size]
         if url:
@@ -764,11 +862,12 @@ def training_upload(
             yield Chunk(upload, start, part, len(body))
     while wait and state["state"] not in UPLOAD_DONE:
         yield Pause(poll)
-        state = yield from got("corpus", "uploads", upload)
+        state = yield from got("snapshot", "snapshots", upload)
     if state["state"] in ("rejected", "expired"):
         raise ServiceError(
             "ValidationError",
-            f"upload {upload} was {state['state']}: {state.get('error') or ''}".strip(),
+            f"snapshot {upload} was {state['state']}: "
+            f"{state.get('error') or ''}".strip(),
             422,
         )
     return state
@@ -783,7 +882,7 @@ def upload_metadata(
     group: str | None = None,
     origin: JsonObject | None = None,
 ) -> JsonObject:
-    """A training upload's metadata, leaving out what was not given."""
+    """A snapshot's training metadata, leaving out what was not given."""
     found: JsonObject = {"target": target, "task": task}
     if column_types is not None:
         found["column_types"] = dict(column_types)
@@ -798,9 +897,14 @@ def run_spec(name_: str, **settings: Any) -> JsonObject:
     return {"name": name_, **{k: v for k, v in settings.items() if v is not None}}
 
 
-def run_list(state: str | None) -> Operation[list[JsonObject]]:
-    """`GET /runs`: the project's runs by name and version, with `state` only those in it."""
-    params = None if state is None else {"state": state}
+def run_list(
+    state: str | None = None,
+    data_digest: str | None = None,
+    tag: str | None = None,
+) -> Operation[list[JsonObject]]:
+    """`GET /runs`: the project's runs by name and version, only those matching what is given."""
+    given = {"state": state, "data_digest": data_digest, "tag": tag}
+    params = {key: value for key, value in given.items() if value is not None} or None
     result = yield Call("GET", "/runs", "run", "runs", params=params)
     value = result.get("runs")
     if type(value) is not list or any(type(item) is not dict for item in value):
@@ -880,15 +984,6 @@ def run_got(run: str, project: str | None = None) -> Operation[JsonObject]:
     """`GET /runs/{run}`: a run by its model, or a name's latest run."""
     path = run_path(run, project)
     result = yield from got("run", "runs", path.segment)
-    return path.owned(result, project)
-
-
-def run_train(
-    run: str, plan: JsonObject, project: str | None = None
-) -> Operation[JsonObject]:
-    """`POST /runs/{run}/train`: sets the plan of a run created without one."""
-    path = run_path(run, project)
-    result = yield from posted("run", "runs", path.segment, "train", {"plan": plan})
     return path.owned(result, project)
 
 
@@ -1171,7 +1266,9 @@ def predictor_push(
         yield from predictor_create(client, resource)
     snapshot = None
     if checked.snapshot is not None:
-        snapshot = (yield from upload_snapshot(client, checked.snapshot))["digest"]
+        snapshot = (
+            yield from upload_snapshot(client, checked.snapshot, prefix=resource)
+        )["digest"]
         require(snapshot == lock.data_digest, "snapshot differs from gf.lock")
     value = yield from posted(
         "predictor",

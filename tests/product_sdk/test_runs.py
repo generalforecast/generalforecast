@@ -48,8 +48,9 @@ def test_a_run_is_created_by_its_fine_tune_name_and_base(wire, asynchronous):
     spec = {
         "name": "credit",
         "base": BASE,
-        "corpus": "credit-v2",
-        "changes": [{"kind": "lora", "rank": 16}],
+        "data": ["credit-2026-02"],
+        "method": {"type": "lora", "rank": 16},
+        "plan": {"steps": 200},
     }
     wire.expect("POST", "/runs", _run("queued"), payload=spec)
     created = run(
@@ -58,8 +59,9 @@ def test_a_run_is_created_by_its_fine_tune_name_and_base(wire, asynchronous):
         lambda c: c.runs.create(
             "credit",
             base=BASE,
-            corpus="credit-v2",
-            changes=[{"kind": "lora", "rank": 16}],
+            data=["credit-2026-02"],
+            method={"type": "lora", "rank": 16},
+            plan={"steps": 200},
         ),
     )
     assert created["model"] == "test/credit@ft2" and created["version"] == 2
@@ -105,22 +107,11 @@ def test_a_run_of_another_project_or_no_run_is_refused_before_any_request(
 
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_every_run_method_takes_the_run_by_its_model(wire, asynchronous):
-    wire.expect(
-        "POST",
-        "/runs/credit@ft2/train",
-        _run("queued"),
-        payload={"plan": {"steps": 200}},
-    )
     wire.expect("POST", "/runs/credit@ft2/cancel", _run("cancelled"), payload={})
     wire.expect("GET", "/runs/credit@ft2/lineage", _lineage(CREATED))
-    trained = run(
-        asynchronous,
-        wire.url,
-        lambda c: c.runs.train("test/credit@ft2", {"steps": 200}),
-    )
     cancelled = run(asynchronous, wire.url, lambda c: c.runs.cancel("test/credit@ft2"))
     lineage = run(asynchronous, wire.url, lambda c: c.runs.lineage("test/credit@ft2"))
-    assert (trained["state"], cancelled["state"]) == ("queued", "cancelled")
+    assert cancelled["state"] == "cancelled"
     assert lineage == _lineage(CREATED)
 
 

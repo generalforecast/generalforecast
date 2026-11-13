@@ -171,9 +171,12 @@ class Spec:
                 request = media = None
                 body = operation.get("requestBody")
                 if body is not None:
-                    [(media, content)] = body["content"].items()
+                    # A route that takes JSON beside a binary body, as
+                    # `POST /snapshots` takes an Arrow stream, is a JSON route.
+                    contents = body["content"]
+                    media = JSON if JSON in contents else next(iter(contents))
                     if media == JSON:
-                        request = self.ref_name(content["schema"])
+                        request = self.ref_name(contents[JSON]["schema"])
                 success = next(
                     response
                     for status, response in operation["responses"].items()
