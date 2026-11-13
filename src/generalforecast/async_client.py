@@ -636,6 +636,7 @@ class Runs(Collection):
         data: builtins.list[str],
         method: JsonObject,
         plan: JsonObject,
+        evaluation: JsonObject | None = None,
         budget: JsonObject | None = None,
         seed: int | None = None,
         tags: builtins.list[str] | None = None,
@@ -660,9 +661,16 @@ class Runs(Collection):
         [...]}`. `plan` gives its `steps` and the trainer's settings,
         `{"steps": 200, "learning_rate": 5e-5, "episode_sampling": {"rows":
         1024}}`; anything the trainer does not read is refused with
-        `ValidationError` (`generalforecast._api.RunPlan`). The run keeps
-        the step that scores best on a 20% hold-out of the table's rows,
-        which it reports as its `evaluation`.
+        `ValidationError` (`generalforecast._api.RunPlan`).
+
+        `evaluation` says how the run holds out rows and keeps a step,
+        `{"holdout": 0.2, "context_rows": 32768, "contexts": 3,
+        "early_stopping_threshold": {"standard_errors": 2.0},
+        "report_share": 0.5}`, each setting left out at that default
+        (`context_rows` the base's trained row cap): a step is kept only on
+        a gain over the base of more than that many standard errors, and
+        the published version's `report` scores it against the base on
+        rows that played no part in choosing it.
 
         A try sent again after a transient failure carries the same request
         id, so the service returns the run the first try made rather than
@@ -674,6 +682,7 @@ class Runs(Collection):
             data=data,
             method=method,
             plan=plan,
+            evaluation=evaluation,
             budget=budget,
             seed=seed,
             tags=tags,

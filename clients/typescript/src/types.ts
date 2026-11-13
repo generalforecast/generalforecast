@@ -701,14 +701,27 @@ export interface RunMethod {
 /** a label to find runs by, as `recipe:fraud-v1` */
 export type RunTag = string;
 
+/** how far above 0 a step's paired gain over the base must be to keep it */
+export interface EarlyStoppingThreshold {
+  standard_errors: number;
+}
+
 /**
- * How the run chooses the weights it publishes. The trainer holds out 20% of the
- * table's rows, scores them every `evaluate_every` steps of the plan, and keeps the
- * step that scores best: `holdout` is that share, and every run says it. A create sends
- * no `evaluation`.
+ * How the run holds out rows and keeps a step. `holdout` of the table's rows, clamped
+ * to 2,000..50,000 rows, are held out by its time column, its group column, or
+ * stratified by class or target; `report_share` of them are report rows, the rest
+ * select rows. Every `eval_steps`, a check scores every select row against `contexts`
+ * fixed contexts of `context_rows` training rows, the base's trained row cap when null,
+ * and a step becomes the new best only if its gain over the base, row by row, is more
+ * than `early_stopping_threshold.standard_errors` standard errors above 0 and beats the
+ * best so far. A create may leave any setting out; the run says each.
  */
 export interface RunEvaluation {
   holdout: number;
+  context_rows: number | null;
+  contexts: number;
+  early_stopping_threshold: EarlyStoppingThreshold;
+  report_share: number;
 }
 
 /** how the trainer draws an episode from the table's training rows */
@@ -733,7 +746,7 @@ export interface RunPlan {
   beta2?: number;
   grad_clip?: number;
   episodes_per_step?: number;
-  evaluate_every?: number;
+  eval_steps?: number;
   early_stopping_patience?: number;
   save_steps?: number;
   save_total_limit?: number;
@@ -745,6 +758,35 @@ export interface RunUsage {
   charged_gpu_seconds: number;
   voided_gpu_seconds: number;
   credits: number;
+}
+
+/**
+ * the task metrics of the base's and the kept step's predictions on the report rows
+ */
+export interface RunReportMetrics {
+  base: Record<string, number>;
+  kept: Record<string, number>;
+}
+
+/**
+ * One table's report rows, scored once for the base and once for the kept step against
+ * the check contexts: their mean losses, the gain (the base's loss less the kept
+ * step's, above 0 when the kept step is better) with its 95% interval from the per-row
+ * gains, and task metrics for each: log loss, accuracy and, for two classes, ROC AUC;
+ * or CRPS, RMSE, MAE and R².
+ */
+export interface RunTableReport {
+  rows: number;
+  base: number;
+  kept: number;
+  gain: number;
+  ci95: number[];
+  metrics: RunReportMetrics;
+}
+
+/** the report rows' scores, keyed by table, `data` while a run has one table */
+export interface RunReport {
+  data: RunTableReport;
 }
 
 /**
@@ -760,6 +802,10 @@ export interface RunPublished {
   validation_loss: number | null;
   base_validation_loss: number | null;
   diverged_at_step?: number;
+  split?: "time" | "group" | "stratified";
+  check_context_rows?: number;
+  check_contexts?: number;
+  report?: RunReport | null;
 }
 
 export interface Run {
@@ -784,6 +830,17 @@ export interface Run {
   published: RunPublished | null;
 }
 
+/**
+ * a create's evaluation settings; each left out takes its default (`RunEvaluation`)
+ */
+export interface RunEvaluationRequest {
+  holdout?: number;
+  context_rows?: number;
+  contexts?: number;
+  early_stopping_threshold?: EarlyStoppingThreshold;
+  report_share?: number;
+}
+
 export interface RunReply extends Envelope {
   result: Run;
 }
@@ -802,6 +859,7 @@ export interface RunCreate {
   data: Name[];
   method: RunMethod;
   plan: RunPlan;
+  evaluation?: RunEvaluationRequest;
   budget?: Record<string, unknown>;
   seed?: number;
   tags?: RunTag[];

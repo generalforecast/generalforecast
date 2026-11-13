@@ -2353,6 +2353,11 @@ paths:
                           input_adapter: false
                         evaluation:
                           holdout: 0.2
+                          context_rows: null
+                          contexts: 3
+                          early_stopping_threshold:
+                            standard_errors: 2.0
+                          report_share: 0.5
                         budget: null
                         seed: 0
                         tags: []
@@ -2392,8 +2397,12 @@ paths:
         A create sent again with the same request id, as the SDK sends a
         retry, returns the run the first one made rather than start
         another; the same request id with another payload is refused with
-        409. The run holds out 20% of the table's rows and keeps the step
-        that scores best on them, which its `evaluation` reports.
+        409. `evaluation` says how the run holds out rows and keeps a step
+        (`RunEvaluation`): a step is kept only when its gain over the base
+        on the select rows is significant, and the published version
+        reports the kept step against the base on the report rows. A run
+        that finds no significant step publishes the base itself, kept at
+        step 0.
       parameters:
       - $ref: '#/components/parameters/project'
       requestBody:
@@ -2424,6 +2433,9 @@ paths:
                       learning_rate: 5.0e-05
                       episode_sampling:
                         rows: 1024
+                    evaluation:
+                      early_stopping_threshold:
+                        standard_errors: 2.0
       responses:
         '200':
           description: ok
@@ -2458,6 +2470,11 @@ paths:
                         input_adapter: false
                       evaluation:
                         holdout: 0.2
+                        context_rows: null
+                        contexts: 3
+                        early_stopping_threshold:
+                          standard_errors: 2.0
+                        report_share: 0.5
                       budget: null
                       seed: 0
                       tags: []
@@ -2599,6 +2616,11 @@ paths:
                         input_adapter: false
                       evaluation:
                         holdout: 0.2
+                        context_rows: null
+                        contexts: 3
+                        early_stopping_threshold:
+                          standard_errors: 2.0
+                        report_share: 0.5
                       budget: null
                       seed: 0
                       tags: []
@@ -2634,6 +2656,11 @@ paths:
                         input_adapter: false
                       evaluation:
                         holdout: 0.2
+                        context_rows: null
+                        contexts: 3
+                        early_stopping_threshold:
+                          standard_errors: 2.0
+                        report_share: 0.5
                       budget: null
                       seed: 0
                       tags: []
@@ -2647,6 +2674,19 @@ paths:
                         kept_step: 180
                         validation_loss: 0.412
                         base_validation_loss: 0.455
+                        split: stratified
+                        check_context_rows: 60000
+                        check_contexts: 3
+                        report:
+                          data:
+                            rows: 12500
+                            base: 0.4561
+                            kept: 0.4523
+                            gain: 0.0038
+                            ci95: [0.0021, 0.0055]
+                            metrics:
+                              base: {log_loss: 0.4561, accuracy: 0.7911, roc_auc: 0.8642}
+                              kept: {log_loss: 0.4523, accuracy: 0.7934, roc_auc: 0.8671}
   /v1/projects/{project}/runs/{run}/cancel:
     post:
       operationId: runs.cancel
@@ -2722,6 +2762,11 @@ paths:
                         input_adapter: false
                       evaluation:
                         holdout: 0.2
+                        context_rows: null
+                        contexts: 3
+                        early_stopping_threshold:
+                          standard_errors: 2.0
+                        report_share: 0.5
                       budget: null
                       seed: 0
                       tags: []
@@ -2756,6 +2801,11 @@ paths:
                         input_adapter: false
                       evaluation:
                         holdout: 0.2
+                        context_rows: null
+                        contexts: 3
+                        early_stopping_threshold:
+                          standard_errors: 2.0
+                        report_share: 0.5
                       budget: null
                       seed: 0
                       tags: []
@@ -2806,6 +2856,11 @@ paths:
                             input_adapter: false
                           evaluation:
                             holdout: 0.2
+                            context_rows: null
+                            contexts: 3
+                            early_stopping_threshold:
+                              standard_errors: 2.0
+                            report_share: 0.5
                           budget: null
                           seed: 0
                           tags: []
@@ -5602,16 +5657,16 @@ components:
           type: integer
           minimum: 1
           maximum: 64
-        evaluate_every:
+        eval_steps:
           type: integer
           minimum: 1
           maximum: 10000
-          description: the steps between checks on the held-out rows, 20 when left out
+          description: the steps between checks on the select rows, 20 when left out
         early_stopping_patience:
           type: integer
           minimum: 0
           maximum: 1000
-          description: checks without improvement before training stops; 0, never, when left out
+          description: checks without a new best before training stops; 0, never, when left out
         save_steps:
           type: integer
           minimum: 1
@@ -5682,20 +5737,161 @@ components:
           type: integer
           description: present when the loss stopped being finite there and training stopped; the
             version keeps the best step before it
+        split:
+          type: string
+          enum: [time, group, stratified]
+          description: the rule that held the rows out
+        check_context_rows:
+          type: integer
+          description: the rows of each check context
+        check_contexts:
+          type: integer
+          description: how many fixed contexts each check scored the select rows against
+        report:
+          description: the kept step against the base on the report rows, by table; null without report rows
+          anyOf:
+          - $ref: '#/components/schemas/RunReport'
+          - type: 'null'
+    RunReport:
+      type: object
+      description: the report rows' scores, keyed by table, `data` while a run has one table
+      required:
+      - data
+      additionalProperties: false
+      properties:
+        data:
+          $ref: '#/components/schemas/RunTableReport'
+    RunTableReport:
+      type: object
+      description: |
+        One table's report rows, scored once for the base and once for the
+        kept step against the check contexts: their mean losses, the gain
+        (the base's loss less the kept step's, above 0 when the kept step is
+        better) with its 95% interval from the per-row gains, and task
+        metrics for each: log loss, accuracy and, for two classes, ROC AUC;
+        or CRPS, RMSE, MAE and R².
+      required:
+      - rows
+      - base
+      - kept
+      - gain
+      - ci95
+      - metrics
+      additionalProperties: false
+      properties:
+        rows:
+          type: integer
+        base:
+          type: number
+        kept:
+          type: number
+        gain:
+          type: number
+        ci95:
+          type: array
+          minItems: 2
+          maxItems: 2
+          items:
+            type: number
+        metrics:
+          $ref: '#/components/schemas/RunReportMetrics'
+    RunReportMetrics:
+      type: object
+      description: the task metrics of the base's and the kept step's predictions on the report rows
+      required:
+      - base
+      - kept
+      additionalProperties: false
+      properties:
+        base:
+          type: object
+          additionalProperties:
+            type: number
+        kept:
+          type: object
+          additionalProperties:
+            type: number
     RunEvaluation:
       type: object
       description: |
-        How the run chooses the weights it publishes. The trainer holds out
-        20% of the table's rows, scores them every `evaluate_every` steps
-        of the plan, and keeps the step that scores best: `holdout` is that
-        share, and every run says it. A create sends no `evaluation`.
+        How the run holds out rows and keeps a step. `holdout` of the
+        table's rows, clamped to 2,000..50,000 rows, are held out by its
+        time column, its group column, or stratified by class or target;
+        `report_share` of them are report rows, the rest select rows. Every
+        `eval_steps`, a check scores every select row against `contexts`
+        fixed contexts of `context_rows` training rows, the base's
+        trained row cap when null, and a step becomes the new best only if
+        its gain over the base, row by row, is more than
+        `early_stopping_threshold.standard_errors` standard errors above 0
+        and beats the best so far. A create may leave any setting out; the
+        run says each.
       required:
       - holdout
+      - context_rows
+      - contexts
+      - early_stopping_threshold
+      - report_share
       additionalProperties: false
       properties:
         holdout:
           type: number
-          description: the share of the table's rows held out to choose the kept step, 0.2
+          minimum: 0.05
+          maximum: 0.5
+          description: the share of the table's rows held out, 0.2 when left out
+        context_rows:
+          description: the rows of each check context; the base's trained row cap when null
+          anyOf:
+          - type: integer
+            minimum: 256
+            maximum: 100000
+          - type: 'null'
+        contexts:
+          type: integer
+          minimum: 1
+          maximum: 5
+          description: the fixed check contexts, 3 when left out
+        early_stopping_threshold:
+          $ref: '#/components/schemas/EarlyStoppingThreshold'
+        report_share:
+          type: number
+          minimum: 0.2
+          maximum: 0.8
+          description: the share of the held-out rows reported rather than checked, 0.5 when left out
+    EarlyStoppingThreshold:
+      type: object
+      description: how far above 0 a step's paired gain over the base must be to keep it
+      required:
+      - standard_errors
+      additionalProperties: false
+      properties:
+        standard_errors:
+          type: number
+          minimum: 0
+          maximum: 5
+          description: in standard errors of the per-row gain, 2 when left out
+    RunEvaluationRequest:
+      type: object
+      description: a create's evaluation settings; each left out takes its default (`RunEvaluation`)
+      additionalProperties: false
+      properties:
+        holdout:
+          type: number
+          minimum: 0.05
+          maximum: 0.5
+        context_rows:
+          type: integer
+          minimum: 256
+          maximum: 100000
+        contexts:
+          type: integer
+          minimum: 1
+          maximum: 5
+        early_stopping_threshold:
+          $ref: '#/components/schemas/EarlyStoppingThreshold'
+        report_share:
+          type: number
+          minimum: 0.2
+          maximum: 0.8
     RunUsage:
       type: object
       required:
@@ -5783,6 +5979,8 @@ components:
           $ref: '#/components/schemas/RunMethod'
         plan:
           $ref: '#/components/schemas/RunPlan'
+        evaluation:
+          $ref: '#/components/schemas/RunEvaluationRequest'
         budget:
           type: object
         seed:

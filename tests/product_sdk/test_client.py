@@ -440,6 +440,7 @@ def test_a_run_names_the_model_it_trains_from_as_base(wire, asynchronous):
         "data": ["credit-2026-01"],
         "method": {"type": "lora", "rank": 16},
         "plan": {"steps": 10},
+        "evaluation": {"contexts": 2},
         "seed": 3,
     }
     wire.expect("POST", "/runs", {"name": "r1"}, payload=spec)
@@ -452,6 +453,7 @@ def test_a_run_names_the_model_it_trains_from_as_base(wire, asynchronous):
             data=["credit-2026-01"],
             method={"type": "lora", "rank": 16},
             plan={"steps": 10},
+            evaluation={"contexts": 2},
             seed=3,
         ),
     )
