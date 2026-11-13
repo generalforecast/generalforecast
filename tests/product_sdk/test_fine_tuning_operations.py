@@ -159,3 +159,100 @@ def test_a_plan_is_its_steps_and_the_trainers_settings():
     ):
         with pytest.raises(_api.PayloadError):
             one.decode(refused, "plan")
+
+
+def _parquet(table):
+    import io
+
+    import pyarrow.parquet as pq
+
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+    return sink.getvalue()
+
+
+def _read(body):
+    import pyarrow.parquet as pq
+
+    return pq.read_table(pa.BufferReader(body))
+
+
+def test_parquet_bytes_and_files_go_as_they_are(tmp_path):
+    body = _parquet(TABLE)
+    assert ops.parquet_bytes(body) == body
+    path = tmp_path / "train"
+    path.write_bytes(body)
+    assert ops.parquet_bytes(path) == body
+
+
+# Fractional values, so a CSV round trip keeps the column a float.
+FILE_TABLE = pa.table({"x": [1.5, 2.25, 3.75], "y": [0, 1, 0]})
+
+
+@pytest.mark.parametrize("suffix", [".csv", ".tsv", ".arrow", ".feather", ".jsonl"])
+def test_other_table_files_are_written_as_parquet(tmp_path, suffix):
+    import pyarrow.csv as pa_csv
+    from pyarrow import feather
+
+    path = tmp_path / f"train{suffix}"
+    if suffix in (".csv", ".tsv"):
+        pa_csv.write_csv(
+            FILE_TABLE,
+            path,
+            pa_csv.WriteOptions(delimiter="\t" if suffix == ".tsv" else ","),
+        )
+    elif suffix == ".jsonl":
+        path.write_text(
+            "".join(
+                f'{{"x": {x}, "y": {y}}}\n'
+                for x, y in zip(
+                    FILE_TABLE["x"].to_pylist(),
+                    FILE_TABLE["y"].to_pylist(),
+                    strict=True,
+                )
+            )
+        )
+    else:
+        feather.write_feather(FILE_TABLE, path)
+    assert _read(ops.parquet_bytes(path)).equals(FILE_TABLE)
+
+
+def test_an_arrow_stream_file_is_read_too(tmp_path):
+    path = tmp_path / "train.arrow"
+    with (
+        pa.OSFile(str(path), "wb") as sink,
+        pa.ipc.new_stream(sink, TABLE.schema) as writer,
+    ):
+        writer.write_table(TABLE)
+    assert _read(ops.parquet_bytes(path)).equals(TABLE)
+
+
+def test_bytes_that_are_not_parquet_are_refused_before_an_upload():
+    upload = ops.training_upload(
+        "train", b"x,y\n1,0\n", {"target": "y", "task": "classification"}, wait=True
+    )
+    step = next(upload)
+    assert isinstance(step, ops.Work)
+    with pytest.raises(ServiceError, match="not Parquet") as raised:
+        step.function(*step.args, **step.kwargs)
+    assert raised.value.status == 422
+
+
+@pytest.mark.parametrize("name", ["train.xlsx", "train"])
+def test_a_file_of_another_kind_is_refused(tmp_path, name):
+    path = tmp_path / name
+    path.write_bytes(b"not a table")
+    with pytest.raises(ServiceError, match="not Parquet"):
+        ops.parquet_bytes(path)
+
+
+def test_a_file_that_does_not_parse_says_so(tmp_path):
+    path = tmp_path / "train.arrow"
+    path.write_bytes(b"not arrow at all")
+    with pytest.raises(ServiceError, match="could not be read as arrow"):
+        ops.parquet_bytes(path)
+
+
+def test_a_missing_path_is_refused(tmp_path):
+    with pytest.raises(ServiceError, match="is not a file"):
+        ops.parquet_bytes(tmp_path / "missing.parquet")

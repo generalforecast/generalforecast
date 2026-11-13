@@ -551,7 +551,11 @@ class Snapshots(Collection):
         origin: JsonObject | None = None,
         wait: bool = True,
     ) -> JsonObject:
-        """Uploads a training table (a frame, an Arrow table, or a Parquet path or bytes) as `name`.
+        """Uploads a training table as `name`: a dataframe, an Arrow table, Parquet bytes, or a file.
+
+        A file is a path to .parquet (sent as it is), or .csv, .tsv, .arrow,
+        .feather or .jsonl (written as Parquet first); other bytes or files
+        are refused before the upload opens.
 
         It goes in chunks, straight to object storage where the service
         says. With `wait`, returns once the service has verified it and the

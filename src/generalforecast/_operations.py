@@ -692,16 +692,106 @@ UPLOAD_DONE = ("ready", "rejected", "expired")
 RUN_DONE = ("finished", "cancelled", "failed")
 
 
+# Files a training upload writes as Parquet on the way; a Parquet file goes as it is.
+UPLOAD_FILES = {
+    ".csv": "csv",
+    ".tsv": "tsv",
+    ".arrow": "arrow",
+    ".feather": "arrow",
+    ".ipc": "arrow",
+    ".jsonl": "jsonl",
+    ".ndjson": "jsonl",
+}
+PARQUET_MAGIC = b"PAR1"
+
+
+def _not_parquet(what: str) -> ServiceError:
+    return ServiceError(
+        "ValidationError",
+        f"{what} is not Parquet; send a .parquet, .csv, .tsv, .arrow, .feather or .jsonl file, "
+        "a dataframe or an Arrow table",
+        422,
+    )
+
+
+def _is_parquet(head: bytes, tail: bytes) -> bool:
+    return head[:4] == PARQUET_MAGIC and tail[-4:] == PARQUET_MAGIC
+
+
+def _file_parquet(path: Path, kind: str) -> bytes:
+    """A CSV, TSV, Arrow IPC (file or stream, so Feather v2) or JSON Lines file written as Parquet.
+
+    CSV and TSV convert batch by batch, so their decoded table is never
+    held whole.
+    """
+    import io
+
+    import pyarrow as pa
+    import pyarrow.csv as pa_csv
+    import pyarrow.json as pa_json
+    import pyarrow.parquet as pq
+
+    sink = io.BytesIO()
+    try:
+        if kind in ("csv", "tsv"):
+            reader = pa_csv.open_csv(
+                path,
+                parse_options=pa_csv.ParseOptions(
+                    delimiter="\t" if kind == "tsv" else ","
+                ),
+            )
+            with pq.ParquetWriter(sink, reader.schema) as writer:
+                for batch in reader:
+                    writer.write_batch(batch)
+        elif kind == "arrow":
+            with pa.memory_map(str(path)) as source:
+                try:
+                    table = pa.ipc.open_file(source).read_all()
+                except pa.ArrowInvalid:
+                    source.seek(0)
+                    table = pa.ipc.open_stream(source).read_all()
+            pq.write_table(table, sink)
+        else:
+            pq.write_table(pa_json.read_json(path), sink)
+    except (pa.ArrowInvalid, pa.ArrowTypeError, UnicodeDecodeError) as error:
+        raise ServiceError(
+            "ValidationError",
+            f"`{path.name}` could not be read as {kind}: {error}",
+            422,
+        ) from None
+    return sink.getvalue()
+
+
 def parquet_bytes(data: Any) -> bytes:
-    """A training table as Parquet bytes: a path or bytes as given, else a table written."""
+    """A training table as Parquet bytes.
+
+    Parquet bytes, or a Parquet file at a path, go as they are. A path to a
+    .csv, .tsv, .arrow, .feather or .jsonl file, or a dataframe or Arrow
+    table, is written as Parquet. Anything else is refused here, before an
+    upload opens.
+    """
     import io
 
     import pyarrow.parquet as pq
 
     if isinstance(data, bytes | bytearray):
+        if not _is_parquet(data[:4], data[-4:]):
+            raise _not_parquet("the bytes")
         return bytes(data)
     if isinstance(data, str | Path):
-        return Path(data).read_bytes()
+        path = Path(data)
+        if not path.is_file():
+            raise ServiceError("ValidationError", f"`{path}` is not a file", 422)
+        with path.open("rb") as file:
+            head = file.read(4)
+            file.seek(max(path.stat().st_size - 4, 0))
+            tail = file.read(4)
+        if _is_parquet(head, tail):
+            return path.read_bytes()
+        kind = UPLOAD_FILES.get(path.suffix.lower())
+        if kind is None:
+            raise _not_parquet(f"`{path.name}`")
+        return _file_parquet(path, kind)
     sink = io.BytesIO()
     pq.write_table(table(data), sink)
     return sink.getvalue()
