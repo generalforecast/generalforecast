@@ -245,7 +245,7 @@ def test_yes_takes_every_default_and_follows_the_run(monkeypatch, tmp_path, clie
         "kept step    50\n"
         "report rows  200\n"
         "log loss     0.4521 base, 0.4188 kept\n"
-        "gain         +7.4%, 95% CI +3.3% to +11.4%\n"
+        "gain         +7.37%, 95% CI +3.34% to +11.39%\n"
         "next: put `model: acme/churn@ft1` in gf.yaml, then run `gf push`\n"
     )
     assert client.snapshots.made == [(snapshot, 300, "churn", "classification")]

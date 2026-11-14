@@ -179,7 +179,7 @@ def _signed(value: float) -> str:
 
 
 def _percent(value: float) -> str:
-    return f"{value:+.1f}%"
+    return f"{value:+.2f}%"
 
 
 class Follower:
