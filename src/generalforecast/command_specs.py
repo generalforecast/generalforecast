@@ -17,10 +17,11 @@ if TYPE_CHECKING:
 TAGLINE = "General Forecast: Inference for structured data foundation models"
 CLOSING = "See 'gf help <command>' for more information"
 
-# `gf --help`: three groups, one line per command, in this order.
+# `gf --help`: four groups, one line per command, in this order.
 GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Predictors", ("init", "check", "eval", "serve", "predict")),
     ("Hosted", ("login", "logout", "whoami", "push", "status", "promote", "rollback")),
+    ("Fine-tuning", ("train", "runs")),
     ("Resources", ("model", "context", "admin")),
 )
 
@@ -37,6 +38,8 @@ COMMAND_HELP = {
     "status": "Show a predictor's environments",
     "promote": "Point an environment at another's revision",
     "rollback": "Point an environment at an earlier revision",
+    "train": "Fine-tune a catalog model on a table",
+    "runs": "Fine-tuning runs: list, watch, cancel",
     "model": "Catalog models: list, show, pull",
     "context": "Live contexts: create, append, label, show",
     "admin": "Keys, secrets, projects, nodes and routers",
@@ -48,6 +51,24 @@ MODEL_ACTIONS: tuple[tuple[str, str], ...] = (
     ("list", "List catalog models, newest first"),
     ("show", "Show one model's task and limits"),
     ("pull", "Download a model's weights to the cache"),
+)
+
+RUNS_ACTIONS: tuple[tuple[str, str], ...] = (
+    ("list", "List the project's runs"),
+    ("watch", "Follow a run until it ends"),
+    ("cancel", "Cancel a run"),
+)
+
+# The states a run passes through, as `gf runs list --state` takes them.
+RUN_STATES = (
+    "queued",
+    "setting_up",
+    "training",
+    "preempted",
+    "finished",
+    "cancelling",
+    "cancelled",
+    "failed",
 )
 
 CONTEXT_ACTIONS: tuple[tuple[str, str], ...] = (

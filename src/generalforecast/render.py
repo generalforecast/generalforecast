@@ -6,8 +6,9 @@
 Commands print status lines on stderr as they go and return their result;
 this module is the only writer of results on stdout. `emit` prints the
 result as JSON, `render` draws it for a person: the scored rows of
-`predict`, the metrics of `eval`, log lines, and the tables and records of
-`whoami`, `status`, `model`, `context` and `admin`.
+`predict`, the metrics of `eval`, what a fine-tuning run published, log
+lines, and the tables and records of `whoami`, `status`, `model`, `runs`,
+`context` and `admin`.
 """
 
 from __future__ import annotations
@@ -284,6 +285,34 @@ def _serving(args: argparse.Namespace, result: dict, out: term.Output) -> None:
         out.line(f"{'next: ' if index == 0 else '      '}{step}")
 
 
+def _published(result: dict, out: term.Output) -> None:
+    """The version a run published and its report, then the step that serves it."""
+    from generalforecast.train_commands import report_rows
+
+    rows, step = report_rows(result)
+    out.table(rows, indent=0, stream=out.out)
+    if step is not None:
+        out.line(f"next: {step}")
+
+
+def _train(args: argparse.Namespace, result: dict, out: term.Output) -> None:
+    if args.detach:
+        out.line(
+            f"next: follow it with `gf runs watch {printable(str(result['model']))}`"
+        )
+    else:
+        _published(result, out)
+
+
+def _runs(args: argparse.Namespace, result: dict, out: term.Output) -> None:
+    from generalforecast.train_commands import run_rows
+
+    if args.action == "list":
+        records(run_rows(result.get("runs", [])), out)
+    elif args.action == "watch":
+        _published(result, out)
+
+
 def _admin(args: argparse.Namespace, result: dict, out: term.Output) -> None:
     if args.noun == "logs":
         _logs(args, result, out)
@@ -300,5 +329,7 @@ _HANDLERS: dict[str, Callable[[argparse.Namespace, dict, term.Output], None]] = 
     "context": _context,
     "eval": _eval,
     "predict": _predict,
+    "train": _train,
+    "runs": _runs,
     "admin": _admin,
 }
