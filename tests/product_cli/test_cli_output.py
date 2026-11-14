@@ -54,6 +54,10 @@ def test_root_help_lists_exactly_the_contract_groups(monkeypatch):
         "  promote    Point an environment at another's revision\n"
         "  rollback   Point an environment at an earlier revision\n"
         "\n"
+        "Fine-tuning:\n"
+        "  train      Fine-tune a catalog model on a table\n"
+        "  runs       Fine-tuning runs: list, watch, cancel\n"
+        "\n"
         "Resources:\n"
         "  model      Catalog models: list, show, pull\n"
         "  context    Live contexts: create, append, label, show\n"
@@ -61,7 +65,7 @@ def test_root_help_lists_exactly_the_contract_groups(monkeypatch):
     )
     assert expected in stdout
     assert stdout.rstrip("\n").endswith(CLOSING)
-    assert len(COMMANDS) == 15 and [len(names) for _, names in GROUPS] == [5, 7, 3]
+    assert len(COMMANDS) == 17 and [len(names) for _, names in GROUPS] == [5, 7, 2, 3]
     assert all(len(text) < 50 for text in COMMAND_HELP.values())
 
 
@@ -118,7 +122,7 @@ def test_retired_flags_and_commands_are_gone(monkeypatch):
     assert json.loads(stderr)["error"]["message"] == (
         "unknown noun `membership` for `gf admin`"
     )
-    for command in ("dataset", "datasets", "bench", "run"):
+    for command in ("dataset", "datasets", "bench"):
         code, stdout, stderr = gf("--json", command, monkeypatch=monkeypatch)
         assert code == 2 and not stdout
         assert json.loads(stderr) == {
@@ -129,6 +133,9 @@ def test_retired_flags_and_commands_are_gone(monkeypatch):
                 "hint": "run 'gf --help' for the list of commands",
             }
         }
+    code, _, stderr = gf("--json", "run", monkeypatch=monkeypatch)
+    assert code == 2
+    assert json.loads(stderr)["error"]["tip"] == "a similar command exists: 'runs'"
     _, stdout, _ = gf("serve", "--help", monkeypatch=monkeypatch)
     for flag in ("--node", "--config", "--init", "--upstream", "--force"):
         assert flag not in stdout

@@ -3,7 +3,7 @@
 
 """The `gf` command: predictors on this machine and on the hosted service.
 
-Fifteen commands in three groups. Commands print status lines on stderr and
+Seventeen commands in four groups. Commands print status lines on stderr and
 return their result; `generalforecast.render` alone writes results on
 stdout, for a person or, under `--json`, as one JSON object. Help and version
 print without importing the SDK.
@@ -53,6 +53,8 @@ from generalforecast.command_specs import (
     NODE_DATA,
     READY_SECONDS,
     ROUTER_CONFIG,
+    RUN_STATES,
+    RUNS_ACTIONS,
     SERVE_HOST,
     SERVE_PORT,
     TABLE_PORT,
@@ -464,6 +466,128 @@ def parser() -> _Parser:
         help="The revision to point at (default: the one before)",
     )
     _wait(p)
+
+    p = command("train")
+    p.add_argument(
+        "table",
+        nargs="?",
+        metavar="TABLE",
+        help="The training table, .csv, .parquet or .json (default: the one table here)",
+    )
+    p.add_argument(
+        "--target",
+        dest="target_column",
+        metavar="<C>",
+        help="The column to predict",
+    )
+    p.add_argument(
+        "--task",
+        metavar="<T>",
+        choices=["classification", "regression"],
+        help="classification or regression (default: from the target)",
+    )
+    p.add_argument(
+        "--base",
+        metavar="<M>",
+        help="The catalog model to fine-tune (default: TabICL v2 for the task)",
+    )
+    p.add_argument(
+        "--method",
+        metavar="<M>",
+        choices=["lora", "input_adapter", "full"],
+        help="lora, input_adapter or full (default: lora)",
+    )
+    p.add_argument(
+        "--rank", type=int, metavar="<N>", help="The LoRA rank (default: 16)"
+    )
+    p.add_argument(
+        "--input-adapter",
+        action="store_true",
+        help="Train an input adapter beside the LoRA adapters",
+    )
+    p.add_argument(
+        "--components",
+        metavar="<C,C>",
+        type=_columns,
+        help="The components full fine-tuning trains (default: all four)",
+    )
+    p.add_argument(
+        "--name",
+        metavar="<NAME>",
+        help="The fine-tune's name (default: from the table's file name)",
+    )
+    p.add_argument(
+        "--steps", type=int, metavar="<N>", help="Optimizer steps (default: 400)"
+    )
+    p.add_argument(
+        "--learning-rate",
+        type=float,
+        metavar="<LR>",
+        help="The learning rate (default: 3e-06, or 1e-07 for full)",
+    )
+    p.add_argument(
+        "--episode-rows",
+        type=int,
+        metavar="<N>",
+        help="Rows in each training episode (default: 8192)",
+    )
+    p.add_argument(
+        "--eval-steps",
+        type=int,
+        metavar="<N>",
+        help="Steps between checks on the held-out rows (default: 25)",
+    )
+    p.add_argument(
+        "--patience",
+        type=int,
+        metavar="<N>",
+        help="Checks without a lower loss before training stops (default: 6)",
+    )
+    p.add_argument(
+        "--holdout",
+        type=float,
+        metavar="<FRACTION>",
+        help="The fraction of rows held out to check and report (default: 0.2)",
+    )
+    p.add_argument(
+        "--budget-gpu-hours",
+        type=float,
+        metavar="<H>",
+        help="The most GPU hours the run may use (default: 2)",
+    )
+    p.add_argument(
+        "--detach",
+        action="store_true",
+        help="Start the run and return without following it",
+    )
+    p.add_argument(
+        "--yes", action="store_true", help="Take the first option of every prompt"
+    )
+    p.add_argument("--no-input", action="store_true", help="Fail instead of prompting")
+
+    runs = nested(command("runs"), "<COMMAND>")
+    for name, text in RUNS_ACTIONS:
+        q = action(runs, name, text)
+        if name == "list":
+            q.add_argument(
+                "--state",
+                metavar="<S>",
+                choices=RUN_STATES,
+                help="Show only runs in this state",
+            )
+            continue
+        q.add_argument(
+            "model",
+            metavar="MODEL",
+            help="The run's model, <project>/<name>@ft<N>, or a name for its latest run",
+        )
+        if name == "cancel":
+            q.add_argument(
+                "--save",
+                action="store_true",
+                help="Publish the weights trained so far as the run's version",
+            )
+            q.add_argument("--yes", action="store_true", help="Cancel without asking")
 
     model = nested(command("model"), "<COMMAND>")
     for name, text in MODEL_ACTIONS:
@@ -1084,7 +1208,7 @@ _ARGV: list[str] = []
 def _incomplete(root: _Parser, args: argparse.Namespace) -> None:
     """Rejects a group named without its action, as argparse leaves it to us."""
     path = [args.command]
-    if args.command in ("model", "context"):
+    if args.command in ("model", "context", "runs"):
         path.append(args.action)
     elif args.command == "admin":
         path.append(args.noun)
@@ -1128,6 +1252,10 @@ def run(args: argparse.Namespace, root: _Parser, out: term.Output) -> dict | Non
         from generalforecast.commands import execute
 
         return execute(args, out)
+    if args.command in ("train", "runs"):
+        from generalforecast.train_commands import execute as fine_tuning
+
+        return fine_tuning(args, out)
     from generalforecast.predictor_commands import execute as predictors
 
     return predictors(args, out)
